@@ -1245,6 +1245,11 @@ function writeConnectAccountIamGrant(homeDir, userId = RENDEZVOUS_TEST_USER_ID, 
       revoked_at_unix_ms: null,
     }],
     audit_events: [],
+    // These validators exercise full root authority over the tunnel, so the
+    // default role ceilings (connect_account/client_key -> operator) are
+    // explicitly cleared. Ceiling enforcement itself is unit-tested in
+    // access::iam.
+    role_ceilings: {},
   };
   fs.writeFileSync(path.join(certDir, 'iam.json'), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
 }
@@ -1312,6 +1317,46 @@ function removeSessionFrameFixture(fixture) {
   fs.rmSync(fixture.dir, { recursive: true, force: true });
 }
 
+// The daemon under test runs against an isolated temp HOME. Interactive
+// login shells started by the terminal probe would hit zsh's first-run
+// wizard (zsh-newuser-install) in an rc-less home and block forever, so
+// give the home minimal shell rc files.
+function seedShellRcFixtures(homeDir) {
+  for (const rc of ['.zshrc', '.bashrc', '.bash_profile', '.profile']) {
+    fs.writeFileSync(path.join(homeDir, rc), '# validator fixture\n');
+  }
+}
+
+// The daemon under test runs against an isolated temp HOME, so the
+// large-payload assertions (chunked >64KiB api_sessions/stream replace
+// events) need enough session history to exist. Seed synthetic session
+// dirs the way the daemon writes them; ~150 entries comfortably clears
+// the 64KiB chunk threshold (~930 bytes per listed session).
+function createSessionSeedFixtures(label, homeDir, count = 150) {
+  const logsDir = path.join(homeDir, '.intendant', 'logs');
+  fs.mkdirSync(logsDir, { recursive: true });
+  const dirs = [];
+  for (let i = 0; i < count; i += 1) {
+    const sessionId = `validator-seed-${label}-${String(i).padStart(4, '0')}`;
+    const dir = path.join(logsDir, sessionId);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'session_meta.json'), JSON.stringify({
+      session_id: sessionId,
+      created_at: '2026-07-01T10:00:00',
+      project_root: `/tmp/validator-seed-${label}`,
+      status: 'completed',
+      last_turn: 3,
+    }));
+    fs.writeFileSync(path.join(dir, 'session.jsonl'), [
+      '{"ts":"10:00:00.000","event":"session_start","level":"info","message":"Session started"}',
+      `{"ts":"10:00:01.000","event":"user_prompt","level":"info","message":"synthetic validator seed session ${i} with a reasonably descriptive first prompt used to size the dashboard sessions payload"}`,
+      '',
+    ].join('\n'));
+    dirs.push(dir);
+  }
+  return { dirs };
+}
+
 function createFilesystemFixture(label) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `intendant-dashboard-control-fs-${label}-`));
   const filePath = path.join(dir, 'filesystem-read.txt');
@@ -1377,6 +1422,8 @@ async function main() {
   const recordingFixture = createRecordingFixture('rendezvous', daemonHome);
   const hlsRecordingFixture = createHlsRecordingFixture('rendezvous', daemonHome);
   const sessionFrameFixture = createSessionFrameFixture('rendezvous', daemonHome);
+  createSessionSeedFixtures('rendezvous', daemonHome);
+  seedShellRcFixtures(daemonHome);
   const filesystemFixture = createFilesystemFixture('rendezvous');
   const daemon = spawn(options.dashboardBinary, ['--no-tui', '--web', String(options.daemonPort)], {
     cwd: options.repoRoot,
@@ -1825,22 +1872,37 @@ async function main() {
         const token = 'dashboard_terminal_e2e_rendezvous';
         const frames = [];
         const handler = event => frames.push(event.detail || {});
-        const waitFor = (predicate, label) => new Promise((resolve, reject) => {
+        // Scan the whole frame list on every tick: PTY echo and command
+        // output arrive split across arbitrarily small terminal_output
+        // frames (the shell line editor redraws chunk by chunk), so a
+        // per-frame `includes(token)` race-passes only when the echo lands
+        // in one read.
+        const waitFor = (scan, label) => new Promise((resolve, reject) => {
           const started = Date.now();
           const tick = () => {
-            const found = frames.find(predicate);
+            const found = scan(frames);
             if (found) {
               resolve(found);
               return;
             }
             if (Date.now() - started > 60000) {
-              reject(new Error(`terminal ${label} timed out`));
+              const seen = frames.slice(0, 12).map(frame => ({
+                t: frame.t,
+                terminal_id: frame.terminal_id,
+                bytes: frame.data ? atob(String(frame.data)).length : 0,
+                preview: frame.data ? atob(String(frame.data)).slice(0, 80) : (frame.error || ''),
+              }));
+              reject(new Error(`terminal ${label} timed out; frames seen: ${JSON.stringify(seen)}`));
               return;
             }
             setTimeout(tick, 25);
           };
           tick();
         });
+        const combinedOutput = () => frames
+          .filter(frame => frame.t === 'terminal_output' && frame.terminal_id === terminalId)
+          .map(frame => atob(String(frame.data || '')))
+          .join('');
         window.addEventListener('intendant-dashboard-terminal-frame', handler);
         try {
           ctl.terminalFrame({
@@ -1850,16 +1912,18 @@ async function main() {
             cols: 80,
             rows: 24,
           });
-          await waitFor(frame => frame.t === 'terminal_opened' && frame.terminal_id === terminalId, 'open');
+          await waitFor(list => list.find(frame => frame.t === 'terminal_opened' && frame.terminal_id === terminalId), 'open');
+          // `\r` submits the command so the token must appear in real
+          // printf output, not just line-editor echo.
           ctl.terminalFrame({
             t: 'terminal_input',
             host_id: 'local',
             terminal_id: terminalId,
-            data: btoa(`printf '${token}\\n'\\r`),
+            data: btoa(`printf '${token}\\n'\r`),
           });
-          const output = await waitFor(frame => {
-            if (frame.t !== 'terminal_output' || frame.terminal_id !== terminalId) return false;
-            return atob(String(frame.data || '')).includes(token);
+          const output = await waitFor(() => {
+            const combined = combinedOutput();
+            return combined.includes(token) ? { combined } : null;
           }, 'output');
           ctl.terminalFrame({
             t: 'terminal_close',
@@ -1870,7 +1934,7 @@ async function main() {
             opened: true,
             sawToken: true,
             terminalId,
-            outputBytes: atob(String(output.data || '')).length,
+            outputBytes: output.combined.length,
           };
         } finally {
           window.removeEventListener('intendant-dashboard-terminal-frame', handler);

@@ -155,6 +155,8 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_peer_pairing_identity_revoke",
     "api_access_overview",
     "api_access_iam_state",
+    "api_access_enrollment_requests",
+    "api_access_enrollment_decide",
     "api_access_iam_upsert_user_client_grant",
     "api_access_iam_update_grant",
     "api_dashboard_targets",
@@ -1969,12 +1971,13 @@ fn dashboard_control_method_operation(
             Some(PeerOperation::SessionInspect)
         }
         "config" => Some(PeerOperation::RuntimeControl),
-        "api_access_overview" | "api_access_iam_state" | "api_dashboard_targets" => {
-            Some(PeerOperation::AccessInspect)
-        }
-        "api_access_iam_upsert_user_client_grant" | "api_access_iam_update_grant" => {
-            Some(PeerOperation::AccessManage)
-        }
+        "api_access_overview"
+        | "api_access_iam_state"
+        | "api_access_enrollment_requests"
+        | "api_dashboard_targets" => Some(PeerOperation::AccessInspect),
+        "api_access_iam_upsert_user_client_grant"
+        | "api_access_iam_update_grant"
+        | "api_access_enrollment_decide" => Some(PeerOperation::AccessManage),
         "api_peer_pairing_requests" | "api_peer_pairing_identities" => {
             Some(PeerOperation::AccessInspect)
         }
@@ -2246,6 +2249,32 @@ fn control_frame_response(
                     "ok": true,
                     "result": crate::web_gateway::access_iam_state_response_value(),
                 })),
+                "api_access_enrollment_requests" => Some(serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": true,
+                    "result": crate::web_gateway::access_enrollment_requests_response_value(),
+                })),
+                "api_access_enrollment_decide" => {
+                    let params = params.unwrap_or_else(|| serde_json::json!({}));
+                    match crate::web_gateway::access_enrollment_decide_response_value(
+                        params,
+                        &runtime.grant.access_principal(),
+                    ) {
+                        Ok(result) => Some(serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": true,
+                            "result": result,
+                        })),
+                        Err(error) => Some(serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": false,
+                            "error": error,
+                        })),
+                    }
+                }
                 "api_access_iam_upsert_user_client_grant" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
                     match crate::web_gateway::access_iam_upsert_user_client_grant_response_value(
@@ -3927,6 +3956,8 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ),
         ("api_access_overview_available", access_inspect),
         ("api_access_iam_state_available", access_inspect),
+        ("api_access_enrollment_requests_available", access_inspect),
+        ("api_access_enrollment_decide_available", access_manage),
         (
             "api_access_iam_upsert_user_client_grant_available",
             access_manage,

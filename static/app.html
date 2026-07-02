@@ -653,8 +653,7 @@ body.access-page #tab-access {
   gap: 6px;
   margin-top: 8px;
 }
-.access-card-actions button,
-.access-moved-note button {
+.access-card-actions button {
   padding: 5px 9px;
   border: 1px solid var(--surface1);
   border-radius: 4px;
@@ -678,135 +677,16 @@ body.access-page #tab-access {
   opacity: 0.55;
   cursor: not-allowed;
 }
-.access-card-actions button:hover,
-.access-moved-note button:hover {
+.access-card-actions button:hover {
   border-color: var(--blue);
 }
 .access-card-actions button.danger:hover {
   border-color: var(--red);
 }
-.access-section {
-  border: 1px solid var(--surface1);
-  border-radius: 6px;
-  padding: 12px 16px;
-  margin: 0 0 16px;
-}
-.access-section > .access-section-title {
-  margin: 0 0 8px;
-  color: var(--blue);
-  font-size: 13px;
-  font-weight: 700;
-}
-.access-iam-form {
-  margin: 0 0 14px;
-  padding: 12px;
-  border: 1px solid var(--surface1);
-  border-radius: 6px;
-  background: var(--base);
-}
-.access-iam-form-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 10px;
-}
-.access-iam-form-title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 800;
-}
-.access-iam-form-status {
-  flex: 0 0 auto;
-  color: var(--overlay0);
-  font-size: 10px;
-  font-weight: 800;
-  text-transform: uppercase;
-}
-.access-iam-form-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 8px;
-}
-.access-iam-form-grid label {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-  color: var(--overlay1);
-  font-size: 10px;
-  font-weight: 800;
-  text-transform: uppercase;
-}
-.access-iam-form-grid input,
-.access-iam-form-grid select {
-  min-width: 0;
-  width: 100%;
-  padding: 7px 8px;
-  border: 1px solid var(--surface1);
-  border-radius: 4px;
-  background: var(--surface0);
-  color: var(--text);
-  font: inherit;
-  font-size: 12px;
-}
-.access-iam-form-grid input:focus,
-.access-iam-form-grid select:focus {
-  outline: 1px solid var(--blue);
-  outline-offset: 1px;
-}
-.access-iam-form-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-top: 10px;
-}
-.access-iam-form-message {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--subtext0);
-  font-size: 11px;
-}
-.access-iam-form-actions button {
-  flex: 0 0 auto;
-  padding: 6px 10px;
-  border: 1px solid var(--blue);
-  border-radius: 4px;
-  background: var(--blue);
-  color: var(--crust);
-  cursor: pointer;
-  font: inherit;
-  font-size: 12px;
-  font-weight: 800;
-}
-.access-iam-form-actions button:disabled {
-  border-color: var(--surface1);
-  background: var(--surface0);
-  color: var(--overlay0);
-  cursor: not-allowed;
-}
 .access-empty {
   color: var(--subtext0);
   font-size: 12px;
   padding: 8px 0;
-}
-.access-moved-note {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px 14px;
-  border: 1px solid var(--surface1);
-  border-radius: 6px;
-  background: var(--base);
-  color: var(--subtext0);
-  font-size: 12px;
 }
 .access-target-surface {
   display: flex;
@@ -1051,11 +931,12 @@ body.access-page #tab-access {
   gap: 10px 14px;
   align-items: center;
   min-width: 0;
-  padding: 10px 12px;
-  border: 1px solid var(--surface1);
+  padding: 11px 13px;
+  border: 1px solid var(--glass-hairline-bright);
   border-left: 3px solid var(--access-target-accent);
-  border-radius: 6px;
-  background: var(--base);
+  border-radius: 8px;
+  background: var(--glass-bg);
+  box-shadow: var(--glass-highlight);
 }
 .access-target-row.ok { --access-target-accent: var(--green); }
 .access-target-row.warn,
@@ -1187,6 +1068,525 @@ body.access-page #tab-access {
 }
 .access-peer-display-slot {
   grid-column: 1 / -1;
+}
+
+/* ── Access redesign components (.acc-*) ──
+   The Access surface speaks one visual language: glass cards on the
+   base background, route chips (how you reach a daemon), role badges
+   (what you may do there), and status chips (grant lifecycle). Colors
+   are meaningful, not decorative: routes are cool hues, authority is
+   warm — the more a role can do, the warmer its badge. */
+
+.acc-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  margin: 18px 2px 10px;
+}
+.acc-section-head:first-child { margin-top: 2px; }
+.acc-section-title {
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+.acc-section-sub {
+  flex: 1 1 260px;
+  font-size: 11.5px;
+  color: var(--subtext0);
+  line-height: 1.45;
+}
+.acc-section-actions { margin-left: auto; display: flex; gap: 8px; }
+
+.acc-btn {
+  min-height: 28px;
+  padding: 4px 12px;
+  border: 1px solid var(--surface1);
+  border-radius: 5px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
+}
+.acc-btn:hover { border-color: var(--blue); }
+.acc-btn.primary {
+  border-color: var(--blue);
+  background: var(--blue);
+  color: var(--crust);
+  font-weight: 800;
+}
+.acc-btn.primary:hover { background: var(--sapphire); border-color: var(--sapphire); }
+.acc-btn.danger { border-color: rgba(243, 139, 168, 0.7); color: var(--red); background: transparent; }
+.acc-btn.danger:hover { border-color: var(--red); background: rgba(243, 139, 168, 0.08); }
+.acc-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* Route chips — transport is how you got there, never authority. */
+.acc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px 2px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--glass-hairline-bright);
+  background: rgba(49, 50, 68, 0.35);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--subtext1);
+  white-space: nowrap;
+}
+.acc-chip::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--overlay0);
+  flex: 0 0 auto;
+}
+.acc-chip.route-mtls::before { background: var(--lavender); }
+.acc-chip.route-mtls { border-color: rgba(180, 190, 254, 0.35); color: var(--lavender); }
+.acc-chip.route-connect::before { background: var(--sapphire); }
+.acc-chip.route-connect { border-color: rgba(116, 199, 236, 0.35); color: var(--sapphire); }
+.acc-chip.route-peer::before { background: var(--mauve); }
+.acc-chip.route-peer { border-color: rgba(203, 166, 247, 0.35); color: var(--mauve); }
+.acc-chip.route-local::before { background: var(--overlay1); }
+.acc-chip.route-local { color: var(--subtext0); }
+.acc-chip.route-webrtc::before { background: var(--teal); }
+.acc-chip.route-webrtc { border-color: rgba(148, 226, 213, 0.35); color: var(--teal); }
+.acc-chip.route-remembered::before { background: transparent; border: 1px dashed var(--overlay0); width: 5px; height: 5px; }
+.acc-chip.route-remembered { border-style: dashed; color: var(--overlay1); }
+
+/* Role badges — warmer = more authority. */
+.acc-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--surface1);
+  background: rgba(49, 50, 68, 0.4);
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  color: var(--subtext1);
+  white-space: nowrap;
+}
+.acc-badge.role-root { border-color: rgba(250, 179, 135, 0.65); color: var(--peach); background: rgba(250, 179, 135, 0.10); }
+.acc-badge.role-operator { border-color: rgba(249, 226, 175, 0.5); color: var(--yellow); background: rgba(249, 226, 175, 0.08); }
+.acc-badge.role-terminal { border-color: rgba(249, 226, 175, 0.4); color: var(--yellow); }
+.acc-badge.role-files { border-color: rgba(166, 227, 161, 0.45); color: var(--green); }
+.acc-badge.role-sessions { border-color: rgba(148, 226, 213, 0.45); color: var(--teal); }
+.acc-badge.role-observer { border-color: rgba(137, 180, 250, 0.45); color: var(--blue); }
+.acc-badge.role-scoped { color: var(--subtext0); }
+.acc-badge.role-peer { border-color: rgba(203, 166, 247, 0.5); color: var(--mauve); background: rgba(203, 166, 247, 0.08); }
+.acc-badge.role-planned { border-style: dashed; color: var(--overlay1); }
+
+/* Attention banners — actionable, never decorative. */
+.acc-attention { display: grid; gap: 8px; }
+.acc-attention:not(:empty) { margin-bottom: 14px; }
+.acc-attention-item {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--glass-hairline-bright);
+  background: var(--glass-bg);
+  box-shadow: var(--glass-highlight);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.acc-attention-item.err { border-color: rgba(243, 139, 168, 0.5); }
+.acc-attention-item.warn { border-color: rgba(249, 226, 175, 0.45); }
+.acc-attention-item .acc-attention-icon {
+  width: 22px; height: 22px;
+  display: grid; place-items: center;
+  border-radius: 6px;
+  font-weight: 900;
+  flex: 0 0 auto;
+}
+.acc-attention-item.err .acc-attention-icon { color: var(--red); background: rgba(243, 139, 168, 0.12); }
+.acc-attention-item.warn .acc-attention-icon { color: var(--yellow); background: rgba(249, 226, 175, 0.12); }
+.acc-attention-item.info .acc-attention-icon { color: var(--sapphire); background: rgba(116, 199, 236, 0.12); }
+.acc-attention-msg { flex: 1 1 320px; color: var(--text); }
+.acc-attention-msg .acc-attention-detail { display: block; margin-top: 2px; color: var(--subtext0); font-size: 11.5px; }
+.acc-attention-steps { margin: 6px 0 0; padding-left: 18px; color: var(--subtext0); font-size: 11.5px; line-height: 1.6; }
+.acc-attention-steps code { color: var(--blue); }
+.acc-attention-item .acc-btn { margin-left: auto; }
+
+/* Hero cards: "You" and "This daemon". */
+.acc-hero-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.acc-hero-card {
+  position: relative;
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 10px;
+  background: var(--glass-bg-deep);
+  box-shadow: var(--glass-highlight);
+  padding: 14px 16px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  align-content: start;
+}
+.acc-hero-glyph {
+  grid-row: span 2;
+  width: 40px; height: 40px;
+  display: grid; place-items: center;
+  border-radius: 9px;
+  border: 1px solid var(--glass-hairline-bright);
+  background: rgba(49, 50, 68, 0.5);
+  color: var(--lavender);
+  font-size: 15px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+}
+.acc-hero-glyph.daemon { color: var(--teal); }
+.acc-hero-kicker {
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--overlay1);
+}
+.acc-hero-title {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.acc-hero-chips { grid-column: 2; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.acc-hero-lines { grid-column: 1 / -1; margin-top: 10px; display: grid; gap: 4px; }
+.acc-hero-line {
+  display: flex;
+  gap: 10px;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.acc-hero-line strong {
+  flex: 0 0 96px;
+  color: var(--overlay1);
+  font-weight: 700;
+}
+.acc-hero-line span { color: var(--subtext1); overflow-wrap: anywhere; min-width: 0; }
+.acc-hero-line span.mono { font-size: 11px; color: var(--subtext0); }
+.acc-hero-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.acc-hero-stats { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.acc-hero-stat {
+  flex: 1 1 80px;
+  border: 1px solid var(--glass-hairline);
+  border-radius: 7px;
+  background: rgba(17, 17, 27, 0.35);
+  padding: 8px 10px;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+.acc-hero-stat:hover { border-color: var(--blue); }
+.acc-hero-stat .n { font-size: 16px; font-weight: 800; color: var(--text); }
+.acc-hero-stat .l { font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--overlay1); margin-top: 2px; }
+
+/* Fleet-at-a-glance strip on Overview. */
+.acc-fleet-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 10px;
+  margin-bottom: 18px;
+}
+.acc-fleet-card {
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 9px;
+  background: var(--glass-bg);
+  padding: 11px 13px;
+  cursor: pointer;
+  display: grid;
+  gap: 7px;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.acc-fleet-card:hover { border-color: var(--blue); background: rgba(24, 24, 37, 0.85); }
+.acc-fleet-card-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.acc-fleet-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--overlay0); flex: 0 0 auto; }
+.acc-fleet-card.ok .acc-fleet-dot { background: var(--green); box-shadow: 0 0 6px rgba(166, 227, 161, 0.6); }
+.acc-fleet-card.checking .acc-fleet-dot { background: var(--yellow); }
+.acc-fleet-card.err .acc-fleet-dot { background: var(--red); }
+.acc-fleet-card.ghost { border-style: dashed; opacity: 0.75; }
+.acc-fleet-name {
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.acc-fleet-self {
+  font-size: 9.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--teal);
+  border: 1px solid rgba(148, 226, 213, 0.4);
+  border-radius: 4px;
+  padding: 1px 5px;
+  flex: 0 0 auto;
+}
+.acc-fleet-meta { display: flex; flex-wrap: wrap; gap: 5px; }
+.acc-fleet-add {
+  border: 1px dashed var(--surface2);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--subtext0);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 11px 13px;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  min-height: 64px;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.acc-fleet-add:hover { border-color: var(--blue); color: var(--blue); }
+
+/* "How access works" explainer. */
+.acc-explainer {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr auto 1fr;
+  gap: 10px;
+  align-items: stretch;
+  margin: 4px 0 14px;
+}
+.acc-explainer-step {
+  border: 1px solid var(--glass-hairline);
+  border-radius: 9px;
+  background: rgba(24, 24, 37, 0.4);
+  padding: 12px 14px;
+}
+.acc-explainer-arrow {
+  align-self: center;
+  color: var(--overlay0);
+  font-size: 16px;
+  font-weight: 900;
+  padding: 0 2px;
+}
+.acc-explainer-kicker {
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--overlay1);
+  margin-bottom: 4px;
+}
+.acc-explainer-title { font-size: 12.5px; font-weight: 800; color: var(--text); margin-bottom: 4px; }
+.acc-explainer-text { font-size: 11px; color: var(--subtext0); line-height: 1.55; }
+@media (max-width: 900px) {
+  .acc-explainer { grid-template-columns: 1fr; }
+  .acc-explainer-arrow { transform: rotate(90deg); justify-self: center; padding: 0; }
+}
+
+/* Collapsible poweruser folds. */
+.acc-fold {
+  margin: 14px 0 0;
+  border: 1px solid var(--glass-hairline);
+  border-radius: 9px;
+  background: rgba(24, 24, 37, 0.35);
+}
+.acc-fold > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 10px 14px;
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--subtext1);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  user-select: none;
+}
+.acc-fold > summary::-webkit-details-marker { display: none; }
+.acc-fold > summary::before {
+  content: '\25B8';
+  color: var(--overlay0);
+  font-size: 11px;
+  transition: transform 0.15s ease;
+}
+.acc-fold[open] > summary::before { transform: rotate(90deg); }
+.acc-fold > summary:hover { color: var(--text); }
+.acc-fold-body { padding: 2px 14px 14px; }
+.acc-fold-hint { margin: 0 0 10px; font-size: 11.5px; color: var(--subtext0); line-height: 1.5; }
+.acc-fold-hint code { color: var(--blue); }
+
+/* Guided grant flow. */
+.acc-grant-flow {
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 10px;
+  background: var(--glass-bg-deep);
+  box-shadow: var(--glass-highlight);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+.acc-grant-flow-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 12px; margin-bottom: 12px; }
+.acc-grant-flow-title { font-size: 13.5px; font-weight: 800; color: var(--text); }
+.acc-grant-flow-sub { font-size: 11.5px; color: var(--subtext0); }
+.acc-grant-flow-mode { margin-left: auto; font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em; color: var(--overlay1); }
+.acc-step-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0 8px;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--overlay1);
+}
+.acc-step-label::after { content: ''; flex: 1; height: 1px; background: var(--glass-hairline); }
+.acc-choice-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
+.acc-choice-card {
+  position: relative;
+  border: 1px solid var(--surface1);
+  border-radius: 8px;
+  background: rgba(49, 50, 68, 0.25);
+  padding: 10px 12px;
+  cursor: pointer;
+  display: grid;
+  gap: 3px;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.acc-choice-card:hover { border-color: var(--overlay1); }
+.acc-choice-card input { position: absolute; opacity: 0; pointer-events: none; }
+.acc-choice-card.selected { border-color: var(--blue); background: rgba(137, 180, 250, 0.08); }
+.acc-choice-card .t { font-size: 12px; font-weight: 800; color: var(--text); display: flex; align-items: center; gap: 6px; }
+.acc-choice-card .d { font-size: 10.5px; color: var(--subtext0); line-height: 1.45; }
+.acc-detected {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(166, 227, 161, 0.35);
+  background: rgba(166, 227, 161, 0.07);
+  color: var(--green);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+.acc-field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.acc-field-grid label { display: grid; gap: 4px; font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; color: var(--overlay1); }
+.acc-field-grid input, .acc-field-grid select {
+  min-height: 30px;
+  padding: 5px 9px;
+  border: 1px solid var(--surface1);
+  border-radius: 5px;
+  background: rgba(17, 17, 27, 0.55);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+}
+.acc-field-grid input:focus, .acc-field-grid select:focus { outline: none; border-color: var(--blue); }
+.acc-role-picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; }
+.acc-role-card {
+  position: relative;
+  border: 1px solid var(--surface1);
+  border-radius: 8px;
+  background: rgba(49, 50, 68, 0.25);
+  padding: 10px 12px;
+  cursor: pointer;
+  display: grid;
+  gap: 4px;
+  align-content: start;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.acc-role-card input { position: absolute; opacity: 0; pointer-events: none; }
+.acc-role-card:hover { border-color: var(--overlay1); }
+.acc-role-card.selected { border-color: var(--blue); background: rgba(137, 180, 250, 0.07); }
+.acc-role-card.selected.warn { border-color: var(--peach); background: rgba(250, 179, 135, 0.07); }
+.acc-role-card-top { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.acc-role-card .t { font-size: 12px; font-weight: 800; color: var(--text); }
+.acc-role-card .d { font-size: 10.5px; color: var(--subtext0); line-height: 1.45; }
+.acc-role-card .p { font-size: 10px; color: var(--overlay1); }
+.acc-grant-flow-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+.acc-grant-flow-msg { font-size: 11.5px; color: var(--subtext0); }
+.acc-status-toggle { display: inline-flex; border: 1px solid var(--surface1); border-radius: 6px; overflow: hidden; }
+.acc-status-toggle label { position: relative; cursor: pointer; }
+.acc-status-toggle input { position: absolute; opacity: 0; pointer-events: none; }
+.acc-status-toggle span { display: inline-block; padding: 5px 12px; font-size: 11px; font-weight: 700; color: var(--subtext0); }
+.acc-status-toggle input:checked + span { background: var(--surface0); color: var(--text); }
+
+/* Principal cards (People & Devices). */
+.acc-principal-list { display: grid; gap: 10px; }
+.acc-principal-card {
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 9px;
+  background: var(--glass-bg);
+  padding: 12px 14px;
+}
+.acc-principal-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.acc-principal-glyph {
+  width: 28px; height: 28px;
+  display: grid; place-items: center;
+  border-radius: 7px;
+  border: 1px solid var(--glass-hairline-bright);
+  background: rgba(49, 50, 68, 0.5);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.03em;
+  color: var(--lavender);
+  flex: 0 0 auto;
+}
+.acc-principal-glyph.kind-peer { color: var(--mauve); }
+.acc-principal-glyph.kind-connect { color: var(--sapphire); }
+.acc-principal-glyph.kind-cert { color: var(--lavender); }
+.acc-principal-glyph.kind-human { color: var(--green); }
+.acc-principal-glyph.kind-session { color: var(--teal); }
+.acc-principal-name { font-size: 13px; font-weight: 800; color: var(--text); overflow-wrap: anywhere; }
+.acc-principal-kind { font-size: 10.5px; color: var(--overlay1); }
+.acc-principal-authn { margin-top: 6px; font-size: 11px; color: var(--subtext0); overflow-wrap: anywhere; }
+.acc-grant-rows { margin-top: 10px; display: grid; gap: 6px; }
+.acc-grant-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--glass-hairline);
+  border-radius: 7px;
+  background: rgba(17, 17, 27, 0.35);
+  font-size: 11.5px;
+}
+.acc-grant-row .t { color: var(--subtext1); }
+.acc-grant-row .why { flex-basis: 100%; color: var(--overlay1); font-size: 10.5px; line-height: 1.5; }
+.acc-grant-row-actions { margin-left: auto; display: flex; gap: 6px; }
+.acc-grant-row-actions .acc-btn { min-height: 24px; padding: 3px 9px; font-size: 11px; }
+
+/* Advanced role catalog. */
+.acc-role-catalog { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; margin-bottom: 12px; }
+.acc-role-info {
+  border: 1px solid var(--glass-hairline);
+  border-radius: 8px;
+  background: rgba(24, 24, 37, 0.4);
+  padding: 10px 12px;
+  display: grid;
+  gap: 5px;
+  align-content: start;
+}
+.acc-role-info-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.acc-role-info .d { font-size: 10.5px; color: var(--subtext0); line-height: 1.5; }
+.acc-role-info .perms { font-size: 10px; color: var(--overlay1); line-height: 1.5; overflow-wrap: anywhere; }
+
+/* Status-bar route prefix. */
+#sb-dashboard-transport-prefix { color: var(--overlay1); }
+
+@media (max-width: 760px) {
+  .acc-hero-grid { grid-template-columns: 1fr; }
+  .acc-hero-line strong { flex-basis: 84px; }
+  .acc-section-actions { margin-left: 0; }
 }
 .settings-save-row {
   display: flex;
@@ -10145,8 +10545,8 @@ body.display-fullscreen-open {
       <span class="field-label" id="sb-conn-label">ws</span>
       <span class="conn-dot err" id="sb-conn"></span>
     </span>
-    <span class="sb-dot-group" id="sb-dashboard-transport" title="Dashboard access">
-      <span class="field-label">access</span>
+    <span class="sb-dot-group clickable" id="sb-dashboard-transport" title="Dashboard access — click for connection diagnostics">
+      <span class="field-label" id="sb-dashboard-transport-prefix">access</span>
       <span class="conn-dot ok" id="sb-dashboard-transport-dot"></span>
       <span id="sb-dashboard-transport-label">Ready</span>
     </span>
@@ -10220,7 +10620,7 @@ body.display-fullscreen-open {
     <button class="tab-btn" data-tab="station" title="Station — the rendered control center (WebGPU canvas)">Station</button>
     <button class="tab-btn" data-tab="sessions" title="Browse, search, resume, and launch sessions">Sessions</button>
     <button class="tab-btn" data-tab="files" title="Browse and download files from this daemon or a peer">Files</button>
-    <button class="tab-btn" data-tab="access" title="Targets, grants, invitations, sharing, and connection diagnostics">Access</button>
+    <button class="tab-btn" data-tab="access" title="Who can reach this daemon and its fleet — people, peers, roles, and connection diagnostics">Access</button>
     <button class="tab-btn" data-tab="debug" title="Daemon diagnostics and raw event streams">Debug</button>
     <button class="tab-btn" data-tab="settings" title="Account, agent, and runtime settings">Settings</button>
   </nav>
@@ -11571,71 +11971,265 @@ body.display-fullscreen-open {
     <div id="tab-access" class="tab-pane">
       <div class="subtabs" id="access-subtabs">
         <button class="subtab-btn active" data-access-tab="overview">Overview</button>
-        <button class="subtab-btn" data-access-tab="people">People & Devices</button>
         <button class="subtab-btn" data-access-tab="daemons">Daemons</button>
-        <button class="subtab-btn" data-access-tab="peers">Peer Trust</button>
-        <button class="subtab-btn" data-access-tab="policies">Policies</button>
-        <button class="subtab-btn" data-access-tab="audit">Audit</button>
-        <button class="subtab-btn" data-access-tab="invitations">Invitations</button>
-        <button class="subtab-btn" data-access-tab="public">Public Shares</button>
+        <button class="subtab-btn" data-access-tab="people">People &amp; Devices</button>
+        <button class="subtab-btn" data-access-tab="peers">Peers</button>
         <button class="subtab-btn" data-access-tab="diagnostics">Diagnostics</button>
+        <button class="subtab-btn" data-access-tab="advanced">Advanced</button>
       </div>
 
       <div class="subtab-panes">
+
+        <!-- ── Overview: who you are, your fleet, how the model works ── -->
         <div class="subtab-pane active" id="access-pane-overview">
           <div class="access-pane-body">
-            <div id="access-model-overview" class="access-overview-grid"></div>
-            <div id="access-overview-details" class="access-detail-grid"></div>
+            <div id="access-attention" class="acc-attention"></div>
+            <div id="access-identity-hero" class="acc-hero-grid"></div>
+            <div class="acc-section-head">
+              <div class="acc-section-title">Fleet</div>
+              <div class="acc-section-sub">Every daemon you can reach from here. Each one still decides locally what you may do.</div>
+            </div>
+            <div id="access-fleet-strip" class="acc-fleet-strip"></div>
+            <div id="access-model-explainer" class="acc-explainer"></div>
           </div>
         </div>
-        <div class="subtab-pane" id="access-pane-people">
-          <div class="access-pane-body">
-            <div id="access-user-client-grant-form"></div>
-            <div id="access-people-overview" class="access-overview-grid"></div>
-            <div id="access-people-details" class="access-detail-grid"></div>
-          </div>
-        </div>
+
+        <!-- ── Daemons: the machines you operate ── -->
         <div class="subtab-pane" id="access-pane-daemons">
           <div class="access-pane-body">
-            <div id="access-daemon-overview" class="access-overview-grid"></div>
+            <div class="acc-section-head">
+              <div class="acc-section-title">Daemons</div>
+              <div class="acc-section-sub">Machines this dashboard can operate. The route is how you reach one; your role there is decided by that daemon.</div>
+              <div class="acc-section-actions">
+                <button type="button" class="acc-btn primary" id="access-link-daemon-btn">Link a daemon</button>
+              </div>
+            </div>
             <div id="access-target-overview" class="access-target-surface"></div>
-            <div id="access-target-details" class="access-detail-grid"></div>
+            <details class="acc-fold" id="access-peer-controls-fold">
+              <summary>Peer messaging &amp; quick controls</summary>
+              <div class="acc-fold-body">
+                <p class="acc-fold-hint">Talk to the agent on a connected peer directly: send messages, delegate tasks, resolve approvals, and open live displays.</p>
+                <div id="daemons-list" class="daemons-list"></div>
+              </div>
+            </details>
+            <details class="acc-fold" id="access-capability-routing-fold">
+              <summary>Capability routing</summary>
+              <div class="acc-fold-body">
+                <p class="acc-fold-hint">
+                  Capability-based discovery and task routing across all connected peers. Capabilities are kebab-case
+                  (<code>display</code>, <code>computer-use</code>, <code>task-delegation</code>, …) plus <code>custom:&lt;name&gt;</code>.
+                  Separate multiple with commas or spaces.
+                </p>
+                <div class="coord-section">
+                  <div class="coord-section-label">Find eligible peers</div>
+                  <div class="coord-row">
+                    <input id="coord-eligible-caps" type="text" placeholder="display, computer-use" autocomplete="off">
+                    <button id="coord-eligible-btn" type="button">Find</button>
+                  </div>
+                  <div id="coord-eligible-result" class="coord-result"></div>
+                </div>
+                <div class="coord-section">
+                  <div class="coord-section-label">Route a task</div>
+                  <div class="coord-row">
+                    <input id="coord-route-caps" type="text" placeholder="display, computer-use" autocomplete="off">
+                  </div>
+                  <textarea id="coord-route-instructions" class="coord-textarea" placeholder="Instructions for the chosen peer…" rows="3"></textarea>
+                  <div class="coord-row">
+                    <button id="coord-route-btn" type="button">Route</button>
+                    <span class="coord-route-hint">Routes to the lexicographically-first peer that satisfies all required capabilities. Cmd/Ctrl+Enter in the textarea also fires.</span>
+                  </div>
+                  <div id="coord-route-result" class="coord-result"></div>
+                </div>
+              </div>
+            </details>
           </div>
         </div>
+
+        <!-- ── People & Devices: user/client access to this daemon ── -->
+        <div class="subtab-pane" id="access-pane-people">
+          <div class="access-pane-body">
+            <div class="acc-section-head">
+              <div class="acc-section-title">People &amp; Devices</div>
+              <div class="acc-section-sub">Humans and their browsers, certificates, and Connect accounts — everyone who may operate <em>this</em> daemon. Daemon-to-daemon trust lives under Peers.</div>
+            </div>
+            <div id="access-people-current" class="acc-hero-grid"></div>
+            <div id="access-enrollment-requests"></div>
+            <div id="access-user-client-grant-form"></div>
+            <div class="acc-section-head">
+              <div class="acc-section-title">Who has access</div>
+              <div class="acc-section-sub">Every user/client principal this daemon knows, with its grants. Draft and revoked grants stay visible for review.</div>
+            </div>
+            <div id="access-people-grants" class="acc-principal-list"></div>
+          </div>
+        </div>
+
+        <!-- ── Peers: daemon-to-daemon federation ── -->
         <div class="subtab-pane" id="access-pane-peers">
           <div class="access-pane-body">
-            <div id="access-peer-overview" class="access-overview-grid"></div>
+            <div class="acc-section-head">
+              <div class="acc-section-title">Peer daemons</div>
+              <div class="acc-section-sub">Daemon-to-daemon federation over mutual TLS. A peer profile bounds what a remote daemon may do here — it never grants a human's browser anything.</div>
+            </div>
+            <div id="access-peer-summary" class="acc-hero-grid"></div>
+
+            <div class="daemon-pairing-grid">
+              <div class="daemon-pairing-panel daemon-add-wizard">
+                <div class="daemon-pairing-title">Link daemons</div>
+                <div class="daemon-pairing-mode-tabs" role="tablist" aria-label="Peer access mode">
+                  <button type="button" class="active" data-daemon-pairing-mode="request">Request Peer Access</button>
+                  <button type="button" data-daemon-pairing-mode="join">Join Invite</button>
+                  <button type="button" data-daemon-pairing-mode="invite">Grant Peer Invite</button>
+                  <button type="button" data-daemon-pairing-mode="manual">Manual Add</button>
+                </div>
+
+                <div class="daemon-pairing-pane active" data-daemon-pairing-pane="request">
+                  <p class="acc-fold-hint">Ask another daemon to let this one in. The other side approves the request and picks the profile.</p>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-request-target-url" type="text" placeholder="target URL" autocomplete="off">
+                    <input id="daemon-request-label" type="text" placeholder="this daemon label" autocomplete="off">
+                  </div>
+                  <div class="daemon-pairing-row">
+                    <select id="daemon-request-profile">
+                      <option value="peer-operator" title="Daemon-to-daemon display input, messages, tasks, and approvals. No settings or runtime control.">Peer operator</option>
+                      <option value="terminal-operator" title="Session reading plus interactive shell access.">Terminal operator</option>
+                      <option value="session-reader" title="Presence, stats, and session history. No shell, task, settings, or display input.">Session reader</option>
+                      <option value="read-only-display" title="Presence, stats, and display viewing. No input control.">Read-only display</option>
+                      <option value="shared-session-spectator" title="Presence, stats, and display viewing. No input control.">Spectator</option>
+                      <option value="task-runner" title="Presence, stats, messages, and task delegation.">Task runner</option>
+                      <option value="stats" title="Presence and usage statistics only.">Stats</option>
+                      <option value="presence-only" title="Basic presence only.">Presence only</option>
+                      <option value="peer-root" title="All daemon-to-daemon peer operations, including settings, sessions, files, shell, and runtime control.">Peer root</option>
+                    </select>
+                    <button id="daemon-request-btn" type="button">Request</button>
+                  </div>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-request-id" type="text" placeholder="request id" autocomplete="off">
+                    <button id="daemon-request-complete-btn" type="button">Check</button>
+                  </div>
+                  <div id="daemon-request-code" class="daemon-pairing-secret"></div>
+                  <span id="daemon-request-status" class="daemon-pairing-status"></span>
+                </div>
+
+                <div class="daemon-pairing-pane" data-daemon-pairing-pane="join">
+                  <p class="acc-fold-hint">Paste an invite another daemon created for you. It contains everything needed to connect.</p>
+                  <textarea id="daemon-join-invite" class="daemon-pairing-textarea" rows="6" placeholder="Paste invite"></textarea>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-join-label" type="text" placeholder="label override" autocomplete="off">
+                    <button id="daemon-join-btn" type="button">Join</button>
+                  </div>
+                  <span id="daemon-join-status" class="daemon-pairing-status"></span>
+                </div>
+
+                <div class="daemon-pairing-pane" data-daemon-pairing-pane="invite">
+                  <p class="acc-fold-hint">Create an invite that lets another daemon connect to this one.</p>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-invite-card-url" type="text" placeholder="advertised URL" autocomplete="off">
+                    <input id="daemon-invite-label" type="text" placeholder="label" autocomplete="off">
+                  </div>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-invite-client-name" type="text" placeholder="client name" autocomplete="off">
+                    <button id="daemon-invite-create-btn" type="button">Create</button>
+                  </div>
+                  <textarea id="daemon-invite-output" class="daemon-pairing-textarea" rows="4" readonly placeholder="Invite appears here"></textarea>
+                  <div class="daemon-pairing-actions">
+                    <button id="daemon-invite-copy-btn" type="button" disabled>Copy</button>
+                    <span id="daemon-invite-status" class="daemon-pairing-status"></span>
+                  </div>
+                  <div class="daemon-pairing-secret">Inbound grant: contains a client private key.</div>
+                </div>
+
+                <div class="daemon-pairing-pane" data-daemon-pairing-pane="manual">
+                  <p class="acc-fold-hint">Add a daemon you already hold client certificates for.</p>
+                  <div class="daemon-add-row">
+                    <input id="daemon-add-url" type="text" placeholder="https://mac-work:8765" autocomplete="off">
+                    <input id="daemon-add-label" type="text" placeholder="label" autocomplete="off">
+                    <button id="daemon-add-btn" type="button">Add</button>
+                  </div>
+                  <div class="daemon-add-row daemon-add-row-via">
+                    <input id="daemon-add-via" type="text" placeholder="via URL(s)" autocomplete="off">
+                  </div>
+                  <div class="daemon-add-row daemon-add-row-via">
+                    <input id="daemon-add-browser-tcp-via" type="text" placeholder="browser TCP URL" autocomplete="off">
+                  </div>
+                  <label class="daemon-add-persist">
+                    <input id="daemon-add-persist" type="checkbox">
+                    <span>Save to intendant.toml</span>
+                  </label>
+                  <span id="daemons-status" class="daemons-status"></span>
+                </div>
+              </div>
+
+              <div class="daemon-pairing-panel">
+                <div class="daemon-pairing-title">Inbound Peer Access Requests</div>
+                <div id="daemon-access-requests-list" class="daemons-list"></div>
+                <div class="daemon-pairing-actions">
+                  <button id="daemon-access-requests-refresh-btn" type="button">Refresh</button>
+                  <span id="daemon-access-requests-status" class="daemon-pairing-status"></span>
+                </div>
+              </div>
+            </div>
+
+            <div class="daemon-pairing-panel daemon-relationships-panel">
+              <div class="daemon-pairing-title">Inbound Peer Grants</div>
+              <div id="daemon-peer-identities-list" class="daemons-list"></div>
+              <div class="daemon-pairing-actions">
+                <button id="daemon-peer-identities-refresh-btn" type="button">Refresh</button>
+                <span id="daemon-peer-identities-status" class="daemon-pairing-status"></span>
+              </div>
+            </div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">Peer grants</div>
+              <div class="acc-section-sub">Every daemon-to-daemon grant this daemon knows about, in both directions.</div>
+            </div>
             <div id="access-peer-details" class="access-detail-grid"></div>
           </div>
         </div>
-        <div class="subtab-pane" id="access-pane-policies">
-          <div class="access-pane-body">
-            <div id="access-policy-overview" class="access-overview-grid"></div>
-            <div id="access-permission-matrix" class="access-detail-grid"></div>
-          </div>
-        </div>
-        <div class="subtab-pane" id="access-pane-audit">
-          <div class="access-pane-body">
-            <div id="access-audit-overview" class="access-overview-grid"></div>
-            <div id="access-grant-details" class="access-detail-grid"></div>
-            <div id="access-model-details" class="access-model-details"></div>
-            <div id="access-grants-mount"></div>
-          </div>
-        </div>
-        <div class="subtab-pane" id="access-pane-invitations">
-          <div class="access-pane-body">
-            <div id="access-invitations-mount"></div>
-          </div>
-        </div>
-        <div class="subtab-pane" id="access-pane-public">
-          <div class="access-pane-body">
-            <div id="access-public-shares" class="access-overview-grid"></div>
-          </div>
-        </div>
+
+        <!-- ── Diagnostics: route health & self-tests ── -->
         <div class="subtab-pane" id="access-pane-diagnostics">
           <div class="access-pane-body">
             <div id="access-diagnostics-overview" class="access-overview-grid"></div>
-            <div id="access-diagnostics-mount"></div>
+            <fieldset class="settings-group" id="connect-health-panel">
+              <legend>Connection Diagnostics</legend>
+              <div id="connect-health-summary" class="connect-health-badges"></div>
+              <div id="connect-health-grid" class="connect-health-grid"></div>
+              <div class="connect-self-test-actions">
+                <button id="connect-self-test-btn" type="button">Run self-test</button>
+                <span id="connect-self-test-status" aria-live="polite"></span>
+              </div>
+              <div id="connect-self-test-results" class="connect-self-test-results"></div>
+            </fieldset>
+          </div>
+        </div>
+
+        <!-- ── Advanced: the full model for powerusers ── -->
+        <div class="subtab-pane" id="access-pane-advanced">
+          <div class="access-pane-body">
+            <div class="acc-section-head">
+              <div class="acc-section-title">Roles &amp; permissions</div>
+              <div class="acc-section-sub">The exact permission matrix this daemon enforces. Roles bundle permissions; peer profiles live in the daemon-to-daemon domain.</div>
+            </div>
+            <div id="access-role-catalog" class="acc-role-catalog"></div>
+            <div id="access-permission-matrix" class="access-detail-grid"></div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">All grants</div>
+              <div class="acc-section-sub">Every grant with its principal, target, policy, transport, and the reason it exists.</div>
+            </div>
+            <div id="access-grant-details" class="access-detail-grid"></div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">Model inspector</div>
+              <div class="acc-section-sub">The raw access model this daemon reports: principals, grants, policies, permissions, IAM roles, audit events, and transports.</div>
+            </div>
+            <div id="access-iam-state-card" class="acc-hero-grid"></div>
+            <div id="access-model-details" class="access-model-details"></div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">Public sharing</div>
+              <div class="acc-section-sub" id="access-public-shares">Nothing is shared publicly. Explicit public or hosted-service shares remain a design target — nothing is exposed unless you grant it.</div>
+            </div>
           </div>
         </div>
       </div>
@@ -11897,149 +12491,6 @@ body.display-fullscreen-open {
         </div>
 
         <!-- Network pane: anything about how this daemon talks to others -->
-        <div class="subtab-pane" id="settings-pane-network">
-          <div class="settings-pane-body settings-pane-body--wide">
-            <div class="access-moved-note">
-              <span>Network access moved to Access.</span>
-              <button id="settings-open-access-btn" type="button">Open Access</button>
-            </div>
-            <fieldset class="settings-group">
-              <legend>Daemons</legend>
-              <div id="daemons-list" class="daemons-list"></div>
-              <div class="daemon-pairing-grid">
-                <div class="daemon-pairing-panel daemon-add-wizard">
-                  <div class="daemon-pairing-title">Peer Routes</div>
-                  <div class="daemon-pairing-mode-tabs" role="tablist" aria-label="Peer access mode">
-                    <button type="button" class="active" data-daemon-pairing-mode="request">Request Peer Access</button>
-                    <button type="button" data-daemon-pairing-mode="join">Join Invite</button>
-                    <button type="button" data-daemon-pairing-mode="invite">Grant Peer Invite</button>
-                    <button type="button" data-daemon-pairing-mode="manual">Manual Add</button>
-                  </div>
-
-                  <div class="daemon-pairing-pane active" data-daemon-pairing-pane="request">
-                    <div class="daemon-pairing-row">
-                      <input id="daemon-request-target-url" type="text" placeholder="target URL" autocomplete="off">
-                      <input id="daemon-request-label" type="text" placeholder="this daemon label" autocomplete="off">
-                    </div>
-                    <div class="daemon-pairing-row">
-                      <select id="daemon-request-profile">
-                        <option value="peer-operator" title="Daemon-to-daemon display input, messages, tasks, and approvals. No settings or runtime control.">Peer operator</option>
-                        <option value="terminal-operator" title="Session reading plus interactive shell access.">Terminal operator</option>
-                        <option value="session-reader" title="Presence, stats, and session history. No shell, task, settings, or display input.">Session reader</option>
-                        <option value="read-only-display" title="Presence, stats, and display viewing. No input control.">Read-only display</option>
-                        <option value="shared-session-spectator" title="Presence, stats, and display viewing. No input control.">Spectator</option>
-                        <option value="task-runner" title="Presence, stats, messages, and task delegation.">Task runner</option>
-                        <option value="stats" title="Presence and usage statistics only.">Stats</option>
-                        <option value="presence-only" title="Basic presence only.">Presence only</option>
-                        <option value="peer-root" title="All daemon-to-daemon peer operations, including settings, sessions, files, shell, and runtime control.">Peer root</option>
-                      </select>
-                      <button id="daemon-request-btn" type="button">Request</button>
-                    </div>
-                    <div class="daemon-pairing-row">
-                      <input id="daemon-request-id" type="text" placeholder="request id" autocomplete="off">
-                      <button id="daemon-request-complete-btn" type="button">Check</button>
-                    </div>
-                    <div id="daemon-request-code" class="daemon-pairing-secret"></div>
-                    <span id="daemon-request-status" class="daemon-pairing-status"></span>
-                  </div>
-
-                  <div class="daemon-pairing-pane" data-daemon-pairing-pane="join">
-                    <textarea id="daemon-join-invite" class="daemon-pairing-textarea" rows="6" placeholder="Paste invite"></textarea>
-                    <div class="daemon-pairing-row">
-                      <input id="daemon-join-label" type="text" placeholder="label override" autocomplete="off">
-                      <button id="daemon-join-btn" type="button">Join</button>
-                    </div>
-                    <span id="daemon-join-status" class="daemon-pairing-status"></span>
-                  </div>
-
-                  <div class="daemon-pairing-pane" data-daemon-pairing-pane="invite">
-                    <div class="daemon-pairing-row">
-                      <input id="daemon-invite-card-url" type="text" placeholder="advertised URL" autocomplete="off">
-                      <input id="daemon-invite-label" type="text" placeholder="label" autocomplete="off">
-                    </div>
-                    <div class="daemon-pairing-row">
-                      <input id="daemon-invite-client-name" type="text" placeholder="client name" autocomplete="off">
-                      <button id="daemon-invite-create-btn" type="button">Create</button>
-                    </div>
-                    <textarea id="daemon-invite-output" class="daemon-pairing-textarea" rows="4" readonly placeholder="Invite appears here"></textarea>
-                    <div class="daemon-pairing-actions">
-                      <button id="daemon-invite-copy-btn" type="button" disabled>Copy</button>
-                      <span id="daemon-invite-status" class="daemon-pairing-status"></span>
-                    </div>
-                    <div class="daemon-pairing-secret">Inbound grant: contains a client private key.</div>
-                  </div>
-
-                  <div class="daemon-pairing-pane" data-daemon-pairing-pane="manual">
-                    <div class="daemon-add-row">
-                      <input id="daemon-add-url" type="text" placeholder="https://mac-work:8765" autocomplete="off">
-                      <input id="daemon-add-label" type="text" placeholder="label" autocomplete="off">
-                      <button id="daemon-add-btn" type="button">Add</button>
-                    </div>
-                    <div class="daemon-add-row daemon-add-row-via">
-                      <input id="daemon-add-via" type="text" placeholder="via URL(s)" autocomplete="off">
-                    </div>
-                    <div class="daemon-add-row daemon-add-row-via">
-                      <input id="daemon-add-browser-tcp-via" type="text" placeholder="browser TCP URL" autocomplete="off">
-                    </div>
-                    <label class="daemon-add-persist">
-                      <input id="daemon-add-persist" type="checkbox">
-                      <span>Save to intendant.toml</span>
-                    </label>
-                    <span id="daemons-status" class="daemons-status"></span>
-                  </div>
-                </div>
-
-                <div class="daemon-pairing-panel">
-                  <div class="daemon-pairing-title">Inbound Peer Access Requests</div>
-                  <div id="daemon-access-requests-list" class="daemons-list"></div>
-                  <div class="daemon-pairing-actions">
-                    <button id="daemon-access-requests-refresh-btn" type="button">Refresh</button>
-                    <span id="daemon-access-requests-status" class="daemon-pairing-status"></span>
-                  </div>
-                </div>
-              </div>
-
-              <div class="daemon-pairing-panel daemon-relationships-panel">
-                <div class="daemon-pairing-title">Inbound Peer Grants</div>
-                <div id="daemon-peer-identities-list" class="daemons-list"></div>
-                <div class="daemon-pairing-actions">
-                  <button id="daemon-peer-identities-refresh-btn" type="button">Refresh</button>
-                  <span id="daemon-peer-identities-status" class="daemon-pairing-status"></span>
-                </div>
-              </div>
-            </fieldset>
-
-            <fieldset class="settings-group">
-              <legend>Coordinator</legend>
-              <p style="color:var(--subtext0);font-size:12px;margin:0 0 10px">
-                Capability-based discovery and task routing across all connected peers. Capabilities are kebab-case (<code style="color:var(--blue)">display</code>, <code style="color:var(--blue)">computer-use</code>, <code style="color:var(--blue)">task-delegation</code>, …) plus <code style="color:var(--blue)">custom:&lt;name&gt;</code>. Separate multiple with commas or spaces.
-              </p>
-
-              <div class="coord-section">
-                <div class="coord-section-label">Find eligible peers</div>
-                <div class="coord-row">
-                  <input id="coord-eligible-caps" type="text" placeholder="display, computer-use" autocomplete="off">
-                  <button id="coord-eligible-btn" type="button">Find</button>
-                </div>
-                <div id="coord-eligible-result" class="coord-result"></div>
-              </div>
-
-              <div class="coord-section">
-                <div class="coord-section-label">Route a task</div>
-                <div class="coord-row">
-                  <input id="coord-route-caps" type="text" placeholder="display, computer-use" autocomplete="off">
-                </div>
-                <textarea id="coord-route-instructions" class="coord-textarea" placeholder="Instructions for the chosen peer…" rows="3"></textarea>
-                <div class="coord-row">
-                  <button id="coord-route-btn" type="button">Route</button>
-                  <span class="coord-route-hint">Routes to the lexicographically-first peer that satisfies all required capabilities. Cmd/Ctrl+Enter in the textarea also fires.</span>
-                </div>
-                <div id="coord-route-result" class="coord-result"></div>
-              </div>
-            </fieldset>
-          </div>
-        </div>
-
         <!-- Debug pane: read-only diagnostics -->
         <div class="subtab-pane" id="settings-pane-debug">
           <div class="settings-pane-body">
@@ -12056,16 +12507,10 @@ body.display-fullscreen-open {
                 Download session report
               </a>
             </fieldset>
-            <fieldset class="settings-group" id="connect-health-panel">
-              <legend>Connection Diagnostics</legend>
-              <div id="connect-health-summary" class="connect-health-badges"></div>
-              <div id="connect-health-grid" class="connect-health-grid"></div>
-              <div class="connect-self-test-actions">
-                <button id="connect-self-test-btn" type="button">Run self-test</button>
-                <span id="connect-self-test-status" aria-live="polite"></span>
-              </div>
-              <div id="connect-self-test-results" class="connect-self-test-results"></div>
-            </fieldset>
+            <p style="color:var(--subtext0);font-size:12px;margin:0 0 8px">
+              Connection diagnostics and self-tests live under
+              <a href="#access/diagnostics" style="color:var(--blue)">Access &rarr; Diagnostics</a>.
+            </p>
             <div id="settings-env-overrides" class="hidden" style="margin:16px 0 0;padding:12px;background:var(--mantle);border-radius:6px">
               <h4 style="margin:0 0 8px;color:var(--peach);font-size:13px">Environment Variable Overrides</h4>
               <div id="settings-env-list" style="font-size:12px;color:var(--subtext0)"></div>
@@ -12854,6 +13299,243 @@ const DASHBOARD_ACTION_MSG_RPC_ACTIONS = new Set([
   'delete_recording',
   'set_diagnostics_visual_marker',
 ]);
+
+/* ── Browser client identity key ──
+   The durable identity of this browser *on this origin*: a WebCrypto P-256
+   keypair whose non-extractable private key lives in IndexedDB. Because
+   browser storage is origin-scoped, a key created under an anchor daemon's
+   origin can never be wielded by code served from any other origin — that
+   property is what lets daemons treat key-bound sessions as anchor-grade
+   (see docs/src/trust-architecture.md). Offers carry the public key plus a
+   signature over (daemon id, client nonce, sdp digest, timestamp); daemons
+   resolve the key fingerprint against their local IAM. */
+
+const CLIENT_IDENTITY_DB = 'intendant-client-identity';
+const CLIENT_IDENTITY_STORE = 'keys';
+const CLIENT_IDENTITY_RECORD = 'v1';
+let clientIdentityCache = null;
+let clientIdentityLoad = null;
+
+function clientIdentitySupported() {
+  return Boolean(window.isSecureContext && crypto?.subtle && window.indexedDB);
+}
+
+function clientIdentityOpenDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(CLIENT_IDENTITY_DB, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(CLIENT_IDENTITY_STORE)) {
+        req.result.createObjectStore(CLIENT_IDENTITY_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('indexedDB open failed'));
+  });
+}
+
+function clientIdentityDbGet(db) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CLIENT_IDENTITY_STORE, 'readonly');
+    const req = tx.objectStore(CLIENT_IDENTITY_STORE).get(CLIENT_IDENTITY_RECORD);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error || new Error('indexedDB read failed'));
+  });
+}
+
+function clientIdentityDbPut(db, record) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CLIENT_IDENTITY_STORE, 'readwrite');
+    tx.objectStore(CLIENT_IDENTITY_STORE).put(record, CLIENT_IDENTITY_RECORD);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('indexedDB write failed'));
+  });
+}
+
+function clientIdentityDbDelete(db) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CLIENT_IDENTITY_STORE, 'readwrite');
+    tx.objectStore(CLIENT_IDENTITY_STORE).delete(CLIENT_IDENTITY_RECORD);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('indexedDB delete failed'));
+  });
+}
+
+async function clientIdentityFingerprint(publicRaw) {
+  const digest = await crypto.subtle.digest('SHA-256', publicRaw);
+  return dashboardBytesToBase64Url(new Uint8Array(digest));
+}
+
+/* Load (or create on first use) this origin's identity key. Returns
+   { privateKey, publicRawB64u, fingerprint, createdAtMs } or null when the
+   platform cannot hold one (non-secure context, storage disabled). */
+async function clientIdentityGet() {
+  if (clientIdentityCache) return clientIdentityCache;
+  if (!clientIdentitySupported()) return null;
+  if (!clientIdentityLoad) {
+    clientIdentityLoad = (async () => {
+      try {
+        const db = await clientIdentityOpenDb();
+        let record = await clientIdentityDbGet(db);
+        if (!record?.privateKey || !record?.publicRaw) {
+          const pair = await crypto.subtle.generateKey(
+            { name: 'ECDSA', namedCurve: 'P-256' },
+            false,
+            ['sign']
+          );
+          const publicRaw = await crypto.subtle.exportKey('raw', pair.publicKey);
+          record = {
+            privateKey: pair.privateKey,
+            publicRaw,
+            createdAtMs: Date.now(),
+          };
+          await clientIdentityDbPut(db, record);
+        }
+        db.close();
+        const publicBytes = new Uint8Array(record.publicRaw);
+        clientIdentityCache = {
+          privateKey: record.privateKey,
+          publicRawB64u: dashboardBytesToBase64Url(publicBytes),
+          fingerprint: await clientIdentityFingerprint(record.publicRaw),
+          createdAtMs: record.createdAtMs || 0,
+        };
+        return clientIdentityCache;
+      } catch (err) {
+        console.warn('[client-identity] unavailable:', err?.message || err);
+        return null;
+      } finally {
+        clientIdentityLoad = null;
+      }
+    })();
+  }
+  return clientIdentityLoad;
+}
+
+async function clientIdentityReset() {
+  clientIdentityCache = null;
+  if (!clientIdentitySupported()) return;
+  const db = await clientIdentityOpenDb();
+  await clientIdentityDbDelete(db);
+  db.close();
+}
+
+/* ── Signed fleet records (trust architecture phase 5) ──
+   Fleet entries that round-trip through the hosted metadata store are
+   signed with this browser's identity key and verified on read, so the
+   store can remember the fleet but cannot invent or alter it unnoticed.
+   Provenance is display metadata only — authority always stays with the
+   target daemon. */
+
+function accessFleetRecordPayload(record, signedAt) {
+  return new TextEncoder().encode([
+    'intendant-fleet-record-v1',
+    String(record.host_id || record.id || ''),
+    String(record.label || ''),
+    String(record.url || ''),
+    String(record.ws_url || ''),
+    String(record.browser_tcp_via_url || ''),
+    String(record.connect_daemon_id || ''),
+    String(signedAt),
+  ].join('\n'));
+}
+
+async function accessFleetSignRecord(record) {
+  const identity = await clientIdentityGet();
+  if (!identity) return record;
+  const signedAt = Date.now();
+  try {
+    const signature = await crypto.subtle.sign(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      identity.privateKey,
+      accessFleetRecordPayload(record, signedAt)
+    );
+    return {
+      ...record,
+      record_key: identity.publicRawB64u,
+      record_sig: dashboardBytesToBase64Url(new Uint8Array(signature)),
+      record_signed_at_unix_ms: signedAt,
+    };
+  } catch (err) {
+    console.warn('[fleet-sync] record signing failed:', err?.message || err);
+    return record;
+  }
+}
+
+/* host_id → 'verified' | 'signed' | 'unverified' | 'hosted-claim'. */
+const accessFleetProvenance = new Map();
+
+async function accessFleetVerifyRecord(record) {
+  if (String(record.source || '') === 'connect_daemon') return 'hosted-claim';
+  const key = String(record.record_key || '');
+  const sig = String(record.record_sig || '');
+  const signedAt = Number(record.record_signed_at_unix_ms || 0);
+  if (!key || !sig || !signedAt) return 'unverified';
+  try {
+    const publicKey = await crypto.subtle.importKey(
+      'raw',
+      dashboardBase64UrlToBytes(key),
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      false,
+      ['verify']
+    );
+    const valid = await crypto.subtle.verify(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      publicKey,
+      dashboardBase64UrlToBytes(sig),
+      accessFleetRecordPayload(record, signedAt)
+    );
+    if (!valid) return 'unverified';
+    const mine = clientIdentityCache?.publicRawB64u === key;
+    return mine ? 'verified' : 'signed';
+  } catch {
+    return 'unverified';
+  }
+}
+
+async function accessFleetRefreshProvenance() {
+  if (!clientIdentitySupported()) return;
+  let changed = false;
+  for (const record of accessFleetRead().targets || []) {
+    const id = String(record.host_id || record.id || '').trim();
+    if (!id) continue;
+    const provenance = await accessFleetVerifyRecord(record);
+    if (accessFleetProvenance.get(id) !== provenance) {
+      accessFleetProvenance.set(id, provenance);
+      changed = true;
+    }
+  }
+  if (changed) renderAccessAdminSummaries();
+}
+
+/* Sign an offer. Absence is legacy-compatible (the daemon falls back to
+   account/trusted-transport identity); a present-but-invalid signature is
+   rejected by the daemon, so a signaling relay can neither forge nor splice
+   a key binding. */
+async function clientIdentityOfferFields(daemonId, clientNonce, sdp) {
+  try {
+    const identity = await clientIdentityGet();
+    if (!identity) return {};
+    const ts = Date.now();
+    const sdpDigest = dashboardBytesToBase64Url(
+      new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sdp)))
+    );
+    const payload = new TextEncoder().encode(
+      `intendant-client-key-offer-v1\n${daemonId || ''}\n${clientNonce || ''}\n${sdpDigest}\n${ts}`
+    );
+    const signature = await crypto.subtle.sign(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      identity.privateKey,
+      payload
+    );
+    return {
+      client_key: identity.publicRawB64u,
+      client_key_sig: dashboardBytesToBase64Url(new Uint8Array(signature)),
+      client_key_ts: ts,
+    };
+  } catch (err) {
+    console.warn('[client-identity] offer signing failed:', err?.message || err);
+    return {};
+  }
+}
 
 function dashboardConnectMutationUnavailable(action, label = 'Dashboard control request', options = {}) {
   const actionLabel = action ? ` ${action}` : '';
@@ -32657,7 +33339,10 @@ async function accessFleetHydrateFromHosted() {
   try {
     const resp = await fetch(accessFleetHostedUrl('/api/fleet/targets'));
     const body = await resp.json().catch(() => ({}));
-    if (resp.ok && body.ok !== false) accessFleetMergeHostedTargets(body.targets || []);
+    if (resp.ok && body.ok !== false) {
+      accessFleetMergeHostedTargets(body.targets || []);
+      accessFleetRefreshProvenance().catch(() => {});
+    }
   } catch (err) {
     console.warn('[access] hosted fleet hydrate failed', err);
   }
@@ -32686,7 +33371,11 @@ async function accessFleetPushToHosted() {
   try {
     const headers = await accessFleetHostedHeaders();
     if (!headers) return;
-    const targets = accessFleetRead().targets || [];
+    // Sign just-in-time so the pushed record always covers its current
+    // content; browsers without WebCrypto push unsigned (shown as such).
+    const targets = await Promise.all(
+      (accessFleetRead().targets || []).map(target => accessFleetSignRecord(target))
+    );
     const resp = await fetch(accessFleetHostedUrl('/api/fleet/targets/sync'), {
       method: 'POST',
       headers,
@@ -32695,6 +33384,7 @@ async function accessFleetPushToHosted() {
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok || body.ok === false) throw new Error(body.error || `HTTP ${resp.status}`);
     accessFleetMergeHostedTargets(body.targets || []);
+    accessFleetRefreshProvenance().catch(() => {});
   } finally {
     accessFleetHostedSyncInFlight = false;
     if (accessFleetHostedSyncDirty) accessFleetScheduleHostedSync();
@@ -32898,6 +33588,52 @@ async function refreshAccessOverviewFromApi(options = {}) {
     }
     return null;
   }
+}
+
+/* Pending browser-key enrollment requests (devices knocking on this daemon).
+   Pull-based like the overview; renderers read the cached list. */
+let accessPendingEnrollments = [];
+
+async function refreshAccessEnrollments(options = {}) {
+  try {
+    const resp = await dashboardJsonFetch('api_access_enrollment_requests', {}, () => authedFetch('/api/access/enrollment-requests', {
+      cache: 'no-store',
+      signal: options.signal,
+    }), 'api_access_enrollment_requests', { signal: options.signal });
+    if (!resp.ok) throw new Error(`/api/access/enrollment-requests returned ${resp.status}`);
+    const payload = await resp.json();
+    const requests = Array.isArray(payload?.requests) ? payload.requests : [];
+    const changed = JSON.stringify(requests) !== JSON.stringify(accessPendingEnrollments);
+    accessPendingEnrollments = requests;
+    if (changed) renderAccessAdminSummaries();
+    return requests;
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    if (!options.silent) {
+      console.warn('[access-enrollments] refresh failed', err);
+    }
+    return null;
+  }
+}
+
+async function accessDecideEnrollment(fingerprint, approve, roleId) {
+  const payload = { fingerprint, approve };
+  if (approve && roleId) payload.role_id = roleId;
+  try {
+    const resp = await dashboardJsonFetch('api_access_enrollment_decide', payload, () => authedFetch('/api/access/enrollment-requests/decide', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }), 'api_access_enrollment_decide', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    showControlToast?.('success', approve ? 'Device approved — it can connect now' : 'Device request denied');
+  } catch (err) {
+    showControlToast?.('error', err?.message || 'Enrollment decision failed');
+  }
+  await refreshAccessEnrollments({ silent: true }).catch(() => null);
+  await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+  renderAccessAdminSummaries();
 }
 
 function upsertDashboardAccessTarget(target) {
@@ -33346,7 +34082,7 @@ function accessOpenDisplay(hostId) {
 
 function accessManageTargetAccess(hostId) {
   const peerId = String(hostId || '').trim();
-  routeTo('access', peerId ? 'invitations' : 'audit');
+  routeTo('access', peerId ? 'peers' : 'people');
 }
 
 async function accessRemoveTarget(hostId, label) {
@@ -33866,81 +34602,16 @@ function accessOverviewModel() {
         peer_profile_grants: true,
         user_client_grants: true,
         principal_binding: 'root_peer_and_local_user_client',
-        enforced_principal_kinds: ['root_session', 'peer_daemon', 'human_user', 'browser_certificate', 'connect_account'],
-        reason: 'The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to browser mTLS or Connect account identities.',
+        enforced_principal_kinds: ['root_session', 'peer_daemon', 'human_user', 'browser_certificate', 'client_key', 'connect_account'],
+        reason: 'The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to browser identity keys, browser mTLS certificates, or Connect account identities.',
       },
+      role_ceilings: {
+        connect_account: 'role:operator',
+        client_key: 'role:operator',
+      },
+      hosted_origins: ['https://connect.intendant.dev'],
     },
   };
-}
-
-function accessOverviewCards() {
-  const overview = accessOverviewModel();
-  const scope = overview.scope || {};
-  const principals = Array.isArray(overview.principals) ? overview.principals : [];
-  const grants = Array.isArray(overview.grants) ? overview.grants : [];
-  const policies = Array.isArray(overview.policies) ? overview.policies : [];
-  const permissions = Array.isArray(overview.permissions) ? overview.permissions : [];
-  const transports = Array.isArray(overview.transports) ? overview.transports : [];
-  const iam = accessIamModel(overview);
-  const iamCapabilities = iam.capabilities && typeof iam.capabilities === 'object' ? iam.capabilities : {};
-  const unresolved = Array.isArray(overview.architecture?.unresolved)
-    ? overview.architecture.unresolved.length
-    : 0;
-  const humanPrincipals = principals.filter(p =>
-    /browser|human|passkey|certificate|connect/.test(String(p.kind || ''))
-  ).length;
-  const peerPrincipals = principals.filter(p => String(p.kind || '') === 'peer_daemon').length;
-  const activeGrants = grants.filter(g => !/planned|draft|offline|revoked|disabled|failed/.test(String(g.status || 'active'))).length;
-  const enforcedPolicies = policies.filter(p => String(p.status || '') === 'enforced').length;
-  const plannedPolicies = policies.filter(p => String(p.status || '') === 'planned').length;
-  const enforcedPermissions = permissions.filter(p => String(p.status || '') === 'enforced').length;
-  const activeTransports = transports.filter(t => !/offline|failed|disabled/.test(String(t.status || 'connected'))).length;
-  const scopeLabel = String(scope.label || selfHostLabel || 'This daemon');
-  const accountState = scope.account || scope.organization || scope.hosted_account_configured
-    ? 'account/org linked'
-    : 'account/org not linked';
-  return [{
-    title: 'Access scope',
-    kind: 'Daemon',
-    detail: `${scopeLabel}: ${accountState}. This page is the admin surface for user/client access and daemon peers.`,
-  }, {
-    title: 'Principals',
-    kind: accessPlural(principals.length, 'principal'),
-    detail: `${accessPlural(humanPrincipals, 'user/client principal', 'user/client principals')} and ${accessPlural(peerPrincipals, 'peer daemon')} are visible in this model.`,
-  }, {
-    title: 'Grants',
-    kind: `${activeGrants}/${grants.length || activeGrants} active`,
-    detail: 'Root owner access and peer-profile access now use the same grant vocabulary.',
-    actions: [{ label: 'Review', onClick: () => routeTo('access', 'audit') }],
-  }, {
-    title: 'IAM foundation',
-    kind: accessIamLoadLabel(iam),
-    detail: iamCapabilities.enforce_root_and_peer_grants
-      ? `Root sessions, peer profiles, and active bound user/client grants use the IAM evaluator. ${accessIamEnforcementReason(iam)}`
-      : `Local IAM state is visible. ${accessIamEnforcementReason(iam)}`,
-    actions: [{ label: 'Policies', onClick: () => routeTo('access', 'policies') }],
-  }, {
-    title: 'Policies',
-    kind: `${enforcedPolicies} enforced`,
-    detail: plannedPolicies === 1
-      ? '1 planned policy area remains a design target.'
-      : `${plannedPolicies} planned policy areas remain design targets.`,
-  }, {
-    title: 'Permissions',
-    kind: `${enforcedPermissions}/${permissions.length || enforcedPermissions} enforced`,
-    detail: 'Access inspect/manage and peer inspect/manage are separate gates; Connect and mTLS remain transports.',
-  }, {
-    title: 'Transports',
-    kind: `${activeTransports}/${transports.length || activeTransports} active`,
-    detail: 'mTLS, hosted tunnels, and peer routes are implementation transports under the same access model.',
-    actions: [{ label: 'Health', onClick: () => routeTo('access', 'diagnostics') }],
-  }, {
-    title: 'Open design',
-    kind: unresolved ? `${unresolved} items` : 'Clear',
-    detail: unresolved
-      ? 'Identity-provider policy, organizations, and the final IAM language are still explicit architecture decisions.'
-      : 'No unresolved access architecture notes are reported by this daemon.',
-  }];
 }
 
 function accessTargetConnection(target, descriptor, summary) {
@@ -34028,27 +34699,40 @@ function accessCreateTargetRow(target) {
   dot.setAttribute('aria-hidden', 'true');
   const titleRow = document.createElement('div');
   titleRow.className = 'access-target-title-row';
-  accessAppendText(titleRow, 'access-target-title', rememberedOnly ? (target.label || hostId || 'Remembered target') : (descriptor.displayName || target.label || 'Target'));
+  accessAppendText(titleRow, 'access-target-title', accessTargetDisplayName(target, descriptor));
   if (descriptor.local) {
     accessAppendText(titleRow, 'access-target-badge', 'this daemon', 'span');
   } else if (rememberedOnly) {
     accessAppendText(titleRow, 'access-target-badge', 'browser record', 'span');
   }
+  const provenanceChip = accessTargetProvenanceChip(target);
+  if (provenanceChip) titleRow.appendChild(provenanceChip);
   const subtitle = accessAppendText(main, 'access-target-subtitle', accessTargetSubtitle(target, descriptor));
   subtitle.title = subtitle.textContent;
   main.prepend(dot, titleRow);
 
   const authLabel = target.auth_label || descriptor.routeDetail || 'Trusted session';
-  const accessCell = accessCreateTargetCell(
-    'Access',
-    `${descriptor.accessDomain || target.access_domain_label || 'Access'} · ${descriptor.accessRole || target.effective_role_label || 'Role'}`,
-    authLabel
-  );
-  const routeCell = accessCreateTargetCell(
-    'Route',
-    rememberedOnly ? 'Remembered target' : (connection.route || target.route_label || 'Route'),
-    rememberedOnly ? 'Not configured on this daemon' : (connection.detail || summary.detail || '')
-  );
+  const roleLabel = descriptor.accessRole || target.effective_role_label || 'Role';
+  const roleId = /peer/i.test(roleLabel) ? 'role:peer-profile' : (/root/i.test(roleLabel) ? 'role:root' : '');
+  const accessCell = document.createElement('div');
+  accessCell.className = 'access-target-cell';
+  accessAppendText(accessCell, 'access-target-label', 'Your role');
+  const roleValue = document.createElement('div');
+  roleValue.className = 'access-target-value';
+  roleValue.appendChild(accessRoleBadge(roleId, roleLabel));
+  accessCell.appendChild(roleValue);
+  accessAppendText(accessCell, 'access-target-detail', authLabel);
+
+  const routeInfo = accessRouteInfoForTarget(target, descriptor, rememberedOnly);
+  const routeCell = document.createElement('div');
+  routeCell.className = 'access-target-cell';
+  accessAppendText(routeCell, 'access-target-label', 'Route');
+  const routeValue = document.createElement('div');
+  routeValue.className = 'access-target-value';
+  routeValue.appendChild(accessRouteChip(routeInfo.kind, routeInfo.label));
+  routeCell.appendChild(routeValue);
+  accessAppendText(routeCell, 'access-target-detail',
+    rememberedOnly ? 'Not configured on this daemon' : (connection.detail || summary.detail || ''));
 
   const chips = document.createElement('div');
   chips.className = 'access-target-chips';
@@ -34110,58 +34794,6 @@ function renderAccessTargetsSurface() {
     el.appendChild(accessCreateTargetRow(target));
   }
   reapplyPeerDisplayPanes();
-}
-
-function accessGrantCards() {
-  const overview = accessOverviewModel();
-  const grants = Array.isArray(overview.grants) ? overview.grants : [];
-  const hasBackendOverview = Boolean(dashboardAccessOverview);
-  const activeGrantCount = list => list.filter(grant =>
-    !/planned|offline|revoked|disabled/.test(String(grant.status || 'active'))
-  ).length;
-  const userClientGrants = grants.filter(grant => String(grant.kind || '') === 'user_client_root');
-  const inboundPeerGrants = grants.filter(grant => String(grant.kind || '') === 'inbound_daemon_peer_profile');
-  const outboundPeerGrants = grants.filter(grant => String(grant.kind || '') === 'daemon_peer_profile');
-  const transportLabel = dashboardConnectModeEnabled()
-    ? 'Hosted transport owner session'
-    : (location.protocol === 'https:' ? 'Trusted browser certificate' : 'Local dashboard session');
-  const cards = [{
-    title: 'Current browser access',
-    kind: userClientGrants.length ? 'Root' : 'Unknown',
-    detail: `${transportLabel} gives this browser root dashboard access to this daemon. This is user/client access, not peer federation.`,
-    actions: [{ label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') }],
-  }];
-
-  const inboundCards = hasBackendOverview
-    ? []
-    : Array.from(document.querySelectorAll('#daemon-peer-identities-list .daemon-identity-card'));
-  const approved = hasBackendOverview
-    ? activeGrantCount(inboundPeerGrants)
-    : inboundCards.filter(card => card.classList.contains('approved')).length;
-  const revoked = hasBackendOverview
-    ? inboundPeerGrants.filter(grant => String(grant.status || '') === 'revoked').length
-    : inboundCards.filter(card => card.classList.contains('revoked')).length;
-  cards.push({
-    title: 'Inbound peer access',
-    kind: approved > 0 ? `${approved} active` : 'None',
-    detail: approved > 0
-      ? `${approved} daemon-to-daemon mTLS grant${approved === 1 ? '' : 's'} can access this daemon with peer profiles.${revoked ? ` ${revoked} revoked grant${revoked === 1 ? '' : 's'} retained for audit.` : ''}`
-      : (revoked ? `${revoked} revoked inbound grant${revoked === 1 ? '' : 's'} retained for audit; none are active.` : 'No peer identities currently have approved inbound access.'),
-    actions: [{ label: 'Review', primary: true, onClick: () => routeTo('access', 'peers') }],
-  });
-
-  const outboundActive = activeGrantCount(outboundPeerGrants);
-  const outboundTotal = hasBackendOverview ? outboundPeerGrants.length : daemons.length;
-  cards.push({
-    title: 'Outbound peer routes',
-    kind: outboundTotal ? `${outboundActive}/${outboundTotal} active` : 'None',
-    detail: outboundTotal
-      ? 'This daemon can reach configured peer targets through daemon-to-daemon grants; this is separate from browser root access.'
-      : 'No peer targets are configured yet.',
-    actions: [{ label: 'Add', onClick: () => routeTo('access', 'invitations') }],
-  });
-
-  return cards;
 }
 
 function accessModelStatusText(value) {
@@ -34366,80 +34998,6 @@ function accessGrantWhy(grant) {
   return source ? `Authority comes from ${source}.` : 'Authority is described by this grant.';
 }
 
-function accessPrincipalDetailCards() {
-  const overview = accessOverviewModel();
-  const grantsByPrincipal = accessGrantsBy(overview, 'principal_id');
-  return accessOverviewArray(overview, 'principals').map(principal => {
-    const id = accessModelLabel(principal.id);
-    const grants = grantsByPrincipal.get(id) || [];
-    const authn = accessOverviewArray(principal, 'authn')
-      .map(item => accessModelLabel(item.label || item.kind))
-      .filter(Boolean)
-      .join(', ');
-    return {
-      title: accessModelLabel(principal.label, id || 'Principal'),
-      status: principal.status || (principal.local ? 'current' : 'active'),
-      lines: [
-        ['Type', accessModelLabel(principal.kind_label || principal.kind, 'Principal')],
-        ['Authentication', authn || accessModelLabel(principal.source, 'Descriptive model')],
-        ['Grants', accessPlural(grants.length, 'grant')],
-        ['Account', principal.account ? JSON.stringify(principal.account) : 'Not linked'],
-        ['Organization', principal.organization ? JSON.stringify(principal.organization) : 'Not linked'],
-        ['Identifier', id],
-      ],
-    };
-  });
-}
-
-function accessTargetDetailCards() {
-  const overview = accessOverviewModel();
-  const grantsByTarget = accessGrantsBy(overview, 'target_id');
-  const transportByTarget = new Map();
-  for (const transport of accessOverviewArray(overview, 'transports')) {
-    const targetId = accessModelLabel(transport.target_id);
-    if (targetId && !transportByTarget.has(targetId)) transportByTarget.set(targetId, transport);
-  }
-  return accessOverviewArray(overview, 'targets').map(target => {
-    const id = accessModelLabel(target.id || target.host_id);
-    const descriptor = dashboardTargetDescriptor(target.local ? '' : accessModelLabel(target.host_id || target.id));
-    const grants = grantsByTarget.get(id) || grantsByTarget.get(accessModelLabel(target.host_id)) || [];
-    const transport = transportByTarget.get(id) || transportByTarget.get(accessModelLabel(target.host_id)) || {};
-    return {
-      title: accessModelLabel(target.label, id || 'Daemon'),
-      status: target.connected === false ? 'offline' : 'connected',
-      lines: [
-        ['Target', target.local ? 'This daemon' : 'Peer daemon'],
-        ['Access domain', target.access_domain_label || descriptor.accessDomain],
-        ['Effective role', target.effective_role_label || descriptor.accessRole],
-        ['Authentication', target.auth_label || descriptor.routeDetail],
-        ['Route', target.route_label || descriptor.routeType],
-        ['Transport', accessModelLabel(transport.kind_label || transport.kind, 'Current dashboard')],
-        ['Grants', accessPlural(grants.length, 'grant')],
-        ['Identifier', id],
-      ],
-    };
-  });
-}
-
-function accessPeerTrustCards() {
-  const overview = accessOverviewModel();
-  const grants = accessOverviewArray(overview, 'grants');
-  const inbound = grants.filter(grant => accessModelLabel(grant.kind) === 'inbound_daemon_peer_profile');
-  const outbound = grants.filter(grant => accessModelLabel(grant.kind) === 'daemon_peer_profile');
-  const revoked = inbound.filter(grant => accessModelLabel(grant.status) === 'revoked').length;
-  return [{
-    title: 'Inbound peer trust',
-    kind: `${inbound.filter(grant => accessModelLabel(grant.status, 'active') !== 'revoked').length} active`,
-    detail: revoked ? `${revoked} revoked grant${revoked === 1 ? '' : 's'} retained for audit.` : 'Approved peer identities that may call into this daemon.',
-    actions: [{ label: 'Requests', onClick: () => routeTo('access', 'invitations') }],
-  }, {
-    title: 'Outbound peer routes',
-    kind: `${outbound.filter(grant => accessModelLabel(grant.status, 'active') !== 'offline').length}/${outbound.length} active`,
-    detail: 'Configured peer targets this daemon may call through daemon-to-daemon trust.',
-    actions: [{ label: 'Daemons', onClick: () => routeTo('access', 'daemons') }],
-  }];
-}
-
 function accessPeerTrustDetailCards() {
   const overview = accessOverviewModel();
   const principalLabels = accessOverviewPrincipalLabelMap(overview);
@@ -34518,6 +35076,28 @@ function accessAuditGrantCards() {
 function accessCurrentUserClientCandidate() {
   const principal = dashboardControlTransport?.lastStatus?.access_principal;
   const authnList = Array.isArray(principal?.authn) ? principal.authn : [];
+  // This origin's identity key is the strongest, always-available binding:
+  // prefer it whenever the keystore holds one (the cache is warmed at
+  // startup, so this synchronous read is normally populated).
+  const keyAuthn = authnList.find(item =>
+    accessModelLabel(item?.kind) === 'client_key' && accessModelLabel(item?.fingerprint)
+  );
+  const localKey = clientIdentityCache;
+  if (keyAuthn || localKey) {
+    return {
+      kind: 'client_key',
+      label: accessModelLabel(principal?.label, 'This browser'),
+      fingerprint: '',
+      client_key_fingerprint: accessModelLabel(keyAuthn?.fingerprint, localKey?.fingerprint || ''),
+      client_key: accessModelLabel(keyAuthn?.public_key, localKey?.publicRawB64u || ''),
+      user_id: accessModelLabel(principal?.account?.user_id),
+      account_name: accessModelLabel(principal?.account?.account_name || principal?.account?.handle),
+      account_provider: accessModelLabel(principal?.account?.provider),
+      verified_provider: accessModelLabel(principal?.account?.verified_provider),
+      organization_id: accessModelLabel(principal?.organization?.id),
+      organization_name: accessModelLabel(principal?.organization?.name),
+    };
+  }
   const browserAuthn = authnList.find(item =>
     accessModelLabel(item?.kind) === 'browser_mtls_cert' && accessModelLabel(item?.fingerprint)
   );
@@ -34559,19 +35139,53 @@ function accessCurrentUserClientCandidate() {
 
 function accessSetField(parent, id, value) {
   const el = parent.querySelector(`#${id}`);
-  if (el) el.value = value == null ? '' : String(value);
+  if (!el) return;
+  el.value = value == null ? '' : String(value);
+  el.dataset.autofill = el.value;
+}
+
+function accessSelectedUserClientKind(form) {
+  return form?.querySelector('input[name="access-user-client-kind"]:checked')?.value || 'browser_certificate';
 }
 
 function accessSyncUserClientGrantFields(form) {
-  const kind = form?.querySelector('#access-user-client-kind')?.value || 'browser_certificate';
-  const fields = form?.querySelectorAll('[data-access-kind-field]') || [];
-  fields.forEach(node => {
+  if (!form) return;
+  const kind = accessSelectedUserClientKind(form);
+  form.querySelectorAll('[data-access-kind-field]').forEach(node => {
     const visibleKinds = String(node.dataset.accessKindField || '')
       .split('|')
       .map(value => value.trim())
       .filter(Boolean);
     node.style.display = visibleKinds.includes(kind) ? '' : 'none';
   });
+  form.querySelectorAll('.acc-choice-card').forEach(card => {
+    const input = card.querySelector('input[name="access-user-client-kind"]');
+    card.classList.toggle('selected', Boolean(input?.checked));
+  });
+  form.querySelectorAll('.acc-role-card').forEach(card => {
+    const input = card.querySelector('input[name="access-user-client-role"]');
+    const selected = Boolean(input?.checked);
+    card.classList.toggle('selected', selected);
+    card.classList.toggle('warn', selected && accessRoleMeta(input?.value).warn === true);
+  });
+  // Warn when the chosen role exceeds what the binding's ceiling will let a
+  // session actually do (connect accounts always; client keys only matter
+  // here when the key was enrolled from a hosted origin, which a manually
+  // pasted fingerprint usually was not).
+  const note = form.querySelector('#access-grant-ceiling-note');
+  if (note) {
+    const ceiling = kind === 'connect_account' ? accessRoleCeilingFor('connect_account') : null;
+    const selectedRole = form.querySelector('input[name="access-user-client-role"]:checked')?.value || '';
+    const ceilingRole = ceiling ? accessIamRoleById(ceiling) : null;
+    const selectedRoleObj = selectedRole ? accessIamRoleById(selectedRole) : null;
+    const exceeds = Boolean(ceiling && selectedRoleObj && ceilingRole
+      && Array.isArray(selectedRoleObj.permissions) && Array.isArray(ceilingRole.permissions)
+      && selectedRoleObj.permissions.some(perm => !ceilingRole.permissions.includes(perm)));
+    note.style.display = exceeds ? '' : 'none';
+    if (exceeds) {
+      note.textContent = `Hosted-route sessions for this account are capped at ${ceiling.replace(/^role:/, '')} by this daemon's role ceiling — the grant saves as ${selectedRole.replace(/^role:/, '')}, but Connect sessions won't exceed the ceiling. Raise or clear role_ceilings in iam.json to change this.`;
+    }
+  }
 }
 
 function accessAssignableIamRoles(overview = accessOverviewModel()) {
@@ -34596,9 +35210,108 @@ function accessAssignableIamRoles(overview = accessOverviewModel()) {
   }];
 }
 
+const ACCESS_GRANT_KIND_CHOICES = [{
+  value: 'client_key',
+  title: 'A browser identity key',
+  desc: 'The key a browser holds in its own storage — signed into every session, no certificate install needed.',
+}, {
+  value: 'browser_certificate',
+  title: 'A browser certificate',
+  desc: 'Pin one browser’s mTLS client certificate to a role on this daemon.',
+}, {
+  value: 'connect_account',
+  title: 'A Connect account',
+  desc: 'Authorize an Intendant Connect account so its hosted dashboard can open this daemon.',
+}, {
+  value: 'human_user',
+  title: 'A person',
+  desc: 'One human record that can carry a key, a certificate, and a Connect account.',
+}];
+
+const ACCESS_ROLE_PICKER_ORDER = [
+  'role:scoped-human', 'role:observer', 'role:session-reader', 'role:files-read',
+  'role:files-write', 'role:terminal', 'role:operator', 'role:root',
+];
+
+/* Grant fanout: the daemons this page can apply a grant to, each with the
+   channel it would use. 'self' uses the normal session; 'remote' is a
+   direct cross-origin call to a fleet daemon (mTLS in the browser, origin
+   allowlisted daemon-side); 'connect-only' targets have no direct route
+   from this page. Every write is still authorized by the target daemon. */
+function accessGrantFanoutTargets() {
+  const targets = [];
+  for (const target of accessTargetRecords()) {
+    const hostId = String(target.host_id || target.id || '').trim();
+    const descriptor = dashboardTargetDescriptor(target.local ? '' : hostId);
+    const label = accessTargetDisplayName(target, descriptor);
+    if (target.local || descriptor.local) {
+      targets.push({ key: 'local', label, mode: 'self' });
+      continue;
+    }
+    const rawUrl = target.browser_tcp_via_url || target.url || target.ws_url
+      || descriptor.peer?.browser_tcp_via_url || descriptor.peer?.url || descriptor.peer?.ws_url || '';
+    let origin = '';
+    try {
+      if (rawUrl) {
+        const url = new URL(rawUrl);
+        const scheme = url.protocol === 'wss:' ? 'https:' : (url.protocol === 'ws:' ? 'http:' : url.protocol);
+        origin = `${scheme}//${url.host}`;
+      }
+    } catch { origin = ''; }
+    const hostedOnly = !origin || /\/app\?connect=1/.test(rawUrl);
+    targets.push({
+      key: hostId || label,
+      label,
+      mode: hostedOnly ? 'connect-only' : 'remote',
+      origin: hostedOnly ? '' : origin,
+      connected: target.connected !== false,
+    });
+  }
+  return targets;
+}
+
+/* Results of the last fanout, kept across re-renders until dismissed. */
+let accessGrantFanoutResults = null;
+
+async function accessApplyGrantToTarget(target, payload) {
+  if (target.mode === 'self') {
+    const resp = await dashboardJsonFetch('api_access_iam_upsert_user_client_grant', payload, () => authedFetch('/api/access/iam/user-client-grants', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }), 'api_access_iam_upsert_user_client_grant', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    return data;
+  }
+  const resp = await fetch(`${target.origin}/api/access/iam/user-client-grants`, {
+    method: 'POST',
+    mode: 'cors',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+  return data;
+}
+
 function renderAccessUserClientGrantForm() {
   const mount = document.getElementById('access-user-client-grant-form');
   if (!mount) return;
+  // Background refreshes (peer events, transport status) re-render the whole
+  // Access surface. Never clobber a grant the user is in the middle of
+  // typing: skip the rebuild while the form is focused or holds edits. A
+  // submit cycle bypasses this via the submitting flag so button state and
+  // the post-save reset still render.
+  const existing = mount.querySelector('form');
+  if (existing && !accessUserClientGrantSubmitting && existing.dataset.submitting !== 'true') {
+    if (existing.contains(document.activeElement)) return;
+    const dirty = Array.from(existing.querySelectorAll('input[type="text"]'))
+      .some(input => (input.dataset.autofill || '') !== input.value)
+      || Array.from(existing.querySelectorAll('input[name="access-grant-fanout"]'))
+        .some(input => input.checked !== input.defaultChecked);
+    if (dirty) return;
+  }
   const overview = accessOverviewModel();
   const iam = accessIamModel(overview);
   const writeApiAvailable = iam?.capabilities?.write_api_available !== false;
@@ -34608,139 +35321,297 @@ function renderAccessUserClientGrantForm() {
   mount.innerHTML = '';
 
   const form = document.createElement('form');
-  form.className = 'access-iam-form';
+  form.className = 'acc-grant-flow';
+  form.dataset.submitting = accessUserClientGrantSubmitting ? 'true' : 'false';
   form.addEventListener('submit', accessSubmitUserClientGrant);
 
   const head = document.createElement('div');
-  head.className = 'access-iam-form-head';
+  head.className = 'acc-grant-flow-head';
   const title = document.createElement('div');
-  title.className = 'access-iam-form-title';
-  title.textContent = 'Current user/client grant';
-  const status = document.createElement('div');
-  status.className = 'access-iam-form-status';
-  status.textContent = canSubmit ? 'Manage' : 'Inspect';
-  head.append(title, status);
+  title.className = 'acc-grant-flow-title';
+  title.textContent = 'Grant access to this daemon';
+  const sub = document.createElement('div');
+  sub.className = 'acc-grant-flow-sub';
+  sub.textContent = 'Bind an identity to a role. This daemon stores and enforces the grant locally.';
+  const mode = document.createElement('div');
+  mode.className = 'acc-grant-flow-mode';
+  mode.textContent = canSubmit ? 'Manage' : 'Inspect only';
+  head.append(title, sub, mode);
+  form.appendChild(head);
 
+  const stepLabel = text => {
+    const label = document.createElement('div');
+    label.className = 'acc-step-label';
+    label.textContent = text;
+    return label;
+  };
+
+  form.appendChild(stepLabel('1 · Who gets access'));
+  const choiceRow = document.createElement('div');
+  choiceRow.className = 'acc-choice-row';
+  for (const choice of ACCESS_GRANT_KIND_CHOICES) {
+    const card = document.createElement('label');
+    card.className = 'acc-choice-card';
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = 'access-user-client-kind';
+    input.value = choice.value;
+    input.addEventListener('change', () => accessSyncUserClientGrantFields(form));
+    const t = document.createElement('div');
+    t.className = 't';
+    t.textContent = choice.title;
+    const d = document.createElement('div');
+    d.className = 'd';
+    d.textContent = choice.desc;
+    card.append(input, t, d);
+    choiceRow.appendChild(card);
+  }
+  form.appendChild(choiceRow);
+  if (candidate) {
+    const detected = document.createElement('div');
+    detected.className = 'acc-detected';
+    detected.textContent = candidate.kind === 'client_key'
+      ? `Detected: this browser’s identity key ${String(candidate.client_key_fingerprint || '').slice(0, 12)}… — fields are pre-filled`
+      : (candidate.kind === 'connect_account'
+        ? `Detected: your Connect account ${candidate.account_name ? `@${candidate.account_name}` : candidate.user_id} — fields are pre-filled`
+        : (candidate.kind === 'human_user'
+          ? 'Detected: your mTLS user — fields are pre-filled'
+          : 'Detected: this browser’s certificate — fields are pre-filled'));
+    form.appendChild(detected);
+  }
+
+  form.appendChild(stepLabel('2 · Identity details'));
   const grid = document.createElement('div');
-  grid.className = 'access-iam-form-grid';
-  const fields = [{
-    id: 'access-user-client-kind',
-    label: 'Type',
-    type: 'select',
-    options: [
-      ['browser_certificate', 'Browser certificate'],
-      ['connect_account', 'Connect account'],
-      ['human_user', 'Human mTLS user'],
-    ],
-  }, {
+  grid.className = 'acc-field-grid';
+  const textFields = [{
     id: 'access-user-client-label',
     label: 'Label',
-    type: 'text',
-    autocomplete: 'off',
+    placeholder: 'e.g. Alice’s laptop browser',
+  }, {
+    id: 'access-user-client-client-key-fingerprint',
+    label: 'Browser key fingerprint',
+    kind: 'client_key|human_user',
+    placeholder: 'shown on the connecting browser’s Access page',
   }, {
     id: 'access-user-client-fingerprint',
-    label: 'Fingerprint',
-    type: 'text',
-    autocomplete: 'off',
+    label: 'Certificate fingerprint',
     kind: 'browser_certificate|human_user',
+    placeholder: 'sha256 fingerprint',
   }, {
     id: 'access-user-client-user-id',
-    label: 'User id',
-    type: 'text',
-    autocomplete: 'off',
+    label: 'Connect user id',
     kind: 'connect_account|human_user',
+    placeholder: 'from the Connect account page',
   }, {
     id: 'access-user-client-account-name',
-    label: 'Handle',
-    type: 'text',
-    autocomplete: 'off',
+    label: 'Connect handle',
     kind: 'connect_account|human_user',
-  }, {
+    placeholder: 'name without the @',
+  }];
+  for (const field of textFields) {
+    const label = document.createElement('label');
+    label.textContent = field.label;
+    if (field.kind) label.dataset.accessKindField = field.kind;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    input.id = field.id;
+    if (field.placeholder) input.placeholder = field.placeholder;
+    label.appendChild(input);
+    grid.appendChild(label);
+  }
+  form.appendChild(grid);
+
+  const advanced = document.createElement('details');
+  advanced.className = 'acc-fold';
+  const advancedSummary = document.createElement('summary');
+  advancedSummary.textContent = 'Advanced identity metadata';
+  const advancedBody = document.createElement('div');
+  advancedBody.className = 'acc-fold-body';
+  const advancedGrid = document.createElement('div');
+  advancedGrid.className = 'acc-field-grid';
+  const advancedFields = [{
     id: 'access-user-client-account-provider',
     label: 'Account provider',
-    type: 'text',
-    autocomplete: 'off',
     kind: 'connect_account|human_user',
   }, {
     id: 'access-user-client-verified-provider',
     label: 'Verified by',
-    type: 'text',
-    autocomplete: 'off',
     kind: 'connect_account|human_user',
   }, {
     id: 'access-user-client-organization-id',
     label: 'Org id',
-    type: 'text',
-    autocomplete: 'off',
     kind: 'human_user',
   }, {
     id: 'access-user-client-organization-name',
     label: 'Org name',
-    type: 'text',
-    autocomplete: 'off',
     kind: 'human_user',
-  }, {
-    id: 'access-user-client-role',
-    label: 'Role',
-    type: 'select',
-    options: accessAssignableIamRoles(overview).map(role => [
-      accessModelLabel(role.id),
-      accessModelLabel(role.label, role.id),
-    ]),
-  }, {
-    id: 'access-user-client-status',
-    label: 'Status',
-    type: 'select',
-    options: [
-      ['active', 'Active'],
-      ['draft', 'Draft'],
-    ],
   }];
-  for (const field of fields) {
+  for (const field of advancedFields) {
     const label = document.createElement('label');
     label.textContent = field.label;
     if (field.kind) label.dataset.accessKindField = field.kind;
-    let input;
-    if (field.type === 'select') {
-      input = document.createElement('select');
-      for (const [value, text] of field.options || []) {
-        const option = document.createElement('option');
-        option.value = value;
-        option.textContent = text;
-        input.appendChild(option);
-      }
-    } else {
-      input = document.createElement('input');
-      input.type = field.type || 'text';
-      input.autocomplete = field.autocomplete || 'off';
-      input.spellcheck = false;
-    }
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
     input.id = field.id;
     label.appendChild(input);
-    grid.appendChild(label);
+    advancedGrid.appendChild(label);
   }
+  advancedBody.appendChild(advancedGrid);
+  advanced.append(advancedSummary, advancedBody);
+  form.appendChild(advanced);
+
+  form.appendChild(stepLabel('3 · Role'));
+  const picker = document.createElement('div');
+  picker.className = 'acc-role-picker';
+  const assignable = accessAssignableIamRoles(overview);
+  const rank = id => {
+    const index = ACCESS_ROLE_PICKER_ORDER.indexOf(id);
+    return index === -1 ? ACCESS_ROLE_PICKER_ORDER.length : index;
+  };
+  const sorted = assignable.slice().sort((a, b) => rank(accessModelLabel(a.id)) - rank(accessModelLabel(b.id)));
+  for (const role of sorted) {
+    const roleId = accessModelLabel(role.id);
+    const meta = accessRoleMeta(roleId);
+    const card = document.createElement('label');
+    card.className = 'acc-role-card';
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = 'access-user-client-role';
+    input.value = roleId;
+    input.addEventListener('change', () => accessSyncUserClientGrantFields(form));
+    const top = document.createElement('div');
+    top.className = 'acc-role-card-top';
+    const t = document.createElement('div');
+    t.className = 't';
+    t.textContent = accessModelLabel(role.label, roleId.replace(/^role:/, ''));
+    top.appendChild(t);
+    const permCount = Array.isArray(role.permissions)
+      ? role.permissions.length
+      : accessIamRoleById(roleId)?.permissions?.length;
+    top.appendChild(accessRoleBadge(roleId, meta.warn ? 'full control' : (permCount ? accessPlural(permCount, 'perm') : 'scoped')));
+    const d = document.createElement('div');
+    d.className = 'd';
+    d.textContent = accessModelLabel(role.summary, meta.short);
+    card.append(input, top, d);
+    picker.appendChild(card);
+  }
+  form.appendChild(picker);
+
+  form.appendChild(stepLabel('4 · Apply to'));
+  const fanoutRow = document.createElement('div');
+  fanoutRow.className = 'acc-choice-row';
+  for (const target of accessGrantFanoutTargets()) {
+    const card = document.createElement('label');
+    card.className = 'acc-choice-card';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.name = 'access-grant-fanout';
+    input.value = target.key;
+    if (target.mode === 'self') input.defaultChecked = true;
+    if (target.mode === 'connect-only' || (target.mode === 'remote' && target.connected === false)) {
+      input.disabled = true;
+    }
+    input.addEventListener('change', () => card.classList.toggle('selected', input.checked));
+    const t = document.createElement('div');
+    t.className = 't';
+    t.textContent = target.label + (target.mode === 'self' ? ' (this daemon)' : '');
+    const d = document.createElement('div');
+    d.className = 'd';
+    d.textContent = target.mode === 'self'
+      ? 'Applied through this session.'
+      : (target.mode === 'remote'
+        ? (target.connected === false
+          ? `Offline — ${target.origin}`
+          : `Direct call to ${target.origin}; that daemon authorizes it independently.`)
+        : 'No direct route from this page — open it via Connect once and approve the key there.');
+    card.classList.toggle('selected', input.checked);
+    card.append(input, t, d);
+    fanoutRow.appendChild(card);
+  }
+  form.appendChild(fanoutRow);
 
   const actions = document.createElement('div');
-  actions.className = 'access-iam-form-actions';
-  const message = document.createElement('div');
-  message.className = 'access-iam-form-message';
-  message.id = 'access-user-client-grant-message';
-  message.textContent = candidate
-    ? (candidate.kind === 'connect_account'
-      ? 'Connect account detected'
-      : (candidate.kind === 'human_user' ? 'Human mTLS user detected' : 'Browser certificate detected'))
-    : 'Manual identity entry';
+  actions.className = 'acc-grant-flow-actions';
+  const statusToggle = document.createElement('div');
+  statusToggle.className = 'acc-status-toggle';
+  for (const [value, text] of [['active', 'Active immediately'], ['draft', 'Save as draft']]) {
+    const label = document.createElement('label');
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = 'access-user-client-status';
+    input.value = value;
+    if (value === 'active') input.checked = true;
+    const span = document.createElement('span');
+    span.textContent = text;
+    label.append(input, span);
+    statusToggle.appendChild(label);
+  }
   const button = document.createElement('button');
   button.type = 'submit';
+  button.className = 'acc-btn primary';
   button.disabled = !canSubmit || accessUserClientGrantSubmitting;
-  button.textContent = accessUserClientGrantSubmitting ? 'Saving' : 'Save grant';
-  actions.append(message, button);
+  button.textContent = accessUserClientGrantSubmitting ? 'Saving…' : 'Save grant';
+  const message = document.createElement('div');
+  message.className = 'acc-grant-flow-msg';
+  message.id = 'access-user-client-grant-message';
+  message.textContent = canSubmit
+    ? ''
+    : 'This session may inspect access but not manage it.';
+  actions.append(statusToggle, button, message);
+  form.appendChild(actions);
 
-  form.append(head, grid, actions);
+  const ceilingNote = document.createElement('div');
+  ceilingNote.className = 'acc-grant-flow-msg';
+  ceilingNote.id = 'access-grant-ceiling-note';
+  ceilingNote.style.display = 'none';
+  ceilingNote.style.color = 'var(--yellow)';
+  ceilingNote.style.marginTop = '8px';
+  form.appendChild(ceilingNote);
+
+  if (accessGrantFanoutResults?.length) {
+    const results = document.createElement('div');
+    results.className = 'acc-grant-rows';
+    results.style.marginTop = '12px';
+    for (const result of accessGrantFanoutResults) {
+      const row = document.createElement('div');
+      row.className = 'acc-grant-row';
+      const label = document.createElement('span');
+      label.className = 't';
+      label.textContent = result.label;
+      row.appendChild(label);
+      row.appendChild(accessModelCreateStatus(result.ok ? 'active' : 'failed'));
+      const message = document.createElement('span');
+      message.className = 'why';
+      message.textContent = result.message;
+      row.appendChild(message);
+      results.appendChild(row);
+    }
+    const dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.className = 'acc-btn';
+    dismiss.textContent = 'Dismiss results';
+    dismiss.addEventListener('click', () => {
+      accessGrantFanoutResults = null;
+      results.remove();
+    });
+    results.appendChild(dismiss);
+    form.appendChild(results);
+  }
+
   mount.appendChild(form);
+
+  const setRadio = (name, value) => {
+    const input = form.querySelector(`input[name="${name}"][value="${value}"]`);
+    if (input) input.checked = true;
+  };
+  setRadio('access-user-client-kind', candidate?.kind || 'client_key');
   if (candidate) {
-    accessSetField(form, 'access-user-client-kind', candidate.kind);
     accessSetField(form, 'access-user-client-label', candidate.label);
+    accessSetField(form, 'access-user-client-client-key-fingerprint', candidate.client_key_fingerprint);
     accessSetField(form, 'access-user-client-fingerprint', candidate.fingerprint);
     accessSetField(form, 'access-user-client-user-id', candidate.user_id);
     accessSetField(form, 'access-user-client-account-name', candidate.account_name);
@@ -34749,9 +35620,7 @@ function renderAccessUserClientGrantForm() {
     accessSetField(form, 'access-user-client-organization-id', candidate.organization_id);
     accessSetField(form, 'access-user-client-organization-name', candidate.organization_name);
   }
-  accessSetField(form, 'access-user-client-role', 'role:scoped-human');
-  accessSetField(form, 'access-user-client-status', 'active');
-  form.querySelector('#access-user-client-kind')?.addEventListener('change', () => accessSyncUserClientGrantFields(form));
+  setRadio('access-user-client-role', 'role:scoped-human');
   accessSyncUserClientGrantFields(form);
 }
 
@@ -34759,12 +35628,25 @@ async function accessSubmitUserClientGrant(event) {
   event?.preventDefault?.();
   const form = event?.currentTarget || document.querySelector('#access-user-client-grant-form form');
   if (!form || accessUserClientGrantSubmitting) return;
-  const kind = form.querySelector('#access-user-client-kind')?.value || 'browser_certificate';
+  const kind = accessSelectedUserClientKind(form);
   const kindHasFingerprint = kind === 'browser_certificate' || kind === 'human_user';
+  const kindHasClientKey = kind === 'client_key' || kind === 'human_user';
   const kindHasAccount = kind === 'connect_account' || kind === 'human_user';
+  const clientKeyFingerprint = kindHasClientKey
+    ? (form.querySelector('#access-user-client-client-key-fingerprint')?.value?.trim() || null)
+    : null;
+  // Only attach the public key and enrollment origin when the fingerprint
+  // being granted is this browser's own key — for a pasted foreign
+  // fingerprint neither is known to this session.
+  const grantingOwnKey = Boolean(
+    clientKeyFingerprint && clientIdentityCache?.fingerprint === clientKeyFingerprint
+  );
   const payload = {
     kind,
     label: form.querySelector('#access-user-client-label')?.value?.trim() || null,
+    client_key_fingerprint: clientKeyFingerprint,
+    client_key: grantingOwnKey ? clientIdentityCache.publicRawB64u : null,
+    client_key_origin: grantingOwnKey ? location.origin : null,
     fingerprint: kindHasFingerprint
       ? (form.querySelector('#access-user-client-fingerprint')?.value?.trim() || null)
       : null,
@@ -34786,15 +35668,27 @@ async function accessSubmitUserClientGrant(event) {
     organization_name: kind === 'human_user'
       ? (form.querySelector('#access-user-client-organization-name')?.value?.trim() || null)
       : null,
-    role_id: form.querySelector('#access-user-client-role')?.value || 'role:scoped-human',
-    status: form.querySelector('#access-user-client-status')?.value || 'active',
+    role_id: form.querySelector('input[name="access-user-client-role"]:checked')?.value || 'role:scoped-human',
+    status: form.querySelector('input[name="access-user-client-status"]:checked')?.value || 'active',
   };
-  if ((kind === 'browser_certificate' || kind === 'human_user') && !payload.fingerprint) {
+  if (kind === 'browser_certificate' && !payload.fingerprint) {
     showControlToast?.('error', 'Fingerprint is required');
+    return;
+  }
+  if (kind === 'client_key' && !payload.client_key_fingerprint) {
+    showControlToast?.('error', 'Browser key fingerprint is required');
     return;
   }
   if (kind === 'connect_account' && !payload.user_id && !payload.account_name) {
     showControlToast?.('error', 'User id or account name is required');
+    return;
+  }
+  if (kind === 'human_user'
+    && !payload.fingerprint
+    && !payload.client_key_fingerprint
+    && !payload.user_id
+    && !payload.account_name) {
+    showControlToast?.('error', 'A person needs at least one binding: key, certificate, or account');
     return;
   }
   if (payload.role_id === 'role:root') {
@@ -34807,27 +35701,43 @@ async function accessSubmitUserClientGrant(event) {
     });
     if (!ok) return;
   }
+  // Fanout: apply the same grant to every selected daemon. Each target
+  // authorizes independently — a refusal on one is reported, not fatal to
+  // the others.
+  const chosenKeys = Array.from(form.querySelectorAll('input[name="access-grant-fanout"]:checked'))
+    .map(input => input.value);
+  const fanoutTargets = accessGrantFanoutTargets()
+    .filter(target => chosenKeys.includes(target.key) && target.mode !== 'connect-only');
+  if (!fanoutTargets.length) {
+    showControlToast?.('error', 'Pick at least one daemon to apply the grant to');
+    return;
+  }
   accessUserClientGrantSubmitting = true;
   renderAccessUserClientGrantForm();
-  try {
-    const resp = await dashboardJsonFetch('api_access_iam_upsert_user_client_grant', payload, () => authedFetch('/api/access/iam/user-client-grants', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_iam_upsert_user_client_grant', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-    if (data?.iam) {
-      dashboardAccessOverview = { ...(dashboardAccessOverview || {}), iam: data.iam };
+  const results = [];
+  for (const target of fanoutTargets) {
+    try {
+      const data = await accessApplyGrantToTarget(target, payload);
+      if (target.mode === 'self' && data?.iam) {
+        dashboardAccessOverview = { ...(dashboardAccessOverview || {}), iam: data.iam };
+      }
+      results.push({ label: target.label, ok: true, message: 'Grant saved' });
+    } catch (err) {
+      results.push({ label: target.label, ok: false, message: err?.message || 'save failed' });
     }
-    await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
-    showControlToast?.('success', 'Access grant saved');
-  } catch (err) {
-    showControlToast?.('error', err?.message || 'Access grant save failed');
-  } finally {
-    accessUserClientGrantSubmitting = false;
-    renderAccessAdminSummaries();
   }
+  accessGrantFanoutResults = results;
+  const failures = results.filter(result => !result.ok).length;
+  if (failures === 0) {
+    showControlToast?.('success', results.length === 1
+      ? 'Access grant saved'
+      : `Access grant saved on ${results.length} daemons`);
+  } else {
+    showControlToast?.('error', `Grant saved on ${results.length - failures}/${results.length} daemons — see results`);
+  }
+  await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+  accessUserClientGrantSubmitting = false;
+  renderAccessAdminSummaries();
 }
 
 async function accessConfirmRevokeGrant(grantId) {
@@ -34873,129 +35783,6 @@ async function accessUpdateGrantLifecycle(grantId, changes = {}) {
     accessGrantLifecycleSubmitting.delete(id);
     renderAccessAdminSummaries();
   }
-}
-
-function accessPeopleCards() {
-  const overview = accessOverviewModel();
-  const principals = accessOverviewArray(overview, 'principals');
-  const human = principals.filter(p => /browser|human|passkey|certificate|connect/.test(accessModelLabel(p.kind))).length;
-  const peer = principals.filter(p => accessModelLabel(p.kind) === 'peer_daemon').length;
-  const plannedKinds = accessOverviewArray(overview, 'supported_principal_kinds')
-    .filter(kind => /planned/.test(accessModelLabel(kind.status))).length;
-  return [{
-    title: 'People and devices',
-    kind: accessPlural(human, 'user/client principal', 'user/client principals'),
-    detail: 'Human-operated dashboard access is separate from daemon peer trust.',
-  }, {
-    title: 'Peer daemon principals',
-    kind: accessPlural(peer, 'peer daemon'),
-    detail: 'Peer daemons use daemon-to-daemon identities and peer profiles.',
-  }, {
-    title: 'Planned principal types',
-    kind: accessPlural(plannedKinds, 'type'),
-    detail: 'Organization groups remain visible as a design target.',
-  }];
-}
-
-function accessDaemonCards() {
-  const targets = accessOverviewArray(accessOverviewModel(), 'targets');
-  const peers = targets.filter(target => !target.local);
-  const online = peers.filter(target => target.connected !== false).length;
-  const remembered = accessFleetTargets();
-  return [{
-    title: 'Daemon targets',
-    kind: accessPlural(targets.length, 'target'),
-    detail: 'Each target is a daemon the dashboard can operate or inspect.',
-  }, {
-    title: 'Browser fleet registry',
-    kind: remembered.length ? accessPlural(remembered.length, 'target') : 'Empty',
-    detail: 'Stored in this browser for navigation and labels. Each daemon still enforces its own IAM locally.',
-    actions: [{ label: DASHBOARD_ACCESS_PAGE_MODE ? 'Current page' : 'Open page', onClick: () => window.location.href = accessHomeHref('daemons') }],
-  }, {
-    title: 'Peer daemons',
-    kind: peers.length ? `${online}/${peers.length} online` : 'None',
-    detail: 'Peer daemon access uses peer routes and daemon mTLS, not user/client root access.',
-    actions: [{ label: 'Add', onClick: () => routeTo('access', 'invitations') }],
-  }];
-}
-
-function accessAuditCards() {
-  const grants = accessOverviewArray(accessOverviewModel(), 'grants');
-  const active = grants.filter(grant => !/planned|draft|offline|revoked|disabled|failed/.test(accessModelLabel(grant.status, 'active'))).length;
-  const revoked = grants.filter(grant => accessModelLabel(grant.status) === 'revoked').length;
-  return [{
-    title: 'Grant audit',
-    kind: `${active}/${grants.length || active} active`,
-    detail: revoked ? `${revoked} revoked grant${revoked === 1 ? '' : 's'} retained for audit.` : 'Every grant below explains the principal, target, policy, transport, and reason.',
-  }];
-}
-
-function accessPolicyCards() {
-  const overview = accessOverviewModel();
-  const policies = accessOverviewArray(overview, 'policies');
-  const permissions = accessOverviewArray(overview, 'permissions');
-  const iam = accessIamModel(overview);
-  const roles = Array.isArray(iam.roles) ? iam.roles : [];
-  const enforcedPolicies = policies.filter(policy => accessModelLabel(policy.status) === 'enforced').length;
-  const enforcedPermissions = permissions.filter(permission => accessModelLabel(permission.status) === 'enforced').length;
-  return [{
-    title: 'Policies',
-    kind: `${enforcedPolicies}/${policies.length || enforcedPolicies} enforced`,
-    detail: 'Policies describe roles; organization groups, directory scopes, and public shares remain planned.',
-  }, {
-    title: 'Permissions',
-    kind: `${enforcedPermissions}/${permissions.length || enforcedPermissions} enforced`,
-    detail: 'Permissions are concrete operation gates used by dashboard-control and peer auth.',
-  }, {
-    title: 'IAM roles',
-    kind: roles.length ? accessPlural(roles.length, 'role') : 'None',
-    detail: accessIamEnforcementReason(iam),
-  }];
-}
-
-function renderAccessOverviewDetails() {
-  const overview = accessOverviewModel();
-  const scope = overview.scope || {};
-  const iam = accessIamModel(overview);
-  const iamCapabilities = iam.capabilities && typeof iam.capabilities === 'object' ? iam.capabilities : {};
-  const iamEnforcement = iam.enforcement && typeof iam.enforcement === 'object' ? iam.enforcement : {};
-  const unresolved = accessOverviewArray(overview.architecture || {}, 'unresolved');
-  accessRenderDetailCards('access-overview-details', [{
-    title: accessModelLabel(scope.label, 'This daemon'),
-    status: 'current',
-    lines: [
-      ['Scope', accessModelLabel(scope.kind, 'local_daemon')],
-      ['Target', accessModelLabel(scope.target_id, selfPeerId || 'local')],
-      ['Account', scope.account ? JSON.stringify(scope.account) : 'Not linked'],
-      ['Organization', scope.organization ? JSON.stringify(scope.organization) : 'Not linked'],
-      ['Hosted account', scope.hosted_account_configured ? 'Configured' : 'Not configured'],
-    ],
-  }, {
-    title: 'Access boundary',
-    status: unresolved.length ? 'planned' : 'enforced',
-    lines: [
-      ['Current model', 'Local user/client grants and daemon peer grants'],
-      ['Connect', 'Transport, not an authority model'],
-      ['Browser mTLS', 'Transport/auth credential for user-client authority'],
-      ['Peer mTLS', 'Daemon-to-daemon authority only'],
-      ['Open decisions', unresolved.join('; ') || 'None reported'],
-    ],
-  }, {
-    title: 'Local IAM state',
-    status: iam.load_status === 'error' ? 'failed' : (iamCapabilities.enforce_root_and_peer_grants ? 'active' : 'planned'),
-    lines: [
-      ['State', accessIamLoadLabel(iam)],
-      ['Store', accessModelLabel(iam.state_path, 'Default access store')],
-      ['Managed principals', accessModelLabel(iam.managed_principals, '0')],
-      ['Managed grants', accessModelLabel(iam.managed_grants, '0')],
-      ['Write API', iamCapabilities.write_api_available ? 'Available' : 'Not exposed'],
-      ['Operation evaluator', iamCapabilities.operation_evaluator ? 'Enabled' : 'Not enabled'],
-      ['Root/peer enforcement', iamCapabilities.enforce_root_and_peer_grants ? 'Enabled' : 'Not enabled'],
-      ['User grant enforcement', iamEnforcement.user_client_grants ? 'Enabled' : 'Not enabled'],
-      ['Binding', accessModelLabel(iamEnforcement.principal_binding, 'root_peer_and_local_user_client')],
-      ['Reason', accessIamEnforcementReason(iam)],
-    ],
-  }]);
 }
 
 function accessPermissionMatrixCell(policy, permission) {
@@ -35102,18 +35889,6 @@ function renderAccessModelDetails() {
   );
 }
 
-function accessPublicShareCards() {
-  return [{
-    title: 'Public shares',
-    kind: 'Disabled',
-    detail: 'No daemon data is currently shared publicly or with the hosted service.',
-  }, {
-    title: 'Stats publishing',
-    kind: 'Off',
-    detail: 'Usage and health stats stay local unless a future explicit share grant enables them.',
-  }];
-}
-
 function accessDiagnosticsCards() {
   const state = connectHealthState();
   return [
@@ -35140,85 +35915,973 @@ function accessDiagnosticsCards() {
   ];
 }
 
+/* ── Access redesign: role metadata, chips, and pane renderers ──
+   One vocabulary everywhere: a PRINCIPAL acts, a ROUTE carries the
+   request (never authority), and the target DAEMON decides via its
+   local IAM. Roles get warmer colors the more they can do. */
+
+const ACCESS_ROLE_META = {
+  'role:root': { cls: 'role-root', warn: true, short: 'Full control of this daemon, including access administration.' },
+  'role:operator': { cls: 'role-operator', short: 'Operate sessions, display, shell, and files. No access or settings administration.' },
+  'role:terminal': { cls: 'role-terminal', short: 'Open and use the interactive shell.' },
+  'role:files-write': { cls: 'role-files', short: 'Browse, download, and upload files.' },
+  'role:files-read': { cls: 'role-files', short: 'Browse and download files, read-only.' },
+  'role:session-reader': { cls: 'role-sessions', short: 'Read sessions, logs, and status.' },
+  'role:observer': { cls: 'role-observer', short: 'Watch read-only, including live displays.' },
+  'role:scoped-human': { cls: 'role-scoped', short: 'Inspect the access model only. A safe first grant.' },
+  'role:directory-files': { cls: 'role-planned', short: 'Planned: file access bounded to chosen directories.' },
+  'role:peer-profile': { cls: 'role-peer', short: 'Daemon-to-daemon authority bounded by the peer profile.' },
+};
+
+function accessRoleMeta(roleId) {
+  const id = accessModelLabel(roleId);
+  if (ACCESS_ROLE_META[id]) return ACCESS_ROLE_META[id];
+  if (/peer/.test(id)) return { cls: 'role-peer', short: 'Daemon-to-daemon authority.' };
+  if (/root/.test(id)) return ACCESS_ROLE_META['role:root'];
+  return { cls: 'role-scoped', short: '' };
+}
+
+function accessRoleBadge(roleId, labelText, options = {}) {
+  const meta = accessRoleMeta(roleId);
+  const badge = document.createElement('span');
+  badge.className = `acc-badge ${options.cls || meta.cls}`;
+  badge.textContent = labelText || accessModelLabel(roleId).replace(/^role:/, '') || 'role';
+  const role = accessIamRoleById(roleId);
+  badge.title = accessModelLabel(role?.summary, meta.short);
+  return badge;
+}
+
+function accessIamRoleById(roleId) {
+  const id = accessModelLabel(roleId);
+  if (!id) return null;
+  const iam = accessIamModel(accessOverviewModel());
+  const roles = Array.isArray(iam.roles) ? iam.roles : [];
+  return roles.find(role => accessModelLabel(role.id) === id) || null;
+}
+
+/* Role ceiling that applies to a session authenticated by `authnKind`
+   (optionally with the binding's recorded enrollment origin). Mirrors the
+   daemon's role_ceiling_for_session so the UI can explain what a session
+   will actually be able to do. */
+function accessRoleCeilingFor(authnKind, authnOrigin = '') {
+  const iam = accessIamModel(accessOverviewModel());
+  const ceilings = iam.role_ceilings && typeof iam.role_ceilings === 'object' ? iam.role_ceilings : {};
+  const kind = accessModelLabel(authnKind);
+  const ceiling = accessModelLabel(ceilings[kind]);
+  if (!kind || !ceiling) return null;
+  if (kind === 'client_key') {
+    const origin = accessModelLabel(authnOrigin).replace(/\/+$/, '');
+    if (!origin) return null;
+    const hosted = (Array.isArray(iam.hosted_origins) ? iam.hosted_origins : [])
+      .some(candidate => accessModelLabel(candidate).replace(/\/+$/, '') === origin);
+    if (!hosted) return null;
+  }
+  return ceiling;
+}
+
+/* Ceiling chip for a principal's grants: which of its bindings are capped. */
+function accessPrincipalCeiling(principal) {
+  const authn = accessOverviewArray(principal, 'authn');
+  for (const item of authn) {
+    const ceiling = accessRoleCeilingFor(item?.kind, item?.origin);
+    if (ceiling) return { ceiling, binding: accessModelLabel(item?.kind) };
+  }
+  return null;
+}
+
+function accessRouteChip(kind, labelText, title = '') {
+  const chip = document.createElement('span');
+  chip.className = `acc-chip route-${kind || 'local'}`;
+  chip.textContent = labelText || '';
+  chip.title = title || {
+    mtls: 'Direct browser mTLS: your browser holds a client certificate for this daemon.',
+    connect: 'Intendant Connect: hosted rendezvous tunnel. A route, not authority — the daemon still checks its local IAM.',
+    peer: 'Daemon-to-daemon route over mutual TLS, bounded by a peer profile.',
+    local: 'Local or trusted dashboard session on this machine.',
+    webrtc: 'Local WebRTC control channel.',
+    remembered: 'Remembered in this browser only; not configured on this daemon right now.',
+  }[kind] || '';
+  return chip;
+}
+
+/* How is THIS page reaching the daemon right now? */
+function accessCurrentRouteInfo() {
+  if (dashboardConnectModeEnabled()) {
+    return { kind: 'connect', label: 'Intendant Connect' };
+  }
+  if (dashboardControlTransportEnabled()) {
+    return { kind: 'webrtc', label: 'Local WebRTC' };
+  }
+  if (location.protocol === 'https:') {
+    return { kind: 'mtls', label: 'Browser mTLS' };
+  }
+  return { kind: 'local', label: 'Local' };
+}
+
+function accessRouteInfoForTarget(target, descriptor, rememberedOnly) {
+  if (rememberedOnly) return { kind: 'remembered', label: 'Remembered' };
+  if (descriptor?.local || target?.local) return accessCurrentRouteInfo();
+  return { kind: 'peer', label: 'Peer mTLS' };
+}
+
+/* Sync-provenance chip for fleet records that round-trip the hosted store.
+   null for live/local targets, which need no such badge. */
+function accessTargetProvenanceChip(target) {
+  const source = String(target?.source || '');
+  if (!/browser_fleet|hosted_access|connect_daemon/.test(source)) return null;
+  const id = String(target?.host_id || target?.id || '').trim();
+  const provenance = accessFleetProvenance.get(id)
+    || (source === 'connect_daemon' ? 'hosted-claim' : null);
+  if (!provenance) return null;
+  const spec = {
+    'verified': { cls: 'webrtc', label: 'synced ✓ this browser', title: 'This fleet record was signed by this browser\u2019s identity key and verified after syncing through the hosted store.' },
+    'signed': { cls: 'remembered', label: 'synced · other device', title: 'Signed by a different device\u2019s key; the signature verifies but this browser cannot vouch for the signer.' },
+    'unverified': { cls: 'remembered', label: 'synced · unverified', title: 'This record carries no valid owner signature — treat labels and URLs as hints from the metadata store, not facts.' },
+    'hosted-claim': { cls: 'connect', label: 'hosted claim', title: 'Attested by the hosted Connect service\u2019s claim records. Navigation metadata only; the daemon still decides all access.' },
+  }[provenance];
+  if (!spec) return null;
+  return accessRouteChip(spec.cls, spec.label, spec.title);
+}
+
+/* Best human name for a target: label unless it is a bare address,
+   then the URL hostname, then a shortened id. Raw IPs and key-shaped
+   ids only appear as the subtitle, never as the headline. */
+function accessTargetDisplayName(target, descriptor) {
+  const candidates = [
+    descriptor?.displayName,
+    target?.label,
+  ];
+  const urlHost = (() => {
+    try {
+      const url = target?.url || target?.browser_tcp_via_url || target?.ws_url || descriptor?.peer?.url;
+      return url ? new URL(url).hostname : '';
+    } catch { return ''; }
+  })();
+  const idish = value => {
+    const text = String(value || '').trim();
+    if (!text) return true;
+    if (/^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/.test(text)) return true;
+    if (/^[A-Za-z0-9_-]{24,}$/.test(text)) return true;
+    return false;
+  };
+  for (const candidate of candidates) {
+    const text = String(candidate || '').trim();
+    if (text && !idish(text)) return text;
+  }
+  if (urlHost && !idish(urlHost)) return urlHost;
+  const fallback = String(candidates.find(Boolean) || target?.host_id || target?.id || '').trim();
+  if (fallback.length > 20 && /^[A-Za-z0-9_-]+$/.test(fallback)) {
+    return `${fallback.slice(0, 8)}…${fallback.slice(-4)}`;
+  }
+  return fallback || 'Daemon';
+}
+
+function accessCurrentPrincipalInfo() {
+  const principal = dashboardControlTransport?.lastStatus?.access_principal;
+  const connectMode = dashboardConnectModeEnabled();
+  const route = accessCurrentRouteInfo();
+  if (principal && typeof principal === 'object') {
+    const authn = Array.isArray(principal.authn) ? principal.authn : [];
+    const cert = authn.find(item => accessModelLabel(item?.kind) === 'browser_mtls_cert');
+    const connect = authn.find(item => accessModelLabel(item?.kind) === 'connect_account');
+    const key = authn.find(item => accessModelLabel(item?.kind) === 'client_key');
+    return {
+      known: true,
+      kind: accessModelLabel(principal.kind, 'browser_session'),
+      label: accessModelLabel(principal.label, connectMode ? 'Connect account' : 'This browser'),
+      roleId: accessModelLabel(principal.role_id, 'role:root'),
+      fingerprint: accessModelLabel(cert?.fingerprint),
+      clientKeyFingerprint: accessModelLabel(key?.fingerprint, clientIdentityCache?.fingerprint || ''),
+      accountName: accessModelLabel(connect?.account_name || principal.account?.account_name || principal.account?.handle),
+      accountUserId: accessModelLabel(connect?.user_id || principal.account?.user_id),
+      ceiling: accessRoleCeilingFor(principal.authn_kind, principal.authn_origin),
+      route,
+    };
+  }
+  return {
+    known: false,
+    kind: connectMode ? 'connect_account' : 'browser_session',
+    label: connectMode ? 'Connect account' : 'This browser',
+    roleId: connectMode ? '' : 'role:root',
+    fingerprint: '',
+    clientKeyFingerprint: accessModelLabel(clientIdentityCache?.fingerprint),
+    accountName: '',
+    accountUserId: '',
+    route,
+  };
+}
+
+function accessPrincipalGlyph(kind) {
+  const value = accessModelLabel(kind);
+  if (/connect|passkey/.test(value)) return { text: '@', cls: 'kind-connect' };
+  if (/client_key/.test(value)) return { text: 'KEY', cls: 'kind-cert' };
+  if (/certificate|mtls/.test(value)) return { text: 'CRT', cls: 'kind-cert' };
+  if (/human/.test(value)) return { text: 'HU', cls: 'kind-human' };
+  if (/peer/.test(value)) return { text: 'PD', cls: 'kind-peer' };
+  return { text: 'BR', cls: 'kind-session' };
+}
+
+function accessHeroLine(label, value, options = {}) {
+  const line = document.createElement('div');
+  line.className = 'acc-hero-line';
+  const key = document.createElement('strong');
+  key.textContent = label;
+  const val = document.createElement('span');
+  if (options.mono) val.classList.add('mono');
+  val.textContent = value;
+  val.title = options.title || value;
+  line.append(key, val);
+  return line;
+}
+
+function accessHeroCard({ glyph, glyphCls, kicker, title, chips = [], lines = [], stats = [], actions = [] }) {
+  const card = document.createElement('div');
+  card.className = 'acc-hero-card';
+  const glyphEl = document.createElement('div');
+  glyphEl.className = `acc-hero-glyph ${glyphCls || ''}`;
+  glyphEl.textContent = glyph || '';
+  glyphEl.setAttribute('aria-hidden', 'true');
+  const kickerEl = document.createElement('div');
+  kickerEl.className = 'acc-hero-kicker';
+  kickerEl.textContent = kicker || '';
+  const titleEl = document.createElement('div');
+  titleEl.className = 'acc-hero-title';
+  titleEl.textContent = title || '';
+  card.append(glyphEl, kickerEl, titleEl);
+  if (chips.length) {
+    const chipRow = document.createElement('div');
+    chipRow.className = 'acc-hero-chips';
+    for (const chip of chips) if (chip) chipRow.appendChild(chip);
+    card.appendChild(chipRow);
+  }
+  if (lines.length) {
+    const lineWrap = document.createElement('div');
+    lineWrap.className = 'acc-hero-lines';
+    for (const line of lines) if (line) lineWrap.appendChild(line);
+    card.appendChild(lineWrap);
+  }
+  if (stats.length) {
+    const statRow = document.createElement('div');
+    statRow.className = 'acc-hero-stats';
+    for (const stat of stats) {
+      const cell = document.createElement('div');
+      cell.className = 'acc-hero-stat';
+      cell.title = stat.title || '';
+      const n = document.createElement('div');
+      n.className = 'n';
+      n.textContent = String(stat.value);
+      const l = document.createElement('div');
+      l.className = 'l';
+      l.textContent = stat.label;
+      cell.append(n, l);
+      if (stat.onClick) cell.addEventListener('click', stat.onClick);
+      statRow.appendChild(cell);
+    }
+    card.appendChild(statRow);
+  }
+  if (actions.length) {
+    const actionRow = document.createElement('div');
+    actionRow.className = 'acc-hero-actions';
+    for (const action of actions) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'acc-btn' + (action.primary ? ' primary' : '');
+      btn.textContent = action.label;
+      btn.addEventListener('click', action.onClick);
+      actionRow.appendChild(btn);
+    }
+    card.appendChild(actionRow);
+  }
+  return card;
+}
+
+function accessUserClientPrincipals(overview = accessOverviewModel()) {
+  return accessOverviewArray(overview, 'principals')
+    .filter(principal => accessModelLabel(principal.kind) !== 'peer_daemon');
+}
+
+function accessPeerGrantCounts(overview = accessOverviewModel()) {
+  const grants = accessOverviewArray(overview, 'grants');
+  const inbound = grants.filter(grant => accessModelLabel(grant.kind) === 'inbound_daemon_peer_profile');
+  const outbound = grants.filter(grant => accessModelLabel(grant.kind) === 'daemon_peer_profile');
+  return {
+    inboundActive: inbound.filter(grant => accessModelLabel(grant.status, 'active') !== 'revoked').length,
+    inboundRevoked: inbound.filter(grant => accessModelLabel(grant.status) === 'revoked').length,
+    outboundActive: outbound.filter(grant => accessModelLabel(grant.status, 'active') !== 'offline').length,
+    outboundTotal: outbound.length,
+  };
+}
+
+/* Overview: actionable warnings first — an empty div when all is well. */
+function renderAccessAttention() {
+  const mount = document.getElementById('access-attention');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const items = [];
+  const status = dashboardTransport?.status
+    ? dashboardTransport.status()
+    : { enabled: dashboardControlTransportEnabled(), connected: false };
+  const summary = dashboardTransportStatusSummary(status);
+  const lastError = String(status.lastError || dashboardControlLastError || '').trim();
+  if (summary.kind === 'err') {
+    if (dashboardConnectModeEnabled()) {
+      items.push({
+        kind: 'err',
+        icon: '!',
+        message: 'Hosted Connect reached this daemon, but the daemon refused dashboard control.',
+        detail: lastError,
+        steps: [
+          'Open the daemon directly (its https://host:8765 address) with root access.',
+          'Go to Access → People & Devices and grant your Connect account a role.',
+          'Reload this page — Connect is only the route; the daemon decides.',
+        ],
+        action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
+      });
+    } else {
+      items.push({
+        kind: 'err',
+        icon: '!',
+        message: 'The dashboard control channel failed.',
+        detail: lastError,
+        action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
+      });
+    }
+  } else if (summary.kind === 'warn' && status.reconnecting) {
+    items.push({
+      kind: 'warn',
+      icon: '~',
+      message: 'Dashboard control is reconnecting.',
+      detail: String(status.reconnectReason || '').trim(),
+      action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
+    });
+  }
+  const overview = accessOverviewModel();
+  const iam = accessIamModel(overview);
+  if (accessModelLabel(iam.load_status) === 'error') {
+    items.push({
+      kind: 'err',
+      icon: '!',
+      message: 'This daemon could not read its local IAM state.',
+      detail: accessModelLabel(iam.state_path),
+      action: { label: 'Inspect', onClick: () => routeTo('access', 'advanced') },
+    });
+  }
+  if (accessPendingEnrollments.length) {
+    items.push({
+      kind: 'info',
+      icon: 'i',
+      message: `${accessPlural(accessPendingEnrollments.length, 'device is', 'devices are')} waiting for an enrollment decision.`,
+      detail: 'A verified browser key reached this daemon without a grant.',
+      action: { label: 'Review', onClick: () => routeTo('access', 'people') },
+    });
+  }
+  const draftGrants = accessOverviewArray(overview, 'grants')
+    .filter(grant => accessModelLabel(grant.kind) === 'user_client_local_iam'
+      && accessModelLabel(grant.status) === 'draft').length;
+  if (draftGrants) {
+    items.push({
+      kind: 'info',
+      icon: 'i',
+      message: `${accessPlural(draftGrants, 'draft grant')} ${draftGrants === 1 ? 'is' : 'are'} saved but not enforced.`,
+      detail: 'Draft grants deny access until activated.',
+      action: { label: 'Review', onClick: () => routeTo('access', 'people') },
+    });
+  }
+  for (const item of items) {
+    const node = document.createElement('div');
+    node.className = `acc-attention-item ${item.kind}`;
+    const icon = document.createElement('div');
+    icon.className = 'acc-attention-icon';
+    icon.textContent = item.icon;
+    const msg = document.createElement('div');
+    msg.className = 'acc-attention-msg';
+    msg.textContent = item.message;
+    if (item.detail) {
+      const detail = document.createElement('span');
+      detail.className = 'acc-attention-detail';
+      detail.textContent = item.detail;
+      msg.appendChild(detail);
+    }
+    if (Array.isArray(item.steps) && item.steps.length) {
+      const list = document.createElement('ol');
+      list.className = 'acc-attention-steps';
+      for (const step of item.steps) {
+        const li = document.createElement('li');
+        li.textContent = step;
+        list.appendChild(li);
+      }
+      msg.appendChild(list);
+    }
+    node.append(icon, msg);
+    if (item.action) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'acc-btn';
+      btn.textContent = item.action.label;
+      btn.addEventListener('click', item.action.onClick);
+      node.appendChild(btn);
+    }
+    mount.appendChild(node);
+  }
+}
+
+function renderAccessIdentityHero() {
+  const mount = document.getElementById('access-identity-hero');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const overview = accessOverviewModel();
+  const iam = accessIamModel(overview);
+  const me = accessCurrentPrincipalInfo();
+  const glyph = accessPrincipalGlyph(me.kind);
+  const role = accessIamRoleById(me.roleId);
+  const roleLabel = accessModelLabel(role?.label, me.roleId ? me.roleId.replace(/^role:/, '') : 'Unknown');
+  const roleMeta = accessRoleMeta(me.roleId);
+  const permissionCount = Array.isArray(role?.permissions) ? role.permissions.length : 0;
+
+  const youChips = [accessRouteChip(me.route.kind, me.route.label)];
+  if (me.roleId) youChips.push(accessRoleBadge(me.roleId, roleLabel));
+  const youLines = [];
+  if (me.roleId) {
+    youLines.push(accessHeroLine('Can do', roleMeta.short || accessModelLabel(role?.summary, ''), {
+      title: Array.isArray(role?.permissions) ? role.permissions.join(', ') : '',
+    }));
+    if (permissionCount) {
+      youLines.push(accessHeroLine('Permissions', `${permissionCount} of ${accessOverviewArray(overview, 'permissions').length || 18}`, {
+        title: Array.isArray(role?.permissions) ? role.permissions.join(', ') : '',
+      }));
+    }
+  } else {
+    youLines.push(accessHeroLine('Can do', 'Not authorized yet — this daemon has no grant for this account.'));
+  }
+  if (me.ceiling) {
+    youLines.push(accessHeroLine('Ceiling', `Sessions on this route are capped at ${me.ceiling.replace(/^role:/, '')} by daemon policy.`, {
+      title: 'role_ceilings in iam.json bounds what low-provenance routes can do, regardless of the granted role.',
+    }));
+  }
+  if (me.clientKeyFingerprint) {
+    youLines.push(accessHeroLine('Browser key', me.clientKeyFingerprint, {
+      mono: true,
+      title: 'This origin’s identity key. Grant it on other daemons to sign in there with no certificate install.',
+    }));
+  }
+  if (me.fingerprint) youLines.push(accessHeroLine('Certificate', me.fingerprint, { mono: true }));
+  if (me.accountName || me.accountUserId) {
+    youLines.push(accessHeroLine('Account', me.accountName ? `@${me.accountName}` : me.accountUserId, {
+      mono: !me.accountName,
+      title: me.accountUserId,
+    }));
+  }
+  mount.appendChild(accessHeroCard({
+    glyph: glyph.text,
+    glyphCls: glyph.cls,
+    kicker: 'You',
+    title: me.label,
+    chips: youChips,
+    lines: youLines,
+    actions: [{ label: 'People & Devices', onClick: () => routeTo('access', 'people') }],
+  }));
+
+  const scope = overview.scope || {};
+  const targets = accessTargetRecords();
+  const peerCounts = accessPeerGrantCounts(overview);
+  const people = accessUserClientPrincipals(overview).length;
+  const daemonChips = [];
+  const iamChip = document.createElement('span');
+  iamChip.className = 'acc-chip route-local';
+  iamChip.textContent = `IAM ${accessIamLoadLabel(iam)}`;
+  iamChip.title = accessIamEnforcementReason(iam);
+  daemonChips.push(iamChip);
+  const daemonLines = [];
+  const hostId = accessModelLabel(scope.target_id, selfPeerId || 'local');
+  daemonLines.push(accessHeroLine('Identity', hostId, { mono: true }));
+  if (accessModelLabel(iam.state_path)) {
+    daemonLines.push(accessHeroLine('IAM store', accessModelLabel(iam.state_path), { mono: true }));
+  }
+  mount.appendChild(accessHeroCard({
+    glyph: 'D',
+    glyphCls: 'daemon',
+    kicker: 'This daemon',
+    title: accessModelLabel(scope.label, selfHostLabel || 'This daemon'),
+    chips: daemonChips,
+    lines: daemonLines,
+    stats: [
+      { value: targets.length, label: targets.length === 1 ? 'daemon' : 'daemons', title: 'Daemons this dashboard can reach', onClick: () => routeTo('access', 'daemons') },
+      { value: people, label: people === 1 ? 'person or device' : 'people & devices', title: 'User/client principals known to this daemon', onClick: () => routeTo('access', 'people') },
+      { value: peerCounts.inboundActive + peerCounts.outboundTotal, label: (peerCounts.inboundActive + peerCounts.outboundTotal) === 1 ? 'peer link' : 'peer links', title: 'Inbound and outbound daemon-to-daemon grants', onClick: () => routeTo('access', 'peers') },
+    ],
+  }));
+}
+
+function renderAccessFleetStrip() {
+  const mount = document.getElementById('access-fleet-strip');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const targets = accessTargetRecords();
+  for (const target of targets) {
+    const hostId = target.local ? '' : String(target.host_id || target.id || '').trim();
+    const descriptor = dashboardTargetDescriptor(hostId);
+    const rememberedOnly = target.source === 'browser_fleet' && !descriptor.local && !descriptor.peer;
+    const summary = dashboardTargetSummary(hostId, 'files');
+    const connection = accessTargetConnection(target, descriptor, summary);
+    const card = document.createElement('div');
+    card.className = `acc-fleet-card ${rememberedOnly ? 'ghost' : (connection.state || 'checking')}`;
+    card.title = connection.title || '';
+    const top = document.createElement('div');
+    top.className = 'acc-fleet-card-top';
+    const dot = document.createElement('span');
+    dot.className = 'acc-fleet-dot';
+    const name = document.createElement('span');
+    name.className = 'acc-fleet-name';
+    name.textContent = accessTargetDisplayName(target, descriptor);
+    top.append(dot, name);
+    if (target.local || descriptor.local) {
+      const self = document.createElement('span');
+      self.className = 'acc-fleet-self';
+      self.textContent = 'this daemon';
+      top.appendChild(self);
+    }
+    const meta = document.createElement('div');
+    meta.className = 'acc-fleet-meta';
+    const route = accessRouteInfoForTarget(target, descriptor, rememberedOnly);
+    meta.appendChild(accessRouteChip(route.kind, route.label));
+    const roleLabel = target.effective_role_label || descriptor.accessRole || '';
+    if (roleLabel) {
+      const roleId = /peer/i.test(roleLabel) ? 'role:peer-profile' : (/root/i.test(roleLabel) ? 'role:root' : '');
+      meta.appendChild(accessRoleBadge(roleId, roleLabel));
+    }
+    const provenanceChip = accessTargetProvenanceChip(target);
+    if (provenanceChip) meta.appendChild(provenanceChip);
+    card.append(top, meta);
+    card.addEventListener('click', () => routeTo('access', 'daemons'));
+    mount.appendChild(card);
+  }
+  const add = document.createElement('button');
+  add.type = 'button';
+  add.className = 'acc-fleet-add';
+  add.textContent = '+ Link a daemon';
+  add.addEventListener('click', () => routeTo('access', 'peers'));
+  mount.appendChild(add);
+}
+
+function renderAccessExplainer() {
+  const mount = document.getElementById('access-model-explainer');
+  if (!mount || mount.dataset.built === 'true') return;
+  mount.dataset.built = 'true';
+  const steps = [{
+    kicker: 'Who',
+    title: 'People, devices & daemons',
+    text: 'A principal is whoever is acting: you in a browser, a certificate, a Connect account, or another daemon.',
+  }, {
+    kicker: 'How',
+    title: 'A route, never authority',
+    text: 'Browser mTLS, Intendant Connect, or a peer link only carry the request. Reaching a daemon proves nothing by itself.',
+  }, {
+    kicker: 'Decides',
+    title: 'Each daemon, locally',
+    text: 'The target daemon checks its own IAM grants and enforces the role. No hosted service can mint authority here.',
+  }];
+  steps.forEach((step, index) => {
+    if (index) {
+      const arrow = document.createElement('div');
+      arrow.className = 'acc-explainer-arrow';
+      arrow.textContent = '→';
+      arrow.setAttribute('aria-hidden', 'true');
+      mount.appendChild(arrow);
+    }
+    const node = document.createElement('div');
+    node.className = 'acc-explainer-step';
+    const kicker = document.createElement('div');
+    kicker.className = 'acc-explainer-kicker';
+    kicker.textContent = step.kicker;
+    const title = document.createElement('div');
+    title.className = 'acc-explainer-title';
+    title.textContent = step.title;
+    const text = document.createElement('div');
+    text.className = 'acc-explainer-text';
+    text.textContent = step.text;
+    node.append(kicker, title, text);
+    mount.appendChild(node);
+  });
+}
+
+/* People & Devices: your identity on this daemon. */
+function renderAccessPeopleCurrent() {
+  const mount = document.getElementById('access-people-current');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const me = accessCurrentPrincipalInfo();
+  const glyph = accessPrincipalGlyph(me.kind);
+  const role = accessIamRoleById(me.roleId);
+  const roleLabel = accessModelLabel(role?.label, me.roleId ? me.roleId.replace(/^role:/, '') : 'Unknown');
+  const chips = [accessRouteChip(me.route.kind, me.route.label)];
+  if (me.roleId) chips.push(accessRoleBadge(me.roleId, roleLabel));
+  const lines = [];
+  if (me.clientKeyFingerprint) {
+    lines.push(accessHeroLine('Browser key', me.clientKeyFingerprint, {
+      mono: true,
+      title: 'Held in this browser’s origin storage; signed into every session offer. Paste this fingerprint into another daemon’s grant form to get access there.',
+    }));
+  }
+  if (me.fingerprint) {
+    lines.push(accessHeroLine('Certificate', me.fingerprint, { mono: true }));
+  }
+  if (me.accountName || me.accountUserId) {
+    lines.push(accessHeroLine('Account', me.accountName ? `@${me.accountName}` : me.accountUserId, { title: me.accountUserId }));
+  }
+  if (!me.clientKeyFingerprint && !me.fingerprint && !me.accountName && !me.accountUserId) {
+    lines.push(accessHeroLine('Binding', 'Trusted session only — no persistent identity. Save a grant below to pin this browser or an account to a role.'));
+  }
+  const actions = [];
+  if (me.clientKeyFingerprint && clientIdentityCache) {
+    actions.push({
+      label: 'Copy key fingerprint',
+      onClick: () => {
+        navigator.clipboard?.writeText(me.clientKeyFingerprint)
+          .then(() => showControlToast?.('success', 'Fingerprint copied'))
+          .catch(() => showControlToast?.('error', 'Copy failed'));
+      },
+    });
+    actions.push({
+      label: 'Reset key',
+      onClick: async () => {
+        const ok = await showDashboardConfirm({
+          title: 'Reset browser identity key',
+          message: 'Grants bound to the current key stop matching this browser. A fresh key is created on the next connection.',
+          confirmLabel: 'Reset key',
+          cancelLabel: 'Cancel',
+          danger: true,
+        });
+        if (!ok) return;
+        try {
+          await clientIdentityReset();
+          showControlToast?.('success', 'Browser key reset — reload to mint a new one');
+        } catch (err) {
+          showControlToast?.('error', `Reset failed: ${err?.message || err}`);
+        }
+        renderAccessAdminSummaries();
+      },
+    });
+  }
+  mount.appendChild(accessHeroCard({
+    glyph: glyph.text,
+    glyphCls: glyph.cls,
+    kicker: 'Your identity on this daemon',
+    title: me.label,
+    chips,
+    lines,
+    actions,
+  }));
+}
+
+/* People & Devices: devices knocking on this daemon, awaiting a decision.
+   Empty (and invisible) when nothing is pending. */
+function renderAccessEnrollmentRequests() {
+  const mount = document.getElementById('access-enrollment-requests');
+  if (!mount) return;
+  mount.innerHTML = '';
+  if (!accessPendingEnrollments.length) return;
+  const canManage = dashboardControlTransport?.lastStatus?.api_access_enrollment_decide_available !== false;
+
+  const head = document.createElement('div');
+  head.className = 'acc-section-head';
+  const title = document.createElement('div');
+  title.className = 'acc-section-title';
+  title.textContent = 'Pending devices';
+  const sub = document.createElement('div');
+  sub.className = 'acc-section-sub';
+  sub.textContent = 'Browsers whose verified identity key reached this daemon without a grant. Approving writes a normal IAM grant; hosted-route keys stay under the role ceiling.';
+  head.append(title, sub);
+  mount.appendChild(head);
+
+  const list = document.createElement('div');
+  list.className = 'acc-principal-list';
+  for (const request of accessPendingEnrollments) {
+    const fingerprint = accessModelLabel(request.fingerprint);
+    const card = document.createElement('div');
+    card.className = 'acc-principal-card';
+    const headRow = document.createElement('div');
+    headRow.className = 'acc-principal-head';
+    const glyphEl = document.createElement('div');
+    glyphEl.className = 'acc-principal-glyph kind-cert';
+    glyphEl.textContent = 'KEY';
+    const nameWrap = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'acc-principal-name';
+    name.textContent = request.account_hint
+      ? `${request.account_hint} — new device`
+      : 'New device';
+    const kind = document.createElement('div');
+    kind.className = 'acc-principal-kind';
+    const attempts = Number(request.attempts || 1);
+    kind.textContent = `${attempts === 1 ? '1 attempt' : `${attempts} attempts`} · last ${new Date(Number(request.last_seen_unix_ms || 0)).toLocaleString()}`;
+    nameWrap.append(name, kind);
+    headRow.append(glyphEl, nameWrap);
+    if (request.origin) {
+      headRow.appendChild(accessRouteChip('connect', 'via hosted route', `The offer arrived through ${request.origin}; the key will be recorded with that origin, so the role ceiling applies until it is re-enrolled from an anchor origin.`));
+    }
+    card.appendChild(headRow);
+
+    const authn = document.createElement('div');
+    authn.className = 'acc-principal-authn';
+    authn.textContent = `Key fingerprint ${fingerprint}`;
+    authn.title = fingerprint;
+    card.appendChild(authn);
+
+    const actions = document.createElement('div');
+    actions.className = 'acc-grant-flow-actions';
+    const roleSelect = document.createElement('select');
+    roleSelect.className = 'acc-btn';
+    roleSelect.title = 'Role the approved device receives on this daemon';
+    for (const role of accessAssignableIamRoles()) {
+      const option = document.createElement('option');
+      option.value = accessModelLabel(role.id);
+      option.textContent = accessModelLabel(role.label, role.id);
+      if (accessModelLabel(role.id) === 'role:observer') option.selected = true;
+      roleSelect.appendChild(option);
+    }
+    const approve = document.createElement('button');
+    approve.type = 'button';
+    approve.className = 'acc-btn primary';
+    approve.textContent = 'Approve';
+    approve.disabled = !canManage;
+    approve.addEventListener('click', () => accessDecideEnrollment(fingerprint, true, roleSelect.value));
+    const deny = document.createElement('button');
+    deny.type = 'button';
+    deny.className = 'acc-btn danger';
+    deny.textContent = 'Deny';
+    deny.disabled = !canManage;
+    deny.addEventListener('click', () => accessDecideEnrollment(fingerprint, false));
+    actions.append(roleSelect, approve, deny);
+    card.appendChild(actions);
+    list.appendChild(card);
+  }
+  mount.appendChild(list);
+}
+
+/* People & Devices: principal cards with their grants and lifecycle. */
+function renderAccessPeopleGrants() {
+  const mount = document.getElementById('access-people-grants');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const overview = accessOverviewModel();
+  const targetLabels = accessOverviewTargetLabelMap(overview);
+  const grantsByPrincipal = accessGrantsBy(overview, 'principal_id');
+  const principals = accessUserClientPrincipals(overview);
+  if (!principals.length) {
+    const empty = document.createElement('div');
+    empty.className = 'access-empty';
+    empty.textContent = 'No people or devices yet — save a grant above to add one.';
+    mount.appendChild(empty);
+    return;
+  }
+  const canManage = dashboardControlTransport?.lastStatus?.api_access_iam_update_grant_available !== false;
+  for (const principal of principals) {
+    const card = document.createElement('div');
+    card.className = 'acc-principal-card';
+    const head = document.createElement('div');
+    head.className = 'acc-principal-head';
+    const glyph = accessPrincipalGlyph(principal.kind);
+    const glyphEl = document.createElement('div');
+    glyphEl.className = `acc-principal-glyph ${glyph.cls}`;
+    glyphEl.textContent = glyph.text;
+    const nameWrap = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'acc-principal-name';
+    name.textContent = accessModelLabel(principal.label, principal.id || 'Principal');
+    const kind = document.createElement('div');
+    kind.className = 'acc-principal-kind';
+    kind.textContent = accessModelLabel(principal.kind_label || principal.kind, 'Principal');
+    nameWrap.append(name, kind);
+    head.append(glyphEl, nameWrap);
+    head.appendChild(accessModelCreateStatus(principal.status || (principal.local ? 'current' : 'active')));
+    card.appendChild(head);
+    const authn = accessOverviewArray(principal, 'authn')
+      .map(item => {
+        const label = accessModelLabel(item.label || item.kind);
+        const fp = accessModelLabel(item.fingerprint);
+        return fp ? `${label} ${fp.slice(0, 18)}…` : label;
+      })
+      .filter(Boolean)
+      .join(' · ');
+    if (authn) {
+      const authnEl = document.createElement('div');
+      authnEl.className = 'acc-principal-authn';
+      authnEl.textContent = authn;
+      authnEl.title = accessModelLabel(principal.id);
+      card.appendChild(authnEl);
+    }
+    const grants = grantsByPrincipal.get(accessModelLabel(principal.id)) || [];
+    if (grants.length) {
+      const rows = document.createElement('div');
+      rows.className = 'acc-grant-rows';
+      for (const grant of grants) {
+        rows.appendChild(accessCreateGrantRow(grant, targetLabels, canManage, principal));
+      }
+      card.appendChild(rows);
+    }
+    mount.appendChild(card);
+  }
+}
+
+function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) {
+  const row = document.createElement('div');
+  row.className = 'acc-grant-row';
+  const grantId = accessModelLabel(grant.id);
+  const status = accessModelLabel(grant.status, 'active');
+  const roleId = accessModelLabel(grant.role_id || grant.role);
+  row.appendChild(accessRoleBadge(roleId.startsWith('role:') ? roleId : `role:${roleId}`, accessModelLabel(grant.role_label || grant.profile || grant.role, 'Role')));
+  const target = document.createElement('span');
+  target.className = 't';
+  target.textContent = `on ${targetLabels.get(accessModelLabel(grant.target_id)) || accessModelLabel(grant.target_id, 'this daemon')}`;
+  row.appendChild(target);
+  row.appendChild(accessModelCreateStatus(status));
+  const capped = principal ? accessPrincipalCeiling(principal) : null;
+  if (capped) {
+    const chip = document.createElement('span');
+    chip.className = 'acc-chip route-connect';
+    chip.textContent = `ceiling: ${capped.ceiling.replace(/^role:/, '')}`;
+    chip.title = `Sessions authenticated by this principal's ${capped.binding.replace(/_/g, ' ')} binding are capped at ${capped.ceiling} by this daemon's role_ceilings policy, regardless of the granted role.`;
+    row.appendChild(chip);
+  }
+  const localIamGrant = accessModelLabel(grant.kind) === 'user_client_local_iam';
+  if (localIamGrant && grantId) {
+    const busy = accessGrantLifecycleSubmitting.has(grantId);
+    const actions = document.createElement('div');
+    actions.className = 'acc-grant-row-actions';
+    const mkBtn = (label, opts, onClick) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'acc-btn' + (opts.primary ? ' primary' : '') + (opts.danger ? ' danger' : '');
+      btn.textContent = busy ? 'Saving' : label;
+      btn.disabled = busy || !canManage;
+      btn.addEventListener('click', onClick);
+      return btn;
+    };
+    if (status !== 'active') actions.appendChild(mkBtn('Activate', { primary: true }, () => accessUpdateGrantLifecycle(grantId, { status: 'active' })));
+    if (status !== 'draft') actions.appendChild(mkBtn('Draft', {}, () => accessUpdateGrantLifecycle(grantId, { status: 'draft' })));
+    if (status !== 'revoked') actions.appendChild(mkBtn('Revoke', { danger: true }, () => accessConfirmRevokeGrant(grantId)));
+    row.appendChild(actions);
+  }
+  const why = document.createElement('div');
+  why.className = 'why';
+  why.textContent = accessGrantWhy(grant);
+  row.appendChild(why);
+  return row;
+}
+
+/* Peers: inbound/outbound summary. */
+function renderAccessPeerSummary() {
+  const mount = document.getElementById('access-peer-summary');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const counts = accessPeerGrantCounts();
+  mount.appendChild(accessHeroCard({
+    glyph: 'IN',
+    glyphCls: 'daemon',
+    kicker: 'Inbound',
+    title: counts.inboundActive
+      ? accessPlural(counts.inboundActive, 'daemon may call in', 'daemons may call in')
+      : 'No inbound peer access',
+    lines: [accessHeroLine('Meaning', 'Approved peer identities that may call capabilities on this daemon, bounded by their profile.'),
+      ...(counts.inboundRevoked ? [accessHeroLine('Revoked', `${counts.inboundRevoked} kept visible for audit`)] : [])],
+  }));
+  mount.appendChild(accessHeroCard({
+    glyph: 'OUT',
+    glyphCls: 'daemon',
+    kicker: 'Outbound',
+    title: counts.outboundTotal
+      ? `${counts.outboundActive}/${counts.outboundTotal} routes active`
+      : 'No outbound peer routes',
+    lines: [accessHeroLine('Meaning', 'Peer daemons this one can reach. Operate them from the Daemons pane.')],
+    actions: [{ label: 'Open Daemons', onClick: () => routeTo('access', 'daemons') }],
+  }));
+}
+
+/* Advanced: role catalog cards. */
+function renderAccessRoleCatalog() {
+  const mount = document.getElementById('access-role-catalog');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const iam = accessIamModel(accessOverviewModel());
+  const roles = Array.isArray(iam.roles) && iam.roles.length ? iam.roles : accessFallbackIamRoles();
+  for (const role of roles) {
+    const node = document.createElement('div');
+    node.className = 'acc-role-info';
+    const top = document.createElement('div');
+    top.className = 'acc-role-info-top';
+    top.appendChild(accessRoleBadge(role.id, accessModelLabel(role.label, role.id)));
+    top.appendChild(accessModelCreateStatus(role.status || 'enforced'));
+    const desc = document.createElement('div');
+    desc.className = 'd';
+    desc.textContent = accessModelLabel(role.summary, accessRoleMeta(role.id).short);
+    const perms = document.createElement('div');
+    perms.className = 'perms';
+    const list = Array.isArray(role.permissions) ? role.permissions : [];
+    perms.textContent = list.length ? list.join(' · ') : 'No permissions';
+    perms.title = list.join(', ');
+    node.append(top, desc, perms);
+    mount.appendChild(node);
+  }
+}
+
+/* Advanced: local IAM state card with raw links. */
+function renderAccessIamStateCard() {
+  const mount = document.getElementById('access-iam-state-card');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const overview = accessOverviewModel();
+  const iam = accessIamModel(overview);
+  const capabilities = iam.capabilities && typeof iam.capabilities === 'object' ? iam.capabilities : {};
+  const unresolved = accessOverviewArray(overview.architecture || {}, 'unresolved');
+  const ceilings = iam.role_ceilings && typeof iam.role_ceilings === 'object' ? iam.role_ceilings : {};
+  const ceilingText = Object.keys(ceilings).length
+    ? Object.entries(ceilings).map(([kind, role]) => `${kind} → ${String(role).replace(/^role:/, '')}`).join(' · ')
+    : 'none configured';
+  const lines = [
+    accessHeroLine('State', accessIamLoadLabel(iam)),
+    accessHeroLine('Store', accessModelLabel(iam.state_path, 'Default access store'), { mono: true }),
+    accessHeroLine('Managed', `${accessModelLabel(iam.managed_principals, '0')} principals · ${accessModelLabel(iam.managed_grants, '0')} grants`),
+    accessHeroLine('Write API', capabilities.write_api_available ? 'Available' : 'Not exposed'),
+    accessHeroLine('Ceilings', ceilingText, {
+      title: 'role_ceilings: low-provenance bindings (Connect accounts, hosted-origin browser keys) never exceed these roles per session. Edit in iam.json.',
+    }),
+    accessHeroLine('Enforcement', accessIamEnforcementReason(iam)),
+  ];
+  if (unresolved.length) {
+    lines.push(accessHeroLine('Open design', unresolved.join('; ')));
+  }
+  mount.appendChild(accessHeroCard({
+    glyph: '{}',
+    glyphCls: 'daemon',
+    kicker: 'Local IAM state',
+    title: 'iam.json',
+    lines,
+    actions: dashboardConnectModeEnabled() ? [] : [
+      { label: 'Raw overview JSON', onClick: () => window.open('/api/access/overview', '_blank', 'noopener') },
+      { label: 'Raw IAM state JSON', onClick: () => window.open('/api/access/iam/state', '_blank', 'noopener') },
+    ],
+  }));
+}
+
 function renderAccessAdminSummaries() {
   if (!document.getElementById('tab-access')) return;
-  accessRenderCards('access-model-overview', accessOverviewCards());
-  renderAccessOverviewDetails();
-  renderAccessUserClientGrantForm();
-  accessRenderCards('access-people-overview', accessPeopleCards());
-  accessRenderDetailCards('access-people-details', accessPrincipalDetailCards());
-  accessRenderCards('access-daemon-overview', accessDaemonCards());
+  renderAccessAttention();
+  renderAccessIdentityHero();
+  renderAccessFleetStrip();
+  renderAccessExplainer();
   renderAccessTargetsSurface();
-  accessRenderDetailCards('access-target-details', accessTargetDetailCards());
-  accessRenderCards('access-peer-overview', accessPeerTrustCards());
+  renderAccessPeopleCurrent();
+  renderAccessEnrollmentRequests();
+  renderAccessUserClientGrantForm();
+  renderAccessPeopleGrants();
+  renderAccessPeerSummary();
   accessRenderDetailCards('access-peer-details', accessPeerTrustDetailCards());
-  accessRenderCards('access-policy-overview', accessPolicyCards());
-  renderAccessPermissionMatrix();
-  accessRenderCards('access-audit-overview', accessAuditCards());
-  accessRenderDetailCards('access-grant-details', accessAuditGrantCards());
-  renderAccessModelDetails();
-  accessRenderCards('access-public-shares', accessPublicShareCards());
   accessRenderCards('access-diagnostics-overview', accessDiagnosticsCards());
-}
-
-function accessEnsureSection(mountId, sectionId, title) {
-  const mount = document.getElementById(mountId);
-  if (!mount) return null;
-  let section = document.getElementById(sectionId);
-  if (!section) {
-    section = document.createElement('div');
-    section.id = sectionId;
-    section.className = 'access-section';
-    const titleEl = document.createElement('div');
-    titleEl.className = 'access-section-title';
-    titleEl.textContent = title || 'Access';
-    const body = document.createElement('div');
-    body.className = 'access-section-body';
-    section.append(titleEl, body);
-  }
-  if (section.parentElement !== mount) mount.appendChild(section);
-  return section.querySelector('.access-section-body');
-}
-
-function accessMoveIntoSection(node, mountId, sectionId, title) {
-  if (!node) return false;
-  const body = accessEnsureSection(mountId, sectionId, title);
-  if (!body) return false;
-  if (node.parentElement !== body) body.appendChild(node);
-  return true;
-}
-
-function accessMoveToMount(node, mountId) {
-  const mount = document.getElementById(mountId);
-  if (!node || !mount) return false;
-  if (node.parentElement !== mount) mount.appendChild(node);
-  return true;
-}
-
-function mountAccessAdminSurface() {
-  accessMoveIntoSection(
-    document.querySelector('.daemon-pairing-grid'),
-    'access-invitations-mount',
-    'access-invitations-section',
-    'Invitations and requests'
-  );
-  accessMoveToMount(
-    document.querySelector('.daemon-relationships-panel'),
-    'access-grants-mount'
-  );
-  accessMoveToMount(
-    document.getElementById('connect-health-panel'),
-    'access-diagnostics-mount'
-  );
-  accessMoveToMount(
-    document.getElementById('coord-eligible-btn')?.closest('fieldset.settings-group'),
-    'access-diagnostics-mount'
-  );
-  const openAccessBtn = document.getElementById('settings-open-access-btn');
-  if (openAccessBtn && openAccessBtn.dataset.wired !== 'true') {
-    openAccessBtn.dataset.wired = 'true';
-    openAccessBtn.addEventListener('click', () => routeTo('access', 'overview'));
-  }
+  renderAccessRoleCatalog();
+  renderAccessPermissionMatrix();
+  accessRenderDetailCards('access-grant-details', accessAuditGrantCards());
+  renderAccessIamStateCard();
+  renderAccessModelDetails();
 }
 
 function setShellHostStatus(text = '', kind = '') {
@@ -41118,8 +42781,15 @@ const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'ses
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['tui', 'shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
-const ACCESS_SUBTAB_ALIASES = { targets: 'daemons', grants: 'audit' };
-const ACCESS_CANONICAL_SUBTABS = ['overview', 'people', 'daemons', 'peers', 'policies', 'audit', 'invitations', 'public', 'diagnostics'];
+const ACCESS_SUBTAB_ALIASES = {
+  targets: 'daemons',
+  invitations: 'peers',
+  policies: 'advanced',
+  audit: 'advanced',
+  grants: 'advanced',
+  public: 'advanced',
+};
+const ACCESS_CANONICAL_SUBTABS = ['overview', 'daemons', 'people', 'peers', 'diagnostics', 'advanced'];
 const VALID_ACCESS_SUBTABS = ACCESS_CANONICAL_SUBTABS.concat(Object.keys(ACCESS_SUBTAB_ALIASES));
 const VALID_SESSIONS_SUBTABS = ['recent', 'deep', 'worktrees', 'new'];
 
@@ -41329,15 +42999,11 @@ function switchTab(tabId) {
   if (tabId === 'settings' && !apiKeyStatusLoaded) {
     loadApiKeyStatus();
   }
-  if (tabId === 'settings') {
-    // Always re-render so connection states reflect current WASM state.
-    renderDaemonsList();
-  }
   if (tabId === 'access') {
-    mountAccessAdminSurface();
     renderDaemonsList();
     renderAccessAdminSummaries();
     refreshAccessOverviewFromApi({ silent: true }).catch(() => {});
+    refreshAccessEnrollments({ silent: true }).catch(() => {});
     if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
   }
 }
@@ -42994,8 +44660,11 @@ function switchAccessSubtab(name) {
   document.querySelectorAll('#tab-access .subtab-pane').forEach(pane => {
     pane.classList.toggle('active', pane.id === `access-pane-${activeAccessSubtab}`);
   });
-  mountAccessAdminSurface();
   renderAccessAdminSummaries();
+  if (activeAccessSubtab === 'daemons') renderDaemonsList();
+  if (activeAccessSubtab === 'overview' || activeAccessSubtab === 'people') {
+    refreshAccessEnrollments({ silent: true }).catch(() => {});
+  }
   if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
 }
 
@@ -43014,7 +44683,6 @@ function switchSettingsSubtab(name) {
     pane.classList.toggle('active', pane.id === `settings-pane-${name}`);
   });
   updateSettingsSaveRow();
-  if (name === 'debug') renderConnectHealthPanel();
 }
 
 // Apply the remembered sub-tab on initial render, before anything
@@ -43031,7 +44699,6 @@ function applyInitialSettingsSubtab() {
     pane.classList.toggle('active', pane.id === `settings-pane-${activeSettingsSubtab}`);
   });
   updateSettingsSaveRow();
-  if (activeSettingsSubtab === 'debug') renderConnectHealthPanel();
 }
 
 // The main Save/Reset row only actually saves the Agent sub-tab's
@@ -43259,6 +44926,7 @@ function dashboardUpdateTransportStatus() {
   const group = document.getElementById('sb-dashboard-transport');
   const dot = document.getElementById('sb-dashboard-transport-dot');
   const label = document.getElementById('sb-dashboard-transport-label');
+  const prefix = document.getElementById('sb-dashboard-transport-prefix');
   const status = dashboardTransport?.status
     ? dashboardTransport.status()
     : { enabled: dashboardControlTransportEnabled(), connected: false };
@@ -43274,6 +44942,12 @@ function dashboardUpdateTransportStatus() {
   }
   dot.className = `conn-dot ${summary.kind}`;
   label.textContent = summary.label;
+  // Name the actual route so "Ready" is never ambiguous: the user can
+  // tell direct mTLS from a hosted Connect tunnel at a glance.
+  if (prefix) {
+    const route = accessCurrentRouteInfo();
+    prefix.textContent = { connect: 'Connect', mtls: 'mTLS', webrtc: 'WebRTC', local: 'local' }[route.kind] || 'access';
+  }
   group.title = summary.title;
   renderConnectHealthPanel(status, summary);
   renderDashboardTargetSummaries();
@@ -46235,19 +47909,27 @@ class DashboardControlTransport {
       if (!DASHBOARD_CONNECT_DAEMON_ID) {
         throw new Error('Connect dashboard missing daemon_id');
       }
+      const identity = await clientIdentityOfferFields(
+        DASHBOARD_CONNECT_DAEMON_ID,
+        this.clientNonce,
+        sdp
+      );
       const answer = await this.postConnectSignal('/api/browser/offer', {
         daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
         sdp,
         client_nonce: this.clientNonce,
+        ...identity,
       });
       this.signalingMode = 'connect-rendezvous';
       dashboardUpdateTransportStatus();
       return answer;
     }
     try {
+      const identity = await clientIdentityOfferFields('', this.clientNonce, sdp);
       const answer = await this.postLocalSignal('/connect/dashboard/offer', {
         sdp,
         client_nonce: this.clientNonce,
+        ...identity,
       });
       this.signalingMode = 'local-http';
       dashboardUpdateTransportStatus();
@@ -47442,6 +49124,7 @@ function dashboardBytesToBase64Url(bytes) {
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
+
 
 function dashboardRandomBase64Url(byteLength = 32) {
   const bytes = new Uint8Array(byteLength);
@@ -52261,8 +53944,6 @@ async function routeTask() {
 }
 
 async function initDaemons() {
-  mountAccessAdminSurface();
-
   // Hydrate the peer list from the server-side PeerRegistry via
   // GET /api/peers. The server already loaded [[peer]] sections
   // from intendant.toml at startup; peers added through the
@@ -62800,6 +64481,16 @@ document.getElementById('sb-hosts-group').addEventListener('click', () => {
   else window.location.href = accessHomeHref('daemons');
 });
 document.getElementById('sb-access-page-link')?.addEventListener('click', openAccessHome);
+document.getElementById('sb-dashboard-transport')?.addEventListener('click', () => routeTo('access', 'diagnostics'));
+document.getElementById('access-link-daemon-btn')?.addEventListener('click', () => routeTo('access', 'peers'));
+
+// Warm the browser identity key early: transports sign offers with it, and
+// the Access renderers read the cache synchronously once it resolves.
+if (clientIdentitySupported()) {
+  clientIdentityGet().then(identity => {
+    if (identity) renderAccessAdminSummaries();
+  }).catch(() => {});
+}
 syncAccessPageNavLink();
 
 // Auto-scroll detection

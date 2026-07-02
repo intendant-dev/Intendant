@@ -51,6 +51,12 @@ struct RendezvousEvent {
     #[serde(default)]
     account_name: Option<String>,
     #[serde(default)]
+    client_key: Option<String>,
+    #[serde(default)]
+    client_key_sig: Option<String>,
+    #[serde(default)]
+    client_key_ts: Option<i64>,
+    #[serde(default)]
     claim_id: Option<String>,
     #[serde(default)]
     challenge: Option<String>,
@@ -305,12 +311,70 @@ async fn handle_event(
                 .map(str::trim)
                 .filter(|nonce| !nonce.is_empty())
                 .map(str::to_string);
+            // A signed browser identity key authenticates end-to-end: the
+            // rendezvous only relays it, and a bad signature fails closed so
+            // a malicious relay cannot strip or corrupt the binding.
+            let client_key_fields = crate::access::client_key::ClientKeyOfferFields {
+                client_key: event.client_key.clone(),
+                client_key_sig: event.client_key_sig.clone(),
+                client_key_ts: event.client_key_ts,
+            };
+            let verified_client_key = match client_key_fields.verify(
+                daemon_id,
+                client_nonce.as_deref().unwrap_or(""),
+                sdp,
+                crate::access::client_key::now_unix_ms(),
+            ) {
+                Ok(verified) => verified,
+                Err(e) => {
+                    let _ = post_error(
+                        client,
+                        base_url,
+                        config,
+                        daemon_id,
+                        &event.id,
+                        &format!("client key verification failed: {e}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
             let grant = match connect_dashboard_grant(
                 event.user_id.as_deref(),
                 event.account_name.as_deref(),
+                verified_client_key.as_ref(),
             ) {
                 Ok(grant) => grant,
                 Err(e) => {
+                    // A verified key without a grant is an enrollment
+                    // candidate: queue it so the owner can approve from an
+                    // already-trusted Access session instead of copying the
+                    // fingerprint out of this error by hand.
+                    if let Some(key) = verified_client_key.as_ref() {
+                        let origin = {
+                            let mut origin = base_url.clone();
+                            origin.set_path("");
+                            origin.set_query(None);
+                            origin.set_fragment(None);
+                            origin.to_string().trim_end_matches('/').to_string()
+                        };
+                        let account_hint = match (
+                            event.account_name.as_deref().map(str::trim).filter(|v| !v.is_empty()),
+                            event.user_id.as_deref().map(str::trim).filter(|v| !v.is_empty()),
+                        ) {
+                            (Some(name), _) => format!("@{name}"),
+                            (None, Some(id)) => id.chars().take(12).collect(),
+                            (None, None) => String::new(),
+                        };
+                        crate::access::enrollment::record_refused_client_key(
+                            &key.fingerprint,
+                            &key.public_key_b64u,
+                            &origin,
+                            "connect-dashboard-control",
+                            &account_hint,
+                            crate::access::client_key::now_unix_ms(),
+                        );
+                    }
                     let _ = post_error(client, base_url, config, daemon_id, &event.id, &e).await;
                     return;
                 }
@@ -446,16 +510,18 @@ async fn handle_event(
 fn connect_dashboard_grant(
     user_id: Option<&str>,
     account_name: Option<&str>,
+    client_key: Option<&crate::access::client_key::VerifiedClientKey>,
 ) -> Result<crate::dashboard_control::DashboardControlGrant, String> {
     let user_id = user_id.map(str::trim).filter(|value| !value.is_empty());
     let account_name = account_name
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if user_id.is_none() && account_name.is_none() {
+    if user_id.is_none() && account_name.is_none() && client_key.is_none() {
         return Err(connect_account_not_authorized_message(
             None,
             None,
-            Some("the Connect offer did not include account identity"),
+            None,
+            Some("the Connect offer did not include account identity or a client key"),
         ));
     }
 
@@ -465,33 +531,54 @@ fn connect_dashboard_grant(
         return Err(connect_account_not_authorized_message(
             user_id,
             account_name,
+            client_key,
             Some("no daemon-local IAM state exists"),
         ));
     }
     let state = crate::access::iam::load_state(&cert_dir)
         .map_err(|e| format!("local IAM state is invalid: {e}"))?;
-    connect_dashboard_grant_from_state(
-        state,
-        user_id,
-        account_name,
-    )
+    connect_dashboard_grant_from_state(state, user_id, account_name, client_key)
 }
 
 fn connect_dashboard_grant_from_state(
     state: crate::access::iam::LocalIamState,
     user_id: Option<&str>,
     account_name: Option<&str>,
+    client_key: Option<&crate::access::client_key::VerifiedClientKey>,
 ) -> Result<crate::dashboard_control::DashboardControlGrant, String> {
     let user_id = user_id.map(str::trim).filter(|value| !value.is_empty());
     let account_name = account_name
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if user_id.is_none() && account_name.is_none() {
+    if user_id.is_none() && account_name.is_none() && client_key.is_none() {
         return Err(connect_account_not_authorized_message(
             None,
             None,
-            Some("the Connect offer did not include account identity"),
+            None,
+            Some("the Connect offer did not include account identity or a client key"),
         ));
+    }
+
+    // A verified browser identity key is the strongest binding: it
+    // authenticated end-to-end regardless of what the rendezvous claims.
+    if let Some(key) = client_key {
+        if let Some(principal) = crate::access::iam::principal_for_client_key(
+            &state,
+            &key.fingerprint,
+            "connect-dashboard-control",
+        )
+        .or_else(|| {
+            crate::access::iam::principal_for_client_key_any_status(
+                &state,
+                &key.fingerprint,
+                "connect-dashboard-control",
+            )
+        }) {
+            return Ok(crate::dashboard_control::DashboardControlGrant::UserClient {
+                principal,
+                iam_state: state,
+            });
+        }
     }
 
     match crate::access::iam::principal_for_connect_account(
@@ -517,7 +604,8 @@ fn connect_dashboard_grant_from_state(
             None => Err(connect_account_not_authorized_message(
                 user_id,
                 account_name,
-                Some("no matching daemon-local Connect account grant exists"),
+                client_key,
+                Some("no matching daemon-local grant exists for the client key or Connect account"),
             )),
         },
     }
@@ -526,6 +614,7 @@ fn connect_dashboard_grant_from_state(
 fn connect_account_not_authorized_message(
     user_id: Option<&str>,
     account_name: Option<&str>,
+    client_key: Option<&crate::access::client_key::VerifiedClientKey>,
     detail: Option<&str>,
 ) -> String {
     let user_id = user_id.map(str::trim).filter(|value| !value.is_empty());
@@ -536,11 +625,17 @@ fn connect_account_not_authorized_message(
         (Some(name), Some(id)) => format!("@{name} ({})", id.chars().take(12).collect::<String>()),
         (Some(name), None) => format!("@{name}"),
         (None, Some(id)) => format!("Connect account {}", id.chars().take(12).collect::<String>()),
-        (None, None) => "Connect account".to_string(),
+        (None, None) => "This client".to_string(),
     };
     let mut message = format!(
-        "{identity} is not authorized by this daemon. Open this daemon's Access page through direct mTLS/local root access and add a local IAM grant for the Connect account before using hosted Connect."
+        "{identity} is not authorized by this daemon. Open this daemon's Access page through direct mTLS/local root access and add a local IAM grant before using hosted Connect."
     );
+    if let Some(key) = client_key {
+        message.push_str(&format!(
+            " The verified browser key fingerprint is {} — grant it under Access → People & Devices.",
+            key.fingerprint
+        ));
+    }
     if let Some(detail) = detail.and_then(|value| {
         let value = value.trim();
         if value.is_empty() {
@@ -711,7 +806,8 @@ mod tests {
         });
 
         let grant =
-            connect_dashboard_grant_from_state(state, Some("user-123"), Some("alice")).unwrap();
+            connect_dashboard_grant_from_state(state, Some("user-123"), Some("alice"), None)
+                .unwrap();
         let crate::dashboard_control::DashboardControlGrant::UserClient {
             principal,
             iam_state,
@@ -742,7 +838,8 @@ mod tests {
     fn unmatched_connect_account_metadata_requires_local_iam_grant() {
         let state = crate::access::iam::LocalIamState::default();
         let error =
-            connect_dashboard_grant_from_state(state, Some("user-123"), Some("alice")).unwrap_err();
+            connect_dashboard_grant_from_state(state, Some("user-123"), Some("alice"), None)
+                .unwrap_err();
         assert!(error.contains("@alice"));
         assert!(error.contains("local IAM grant"));
         assert!(error.contains("direct mTLS"));
@@ -751,9 +848,92 @@ mod tests {
     #[test]
     fn connect_offer_without_account_identity_is_rejected() {
         let state = crate::access::iam::LocalIamState::default();
-        let error = connect_dashboard_grant_from_state(state, None, None).unwrap_err();
+        let error = connect_dashboard_grant_from_state(state, None, None, None).unwrap_err();
         assert!(error.contains("not authorized"));
-        assert!(error.contains("did not include account identity"));
+        assert!(error.contains("did not include account identity or a client key"));
+    }
+
+    #[test]
+    fn verified_client_key_binds_before_account_metadata() {
+        let mut state = crate::access::iam::LocalIamState::default();
+        state.principals.push(crate::access::iam::IamPrincipal {
+            id: "principal:client-key:fp-abc".to_string(),
+            kind: "client_key".to_string(),
+            label: "Anchor browser key".to_string(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            account: None,
+            organization: None,
+            authn: vec![serde_json::json!({
+                "kind": "client_key",
+                "fingerprint": "fp-abc",
+                "origin": "https://anchor.local:8765"
+            })],
+            notes: None,
+            created_at_unix_ms: Some(100),
+        });
+        state.grants.push(crate::access::iam::IamGrant {
+            id: "grant:client-key:fp-abc:terminal".to_string(),
+            principal_id: "principal:client-key:fp-abc".to_string(),
+            target_id: "local".to_string(),
+            role_id: "role:terminal".to_string(),
+            policy_id: "policy:terminal".to_string(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            reason: "test client key grant".to_string(),
+            created_at_unix_ms: Some(101),
+            revoked_at_unix_ms: None,
+        });
+
+        let key = crate::access::client_key::VerifiedClientKey {
+            fingerprint: "fp-abc".to_string(),
+            public_key_b64u: "unused".to_string(),
+        };
+        // Account metadata matches nothing, but the verified key must bind.
+        let grant = connect_dashboard_grant_from_state(
+            state,
+            Some("unknown-user"),
+            Some("unknown"),
+            Some(&key),
+        )
+        .unwrap();
+        let crate::dashboard_control::DashboardControlGrant::UserClient {
+            principal,
+            iam_state,
+        } = grant
+        else {
+            panic!("expected key-bound user-client grant");
+        };
+        assert_eq!(principal.kind, "client_key");
+        assert!(
+            crate::access::iam::evaluate_principal_operation_with_state(
+                &iam_state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::Terminal,
+            )
+            .allowed
+        );
+        assert!(
+            !crate::access::iam::evaluate_principal_operation_with_state(
+                &iam_state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::AccessManage,
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn unmatched_client_key_reports_its_fingerprint() {
+        let state = crate::access::iam::LocalIamState::default();
+        let key = crate::access::client_key::VerifiedClientKey {
+            fingerprint: "fp-unenrolled".to_string(),
+            public_key_b64u: "unused".to_string(),
+        };
+        let error =
+            connect_dashboard_grant_from_state(state, None, None, Some(&key)).unwrap_err();
+        assert!(error.contains("fp-unenrolled"));
+        assert!(error.contains("People & Devices"));
     }
 
     #[test]
@@ -792,7 +972,8 @@ mod tests {
         });
 
         let grant =
-            connect_dashboard_grant_from_state(state, Some("user-123"), Some("alice")).unwrap();
+            connect_dashboard_grant_from_state(state, Some("user-123"), Some("alice"), None)
+                .unwrap();
         let crate::dashboard_control::DashboardControlGrant::UserClient {
             principal,
             iam_state,

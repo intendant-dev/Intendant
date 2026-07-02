@@ -35,6 +35,7 @@ Read the relevant chapter before changing a subsystem:
 | Runtime stdin/stdout JSON protocol | `docs/src/runtime-protocol.md` |
 | WebRTC display (shared encoder pool, tile streaming) | `docs/src/display-pipeline.md` |
 | Peer federation, cross-machine display, LAN/mTLS | `docs/src/peer-federation.md` |
+| Trust model: anchor daemons, client identity keys, role ceilings, IAM | `docs/src/trust-architecture.md` |
 | Computer use, live audio, phone/voice-call skills | `docs/src/computer-use-and-audio.md` |
 | Presence layer (server text + browser voice) | `docs/src/presence.md` |
 | TUI + the autonomy/approval model | `docs/src/tui.md` |

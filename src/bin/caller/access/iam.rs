@@ -31,6 +31,32 @@ pub struct LocalIamState {
     pub grants: Vec<IamGrant>,
     #[serde(default)]
     pub audit_events: Vec<IamAuditEvent>,
+    /// Effective-permission ceilings for low-provenance authn bindings,
+    /// keyed by binding kind (`connect_account`, `client_key`). A session
+    /// authenticated by a capped binding never exceeds the ceiling role's
+    /// permissions, no matter what its grant says. `connect_account`
+    /// sessions are always subject to their ceiling; `client_key` sessions
+    /// only when the key's recorded enrollment origin is in
+    /// `hosted_origins`. Owners who accept hosted-root risk can raise or
+    /// clear a ceiling by editing this map (an explicit empty map disables
+    /// ceilings entirely).
+    #[serde(default = "default_role_ceilings")]
+    pub role_ceilings: std::collections::BTreeMap<String, String>,
+    /// Origins treated as hosted (low-provenance) app sources when recorded
+    /// on a client key's enrollment binding.
+    #[serde(default = "default_hosted_origins")]
+    pub hosted_origins: Vec<String>,
+}
+
+fn default_role_ceilings() -> std::collections::BTreeMap<String, String> {
+    let mut ceilings = std::collections::BTreeMap::new();
+    ceilings.insert("connect_account".to_string(), "role:operator".to_string());
+    ceilings.insert("client_key".to_string(), "role:operator".to_string());
+    ceilings
+}
+
+fn default_hosted_origins() -> Vec<String> {
+    vec!["https://connect.intendant.dev".to_string()]
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -116,6 +142,19 @@ pub struct UserClientGrantUpsertRequest {
     pub label: Option<String>,
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// Browser identity-key fingerprint (base64url of sha256 over the raw
+    /// P-256 point). Distinct from `fingerprint`, which is the hex mTLS
+    /// certificate fingerprint.
+    #[serde(default)]
+    pub client_key_fingerprint: Option<String>,
+    /// Optional full public key (base64url raw point) kept for audit/display.
+    #[serde(default)]
+    pub client_key: Option<String>,
+    /// Origin the key was enrolled from, recorded by the trusted session
+    /// that creates the grant. Role ceilings use this to distinguish
+    /// anchor-origin keys from hosted-origin keys.
+    #[serde(default)]
+    pub client_key_origin: Option<String>,
     #[serde(default)]
     pub user_id: Option<String>,
     #[serde(default)]
@@ -198,6 +237,16 @@ pub struct AccessPrincipal {
     pub organization: Option<Value>,
     #[serde(default)]
     pub authn: Vec<Value>,
+    /// The authn binding kind that actually authenticated this session
+    /// (e.g. `client_key`, `connect_account`, `browser_mtls_cert`). Role
+    /// ceilings key off this, not the principal kind, because one principal
+    /// (a `human_user`) can carry several bindings of different provenance.
+    #[serde(default)]
+    pub authn_kind: Option<String>,
+    /// The origin recorded on the matched binding at grant time, when the
+    /// binding carries one (client keys do).
+    #[serde(default)]
+    pub authn_origin: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -223,6 +272,8 @@ impl AccessPrincipal {
             account: None,
             organization: None,
             authn: Vec::new(),
+            authn_kind: None,
+            authn_origin: None,
         }
     }
 
@@ -239,6 +290,26 @@ impl AccessPrincipal {
         principal.account = account;
         principal.organization = organization;
         principal.authn = authn;
+        principal
+    }
+
+    /// A trusted-local root session whose offer carried a verified browser
+    /// identity key that has no local grant yet. The session keeps its
+    /// root-compatible authority (the transport is trusted), but the key is
+    /// surfaced in `authn` so the UI can offer to enroll it.
+    pub fn root_dashboard_session_with_client_key(
+        source: impl Into<String>,
+        transport: impl Into<String>,
+        client_key_fingerprint: &str,
+        client_key_public_b64u: &str,
+    ) -> Self {
+        let mut principal = Self::root_dashboard_session(source, transport);
+        principal.authn.push(serde_json::json!({
+            "kind": "client_key",
+            "label": "Browser identity key",
+            "fingerprint": client_key_fingerprint,
+            "public_key": client_key_public_b64u,
+        }));
         principal
     }
 
@@ -267,6 +338,8 @@ impl AccessPrincipal {
             account: None,
             organization: None,
             authn: Vec::new(),
+            authn_kind: None,
+            authn_origin: None,
         }
     }
 
@@ -305,6 +378,8 @@ impl AccessPrincipal {
             account: principal.account.clone(),
             organization: principal.organization.clone(),
             authn: principal.authn.clone(),
+            authn_kind: None,
+            authn_origin: None,
         }
     }
 
@@ -376,6 +451,8 @@ impl Default for LocalIamState {
             roles: builtin_role_templates(),
             grants: Vec::new(),
             audit_events: Vec::new(),
+            role_ceilings: default_role_ceilings(),
+            hosted_origins: default_hosted_origins(),
         }
     }
 }
@@ -763,6 +840,13 @@ fn validate_user_client_role(state: &LocalIamState, role_id: &str) -> AccessResu
 fn normalize_user_client_kind(request: &UserClientGrantUpsertRequest) -> AccessResult<String> {
     let explicit = trimmed_nonempty(request.kind.as_str());
     let inferred = if request
+        .client_key_fingerprint
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .is_some()
+    {
+        Some("client_key")
+    } else if request
         .fingerprint
         .as_deref()
         .and_then(trimmed_nonempty)
@@ -789,6 +873,9 @@ fn normalize_user_client_kind(request: &UserClientGrantUpsertRequest) -> AccessR
         "browser_certificate" | "browser_mtls_cert" | "browser-mtls-cert" => {
             Ok("browser_certificate".to_string())
         }
+        "client_key" | "client-key" | "browser_key" | "browser-key" => {
+            Ok("client_key".to_string())
+        }
         "connect_account" | "connect-account" | "passkey_account" | "passkey-account" => {
             Ok("connect_account".to_string())
         }
@@ -796,7 +883,8 @@ fn normalize_user_client_kind(request: &UserClientGrantUpsertRequest) -> AccessR
             Ok("human_user".to_string())
         }
         _ => Err(AccessError(
-            "kind must be browser_certificate, connect_account, or human_user".to_string(),
+            "kind must be client_key, browser_certificate, connect_account, or human_user"
+                .to_string(),
         )),
     }
 }
@@ -923,9 +1011,69 @@ fn build_user_client_binding(
                 authn: vec![Value::Object(authn)],
             })
         }
+        "client_key" => {
+            let fingerprint = request
+                .client_key_fingerprint
+                .as_deref()
+                .and_then(trimmed_nonempty)
+                .map(normalize_client_key_fingerprint)
+                .filter(|fingerprint| !fingerprint.is_empty())
+                .ok_or_else(|| AccessError("client_key_fingerprint is required".to_string()))?;
+            let label = request
+                .label
+                .as_deref()
+                .and_then(trimmed_nonempty)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("Browser key {}", short_id(&fingerprint)));
+            Ok(UserClientBinding {
+                principal_id: format!("principal:client-key:{fingerprint}"),
+                principal_kind: "client_key".to_string(),
+                label,
+                account: None,
+                organization: organization_metadata(request),
+                authn: vec![client_key_authn_entry(
+                    &fingerprint,
+                    request.client_key.as_deref(),
+                    request.client_key_origin.as_deref(),
+                )],
+            })
+        }
         "human_user" => build_human_user_binding(request),
         _ => Err(AccessError(format!("unsupported user/client kind {kind}"))),
     }
+}
+
+/// Client-key fingerprints are base64url (case-sensitive); unlike hex mTLS
+/// fingerprints they must not be case-folded or stripped.
+pub fn normalize_client_key_fingerprint(value: &str) -> String {
+    value.trim().to_string()
+}
+
+fn client_key_authn_entry(
+    fingerprint: &str,
+    public_key: Option<&str>,
+    origin: Option<&str>,
+) -> Value {
+    let mut authn = serde_json::Map::new();
+    authn.insert("kind".to_string(), Value::String("client_key".to_string()));
+    authn.insert(
+        "label".to_string(),
+        Value::String("Browser identity key".to_string()),
+    );
+    authn.insert(
+        "fingerprint".to_string(),
+        Value::String(fingerprint.to_string()),
+    );
+    if let Some(public_key) = public_key.and_then(trimmed_nonempty) {
+        authn.insert(
+            "public_key".to_string(),
+            Value::String(public_key.to_string()),
+        );
+    }
+    if let Some(origin) = origin.and_then(trimmed_nonempty) {
+        authn.insert("origin".to_string(), Value::String(origin.to_string()));
+    }
+    Value::Object(authn)
 }
 
 fn build_human_user_binding(
@@ -936,6 +1084,12 @@ fn build_human_user_binding(
         .as_deref()
         .and_then(trimmed_nonempty)
         .map(normalize_fingerprint)
+        .filter(|fingerprint| !fingerprint.is_empty());
+    let client_key_fingerprint = request
+        .client_key_fingerprint
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .map(normalize_client_key_fingerprint)
         .filter(|fingerprint| !fingerprint.is_empty());
     let user_id = request
         .user_id
@@ -948,15 +1102,20 @@ fn build_human_user_binding(
         .or(request.account_name.as_deref())
         .and_then(trimmed_nonempty)
         .map(ToOwned::to_owned);
-    if fingerprint.is_none() && user_id.is_none() && handle.is_none() {
+    if fingerprint.is_none()
+        && client_key_fingerprint.is_none()
+        && user_id.is_none()
+        && handle.is_none()
+    {
         return Err(AccessError(
-            "human_user requires a fingerprint, user_id, or handle".to_string(),
+            "human_user requires a fingerprint, client key, user_id, or handle".to_string(),
         ));
     }
     let id_source = user_id
         .as_deref()
         .or(handle.as_deref())
         .or(fingerprint.as_deref())
+        .or(client_key_fingerprint.as_deref())
         .unwrap_or("human");
     let label = request
         .label
@@ -973,6 +1132,13 @@ fn build_human_user_binding(
             "label": "Browser mTLS certificate",
             "fingerprint": fingerprint,
         }));
+    }
+    if let Some(client_key_fingerprint) = client_key_fingerprint.as_ref() {
+        authn.push(client_key_authn_entry(
+            client_key_fingerprint,
+            request.client_key.as_deref(),
+            request.client_key_origin.as_deref(),
+        ));
     }
     if user_id.is_some() || handle.is_some() {
         let mut connect = serde_json::Map::new();
@@ -1169,9 +1335,11 @@ pub fn overview_metadata(load: &LoadedIamState) -> Value {
             "peer_profile_grants": true,
             "user_client_grants": true,
             "principal_binding": "root_peer_and_local_user_client",
-            "enforced_principal_kinds": ["root_session", "peer_daemon", "human_user", "browser_certificate", "connect_account"],
-            "reason": "The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to browser mTLS or Connect account identities."
-        }
+            "enforced_principal_kinds": ["root_session", "peer_daemon", "human_user", "browser_certificate", "client_key", "connect_account"],
+            "reason": "The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to browser identity keys, browser mTLS certificates, or Connect account identities."
+        },
+        "role_ceilings": load.state.role_ceilings.clone(),
+        "hosted_origins": load.state.hosted_origins.clone()
     })
 }
 
@@ -1395,23 +1563,79 @@ pub fn evaluate_principal_operation_with_state(
         );
     };
     let permission = operation_permission_id(op);
-    if role
+    if !role
         .permissions
         .iter()
         .any(|candidate| candidate == permission)
     {
-        AccessDecision::allowed(
-            principal,
-            op,
-            format!("local IAM role {role_id} allows {permission}"),
-        )
-    } else {
-        AccessDecision::denied(
+        return AccessDecision::denied(
             principal,
             op,
             format!("local IAM role {role_id} does not allow {permission}"),
-        )
+        );
     }
+
+    // Role ceilings: the effective permission set of a low-provenance
+    // session is the intersection of its granted role and the ceiling role
+    // for the binding that authenticated it. The grant stays intact; only
+    // this session's authority is bounded.
+    if let Some(ceiling_role_id) = role_ceiling_for_session(state, principal) {
+        let Some(ceiling_role) = state.roles.iter().find(|role| role.id == ceiling_role_id)
+        else {
+            return AccessDecision::denied(
+                principal,
+                op,
+                format!(
+                    "role ceiling {ceiling_role_id} is configured but not defined; failing closed"
+                ),
+            );
+        };
+        if !ceiling_role
+            .permissions
+            .iter()
+            .any(|candidate| candidate == permission)
+        {
+            let binding = principal.authn_kind.as_deref().unwrap_or("session");
+            return AccessDecision::denied(
+                principal,
+                op,
+                format!(
+                    "role ceiling {ceiling_role_id} for {binding} bindings does not allow {permission}"
+                ),
+            );
+        }
+    }
+
+    AccessDecision::allowed(
+        principal,
+        op,
+        format!("local IAM role {role_id} allows {permission}"),
+    )
+}
+
+/// The ceiling role applying to this session, if any. `connect_account`
+/// bindings are always subject to their configured ceiling; `client_key`
+/// bindings only when the key's recorded enrollment origin is one of the
+/// configured hosted origins (keys born on daemon-served origins are
+/// anchor-grade and uncapped).
+pub fn role_ceiling_for_session(
+    state: &LocalIamState,
+    principal: &AccessPrincipal,
+) -> Option<String> {
+    let binding = principal.authn_kind.as_deref()?;
+    let ceiling = state.role_ceilings.get(binding)?;
+    if binding == "client_key" {
+        let origin = principal.authn_origin.as_deref().unwrap_or("");
+        let hosted = !origin.is_empty()
+            && state
+                .hosted_origins
+                .iter()
+                .any(|candidate| candidate.trim_end_matches('/') == origin.trim_end_matches('/'));
+        if !hosted {
+            return None;
+        }
+    }
+    Some(ceiling.clone())
 }
 
 pub fn operation_permission_id(op: crate::peer::access_policy::PeerOperation) -> &'static str {
@@ -1675,6 +1899,7 @@ fn root_permission_ids() -> Vec<String> {
 fn principal_kind_label(kind: &str) -> &'static str {
     match kind {
         "browser_certificate" => "Browser certificate",
+        "client_key" => "Browser key",
         "connect_account" => "Connect account",
         "passkey_account" => "Passkey account",
         "human_user" | "" => "Human user",
@@ -1735,6 +1960,24 @@ pub fn principal_for_browser_mtls_cert_any_status(
     )
 }
 
+pub fn principal_for_client_key(
+    state: &LocalIamState,
+    fingerprint: &str,
+    transport: impl Into<String>,
+) -> Option<AccessPrincipal> {
+    let fingerprint = normalize_client_key_fingerprint(fingerprint);
+    principal_for_authn(state, "client_key", "fingerprint", &fingerprint, transport)
+}
+
+pub fn principal_for_client_key_any_status(
+    state: &LocalIamState,
+    fingerprint: &str,
+    transport: impl Into<String>,
+) -> Option<AccessPrincipal> {
+    let fingerprint = normalize_client_key_fingerprint(fingerprint);
+    principal_for_authn_any_status(state, "client_key", "fingerprint", &fingerprint, transport)
+}
+
 pub fn principal_for_connect_account(
     state: &LocalIamState,
     user_id: &str,
@@ -1783,6 +2026,18 @@ pub fn principal_for_connect_account_any_status(
     })
 }
 
+fn matched_authn_origin(principal: &IamPrincipal, authn_kind: &str, key: &str, value: &str) -> Option<String> {
+    principal
+        .authn
+        .iter()
+        .find(|authn| {
+            authn.get("kind").and_then(Value::as_str) == Some(authn_kind)
+                && authn.get(key).and_then(Value::as_str) == Some(value)
+        })
+        .and_then(|authn| authn.get("origin").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
 fn principal_for_authn(
     state: &LocalIamState,
     authn_kind: &str,
@@ -1805,9 +2060,10 @@ fn principal_for_authn(
         .grants
         .iter()
         .find(|grant| grant.principal_id == principal.id && is_enforced_status(&grant.status))?;
-    Some(AccessPrincipal::local_user_client(
-        principal, grant, transport,
-    ))
+    let mut access = AccessPrincipal::local_user_client(principal, grant, transport);
+    access.authn_kind = Some(authn_kind.to_string());
+    access.authn_origin = matched_authn_origin(principal, authn_kind, key, value);
+    Some(access)
 }
 
 fn principal_for_authn_any_status(
@@ -1837,9 +2093,10 @@ fn principal_for_authn_any_status(
                 .iter()
                 .find(|grant| grant.principal_id == principal.id)
         })?;
-    Some(AccessPrincipal::local_user_client(
-        principal, grant, transport,
-    ))
+    let mut access = AccessPrincipal::local_user_client(principal, grant, transport);
+    access.authn_kind = Some(authn_kind.to_string());
+    access.authn_origin = matched_authn_origin(principal, authn_kind, key, value);
+    Some(access)
 }
 
 #[allow(dead_code)]
@@ -2060,6 +2317,166 @@ mod tests {
             )
             .allowed
         );
+    }
+
+    #[test]
+    fn role_ceiling_caps_connect_account_sessions() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "connect_account".to_string(),
+                user_id: Some("user-123".to_string()),
+                account_name: Some("alice".to_string()),
+                role_id: Some("role:root".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        let principal =
+            principal_for_connect_account(&state, "user-123", Some("alice"), "connect").unwrap();
+        assert_eq!(principal.authn_kind.as_deref(), Some("connect_account"));
+        // The grant says root, but the default connect_account ceiling is
+        // operator: operating permissions pass, admin permissions do not.
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::Terminal,
+            )
+            .allowed
+        );
+        let denied = evaluate_principal_operation_with_state(
+            &state,
+            &principal,
+            crate::peer::access_policy::PeerOperation::AccessManage,
+        );
+        assert!(!denied.allowed);
+        assert!(denied.reason.contains("role ceiling"));
+
+        // Clearing the ceiling restores the full granted role.
+        state.role_ceilings.clear();
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::AccessManage,
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn role_ceiling_caps_only_hosted_origin_client_keys() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("anchor-key".to_string()),
+                client_key_origin: Some("https://anchor.local:8765".to_string()),
+                role_id: Some("role:root".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("hosted-key".to_string()),
+                client_key_origin: Some("https://connect.intendant.dev".to_string()),
+                role_id: Some("role:root".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        // Anchor-origin keys are anchor-grade: no ceiling.
+        let anchor = principal_for_client_key(&state, "anchor-key", "connect").unwrap();
+        assert_eq!(anchor.authn_origin.as_deref(), Some("https://anchor.local:8765"));
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &anchor,
+                crate::peer::access_policy::PeerOperation::AccessManage,
+            )
+            .allowed
+        );
+
+        // Keys enrolled from a hosted origin are capped.
+        let hosted = principal_for_client_key(&state, "hosted-key", "connect").unwrap();
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &hosted,
+                crate::peer::access_policy::PeerOperation::Terminal,
+            )
+            .allowed
+        );
+        assert!(
+            !evaluate_principal_operation_with_state(
+                &state,
+                &hosted,
+                crate::peer::access_policy::PeerOperation::AccessManage,
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn upsert_client_key_grant_creates_active_binding() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let result = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                // Kind is inferred from the client-key fingerprint.
+                client_key_fingerprint: Some("Fp_Base64-Url".to_string()),
+                client_key: Some("BPubKeyRaw".to_string()),
+                client_key_origin: Some("https://anchor.local:8765".to_string()),
+                role_id: Some("role:terminal".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        assert!(result.created_principal);
+        assert_eq!(result.principal.kind, "client_key");
+        // base64url fingerprints keep their case, unlike hex cert prints.
+        let authn = &result.principal.authn[0];
+        assert_eq!(authn["kind"], "client_key");
+        assert_eq!(authn["fingerprint"], "Fp_Base64-Url");
+        assert_eq!(authn["origin"], "https://anchor.local:8765");
+        assert_eq!(authn["public_key"], "BPubKeyRaw");
+
+        let principal =
+            principal_for_client_key(&state, "Fp_Base64-Url", "connect-dashboard-control")
+                .unwrap();
+        assert_eq!(principal.id, result.principal.id);
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::Terminal,
+            )
+            .allowed
+        );
+        assert!(
+            !evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::Settings,
+            )
+            .allowed
+        );
+        // Case differences must not match.
+        assert!(principal_for_client_key(&state, "fp_base64-url", "x").is_none());
     }
 
     #[test]
