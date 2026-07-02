@@ -447,6 +447,16 @@ async function main() {
     );
     assert.strictEqual(storedHosted, true, 'hosted page did not store the document');
 
+    // The connect page's Advanced drawer lists the stored document
+    // (client-side only — same origin, same localStorage).
+    await hosted.goto(`${connectOrigin}/connect`, { timeout: START_TIMEOUT_MS });
+    await hosted.waitForFunction(
+      () => (document.getElementById('org-rows')?.textContent || '').includes('@acme'),
+      { timeout: START_TIMEOUT_MS }
+    );
+    await hosted.goto(`${connectOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.memberDaemonId)}#activity`, { timeout: START_TIMEOUT_MS });
+    await hosted.waitForFunction(() => Boolean(window.intendantDashboardControl), { timeout: START_TIMEOUT_MS });
+
     // Reload: the rendezvous offer carries the document; the daemon
     // materializes it and the Connect session binds the scoped member
     // principal — the account itself still has no grant of its own.

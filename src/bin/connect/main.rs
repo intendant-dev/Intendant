@@ -2962,6 +2962,14 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     .user-id-row code {{ flex: 1 1 auto; min-width: 0; color: var(--text); font-size: 12px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: rgba(17, 17, 27, .55); }}
     .user-id-row button {{ height: 30px; padding: 0 10px; font-size: 12px; flex: 0 0 auto; }}
     .metric-row {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
+    .org-row {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }}
+    .org-row:first-child {{ padding-top: 0; }}
+    .org-row:last-child {{ border-bottom: 0; padding-bottom: 0; }}
+    .org-main {{ min-width: 0; display: grid; gap: 3px; }}
+    .org-main strong {{ font-size: 13.5px; }}
+    .org-main .sub {{ color: var(--muted-2); font-size: 12px; }}
+    .org-side {{ display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }}
+    .pill.err {{ color: var(--err); border-color: rgba(243, 139, 168, .4); background: rgba(243, 139, 168, .08); }}
     .audit {{ display: grid; }}
     .event {{ padding: 11px 0; border-bottom: 1px solid var(--line); font-size: 13px; }}
     .event:first-child {{ padding-top: 0; }}
@@ -3070,7 +3078,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
 
     <!-- ── Signed in: the power drawer ── -->
     <details id="advanced" class="advanced hidden">
-      <summary>Advanced <span class="hint">&mdash; account identity, sync encryption, audit trail</span></summary>
+      <summary>Advanced <span class="hint">&mdash; account identity, organizations, sync encryption, audit trail</span></summary>
       <div class="advanced-body">
         <div class="advanced-block" id="session-card">
           <h3>Account</h3>
@@ -3084,6 +3092,11 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
             <code id="session-user-id"></code>
             <button id="copy-user-id" class="ghost" type="button">Copy</button>
           </div>
+        </div>
+        <div class="advanced-block" id="orgs-block">
+          <h3>Organizations</h3>
+          <div class="sub">Signed membership documents this browser holds on this origin. They never touch this server &mdash; your browser presents them directly to daemons that trust the issuing org.</div>
+          <div id="org-rows"></div>
         </div>
         <div class="advanced-block">
           <h3>What this account can and cannot do</h3>
@@ -3291,6 +3304,82 @@ async function claimDaemon() {{
   }}
 }}
 
+/* Read (never create) this origin's browser identity key fingerprint so
+   stored org documents can be badged as bound to this browser or not. */
+async function ownIdentityFingerprint() {{
+  try {{
+    if (!window.indexedDB || !crypto?.subtle) return '';
+    const db = await new Promise((resolve, reject) => {{
+      const req = indexedDB.open('intendant-client-identity', 1);
+      req.onupgradeneeded = () => {{
+        if (!req.result.objectStoreNames.contains('keys')) req.result.createObjectStore('keys');
+      }};
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    }});
+    const record = await new Promise((resolve, reject) => {{
+      const tx = db.transaction('keys', 'readonly');
+      const req = tx.objectStore('keys').get('v1');
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    }});
+    db.close();
+    if (!record?.publicRaw) return '';
+    const digest = await crypto.subtle.digest('SHA-256', record.publicRaw);
+    return bufToB64u(digest);
+  }} catch {{ return ''; }}
+}}
+
+async function renderOrgs() {{
+  const rows = $('org-rows');
+  rows.innerHTML = '';
+  let map = {{}};
+  try {{ map = JSON.parse(localStorage.getItem('intendant_org_grants_v1') || '{{}}') || {{}}; }} catch {{}}
+  const docs = Object.values(map).filter(doc => doc && typeof doc === 'object' && doc.org?.handle);
+  if (!docs.length) {{
+    rows.innerHTML = '<div class="empty-hint">None stored in this browser. Daemon dashboards keep a membership document here when you join with one; it is then presented automatically on every connection.</div>';
+    return;
+  }}
+  const ownFp = await ownIdentityFingerprint();
+  const now = Date.now();
+  for (const doc of docs) {{
+    const expires = Number(doc.expires_at_unix_ms || 0);
+    const daysLeft = Math.floor((expires - now) / 86400000);
+    const expired = expires <= now;
+    const role = String(doc.role_id || '').replace(/^role:/, '').replace(/^peer:/, 'daemon: ');
+    const subjectFp = String(doc.subject?.peer_fingerprint || doc.subject?.client_key_fingerprint || '');
+    const mine = ownFp && subjectFp === ownFp;
+    const expiryText = expired
+      ? 'expired — ask the org for a renewed document'
+      : daysLeft < 1 ? 'expires today'
+      : `expires in ${{daysLeft}} day${{daysLeft === 1 ? '' : 's'}}`;
+    const row = document.createElement('div');
+    row.className = 'org-row';
+    row.innerHTML = `
+      <div class="org-main">
+        <strong>@${{escapeHtml(String(doc.org.handle))}}</strong>
+        <span class="sub">${{escapeHtml(role)}} &middot; ${{mine ? 'bound to this browser' : 'bound to ' + escapeHtml(shortId(subjectFp))}} &middot; ${{escapeHtml(expiryText)}}</span>
+      </div>
+      <div class="org-side">
+        <span class="pill ${{expired ? 'err' : (daysLeft < 5 ? 'warn' : 'ok')}}">${{expired ? 'expired' : 'active'}}</span>
+        <button class="ghost" data-org-remove="${{escapeAttr(String(doc.org.handle))}}">Remove</button>
+      </div>`;
+    rows.appendChild(row);
+  }}
+  rows.querySelectorAll('[data-org-remove]').forEach(button => {{
+    button.addEventListener('click', () => {{
+      const handle = button.getAttribute('data-org-remove');
+      if (!confirm(`Remove the stored @${{handle}} document from this browser? Access already granted on daemons is unaffected; automatic presentation stops.`)) return;
+      try {{
+        const current = JSON.parse(localStorage.getItem('intendant_org_grants_v1') || '{{}}') || {{}};
+        delete current[handle];
+        localStorage.setItem('intendant_org_grants_v1', JSON.stringify(current));
+      }} catch {{}}
+      renderOrgs();
+    }});
+  }});
+}}
+
 let fleetAesKey = null;
 async function fleetEncryptionKey() {{
   if (fleetAesKey) return fleetAesKey;
@@ -3334,6 +3423,7 @@ async function refreshAll() {{
     ]);
     state.daemons = daemons.daemons || [];
     state.fleetTargets = await Promise.all((fleet.targets || []).map(decryptFleetTarget));
+    renderOrgs().catch(() => {{}});
     renderDaemons();
     renderFleetTargets();
     renderAudit(audit.events || []);
