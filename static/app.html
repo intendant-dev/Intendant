@@ -188,6 +188,8 @@ html {
   display: inline-block;
   max-width: 96px;
   vertical-align: bottom;
+  font-size: 11px;
+  color: var(--overlay0);
 }
 .status-bar #sb-dashboard-transport-label {
   display: inline-block;
@@ -196,7 +198,11 @@ html {
   max-width: 112px;
   vertical-align: bottom;
 }
-.status-bar .autonomy { font-weight: 600; }
+.status-bar .autonomy {
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
 .status-bar .sep { color: var(--surface2); }
 .status-bar .field-label { color: var(--overlay0); font-size: 10px; margin-right: -6px; }
 /* The negative margin above is sized for direct status-bar children
@@ -206,6 +212,14 @@ html {
    contexts so the wrapper's own gap rule controls the spacing. */
 .status-bar .display-toggle-wrap .field-label,
 .status-bar .sb-dot-group .field-label { margin-right: 0; }
+.status-bar .display-toggle-wrap .field-label { cursor: pointer; }
+/* Grant state colors itself: red until the user grants their display. */
+.status-bar #sb-display-access {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--red);
+}
+.status-bar #sb-display-access.granted { color: var(--green); }
 .display-toggle-wrap { position: relative; display: inline-flex; align-items: center; gap: 4px; }
 .display-picker {
   display: none;
@@ -278,6 +292,7 @@ html {
   cursor: default;
 }
 .status-bar .sb-dot-group.clickable { cursor: pointer; }
+.status-bar .sb-dot-group .sep { margin: 0 2px; }
 .status-bar .active-badge {
   margin-left: 0;
   flex-shrink: 0;
@@ -338,7 +353,7 @@ body.access-page #tab-access {
   flex-shrink: 0;
 }
 .ticker-collapsed { display: flex; gap: 8px; align-items: center; white-space: nowrap; }
-.ticker-expanded { flex-direction: column; gap: 2px; font-size: 11px; }
+.ticker-expanded { display: flex; flex-direction: column; gap: 2px; font-size: 11px; }
 .ticker-expanded > div { white-space: nowrap; }
 .tk-sep { color: var(--surface2); }
 .ticker-chevron { color: var(--overlay0); font-size: 10px; line-height: 1; margin-top: 2px; flex-shrink: 0; }
@@ -3105,13 +3120,23 @@ body.access-page #tab-access {
   min-width: max-content;
   padding: 0 4px 4px 8px;
 }
+/* Labeled small selects — same voice as the Sessions toolbar controls. */
+.subtab-control-label {
+  font-size: 10.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--overlay1);
+  white-space: nowrap;
+}
 .verbosity-select,
 .host-filter-select {
-  padding: 2px 6px;
+  height: 28px;
+  padding: 2px 8px;
   background: var(--surface0);
   border: 1px solid var(--surface1);
   border-radius: 4px;
-  color: var(--subtext0);
+  color: var(--text);
   font-family: inherit;
   font-size: 11px;
   cursor: pointer;
@@ -3857,6 +3882,17 @@ body.context-focus-active {
   min-height: 0;
   flex-direction: column;
   background: var(--concurrent-view-bg);
+}
+/* Idle notice for the live log: absolute overlay so the stream's scroll
+   geometry is untouched; pointer-events none so clicks reach the log and
+   the approval/human panels are unaffected. Below .concurrent-log-label
+   (z-index 2), which must stay on top. */
+.log-empty-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  align-content: center;
+  pointer-events: none;
 }
 .concurrent-log-label {
   position: absolute;
@@ -7747,15 +7783,25 @@ body.context-focus-active {
 .diff-line-hunk { color: var(--blue); background: rgba(137,180,250,0.09); font-weight: 600; }
 .diff-line-file { color: var(--subtext1); background: var(--mantle); }
 .diff-line-ctx { color: var(--text); }
+/* Empty slots speak the ui-empty.compact voice; the class name stays
+   because the renderers regenerate these nodes. */
 .changes-empty {
-  color: var(--overlay0);
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 18px 16px;
   text-align: center;
-  padding: 40px;
-  font-size: 13px;
+  color: var(--subtext0);
+  font-size: 11.5px;
+  line-height: 1.55;
 }
-.changes-sidebar .changes-empty {
-  text-align: left;
-  padding: 18px 10px;
+/* Bare diff header (no file selected) reads as a compact empty hint. */
+.changes-diff-header:not(:has(.changes-diff-path)) {
+  justify-content: center;
+  padding: 18px 16px;
+  color: var(--subtext0);
+  font-size: 11.5px;
+  font-weight: 500;
 }
 @media (max-width: 700px) {
   .changes-container {
@@ -8160,7 +8206,7 @@ body.context-focus-active {
 /* ── Control sub-tab ── */
 .control-pane-body {
   padding: 16px 20px;
-  max-width: 640px;
+  max-width: 680px;
   width: 100%;
   min-width: 0;
   box-sizing: border-box;
@@ -8168,14 +8214,16 @@ body.context-focus-active {
   flex: 1;
   position: relative;
 }
+/* One muted line above the cards: which backend the knobs below target
+   and when changes land. */
 .control-header {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 12px;
-  font-size: 13px;
-  color: var(--subtext1);
+  font-size: 11.5px;
+  color: var(--subtext0);
 }
 .control-backend-badge {
   min-width: 0;
@@ -8229,6 +8277,7 @@ body.context-focus-active {
   min-width: 0;
   box-sizing: border-box;
 }
+#control-approval-rules { margin-bottom: 12px; }
 .control-group legend {
   color: var(--blue);
   font-size: 12px;
@@ -8407,6 +8456,18 @@ body.context-focus-active {
   grid-template-columns: minmax(0, 1fr);
   gap: 12px;
 }
+/* Shell children are spaced by the grid gap alone; neutralize the
+   stand-alone margins the shared vocabulary carries. */
+.managed-context-shell > .ui-explainer { margin: 0; }
+.managed-context-shell > .ui-fold { margin: 0; }
+.managed-context-shell > .ui-card + .ui-card { margin-top: 0; }
+/* Inside a ui-card the session toolbar keeps its flex layout only —
+   the card supplies the chrome. */
+.ui-card > .managed-context-toolbar {
+  border: none;
+  background: transparent;
+  padding: 0;
+}
 .managed-context-toolbar,
 .managed-context-card {
   border: 1px solid var(--surface1);
@@ -8436,12 +8497,20 @@ body.context-focus-active {
 }
 .managed-context-field span,
 .managed-context-card h3,
-.managed-context-card h4 {
+.managed-context-card h4,
+.managed-context-card-header h3,
+.managed-context-card-header h4 {
   font-size: 11px;
   color: var(--overlay1);
   font-weight: 600;
   text-transform: uppercase;
   margin: 0;
+}
+/* Field labels share the ui-field-grid label voice. */
+.managed-context-field span {
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
 }
 .managed-context-field input,
 .managed-context-field select,
@@ -8567,6 +8636,7 @@ body.context-focus-active {
   font-size: 12px;
   line-height: 1.45;
 }
+#managed-context-alerts { margin-top: 10px; }
 .managed-context-alert {
   border: 1px solid rgba(249, 226, 175, 0.45);
   background: rgba(249, 226, 175, 0.10);
@@ -10697,11 +10767,11 @@ body.display-fullscreen-open {
     </div>
     <span class="sep">|</span>
     <span class="field-label">autonomy</span>
-    <span class="autonomy" id="sb-autonomy" style="cursor:pointer;text-decoration:underline dotted" onclick="cycleAutonomy()" title="Click to cycle: Low → Medium → High → Full">Medium</span>
+    <span class="autonomy" id="sb-autonomy" onclick="cycleAutonomy()" title="Click to cycle: Low → Medium → High → Full">Medium</span>
     <span class="sep">|</span>
     <span class="display-toggle-wrap">
-      <span class="field-label" id="sb-display-label" style="cursor:pointer" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">your display</span>
-      <span id="sb-display-access" style="cursor:pointer;font-weight:600;color:#f38ba8" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">off</span>
+      <span class="field-label" id="sb-display-label" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">your display</span>
+      <span id="sb-display-access" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">off</span>
       <div class="display-picker" id="display-picker"></div>
     </span>
     <span class="sep">|</span>
@@ -10720,15 +10790,15 @@ body.display-fullscreen-open {
     <span class="sb-dot-group" title="Live model connection (voice + video — Gemini Live / OpenAI Realtime)">
       <span class="field-label">live</span>
       <span class="voice-dot" id="sb-voice"></span>
-      <span style="font-size:11px;color:var(--overlay0)" id="sb-voice-label"></span>
+      <span id="sb-voice-label"></span>
     </span>
-    <span class="sb-dot-group clickable" id="sb-hosts-group" style="display:none" title="Aggregate state of configured secondary daemons - click to open Access targets">
-      <span class="sep" style="margin:0 2px">|</span>
+    <span class="sb-dot-group clickable hidden" id="sb-hosts-group" title="Aggregate state of configured secondary daemons - click to open Access targets">
+      <span class="sep">|</span>
       <span class="field-label">hosts</span>
       <span class="hosts-aggregate-dot" id="sb-hosts-dot"></span>
     </span>
     <span class="sb-dot-group clickable" id="sb-access-page-link" title="Open fleet access administration">
-      <span class="sep" style="margin:0 2px">|</span>
+      <span class="sep">|</span>
       <span class="field-label" id="sb-access-page-prefix">admin</span>
       <span class="access-nav-link" id="sb-access-page-label">Access</span>
     </span>
@@ -10840,12 +10910,14 @@ body.display-fullscreen-open {
         </button>
         <button class="subtab-btn" data-activity-tab="control">Control</button>
         <div class="activity-subtab-controls" id="activity-log-controls">
+          <label class="subtab-control-label" for="verbosity-select">Verbosity</label>
           <select class="verbosity-select" id="verbosity-select" title="Log verbosity">
             <option value="normal" selected>Normal</option>
             <option value="verbose">Verbose</option>
             <option value="debug">Debug</option>
           </select>
-          <select class="host-filter-select" id="host-filter-select" title="Filter activity by source host" style="display:none">
+          <label class="subtab-control-label hidden" for="host-filter-select" id="host-filter-label">Host</label>
+          <select class="host-filter-select hidden" id="host-filter-select" title="Filter activity by source host">
             <option value="">All hosts</option>
           </select>
         </div>
@@ -10896,6 +10968,15 @@ body.display-fullscreen-open {
               <button type="button" class="concurrent-log-action" id="concurrent-log-maximize" title="Maximize concurrent view" aria-label="Maximize concurrent view">&#x26F6;</button>
             </div>
             <div class="log-stream" id="log-stream"></div>
+            <div class="ui-empty log-empty-overlay" id="log-empty-state" aria-hidden="true">
+              <div class="ui-empty-glyph">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 12h4l2.5-6 4 12 2.5-6h5"/>
+                </svg>
+              </div>
+              <div class="ui-empty-title">No activity yet</div>
+              <div class="ui-empty-hint">Send a task below to start the agent, or pick a session from Sessions.</div>
+            </div>
           </div>
           <button class="scroll-bottom-btn" id="scroll-bottom" title="Scroll to bottom">&#x2193;</button>
 
@@ -10991,35 +11072,68 @@ body.display-fullscreen-open {
         <div class="subtab-pane" id="activity-managed-pane">
           <div class="managed-context-pane">
             <div class="managed-context-shell">
-              <div class="managed-context-toolbar">
-                <label class="managed-context-field wide" for="managed-context-session">
-                  <span>Codex session</span>
-                  <select id="managed-context-session"></select>
-                </label>
-                <label class="managed-context-field short" for="managed-context-position">
-                  <span>Anchor side</span>
-                  <select id="managed-context-position">
-                    <option value="after">after</option>
-                    <option value="before">before</option>
-                  </select>
-                </label>
-                <button type="button" class="managed-context-btn" id="managed-context-use-target">Use target</button>
-                <button type="button" class="managed-context-btn" id="managed-context-refresh">Refresh</button>
+              <div class="ui-explainer">
+                <div class="ui-explainer-step">
+                  <div class="ui-explainer-kicker">Managed context</div>
+                  <div class="ui-explainer-title">Watch</div>
+                  <div class="ui-explainer-text">Density and records show how the managed context evolves as the session runs.</div>
+                </div>
+                <div class="ui-explainer-arrow" aria-hidden="true">&#x2192;</div>
+                <div class="ui-explainer-step">
+                  <div class="ui-explainer-kicker">Managed context</div>
+                  <div class="ui-explainer-title">Anchor</div>
+                  <div class="ui-explainer-text">Pick the exact conversation item to branch from — from the log or the recent-anchor list.</div>
+                </div>
+                <div class="ui-explainer-arrow" aria-hidden="true">&#x2192;</div>
+                <div class="ui-explainer-step">
+                  <div class="ui-explainer-kicker">Managed context</div>
+                  <div class="ui-explainer-title">Rewind</div>
+                  <div class="ui-explainer-text">Crystallize a clean continuation: keep the durable facts, drop the noise.</div>
+                </div>
               </div>
 
-              <div class="managed-context-card">
-                <div class="managed-context-card-header">
-                  <h3>Density</h3>
-                  <span class="managed-context-muted" id="managed-context-updated">--</span>
+              <section class="ui-card">
+                <div class="ui-section-head">
+                  <h3 class="ui-section-title">Session</h3>
+                  <span class="ui-section-sub">The managed Codex session to inspect and operate on.</span>
+                </div>
+                <div class="managed-context-toolbar">
+                  <label class="managed-context-field wide" for="managed-context-session">
+                    <span>Codex session</span>
+                    <select id="managed-context-session"></select>
+                  </label>
+                  <label class="managed-context-field short" for="managed-context-position">
+                    <span>Anchor side</span>
+                    <select id="managed-context-position">
+                      <option value="after">after</option>
+                      <option value="before">before</option>
+                    </select>
+                  </label>
+                  <button type="button" class="managed-context-btn" id="managed-context-use-target">Use target</button>
+                  <button type="button" class="managed-context-btn" id="managed-context-refresh">Refresh</button>
+                </div>
+              </section>
+
+              <section class="ui-card">
+                <div class="ui-section-head">
+                  <h3 class="ui-section-title">Density</h3>
+                  <span class="ui-section-sub">How much signal the context holds and how hard compaction pressure is pushing.</span>
+                  <div class="ui-section-actions">
+                    <span class="managed-context-muted" id="managed-context-updated">--</span>
+                  </div>
                 </div>
                 <div class="managed-context-grid" id="managed-context-stats"></div>
                 <div class="managed-context-pressure-track">
                   <div class="managed-context-pressure-fill" id="managed-context-pressure-fill"></div>
                 </div>
-                <div id="managed-context-alerts" style="margin-top:10px"></div>
-              </div>
+                <div id="managed-context-alerts"></div>
+              </section>
 
-              <div class="managed-context-card managed-context-card-grid">
+              <details class="ui-fold" id="managed-context-rewind-fold">
+                <summary>Rewind composer</summary>
+                <div class="ui-fold-body">
+                  <p class="ui-fold-hint">Branch the session from an exact item: name the anchor, say why, and write the primer that carries forward.</p>
+                  <div class="managed-context-card-grid">
                 <div>
                   <div class="managed-context-card-header">
                     <h3>Rewind</h3>
@@ -11066,9 +11180,15 @@ body.display-fullscreen-open {
                   </div>
                   <div class="managed-context-anchor-list" id="managed-context-anchors"></div>
                 </div>
-              </div>
+                  </div>
+                </div>
+              </details>
 
-              <div class="managed-context-card managed-context-card-grid">
+              <details class="ui-fold" id="managed-context-records-fold">
+                <summary>Records &amp; backout</summary>
+                <div class="ui-fold-body">
+                  <p class="ui-fold-hint">Every rewind leaves a record — inspect one, restore it, fork from it, or back it out.</p>
+                  <div class="managed-context-card-grid">
                 <div>
                   <div class="managed-context-card-header">
                     <h3>Records</h3>
@@ -11102,7 +11222,9 @@ body.display-fullscreen-open {
                   </div>
                   <pre class="managed-context-raw" id="managed-context-action-result">No action yet</pre>
                 </div>
-              </div>
+                  </div>
+                </div>
+              </details>
 
               <div class="managed-context-card">
                 <div class="managed-context-card-header">
@@ -11162,8 +11284,11 @@ body.display-fullscreen-open {
               <span class="control-fast-status hidden" id="control-fast-status"></span>
               <span class="control-applies-note" id="control-applies-note">changes apply on next task</span>
             </div>
-            <fieldset class="control-group" id="control-approval-rules">
-              <legend>Approval rules</legend>
+            <section class="ui-card" id="control-approval-rules">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title">Approval rules</h3>
+                <span class="ui-section-sub">Per-category gates for the internal agent. Applied live and saved to <code>intendant.toml</code>.</span>
+              </div>
               <div class="control-row">
                 <label for="control-approval-file_read">File read</label>
                 <select id="control-approval-file_read" data-approval-category="file_read">
@@ -11231,7 +11356,7 @@ body.display-fullscreen-open {
               <div class="control-hint">
                 Per-category gates for the internal agent. <strong>Auto</strong>: run without asking. <strong>Ask</strong>: prompt for approval. <strong>Deny</strong>: block outright. Applied live and saved to <code>intendant.toml [approval]</code>.
               </div>
-            </fieldset>
+            </section>
             <div id="control-codex-section">
               <fieldset class="control-group">
                 <legend>Thread actions</legend>
@@ -13379,6 +13504,12 @@ function resetMainLogNewBelow() {
 }
 
 let logEntryCount = 0;
+// Idle empty state for the live log: visible only while the stream has
+// zero entries. Called wherever logEntryCount changes to/from zero.
+function updateLogEmptyState() {
+  const empty = document.getElementById('log-empty-state');
+  if (empty) empty.classList.toggle('hidden', logEntryCount > 0);
+}
 let commandOutputGroupSeq = 0;
 const activeCommandOutputGroups = new Map();
 const commandOutputGroups = new Map();
@@ -22761,6 +22892,24 @@ const NEW_SESSION_SPAWN_TIMEOUT_MS = 90000;
 const NEW_SESSION_LAUNCH_FAILURE_GRACE_MS = 15000;
 
 async function refreshControlPane() {
+  // Deep links (#activity/control) route here during script evaluation,
+  // before the dashboard transport is constructed — poll briefly instead
+  // of throwing on a null transport and leaving the pane half-rendered.
+  if (!dashboardTransport) {
+    if (!refreshControlPane._waitingForTransport) {
+      refreshControlPane._waitingForTransport = true;
+      const retry = () => {
+        if (dashboardTransport) {
+          refreshControlPane._waitingForTransport = false;
+          refreshControlPane();
+        } else {
+          setTimeout(retry, 250);
+        }
+      };
+      setTimeout(retry, 250);
+    }
+    return;
+  }
   try {
     const d = await fetchDashboardSettings();
     controlCurrentBackend = normalizeAgentId(d.external_agent);
@@ -24604,6 +24753,10 @@ function fillManagedContextAnchor(itemId, sessionId = '') {
   }
   const anchor = managedContextEl('managed-context-anchor');
   if (anchor) anchor.value = itemId || '';
+  // The composer lives in a closed-by-default fold; open it so the
+  // just-selected anchor is visible.
+  const fold = managedContextEl('managed-context-rewind-fold');
+  if (fold) fold.open = true;
   showControlToast('info', 'Managed context anchor selected');
 }
 window.fillManagedContextAnchor = fillManagedContextAnchor;
@@ -25856,6 +26009,7 @@ function clearLogs(options = {}) {
   const clearSessionWindows = options.clearSessionWindows !== false;
   clearMainLogContainers();
   logEntryCount = 0;
+  updateLogEmptyState();
   activeCommandOutputGroups.clear();
   commandOutputGroups.clear();
   if (clearSessionWindows) {
@@ -32466,6 +32620,7 @@ function appendLogEntryElement(entry, sessionRecord = null) {
       appendLogEntryToSessionWindow(entry, logReplayAppendBatch);
     }
     logEntryCount++;
+    updateLogEmptyState();
     logReplayAppendBatch.added++;
     return;
   }
@@ -32481,6 +32636,7 @@ function appendLogEntryElement(entry, sessionRecord = null) {
     appendLogEntryToSessionWindow(entry);
   }
   logEntryCount++;
+  updateLogEmptyState();
   pruneMainLogContainer(container);
   if (!concurrentLogDetachedFragment && autoScroll && stream) {
     stream.scrollTop = stream.scrollHeight;
@@ -33183,14 +33339,14 @@ function setContextUsagePct(pct) {
   if (!fill || !label) return;
   if (pct === undefined || pct === null || Number.isNaN(Number(pct))) {
     fill.style.width = '0%';
-    fill.style.background = '#6c7086';
+    fill.style.background = 'var(--overlay0)';
     label.textContent = '--';
-    label.style.color = '#6c7086';
+    label.style.color = 'var(--overlay0)';
     return;
   }
   const value = Number(pct);
   fill.style.width = Math.min(value, 100) + '%';
-  const color = value < 50 ? '#a6e3a1' : value < 85 ? '#f9e2af' : '#f38ba8';
+  const color = value < 50 ? 'var(--green)' : value < 85 ? 'var(--yellow)' : 'var(--red)';
   fill.style.background = color;
   label.textContent = value.toFixed(1) + '%';
   label.style.color = color;
@@ -33256,8 +33412,8 @@ function updateStatusBar(d) {
     const el = document.getElementById('sb-autonomy');
     const autonomy = normalizeAutonomyLabel(d.autonomy);
     el.textContent = autonomy;
-    const colors = { Low: '#f38ba8', Medium: '#f9e2af', High: '#94e2d5', Full: '#a6e3a1' };
-    el.style.color = colors[autonomy] || '#f9e2af';
+    const colors = { Low: 'var(--red)', Medium: 'var(--yellow)', High: 'var(--teal)', Full: 'var(--green)' };
+    el.style.color = colors[autonomy] || 'var(--yellow)';
   }
   if (d.session_id) {
     const sid = String(d.session_id || '').trim();
@@ -33582,7 +33738,6 @@ window.toggleTicker = function() {
   document.getElementById('ticker-chevron').innerHTML = tickerExpanded ? '&#x25BE;' : '&#x25B8;';
   document.getElementById('ticker-collapsed').classList.toggle('hidden', tickerExpanded);
   document.getElementById('ticker-expanded').classList.toggle('hidden', !tickerExpanded);
-  document.getElementById('ticker-expanded').style.display = tickerExpanded ? 'flex' : '';
 };
 
 function renderUsageTab(c) {
@@ -50552,10 +50707,10 @@ function updateHostsAggregateDot() {
   const dot = document.getElementById('sb-hosts-dot');
   if (!dot || !group) return;
   if (daemons.length === 0) {
-    group.style.display = 'none';
+    group.classList.add('hidden');
     return;
   }
-  group.style.display = '';
+  group.classList.remove('hidden');
 
   let anyDisconnected = false;
   let anySkewed = false;
@@ -55039,12 +55194,13 @@ function refreshHostFilterOptions() {
   const sel = document.getElementById('host-filter-select');
   if (!sel) return;
 
-  // Hide the dropdown entirely when there are no secondaries — nothing
-  // to filter. Matches the host-badge show/hide behavior. We don't
-  // clear `activeHostFilter` here because the user may still have a
-  // previously-configured filter in localStorage that they want back
-  // as soon as they re-add that secondary.
-  sel.style.display = daemons.length > 0 ? '' : 'none';
+  // Hide the dropdown (and its label) entirely when there are no
+  // secondaries — nothing to filter. Matches the host-badge show/hide
+  // behavior. We don't clear `activeHostFilter` here because the user
+  // may still have a previously-configured filter in localStorage that
+  // they want back as soon as they re-add that secondary.
+  sel.classList.toggle('hidden', daemons.length === 0);
+  document.getElementById('host-filter-label')?.classList.toggle('hidden', daemons.length === 0);
   if (daemons.length === 0) {
     return;
   }
@@ -65414,13 +65570,8 @@ window.toggleUserDisplay = function(event) {
 function setUserDisplayState(granted) {
   userDisplayGranted = granted;
   const el = document.getElementById('sb-display-access');
-  if (granted) {
-    el.textContent = 'on';
-    el.style.color = '#a6e3a1'; // green
-  } else {
-    el.textContent = 'off';
-    el.style.color = '#f38ba8'; // red
-  }
+  el.textContent = granted ? 'on' : 'off';
+  el.classList.toggle('granted', granted);
 }
 
 // Dismiss display picker on click outside or Escape
