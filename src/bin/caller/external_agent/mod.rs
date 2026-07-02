@@ -60,10 +60,14 @@ pub(super) fn encode_mcp_query_value(value: &str) -> String {
 
 /// Build the loopback MCP URL Intendant injects into a supervised backend.
 ///
-/// Carries the per-process auth token, the Intendant session id (so tool
-/// calls are scoped to the calling backend), the `core` tool profile (the
-/// small bootstrap set — the broad surface is discovered lazily through
-/// `intendant ctl`), and, for Codex, the managed-context mode.
+/// Carries the auth token, the Intendant session id (so tool calls are
+/// scoped to the calling backend), the `core` tool profile (the small
+/// bootstrap set — the broad surface is discovered lazily through
+/// `intendant ctl`), and, for Codex, the managed-context mode. When a
+/// session id is present the injected token is *session-scoped* (derived
+/// from the per-process token and the session id), so the backend
+/// authenticates as exactly that supervised agent session to the daemon's
+/// IAM layer and cannot present another session's identity.
 pub(super) fn intendant_bootstrap_mcp_url(
     port: u16,
     session_id: Option<&str>,
@@ -71,7 +75,8 @@ pub(super) fn intendant_bootstrap_mcp_url(
     mcp_token: Option<&str>,
 ) -> String {
     let mut params: Vec<(&str, String)> = Vec::new();
-    if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+    let session_id = session_id.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(session_id) = session_id {
         params.push(("session_id", encode_mcp_query_value(session_id)));
     }
     if let Some(mode) = managed_context.map(str::trim).filter(|s| !s.is_empty()) {
@@ -79,7 +84,11 @@ pub(super) fn intendant_bootstrap_mcp_url(
     }
     params.push(("tool_profile", "core".to_string()));
     if let Some(token) = mcp_token.map(str::trim).filter(|s| !s.is_empty()) {
-        params.push(("mcp_token", encode_mcp_query_value(token)));
+        let value = match session_id {
+            Some(session_id) => crate::web_gateway::session_scoped_mcp_token(token, session_id),
+            None => token.to_string(),
+        };
+        params.push(("mcp_token", encode_mcp_query_value(&value)));
     }
     let query = params
         .into_iter()

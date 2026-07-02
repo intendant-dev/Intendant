@@ -8441,6 +8441,28 @@ async fn api_mcp_tool_call_response(
             "mcp tool call",
         );
     }
+    // Layered on top of the dispatch-level `message.send` gate: the named
+    // tool must also clear its own IAM operation, so a principal scoped to
+    // messaging cannot reach display input or runtime control through the
+    // generic tool-call RPC.
+    let decision = runtime
+        .grant
+        .access_decision(crate::mcp::mcp_tool_operation(&name));
+    if !decision.allowed {
+        return http_body_response(
+            id,
+            403,
+            mcp_error_body(
+                mcp_id,
+                -32603,
+                &format!(
+                    "permission denied for tool '{name}': {} (permission {})",
+                    decision.reason, decision.permission
+                ),
+            ),
+            "mcp tool call",
+        );
+    }
     let arguments = params
         .get("arguments")
         .or_else(|| params.get("args"))

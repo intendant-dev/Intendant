@@ -326,6 +326,16 @@ The pieces that implement the model, mapped to the codebase:
   and cannot silently inject or relabel a daemon in your fleet view.
   Cross-device encryption of private fields (via passkey-PRF-derived keys)
   remains the follow-on step.
+- **MCP principal binding**: `/mcp` requests (supervised backends, `intendant
+  ctl`, the dashboard's tool RPC) enter the same evaluator as every other
+  surface. Supervised agents authenticate with a session-scoped token derived
+  from the daemon's per-process secret, binding them to
+  `principal:agent-session:<id>`; tokenless loopback callers bind to
+  `principal:local-process:loopback`; browser pages must present the daemon's
+  own origin. Each tool call is checked against a per-tool permission map at
+  call time, so `agent_session` / `local_process` grants scope what a given
+  supervised agent or local shell may reach (defaults stay root-compatible on
+  a single-user daemon). See [MCP Server](./mcp-server.md#mcp-authorization).
 - **Org root keys**: membership and role assertions signed by the org key;
   daemons verify signatures rather than trusting a directory. The global
   directory maps handle → org root key and is cross-checkable; a

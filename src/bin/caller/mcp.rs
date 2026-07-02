@@ -1457,6 +1457,67 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
     }
 }
 
+/// The IAM permission gate a given MCP tool call must clear.
+///
+/// Every `/mcp` HTTP request and every dashboard `api_mcp_tool_call` RPC is
+/// bound to an `AccessPrincipal` and evaluated against this operation before
+/// the tool dispatches — this is call-time enforcement, unlike
+/// `tool_allowed_for_profile`, which only shapes `tools/list` output and
+/// deliberately leaves hidden tools callable (the lazy `intendant ctl` path).
+/// Root-compatible principals pass everything; scoped grants (per agent
+/// session, per local process, per browser identity, per peer profile) get
+/// exactly the permissions their role carries.
+///
+/// When adding a tool, add an arm here. Unmapped tools deliberately fall to
+/// `RuntimeControl` — the most restrictive commonly-granted gate — so a new
+/// tool is never accidentally reachable by narrowly-scoped principals before
+/// someone classifies it.
+pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::PeerOperation {
+    use crate::peer::access_policy::PeerOperation;
+    match name {
+        // Daemon/agent status summaries.
+        "get_status" | "get_restart_status" | "get_controller_loop_status"
+        | "browser_workspace_providers" | "list_browser_workspaces" => PeerOperation::StatsRead,
+        // Session observation: logs, pending prompts, managed-context anchors.
+        "get_logs" | "get_pending_approval" | "get_pending_input" | "list_rewind_anchors"
+        | "inspect_rewind_anchor" => PeerOperation::SessionInspect,
+        // Resolving supervised approvals.
+        "approve" | "deny" | "skip" | "approve_all" => PeerOperation::Approval,
+        // Injecting user-style messages into the session.
+        "respond" => PeerOperation::Message,
+        // Starting or delegating agent work.
+        "start_task" => PeerOperation::Task,
+        // Mutating the supervised session's context/lineage.
+        "rewind_context" | "rewind_backout" | "claim_fission_canonical" | "fission_spawn"
+        | "fission_control" => PeerOperation::SessionManage,
+        // Viewing displays, frames, and shared-view surfaces.
+        "list_displays" | "take_screenshot" | "read_screen" | "list_frames" | "read_frame"
+        | "capture_shared_view_frame" | "show_shared_view" | "hide_shared_view"
+        | "focus_shared_view" => PeerOperation::DisplayView,
+        // Controlling displays and injecting input — including granting the
+        // agent access to the user's real session.
+        "take_display" | "release_display" | "grant_user_display" | "revoke_user_display"
+        | "request_shared_view_input" | "execute_cu_actions" => PeerOperation::DisplayInput,
+        // Browser workspaces, live audio, autonomy/verbosity, lifecycle, and
+        // controller-restart orchestration are runtime-control surfaces.
+        "create_browser_workspace"
+        | "close_browser_workspace"
+        | "acquire_browser_workspace"
+        | "release_browser_workspace"
+        | "spawn_live_audio"
+        | "set_autonomy"
+        | "set_verbosity"
+        | "quit"
+        | "schedule_controller_restart"
+        | "controller_turn_complete"
+        | "cancel_controller_restart"
+        | "request_controller_loop_halt"
+        | "clear_controller_loop_halt"
+        | "intervene_controller_loop" => PeerOperation::RuntimeControl,
+        _ => PeerOperation::RuntimeControl,
+    }
+}
+
 macro_rules! manual_http_tool_definition {
     ($name:literal, $description:literal, $params:ty) => {{
         let mut schema = serde_json::to_value(schemars::schema_for!($params)).unwrap_or_default();
@@ -16674,6 +16735,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mcp_tool_operation_maps_surface_to_permission_gates() {
+        use crate::peer::access_policy::PeerOperation;
+
+        assert_eq!(mcp_tool_operation("get_status"), PeerOperation::StatsRead);
+        assert_eq!(
+            mcp_tool_operation("get_logs"),
+            PeerOperation::SessionInspect
+        );
+        assert_eq!(mcp_tool_operation("approve"), PeerOperation::Approval);
+        assert_eq!(mcp_tool_operation("respond"), PeerOperation::Message);
+        assert_eq!(mcp_tool_operation("start_task"), PeerOperation::Task);
+        assert_eq!(
+            mcp_tool_operation("rewind_context"),
+            PeerOperation::SessionManage
+        );
+        assert_eq!(
+            mcp_tool_operation("fission_spawn"),
+            PeerOperation::SessionManage
+        );
+        assert_eq!(
+            mcp_tool_operation("take_screenshot"),
+            PeerOperation::DisplayView
+        );
+        assert_eq!(
+            mcp_tool_operation("show_shared_view"),
+            PeerOperation::DisplayView
+        );
+        // The user-session reach: granting the agent the user's display and
+        // injecting input both sit behind display.input.
+        assert_eq!(
+            mcp_tool_operation("grant_user_display"),
+            PeerOperation::DisplayInput
+        );
+        assert_eq!(
+            mcp_tool_operation("execute_cu_actions"),
+            PeerOperation::DisplayInput
+        );
+        assert_eq!(
+            mcp_tool_operation("request_shared_view_input"),
+            PeerOperation::DisplayInput
+        );
+        assert_eq!(mcp_tool_operation("quit"), PeerOperation::RuntimeControl);
+        assert_eq!(
+            mcp_tool_operation("schedule_controller_restart"),
+            PeerOperation::RuntimeControl
+        );
+        // Unmapped/new tools stay behind the most restrictive
+        // commonly-granted gate until someone classifies them.
+        assert_eq!(
+            mcp_tool_operation("some_future_tool"),
+            PeerOperation::RuntimeControl
+        );
     }
 
     #[test]

@@ -4215,16 +4215,81 @@ fn has_browser_origin_headers(header_text: &str) -> bool {
         || http_header_present(header_text, "sec-fetch-dest")
 }
 
-fn loopback_mcp_auth_matches(header_text: &str) -> bool {
+/// Derive the session-scoped MCP token injected into a supervised backend's
+/// bootstrap URL. Unlike the shared per-process token, possession of a
+/// derived token authenticates *which* supervised agent session is calling:
+/// it is preimage-bound to one session id, so a backend cannot present
+/// another session's identity (or recover the process token) from it.
+pub(crate) fn session_scoped_mcp_token(base_token: &str, session_id: &str) -> String {
+    let mut input = Vec::with_capacity(base_token.len() + session_id.len() + 1);
+    input.extend_from_slice(base_token.as_bytes());
+    input.push(0);
+    input.extend_from_slice(session_id.as_bytes());
+    ring::digest::digest(&ring::digest::SHA256, &input)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// How a request authenticated against this daemon's MCP token, if at all.
+#[derive(Debug, PartialEq)]
+enum McpTokenBinding {
+    /// No MCP token material presented. A non-matching `Authorization:
+    /// Bearer` value deliberately lands here rather than in `Invalid`: that
+    /// header is shared with federation tokens, which the dashboard's
+    /// `authedFetch` attaches to every request when one is stored.
+    Missing,
+    /// The shared per-process token — daemon-minted, root-equivalent.
+    Process,
+    /// A token derived for exactly this request's (decoded) session id.
+    Session(String),
+    /// An explicit MCP token form (`mcp_token` query parameter or
+    /// `x-intendant-mcp-token` header) was presented and matched nothing.
+    Invalid,
+}
+
+fn mcp_request_token_binding(header_text: &str) -> McpTokenBinding {
     let expected = loopback_mcp_auth_token();
     let request_line = header_text.lines().next().unwrap_or("");
-    if query_param(request_line, "mcp_token").as_deref() == Some(expected) {
-        return true;
+    let (session_id, _, _) = mcp_context_from_request_line(request_line);
+    let derived = session_id
+        .as_deref()
+        .map(|sid| session_scoped_mcp_token(expected, sid));
+    let classify = |candidate: &str| {
+        if candidate == expected {
+            Some(McpTokenBinding::Process)
+        } else if derived.as_deref() == Some(candidate) {
+            session_id.clone().map(McpTokenBinding::Session)
+        } else {
+            None
+        }
+    };
+    let explicit = query_param(request_line, "mcp_token")
+        .or_else(|| http_header_value(header_text, "x-intendant-mcp-token").map(str::to_string));
+    if let Some(candidate) = explicit {
+        return classify(&candidate).unwrap_or(McpTokenBinding::Invalid);
     }
-    if http_header_value(header_text, "x-intendant-mcp-token") == Some(expected) {
-        return true;
+    let bearer = http_header_value(header_text, "authorization").and_then(|value| {
+        let value = value.trim();
+        value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "))
+            .map(|token| token.trim().to_string())
+    });
+    if let Some(candidate) = bearer {
+        if let Some(binding) = classify(&candidate) {
+            return binding;
+        }
     }
-    verify_bearer_token(header_text, Some(expected)).is_ok()
+    McpTokenBinding::Missing
+}
+
+fn loopback_mcp_auth_matches(header_text: &str) -> bool {
+    matches!(
+        mcp_request_token_binding(header_text),
+        McpTokenBinding::Process | McpTokenBinding::Session(_)
+    )
 }
 
 fn is_loopback_cleartext_mcp_request(
@@ -17041,12 +17106,49 @@ fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
     }
 }
 
+/// Drop tool definitions the bound principal may not call. Root-compatible
+/// principals see everything; a scoped grant's `tools/list` matches what
+/// `tools/call` would actually allow, so clients never advertise tools that
+/// call-time enforcement will refuse.
+fn filter_mcp_tools_by_access(listed: &mut serde_json::Value, access: &HttpAccessContext) {
+    if let Some(tools) = listed.get_mut("tools").and_then(serde_json::Value::as_array_mut) {
+        tools.retain(|tool| {
+            tool.get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(|name| access.decision(crate::mcp::mcp_tool_operation(name)).allowed)
+                .unwrap_or(false)
+        });
+    }
+}
+
+/// The agent-visible refusal for an IAM-denied tool call: an `isError` tool
+/// result (mirroring the managed-context gate) so supervised backends see
+/// the reason and adapt instead of treating it as a transport fault.
+fn mcp_permission_denied_result(
+    name: &str,
+    principal: &crate::access::iam::AccessPrincipal,
+    decision: &crate::access::iam::AccessDecision,
+) -> serde_json::Value {
+    serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": format!(
+                "Permission denied for tool '{name}': {} (principal {}, permission {}). \
+                 The daemon owner can adjust this principal's IAM grant under Access.",
+                decision.reason, principal.id, decision.permission,
+            ),
+        }],
+        "isError": true,
+    })
+}
+
 async fn handle_mcp_http_request(
     body: &str,
     server: &crate::mcp::IntendantServer,
     session_id: Option<&str>,
     codex_managed_context: Option<bool>,
     tool_profile: Option<&str>,
+    access: &HttpAccessContext,
 ) -> McpHttpOutcome {
     let request: McpHttpRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -17083,9 +17185,13 @@ async fn handle_mcp_http_request(
             // All notification methods: acknowledge and return 202.
             return McpHttpOutcome::Accepted;
         }
-        "tools/list" => Ok(server
-            .list_tools_json_for_session(session_id, codex_managed_context, tool_profile)
-            .await),
+        "tools/list" => {
+            let mut listed = server
+                .list_tools_json_for_session(session_id, codex_managed_context, tool_profile)
+                .await;
+            filter_mcp_tools_by_access(&mut listed, access);
+            Ok(listed)
+        }
         "tools/call" => {
             let params = request.params.unwrap_or_default();
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -17093,6 +17199,19 @@ async fn handle_mcp_http_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
+            let decision = access.decision(crate::mcp::mcp_tool_operation(name));
+            if !decision.allowed {
+                return McpHttpOutcome::Response(McpHttpResponse {
+                    jsonrpc: "2.0".into(),
+                    id: request.id,
+                    result: Some(mcp_permission_denied_result(
+                        name,
+                        &access.principal,
+                        &decision,
+                    )),
+                    error: None,
+                });
+            }
             match server
                 .call_tool_by_name_for_session(name, args, session_id, codex_managed_context)
                 .await
@@ -23475,6 +23594,49 @@ pub fn spawn_web_gateway(
                         //   - DELETE for session:    405 Method Not Allowed (stateless)
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         if let Some(ref mcp) = mcp_server {
+                            // Bind the request to an access principal before
+                            // touching the body. Loopback reachability or a
+                            // shared token alone no longer authorizes the
+                            // tool surface — see `mcp_http_access_context`.
+                            let cert_dir = crate::access::backend::select_backend().cert_dir();
+                            let mcp_access = match mcp_http_access_context(
+                                &cert_dir,
+                                peer_connection_identity.as_ref(),
+                                tls_client_cert_fingerprint.as_deref(),
+                                tls_client_cert_present,
+                                is_tls,
+                                peer_addr,
+                                &header_text,
+                            ) {
+                                Ok(access) => access,
+                                Err((status, message)) => {
+                                    let reason = match status {
+                                        401 => "Unauthorized",
+                                        403 => "Forbidden",
+                                        _ => "Error",
+                                    };
+                                    let body = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": serde_json::Value::Null,
+                                        "error": { "code": -32600, "message": message },
+                                    })
+                                    .to_string();
+                                    let response = format!(
+                                        "HTTP/1.1 {status} {reason}\r\n\
+                                         Content-Type: application/json\r\n\
+                                         Access-Control-Allow-Origin: *\r\n\
+                                         Content-Length: {}\r\n\
+                                         Cache-Control: no-cache\r\n\
+                                         Connection: close\r\n\
+                                         \r\n\
+                                         {body}",
+                                        body.len(),
+                                    );
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                    finalize_http_stream(&mut stream).await;
+                                    return;
+                                }
+                            };
                             let content_length: usize = header_text
                                 .lines()
                                 .find(|l| l.to_lowercase().starts_with("content-length:"))
@@ -23505,6 +23667,7 @@ pub fn spawn_web_gateway(
                                 mcp_session_id.as_deref(),
                                 codex_managed_context,
                                 tool_profile.as_deref(),
+                                &mcp_access,
                             )
                             .await;
                             let http_response = match outcome {
@@ -27555,6 +27718,7 @@ fn http_access_forbidden_response(
     )
 }
 
+#[derive(Debug)]
 struct HttpAccessContext {
     principal: crate::access::iam::AccessPrincipal,
     iam_state: Option<crate::access::iam::LocalIamState>,
@@ -27625,6 +27789,156 @@ fn http_access_context(
         principal: crate::access::iam::AccessPrincipal::root_dashboard_session(source, transport),
         iam_state: None,
     })
+}
+
+/// Bind a `POST /mcp` request to an access principal, the same way the
+/// dashboard HTTP APIs and federation surfaces bind theirs. Resolution
+/// order:
+///
+/// 1. **Peer daemons** (mTLS peer identity) keep their profile-scoped
+///    principal.
+/// 2. **MCP token holders**: a session-derived token authenticates that
+///    supervised agent session; the shared per-process token is
+///    root-equivalent possession (its `session_id`, when present, still
+///    scopes the request so owner grants apply). Both consult local IAM for
+///    an `agent_session` binding (exact session id, then the `"*"`
+///    wildcard) before falling back to a default transport-trusted
+///    principal. An explicit-but-wrong MCP token fails loud.
+/// 3. **Browser pages**: requests carrying browser origin markers must come
+///    from this daemon's own origin (or the app bundle scheme) and then
+///    bind exactly like any dashboard HTTP request (mTLS certificate
+///    principal or trusted-transport root). Foreign origins are refused —
+///    the same posture as the rest of `/api/*`.
+/// 4. **mTLS client certificates** bind to their IAM principal.
+/// 5. **Tokenless loopback** processes bind to the `local_process`
+///    principal — root-compatible by default so bare `intendant ctl` keeps
+///    working on a plain local daemon, scopeable/revocable via a local IAM
+///    grant. Tokenless non-loopback requests are refused.
+fn mcp_http_access_context(
+    cert_dir: &std::path::Path,
+    identity: Option<&PeerConnectionIdentity>,
+    tls_client_cert_fingerprint: Option<&str>,
+    tls_client_cert_present: bool,
+    is_tls: bool,
+    peer_addr: std::net::SocketAddr,
+    header_text: &str,
+) -> Result<HttpAccessContext, (u16, String)> {
+    let dashboard_equivalent_context = || {
+        http_access_context(
+            cert_dir,
+            identity,
+            tls_client_cert_fingerprint,
+            tls_client_cert_present,
+            is_tls,
+        )
+        .map_err(|message| (500u16, message))
+    };
+    if identity.is_some() {
+        return dashboard_equivalent_context();
+    }
+    let transport = if is_tls { "https" } else { "http" };
+    let load_state =
+        || load_local_iam_state_for_request(cert_dir).map_err(|message| (500u16, message));
+    match mcp_request_token_binding(header_text) {
+        McpTokenBinding::Invalid => Err((
+            401,
+            "invalid mcp_token; use the URL Intendant injected (INTENDANT_MCP_URL)".to_string(),
+        )),
+        McpTokenBinding::Session(session_id) => {
+            if let Some(state) = load_state()? {
+                if let Some(principal) = crate::access::iam::principal_for_agent_session(
+                    &state,
+                    &session_id,
+                    transport,
+                ) {
+                    return Ok(HttpAccessContext {
+                        principal,
+                        iam_state: Some(state),
+                    });
+                }
+            }
+            Ok(HttpAccessContext {
+                principal: crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+                    &session_id,
+                    transport,
+                    true,
+                ),
+                iam_state: None,
+            })
+        }
+        McpTokenBinding::Process => {
+            let request_line = header_text.lines().next().unwrap_or("");
+            let (session_id, _, _) = mcp_context_from_request_line(request_line);
+            let Some(session_id) = session_id else {
+                return Ok(HttpAccessContext {
+                    principal: crate::access::iam::AccessPrincipal::mcp_token_holder(transport),
+                    iam_state: None,
+                });
+            };
+            if let Some(state) = load_state()? {
+                if let Some(principal) = crate::access::iam::principal_for_agent_session(
+                    &state,
+                    &session_id,
+                    transport,
+                ) {
+                    return Ok(HttpAccessContext {
+                        principal,
+                        iam_state: Some(state),
+                    });
+                }
+            }
+            Ok(HttpAccessContext {
+                principal: crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+                    &session_id,
+                    transport,
+                    false,
+                ),
+                iam_state: None,
+            })
+        }
+        McpTokenBinding::Missing => {
+            if has_browser_origin_headers(header_text) {
+                let origin_allowed = extract_origin_header(header_text)
+                    .map(|origin| is_own_or_app_origin(&origin, is_tls, header_text))
+                    .unwrap_or(false);
+                if !origin_allowed {
+                    return Err((
+                        403,
+                        "cross-origin /mcp requests are refused; only pages served by this \
+                         daemon (or its app bundle) may call /mcp without an mcp_token"
+                            .to_string(),
+                    ));
+                }
+                return dashboard_equivalent_context();
+            }
+            if tls_client_cert_fingerprint.is_some() {
+                return dashboard_equivalent_context();
+            }
+            if !peer_addr.ip().is_loopback() {
+                return Err((
+                    401,
+                    "mcp_token required: tokenless /mcp is only served to loopback clients"
+                        .to_string(),
+                ));
+            }
+            if let Some(state) = load_state()? {
+                if let Some(principal) =
+                    crate::access::iam::principal_for_loopback_mcp(&state, transport)
+                {
+                    return Ok(HttpAccessContext {
+                        principal,
+                        iam_state: Some(state),
+                    });
+                }
+            }
+            Ok(HttpAccessContext {
+                principal: crate::access::iam::AccessPrincipal::local_loopback_mcp_default(
+                    transport,
+                ),
+                iam_state: None,
+            })
+        }
+    }
 }
 
 fn load_local_iam_state_for_request(
@@ -34448,6 +34762,326 @@ mod tests {
                 "POST /mcp?mcp_token={token} HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Site: cross-site\r\n\r\n"
             )
         ));
+    }
+
+    #[test]
+    fn session_scoped_mcp_token_binds_one_session() {
+        let a = session_scoped_mcp_token("base", "session-a");
+        let b = session_scoped_mcp_token("base", "session-b");
+        assert_eq!(a, session_scoped_mcp_token("base", "session-a"));
+        assert_ne!(a, b);
+        assert_ne!(a, "base");
+        assert_ne!(a, session_scoped_mcp_token("other", "session-a"));
+        assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn mcp_request_token_binding_classifies_token_forms() {
+        let token = loopback_mcp_auth_token();
+        let derived = session_scoped_mcp_token(token, "child");
+
+        assert_eq!(
+            mcp_request_token_binding(&format!(
+                "POST /mcp?mcp_token={token} HTTP/1.1\r\nHost: h\r\n\r\n"
+            )),
+            McpTokenBinding::Process
+        );
+        assert_eq!(
+            mcp_request_token_binding(&format!(
+                "POST /mcp HTTP/1.1\r\nHost: h\r\nX-Intendant-Mcp-Token: {token}\r\n\r\n"
+            )),
+            McpTokenBinding::Process
+        );
+        assert_eq!(
+            mcp_request_token_binding(&format!(
+                "POST /mcp HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer {token}\r\n\r\n"
+            )),
+            McpTokenBinding::Process
+        );
+        // A session-derived token authenticates exactly its own session id.
+        assert_eq!(
+            mcp_request_token_binding(&format!(
+                "POST /mcp?session_id=child&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            )),
+            McpTokenBinding::Session("child".to_string())
+        );
+        assert_eq!(
+            mcp_request_token_binding(&format!(
+                "POST /mcp?session_id=other&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            )),
+            McpTokenBinding::Invalid
+        );
+        assert_eq!(
+            mcp_request_token_binding(&format!(
+                "POST /mcp?mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            )),
+            McpTokenBinding::Invalid
+        );
+        // Wrong explicit token forms fail loud.
+        assert_eq!(
+            mcp_request_token_binding("POST /mcp?mcp_token=wrong HTTP/1.1\r\nHost: h\r\n\r\n"),
+            McpTokenBinding::Invalid
+        );
+        // A non-matching bearer is NOT an MCP auth attempt: the dashboard's
+        // authedFetch attaches stored federation tokens to every request.
+        assert_eq!(
+            mcp_request_token_binding(
+                "POST /mcp HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer federation-token\r\n\r\n"
+            ),
+            McpTokenBinding::Missing
+        );
+        assert_eq!(
+            mcp_request_token_binding("POST /mcp HTTP/1.1\r\nHost: h\r\n\r\n"),
+            McpTokenBinding::Missing
+        );
+
+        // The derived token also satisfies the strict-TLS loopback
+        // cleartext exception, so supervised backends keep working against
+        // HTTPS-only daemons.
+        let loopback =
+            std::net::SocketAddr::new(std::net::Ipv4Addr::new(127, 0, 0, 1).into(), 43210);
+        assert!(is_loopback_cleartext_mcp_request(
+            loopback,
+            false,
+            &format!(
+                "POST /mcp?session_id=child&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            )
+        ));
+    }
+
+    #[test]
+    fn mcp_http_access_context_binds_token_origin_and_loopback_paths() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 4000);
+        let lan = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 9).into(), 4000);
+        let plain = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
+
+        // Tokenless loopback keeps working — bound to its own principal.
+        let local =
+            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain)
+                .unwrap();
+        assert_eq!(local.principal.id, "principal:local-process:loopback");
+        assert_eq!(local.principal.kind, "root_session");
+        assert!(
+            local
+                .decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+                .allowed
+        );
+
+        // Tokenless non-loopback is refused.
+        let err = mcp_http_access_context(tmp.path(), None, None, false, false, lan, plain)
+            .unwrap_err();
+        assert_eq!(err.0, 401);
+
+        // A wrong explicit token fails loud even on loopback.
+        let err = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            "POST /mcp?mcp_token=wrong HTTP/1.1\r\nHost: h\r\n\r\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 401);
+
+        // Foreign browser origins are refused; the daemon's own page binds
+        // like any dashboard HTTP request.
+        let err = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: https://evil.example\r\n\r\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 403);
+        let dash = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(dash.principal.id, "principal:root:dashboard");
+
+        // Process-token possession binds the token-holder principal; a
+        // session-derived token binds that agent session.
+        let token = loopback_mcp_auth_token();
+        let holder = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            lan,
+            &format!("POST /mcp?mcp_token={token} HTTP/1.1\r\nHost: h\r\n\r\n"),
+        )
+        .unwrap();
+        assert_eq!(holder.principal.id, "principal:mcp-token-holder");
+        let derived = session_scoped_mcp_token(token, "child-1");
+        let agent = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &format!(
+                "POST /mcp?session_id=child-1&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(agent.principal.id, "principal:agent-session:child-1");
+        assert_eq!(agent.principal.source, "mcp-session-token");
+        assert!(
+            agent
+                .decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn mcp_http_access_context_enforces_scoped_agent_and_loopback_grants() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 4000);
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "test");
+
+        let mut state = crate::access::iam::LocalIamState::default();
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "agent_session".to_string(),
+                session_id: Some("kid-1".to_string()),
+                role_id: Some("role:session-reader".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "agent_session".to_string(),
+                session_id: Some("*".to_string()),
+                role_id: Some("role:operator".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "local_process".to_string(),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+
+        let token = loopback_mcp_auth_token();
+        let derived = session_scoped_mcp_token(token, "kid-1");
+        let scoped = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &format!(
+                "POST /mcp?session_id=kid-1&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(scoped.principal.kind, "agent_session");
+        assert!(
+            scoped
+                .decision(crate::peer::access_policy::PeerOperation::SessionInspect)
+                .allowed
+        );
+        assert!(
+            !scoped
+                .decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+                .allowed
+        );
+
+        // Sessions without an exact binding fall to the wildcard grant.
+        let derived_other = session_scoped_mcp_token(token, "other");
+        let wildcard = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &format!(
+                "POST /mcp?session_id=other&mcp_token={derived_other} HTTP/1.1\r\nHost: h\r\n\r\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(wildcard.principal.id, "principal:agent-session:any");
+        assert!(
+            wildcard
+                .decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+                .allowed
+        );
+        assert!(
+            !wildcard
+                .decision(crate::peer::access_policy::PeerOperation::AccessManage)
+                .allowed
+        );
+
+        // The tokenless loopback path honors its local_process grant.
+        let local = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(local.principal.kind, "local_process");
+        assert!(
+            local
+                .decision(crate::peer::access_policy::PeerOperation::DisplayView)
+                .allowed
+        );
+        assert!(
+            !local
+                .decision(crate::peer::access_policy::PeerOperation::Terminal)
+                .allowed
+        );
+
+        // tools/list filtering matches what tools/call would allow.
+        let mut listed = serde_json::json!({
+            "tools": [
+                { "name": "get_status" },
+                { "name": "get_logs" },
+                { "name": "execute_cu_actions" },
+                { "name": "quit" },
+            ]
+        });
+        filter_mcp_tools_by_access(&mut listed, &scoped);
+        let names: Vec<&str> = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(names, vec!["get_status", "get_logs"]);
     }
 
     /// A specific bind address is preserved verbatim in the

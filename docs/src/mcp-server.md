@@ -64,12 +64,58 @@ status, shared-view collaboration, and the minimal real-display/CU tools
 (`list_displays`, `grant_user_display`, `revoke_user_display`, `read_screen`,
 `take_screenshot`, `execute_cu_actions`) — managed and vanilla alike; managed
 context additionally advertises the managed-context rewind/backout and fission
-tools. Omitting `tool_profile` keeps the historical full tool list. Filtering
-applies to `tools/list` only — hidden tools remain callable (that is the lazy
-`ctl tools call` path). Note that `/mcp` authorization is the loopback
-`mcp_token` / transport security, **not** the local IAM principal system that
-gates the dashboard and federation surfaces — a known gap to close as IAM
-coverage expands.
+tools. Omitting `tool_profile` keeps the historical full tool list. Profile
+filtering applies to `tools/list` only — hidden tools remain callable (that
+is the lazy `ctl tools call` path). *Authorization* is separate: see the next
+section.
+
+### /mcp authorization
+
+Every `POST /mcp` request binds to a principal in the same local IAM system
+that gates the dashboard and federation surfaces
+([Trust Architecture](./trust-architecture.md)), and **every `tools/call` is
+evaluated at call time** against that principal's permissions via a per-tool
+operation map (`mcp_tool_operation` in `mcp.rs`; e.g. `execute_cu_actions`
+and `grant_user_display` require `display.input`, `start_task` requires
+`task.run`, unclassified tools require `runtime.control`). `tools/list` is
+filtered to what the principal may actually call. Binding order:
+
+1. **Peer daemons** (mTLS peer identity) use their peer-profile principal.
+2. **Supervised backends** present the token in their injected
+   `INTENDANT_MCP_URL`. It is *session-scoped* — derived from the daemon's
+   per-process token and the `session_id` — so it authenticates exactly that
+   agent session (`principal:agent-session:<id>`). Possession of the raw
+   per-process token remains root-equivalent. Explicit-but-wrong tokens are
+   refused with 401.
+3. **Browser pages** may only call `/mcp` from this daemon's own origin (or
+   the macOS app scheme) and then bind like any dashboard HTTP request
+   (mTLS certificate principal or trusted-transport root). Foreign origins
+   get 403 — same posture as the rest of `/api/*`.
+4. **Tokenless loopback** processes bind to
+   `principal:local-process:loopback`. Tokenless non-loopback requests are
+   refused.
+
+By default the supervised-agent, token-holder, and local-loopback principals
+are root-compatible, so bare `intendant ctl` on the daemon host and existing
+supervised backends keep working with zero ceremony. The point of the
+binding is that the owner can now *scope* them: an
+`agent_session` grant (exact `session_id`, or `"*"` for every supervised
+agent) or a `local_process` grant against
+`POST /api/access/iam/user-client-grants` pins that principal to a role, and
+call-time enforcement + `tools/list` follow it. Example — cap every
+supervised agent at operator (no runtime control, no settings/access
+administration):
+
+```bash
+curl -X POST http://localhost:8765/api/access/iam/user-client-grants \
+  -H 'Content-Type: application/json' \
+  -d '{"kind": "agent_session", "session_id": "*", "role_id": "role:operator"}'
+```
+
+The shared per-process token still exists as the transport-layer fallback
+(and is what the strict-TLS loopback-cleartext exception checks), but
+possession of it is no longer the *authorization* story — grants and the
+evaluator are.
 With the patched managed Codex binary, `rewind_backout mode="fork"` creates a
 new Codex thread while inheriting the lineage prompt-cache key from the saved
 rollout; same-thread `restore` remains available when the current thread should

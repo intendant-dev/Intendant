@@ -12449,10 +12449,19 @@ command = "asana-mcp"
         agent.mcp_session_id = Some("session with spaces".to_string());
         agent.mcp_auth_token = Some("token with spaces&symbols".to_string());
 
+        // The injected token is session-scoped (derived from the process
+        // token and this session id), so the backend authenticates as this
+        // exact supervised session.
+        let expected_token = crate::web_gateway::session_scoped_mcp_token(
+            "token with spaces&symbols",
+            "session with spaces",
+        );
         let url = agent.intendant_mcp_url(8765);
         assert_eq!(
             url,
-            "http://localhost:8765/mcp?session_id=session%20with%20spaces&managed_context=managed&tool_profile=core&mcp_token=token%20with%20spaces%26symbols"
+            format!(
+                "http://localhost:8765/mcp?session_id=session%20with%20spaces&managed_context=managed&tool_profile=core&mcp_token={expected_token}"
+            )
         );
     }
 
