@@ -17106,6 +17106,23 @@ fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
     }
 }
 
+/// CORS header segment for `/mcp` responses: echo the requesting origin
+/// only when it is this daemon's own origin or the app-bundle scheme (the
+/// macOS app's page is served from `intendant://` and genuinely needs the
+/// echo); every other origin — and non-browser clients — gets no
+/// `Access-Control-Allow-Origin` at all. The endpoint used to send the
+/// wildcard, which would have let any page read a response it somehow
+/// obtained; scoping the echo matches the access gate, which refuses
+/// foreign-origin requests anyway.
+fn mcp_cors_header_segment(header_text: &str, is_tls: bool) -> String {
+    match extract_origin_header(header_text)
+        .filter(|origin| is_own_or_app_origin(origin, is_tls, header_text))
+    {
+        Some(origin) => format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"),
+        None => "Vary: Origin\r\n".to_string(),
+    }
+}
+
 /// Drop tool definitions the bound principal may not call. Root-compatible
 /// principals see everything; a scoped grant's `tools/list` matches what
 /// `tools/call` would actually allow, so clients never advertise tools that
@@ -23594,6 +23611,7 @@ pub fn spawn_web_gateway(
                         //   - DELETE for session:    405 Method Not Allowed (stateless)
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         if let Some(ref mcp) = mcp_server {
+                            let mcp_cors = mcp_cors_header_segment(&header_text, is_tls);
                             // Bind the request to an access principal before
                             // touching the body. Loopback reachability or a
                             // shared token alone no longer authorizes the
@@ -23624,7 +23642,7 @@ pub fn spawn_web_gateway(
                                     let response = format!(
                                         "HTTP/1.1 {status} {reason}\r\n\
                                          Content-Type: application/json\r\n\
-                                         Access-Control-Allow-Origin: *\r\n\
+                                         {mcp_cors}\
                                          Content-Length: {}\r\n\
                                          Cache-Control: no-cache\r\n\
                                          Connection: close\r\n\
@@ -23676,7 +23694,7 @@ pub fn spawn_web_gateway(
                                     format!(
                                         "HTTP/1.1 200 OK\r\n\
                                          Content-Type: application/json\r\n\
-                                         Access-Control-Allow-Origin: *\r\n\
+                                         {mcp_cors}\
                                          Content-Length: {}\r\n\
                                          \r\n\
                                          {}",
@@ -23684,11 +23702,12 @@ pub fn spawn_web_gateway(
                                         json,
                                     )
                                 }
-                                McpHttpOutcome::Accepted => "HTTP/1.1 202 Accepted\r\n\
-                                     Access-Control-Allow-Origin: *\r\n\
+                                McpHttpOutcome::Accepted => format!(
+                                    "HTTP/1.1 202 Accepted\r\n\
+                                     {mcp_cors}\
                                      Content-Length: 0\r\n\
                                      \r\n"
-                                    .to_string(),
+                                ),
                             };
                             let _ = stream.write_all(http_response.as_bytes()).await;
                         } else {
@@ -23712,10 +23731,13 @@ pub fn spawn_web_gateway(
                         // are not supported by our stateless endpoint.  Return 405 so rmcp
                         // gracefully falls back (skips SSE / ignores session delete).
                         use tokio::io::AsyncWriteExt;
-                        let http = "HTTP/1.1 405 Method Not Allowed\r\n\
-                                    Access-Control-Allow-Origin: *\r\n\
-                                    Content-Length: 0\r\n\
-                                    \r\n";
+                        let http = format!(
+                            "HTTP/1.1 405 Method Not Allowed\r\n\
+                             {}\
+                             Content-Length: 0\r\n\
+                             \r\n",
+                            mcp_cors_header_segment(&header_text, is_tls)
+                        );
                         let _ = stream.write_all(http.as_bytes()).await;
                     } else if let Some(response) = dashboard_local_file_response(request_line) {
                         use tokio::io::AsyncWriteExt;
@@ -27813,7 +27835,11 @@ fn http_access_context(
 /// 5. **Tokenless loopback** processes bind to the `local_process`
 ///    principal — root-compatible by default so bare `intendant ctl` keeps
 ///    working on a plain local daemon, scopeable/revocable via a local IAM
-///    grant. Tokenless non-loopback requests are refused.
+///    grant. Once the owner scopes agent sessions at all, this default
+///    fails closed instead (a scoped agent must not escape its grant by
+///    shedding its token), until an explicit `local_process` grant states
+///    what bare loopback callers get. Tokenless non-loopback requests are
+///    refused.
 fn mcp_http_access_context(
     cert_dir: &std::path::Path,
     identity: Option<&PeerConnectionIdentity>,
@@ -27929,6 +27955,16 @@ fn mcp_http_access_context(
                         principal,
                         iam_state: Some(state),
                     });
+                }
+                if crate::access::iam::agent_session_scoping_present(&state) {
+                    return Err((
+                        401,
+                        "agent sessions are scoped on this daemon, so tokenless loopback \
+                         /mcp is disabled; call with your injected INTENDANT_MCP_URL, or \
+                         create a local_process IAM grant to state what bare loopback \
+                         callers may do"
+                            .to_string(),
+                    ));
                 }
             }
             Ok(HttpAccessContext {
@@ -35082,6 +35118,97 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
             .collect();
         assert_eq!(names, vec!["get_status", "get_logs"]);
+    }
+
+    #[test]
+    fn tokenless_loopback_fails_closed_once_agent_sessions_are_scoped() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 4000);
+        let plain = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "test");
+
+        let mut state = crate::access::iam::LocalIamState::default();
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "agent_session".to_string(),
+                session_id: Some("*".to_string()),
+                role_id: Some("role:operator".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+
+        // A scoped agent shedding its token no longer lands on a
+        // root-compatible default.
+        let err = mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain)
+            .unwrap_err();
+        assert_eq!(err.0, 401);
+        assert!(err.1.contains("local_process"), "guidance in: {}", err.1);
+
+        // Presenting the token still binds the (wildcard-scoped) session.
+        let token = loopback_mcp_auth_token();
+        let derived = session_scoped_mcp_token(token, "kid-9");
+        let agent = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &format!(
+                "POST /mcp?session_id=kid-9&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(agent.principal.id, "principal:agent-session:any");
+
+        // An explicit local_process grant states what bare loopback gets.
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "local_process".to_string(),
+                role_id: Some("role:terminal".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        let local =
+            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain)
+                .unwrap();
+        assert_eq!(local.principal.kind, "local_process");
+        assert_eq!(local.principal.role_id, "role:terminal");
+    }
+
+    #[test]
+    fn mcp_cors_segment_echoes_only_own_or_app_origin() {
+        let own =
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n";
+        assert_eq!(
+            mcp_cors_header_segment(own, false),
+            "Access-Control-Allow-Origin: http://localhost:8765\r\nVary: Origin\r\n"
+        );
+        let app = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: intendant://app\r\n\r\n";
+        assert!(mcp_cors_header_segment(app, false).contains("intendant://app"));
+        let foreign =
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: https://evil.example\r\n\r\n";
+        assert_eq!(mcp_cors_header_segment(foreign, false), "Vary: Origin\r\n");
+        let no_origin = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
+        assert_eq!(mcp_cors_header_segment(no_origin, false), "Vary: Origin\r\n");
+        // Scheme must match the connection: an http origin cannot claim a
+        // TLS daemon's identity.
+        let tls_mismatch =
+            "POST /mcp HTTP/1.1\r\nHost: daemon.local:8765\r\nOrigin: http://daemon.local:8765\r\n\r\n";
+        assert_eq!(mcp_cors_header_segment(tls_mismatch, true), "Vary: Origin\r\n");
+        let tls_own =
+            "POST /mcp HTTP/1.1\r\nHost: daemon.local:8765\r\nOrigin: https://daemon.local:8765\r\n\r\n";
+        assert!(mcp_cors_header_segment(tls_own, true)
+            .contains("Access-Control-Allow-Origin: https://daemon.local:8765"));
     }
 
     /// A specific bind address is preserved verbatim in the

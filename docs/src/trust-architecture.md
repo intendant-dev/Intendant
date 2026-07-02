@@ -334,8 +334,11 @@ The pieces that implement the model, mapped to the codebase:
   `principal:local-process:loopback`; browser pages must present the daemon's
   own origin. Each tool call is checked against a per-tool permission map at
   call time, so `agent_session` / `local_process` grants scope what a given
-  supervised agent or local shell may reach (defaults stay root-compatible on
-  a single-user daemon). See [MCP Server](./mcp-server.md#mcp-authorization).
+  supervised agent or local shell may reach. Defaults stay root-compatible on
+  a single-user daemon; once any agent session is scoped, the tokenless
+  loopback default fails closed until a `local_process` grant states what
+  bare local callers get. See
+  [MCP Server](./mcp-server.md#mcp-authorization).
 - **Org root keys**: membership and role assertions signed by the org key;
   daemons verify signatures rather than trusting a directory. The global
   directory maps handle → org root key and is cross-checkable; a

@@ -852,6 +852,7 @@ pub fn update_user_client_grant(
         "browser_certificate"
             | "connect_account"
             | "human_user"
+            | "client_key"
             | "agent_session"
             | "local_process"
             | ""
@@ -2229,6 +2230,23 @@ pub fn principal_for_loopback_mcp(
     principal_for_authn(state, "loopback_mcp", "scope", "loopback", transport)
 }
 
+/// Whether the owner has scoped supervised agent sessions at all: any
+/// enforced principal carrying an `agent_session` binding counts, active
+/// grant or not (an expired grant must not silently reopen anything). Once
+/// this is true, the tokenless loopback `/mcp` default flips from
+/// root-compatible to fail-closed — otherwise a scoped agent could shed its
+/// injected token and re-enter as the unscoped local-process principal,
+/// making the agent grant decorative.
+pub fn agent_session_scoping_present(state: &LocalIamState) -> bool {
+    state.principals.iter().any(|principal| {
+        is_enforced_status(&principal.status)
+            && principal
+                .authn
+                .iter()
+                .any(|authn| authn.get("kind").and_then(Value::as_str) == Some("agent_session"))
+    })
+}
+
 pub fn principal_for_connect_account(
     state: &LocalIamState,
     user_id: &str,
@@ -2615,6 +2633,92 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("session_id"));
+    }
+
+    #[test]
+    fn client_key_grants_can_be_updated() {
+        let actor = AccessPrincipal::root_dashboard_session("test", "test");
+        let mut state = LocalIamState::default();
+        let created = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "client_key".to_string(),
+                client_key_fingerprint: Some("fp-abc".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        assert_eq!(created.principal.kind, "client_key");
+
+        let updated = update_user_client_grant(
+            &mut state,
+            IamGrantUpdateRequest {
+                grant_id: created.grant.id.clone(),
+                role_id: Some("role:operator".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        assert_eq!(updated.grant.role_id, "role:operator");
+
+        let revoked = update_user_client_grant(
+            &mut state,
+            IamGrantUpdateRequest {
+                grant_id: created.grant.id,
+                status: Some("revoked".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        assert_eq!(revoked.grant.status, "revoked");
+        assert!(principal_for_client_key(&state, "fp-abc", "https").is_none());
+    }
+
+    #[test]
+    fn agent_session_scoping_presence_tracks_enforced_bindings() {
+        let actor = AccessPrincipal::root_dashboard_session("test", "test");
+        let mut state = LocalIamState::default();
+        assert!(!agent_session_scoping_present(&state));
+
+        let created = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "agent_session".to_string(),
+                session_id: Some("*".to_string()),
+                role_id: Some("role:operator".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        assert!(agent_session_scoping_present(&state));
+
+        // An expired grant does not reopen anything: the binding still
+        // counts as scoping intent.
+        state
+            .grants
+            .iter_mut()
+            .find(|grant| grant.id == created.grant.id)
+            .unwrap()
+            .expires_at_unix_ms = Some(1);
+        assert!(agent_session_scoping_present(&state));
+
+        // Deliberate revocation demotes the principal and clears the flag.
+        update_user_client_grant(
+            &mut state,
+            IamGrantUpdateRequest {
+                grant_id: created.grant.id,
+                status: Some("revoked".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        assert!(!agent_session_scoping_present(&state));
     }
 
     #[test]

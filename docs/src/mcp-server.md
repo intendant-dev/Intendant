@@ -93,7 +93,11 @@ filtered to what the principal may actually call. Binding order:
    get 403 — same posture as the rest of `/api/*`.
 4. **Tokenless loopback** processes bind to
    `principal:local-process:loopback`. Tokenless non-loopback requests are
-   refused.
+   refused. Once any `agent_session` grant exists, this path **fails
+   closed** (401) until an explicit `local_process` grant states what bare
+   loopback callers may do — otherwise a scoped agent could shed its
+   injected token and re-enter as the root-compatible local default,
+   making its grant decorative.
 
 By default the supervised-agent, token-holder, and local-loopback principals
 are root-compatible, so bare `intendant ctl` on the daemon host and existing
@@ -112,10 +116,25 @@ curl -X POST http://localhost:8765/api/access/iam/user-client-grants \
   -d '{"kind": "agent_session", "session_id": "*", "role_id": "role:operator"}'
 ```
 
+Scoping any agent session flips the tokenless loopback default to
+fail-closed, so pair it with an explicit statement of what your own bare
+`intendant ctl` gets (root keeps it exactly as before, now as a visible,
+revocable grant):
+
+```bash
+curl -X POST http://localhost:8765/api/access/iam/user-client-grants \
+  -H 'Content-Type: application/json' \
+  -d '{"kind": "local_process", "role_id": "role:root"}'
+```
+
 The shared per-process token still exists as the transport-layer fallback
 (and is what the strict-TLS loopback-cleartext exception checks), but
 possession of it is no longer the *authorization* story — grants and the
 evaluator are.
+
+CORS on `/mcp` matches the gate: responses echo `Access-Control-Allow-Origin`
+only for the daemon's own origin or the app-bundle scheme (which genuinely
+needs it); foreign origins and non-browser clients get no CORS grant at all.
 With the patched managed Codex binary, `rewind_backout mode="fork"` creates a
 new Codex thread while inheriting the lineage prompt-cache key from the saved
 rollout; same-thread `restore` remains available when the current thread should
