@@ -4316,6 +4316,14 @@ fn loopback_mcp_auth_matches(header_text: &str) -> bool {
     )
 }
 
+/// Loopback test that also recognizes IPv4-mapped IPv6 loopback
+/// (`::ffff:127.0.0.1`) — what a 127.0.0.1 client looks like to a daemon
+/// bound on a dual-stack wildcard socket. `Ipv6Addr::is_loopback` alone is
+/// false for mapped addresses, which wrongly 401'd tokenless loopback /mcp.
+fn client_ip_is_loopback(ip: std::net::IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
+}
+
 fn is_loopback_cleartext_mcp_request(
     remote_addr: std::net::SocketAddr,
     is_tls: bool,
@@ -4323,7 +4331,7 @@ fn is_loopback_cleartext_mcp_request(
 ) -> bool {
     let request_line = header_text.lines().next().unwrap_or("");
     !is_tls
-        && remote_addr.ip().is_loopback()
+        && client_ip_is_loopback(remote_addr.ip())
         && is_mcp_request_path(request_line)
         && !has_browser_origin_headers(header_text)
         && loopback_mcp_auth_matches(header_text)
@@ -28839,7 +28847,7 @@ fn mcp_http_access_context(
             if tls_client_cert_fingerprint.is_some() {
                 return dashboard_equivalent_context();
             }
-            if !peer_addr.ip().is_loopback() {
+            if !client_ip_is_loopback(peer_addr.ip()) {
                 return Err((
                     401,
                     "mcp_token required: tokenless /mcp is only served to loopback clients"
@@ -35675,6 +35683,19 @@ mod tests {
         assert_eq!(session_id.as_deref(), Some("wrapped id"));
         assert_eq!(managed_context, Some(false));
         assert_eq!(tool_profile, None);
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_loopback_counts_as_loopback() {
+        use std::net::IpAddr;
+
+        assert!(client_ip_is_loopback("127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(client_ip_is_loopback("::1".parse::<IpAddr>().unwrap()));
+        // What a 127.0.0.1 client looks like on a dual-stack wildcard bind.
+        assert!(client_ip_is_loopback("::ffff:127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(!client_ip_is_loopback("::ffff:192.168.1.10".parse::<IpAddr>().unwrap()));
+        assert!(!client_ip_is_loopback("192.168.1.10".parse::<IpAddr>().unwrap()));
+        assert!(!client_ip_is_loopback("fe80::1".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
