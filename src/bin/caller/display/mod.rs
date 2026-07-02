@@ -565,6 +565,17 @@ pub trait DisplayBackend: Send + Sync + 'static {
         )))
     }
 
+    /// Paste literal text via the display's clipboard: set the clipboard,
+    /// then press the platform paste chord. Backends without clipboard
+    /// access keep this default error.
+    async fn paste_text(&self, text: &str) -> Result<(), CallerError> {
+        let _ = text;
+        Err(CallerError::Display(format!(
+            "the {} display backend does not support clipboard paste — use a type action instead",
+            self.kind()
+        )))
+    }
+
     /// Current display resolution (width, height).
     fn resolution(&self) -> (u32, u32);
 
@@ -2821,6 +2832,11 @@ impl DisplaySession {
     /// Inject literal text into the display backend.
     pub async fn inject_text(&self, text: &str) -> Result<(), CallerError> {
         self.backend.inject_text(text).await
+    }
+
+    /// Paste text via the display backend's clipboard.
+    pub async fn paste_text(&self, text: &str) -> Result<(), CallerError> {
+        self.backend.paste_text(text).await
     }
 
     /// Current display resolution.

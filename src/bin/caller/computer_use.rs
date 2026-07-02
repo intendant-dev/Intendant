@@ -1974,16 +1974,18 @@ async fn execute_via_session(
                 });
                 needs_auto_screenshot = true;
             }
-            CuAction::Paste { .. } => {
+            CuAction::Paste { text } => {
+                // Clipboard paste through the backend (Windows: arboard +
+                // ctrl+v; Wayland: portal clipboard). Backends without
+                // clipboard access return the trait-default error.
+                let result = session.paste_text(text).await;
+                let success = result.is_ok();
                 results.push(CuActionResult {
-                    success: false,
+                    success,
                     screenshot: None,
-                    error: Some(
-                        "paste is not supported on the Wayland/Windows session backend yet — \
-                         use type instead"
-                            .to_string(),
-                    ),
+                    error: result.err().map(|e| e.to_string()),
                 });
+                needs_auto_screenshot = true;
             }
             CuAction::Key { key } => {
                 let events = key_action_events(key);
