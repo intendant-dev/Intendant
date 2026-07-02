@@ -391,6 +391,20 @@ mod tests {
         assert_eq!(role_to_shared(""), "unknown");
     }
 
+    /// Live test — needs a session accessibility bus and a focused window.
+    /// Run on the Linux boxes:
+    /// `cargo test --bin intendant atspi_read -- --ignored --nocapture`
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore]
+    async fn live_read_frontmost() {
+        let elements = super::read_frontmost(12, 400).await.expect("AT-SPI read");
+        println!(
+            "{}",
+            crate::computer_use::format_screen_elements(&elements)
+        );
+    }
+
     #[test]
     fn make_element_normalizes_fields() {
         let el = make_element(
