@@ -27824,8 +27824,11 @@ fn http_access_context(
 ///    root-equivalent possession (its `session_id`, when present, still
 ///    scopes the request so owner grants apply). Both consult local IAM for
 ///    an `agent_session` binding (exact session id, then the `"*"`
-///    wildcard) before falling back to a default transport-trusted
-///    principal. An explicit-but-wrong MCP token fails loud.
+///    wildcard). A known binding whose grant lapsed — expired or revoked —
+///    binds the scoped principal and is denied by the evaluator (the
+///    browser-cert pattern); only sessions with *no* binding at all fall
+///    back to the default transport-trusted principal. An
+///    explicit-but-wrong MCP token fails loud.
 /// 3. **Browser pages**: requests carrying browser origin markers must come
 ///    from this daemon's own origin (or the app bundle scheme) and then
 ///    bind exactly like any dashboard HTTP request (mTLS certificate
@@ -27835,11 +27838,12 @@ fn http_access_context(
 /// 5. **Tokenless loopback** processes bind to the `local_process`
 ///    principal — root-compatible by default so bare `intendant ctl` keeps
 ///    working on a plain local daemon, scopeable/revocable via a local IAM
-///    grant. Once the owner scopes agent sessions at all, this default
-///    fails closed instead (a scoped agent must not escape its grant by
-///    shedding its token), until an explicit `local_process` grant states
-///    what bare loopback callers get. Tokenless non-loopback requests are
-///    refused.
+///    grant (a lapsed grant denies; it does not restore the default). Once
+///    the owner has ever scoped agent sessions, this default fails closed
+///    instead (a scoped agent must not escape its grant by shedding its
+///    token — not even after its grant expires or is revoked), until an
+///    explicit `local_process` grant states what bare loopback callers
+///    get. Tokenless non-loopback requests are refused.
 fn mcp_http_access_context(
     cert_dir: &std::path::Path,
     identity: Option<&PeerConnectionIdentity>,
@@ -27871,26 +27875,7 @@ fn mcp_http_access_context(
             "invalid mcp_token; use the URL Intendant injected (INTENDANT_MCP_URL)".to_string(),
         )),
         McpTokenBinding::Session(session_id) => {
-            if let Some(state) = load_state()? {
-                if let Some(principal) = crate::access::iam::principal_for_agent_session(
-                    &state,
-                    &session_id,
-                    transport,
-                ) {
-                    return Ok(HttpAccessContext {
-                        principal,
-                        iam_state: Some(state),
-                    });
-                }
-            }
-            Ok(HttpAccessContext {
-                principal: crate::access::iam::AccessPrincipal::supervised_agent_session_default(
-                    &session_id,
-                    transport,
-                    true,
-                ),
-                iam_state: None,
-            })
+            mcp_agent_session_context(cert_dir, &session_id, transport, true)
         }
         McpTokenBinding::Process => {
             let request_line = header_text.lines().next().unwrap_or("");
@@ -27901,26 +27886,7 @@ fn mcp_http_access_context(
                     iam_state: None,
                 });
             };
-            if let Some(state) = load_state()? {
-                if let Some(principal) = crate::access::iam::principal_for_agent_session(
-                    &state,
-                    &session_id,
-                    transport,
-                ) {
-                    return Ok(HttpAccessContext {
-                        principal,
-                        iam_state: Some(state),
-                    });
-                }
-            }
-            Ok(HttpAccessContext {
-                principal: crate::access::iam::AccessPrincipal::supervised_agent_session_default(
-                    &session_id,
-                    transport,
-                    false,
-                ),
-                iam_state: None,
-            })
+            mcp_agent_session_context(cert_dir, &session_id, transport, false)
         }
         McpTokenBinding::Missing => {
             if has_browser_origin_headers(header_text) {
@@ -27956,6 +27922,16 @@ fn mcp_http_access_context(
                         iam_state: Some(state),
                     });
                 }
+                // A lapsed local_process grant binds and is denied by the
+                // evaluator; it never restores the open default.
+                if let Some(principal) =
+                    crate::access::iam::principal_for_loopback_mcp_any_status(&state, transport)
+                {
+                    return Ok(HttpAccessContext {
+                        principal,
+                        iam_state: Some(state),
+                    });
+                }
                 if crate::access::iam::agent_session_scoping_present(&state) {
                     return Err((
                         401,
@@ -27975,6 +27951,48 @@ fn mcp_http_access_context(
             })
         }
     }
+}
+
+/// Resolve a supervised agent session's `/mcp` access context: an active
+/// `agent_session` binding scopes it; a known-but-lapsed binding (expired
+/// or revoked grant) still binds the scoped principal so the evaluator
+/// denies with the real reason — expiry or revocation must never return an
+/// agent to implicit root; only a session with no binding at all gets the
+/// default transport-trusted principal.
+fn mcp_agent_session_context(
+    cert_dir: &std::path::Path,
+    session_id: &str,
+    transport: &str,
+    authenticated: bool,
+) -> Result<HttpAccessContext, (u16, String)> {
+    if let Some(state) =
+        load_local_iam_state_for_request(cert_dir).map_err(|message| (500u16, message))?
+    {
+        if let Some(principal) =
+            crate::access::iam::principal_for_agent_session(&state, session_id, transport)
+        {
+            return Ok(HttpAccessContext {
+                principal,
+                iam_state: Some(state),
+            });
+        }
+        if let Some(principal) = crate::access::iam::principal_for_agent_session_any_status(
+            &state, session_id, transport,
+        ) {
+            return Ok(HttpAccessContext {
+                principal,
+                iam_state: Some(state),
+            });
+        }
+    }
+    Ok(HttpAccessContext {
+        principal: crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+            session_id,
+            transport,
+            authenticated,
+        ),
+        iam_state: None,
+    })
 }
 
 fn load_local_iam_state_for_request(
@@ -35183,6 +35201,89 @@ mod tests {
                 .unwrap();
         assert_eq!(local.principal.kind, "local_process");
         assert_eq!(local.principal.role_id, "role:terminal");
+    }
+
+    #[test]
+    fn lapsed_mcp_grants_bind_and_deny_instead_of_reopening_defaults() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 4000);
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "test");
+
+        let mut state = crate::access::iam::LocalIamState::default();
+        let agent_grant = crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "agent_session".to_string(),
+                session_id: Some("kid-1".to_string()),
+                role_id: Some("role:operator".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        state
+            .grants
+            .iter_mut()
+            .find(|grant| grant.id == agent_grant.grant.id)
+            .unwrap()
+            .expires_at_unix_ms = Some(1);
+        let local_grant = crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "local_process".to_string(),
+                role_id: Some("role:observer".to_string()),
+                status: Some("revoked".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        assert_eq!(local_grant.grant.status, "revoked");
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+
+        // The agent whose grant expired binds its scoped principal and is
+        // denied — it does NOT return to the default root trust.
+        let token = loopback_mcp_auth_token();
+        let derived = session_scoped_mcp_token(token, "kid-1");
+        let agent = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &format!(
+                "POST /mcp?session_id=kid-1&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(agent.principal.id, "principal:agent-session:kid-1");
+        assert_eq!(agent.principal.kind, "agent_session");
+        let decision = agent.decision(crate::peer::access_policy::PeerOperation::StatsRead);
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("expired"), "{}", decision.reason);
+
+        // The tokenless loopback caller with a revoked local_process grant
+        // binds that principal and is denied per-op — the open default does
+        // not return, and the agent-scoping 401 does not mask the real
+        // reason.
+        let local = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(local.principal.id, "principal:local-process:loopback");
+        assert!(
+            !local
+                .decision(crate::peer::access_policy::PeerOperation::StatsRead)
+                .allowed
+        );
     }
 
     #[test]

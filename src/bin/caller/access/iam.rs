@@ -2220,6 +2220,30 @@ pub fn principal_for_agent_session(
     .or_else(|| principal_for_authn(state, "agent_session", "session_id", "*", transport))
 }
 
+/// Any-status counterpart of [`principal_for_agent_session`], mirroring
+/// the browser-certificate pattern: a *known* binding whose grant has
+/// lapsed (expired or revoked) still binds the scoped principal, so the
+/// evaluator denies with the real reason instead of the caller falling
+/// back to transport-default trust. Once an owner has named an agent
+/// session, its authority comes only from grants.
+pub fn principal_for_agent_session_any_status(
+    state: &LocalIamState,
+    session_id: &str,
+    transport: impl Into<String>,
+) -> Option<AccessPrincipal> {
+    let transport = transport.into();
+    principal_for_authn_any_status(
+        state,
+        "agent_session",
+        "session_id",
+        session_id,
+        transport.clone(),
+    )
+    .or_else(|| {
+        principal_for_authn_any_status(state, "agent_session", "session_id", "*", transport)
+    })
+}
+
 /// Resolve the tokenless loopback `/mcp` caller to a scoped local IAM
 /// principal, when the owner has created a `local_process` grant. `None`
 /// means the default root-compatible loopback principal applies.
@@ -2230,20 +2254,34 @@ pub fn principal_for_loopback_mcp(
     principal_for_authn(state, "loopback_mcp", "scope", "loopback", transport)
 }
 
-/// Whether the owner has scoped supervised agent sessions at all: any
-/// enforced principal carrying an `agent_session` binding counts, active
-/// grant or not (an expired grant must not silently reopen anything). Once
-/// this is true, the tokenless loopback `/mcp` default flips from
-/// root-compatible to fail-closed — otherwise a scoped agent could shed its
-/// injected token and re-enter as the unscoped local-process principal,
-/// making the agent grant decorative.
+/// Any-status counterpart of [`principal_for_loopback_mcp`]: a lapsed
+/// `local_process` grant denies rather than silently restoring the
+/// root-compatible loopback default. Restoring implicit-root behavior is
+/// an explicit re-grant (e.g. `role:root`), not a timer or a revocation
+/// side effect.
+pub fn principal_for_loopback_mcp_any_status(
+    state: &LocalIamState,
+    transport: impl Into<String>,
+) -> Option<AccessPrincipal> {
+    principal_for_authn_any_status(state, "loopback_mcp", "scope", "loopback", transport)
+}
+
+/// Whether the owner has ever scoped supervised agent sessions: any
+/// principal carrying an `agent_session` binding counts, regardless of
+/// principal or grant status. Once true, the tokenless loopback `/mcp`
+/// default flips from root-compatible to fail-closed — otherwise a scoped
+/// agent could shed its injected token and re-enter as the unscoped
+/// local-process principal, making the agent grant decorative. The flag is
+/// deliberately sticky across expiry *and* revocation: neither a timer
+/// running out nor "cut this agent off" may quietly reopen the anonymous
+/// local door. The explicit way back is a `local_process` grant stating
+/// what bare loopback callers get.
 pub fn agent_session_scoping_present(state: &LocalIamState) -> bool {
     state.principals.iter().any(|principal| {
-        is_enforced_status(&principal.status)
-            && principal
-                .authn
-                .iter()
-                .any(|authn| authn.get("kind").and_then(Value::as_str) == Some("agent_session"))
+        principal
+            .authn
+            .iter()
+            .any(|authn| authn.get("kind").and_then(Value::as_str) == Some("agent_session"))
     })
 }
 
@@ -2679,7 +2717,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_session_scoping_presence_tracks_enforced_bindings() {
+    fn agent_session_scoping_presence_is_sticky() {
         let actor = AccessPrincipal::root_dashboard_session("test", "test");
         let mut state = LocalIamState::default();
         assert!(!agent_session_scoping_present(&state));
@@ -2697,8 +2735,9 @@ mod tests {
         .unwrap();
         assert!(agent_session_scoping_present(&state));
 
-        // An expired grant does not reopen anything: the binding still
-        // counts as scoping intent.
+        // Neither expiry nor deliberate revocation reopens anything: the
+        // binding keeps counting as scoping intent. The explicit way back
+        // is a local_process grant, never a lapsed timer.
         state
             .grants
             .iter_mut()
@@ -2707,7 +2746,6 @@ mod tests {
             .expires_at_unix_ms = Some(1);
         assert!(agent_session_scoping_present(&state));
 
-        // Deliberate revocation demotes the principal and clears the flag.
         update_user_client_grant(
             &mut state,
             IamGrantUpdateRequest {
@@ -2718,7 +2756,110 @@ mod tests {
             &actor,
         )
         .unwrap();
-        assert!(!agent_session_scoping_present(&state));
+        assert!(agent_session_scoping_present(&state));
+    }
+
+    #[test]
+    fn lapsed_agent_session_grants_bind_and_deny_instead_of_defaulting() {
+        use crate::peer::access_policy::PeerOperation;
+
+        let actor = AccessPrincipal::root_dashboard_session("test", "test");
+        let mut state = LocalIamState::default();
+        let created = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "agent_session".to_string(),
+                session_id: Some("kid-1".to_string()),
+                role_id: Some("role:operator".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        // Expire the grant: the active resolver no longer matches, but the
+        // any-status resolver still binds the scoped principal, and the
+        // evaluator denies with the expiry as the reason.
+        state
+            .grants
+            .iter_mut()
+            .find(|grant| grant.id == created.grant.id)
+            .unwrap()
+            .expires_at_unix_ms = Some(1);
+        assert!(principal_for_agent_session(&state, "kid-1", "http").is_none());
+        let lapsed = principal_for_agent_session_any_status(&state, "kid-1", "http").unwrap();
+        assert_eq!(lapsed.id, "principal:agent-session:kid-1");
+        let decision =
+            evaluate_principal_operation_with_state(&state, &lapsed, PeerOperation::StatsRead);
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("expired"), "{}", decision.reason);
+
+        // A revoked wildcard binding catches sessions with no exact
+        // binding, so they deny too instead of falling back to default
+        // trust.
+        let wildcard = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "agent_session".to_string(),
+                session_id: Some("*".to_string()),
+                role_id: Some("role:operator".to_string()),
+                status: Some("revoked".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        assert_eq!(wildcard.grant.status, "revoked");
+        assert!(principal_for_agent_session(&state, "other", "http").is_none());
+        let lapsed_other =
+            principal_for_agent_session_any_status(&state, "other", "http").unwrap();
+        assert_eq!(lapsed_other.id, "principal:agent-session:any");
+        assert!(
+            !evaluate_principal_operation_with_state(
+                &state,
+                &lapsed_other,
+                PeerOperation::StatsRead
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn lapsed_local_process_grant_binds_and_denies() {
+        use crate::peer::access_policy::PeerOperation;
+
+        let actor = AccessPrincipal::root_dashboard_session("test", "test");
+        let mut state = LocalIamState::default();
+        assert!(principal_for_loopback_mcp_any_status(&state, "http").is_none());
+
+        let created = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "local_process".to_string(),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        update_user_client_grant(
+            &mut state,
+            IamGrantUpdateRequest {
+                grant_id: created.grant.id,
+                status: Some("revoked".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        assert!(principal_for_loopback_mcp(&state, "http").is_none());
+        let lapsed = principal_for_loopback_mcp_any_status(&state, "http").unwrap();
+        assert_eq!(lapsed.id, "principal:local-process:loopback");
+        assert!(
+            !evaluate_principal_operation_with_state(&state, &lapsed, PeerOperation::StatsRead)
+                .allowed
+        );
     }
 
     #[test]

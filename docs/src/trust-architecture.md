@@ -335,9 +335,10 @@ The pieces that implement the model, mapped to the codebase:
   own origin. Each tool call is checked against a per-tool permission map at
   call time, so `agent_session` / `local_process` grants scope what a given
   supervised agent or local shell may reach. Defaults stay root-compatible on
-  a single-user daemon; once any agent session is scoped, the tokenless
-  loopback default fails closed until a `local_process` grant states what
-  bare local callers get. See
+  a single-user daemon; once any agent session has ever been scoped, the
+  tokenless loopback default fails closed until a `local_process` grant
+  states what bare local callers get, and a lapsed grant (expired or
+  revoked) denies rather than restoring default trust. See
   [MCP Server](./mcp-server.md#mcp-authorization).
 - **Org root keys**: membership and role assertions signed by the org key;
   daemons verify signatures rather than trusting a directory. The global

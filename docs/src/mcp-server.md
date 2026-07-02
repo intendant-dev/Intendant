@@ -86,18 +86,30 @@ filtered to what the principal may actually call. Binding order:
    per-process token and the `session_id` — so it authenticates exactly that
    agent session (`principal:agent-session:<id>`). Possession of the raw
    per-process token remains root-equivalent. Explicit-but-wrong tokens are
-   refused with 401.
+   refused with 401. A session whose binding is known but whose grant has
+   *lapsed* (expired or revoked) binds the scoped principal and is denied
+   with the real reason — it does not fall back to default trust; only
+   sessions with no binding at all do.
 3. **Browser pages** may only call `/mcp` from this daemon's own origin (or
    the macOS app scheme) and then bind like any dashboard HTTP request
    (mTLS certificate principal or trusted-transport root). Foreign origins
    get 403 — same posture as the rest of `/api/*`.
 4. **Tokenless loopback** processes bind to
    `principal:local-process:loopback`. Tokenless non-loopback requests are
-   refused. Once any `agent_session` grant exists, this path **fails
-   closed** (401) until an explicit `local_process` grant states what bare
-   loopback callers may do — otherwise a scoped agent could shed its
-   injected token and re-enter as the root-compatible local default,
-   making its grant decorative.
+   refused. Once any `agent_session` binding exists — even one whose grant
+   has since expired or been revoked — this path **fails closed** (401)
+   until an explicit `local_process` grant states what bare loopback
+   callers may do; otherwise a scoped agent could shed its injected token
+   and re-enter as the root-compatible local default, making its grant
+   decorative. A lapsed `local_process` grant likewise denies rather than
+   restoring the open default.
+
+The rule across all of these: **once a principal is named, its authority
+comes only from grants, and a lapsed grant means "no" — never "back to
+defaults".** Security posture only relaxes when a person explicitly
+relaxes it: re-grant `role:root` (to the `"*"` agent principal or to
+`local_process`) to restore the implicit-trust behavior visibly and
+auditable, rather than by timer or revocation side effect.
 
 By default the supervised-agent, token-holder, and local-loopback principals
 are root-compatible, so bare `intendant ctl` on the daemon host and existing
