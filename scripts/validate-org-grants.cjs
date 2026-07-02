@@ -455,11 +455,76 @@ async function main() {
     assert(hostedGrant, `hosted ride-along grant missing: ${JSON.stringify(orgGrants(iam))}`);
     assert.strictEqual(hostedGrant.status, 'active');
 
+    // ══ Scenario 3: org revocation list + renewal (phase 6 step 5) ══
+    // Renewal first, while nothing is revoked: same grant_id, fresh window.
+    const renewedLocal = await postJson(`${orgApi}/api/access/org-grants/renew`, doc);
+    assert.strictEqual(renewedLocal.status, 200, `renew failed: ${JSON.stringify(renewedLocal.body)}`);
+    assert.strictEqual(renewedLocal.body.document.grant_id, doc.grant_id, 'renewal changed grant_id');
+    assert(renewedLocal.body.document.expires_at_unix_ms > doc.expires_at_unix_ms, 'renewal did not extend expiry');
+    assert.strictEqual(
+      renewedLocal.body.document.expires_at_unix_ms - renewedLocal.body.document.issued_at_unix_ms,
+      doc.expires_at_unix_ms - doc.issued_at_unix_ms,
+      'renewal changed the lifetime span'
+    );
+
+    // The org revokes the hosted member by subject fingerprint.
+    const revokedMember = await postJson(`${orgApi}/api/access/org-grants/revoke-member`, {
+      handle: 'acme',
+      subject: fingerprintHosted,
+    });
+    assert.strictEqual(revokedMember.status, 200, `revoke-member failed: ${JSON.stringify(revokedMember.body)}`);
+    assert.strictEqual(revokedMember.body.orl.seq, 1, `expected first revocation at seq 1: ${JSON.stringify(revokedMember.body.orl)}`);
+
+    // The list is served publicly by the org daemon and matches.
+    const served = await fetchJson(`${orgApi}/api/access/orgs/acme/revocations`);
+    assert.strictEqual(served.status, 200, `orl fetch failed: ${JSON.stringify(served.body)}`);
+    assert.deepStrictEqual(served.body.orl, revokedMember.body.orl, 'served list differs from the revoke response');
+
+    // Renewal of the revoked member's document is refused by the org.
+    const renewRevoked = await postJson(`${orgApi}/api/access/org-grants/renew`, issuedHosted.body.document);
+    assert.strictEqual(renewRevoked.status, 400, `revoked renewal unexpectedly succeeded: ${JSON.stringify(renewRevoked.body)}`);
+    assert(/revoked/.test(String(renewRevoked.body.error)), `expected revoked-refusal: ${JSON.stringify(renewRevoked.body)}`);
+
+    // Anyone can carry the list to the member daemon; the signature and
+    // monotonic seq make the courier irrelevant.
+    const applied = await postJson(`${memberOrigin}/api/access/orgs/revocations/apply`, served.body.orl);
+    assert.strictEqual(applied.status, 200, `orl apply failed: ${JSON.stringify(applied.body)}`);
+    assert.strictEqual(applied.body.applied.changed, true);
+    assert.strictEqual(applied.body.applied.revoked_grants, 1, `expected exactly the hosted grant revoked: ${JSON.stringify(applied.body.applied)}`);
+    iam = readMemberIam(memberHome);
+    assert.strictEqual(
+      iam.grants.find(g => g.id === hostedGrant.id).status,
+      'revoked',
+      'ORL apply did not revoke the hosted grant'
+    );
+    const trustedEntry = (iam.trusted_orgs || []).find(o => o.handle === 'acme');
+    assert.strictEqual(trustedEntry.last_orl_seq, 1, 'seq not persisted');
+    assert(trustedEntry.orl_revoked_subjects.includes(fingerprintHosted), 'subject not persisted');
+
+    // Re-applying the same seq is an idempotent no-op.
+    const reapplied = await postJson(`${memberOrigin}/api/access/orgs/revocations/apply`, served.body.orl);
+    assert.strictEqual(reapplied.body.applied.changed, false, `expected idempotent re-apply: ${JSON.stringify(reapplied.body)}`);
+
+    // The revoked member reconnects with its still-signed document: the
+    // ride-along is refused by the persisted list (daemon-side log), and
+    // the revoked grant stays revoked.
+    const memberLogMark = logs.member.length;
+    await reloadPage(hosted);
+    await waitFor(
+      () => logs.member.slice(memberLogMark).join('').includes('offer org grant not accepted')
+        && logs.member.slice(memberLogMark).join('').includes('revocation list'),
+      CONNECT_TIMEOUT_MS,
+      'daemon refusal of the ORL-revoked document'
+    );
+    iam = readMemberIam(memberHome);
+    assert.strictEqual(iam.grants.find(g => g.id === hostedGrant.id).status, 'revoked', 'reconnect resurrected an ORL-revoked grant');
+
     console.log(JSON.stringify({
       ok: true,
       org_root_key: rootKey,
       local_fingerprint: fingerprintLocal,
       hosted_fingerprint: fingerprintHosted,
+      orl_seq: revokedMember.body.orl.seq,
       materialized_grants: orgGrants(iam).map(g => ({ id: g.id, status: g.status, role: g.role_id })),
     }, null, 2));
   } catch (err) {

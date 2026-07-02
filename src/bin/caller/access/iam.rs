@@ -63,6 +63,17 @@ pub struct TrustedOrg {
     pub status: String,
     #[serde(default)]
     pub added_at_unix_ms: Option<u64>,
+    /// Highest org revocation list `seq` applied on this daemon; lists at
+    /// or below it are idempotently ignored.
+    #[serde(default)]
+    pub last_orl_seq: u64,
+    /// The applied list's entries, persisted so materialization and
+    /// renewal refuse revoked grant ids / subjects that were never
+    /// materialized here in the first place.
+    #[serde(default)]
+    pub orl_revoked_grant_ids: Vec<String>,
+    #[serde(default)]
+    pub orl_revoked_subjects: Vec<String>,
 }
 
 fn default_role_ceilings() -> std::collections::BTreeMap<String, String> {

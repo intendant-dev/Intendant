@@ -267,6 +267,30 @@ pub fn materialize_org_grant(
         )));
     };
 
+    // The org's own revocation list, as last applied here: a listed grant
+    // or subject is refused even though the document's signature is valid
+    // — a still-held document must not outrun its revocation.
+    let fingerprint = normalize_client_key_fingerprint(&doc.subject.client_key_fingerprint);
+    let doc_grant_id = doc.grant_id.trim();
+    if trusted
+        .orl_revoked_grant_ids
+        .iter()
+        .any(|id| id == doc_grant_id)
+    {
+        return Err(AccessError(format!(
+            "org grant {doc_grant_id} is revoked by org {handle}'s revocation list"
+        )));
+    }
+    if trusted
+        .orl_revoked_subjects
+        .iter()
+        .any(|subject| subject == &fingerprint)
+    {
+        return Err(AccessError(format!(
+            "the subject key is revoked by org {handle}'s revocation list"
+        )));
+    }
+
     let targets_self = doc.targets.iter().any(|target| {
         target == "*" || daemon_ids.iter().any(|id| id == target)
     });
@@ -313,7 +337,6 @@ pub fn materialize_org_grant(
         )));
     }
 
-    let fingerprint = normalize_client_key_fingerprint(&doc.subject.client_key_fingerprint);
     let principal_id = format!("principal:client-key:{fingerprint}");
     let label = if doc.subject.label.trim().is_empty() {
         format!("{handle} member")
@@ -503,6 +526,333 @@ pub fn present_org_grant_value(
     Ok(outcome)
 }
 
+/// ── Org revocation lists (phase 6 step 5) ──
+///
+/// The root signs a cumulative list of revoked document grant ids and
+/// subject fingerprints. The org daemon maintains it next to the root
+/// key; anyone may carry it to a consuming daemon, whose signature check
+/// plus monotonic `seq` make the courier irrelevant. Applying it revokes
+/// matching materialized grants AND persists the lists on the trusted-org
+/// entry so future materialization/renewal of listed entries is refused.
+pub const ORG_ORL_PROTOCOL: &str = "intendant-org-orl-v1";
+/// Body cap for carried lists (~1500 revocations); the org daemon refuses
+/// to grow a list past this so consumers can always accept it.
+pub const MAX_ORG_ORL_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OrgRevocationList {
+    pub v: u32,
+    pub kind: String,
+    pub org: OrgGrantOrg,
+    pub seq: u64,
+    pub revoked_grant_ids: Vec<String>,
+    pub revoked_subjects: Vec<String>,
+    pub issued_at_unix_ms: u64,
+    pub sig: String,
+}
+
+/// Newline-joined signing payload, like every protocol here. Entries are
+/// comma-joined inside their line: grant ids are UUIDs and subjects are
+/// base64url fingerprints, so neither can contain a comma.
+pub fn orl_signing_payload(orl: &OrgRevocationList) -> Vec<u8> {
+    format!(
+        "{ORG_ORL_PROTOCOL}\n{}\n{}\n{}\n{}\n{}\n{}",
+        orl.org.handle,
+        orl.org.root_key,
+        orl.seq,
+        orl.revoked_grant_ids.join(","),
+        orl.revoked_subjects.join(","),
+        orl.issued_at_unix_ms,
+    )
+    .into_bytes()
+}
+
+/// Integrity only (shape + signature). Trust — is this org's key trusted
+/// here, is the seq fresh — is [`apply_orl`]'s job. Lists do not expire;
+/// `seq` is the staleness control.
+pub fn verify_orl(orl: &OrgRevocationList) -> Result<(), String> {
+    if orl.v != 1 || orl.kind != "org-revocations" {
+        return Err("unsupported org revocation list version or kind".to_string());
+    }
+    let key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(orl.org.root_key.trim())
+        .map_err(|_| "org root key is not valid base64url".to_string())?;
+    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(orl.sig.trim())
+        .map_err(|_| "org revocation list signature is not valid base64url".to_string())?;
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key)
+        .verify(&orl_signing_payload(orl), &sig)
+        .map_err(|_| "org revocation list signature verification failed".to_string())
+}
+
+pub fn orl_path(cert_dir: &Path, handle: &str) -> PathBuf {
+    cert_dir.join("org").join(handle).join("orl.json")
+}
+
+/// The org daemon's current list, signing an empty seq-0 list lazily when
+/// none exists yet. A corrupt on-disk list is an error, not a reset — a
+/// re-signed lower `seq` would be refused by every consumer.
+pub fn load_or_init_orl(
+    identity: &DaemonIdentity,
+    cert_dir: &Path,
+    handle: &str,
+    now_unix_ms: u64,
+) -> Result<OrgRevocationList, String> {
+    let path = orl_path(cert_dir, handle);
+    if path.exists() {
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let orl: OrgRevocationList = serde_json::from_str(&raw)
+            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        verify_orl(&orl)?;
+        if orl.org.root_key != identity.public_key_b64u() {
+            return Err(format!(
+                "{} was signed by a different org root key",
+                path.display()
+            ));
+        }
+        return Ok(orl);
+    }
+    let mut orl = OrgRevocationList {
+        v: 1,
+        kind: "org-revocations".to_string(),
+        org: OrgGrantOrg {
+            handle: handle.trim().to_string(),
+            root_key: identity.public_key_b64u(),
+        },
+        seq: 0,
+        revoked_grant_ids: Vec::new(),
+        revoked_subjects: Vec::new(),
+        issued_at_unix_ms: now_unix_ms,
+        sig: String::new(),
+    };
+    orl.sig = identity.sign_b64u(&orl_signing_payload(&orl));
+    Ok(orl)
+}
+
+/// Org-daemon action: add entries, bump `seq`, re-sign, persist.
+pub fn orl_revoke(
+    identity: &DaemonIdentity,
+    cert_dir: &Path,
+    handle: &str,
+    grant_ids: &[String],
+    subjects: &[String],
+    now_unix_ms: u64,
+) -> Result<OrgRevocationList, String> {
+    let mut orl = load_or_init_orl(identity, cert_dir, handle, now_unix_ms)?;
+    let mut added = false;
+    for id in grant_ids {
+        let id = id.trim();
+        if id.contains(',') {
+            return Err(format!("invalid grant id {id:?}"));
+        }
+        if !id.is_empty() && !orl.revoked_grant_ids.iter().any(|existing| existing == id) {
+            orl.revoked_grant_ids.push(id.to_string());
+            added = true;
+        }
+    }
+    for subject in subjects {
+        let subject = normalize_client_key_fingerprint(subject);
+        if subject.contains(',') {
+            return Err(format!("invalid subject fingerprint {subject:?}"));
+        }
+        if !subject.is_empty()
+            && !orl
+                .revoked_subjects
+                .iter()
+                .any(|existing| existing == &subject)
+        {
+            orl.revoked_subjects.push(subject);
+            added = true;
+        }
+    }
+    if !added {
+        return Err("nothing new to revoke: pass a document grant_id or a subject key fingerprint".to_string());
+    }
+    orl.seq += 1;
+    orl.issued_at_unix_ms = now_unix_ms;
+    orl.sig = identity.sign_b64u(&orl_signing_payload(&orl));
+    let serialized = serde_json::to_string_pretty(&orl).map_err(|e| e.to_string())?;
+    if serialized.len() > MAX_ORG_ORL_BYTES {
+        return Err(format!(
+            "revocation list would exceed {MAX_ORG_ORL_BYTES} bytes; expire old grants instead of growing it further"
+        ));
+    }
+    let path = orl_path(cert_dir, handle);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, format!("{serialized}\n"))
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(orl)
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AppliedOrl {
+    pub org_handle: String,
+    pub seq: u64,
+    pub revoked_grants: usize,
+    /// False when this seq (or a newer one) was already applied.
+    pub changed: bool,
+}
+
+/// Consumer action: verify against the locally trusted key, enforce
+/// monotonic `seq`, persist the lists, and revoke matching materialized
+/// grants. Idempotent for an already-applied seq; stale lists are refused
+/// loudly so couriers learn they carried an old copy.
+pub fn apply_orl(
+    state: &mut LocalIamState,
+    orl: &OrgRevocationList,
+    now_unix_ms: u64,
+) -> AccessResult<AppliedOrl> {
+    verify_orl(orl).map_err(AccessError)?;
+    let handle = orl.org.handle.trim().to_string();
+    let Some(index) = state.trusted_orgs.iter().position(|org| {
+        org.handle == handle
+            && org.root_key == orl.org.root_key
+            && is_enforced_status(&org.status)
+    }) else {
+        return Err(AccessError(format!(
+            "this daemon does not trust org {handle} with that root key, so its revocation list does not apply here"
+        )));
+    };
+    if orl.seq < state.trusted_orgs[index].last_orl_seq {
+        return Err(AccessError(format!(
+            "stale revocation list: seq {} was already superseded by {} here",
+            orl.seq, state.trusted_orgs[index].last_orl_seq
+        )));
+    }
+    if orl.seq == state.trusted_orgs[index].last_orl_seq {
+        return Ok(AppliedOrl {
+            org_handle: handle,
+            seq: orl.seq,
+            revoked_grants: 0,
+            changed: false,
+        });
+    }
+
+    let revoked_grant_ids: Vec<String> = orl
+        .revoked_grant_ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    let revoked_subjects: Vec<String> = orl
+        .revoked_subjects
+        .iter()
+        .map(|subject| normalize_client_key_fingerprint(subject))
+        .filter(|subject| !subject.is_empty())
+        .collect();
+
+    // Subjects resolve to principals via their client-key authn entries.
+    let revoked_principals: Vec<String> = state
+        .principals
+        .iter()
+        .filter(|principal| {
+            principal.authn.iter().any(|authn| {
+                authn.get("kind").and_then(|v| v.as_str()) == Some("client_key")
+                    && authn
+                        .get("fingerprint")
+                        .and_then(|v| v.as_str())
+                        .map(normalize_client_key_fingerprint)
+                        .map(|fingerprint| revoked_subjects.contains(&fingerprint))
+                        .unwrap_or(false)
+            })
+        })
+        .map(|principal| principal.id.clone())
+        .collect();
+
+    let source = format!("org:{handle}");
+    let local_grant_ids: Vec<String> = revoked_grant_ids
+        .iter()
+        .map(|id| format!("grant:org:{handle}:{id}"))
+        .collect();
+    let mut revoked = 0;
+    for grant in state.grants.iter_mut().filter(|grant| {
+        grant.source == source
+            && is_enforced_status(&grant.status)
+            && (local_grant_ids.iter().any(|id| id == &grant.id)
+                || revoked_principals.iter().any(|id| id == &grant.principal_id))
+    }) {
+        grant.status = "revoked".to_string();
+        grant.revoked_at_unix_ms = Some(now_unix_ms);
+        revoked += 1;
+    }
+
+    let entry = &mut state.trusted_orgs[index];
+    entry.last_orl_seq = orl.seq;
+    entry.orl_revoked_grant_ids = revoked_grant_ids;
+    entry.orl_revoked_subjects = revoked_subjects;
+
+    state.audit_events.push(IamAuditEvent {
+        id: format!("audit:{now_unix_ms}:{}", state.audit_events.len() + 1),
+        at_unix_ms: Some(now_unix_ms),
+        actor_principal_id: format!("org:{handle}"),
+        action: "apply_org_revocations".to_string(),
+        target_id: format!("org:{handle}"),
+        summary: format!(
+            "Applied org {handle} revocation list seq {} ({} grants revoked here)",
+            orl.seq, revoked
+        ),
+    });
+
+    Ok(AppliedOrl {
+        org_handle: handle,
+        seq: orl.seq,
+        revoked_grants: revoked,
+        changed: true,
+    })
+}
+
+/// Org-daemon action: re-sign a still-valid document with a fresh window.
+/// The `grant_id` deliberately stays stable so ORL revocation by grant_id
+/// survives renewal; the original lifetime span is preserved (90d cap).
+/// The org's own list gates renewal — a revoked grant or subject must age
+/// out via expiry instead.
+pub fn renew_org_grant(
+    identity: &DaemonIdentity,
+    orl: &OrgRevocationList,
+    doc: &OrgGrantDocument,
+    now_unix_ms: u64,
+) -> Result<OrgGrantDocument, String> {
+    verify_org_grant(doc, now_unix_ms)?;
+    if doc.org.root_key != identity.public_key_b64u() {
+        return Err(
+            "this daemon does not hold the org root key that signed the document".to_string(),
+        );
+    }
+    if doc.org.handle.trim() != orl.org.handle {
+        return Err("document and revocation list belong to different orgs".to_string());
+    }
+    let doc_grant_id = doc.grant_id.trim();
+    if orl
+        .revoked_grant_ids
+        .iter()
+        .any(|id| id == doc_grant_id)
+    {
+        return Err(format!(
+            "org grant {doc_grant_id} is revoked; it cannot be renewed"
+        ));
+    }
+    let fingerprint = normalize_client_key_fingerprint(&doc.subject.client_key_fingerprint);
+    if orl
+        .revoked_subjects
+        .iter()
+        .any(|subject| subject == &fingerprint)
+    {
+        return Err("the subject key is revoked; the document cannot be renewed".to_string());
+    }
+    let span = doc
+        .expires_at_unix_ms
+        .saturating_sub(doc.issued_at_unix_ms)
+        .min(MAX_ORG_GRANT_TTL_MS);
+    let mut renewed = doc.clone();
+    renewed.issued_at_unix_ms = now_unix_ms;
+    renewed.expires_at_unix_ms = now_unix_ms.saturating_add(span);
+    renewed.sig = identity.sign_b64u(&org_grant_signing_payload(&renewed));
+    Ok(renewed)
+}
+
 /// Root-session action: trust an org key on this daemon.
 pub fn trust_org(
     state: &mut LocalIamState,
@@ -534,18 +884,29 @@ pub fn trust_org(
     if !state.roles.iter().any(|role| role.id == max_role) {
         return Err(AccessError(format!("unknown max_role {max_role}")));
     }
-    let entry = TrustedOrg {
+    let mut entry = TrustedOrg {
         handle: handle.clone(),
         root_key,
         max_role,
         status: "active".to_string(),
         added_at_unix_ms: Some(now_unix_ms),
+        last_orl_seq: 0,
+        orl_revoked_grant_ids: Vec::new(),
+        orl_revoked_subjects: Vec::new(),
     };
     if let Some(existing) = state
         .trusted_orgs
         .iter_mut()
         .find(|org| org.handle == handle)
     {
+        // Re-trusting (e.g. to change the cap) keeps the applied
+        // revocation state — it belongs to the key, so it only resets
+        // when the key actually changes.
+        if existing.root_key == entry.root_key {
+            entry.last_orl_seq = existing.last_orl_seq;
+            entry.orl_revoked_grant_ids = existing.orl_revoked_grant_ids.clone();
+            entry.orl_revoked_subjects = existing.orl_revoked_subjects.clone();
+        }
         *existing = entry.clone();
     } else {
         state.trusted_orgs.push(entry.clone());
@@ -632,6 +993,12 @@ mod tests {
         // Keep the tempdir alive long enough by leaking it; tests are short.
         std::mem::forget(dir);
         identity
+    }
+
+    fn org_identity_with_dir() -> (tempfile::TempDir, DaemonIdentity) {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = load_or_create_org_identity(dir.path(), "acme").unwrap();
+        (dir, identity)
     }
 
     // Anchor test time to the real clock: grant resolution checks expiry
@@ -853,6 +1220,167 @@ mod tests {
         let forged = issue(&other, &state, "role:observer");
         let err = materialize_org_grant(&mut state, &forged, &ids, test_now()).unwrap_err();
         assert!(err.to_string().contains("does not trust org acme"));
+    }
+
+    #[test]
+    fn orl_applies_monotonically_and_blocks_rematerialization() {
+        let (dir, identity) = org_identity_with_dir();
+        let mut state = LocalIamState::default();
+        trust_org(&mut state, "acme", &identity.public_key_b64u(), None, test_now()).unwrap();
+        let doc = issue(&identity, &state, "role:session-reader");
+        let outcome =
+            materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now()).unwrap();
+        assert_eq!(outcome.grant.status, "active");
+
+        // Fresh org daemons serve a signed empty seq-0 list.
+        let empty = load_or_init_orl(&identity, dir.path(), "acme", test_now()).unwrap();
+        assert_eq!(empty.seq, 0);
+        verify_orl(&empty).unwrap();
+
+        // Revoke the document by grant_id: seq bumps, list persists.
+        let orl = orl_revoke(
+            &identity,
+            dir.path(),
+            "acme",
+            &[doc.grant_id.clone()],
+            &[],
+            test_now(),
+        )
+        .unwrap();
+        assert_eq!(orl.seq, 1);
+        verify_orl(&orl).unwrap();
+        let reloaded = load_or_init_orl(&identity, dir.path(), "acme", test_now()).unwrap();
+        assert_eq!(reloaded, orl);
+
+        // Tampering is caught by the signature.
+        let mut tampered = orl.clone();
+        tampered.revoked_grant_ids.pop();
+        assert!(verify_orl(&tampered).unwrap_err().contains("signature"));
+
+        // Applying revokes the materialized grant and persists the lists.
+        let applied = apply_orl(&mut state, &orl, test_now()).unwrap();
+        assert!(applied.changed);
+        assert_eq!(applied.revoked_grants, 1);
+        let grant = state
+            .grants
+            .iter()
+            .find(|grant| grant.id == outcome.grant.id)
+            .unwrap();
+        assert_eq!(grant.status, "revoked");
+        let trusted = &state.trusted_orgs[0];
+        assert_eq!(trusted.last_orl_seq, 1);
+        assert_eq!(trusted.orl_revoked_grant_ids, vec![doc.grant_id.clone()]);
+
+        // Same seq again: idempotent no-op. A member re-presenting the
+        // still-signed document is refused by the persisted list.
+        let again = apply_orl(&mut state, &orl, test_now()).unwrap();
+        assert!(!again.changed);
+        let err = materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now())
+            .unwrap_err();
+        assert!(err.to_string().contains("revocation list"), "{err}");
+
+        // Subject revocation sweeps by fingerprint and blocks new docs for
+        // that key even with fresh grant_ids.
+        let doc2 = issue(&identity, &state, "role:observer");
+        // (issue() binds subject "member-key"; doc2 has a new grant_id.)
+        let orl2 = orl_revoke(
+            &identity,
+            dir.path(),
+            "acme",
+            &[],
+            &["member-key".to_string()],
+            test_now(),
+        )
+        .unwrap();
+        assert_eq!(orl2.seq, 2);
+        apply_orl(&mut state, &orl2, test_now()).unwrap();
+        let err = materialize_org_grant(&mut state, &doc2, &["*".to_string()], test_now())
+            .unwrap_err();
+        assert!(err.to_string().contains("subject key is revoked"), "{err}");
+
+        // A stale (superseded) list is refused loudly.
+        let err = apply_orl(&mut state, &orl, test_now()).unwrap_err();
+        assert!(err.to_string().contains("stale"), "{err}");
+
+        // Untrusting states refuse the list entirely.
+        let mut fresh = LocalIamState::default();
+        let err = apply_orl(&mut fresh, &orl2, test_now()).unwrap_err();
+        assert!(err.to_string().contains("does not trust org"), "{err}");
+
+        // Re-trusting with the same key preserves the applied ORL state;
+        // a changed key resets it.
+        trust_org(
+            &mut state,
+            "acme",
+            &identity.public_key_b64u(),
+            Some("role:terminal"),
+            test_now(),
+        )
+        .unwrap();
+        assert_eq!(state.trusted_orgs[0].last_orl_seq, 2);
+        assert!(!state.trusted_orgs[0].orl_revoked_subjects.is_empty());
+        let other = org_identity();
+        trust_org(&mut state, "acme", &other.public_key_b64u(), None, test_now()).unwrap();
+        assert_eq!(state.trusted_orgs[0].last_orl_seq, 0);
+        assert!(state.trusted_orgs[0].orl_revoked_grant_ids.is_empty());
+    }
+
+    #[test]
+    fn renewal_keeps_grant_id_and_respects_the_orl() {
+        let (dir, identity) = org_identity_with_dir();
+        let state = LocalIamState::default();
+        let doc = issue(&identity, &state, "role:session-reader");
+        let orl = load_or_init_orl(&identity, dir.path(), "acme", test_now()).unwrap();
+
+        let later = test_now() + 1000;
+        let renewed = renew_org_grant(&identity, &orl, &doc, later).unwrap();
+        assert_eq!(renewed.grant_id, doc.grant_id, "grant_id must stay stable");
+        assert_eq!(renewed.subject, doc.subject);
+        assert_eq!(renewed.role_id, doc.role_id);
+        assert_eq!(renewed.issued_at_unix_ms, later);
+        assert_eq!(
+            renewed.expires_at_unix_ms - renewed.issued_at_unix_ms,
+            doc.expires_at_unix_ms - doc.issued_at_unix_ms,
+            "original lifetime span is preserved"
+        );
+        verify_org_grant(&renewed, later).unwrap();
+
+        // The org's own list gates renewal, by grant_id and by subject.
+        let orl = orl_revoke(
+            &identity,
+            dir.path(),
+            "acme",
+            &[doc.grant_id.clone()],
+            &[],
+            test_now(),
+        )
+        .unwrap();
+        let err = renew_org_grant(&identity, &orl, &doc, later).unwrap_err();
+        assert!(err.contains("revoked"), "{err}");
+        let doc2 = issue(&identity, &state, "role:observer");
+        let orl = orl_revoke(
+            &identity,
+            dir.path(),
+            "acme",
+            &[],
+            &["member-key".to_string()],
+            test_now(),
+        )
+        .unwrap();
+        let err = renew_org_grant(&identity, &orl, &doc2, later).unwrap_err();
+        assert!(err.contains("subject key is revoked"), "{err}");
+
+        // Only the signing key's daemon can renew.
+        let stranger = org_identity();
+        let strangers_orl = OrgRevocationList {
+            org: OrgGrantOrg {
+                handle: "acme".to_string(),
+                root_key: stranger.public_key_b64u(),
+            },
+            ..orl.clone()
+        };
+        let err = renew_org_grant(&stranger, &strangers_orl, &doc2, later).unwrap_err();
+        assert!(err.contains("does not hold the org root key"), "{err}");
     }
 
     #[test]

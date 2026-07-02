@@ -149,14 +149,14 @@ and first contact, honest about what it is.
 
 ## Phase 6 design: organization grants in detail
 
-> Status: **implemented** (v1: steps 1-4 of the rollout below). Grant
+> Status: **implemented** (v1: steps 1-5 of the rollout below). Grant
 > expiry, org root keys, signed grant documents, per-daemon trust with a
 > local cap, materialization, the presentation/issue/trust/revoke
-> endpoints, and the offer ride-along (documents attached to
-> dashboard-control offers) are live; signed revocation lists and renewal
-> (step 5) and peer-subject/issuer-key delegation (step 6) remain. This
-> section is the spec the code follows; the earlier "two lanes" section is
-> the product narrative it serves.
+> endpoints, the offer ride-along (documents attached to dashboard-control
+> offers), and signed revocation lists + renewal are live;
+> peer-subject/issuer-key delegation (step 6) and revocation-list gossip
+> over peer links remain. This section is the spec the code follows; the
+> earlier "two lanes" section is the product narrative it serves.
 
 ### Objects
 
@@ -283,6 +283,61 @@ Layered, with the failure mode stated honestly:
 An unreachable revocation list plus a long expiry is a stale-authority
 window — hence the 90-day hard cap and the 30-day default.
 
+**ORL format and semantics.** The list is cumulative and self-contained:
+
+```json
+{
+  "v": 1,
+  "kind": "org-revocations",
+  "org": { "handle": "acme", "root_key": "<ed25519 b64u>" },
+  "seq": 4,                          // monotonic; consumers refuse stale
+  "revoked_grant_ids": ["…"],        // document grant_ids, not local grant ids
+  "revoked_subjects": ["…"],         // client key fingerprints — "member is out"
+  "issued_at_unix_ms": 0,
+  "sig": "<ed25519 over the newline payload>"
+}
+```
+
+The signing payload is newline-joined like every other protocol here. The
+org daemon persists the current list next to the root key
+(`org/<handle>/orl.json`), bumps `seq` on every change, and serves it at
+`GET /api/access/orgs/<handle>/revocations` (public — it is org-public
+data; an empty seq-0 list is signed lazily on first read).
+
+**Delivery is carried, not discovered (v1).** A consumer daemon has no
+address for "the org daemon" — there is no membership server to ask — so
+the list travels the same way grant documents do: anyone may push it to
+`POST /api/access/orgs/revocations/apply` (doorbell class:
+unauthenticated, rate-limited, size-capped — the signature is the
+authority, and replaying an old list is refused by `seq`). The org admin's
+browser fans it out to fleet daemons; peer-link gossip and periodic pull
+come later with step 6/phase 7 plumbing.
+
+**Application.** A daemon that trusts the org verifies the signature
+against its *trusted* key for that handle, requires `seq` strictly greater
+than the last applied (equal is an idempotent no-op), then persists the
+lists and the new `seq` on its `trusted_orgs` entry and revokes every
+materialized grant whose document `grant_id` or subject fingerprint is
+listed. Persisting matters beyond the sweep: **materialization and
+renewal both check the stored lists**, so a revoked grant_id or subject
+is refused *future* presentation too — combined with the no-resurrection
+rule above, an ORL revocation sticks even against a member who still
+holds a validly signed document.
+
+**Renewal.** A member (or anyone carrying the document) presents a
+still-valid document to the *org daemon* —
+`POST /api/access/org-grants/renew`, doorbell class — and receives a
+freshly signed copy: same subject, role, targets, and **the same
+`grant_id`**, with `issued_at` set to now and the original lifetime span
+preserved (capped at 90 days). Keeping `grant_id` stable is deliberate:
+ORL revocation by grant_id keeps working across renewals, and the
+document's identity is the grant, not the signature instance. The org
+daemon refuses renewal for anything its own ORL lists (by grant_id or
+subject) — expiry then retires the member within the document's remaining
+lifetime. Only the daemon holding the org root key can renew, and renewal
+grants nothing a fresh issue would not; it exists so membership can be
+kept short-lived without the issuer in the loop.
+
 ### Rollout
 
 1. ✅ Grant expiry in the IAM schema, evaluator, and UI.
@@ -298,7 +353,14 @@ window — hence the 90-day hard cap and the 30-day default.
    the hosted-rendezvous and local paths; daemons materialize before
    grant resolution, idempotent-quiet, without resurrecting local
    revocations. E2E: `scripts/validate-org-grants.cjs`.
-5. ⏳ Revocation list + renewal endpoint + peer gossip.
+5. ✅ Revocation list + renewal: root-signed cumulative ORL maintained on
+   the org daemon (`orl.json`, served publicly), carried to consumers via
+   the public apply doorbell, enforced monotonically and persisted so
+   listed grant ids/subjects are refused at materialization and renewal;
+   renewal re-signs a still-valid document with the same `grant_id` and
+   its original lifetime span. UI: revoke-member / copy-list / apply-list
+   / renew flows under Access → Advanced → Organizations. Peer-link
+   gossip and periodic pull remain for later plumbing.
 6. ⏳ Peer-daemon subjects and issuer-key delegation.
 
 ## Mechanisms
