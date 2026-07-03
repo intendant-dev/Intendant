@@ -14666,7 +14666,10 @@ async function vaultUnlockWithPhrase(input) {
   for (const envelope of vaultState.blob?.envelopes || []) {
     if (envelope.kind !== 'phrase') continue;
     const kBytes = await vaultUnwrapMasterKey(kek, envelope);
-    if (kBytes) return vaultFinishUnlock(kBytes, envelope.id);
+    // matchedEnvelopeId means "the prf envelope this session's passkey
+    // opened" — a phrase unlock matches none, which is exactly what
+    // makes the enroll-this-passkey offer appear.
+    if (kBytes) return vaultFinishUnlock(kBytes, null);
   }
   vaultState.lastError = 'The phrase is well-formed but does not open this vault.';
   renderAccessVaultSection();
@@ -15275,6 +15278,27 @@ function renderAccessVaultSection() {
   mount.innerHTML = '';
   mount.appendChild(card);
 }
+
+/* Debug/validator handle (the module scope hides the vault globals; the
+   validators observe state through this, like intendantDashboardControl). */
+window.intendantVault = {
+  state: () => ({
+    status: vaultState.status,
+    revision: vaultState.revision,
+    highWater: vaultState.highWater,
+    entries: vaultState.entries.map(e => ({ ...e })),
+    envelopes: (vaultState.blob?.envelopes || []).map(e => ({ kind: e.kind, id: e.id, label: e.label })),
+    matchedEnvelopeId: vaultState.matchedEnvelopeId,
+    rollbackWarning: vaultState.rollbackWarning,
+    lastError: vaultState.lastError,
+    migratedVoiceKeys: vaultState.migratedVoiceKeys,
+  }),
+  init: () => vaultInit(),
+  lock: () => vaultLock(),
+  unlockWithPasskey: () => vaultUnlockWithPasskey(),
+  unlockWithPhrase: phrase => vaultUnlockWithPhrase(phrase),
+  voiceApiKeyGet: storageKey => voiceApiKeyGet(storageKey),
+};
 
 /* Sign an offer. Absence is legacy-compatible (the daemon falls back to
    account/trusted-transport identity); a present-but-invalid signature is
@@ -23066,6 +23090,11 @@ async function main() {
   // Store app globally for reconnect/debug hooks.
   window.__presenceWeb = app;
 
+  // Fire-and-forget: the vault only needs the hosted origin (same-origin
+  // fetch + the login PRF secret), not the control transport — and it
+  // must never block or be blocked by dashboard bootstrap.
+  vaultInit();
+
   let connectBootstrapReady = !dashboardConnectModeEnabled();
   if (dashboardConnectModeEnabled()) {
     setConnectEventStatus('warn', 'Connecting dashboard events through Hosted Connect');
@@ -23074,7 +23103,6 @@ async function main() {
       await waitForDashboardControlReady(30000);
       await hydrateDashboardFromControl();
       await accessFleetHydrateFromHosted();
-      vaultInit(); // fire-and-forget: the vault must never block dashboard bootstrap
       connectBootstrapReady = true;
       setConnectEventStatus('ok', 'Dashboard events are live through verified Hosted Connect');
     } catch (err) {
@@ -23121,10 +23149,6 @@ async function main() {
 
     maybeStartDashboardControlTransport();
   }
-
-  // Idempotent (no-op when the connect bootstrap above already ran it):
-  // outside hosted mode this just settles the vault UI to 'unavailable'.
-  vaultInit();
 
   // Initialize multi-host state now that self-label is resolved and the
   // WASM app is ready. Hydrates the peer list from the server-side
