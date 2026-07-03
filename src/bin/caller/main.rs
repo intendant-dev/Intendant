@@ -2,12 +2,16 @@ mod access;
 mod agent_runner;
 mod app_state_pricing;
 mod approval;
+mod atspi_read;
 mod audio_routing;
 mod autonomy;
 #[cfg(target_os = "macos")]
 mod ax;
 mod browser_workspace;
 mod computer_use;
+mod windows_uia;
+#[cfg(target_os = "linux")]
+mod x11_input;
 mod connect_rendezvous;
 mod context_rewind;
 mod control;
@@ -33458,6 +33462,67 @@ fn configure_sandbox_env(flags: &CliFlags, project: &Project, log_dir: &std::pat
     env::set_var("INTENDANT_SANDBOX_WRITE_PATHS", write_paths.join(":"));
 }
 
+/// The `--scoped-shell-exec` wrapper (see terminal::scoped_shell_command):
+/// apply the Landlock policy from INTENDANT_SCOPED_SHELL_POLICY to this
+/// process, then exec the shell given in argv. Never returns — on any
+/// failure it exits non-zero with a message on stderr (which lands in the
+/// terminal pane), and it FAILS CLOSED: a kernel without Landlock refuses
+/// to run the shell rather than running it unconfined.
+fn run_scoped_shell_exec() -> ! {
+    let fail = |message: String| -> ! {
+        eprintln!("scoped shell: {message}");
+        std::process::exit(1);
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let policy_json = match env::var(terminal::SCOPED_SHELL_POLICY_ENV) {
+            Ok(value) => value,
+            Err(_) => fail(format!(
+                "{} is not set; this mode is spawned internally by the daemon",
+                terminal::SCOPED_SHELL_POLICY_ENV
+            )),
+        };
+        let policy: terminal::ScopedShellPolicy = match serde_json::from_str(&policy_json) {
+            Ok(policy) => policy,
+            Err(e) => fail(format!("invalid sandbox policy: {e}")),
+        };
+        let config = sandbox::SandboxConfig {
+            read_paths: policy.read,
+            write_paths: policy.write,
+            enabled: true,
+        };
+        match config.apply_to_current_process() {
+            Ok(true) => {}
+            Ok(false) => fail(
+                "this kernel does not support Landlock, so the filesystem scope on your \
+                 grant cannot be enforced; refusing to start an unconfined shell"
+                    .to_string(),
+            ),
+            Err(e) => fail(format!("applying Landlock failed: {e}")),
+        }
+
+        let args: Vec<String> = env::args().skip(2).collect();
+        let Some((shell, shell_args)) = args.split_first() else {
+            fail("no shell given".to_string());
+        };
+        use std::os::unix::process::CommandExt as _;
+        let mut command = std::process::Command::new(shell);
+        command
+            .args(shell_args)
+            .env_remove(terminal::SCOPED_SHELL_POLICY_ENV);
+        let e = command.exec();
+        fail(format!("exec {shell}: {e}"));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        fail(
+            "--scoped-shell-exec is the Linux Landlock wrapper; macOS scoped shells use \
+             sandbox-exec and Windows does not support scoped shells yet"
+                .to_string(),
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), CallerError> {
     // Install the process-wide rustls `CryptoProvider`. **Required
@@ -33513,6 +33578,15 @@ async fn main() -> Result<(), CallerError> {
 
     // Ensure platform tool directories (Homebrew etc.) are in PATH.
     platform::ensure_tool_paths();
+
+    // Internal wrapper mode for filesystem-scoped dashboard shells (Linux):
+    // `intendant --scoped-shell-exec <shell> [args…]` with the sandbox
+    // policy in INTENDANT_SCOPED_SHELL_POLICY. Applies Landlock to this
+    // process (fail-closed) and execs the shell. Spawned only by
+    // terminal::PtySession — not a user-facing command.
+    if env::args().nth(1).as_deref() == Some("--scoped-shell-exec") {
+        run_scoped_shell_exec();
+    }
 
     // `intendant lan` was removed when the native dashboard certificate flow
     // became `intendant access`. Fail explicitly so the old command cannot be

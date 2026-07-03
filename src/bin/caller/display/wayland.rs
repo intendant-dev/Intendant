@@ -7,12 +7,15 @@
 
 use super::{DisplayBackend, Frame, FrameFormat, InputEvent};
 use crate::error::CallerError;
+use ashpd::desktop::clipboard::Clipboard;
 use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::{PersistMode, Session};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 /// Enumerate Wayland displays.
@@ -48,6 +51,11 @@ struct PortalSession {
     remote_desktop: RemoteDesktop<'static>,
     /// The session handle obtained from `create_session()`.
     session: Session<'static, RemoteDesktop<'static>>,
+    /// Clipboard portal proxy, present when the session was armed for
+    /// clipboard access before `Start` (the portal requires the capability
+    /// request up front). Consumed by the paste path; `None` when the
+    /// portal backend lacks the Clipboard interface.
+    clipboard: Option<Clipboard<'static>>,
 }
 
 /// Wayland screen capture and input injection backend.
@@ -136,6 +144,25 @@ impl DisplayBackend for WaylandBackend {
             )
             .await
             .map_err(|e| CallerError::Display(format!("select sources: {e}")))?;
+
+        // --- Clipboard capability (optional, must precede Start) ---
+        // Arms the session for later paste operations; no clipboard data
+        // moves here. portal backends without the Clipboard interface
+        // (pre-45 portal-gnome, portal-gtk) leave it None and paste keeps
+        // its unsupported error while capture and input proceed normally.
+        let clipboard = match Clipboard::new().await {
+            Ok(proxy) => match proxy.request(&session).await {
+                Ok(()) => Some(proxy),
+                Err(e) => {
+                    eprintln!("[display/wayland] clipboard portal request failed: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("[display/wayland] clipboard portal unavailable: {e}");
+                None
+            }
+        };
 
         let started = remote_desktop
             .start(&session, None)
@@ -227,6 +254,7 @@ impl DisplayBackend for WaylandBackend {
             pw_thread,
             remote_desktop,
             session,
+            clipboard,
         });
 
         Ok(rx)
@@ -295,15 +323,17 @@ impl DisplayBackend for WaylandBackend {
                 .map_err(|e| wayland_input_error("pointer inject", e))?;
             }
             InputEvent::MouseDown { x, y, b } => {
-                // Move to position first (best-effort).
-                let _ = rd
-                    .notify_pointer_motion_absolute(
-                        session,
-                        node_id,
-                        x * width as f64,
-                        y * height as f64,
-                    )
-                    .await;
+                // Move to position first. If the reposition fails, the press
+                // would land wherever the pointer happens to be — propagate
+                // the error instead of clicking a place the model never chose.
+                rd.notify_pointer_motion_absolute(
+                    session,
+                    node_id,
+                    x * width as f64,
+                    y * height as f64,
+                )
+                .await
+                .map_err(|e| wayland_input_error("pointer move (before press)", e))?;
                 // Linux evdev button codes: BTN_LEFT=0x110, BTN_MIDDLE=0x112, BTN_RIGHT=0x111
                 let button_code: i32 = match b {
                     0 => 0x110,
@@ -316,14 +346,14 @@ impl DisplayBackend for WaylandBackend {
                     .map_err(|e| wayland_input_error("button inject", e))?;
             }
             InputEvent::MouseUp { x, y, b } => {
-                let _ = rd
-                    .notify_pointer_motion_absolute(
-                        session,
-                        node_id,
-                        x * width as f64,
-                        y * height as f64,
-                    )
-                    .await;
+                rd.notify_pointer_motion_absolute(
+                    session,
+                    node_id,
+                    x * width as f64,
+                    y * height as f64,
+                )
+                .await
+                .map_err(|e| wayland_input_error("pointer move (before release)", e))?;
                 let button_code: i32 = match b {
                     0 => 0x110,
                     1 => 0x112,
@@ -369,7 +399,7 @@ impl DisplayBackend for WaylandBackend {
         let session = &ps.session;
 
         for ch in text.chars() {
-            let keysym = char_to_x11_keysym(ch).ok_or_else(|| {
+            let keysym = super::keymap::char_to_x11_keysym(ch).ok_or_else(|| {
                 CallerError::Display(format!(
                     "unsupported Wayland text character: U+{:04X}",
                     ch as u32
@@ -386,6 +416,87 @@ impl DisplayBackend for WaylandBackend {
         Ok(())
     }
 
+    async fn paste_text(&self, text: &str) -> Result<(), CallerError> {
+        // Paste gesture emulation, matching the Windows backend: (1) make
+        // exactly `text` the session's current paste payload, (2) press
+        // ctrl+v in the already-approved RemoteDesktop session. The payload
+        // is only handed out when the focused app asks for it during the
+        // paste — the portal transfer callback is not a monitor.
+        let guard = self.portal_session.lock().await;
+        let ps = guard.as_ref().ok_or_else(|| {
+            CallerError::Display("no active portal session for paste".to_string())
+        })?;
+        let Some(clipboard) = &ps.clipboard else {
+            return Err(CallerError::Display(
+                "the portal backend does not provide the Clipboard interface — \
+                 use a type action instead"
+                    .to_string(),
+            ));
+        };
+
+        let transfers = clipboard
+            .receive_selection_transfer()
+            .await
+            .map_err(|e| CallerError::Display(format!("clipboard SelectionTransfer: {e}")))?;
+        futures_util::pin_mut!(transfers);
+
+        set_paste_payload(clipboard, &ps.session).await?;
+
+        let rd = &ps.remote_desktop;
+        let session = &ps.session;
+        let ctrl = super::keymap::dom_code_to_evdev("ControlLeft")
+            .ok_or_else(|| CallerError::Display("keymap missing ControlLeft".to_string()))?
+            as i32;
+        let v = super::keymap::dom_code_to_evdev("KeyV")
+            .ok_or_else(|| CallerError::Display("keymap missing KeyV".to_string()))?
+            as i32;
+        rd.notify_keyboard_keycode(session, ctrl, KeyState::Pressed)
+            .await
+            .map_err(|e| wayland_input_error("paste chord (ctrl down)", e))?;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        rd.notify_keyboard_keycode(session, v, KeyState::Pressed)
+            .await
+            .map_err(|e| wayland_input_error("paste chord (v down)", e))?;
+        rd.notify_keyboard_keycode(session, v, KeyState::Released)
+            .await
+            .map_err(|e| wayland_input_error("paste chord (v up)", e))?;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        rd.notify_keyboard_keycode(session, ctrl, KeyState::Released)
+            .await
+            .map_err(|e| wayland_input_error("paste chord (ctrl up)", e))?;
+
+        let session_id = format!("{:?}", ps.session);
+        let deadline = tokio::time::sleep(PASTE_TRANSFER_DEADLINE);
+        tokio::pin!(deadline);
+        let mut served = 0usize;
+
+        while served < MAX_PASTE_TRANSFERS {
+            tokio::select! {
+                _ = &mut deadline => break,
+                transfer = transfers.next() => {
+                    let Some((transfer_session, mime_type, serial)) = transfer else {
+                        break;
+                    };
+                    if format!("{transfer_session:?}") != session_id
+                        || !is_text_plain_mime(&mime_type)
+                    {
+                        continue;
+                    }
+                    write_paste_transfer(clipboard, session, serial, text).await?;
+                    served += 1;
+                }
+            }
+        }
+
+        if served == 0 {
+            return Err(CallerError::Display(
+                "the focused app never requested the paste payload".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     fn resolution(&self) -> (u32, u32) {
         (
             self.shared_width.load(Ordering::SeqCst),
@@ -396,6 +507,70 @@ impl DisplayBackend for WaylandBackend {
     fn kind(&self) -> &'static str {
         "wayland"
     }
+}
+
+/// Bounded serving window for one paste gesture: the focused app must ask
+/// for the payload within this deadline, then serving stops regardless.
+// W3c (the call-local transfer loop) consumes these; allow until it lands.
+#[allow(dead_code)]
+const PASTE_TRANSFER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+/// A single paste legitimately fires at most a couple of transfer requests
+/// (some apps ask once per advertised mime type); serving stops after this
+/// many even inside the deadline.
+#[allow(dead_code)]
+const MAX_PASTE_TRANSFERS: usize = 2;
+
+/// Whether a `SelectionTransfer` mime type is one of the text/plain forms we
+/// advertise (exact or parameterized, e.g. `text/plain;charset=utf-8`).
+/// Non-text requests are ignored by the paste serving loop.
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_text_plain_mime(mime: &str) -> bool {
+    let m = mime.trim().to_ascii_lowercase();
+    m == "text/plain" || m.starts_with("text/plain;")
+}
+
+/// Advertise this session as the owner of a text/plain paste payload. The
+/// bytes themselves are written only when the focused app requests them during
+/// the call-local paste window.
+async fn set_paste_payload(
+    clipboard: &Clipboard<'static>,
+    session: &Session<'static, RemoteDesktop<'static>>,
+) -> Result<(), CallerError> {
+    clipboard
+        .set_selection(session, &["text/plain;charset=utf-8", "text/plain"])
+        .await
+        .map_err(|e| CallerError::Display(format!("clipboard SetSelection: {e}")))
+}
+
+async fn write_paste_transfer(
+    clipboard: &Clipboard<'static>,
+    session: &Session<'static, RemoteDesktop<'static>>,
+    serial: u32,
+    text: &str,
+) -> Result<(), CallerError> {
+    let fd = clipboard
+        .selection_write(session, serial)
+        .await
+        .map_err(|e| CallerError::Display(format!("clipboard SelectionWrite: {e}")))?;
+    let fd: std::os::fd::OwnedFd = fd.into();
+    let file = std::fs::File::from(fd);
+    let mut file = tokio::fs::File::from_std(file);
+
+    let write_result = async {
+        file.write_all(text.as_bytes()).await?;
+        file.flush().await?;
+        file.shutdown().await
+    }
+    .await;
+    drop(file);
+
+    let success = write_result.is_ok();
+    clipboard
+        .selection_write_done(session, serial, success)
+        .await
+        .map_err(|e| CallerError::Display(format!("clipboard SelectionWriteDone: {e}")))?;
+
+    write_result.map_err(|e| CallerError::Display(format!("clipboard transfer write: {e}")))
 }
 
 async fn verify_remote_interaction(
@@ -434,25 +609,6 @@ fn wayland_input_error(action: &str, error: impl std::fmt::Display) -> CallerErr
 
 fn wayland_input_recovery_hint() -> &'static str {
     "Wayland portal input is not active. Revoke and grant the user display again, then approve the GNOME portal with Allow Remote Interaction enabled; screenshot-only approval is insufficient for Computer Use input."
-}
-
-fn char_to_x11_keysym(ch: char) -> Option<i32> {
-    match ch {
-        '\n' | '\r' => Some(0xff0d),
-        '\t' => Some(0xff09),
-        '\u{8}' => Some(0xff08),
-        '\u{1b}' => Some(0xff1b),
-        ' '..='~' => Some(ch as i32),
-        '\u{a0}'..='\u{ff}' => Some(ch as i32),
-        _ => {
-            let code = ch as u32;
-            if code <= 0x10ffff {
-                Some((0x01000000 | code) as i32)
-            } else {
-                None
-            }
-        }
-    }
 }
 
 /// Manually mmap an fd-backed buffer (DMA-BUF or MemFd), copy the pixel region,
@@ -844,9 +1000,22 @@ fn target_pipewire_framerate(fps: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        char_to_x11_keysym, target_pipewire_framerate, wayland_input_error,
+        is_text_plain_mime, target_pipewire_framerate, wayland_input_error,
         wayland_remote_interaction_error,
     };
+    use crate::display::keymap::char_to_x11_keysym;
+
+    #[test]
+    fn paste_mime_matching() {
+        assert!(is_text_plain_mime("text/plain"));
+        assert!(is_text_plain_mime("text/plain;charset=utf-8"));
+        assert!(is_text_plain_mime("TEXT/PLAIN"));
+        assert!(is_text_plain_mime(" text/plain "));
+        assert!(!is_text_plain_mime("text/html"));
+        assert!(!is_text_plain_mime("text/plainx"));
+        assert!(!is_text_plain_mime("image/png"));
+        assert!(!is_text_plain_mime(""));
+    }
 
     #[test]
     fn target_pipewire_framerate_clamps_to_supported_range() {

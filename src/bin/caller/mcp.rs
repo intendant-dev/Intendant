@@ -8068,7 +8068,17 @@ fn image_tool_result(text: impl Into<String>, base64_png: impl Into<String>) -> 
     ])
 }
 
-fn compact_image_tool_result(mut metadata: serde_json::Value, mime_type: &str) -> CallToolResult {
+/// Error twin of [`image_tool_result`]: marks the tool call failed while still
+/// attaching the screenshot, so harnesses gating on `is_error` see the failure
+/// and the model keeps the visual evidence for diagnosis.
+fn image_tool_error(text: impl Into<String>, base64_png: impl Into<String>) -> CallToolResult {
+    CallToolResult::error(vec![
+        Content::text(text.into()),
+        Content::image(base64_png.into(), "image/png"),
+    ])
+}
+
+fn compact_image_metadata(mut metadata: serde_json::Value, mime_type: &str) -> String {
     if let serde_json::Value::Object(map) = &mut metadata {
         map.entry("mime_type".to_string())
             .or_insert_with(|| serde_json::Value::String(mime_type.to_string()));
@@ -8079,7 +8089,16 @@ fn compact_image_tool_result(mut metadata: serde_json::Value, mime_type: &str) -
             map.entry("artifact_path".to_string()).or_insert(path);
         }
     }
-    text_tool_result(metadata.to_string())
+    metadata.to_string()
+}
+
+fn compact_image_tool_result(metadata: serde_json::Value, mime_type: &str) -> CallToolResult {
+    text_tool_result(compact_image_metadata(metadata, mime_type))
+}
+
+/// Error twin of [`compact_image_tool_result`].
+fn compact_image_tool_error(metadata: serde_json::Value, mime_type: &str) -> CallToolResult {
+    text_tool_error(compact_image_metadata(metadata, mime_type))
 }
 
 fn clamp_shared_view_unit(value: f64) -> f64 {
@@ -8123,8 +8142,16 @@ enum UserSessionDisplayActivationRequest {
     Requested,
 }
 
+/// How long a user-display activation may sit "pending" before a new CU call
+/// is allowed to re-request it. Must cover the full Wayland portal approval
+/// window (`WAYLAND_PORTAL_APPROVAL_TIMEOUT_SECS` = 300s in main.rs) plus
+/// margin: a shorter TTL let CU calls re-emit `UserDisplayGranted` while the
+/// user was still looking at the (up to 300s) portal dialog, queueing a
+/// duplicate dialog behind the first. Every real terminal path clears the
+/// marker via events (`DisplayReady` / `DisplayCaptureLost`), so the TTL is
+/// only a backstop against a lost event.
 const WAYLAND_USER_DISPLAY_ACTIVATION_PENDING_STALE_AFTER: std::time::Duration =
-    std::time::Duration::from_secs(30);
+    std::time::Duration::from_secs(330);
 
 fn display_id_for_cu_target(target: crate::computer_use::DisplayTarget) -> u32 {
     match target {
@@ -10714,6 +10741,23 @@ impl IntendantServer {
             }
         }
 
+        // Honest tool-level status: action failures must not surface as a
+        // clean MCP success just because a screenshot came along. Every
+        // action failing marks the whole call is_error; partial failures get
+        // a loud leading line (a "failed" buried mid-list gets skimmed over).
+        let failed = actions
+            .iter()
+            .zip(results.iter())
+            .filter(|(_, r)| cu_result_status(r) != "ok")
+            .count();
+        let all_failed = failed == actions.len();
+        if failed > 0 && !all_failed {
+            summaries.insert(
+                0,
+                format!("WARNING: {failed}/{} actions failed", actions.len()),
+            );
+        }
+
         // Attach the last screenshot inline, annotated with click markers.
         // Also save the annotated version to disk so substitute_screenshot_from_disk
         // picks it up for the Activity tab.
@@ -10734,20 +10778,29 @@ impl IntendantServer {
             }
             summaries.push("post-action screenshot captured".to_string());
             if compact_output {
-                return Ok(compact_image_tool_result(
-                    serde_json::json!({
-                        "status": "actions executed",
-                        "actions": summaries,
-                        "screenshot_path": ss.path,
-                        "width": ss.width,
-                        "height": ss.height,
-                    }),
-                    "image/png",
-                ));
+                let payload = serde_json::json!({
+                    "status": if all_failed { "all actions failed" } else { "actions executed" },
+                    "actions": summaries,
+                    "screenshot_path": ss.path,
+                    "width": ss.width,
+                    "height": ss.height,
+                });
+                return Ok(if all_failed {
+                    compact_image_tool_error(payload, "image/png")
+                } else {
+                    compact_image_tool_result(payload, "image/png")
+                });
             }
-            return Ok(image_tool_result(summaries.join("\n"), annotated));
+            return Ok(if all_failed {
+                image_tool_error(summaries.join("\n"), annotated)
+            } else {
+                image_tool_result(summaries.join("\n"), annotated)
+            });
         }
 
+        if all_failed {
+            return Ok(text_tool_error(summaries.join("\n")));
+        }
         Ok(text_tool_result(summaries.join("\n")))
     }
 

@@ -4316,6 +4316,14 @@ fn loopback_mcp_auth_matches(header_text: &str) -> bool {
     )
 }
 
+/// Loopback test that also recognizes IPv4-mapped IPv6 loopback
+/// (`::ffff:127.0.0.1`) — what a 127.0.0.1 client looks like to a daemon
+/// bound on a dual-stack wildcard socket. `Ipv6Addr::is_loopback` alone is
+/// false for mapped addresses, which wrongly 401'd tokenless loopback /mcp.
+fn client_ip_is_loopback(ip: std::net::IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
+}
+
 fn is_loopback_cleartext_mcp_request(
     remote_addr: std::net::SocketAddr,
     is_tls: bool,
@@ -4323,7 +4331,7 @@ fn is_loopback_cleartext_mcp_request(
 ) -> bool {
     let request_line = header_text.lines().next().unwrap_or("");
     !is_tls
-        && remote_addr.ip().is_loopback()
+        && client_ip_is_loopback(remote_addr.ip())
         && is_mcp_request_path(request_line)
         && !has_browser_origin_headers(header_text)
         && loopback_mcp_auth_matches(header_text)
@@ -19264,6 +19272,11 @@ pub fn spawn_web_gateway(
                         let mut ws_denied_logged: std::collections::HashSet<String> =
                             std::collections::HashSet::new();
 
+                        // Shell-session lane for this connection: root sees
+                        // every session, scoped principals see owned/shared.
+                        let ws_terminal_actor =
+                            dashboard_control_grant_inbound.terminal_actor();
+
                         // Per-connection audio transcription buffer.
                         // PCM16 bytes are accumulated and drained every ~3s.
                         let mut audio_buf: Vec<u8> = Vec::new();
@@ -20794,11 +20807,36 @@ pub fn spawn_web_gateway(
                                                 terminal_id: terminal_id.clone(),
                                             };
 
+                                            // Attach needs only the terminal.view
+                                            // floor already enforced; creating a
+                                            // shell needs shell.spawn, decided at
+                                            // frame time so expiry mid-connection
+                                            // is honored. A grant-level fs scope
+                                            // makes the new shell a sandboxed one.
+                                            let spawn_policy = crate::terminal::ShellSpawnPolicy {
+                                                may_spawn: dashboard_control_grant_inbound
+                                                    .access_decision(
+                                                        crate::peer::access_policy::PeerOperation::ShellSpawn,
+                                                    )
+                                                    .allowed,
+                                                shared: json["shared"]
+                                                    .as_bool()
+                                                    .unwrap_or(false),
+                                                scope: dashboard_control_grant_inbound
+                                                    .filesystem()
+                                                    .cloned(),
+                                            };
                                             match terminal_registry_inbound
-                                                .open_or_attach(key.clone(), cols, rows)
+                                                .open_or_attach(
+                                                    key.clone(),
+                                                    cols,
+                                                    rows,
+                                                    &ws_terminal_actor,
+                                                    spawn_policy,
+                                                )
                                                 .await
                                             {
-                                                Ok(session) => {
+                                                Ok((session, _created)) => {
                                                     // Spawn a forwarder task that drains the session's
                                                     // per-listener channel and sends base64-encoded
                                                     // output to this WS connection.
@@ -20844,6 +20882,9 @@ pub fn spawn_web_gateway(
                                                         "t": "terminal_opened",
                                                         "host_id": host_id,
                                                         "terminal_id": terminal_id,
+                                                        "shared": session.shared(),
+                                                        "can_share": session
+                                                            .managed_by(&ws_terminal_actor),
                                                     });
                                                     let _ = direct_tx_inbound.send(ack.to_string());
                                                 }
@@ -20852,7 +20893,7 @@ pub fn spawn_web_gateway(
                                                         "t": "terminal_error",
                                                         "host_id": host_id,
                                                         "terminal_id": terminal_id,
-                                                        "error": e,
+                                                        "error": e.to_string(),
                                                     });
                                                     let _ = direct_tx_inbound.send(err.to_string());
                                                 }
@@ -20878,8 +20919,9 @@ pub fn spawn_web_gateway(
                                                     host_id,
                                                     terminal_id,
                                                 };
-                                                if let Some(session) =
-                                                    terminal_registry_inbound.get(&key).await
+                                                if let Some(session) = terminal_registry_inbound
+                                                    .get_visible(&key, &ws_terminal_actor)
+                                                    .await
                                                 {
                                                     session.write_input(&data);
                                                 }
@@ -20901,8 +20943,9 @@ pub fn spawn_web_gateway(
                                                 host_id,
                                                 terminal_id,
                                             };
-                                            if let Some(session) =
-                                                terminal_registry_inbound.get(&key).await
+                                            if let Some(session) = terminal_registry_inbound
+                                                .get_visible(&key, &ws_terminal_actor)
+                                                .await
                                             {
                                                 session.resize(cols, rows);
                                             }
@@ -20921,7 +20964,44 @@ pub fn spawn_web_gateway(
                                                 host_id,
                                                 terminal_id,
                                             };
-                                            terminal_registry_inbound.close(&key).await;
+                                            terminal_registry_inbound
+                                                .close_visible(&key, &ws_terminal_actor)
+                                                .await;
+                                        }
+                                        Some("terminal_share") => {
+                                            // {"t":"terminal_share","host_id":"local","terminal_id":"shell-0","shared":true}
+                                            let host_id = json["host_id"]
+                                                .as_str()
+                                                .unwrap_or("local")
+                                                .to_string();
+                                            let terminal_id = json["terminal_id"]
+                                                .as_str()
+                                                .unwrap_or("shell-0")
+                                                .to_string();
+                                            let shared =
+                                                json["shared"].as_bool().unwrap_or(true);
+                                            let key = crate::terminal::TerminalKey {
+                                                host_id: host_id.clone(),
+                                                terminal_id: terminal_id.clone(),
+                                            };
+                                            let msg = match terminal_registry_inbound
+                                                .set_shared(&key, &ws_terminal_actor, shared)
+                                                .await
+                                            {
+                                                Some(state) => serde_json::json!({
+                                                    "t": "terminal_shared",
+                                                    "host_id": host_id,
+                                                    "terminal_id": terminal_id,
+                                                    "shared": state,
+                                                }),
+                                                None => serde_json::json!({
+                                                    "t": "terminal_error",
+                                                    "host_id": host_id,
+                                                    "terminal_id": terminal_id,
+                                                    "error": "not allowed: only the session owner or root can change sharing",
+                                                }),
+                                            };
+                                            let _ = direct_tx_inbound.send(msg.to_string());
                                         }
                                         Some("display_input") => {
                                             // Input event (keyboard/mouse) for a display session.
@@ -28861,7 +28941,7 @@ fn mcp_http_access_context(
             if tls_client_cert_fingerprint.is_some() {
                 return dashboard_equivalent_context();
             }
-            if !peer_addr.ip().is_loopback() {
+            if !client_ip_is_loopback(peer_addr.ip()) {
                 return Err((
                     401,
                     "mcp_token required: tokenless /mcp is only served to loopback clients"
@@ -29302,9 +29382,14 @@ fn peer_identity_allows_ws_control(
 fn ws_frame_operation(frame_type: &str) -> Option<crate::peer::access_policy::PeerOperation> {
     use crate::peer::access_policy::PeerOperation;
     match frame_type {
-        // Same frame names as the dashboard-control tunnel table.
-        "terminal_open" | "terminal_input" | "terminal_resize" | "terminal_close" => {
-            Some(PeerOperation::Terminal)
+        // Same frame names as the dashboard-control tunnel table. Floor
+        // operations: terminal_open may additionally require shell.spawn
+        // (when the session doesn't exist yet) and every terminal frame is
+        // scoped to sessions the actor can see — both enforced statefully
+        // in the frame handlers.
+        "terminal_open" => Some(PeerOperation::TerminalView),
+        "terminal_input" | "terminal_resize" | "terminal_close" | "terminal_share" => {
+            Some(PeerOperation::TerminalWrite)
         }
         "display_input" => Some(PeerOperation::DisplayInput),
         // Parity: api_diagnostics_visual_freshness → DisplayInput. The
@@ -35851,6 +35936,19 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_mapped_ipv6_loopback_counts_as_loopback() {
+        use std::net::IpAddr;
+
+        assert!(client_ip_is_loopback("127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(client_ip_is_loopback("::1".parse::<IpAddr>().unwrap()));
+        // What a 127.0.0.1 client looks like on a dual-stack wildcard bind.
+        assert!(client_ip_is_loopback("::ffff:127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(!client_ip_is_loopback("::ffff:192.168.1.10".parse::<IpAddr>().unwrap()));
+        assert!(!client_ip_is_loopback("192.168.1.10".parse::<IpAddr>().unwrap()));
+        assert!(!client_ip_is_loopback("fe80::1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
     fn loopback_cleartext_mcp_exception_is_narrow() {
         use std::net::{Ipv4Addr, SocketAddr};
 
@@ -36225,7 +36323,7 @@ mod tests {
         );
         assert!(
             !local
-                .decision(crate::peer::access_policy::PeerOperation::Terminal)
+                .decision(crate::peer::access_policy::PeerOperation::TerminalWrite)
                 .allowed
         );
 
@@ -40596,11 +40694,15 @@ mod tests {
         use crate::peer::access_policy::PeerOperation;
         assert_eq!(
             ws_frame_operation("terminal_open"),
-            Some(PeerOperation::Terminal)
+            Some(PeerOperation::TerminalView)
         );
         assert_eq!(
             ws_frame_operation("terminal_input"),
-            Some(PeerOperation::Terminal)
+            Some(PeerOperation::TerminalWrite)
+        );
+        assert_eq!(
+            ws_frame_operation("terminal_share"),
+            Some(PeerOperation::TerminalWrite)
         );
         assert_eq!(
             ws_frame_operation("display_input"),

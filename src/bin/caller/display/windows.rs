@@ -113,11 +113,12 @@ use windows::Win32::System::StationsAndDesktops::{
     DESKTOP_READOBJECTS, HDESK,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
+    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_CONTROL, VK_RETURN, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
@@ -554,6 +555,53 @@ impl DisplayBackend for WindowsBackend {
         Ok(())
     }
 
+    async fn inject_text(&self, text: &str) -> Result<(), CallerError> {
+        // KEYEVENTF_UNICODE delivers exact UTF-16 code units to the focused
+        // window independent of keyboard layout. Newlines go through
+        // VK_RETURN so apps see a real Enter keypress rather than a
+        // line-separator character.
+        for (i, ch) in text.chars().enumerate() {
+            if ch == '\n' || ch == '\r' {
+                inject_vk(VK_RETURN, false)?;
+                inject_vk(VK_RETURN, true)?;
+            } else {
+                let mut units = [0u16; 2];
+                for unit in ch.encode_utf16(&mut units) {
+                    send_unicode_unit(*unit, false)?;
+                    send_unicode_unit(*unit, true)?;
+                }
+            }
+            // Pace in bursts (matches the other backends' typing cadence).
+            if i % 20 == 19 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn paste_text(&self, text: &str) -> Result<(), CallerError> {
+        // The OS hosts clipboard content on Windows (set-and-forget), so
+        // arboard needs no serving thread. The previous clipboard is not
+        // restored — Windows CU displays are agent-owned sessions.
+        let owned = text.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut clipboard = arboard::Clipboard::new()
+                .map_err(|e| CallerError::Display(format!("open clipboard: {e}")))?;
+            clipboard
+                .set_text(owned)
+                .map_err(|e| CallerError::Display(format!("set clipboard text: {e}")))
+        })
+        .await
+        .map_err(|e| CallerError::Display(format!("clipboard task join: {e}")))??;
+
+        inject_vk(VK_CONTROL, false)?;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        inject_vk(VK_V, false)?;
+        inject_vk(VK_V, true)?;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        inject_vk(VK_CONTROL, true)
+    }
+
     fn resolution(&self) -> (u32, u32) {
         (
             self.width.load(Ordering::SeqCst),
@@ -593,14 +641,17 @@ fn mouse_up_flag(b: u8) -> MOUSE_EVENT_FLAGS {
 
 /// Inject a single keyboard event (down or up) for a DOM `code`.
 ///
-/// Unknown codes are silently ignored (matching the x11/macos backends, which
-/// no-op when the keymap returns `None`). The `KEYEVENTF_EXTENDEDKEY` flag is
-/// applied for keys in the extended block so the right-hand modifiers, arrows,
-/// navigation cluster, and numpad enter/divide resolve to the correct physical
-/// key.
+/// Unknown codes are an error: silently swallowing them let a CU `key` action
+/// report "ok" while injecting nothing (the same false-OK class that was
+/// fixed on the Wayland backend). The `KEYEVENTF_EXTENDEDKEY` flag is applied
+/// for keys in the extended block so the right-hand modifiers, arrows,
+/// navigation cluster, and numpad enter/divide resolve to the correct
+/// physical key.
 fn inject_key(code: &str, key_up: bool) -> Result<(), CallerError> {
     let Some(vk) = super::windows_keymap::dom_code_to_vk(code) else {
-        return Ok(());
+        return Err(CallerError::Display(format!(
+            "unsupported Windows key code: {code}"
+        )));
     };
 
     let mut flags = KEYBD_EVENT_FLAGS(0);
@@ -611,12 +662,65 @@ fn inject_key(code: &str, key_up: bool) -> Result<(), CallerError> {
         flags |= KEYEVENTF_KEYUP;
     }
 
+    // SAFETY: `MapVirtualKeyW` is a pure table lookup taking scalar arguments
+    // (no pointers); every u32 is a valid input and the return value needs no
+    // cleanup.
+    let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
+
     let input = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: VIRTUAL_KEY(vk),
-                wScan: 0,
+                // Filled so apps that read scancodes (games, some terminals)
+                // see a plausible physical key, not 0.
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    send_one_input(&input)
+}
+
+/// Inject a bare virtual-key press or release (scancode filled like
+/// [`inject_key`]).
+fn inject_vk(vk: VIRTUAL_KEY, key_up: bool) -> Result<(), CallerError> {
+    // SAFETY: pure table lookup with scalar arguments; see `inject_key`.
+    let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) } as u16;
+    let mut flags = KEYBD_EVENT_FLAGS(0);
+    if key_up {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    send_one_input(&input)
+}
+
+/// Send one UTF-16 code unit as a `KEYEVENTF_UNICODE` keyboard event —
+/// layout-independent exact text delivery to the focused window.
+fn send_unicode_unit(unit: u16, key_up: bool) -> Result<(), CallerError> {
+    let mut flags = KEYEVENTF_UNICODE;
+    if key_up {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: unit,
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: 0,

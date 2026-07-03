@@ -608,23 +608,32 @@ impl LocalIamState {
         if self.schema_version == 0 {
             self.schema_version = IAM_SCHEMA_VERSION;
         }
-        // Builtin roles are template-owned: sync existing ones so an
-        // on-disk state minted before a permission existed (e.g.
-        // credentials.manage) picks it up on load, and append the rest.
-        // User-created roles (source != builtin) are never touched.
-        for role in builtin_role_templates() {
-            if let Some(existing) = self
+        let templates = builtin_role_templates();
+        for role in templates.iter().cloned() {
+            match self
                 .roles
                 .iter_mut()
                 .find(|existing| existing.id == role.id)
             {
-                if existing.source == "builtin" {
-                    *existing = role;
-                }
-            } else {
-                self.roles.push(role);
+                // Builtin role definitions are owned by the binary, not the
+                // state file: refresh persisted copies to the current
+                // template so semantic migrations (e.g. the terminal.use →
+                // view/write/spawn split, or a permission added later like
+                // credentials.manage) propagate on upgrade. Roles under
+                // custom ids are untouched.
+                Some(existing) if existing.source == "builtin" => *existing = role,
+                Some(_) => {}
+                None => self.roles.push(role),
             }
         }
+        // The same ownership cuts the other way: a persisted builtin role
+        // the binary no longer ships (e.g. the never-enforced
+        // role:directory-files, superseded by grant-level fs scopes) is
+        // dropped on load. Grants could never reference planned roles, and
+        // a grant on any removed role fails closed in the evaluator.
+        self.roles.retain(|role| {
+            role.source != "builtin" || templates.iter().any(|template| template.id == role.id)
+        });
         self.principals.retain(|p| !p.id.trim().is_empty());
         self.roles.retain(|r| !r.id.trim().is_empty());
         self.grants
@@ -1533,7 +1542,6 @@ pub fn policy_for_role(role_id: &str) -> String {
         "role:files-read" => "policy:files-read".to_string(),
         "role:files-write" => "policy:files-write".to_string(),
         "role:operator" => "policy:operator".to_string(),
-        "role:directory-files" => "policy:directory-files".to_string(),
         other => format!("policy:{}", slug_component(other)),
     }
 }
@@ -1695,7 +1703,10 @@ fn permission_label(id: &str) -> &'static str {
         "peer.manage" => "Peer manage",
         "session.inspect" => "Session inspect",
         "session.manage" => "Session manage",
-        "terminal.use" => "Terminal use",
+        "terminal.use" => "Terminal (legacy)",
+        "terminal.view" => "Terminal view",
+        "terminal.write" => "Terminal write",
+        "shell.spawn" => "Shell spawn",
         "settings.manage" => "Settings manage",
         "credentials.manage" => "Credentials manage",
         "runtime.control" => "Runtime control",
@@ -1724,7 +1735,12 @@ fn permission_summary(id: &str) -> &'static str {
         "peer.manage" => "Create, remove, pair, and use daemon peer routes.",
         "session.inspect" => "Read session lists, logs, reports, recordings, and replay metadata.",
         "session.manage" => "Delete, rewind, prune, upload to, or otherwise mutate sessions.",
-        "terminal.use" => "Open and operate dashboard shell sessions.",
+        "terminal.use" => {
+            "Legacy aggregate: implies terminal.view, terminal.write, and shell.spawn."
+        }
+        "terminal.view" => "Attach to shared shell sessions read-only (scrollback and live output).",
+        "terminal.write" => "Type into, resize, and close shell sessions you can see.",
+        "shell.spawn" => "Create new shell sessions on this daemon.",
         "settings.manage" => "Read or write daemon settings and API keys.",
         "credentials.manage" => {
             "Grant, renew, revoke, and inspect borrowed provider-credential leases (vault fueling)."
@@ -1869,11 +1885,7 @@ pub fn evaluate_principal_operation_with_state(
         );
     };
     let permission = operation_permission_id(op);
-    if !role
-        .permissions
-        .iter()
-        .any(|candidate| candidate == permission)
-    {
+    if !permissions_allow(&role.permissions, permission) {
         return AccessDecision::denied(
             principal,
             op,
@@ -1895,11 +1907,7 @@ pub fn evaluate_principal_operation_with_state(
                 ),
             );
         };
-        if !ceiling_role
-            .permissions
-            .iter()
-            .any(|candidate| candidate == permission)
-        {
+        if !permissions_allow(&ceiling_role.permissions, permission) {
             let binding = principal.authn_kind.as_deref().unwrap_or("session");
             return AccessDecision::denied(
                 principal,
@@ -1943,6 +1951,38 @@ pub fn role_ceiling_for_session(
     Some(ceiling.clone())
 }
 
+/// True when a permission list grants `permission`. The legacy aggregate id
+/// `terminal.use` implies the three split terminal permissions, so custom
+/// roles and org grant caps written before the split keep their meaning
+/// (full terminal capability) without an iam.json rewrite. Builtin roles
+/// are refreshed from templates on load and never carry the legacy id.
+pub fn permissions_allow(permissions: &[String], permission: &str) -> bool {
+    permissions.iter().any(|candidate| {
+        candidate == permission
+            || (candidate == "terminal.use"
+                && matches!(
+                    permission,
+                    "terminal.view" | "terminal.write" | "shell.spawn"
+                ))
+    })
+}
+
+/// First permission in `granted` that `cap` does not cover, if any — the
+/// set-containment twin of [`permissions_allow`], expanding the legacy
+/// `terminal.use` aggregate on BOTH sides (a legacy grant fits under a
+/// split-id cap and vice versa).
+pub fn permissions_excess<'a>(granted: &'a [String], cap: &[String]) -> Option<&'a String> {
+    granted.iter().find(|permission| {
+        if permission.as_str() == "terminal.use" {
+            !["terminal.view", "terminal.write", "shell.spawn"]
+                .iter()
+                .all(|split| permissions_allow(cap, split))
+        } else {
+            !permissions_allow(cap, permission)
+        }
+    })
+}
+
 pub fn operation_permission_id(op: crate::peer::access_policy::PeerOperation) -> &'static str {
     use crate::peer::access_policy::PeerOperation;
     match op {
@@ -1959,7 +1999,9 @@ pub fn operation_permission_id(op: crate::peer::access_policy::PeerOperation) ->
         PeerOperation::PeerManage => "peer.manage",
         PeerOperation::SessionInspect => "session.inspect",
         PeerOperation::SessionManage => "session.manage",
-        PeerOperation::Terminal => "terminal.use",
+        PeerOperation::TerminalView => "terminal.view",
+        PeerOperation::TerminalWrite => "terminal.write",
+        PeerOperation::ShellSpawn => "shell.spawn",
         PeerOperation::Settings => "settings.manage",
         PeerOperation::CredentialsManage => "credentials.manage",
         PeerOperation::RuntimeControl => "runtime.control",
@@ -2063,7 +2105,9 @@ fn builtin_role_templates() -> Vec<IamRole> {
                 "peer.manage".to_string(),
                 "session.inspect".to_string(),
                 "session.manage".to_string(),
-                "terminal.use".to_string(),
+                "terminal.view".to_string(),
+                "terminal.write".to_string(),
+                "shell.spawn".to_string(),
                 "settings.manage".to_string(),
                 "runtime.control".to_string(),
                 "filesystem.read".to_string(),
@@ -2114,14 +2158,16 @@ fn builtin_role_templates() -> Vec<IamRole> {
             id: "role:terminal".to_string(),
             label: "Terminal".to_string(),
             status: "enforced".to_string(),
-            summary: "Open and use shell sessions without broader dashboard mutation rights."
+            summary: "Collaborate in shared shell sessions (view and type) without \
+                      spawning new shells or broader dashboard mutation rights."
                 .to_string(),
             permissions: vec![
                 "presence.read".to_string(),
                 "stats.read".to_string(),
                 "access.inspect".to_string(),
                 "session.inspect".to_string(),
-                "terminal.use".to_string(),
+                "terminal.view".to_string(),
+                "terminal.write".to_string(),
             ],
             source: "builtin".to_string(),
         },
@@ -2171,7 +2217,9 @@ fn builtin_role_templates() -> Vec<IamRole> {
                 "peer.inspect".to_string(),
                 "session.inspect".to_string(),
                 "session.manage".to_string(),
-                "terminal.use".to_string(),
+                "terminal.view".to_string(),
+                "terminal.write".to_string(),
+                "shell.spawn".to_string(),
                 // Fueling from a hosted session is the core custody flow and
                 // the hosted ceiling defaults to operator — without this the
                 // vault bootstrap story dies at its last step. Scoped guest
@@ -2180,14 +2228,6 @@ fn builtin_role_templates() -> Vec<IamRole> {
                 "filesystem.read".to_string(),
                 "filesystem.write".to_string(),
             ],
-            source: "builtin".to_string(),
-        },
-        IamRole {
-            id: "role:directory-files".to_string(),
-            label: "Directory scoped files".to_string(),
-            status: "planned".to_string(),
-            summary: "Future file role bounded by selected roots and operations.".to_string(),
-            permissions: vec!["filesystem.read".to_string()],
             source: "builtin".to_string(),
         },
     ]
@@ -2208,7 +2248,9 @@ fn root_permission_ids() -> Vec<String> {
         "peer.manage",
         "session.inspect",
         "session.manage",
-        "terminal.use",
+        "terminal.view",
+        "terminal.write",
+        "shell.spawn",
         "settings.manage",
         "credentials.manage",
         "runtime.control",
@@ -2534,6 +2576,99 @@ fn set_private_perms(path: &Path) -> AccessResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The terminal.use → view/write/spawn split: the legacy aggregate in a
+    /// custom role's permission list keeps granting all three, containment
+    /// expands it on both sides, and persisted builtin roles are refreshed
+    /// to the current template on load (so role:terminal actually loses
+    /// shell.spawn on upgrade instead of keeping it via legacy expansion).
+    #[test]
+    fn terminal_permission_split_legacy_and_migration() {
+        let legacy = vec!["terminal.use".to_string()];
+        assert!(permissions_allow(&legacy, "terminal.view"));
+        assert!(permissions_allow(&legacy, "terminal.write"));
+        assert!(permissions_allow(&legacy, "shell.spawn"));
+        assert!(!permissions_allow(&legacy, "filesystem.read"));
+        let split = vec!["terminal.view".to_string(), "terminal.write".to_string()];
+        assert!(!permissions_allow(&split, "shell.spawn"));
+        assert!(!permissions_allow(&split, "terminal.use"));
+
+        // Containment: legacy fits under split caps and vice versa.
+        let all_split = vec![
+            "terminal.view".to_string(),
+            "terminal.write".to_string(),
+            "shell.spawn".to_string(),
+        ];
+        assert!(permissions_excess(&legacy, &all_split).is_none());
+        assert!(permissions_excess(&all_split, &legacy).is_none());
+        assert_eq!(
+            permissions_excess(&legacy, &split).map(String::as_str),
+            Some("terminal.use")
+        );
+
+        // Migration: a persisted pre-split builtin role is refreshed.
+        let mut stale = LocalIamState::default();
+        let terminal_role = stale
+            .roles
+            .iter_mut()
+            .find(|role| role.id == "role:terminal")
+            .unwrap();
+        terminal_role.permissions = vec!["terminal.use".to_string()];
+        let migrated = stale.normalize();
+        let refreshed = migrated
+            .roles
+            .iter()
+            .find(|role| role.id == "role:terminal")
+            .unwrap();
+        assert!(refreshed
+            .permissions
+            .iter()
+            .any(|permission| permission == "terminal.view"));
+        assert!(!refreshed
+            .permissions
+            .iter()
+            .any(|permission| permission == "terminal.use"));
+        assert!(!refreshed
+            .permissions
+            .iter()
+            .any(|permission| permission == "shell.spawn"));
+
+        // Custom roles are never rewritten — and never dropped, while a
+        // RETIRED builtin (role:directory-files shipped as a planned
+        // placeholder before grant-level fs scopes superseded it) is
+        // removed from persisted state on load.
+        let mut custom_state = LocalIamState::default();
+        custom_state.roles.push(IamRole {
+            id: "role:custom-legacy".to_string(),
+            label: "Custom".to_string(),
+            status: "enforced".to_string(),
+            summary: String::new(),
+            permissions: vec!["terminal.use".to_string()],
+            source: "local".to_string(),
+        });
+        custom_state.roles.push(IamRole {
+            id: "role:directory-files".to_string(),
+            label: "Directory scoped files".to_string(),
+            status: "planned".to_string(),
+            summary: String::new(),
+            permissions: vec!["filesystem.read".to_string()],
+            source: "builtin".to_string(),
+        });
+        let normalized = custom_state.normalize();
+        let custom = normalized
+            .roles
+            .iter()
+            .find(|role| role.id == "role:custom-legacy")
+            .unwrap();
+        assert_eq!(custom.permissions, vec!["terminal.use".to_string()]);
+        assert!(
+            !normalized
+                .roles
+                .iter()
+                .any(|role| role.id == "role:directory-files"),
+            "retired builtin role should be dropped on load"
+        );
+    }
 
     #[test]
     fn missing_state_loads_default_foundation() {
@@ -3092,8 +3227,12 @@ mod tests {
                 .allowed
         );
         assert!(
-            !evaluate_principal_operation_with_state(&state, &principal, PeerOperation::Terminal)
-                .allowed
+            !evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                PeerOperation::TerminalWrite
+            )
+            .allowed
         );
     }
 
@@ -3185,7 +3324,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::Terminal,
+                crate::peer::access_policy::PeerOperation::TerminalWrite,
             )
             .allowed
         );
@@ -3197,7 +3336,7 @@ mod tests {
         let decision = evaluate_principal_operation_with_state(
             &state,
             &principal,
-            crate::peer::access_policy::PeerOperation::Terminal,
+            crate::peer::access_policy::PeerOperation::TerminalWrite,
         );
         assert!(!decision.allowed);
         assert!(decision.reason.contains("expired"), "{}", decision.reason);
@@ -3247,7 +3386,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::Terminal,
+                crate::peer::access_policy::PeerOperation::ShellSpawn,
             )
             .allowed
         );
@@ -3319,7 +3458,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &hosted,
-                crate::peer::access_policy::PeerOperation::Terminal,
+                crate::peer::access_policy::PeerOperation::ShellSpawn,
             )
             .allowed
         );
@@ -3367,7 +3506,15 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::Terminal,
+                crate::peer::access_policy::PeerOperation::TerminalWrite,
+            )
+            .allowed
+        );
+        assert!(
+            !evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::ShellSpawn,
             )
             .allowed
         );
@@ -3496,7 +3643,25 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::Terminal,
+                crate::peer::access_policy::PeerOperation::TerminalView,
+            )
+            .allowed
+        );
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::TerminalWrite,
+            )
+            .allowed
+        );
+        // The split took spawn away from role:terminal: collaborators can
+        // see and type into shared shells but cannot create new ones.
+        assert!(
+            !evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::ShellSpawn,
             )
             .allowed
         );
@@ -3677,26 +3842,7 @@ mod tests {
     #[test]
     fn root_principal_allows_every_current_operation() {
         let principal = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
-        for op in [
-            crate::peer::access_policy::PeerOperation::PresenceRead,
-            crate::peer::access_policy::PeerOperation::StatsRead,
-            crate::peer::access_policy::PeerOperation::DisplayView,
-            crate::peer::access_policy::PeerOperation::DisplayInput,
-            crate::peer::access_policy::PeerOperation::Message,
-            crate::peer::access_policy::PeerOperation::Task,
-            crate::peer::access_policy::PeerOperation::Approval,
-            crate::peer::access_policy::PeerOperation::AccessInspect,
-            crate::peer::access_policy::PeerOperation::AccessManage,
-            crate::peer::access_policy::PeerOperation::PeerInspect,
-            crate::peer::access_policy::PeerOperation::PeerManage,
-            crate::peer::access_policy::PeerOperation::SessionInspect,
-            crate::peer::access_policy::PeerOperation::SessionManage,
-            crate::peer::access_policy::PeerOperation::Terminal,
-            crate::peer::access_policy::PeerOperation::Settings,
-            crate::peer::access_policy::PeerOperation::RuntimeControl,
-            crate::peer::access_policy::PeerOperation::FilesystemRead,
-            crate::peer::access_policy::PeerOperation::FilesystemWrite,
-        ] {
+        for op in crate::peer::access_policy::ALL_OPERATIONS {
             assert!(
                 evaluate_principal_operation(&principal, op).allowed,
                 "{op:?} should be allowed for root principal"

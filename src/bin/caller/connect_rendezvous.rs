@@ -945,7 +945,7 @@ mod tests {
             crate::access::iam::evaluate_principal_operation_with_state(
                 &iam_state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::Terminal,
+                crate::peer::access_policy::PeerOperation::TerminalWrite,
             )
             .allowed
         );
