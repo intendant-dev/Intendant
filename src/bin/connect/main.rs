@@ -4944,7 +4944,9 @@ const REPO_URL: &str = "https://github.com/lovon-spec/intendant";
 /// the install one-liner is origin-aware so a self-hosted rendezvous
 /// advertises its own installer.
 fn landing_ui_html(origin: &str) -> String {
-    let install_cmd = format!("curl -fsSL {origin}/install.sh | sh -s -- --owner <your-key>");
+    // The placeholder must be entity-escaped or the browser eats it as a tag.
+    let install_cmd =
+        format!("curl -fsSL {origin}/install.sh | sh -s -- --owner &lt;your-key&gt;");
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -4989,12 +4991,12 @@ fn landing_ui_html(origin: &str) -> String {
     .wrap {{ max-width: 1060px; margin: 0 auto; padding: 0 22px; }}
     header {{
       display: flex; align-items: center; justify-content: space-between;
-      padding: 18px 0;
+      padding: 18px 0; flex-wrap: wrap; gap: 10px 18px;
     }}
     .mark {{ font-weight: 700; letter-spacing: .3px; font-size: 17px; color: var(--text); }}
     .mark span {{ color: var(--accent); }}
-    nav {{ display: flex; gap: 20px; align-items: center; font-size: 14.5px; }}
-    nav a {{ color: var(--muted); }}
+    nav {{ display: flex; gap: 14px 20px; align-items: center; font-size: 14.5px; flex-wrap: wrap; }}
+    nav a {{ color: var(--muted); white-space: nowrap; }}
     nav a:hover {{ color: var(--text); }}
     .btn {{
       display: inline-block; padding: 9px 18px; border-radius: 999px;
@@ -5041,7 +5043,7 @@ fn landing_ui_html(origin: &str) -> String {
     .step .n {{ color: var(--accent); font-weight: 700; margin-right: 6px; }}
     section.features {{ padding: 58px 0 8px; }}
     .features h2, .trustrow h2 {{ font-size: 22px; margin: 0 0 18px; letter-spacing: -.2px; }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }}
     .card {{
       border: 1px solid var(--line); border-radius: var(--radius);
       background: var(--surface); padding: 18px 18px 16px;
@@ -6922,8 +6924,11 @@ mod tests {
         let html = landing_ui_html("https://rendezvous.example");
         assert!(html.contains("<title>Intendant — an operating environment"));
         // The install one-liner advertises the serving origin, so a
-        // self-hosted rendezvous shows its own installer.
+        // self-hosted rendezvous shows its own installer — with the
+        // placeholder entity-escaped so browsers render it as text.
         assert!(html.contains("curl -fsSL https://rendezvous.example/install.sh"));
+        assert!(html.contains("--owner &lt;your-key&gt;"));
+        assert!(!html.contains("--owner <your-key>"));
         // Beginner path and depth are both one click away.
         assert!(html.contains(r#"href="/connect""#));
         assert!(html.contains(r#"href="/trust""#));
