@@ -723,6 +723,45 @@ struct UserClientBinding {
     authn: Vec<Value>,
 }
 
+/// `--owner <client-key-fingerprint>` bootstrap (credential custody):
+/// seed a root grant pinned to the given browser identity key so a fresh
+/// install is owned from first boot — authority minted locally, nothing
+/// secret on the wire (the fingerprint is public). Idempotent: an
+/// existing root binding for the key is left untouched, so restarting
+/// with the same flag neither duplicates grants nor grows the audit log.
+pub fn seed_owner_bootstrap_grant(cert_dir: &Path, fingerprint: &str) -> AccessResult<bool> {
+    let fingerprint = normalize_client_key_fingerprint(fingerprint);
+    if fingerprint.is_empty() {
+        return Err(AccessError(
+            "--owner requires a client-key fingerprint (shown in the Access drawer)".to_string(),
+        ));
+    }
+    let mut state = load_state(cert_dir)?;
+    if let Some(existing) = principal_for_client_key(&state, &fingerprint, "owner-bootstrap") {
+        if existing.role_id == "role:root" {
+            return Ok(false);
+        }
+    }
+    let actor = AccessPrincipal::root_dashboard_session("owner-bootstrap", "cli");
+    upsert_user_client_grant(
+        &mut state,
+        UserClientGrantUpsertRequest {
+            client_key_fingerprint: Some(fingerprint),
+            label: Some("Owner (bootstrap)".to_string()),
+            role_id: Some("role:root".to_string()),
+            status: Some("active".to_string()),
+            reason: Some(
+                "--owner bootstrap: root authority pinned to this browser key at install time"
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+        &actor,
+    )?;
+    save_state(cert_dir, &state)?;
+    Ok(true)
+}
+
 pub fn upsert_user_client_grant(
     state: &mut LocalIamState,
     request: UserClientGrantUpsertRequest,
@@ -2729,6 +2768,35 @@ mod tests {
 
         assert!(matches!(loaded.status, IamStateStatus::Error(_)));
         assert_eq!(loaded.state.managed_grant_count(), 0);
+    }
+
+    #[test]
+    fn owner_bootstrap_seeds_root_once_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        assert!(seed_owner_bootstrap_grant(tmp.path(), "Owner_Key-Fp").unwrap());
+        let state = load_state(tmp.path()).unwrap();
+        let principal =
+            principal_for_client_key(&state, "Owner_Key-Fp", "test").expect("owner principal");
+        assert_eq!(principal.kind, "client_key");
+        assert_eq!(principal.role_id, "role:root");
+        let audit_after_first = state.audit_events.len();
+
+        // Restarting with the same flag must not duplicate anything.
+        assert!(!seed_owner_bootstrap_grant(tmp.path(), "Owner_Key-Fp").unwrap());
+        let state = load_state(tmp.path()).unwrap();
+        assert_eq!(state.audit_events.len(), audit_after_first);
+        assert_eq!(
+            state
+                .grants
+                .iter()
+                .filter(|grant| grant.principal_id == principal.id)
+                .count(),
+            1
+        );
+
+        // Whitespace-only fingerprints are refused.
+        assert!(seed_owner_bootstrap_grant(tmp.path(), "   ").is_err());
     }
 
     #[test]

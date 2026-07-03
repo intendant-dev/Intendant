@@ -423,6 +423,54 @@ async function main() {
     }, STEP_TIMEOUT_MS, 'daemon unfueled after UI revoke');
     console.log('PASS lease-ui-revoke panel revocation unfuels the daemon');
 
+    // ── --owner bootstrap (install.sh step 6) ──
+    // A fresh daemon started with --owner <client-key-fingerprint> must
+    // seed a root grant pinned to that key at startup, and a restart with
+    // the same flag must not duplicate grants or grow the audit log.
+    const ownerHome = path.join(tmp, 'owner-home');
+    fs.mkdirSync(ownerHome, { recursive: true });
+    const ownerFp = 'E2E_Owner_Key-Fingerprint';
+    // Offset past the org-validator port block (8898/8899).
+    const ownerPort = options.daemonPort + 11;
+    const ownerIamPath = path.join(ownerHome, '.intendant', 'access-certs', 'iam.json');
+    const spawnOwnerDaemon = () => spawnLogged(options.daemonBinary, [
+      '--no-tui', '--no-tls', '--bind', '127.0.0.1', '--web', String(ownerPort),
+      '--owner', ownerFp,
+    ], {
+      cwd: tmp,
+      env: { ...daemonEnv, HOME: ownerHome },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }, logs.daemon);
+
+    const ownerChild = spawnOwnerDaemon();
+    await waitFor(() => httpStatus(`http://127.0.0.1:${ownerPort}/config`).then(s => s === 200), START_TIMEOUT_MS, 'owner daemon readiness');
+    const ownerIam = JSON.parse(fs.readFileSync(ownerIamPath, 'utf8'));
+    const ownerPrincipal = ownerIam.principals.find(p =>
+      p.kind === 'client_key' && (p.authn || []).some(a => a.fingerprint === ownerFp));
+    assert(ownerPrincipal, `no client_key principal for the owner fingerprint: ${JSON.stringify(ownerIam.principals)}`);
+    const ownerGrants = ownerIam.grants.filter(g => g.principal_id === ownerPrincipal.id);
+    assert.strictEqual(ownerGrants.length, 1, `expected exactly one owner grant: ${JSON.stringify(ownerGrants)}`);
+    assert.strictEqual(ownerGrants[0].role_id, 'role:root', 'owner grant must be root');
+    assert.strictEqual(ownerGrants[0].status, 'active');
+    const ownerAuditCount = (ownerIam.audit_events || []).length;
+
+    ownerChild.kill('SIGTERM');
+    await new Promise(resolve => setTimeout(resolve, 500));
+    spawnOwnerDaemon();
+    await waitFor(() => httpStatus(`http://127.0.0.1:${ownerPort}/config`).then(s => s === 200), START_TIMEOUT_MS, 'owner daemon restart');
+    const ownerIamAfter = JSON.parse(fs.readFileSync(ownerIamPath, 'utf8'));
+    assert.strictEqual(
+      ownerIamAfter.grants.filter(g => g.principal_id === ownerPrincipal.id).length,
+      1,
+      'restart with the same --owner duplicated the grant'
+    );
+    assert.strictEqual(
+      (ownerIamAfter.audit_events || []).length,
+      ownerAuditCount,
+      'idempotent --owner restart grew the audit log'
+    );
+    console.log('PASS lease-owner-bootstrap root grant pinned once, restart idempotent');
+
     console.log('PASS validate-credential-leases all scenarios');
   } catch (err) {
     console.error(`FAIL validate-credential-leases reason="${err.message}"`);
