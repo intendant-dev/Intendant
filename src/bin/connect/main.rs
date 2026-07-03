@@ -94,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/app", get(app_html))
         .route("/healthz", get(healthz))
         .route("/install.sh", get(install_sh))
+        .route("/favicon.png", get(favicon_png))
         .route("/assets/landing/{name}", get(landing_asset))
         .route("/readyz", get(readyz))
         .route("/api/me", get(api_me))
@@ -928,6 +929,21 @@ async fn install_sh() -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         INSTALL_SH,
+    )
+}
+
+/// The canonical Intendant mark (macos-app/icon.png cropped full-bleed and
+/// downscaled — regenerate with `PIL: crop(alpha bbox) → resize`), embedded so
+/// every page this binary serves gets the real logo without a static root.
+const BRAND_ICON_PNG: &[u8] = include_bytes!("../../../static/icon-128.png");
+
+async fn favicon_png() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        BRAND_ICON_PNG,
     )
 }
 
@@ -4891,6 +4907,7 @@ fn trust_ui_html(origin: &str) -> String {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>How trust works — Intendant Connect</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
   <style>
     :root {{
       color-scheme: dark;
@@ -4909,7 +4926,7 @@ fn trust_ui_html(origin: &str) -> String {
     code {{ color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }}
     header {{ border-bottom: 1px solid var(--line); background: rgba(24, 24, 37, .82); }}
     .topbar {{ width: min(760px, calc(100vw - 32px)); margin: 0 auto; min-height: 60px; display: flex; align-items: center; gap: 12px; }}
-    .brand-mark {{ width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--lavender); background: linear-gradient(160deg, #1e1e2e, #24273a); font-size: 11px; font-weight: 800; }}
+    .brand-mark {{ width: 30px; height: 30px; display: block; flex: 0 0 auto; }}
     .topbar a {{ color: var(--text); text-decoration: none; font-weight: 700; font-size: 15px; }}
     main {{ width: min(760px, calc(100vw - 32px)); margin: 0 auto; padding: 34px 0 72px; line-height: 1.62; font-size: 15px; }}
     h1 {{ font-size: 28px; letter-spacing: -.015em; line-height: 1.15; margin: 0 0 8px; }}
@@ -4925,7 +4942,7 @@ fn trust_ui_html(origin: &str) -> String {
   </style>
 </head>
 <body>
-  <header><div class="topbar"><div class="brand-mark" aria-hidden="true">IC</div><a href="/connect">Intendant Connect</a></div></header>
+  <header><div class="topbar"><img class="brand-mark" src="/favicon.png" alt=""><a href="/connect">Intendant Connect</a></div></header>
   <main>
     <h1>How trust works here</h1>
     <p class="lede">The short version: this service makes introductions and carries ciphertext. Authority over your computers never lives here &mdash; not even when you sign in.</p>
@@ -4987,7 +5004,7 @@ fn landing_ui_html(origin: &str) -> String {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Intendant — an operating environment for autonomous AI agents</title>
   <meta name="description" content="Give an AI agent a full machine — shell, files, display, voice — under layered human oversight. Your keys stay yours.">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%231e1e2e'/><text x='32' y='44' font-family='system-ui' font-size='30' font-weight='700' text-anchor='middle' fill='%23b4befe'>in</text></svg>">
+  <link rel="icon" type="image/png" href="/favicon.png">
   <style>
     :root {{
       color-scheme: dark;
@@ -5028,7 +5045,8 @@ fn landing_ui_html(origin: &str) -> String {
       display: flex; align-items: center; justify-content: space-between;
       padding: 18px 0; flex-wrap: wrap; gap: 10px 18px;
     }}
-    .mark {{ font-weight: 700; letter-spacing: .3px; font-size: 17px; color: var(--text); }}
+    .mark {{ display: flex; align-items: center; font-weight: 700; letter-spacing: .3px; font-size: 17px; color: var(--text); }}
+    .mark img {{ width: 26px; height: 26px; display: block; margin-right: 9px; }}
     .mark span {{ color: var(--accent); }}
     nav {{ display: flex; gap: 14px 20px; align-items: center; font-size: 14.5px; flex-wrap: wrap; }}
     nav a {{ color: var(--muted); white-space: nowrap; }}
@@ -5159,7 +5177,7 @@ fn landing_ui_html(origin: &str) -> String {
 <body>
   <div class="wrap">
     <header>
-      <div class="mark">intendant<span>.dev</span></div>
+      <div class="mark"><img src="/favicon.png" alt="">intendant<span>.dev</span></div>
       <nav>
         <a href="/trust">How trust works</a>
         <a href="{DOCS_URL}">Docs</a>
@@ -5374,6 +5392,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{product_title}</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
   <style>
     :root {{
       color-scheme: dark;
@@ -5427,7 +5446,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     header {{ border-bottom: 1px solid var(--line); background: rgba(24, 24, 37, .82); backdrop-filter: blur(10px); position: sticky; top: 0; z-index: 5; }}
     .topbar {{ width: min(1180px, calc(100vw - 32px)); margin: 0 auto; min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }}
     .brand {{ display: flex; align-items: center; gap: 12px; min-width: 0; }}
-    .brand-mark {{ width: 34px; height: 34px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--line-strong); border-radius: 9px; color: var(--lavender); background: linear-gradient(160deg, #1e1e2e, #24273a); font-size: 12px; font-weight: 800; }}
+    .brand-mark {{ width: 34px; height: 34px; display: block; flex: 0 0 auto; }}
     .brand h1 {{ font-size: 17px; line-height: 1.15; margin: 0; }}
     .brand-sub {{ color: var(--muted-2); font-size: 12px; margin-top: 2px; }}
     .top-actions {{ display: flex; align-items: center; gap: 9px; }}
@@ -5441,7 +5460,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     /* ── Signed out: hero ── */
     body.signed-out main.shell {{ width: min(560px, calc(100vw - 32px)); padding-top: 7vh; }}
     .hero {{ text-align: center; display: grid; gap: 14px; justify-items: center; padding: 8px 0 22px; }}
-    .hero-mark {{ width: 58px; height: 58px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 16px; color: var(--lavender); background: linear-gradient(160deg, #1e1e2e, #24273a); font-size: 20px; font-weight: 800; box-shadow: var(--shadow); }}
+    .hero-mark {{ width: 58px; height: 58px; display: block; border-radius: 16px; box-shadow: var(--shadow); }}
     .hero-title {{ font-size: 32px; line-height: 1.12; margin: 6px 0 0; letter-spacing: -.015em; }}
     .hero-sub {{ color: var(--muted); font-size: 15px; line-height: 1.55; margin: 0; max-width: 46ch; }}
     .auth-card {{ border: 1px solid var(--line-strong); background: rgba(24, 24, 37, .72); border-radius: var(--radius); box-shadow: var(--shadow); padding: 22px; display: grid; gap: 14px; }}
@@ -5560,7 +5579,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
   <header>
     <div class="topbar">
       <div class="brand">
-        <div class="brand-mark" aria-hidden="true">IC</div>
+        <img class="brand-mark" src="/favicon.png" alt="">
         <div>
         <h1>{product_title}</h1>
           <div class="brand-sub">{account_subtitle}</div>
@@ -5577,7 +5596,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     <!-- ── Signed out: landing ── -->
     <section id="auth">
       <div class="hero">
-        <div class="hero-mark" aria-hidden="true">IC</div>
+        <img class="hero-mark" src="/favicon.png" alt="">
         <h2 class="hero-title">Your computers, anywhere.</h2>
         <p class="hero-sub">Sign in with a passkey and open any machine you own, from any browser. This service only makes the introduction &mdash; each computer verifies you itself and decides what you may do, end to end.</p>
       </div>
@@ -7139,6 +7158,26 @@ mod tests {
             );
         }
         assert!(html.contains("alt=\"The Intendant dashboard's Activity feed"));
+        // The canonical mark, not an ad-hoc monogram: favicon + header logo.
+        assert!(html.contains(r#"<link rel="icon" type="image/png" href="/favicon.png">"#));
+        assert!(html.contains(r#"<img src="/favicon.png""#));
+        assert!(!html.contains("data:image/svg"));
+    }
+
+    #[test]
+    fn every_page_serves_the_canonical_mark() {
+        // PNG magic on the embedded brand icon (kept in lockstep with
+        // static/icon-128.png by include_bytes!).
+        assert_eq!(&BRAND_ICON_PNG[0..8], b"\x89PNG\r\n\x1a\n");
+        assert!(BRAND_ICON_PNG.len() > 2_048, "brand icon suspiciously small");
+        let favicon_link = r#"<link rel="icon" type="image/png" href="/favicon.png">"#;
+        let connect = connect_ui_html("https://x.example", "Intendant Connect", "Rendezvous account");
+        assert!(connect.contains(favicon_link));
+        assert!(connect.contains(r#"class="brand-mark" src="/favicon.png""#));
+        assert!(!connect.contains(">IC</div>"));
+        let trust = trust_ui_html("https://x.example");
+        assert!(trust.contains(favicon_link));
+        assert!(!trust.contains(">IC</div>"));
     }
 
     #[test]
