@@ -5001,6 +5001,111 @@ fn trust_ui_html(origin: &str) -> String {
 const DOCS_URL: &str = "https://lovon-spec.github.io/Intendant/";
 const REPO_URL: &str = "https://github.com/lovon-spec/intendant";
 
+/// The deployment advisor inside the landing install section: three
+/// questions -> the same one-liner (with `--service` where it belongs)
+/// plus an honest fueling plan for after the claim. A separate const so
+/// its CSS/JS braces stay out of the page-level `format!`; it derives
+/// the command from `location.origin` at runtime, so a self-hosted
+/// rendezvous advertises its own installer here too. Folded shut by
+/// default — the one-command story stays the headline.
+const LANDING_ADVISOR_HTML: &str = r##"<details class="advisor" id="advisor">
+        <style>
+          .advisor { margin-top: 26px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(30, 30, 46, .55); }
+          .advisor summary { cursor: pointer; padding: 14px 16px; font-size: 14.5px; color: var(--muted); list-style: none; }
+          .advisor summary::before { content: "?"; display: inline-block; width: 20px; height: 20px; margin-right: 10px; border-radius: 50%; background: var(--surface-2); color: var(--accent); font-weight: 700; font-size: 12.5px; text-align: center; line-height: 20px; }
+          .advisor summary::-webkit-details-marker { display: none; }
+          .advisor summary:hover { color: var(--text); }
+          .advisor[open] summary { border-bottom: 1px solid var(--line); color: var(--text); }
+          .advbody { padding: 16px; display: grid; gap: 14px; }
+          .advq { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+          .advq .ql { font-size: 13.5px; color: var(--muted-2); min-width: 200px; }
+          .advq button { background: transparent; border: 1px solid var(--line-strong); color: var(--muted); border-radius: 999px; padding: 5px 13px; font-size: 13px; cursor: pointer; }
+          .advq button:hover { color: var(--text); border-color: var(--accent); }
+          .advq button.on { background: var(--surface-2); color: var(--text); border-color: var(--accent); }
+          .advout { border-top: 1px solid var(--line); padding-top: 14px; display: grid; gap: 10px; }
+          .advout ul { margin: 0; padding-left: 20px; font-size: 14px; color: var(--muted); display: grid; gap: 6px; }
+          .advout ul b { color: var(--text); }
+        </style>
+        <summary>Not sure which shape fits? Answer three questions.</summary>
+        <div class="advbody">
+          <div class="advq" data-q="box">
+            <span class="ql">Where will it run?</span>
+            <button data-v="vps" class="on">A rented VPS</button>
+            <button data-v="server">My own always-on machine</button>
+            <button data-v="laptop">The machine I'm on now</button>
+          </div>
+          <div class="advq" data-q="fuel">
+            <span class="ql">What will fuel it?</span>
+            <button data-v="api" class="on">API keys</button>
+            <button data-v="sub">Subscriptions (Codex, Claude Code)</button>
+            <button data-v="both">Both</button>
+          </div>
+          <div class="advq" data-q="solo">
+            <span class="ql">Keep working with your browser closed?</span>
+            <button data-v="no" class="on">No — while I watch</button>
+            <button data-v="yes">Yes — unattended runs</button>
+          </div>
+          <div class="advout">
+            <div class="terminal">
+              <div class="tbar">
+                <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+                <span class="bftitle">still one command</span>
+                <button onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('advcmd').textContent)">copy</button>
+              </div>
+              <pre><span class="ps">$ </span><span id="advcmd"></span></pre>
+            </div>
+            <ul id="advplan"></ul>
+            <p class="installnote" id="advnote"></p>
+          </div>
+        </div>
+        <script>
+        (function () {
+          var pick = { box: 'vps', fuel: 'api', solo: 'no' };
+          function render() {
+            // </> keep raw angle brackets out of the inline
+            // script (the page-level invariant the tests pin).
+            var cmd = 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- --owner \u003cyour-key\u003e';
+            if (pick.box !== 'laptop') cmd += ' --service';
+            document.getElementById('advcmd').textContent = cmd;
+            var plan = [];
+            if (pick.box === 'laptop') {
+              plan.push('<b>Fueling is optional here.</b> A local .env key works as-is; the vault still adds cross-device sync and one-click revocation.');
+            } else {
+              var watched = pick.solo === 'no';
+              if (pick.fuel !== 'sub') {
+                plan.push(watched
+                  ? '<b>Anthropic & Gemini: client egress.</b> Calls relay through this browser — the box never holds a key at all. OpenAI’s API refuses browser relay, so lease it with the offline window at “while connected only”.'
+                  : '<b>API keys: leases with a 24 h offline window.</b> Borrowed in memory only, never on disk, revocable from any signed-in device.');
+              }
+              if (pick.fuel !== 'api') {
+                plan.push('<b>Subscriptions: access-token OAuth leases</b> (the default) — your browser refreshes the token and leases only the short-lived result. Codex works out of the box.');
+                plan.push(watched
+                  ? '<b>Claude Code</b> still needs the full-credential opt-in (Anthropic’s token endpoint refuses browser refresh) — decide per box.'
+                  : '<b>Unattended subscription runs</b> beyond the token’s life (≈ 1 h) need the full-credential opt-in: the honest trade is durable authority on the box for the lease window. Claude Code always needs it today.');
+              }
+            }
+            document.getElementById('advplan').innerHTML = plan.map(function (item) { return '<li>' + item + '</li>'; }).join('');
+            var note = { vps: 'A disposable box should hold nothing durable: with egress or access-token leases, wiping it loses nothing and leaks nothing.',
+                         server: 'Nothing rests on disk either way — leases only bound what a runtime compromise could spend before you revoke.',
+                         laptop: 'Custody buys the least on the machine your browser already runs on.' }[pick.box];
+            if (pick.box !== 'laptop') note += ' --service installs a systemd unit so the daemon outlives the SSH session; the claim phrase lands in journalctl.';
+            document.getElementById('advnote').textContent = note;
+          }
+          Array.prototype.forEach.call(document.querySelectorAll('#advisor .advq'), function (row) {
+            Array.prototype.forEach.call(row.querySelectorAll('button'), function (button) {
+              button.addEventListener('click', function () {
+                Array.prototype.forEach.call(row.querySelectorAll('button'), function (other) { other.classList.remove('on'); });
+                button.classList.add('on');
+                pick[row.getAttribute('data-q')] = button.getAttribute('data-v');
+                render();
+              });
+            });
+          });
+          render();
+        })();
+        </script>
+      </details>"##;
+
 /// The public landing page at `/`. Deliberately static and dependency-free;
 /// the install one-liner is origin-aware so a self-hosted rendezvous
 /// advertises its own installer.
@@ -5368,6 +5473,7 @@ fn landing_ui_html(origin: &str) -> String {
             Grant time-boxed credential leases from your encrypted vault — or relay calls through your browser and never hand over a key at all.</div>
         </div>
       </div>
+      {advisor}
     </section>
 
     <section class="trustrow">
@@ -5395,7 +5501,8 @@ fn landing_ui_html(origin: &str) -> String {
     </footer>
   </div>
 </body>
-</html>"##
+</html>"##,
+        advisor = LANDING_ADVISOR_HTML,
     )
 }
 
@@ -7179,6 +7286,16 @@ mod tests {
         assert!(html.contains(r#"<link rel="icon" type="image/png" href="/favicon.png">"#));
         assert!(html.contains(r#"<img src="/logo.svg""#));
         assert!(!html.contains("data:image/svg"));
+        // The deployment advisor: folded shut (the one-command story stays
+        // the headline), three questions, and a runtime-origin command so
+        // self-hosted rendezvous advertise their own installer there too.
+        assert!(html.contains("Not sure which shape fits?"));
+        assert!(!html.contains("<details class=\"advisor\" open"));
+        for question in ["Where will it run?", "What will fuel it?", "Keep working with your browser closed?"] {
+            assert!(html.contains(question), "advisor must ask: {question}");
+        }
+        assert!(html.contains("location.origin + '/install.sh"));
+        assert!(html.contains("--service"));
     }
 
     #[test]

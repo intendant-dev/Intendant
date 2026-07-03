@@ -254,6 +254,13 @@ seconds from a phone:
    is public (shown in the Access drawer); the daemon boots with an
    owner grant pinned to that browser key — authority minted locally, as
    always. Nothing sensitive appears in the command or on the wire.
+   On a Linux VPS add `--service`: the installer writes a systemd unit
+   (system-wide as root, `--user` with lingering otherwise) so the
+   daemon outlives the SSH session and restarts on failure — the claim
+   phrase then lands in `journalctl -u intendant`. The landing page's
+   fold-out advisor ("Not sure which shape fits?") maps three questions
+   — where it runs, what fuels it, attended or not — onto this same
+   command plus an honest fueling plan.
 2. **Claim**: the daemon prints its claim phrase; the user claims it in
    the browser they are already holding (existing flow).
 3. **Fuel**: the first dashboard session opens over the verified tunnel
