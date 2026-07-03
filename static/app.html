@@ -15022,6 +15022,145 @@ function vaultSetOauthLeasesEnabled(enabled) {
   localStorage.setItem(vaultLeaseDaemonKey('oauth_leases'), enabled ? 'true' : 'false');
 }
 
+/* ── Access-token OAuth mode (the default) ──
+   The vault entry holds the full auth file, but what leaves this browser
+   by default is only a short-lived access token: the refresh token stays
+   in the vault, this tab performs the provider refresh itself (writing
+   rotated tokens back into the vault), and the grant carries
+   mode:'access_token' — material the daemon verifies is refresh-free
+   before accepting. The full-credential opt-in above remains for long
+   unattended autonomy and for providers whose token endpoint refuses
+   browser CORS (Anthropic's currently does; OpenAI's allows any origin). */
+
+const VAULT_OAUTH_PROVIDERS = {
+  'oauth:codex': {
+    tokenUrl: 'https://auth.openai.com/oauth/token',
+    // The Codex CLI's public OAuth client id (a PKCE public client, not a secret).
+    clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+    scope: 'openid profile email',
+  },
+  'oauth:claude-code': {
+    tokenUrl: 'https://console.anthropic.com/v1/oauth/token',
+    // Claude Code's public OAuth client id.
+    clientId: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+    corsNote:
+      'Anthropic’s token endpoint refuses browser origins, so this tab cannot refresh Claude Code tokens — enable full-credential OAuth leases to fuel it.',
+  },
+};
+/* Refresh when the current token has less life left than this. With
+   provider access tokens living ≈1 h against a 5-minute renewal tick,
+   the daemon-side token is always at least this fresh. */
+const VAULT_OAUTH_REFRESH_MARGIN_MS = 10 * 60 * 1000;
+const vaultOauthEndpointOverrides = {}; // validator-only (debug handle)
+
+function vaultOauthRefreshTokenOf(kind, secretJson) {
+  if (kind === 'oauth:codex') return String(secretJson?.tokens?.refresh_token || '');
+  if (kind === 'oauth:claude-code') return String(secretJson?.claudeAiOauth?.refreshToken || '');
+  return '';
+}
+
+/* Epoch ms when the entry's current access token dies; 0 = unknown,
+   which reads as already-stale so the first fueling always refreshes. */
+function vaultOauthExpiryMs(kind, secretJson) {
+  if (kind === 'oauth:claude-code') return Number(secretJson?.claudeAiOauth?.expiresAt) || 0;
+  if (kind === 'oauth:codex') {
+    try {
+      // ChatGPT-plan access tokens are JWTs; exp is authoritative and
+      // survives page reloads (unlike a refresh-time bookkeeping map).
+      const payload = String(secretJson.tokens.access_token).split('.')[1];
+      const claims = JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')));
+      return (Number(claims.exp) || 0) * 1000;
+    } catch {
+      return 0;
+    }
+  }
+  return 0;
+}
+
+/* The lease material for access-token mode: the auth file with every
+   durable field blanked. Empty strings rather than deletions — the
+   agents' deserializers expect the fields — and the daemon re-verifies
+   the result before accepting the grant. */
+function vaultOauthAccessMaterial(kind, secretJson) {
+  const copy = JSON.parse(JSON.stringify(secretJson));
+  if (kind === 'oauth:codex') {
+    if (copy.tokens) copy.tokens.refresh_token = '';
+    if (typeof copy.OPENAI_API_KEY === 'string') copy.OPENAI_API_KEY = null;
+  }
+  if (kind === 'oauth:claude-code' && copy.claudeAiOauth) copy.claudeAiOauth.refreshToken = '';
+  return JSON.stringify(copy);
+}
+
+/* Provider refresh from this tab. Writes back into the vault entry: the
+   new access token always, the rotated refresh token when the provider
+   rotates (both do) — without the write-back the stored refresh token
+   could be single-use and dead by the next unlock. */
+async function vaultOauthRefresh(kind, entry) {
+  const provider = VAULT_OAUTH_PROVIDERS[kind];
+  if (!provider) throw new Error(`no OAuth refresh route for ${kind}`);
+  let secretJson;
+  try {
+    secretJson = JSON.parse(String(entry.secret));
+  } catch {
+    throw new Error('the stored auth JSON does not parse — re-paste the auth file');
+  }
+  const refreshToken = vaultOauthRefreshTokenOf(kind, secretJson);
+  if (!refreshToken) throw new Error('the stored auth JSON has no refresh token — re-paste the auth file');
+  let response;
+  try {
+    response = await fetch(vaultOauthEndpointOverrides[kind] || provider.tokenUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'refresh_token',
+        client_id: provider.clientId,
+        refresh_token: refreshToken,
+        ...(provider.scope ? { scope: provider.scope } : {}),
+      }),
+    });
+  } catch (err) {
+    throw new Error(
+      `token refresh unreachable (${err?.message || err})${provider.corsNote ? ` — ${provider.corsNote}` : ''}`
+    );
+  }
+  if (!response.ok) throw new Error(`token refresh failed: HTTP ${response.status}`);
+  const fresh = await response.json();
+  if (!fresh?.access_token) throw new Error('token refresh returned no access token');
+  const nowMs = Date.now();
+  if (kind === 'oauth:codex') {
+    secretJson.tokens = secretJson.tokens || {};
+    secretJson.tokens.access_token = String(fresh.access_token);
+    if (fresh.id_token) secretJson.tokens.id_token = String(fresh.id_token);
+    if (fresh.refresh_token) secretJson.tokens.refresh_token = String(fresh.refresh_token);
+    secretJson.last_refresh = new Date(nowMs).toISOString();
+  } else if (kind === 'oauth:claude-code') {
+    secretJson.claudeAiOauth = secretJson.claudeAiOauth || {};
+    secretJson.claudeAiOauth.accessToken = String(fresh.access_token);
+    if (fresh.refresh_token) secretJson.claudeAiOauth.refreshToken = String(fresh.refresh_token);
+    if (fresh.expires_in) secretJson.claudeAiOauth.expiresAt = nowMs + Number(fresh.expires_in) * 1000;
+  }
+  vaultUpsertEntry({ id: entry.id, secret: JSON.stringify(secretJson) });
+  return secretJson;
+}
+
+/* Fresh access-token material for an oauth entry, refreshing through the
+   provider first when the current token is inside the margin. */
+async function vaultOauthAccessTokenMaterial(entry, kind) {
+  if (vaultState.status !== 'unlocked') {
+    throw new Error('unlock the vault to refresh the access token');
+  }
+  let secretJson;
+  try {
+    secretJson = JSON.parse(String(entry.secret));
+  } catch {
+    throw new Error('the stored auth JSON does not parse — re-paste the auth file');
+  }
+  if (vaultOauthExpiryMs(kind, secretJson) - Date.now() < VAULT_OAUTH_REFRESH_MARGIN_MS) {
+    secretJson = await vaultOauthRefresh(kind, entry);
+  }
+  return vaultOauthAccessMaterial(kind, secretJson);
+}
+
 function vaultLeaseTransportReady() {
   if (!DASHBOARD_CONNECT_MODE) return false;
   try {
@@ -15081,10 +15220,17 @@ async function vaultFuelEntry(entry) {
   vaultLeaseState.busy = true;
   renderAccessVaultSection();
   try {
+    const oauth = kind.startsWith('oauth:');
+    const fullCredential = oauth && vaultOauthLeasesEnabled();
+    const material =
+      oauth && !fullCredential
+        ? await vaultOauthAccessTokenMaterial(entry, kind)
+        : String(entry.secret);
     const result = await vaultLeaseRpc('api_credential_lease_grant', {
       kind,
       label: entry.label || vaultProviderLabel(entry.provider),
-      material: String(entry.secret),
+      material,
+      ...(oauth ? { mode: fullCredential ? 'full_credential' : 'access_token' } : {}),
       ttl_ms: VAULT_LEASE_TTL_MS,
       offline_ms: vaultOfflineMs(),
     });
@@ -15115,25 +15261,52 @@ async function vaultRevokeLease(leaseId) {
 
 /* Connected renewal: every granting tab renews its own leases while the
    tunnel is up; a failed renewal (revoked elsewhere, expiry, detach)
-   just drops the lease from this tab's renew set. */
+   just drops the lease from this tab's renew set. Access-token oauth
+   leases whose provider token nears expiry re-grant freshly refreshed
+   material instead — a plain renew would keep a lease alive around a
+   token that is about to die. */
+async function vaultRenewOwnLeasesOnce() {
+  if (!vaultLeaseTransportReady()) return;
+  for (const leaseId of Array.from(vaultOwnLeaseIds)) {
+    const lease = vaultLeaseState.leases.find(l => l.lease_id === leaseId);
+    if (lease?.mode === 'access_token' && vaultState.status === 'unlocked') {
+      const entry = vaultState.entries.find(e => vaultEntryLeaseKind(e) === lease.kind);
+      if (entry) {
+        let stale = true;
+        try {
+          stale =
+            vaultOauthExpiryMs(lease.kind, JSON.parse(String(entry.secret))) - Date.now() <
+            VAULT_OAUTH_REFRESH_MARGIN_MS;
+        } catch (_) {}
+        if (stale) {
+          // Replaces the lease on the daemon; the ids reconcile on the
+          // forced status refresh below. On failure the stale lease is
+          // deliberately left un-renewed: its token is dying anyway,
+          // and keeping it alive would just read as phantom fuel.
+          await vaultFuelEntry(entry);
+          continue;
+        }
+      }
+    }
+    try {
+      await vaultLeaseRpc('api_credential_lease_renew', { lease_id: leaseId });
+    } catch (err) {
+      console.warn(`[vault] lease renewal failed for ${leaseId}:`, err?.message || err);
+      vaultOwnLeaseIds.delete(leaseId);
+    }
+  }
+  vaultRefreshLeases({ force: true }).catch(() => {});
+}
+
 function vaultEnsureRenewLoop() {
   if (vaultRenewTimer || !vaultOwnLeaseIds.size) return;
-  vaultRenewTimer = window.setInterval(async () => {
+  vaultRenewTimer = window.setInterval(() => {
     if (!vaultOwnLeaseIds.size) {
       window.clearInterval(vaultRenewTimer);
       vaultRenewTimer = null;
       return;
     }
-    if (!vaultLeaseTransportReady()) return;
-    for (const leaseId of Array.from(vaultOwnLeaseIds)) {
-      try {
-        await vaultLeaseRpc('api_credential_lease_renew', { lease_id: leaseId });
-      } catch (err) {
-        console.warn(`[vault] lease renewal failed for ${leaseId}:`, err?.message || err);
-        vaultOwnLeaseIds.delete(leaseId);
-      }
-    }
-    vaultRefreshLeases({ force: true }).catch(() => {});
+    vaultRenewOwnLeasesOnce().catch(() => {});
   }, VAULT_LEASE_RENEW_EVERY_MS);
 }
 
@@ -15723,6 +15896,16 @@ function vaultRenderFueling(card) {
     const kindChip = document.createElement('span');
     kindChip.className = 'vault-chip ok';
     kindChip.textContent = lease.kind;
+    let modeChip = null;
+    if (lease.mode === 'access_token' || lease.mode === 'full_credential') {
+      modeChip = document.createElement('span');
+      modeChip.className = lease.mode === 'access_token' ? 'vault-chip' : 'vault-chip warn';
+      modeChip.textContent = lease.mode === 'access_token' ? 'access token' : 'full credential';
+      modeChip.title =
+        lease.mode === 'access_token'
+          ? 'Short-lived access token; the refresh token never left the browser vault.'
+          : 'Full auth file (refresh token included) — durable authority for the lease window.';
+    }
     const detail = document.createElement('span');
     detail.className = 'secret';
     const renewing = vaultOwnLeaseIds.has(lease.lease_id) ? ', renewing from this tab' : '';
@@ -15732,7 +15915,8 @@ function vaultRenderFueling(card) {
     actions.appendChild(
       vaultButton('Revoke', () => vaultRevokeLease(lease.lease_id), { danger: true })
     );
-    row.append(lbl, kindChip, detail, actions);
+    if (modeChip) row.append(lbl, kindChip, modeChip, detail, actions);
+    else row.append(lbl, kindChip, detail, actions);
     list.appendChild(row);
   }
   card.appendChild(list);
@@ -15764,15 +15948,18 @@ function vaultRenderFueling(card) {
   const fuelRow = document.createElement('div');
   fuelRow.className = 'vault-actions';
   for (const { entry, kind } of fuelable) {
-    const oauthBlocked = kind.startsWith('oauth:') && !vaultOauthLeasesEnabled();
     const active = vaultLeaseState.leases.some(lease => lease.kind === kind);
     const button = vaultButton(
       `${active ? 'Re-fuel' : 'Fuel'}: ${entry.label || vaultProviderLabel(entry.provider)}`,
       () => vaultFuelEntry(entry),
       { primary: !active }
     );
-    button.disabled = vaultLeaseState.busy || oauthBlocked;
-    if (oauthBlocked) button.title = 'Enable full-credential OAuth leases below first.';
+    button.disabled = vaultLeaseState.busy;
+    if (kind.startsWith('oauth:')) {
+      button.title = vaultOauthLeasesEnabled()
+        ? 'Full-credential lease: the daemon holds the auth file (refresh token included) for the lease window.'
+        : 'Access-token lease: this browser refreshes the token and leases only the short-lived result; the refresh token never leaves the vault.';
+    }
     fuelRow.appendChild(button);
   }
   if (!fuelable.length) {
@@ -15798,7 +15985,7 @@ function vaultRenderFueling(card) {
     label.htmlFor = 'vault-oauth-lease-toggle';
     label.className = 'vault-note';
     label.textContent =
-      'Allow full-credential OAuth leases to this daemon. While such a lease is live the daemon holds durable subscription authority; revocation then depends on lease discipline (worst case: the provider’s session-revocation page).';
+      'Fuel OAuth with the full credential file instead of browser-refreshed access tokens. While such a lease is live the daemon holds durable subscription authority; revocation then depends on lease discipline (worst case: the provider’s session-revocation page). Needed for Claude Code today — Anthropic’s token endpoint refuses browser refresh — and for autonomy beyond the provider’s access-token lifetime.';
     oauthRow.append(toggle, label);
     card.appendChild(oauthRow);
   }
@@ -15808,7 +15995,7 @@ function vaultRenderFueling(card) {
   const renewNote = document.createElement('div');
   renewNote.className = 'vault-note';
   renewNote.textContent =
-    'Leases renew every 5 minutes from this tab while it stays connected; material lives only in the daemon’s memory and dies on expiry, revocation, or restart.';
+    'Leases renew every 5 minutes from this tab while it stays connected (access-token OAuth leases re-grant a freshly refreshed token as needed); material lives only in the daemon’s memory and dies on expiry, revocation, or restart.';
   card.appendChild(renewNote);
 }
 
@@ -16044,6 +16231,14 @@ window.intendantVault = {
     return vaultFuelEntry(entry);
   },
   revokeLease: leaseId => vaultRevokeLease(leaseId),
+  /* Validator-only: point OAuth refresh at a mock token endpoint, and
+     drive one renewal tick on demand instead of waiting five minutes. */
+  setOauthEndpoints: (map = {}) => {
+    for (const key of Object.keys(vaultOauthEndpointOverrides)) delete vaultOauthEndpointOverrides[key];
+    Object.assign(vaultOauthEndpointOverrides, map);
+  },
+  renewTick: () => vaultRenewOwnLeasesOnce(),
+  setOauthLeases: enabled => vaultSetOauthLeasesEnabled(Boolean(enabled)),
   setEgress: (kinds, opts = {}) => {
     vaultEgressState.enabled = new Set((Array.isArray(kinds) ? kinds : []).map(String));
     vaultEgressPersistEnabled();

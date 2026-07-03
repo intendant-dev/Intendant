@@ -13,6 +13,12 @@
 //   4. renew extends the expiry; status reports the lease + usage fields
 //   5. unknown-kind grant is refused server-side
 //   6. revoke -> status empty, key status back to false
+//   7. oauth materialization lifecycle + the UI custody story + --owner
+//   8. access-token OAuth mode against a mock token endpoint: browser
+//      refresh with rotation written back to the vault, refresh-free
+//      material on disk, near-expiry re-grant on the renewal tick, the
+//      daemon's fail-closed refusal of refresh-bearing material, and the
+//      full-credential opt-in still carrying the whole auth file
 //
 // Usage: node scripts/validate-credential-leases.cjs
 //   [--connect-binary <path>] [--daemon-binary <path>]
@@ -27,6 +33,7 @@ const { launchBrowser } = require('./lib/browser-automation.cjs');
 
 const DEFAULT_CONNECT_PORT = 9895;
 const DEFAULT_DAEMON_PORT = 8897;
+const MOCK_OAUTH_PORT = 8921;
 const DEFAULT_DAEMON_ID = 'credential-lease-daemon';
 const START_TIMEOUT_MS = 45000;
 const CONNECT_TIMEOUT_MS = 45000;
@@ -177,6 +184,7 @@ async function main() {
   const logs = { connect: [], daemon: [] };
   const children = [];
   let browser = null;
+  let mockOauthServer = null;
 
   function spawnLogged(command, args, spawnOptions, sink) {
     const child = spawn(command, args, spawnOptions);
@@ -423,6 +431,156 @@ async function main() {
     }, STEP_TIMEOUT_MS, 'daemon unfueled after UI revoke');
     console.log('PASS lease-ui-revoke panel revocation unfuels the daemon');
 
+    // ── Access-token OAuth mode (the default for oauth kinds) ──
+    // A mock token endpoint stands in for auth.openai.com: it rotates the
+    // refresh token on every use and mints JWT-shaped access tokens (the
+    // browser reads codex expiry from the JWT exp claim). CORS headers on
+    // both OPTIONS and POST are load-bearing — the refreshing page is on
+    // the connect origin.
+    const b64url = obj => Buffer.from(JSON.stringify(obj)).toString('base64url');
+    const oauthMock = { refreshToken: 'rt-0', expiresInSec: 300, refreshCount: 0, lastBody: null };
+    mockOauthServer = require('http').createServer((req, res) => {
+      const cors = {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'content-type',
+      };
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, cors);
+        res.end();
+        return;
+      }
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => {
+        let parsed = {};
+        try { parsed = JSON.parse(body); } catch { /* fall through to invalid_grant */ }
+        oauthMock.lastBody = parsed;
+        if (parsed.grant_type !== 'refresh_token' || parsed.refresh_token !== oauthMock.refreshToken) {
+          res.writeHead(401, { ...cors, 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid_grant' }));
+          return;
+        }
+        oauthMock.refreshCount += 1;
+        oauthMock.refreshToken = `rt-${oauthMock.refreshCount}`;
+        res.writeHead(200, { ...cors, 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          // n makes consecutive tokens distinct even within one epoch
+          // second (exp alone would collide on a fast run).
+          access_token: `${b64url({ alg: 'none' })}.${b64url({ exp: Math.floor(Date.now() / 1000) + oauthMock.expiresInSec, n: oauthMock.refreshCount })}.e2e`,
+          id_token: `idt-${oauthMock.refreshCount}`,
+          refresh_token: oauthMock.refreshToken,
+          expires_in: oauthMock.expiresInSec,
+        }));
+      });
+    });
+    await new Promise(resolve => mockOauthServer.listen(MOCK_OAUTH_PORT, '127.0.0.1', resolve));
+
+    // Store the full codex auth file in the vault through the real form.
+    const codexSeed = JSON.stringify({
+      OPENAI_API_KEY: null,
+      tokens: { access_token: 'stale-not-a-jwt', refresh_token: 'rt-0', account_id: 'acct-e2e' },
+      last_refresh: '2026-01-01T00:00:00.000Z',
+    });
+    const addCodex = await page.evaluate(secret => {
+      const section = document.getElementById('access-vault-section');
+      const fold = Array.from(section.querySelectorAll('details summary'))
+        .find(s => s.textContent.trim() === 'Add a credential');
+      if (!fold) return 'no add fold';
+      fold.parentElement.open = true;
+      const selects = section.querySelectorAll('.vault-form-grid select');
+      if (selects.length < 2) return 'form fields missing';
+      selects[0].value = 'oauth';
+      selects[0].dispatchEvent(new Event('change'));
+      selects[1].value = 'codex';
+      const inputs = section.querySelectorAll('.vault-form-grid input');
+      inputs[0].value = 'UI Codex';
+      const area = fold.parentElement.querySelector('textarea');
+      if (!area) return 'no auth textarea';
+      area.value = secret;
+      const button = Array.from(section.querySelectorAll('button'))
+        .find(b => b.textContent.trim() === 'Add to vault');
+      if (!button) return 'no add button';
+      button.click();
+      return 'ok';
+    }, codexSeed);
+    assert.strictEqual(addCodex, 'ok', `UI add-codex failed: ${addCodex}`);
+    const codexEntryId = await waitFor(async () =>
+      (await vaultState())?.entries.find(e => e.kind === 'oauth' && e.provider === 'codex')?.id,
+    STEP_TIMEOUT_MS, 'codex entry stored');
+
+    await page.evaluate(url => window.intendantVault.setOauthEndpoints({ 'oauth:codex': url }),
+      `http://127.0.0.1:${MOCK_OAUTH_PORT}/oauth/token`);
+    await page.evaluate(id => window.intendantVault.fuelEntry(id), codexEntryId);
+    const atLease = await waitFor(async () => {
+      const status = await rpc('api_credential_lease_status');
+      const lease = status.leases.find(l => l.kind === 'oauth:codex');
+      return lease && lease.mode === 'access_token' ? lease : null;
+    }, STEP_TIMEOUT_MS, 'access-token codex lease');
+    const codexAuthAt = JSON.parse(fs.readFileSync(codexAuthPath, 'utf8'));
+    assert.strictEqual(codexAuthAt.tokens.refresh_token, '', 'materialized auth must be refresh-free');
+    assert.strictEqual(codexAuthAt.OPENAI_API_KEY, null, 'materialized auth must not carry an API key');
+    assert.strictEqual(codexAuthAt.tokens.account_id, 'acct-e2e', 'non-secret fields must survive the strip');
+    assert(String(codexAuthAt.tokens.access_token).split('.').length === 3, 'expected the freshly minted JWT on disk');
+    assert.strictEqual(oauthMock.lastBody?.client_id, 'app_EMoamEEZ73f0CkXaXp7hrann', 'refresh must use the codex public client id');
+    const vaultCodexAfterFuel = JSON.parse(
+      (await vaultState()).entries.find(e => e.id === codexEntryId).secret
+    );
+    assert.strictEqual(vaultCodexAfterFuel.tokens.refresh_token, 'rt-1', 'rotated refresh token must be written back to the vault');
+    assert.strictEqual(vaultCodexAfterFuel.tokens.access_token, codexAuthAt.tokens.access_token, 'vault copy tracks the fresh access token');
+    console.log('PASS lease-oauth-access-token browser-refreshed grant: refresh-free on disk, rotation in the vault');
+
+    // The 300 s token life sits inside the 10-minute margin, so one
+    // renewal tick must refresh again and re-grant (new lease id).
+    await page.evaluate(() => window.intendantVault.renewTick());
+    const atLease2 = await waitFor(async () => {
+      const status = await rpc('api_credential_lease_status');
+      const lease = status.leases.find(l => l.kind === 'oauth:codex');
+      return lease && lease.lease_id !== atLease.lease_id ? lease : null;
+    }, STEP_TIMEOUT_MS, 're-granted access-token lease');
+    assert.strictEqual(atLease2.mode, 'access_token');
+    const codexAuthAt2 = JSON.parse(fs.readFileSync(codexAuthPath, 'utf8'));
+    assert.notStrictEqual(codexAuthAt2.tokens.access_token, codexAuthAt.tokens.access_token, 'renewal tick must materialize the newer token');
+    assert.strictEqual(codexAuthAt2.tokens.refresh_token, '', 're-granted material must stay refresh-free');
+    const vaultCodexAfterTick = JSON.parse(
+      (await vaultState()).entries.find(e => e.id === codexEntryId).secret
+    );
+    assert.strictEqual(vaultCodexAfterTick.tokens.refresh_token, 'rt-2', 'second rotation must be written back too');
+    const ownAfterTick = await page.evaluate(() => window.intendantVault.leases().ownLeaseIds);
+    assert(ownAfterTick.includes(atLease2.lease_id), 'the tab must renew the replacement lease');
+    console.log('PASS lease-oauth-access-token-renew near-expiry tick re-granted fresh material');
+
+    // Fail-closed on the daemon: material claiming access-token mode but
+    // still carrying durable authority is refused (both oauth kinds).
+    for (const [kind, material] of [
+      ['oauth:codex', JSON.stringify({ tokens: { access_token: 'a', refresh_token: 'r' } })],
+      ['oauth:claude-code', JSON.stringify({ claudeAiOauth: { accessToken: 'a', refreshToken: 'r' } })],
+    ]) {
+      let refused = false;
+      try {
+        await rpc('api_credential_lease_grant', { kind, label: 'x', mode: 'access_token', material });
+      } catch (err) {
+        refused = /refresh token/.test(String((err && err.message) || err));
+      }
+      assert(refused, `daemon must refuse refresh-bearing access-token material for ${kind}`);
+    }
+    console.log('PASS lease-oauth-fail-closed refresh-bearing access-token grants refused server-side');
+
+    // The full-credential opt-in still leases the whole auth file.
+    await page.evaluate(() => window.intendantVault.setOauthLeases(true));
+    await page.evaluate(id => window.intendantVault.fuelEntry(id), codexEntryId);
+    await waitFor(async () => {
+      const status = await rpc('api_credential_lease_status');
+      const lease = status.leases.find(l => l.kind === 'oauth:codex');
+      return lease && lease.mode === 'full_credential' ? lease : null;
+    }, STEP_TIMEOUT_MS, 'full-credential codex lease');
+    const codexAuthFull = JSON.parse(fs.readFileSync(codexAuthPath, 'utf8'));
+    assert.strictEqual(codexAuthFull.tokens.refresh_token, 'rt-2', 'full-credential mode leases the refresh token');
+    await page.evaluate(() => window.intendantVault.setOauthLeases(false));
+    await rpc('api_credential_lease_revoke', { kind: 'oauth:codex' });
+    await waitFor(() => !fs.existsSync(codexAuthPath), STEP_TIMEOUT_MS, 'codex materialization deleted after the mode scenarios');
+    console.log('PASS lease-oauth-full-credential opt-in leases the whole auth file');
+
     // ── --owner bootstrap (install.sh step 6) ──
     // A fresh daemon started with --owner <client-key-fingerprint> must
     // seed a root grant pinned to that key at startup, and a restart with
@@ -481,10 +639,13 @@ async function main() {
     process.exitCode = 1;
   } finally {
     if (browser) await browser.close().catch(() => {});
+    if (mockOauthServer) mockOauthServer.close();
     for (const child of children) {
       try { child.kill('SIGTERM'); } catch { /* already gone */ }
     }
-    fs.rmSync(tmp, { recursive: true, force: true });
+    // The SIGTERM'd children may still be flushing logs; rmSync retries
+    // ENOTEMPTY/EBUSY so teardown doesn't fail an otherwise-green run.
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
   }
 }
 

@@ -437,7 +437,9 @@ async function main() {
       try { child.kill('SIGTERM'); } catch { /* already gone */ }
     }
     if (mock) mock.close();
-    fs.rmSync(tmp, { recursive: true, force: true });
+    // The SIGTERM'd children may still be flushing logs; rmSync retries
+    // ENOTEMPTY/EBUSY so teardown doesn't fail an otherwise-green run.
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
   }
 }
 

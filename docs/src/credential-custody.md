@@ -1,18 +1,22 @@
 # Credential Custody: the Vault and Leases
 
-> Status: **shipped 2026-07-03, all six rollout steps.** The four sign-off
-> decisions were resolved as recommended: offline-lease default **24h**;
-> full-credential OAuth leases **built but off by default**; recovery
-> phrase **mandatory** at vault creation; scoping ships as the **single
-> default rule** with per-entry overrides deferred. One documented
-> deviation: v1 OAuth fueling is the full-credential opt-in only — the
-> access-token lease mode (browser-side token refresh) is a stated
-> follow-up, so OAuth leasing is entirely off until a daemon's toggle is
-> flipped. End-to-end coverage: `scripts/validate-vault.cjs` (vault
+> Status: **shipped 2026-07-03, all six rollout steps + access-token
+> OAuth mode.** The four sign-off decisions were resolved as recommended:
+> offline-lease default **24h**; full-credential OAuth leases **built but
+> off by default**; recovery phrase **mandatory** at vault creation;
+> scoping ships as the **single default rule** with per-entry overrides
+> deferred. The v1 deviation (OAuth fueling = full-credential opt-in
+> only) is resolved: access-token leases (browser-side token refresh,
+> `mode: "access_token"`) are now the OAuth default. Reach caveat:
+> OpenAI's token endpoint serves any browser origin, so Codex works
+> out of the box; Anthropic's origin-allowlists browsers away, so Claude
+> Code still needs the full-credential opt-in until that changes.
+> End-to-end coverage: `scripts/validate-vault.cjs` (vault
 > custody, nine scenarios), `scripts/validate-credential-leases.cjs`
 > (lease lifecycle, OAuth materialization, UI fueling, `--owner`
-> bootstrap), and `scripts/validate-client-egress.cjs` (browser-relayed
-> calls against a mock provider, custody + allowlist proofs). The
+> bootstrap, access-token mode against a mock token endpoint), and
+> `scripts/validate-client-egress.cjs` (browser-relayed calls against a
+> mock provider, custody + allowlist proofs). The
 > access-control counterpart (who may reach a daemon at all) is
 > [Trust Architecture](./trust-architecture.md); this chapter is about the
 > *other* secrets — the model-provider credentials a daemon spends.
@@ -109,7 +113,7 @@ the controller **in memory only**, tagged with an expiry.
 
 | Frame | Direction | Meaning |
 |---|---|---|
-| `credential_lease_grant` | browser → daemon | credential material + lease id + TTL + scope |
+| `credential_lease_grant` | browser → daemon | credential material + lease id + TTL + scope (+ `mode` for oauth kinds: `access_token` / `full_credential`) |
 | `credential_lease_renew` | browser → daemon | extend a lease (sent automatically while connected) |
 | `credential_lease_revoke` | browser → daemon | kill a lease now; daemon wipes the material |
 | `credential_lease_status` | daemon → browser | active leases, expiries, usage counters (for the UI and the audit trail) |
@@ -139,19 +143,30 @@ lane) telling the user which daemon went dry.
 suited to leasing than raw keys, because the protocol already separates
 durable from ephemeral authority:
 
-- **Access-token lease (the intended default; not yet built):** the
-  browser keeps the **refresh token** in the vault and never leases it.
-  It performs token refresh itself and leases only short-lived **access
-  tokens** over the tunnel. The daemon's maximum authority horizon is
-  the provider's own access TTL (typically ≤1h) past the offline-lease
-  window, no matter what an attacker does. This mode needs per-provider
-  OAuth token plumbing in the browser and is the follow-up milestone;
-  until it lands, OAuth fueling is entirely off by default.
-- **Full-credential lease (opt-in per daemon — what v1 ships):** for
-  long unattended autonomy, the pasted auth-file JSON (refresh token
-  included) is leased with a TTL we enforce. Honest note in the UI:
-  during that window the daemon holds durable authority; revocation then
-  depends on our lease discipline (and, worst case, the provider's
+- **Access-token lease (the default):** the browser keeps the **refresh
+  token** in the vault and never leases it. It performs token refresh
+  itself against the provider's token endpoint (rotated refresh tokens
+  are written back into the vault — both providers rotate) and leases
+  only short-lived **access tokens** over the tunnel, as material with
+  every durable field blanked and `mode: "access_token"` on the grant.
+  The daemon re-verifies the material is refresh-free before accepting —
+  fail-closed against custodian bugs — and re-materializes on every
+  re-grant; the granting tab's renewal tick re-grants freshly refreshed
+  material whenever the current token nears expiry. The daemon's maximum
+  authority horizon is the provider's own access TTL (typically ≤1h)
+  past the last re-grant, no matter what an attacker does. Reach: this
+  needs the token endpoint to answer browser CORS. OpenAI's
+  (`auth.openai.com`) serves `Access-Control-Allow-Origin: *`, so
+  **Codex fuels this way out of the box**; Anthropic's
+  (`console.anthropic.com`) allowlists origins and refuses others, so
+  **Claude Code cannot refresh in the browser today** and stays behind
+  the full-credential opt-in (the UI says exactly that).
+- **Full-credential lease (opt-in per daemon):** for long unattended
+  autonomy beyond the provider's access-token lifetime — and for Claude
+  Code, per the CORS limit above — the pasted auth-file JSON (refresh
+  token included) is leased with a TTL we enforce. Honest note in the
+  UI: during that window the daemon holds durable authority; revocation
+  then depends on our lease discipline (and, worst case, the provider's
   session-revocation page).
 
 **External-agent materialization (a documented weakening).** Codex and
@@ -261,7 +276,9 @@ enforced by the daemon's own IAM from first boot.
 3. ✅ OAuth materialization for Codex (`CODEX_HOME`) and Claude Code
    (`CLAUDE_CONFIG_DIR`): private 0700/0600 files, deleted on expiry,
    revocation, shutdown, and a startup recovery sweep; full-credential
-   opt-in per daemon (OFF by default). Access-token mode: follow-up.
+   opt-in per daemon (OFF by default). Access-token mode shipped as the
+   OAuth default (browser refresh + rotation write-back; daemon-verified
+   refresh-free material; Codex live, Claude Code pending provider CORS).
 4. ✅ Offline-lease knob, fueling panel (per-daemon status, revocation,
    usage audit fields), dry-daemon Web Push.
 5. ✅ Client-egress mode for Anthropic/Gemini (host-allowlisted browser
