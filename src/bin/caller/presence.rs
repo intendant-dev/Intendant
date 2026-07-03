@@ -1031,9 +1031,6 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SessionGoal { .. }
         | AppEvent::SessionRenameResult { .. }
         | AppEvent::SessionAgentConfigResult { .. }
-        | AppEvent::GeminiConfigChanged { .. }
-        | AppEvent::GeminiThreadActionRequested { .. }
-        | AppEvent::GeminiThreadActionResult { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::Key(_)
         | AppEvent::Resize(_, _)

@@ -276,7 +276,6 @@ impl AppEventUpcaster {
             | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::ExternalFollowUpRequested { .. }
             | AppEvent::FollowUpCancelRequested { .. }
-            | AppEvent::GeminiThreadActionRequested { .. }
             | AppEvent::SessionStopRequested { .. }
             | AppEvent::SessionIdentity { .. }
             | AppEvent::SessionRelationship { .. }
@@ -331,23 +330,7 @@ impl AppEventUpcaster {
                 },
             )],
 
-            AppEvent::GeminiThreadActionResult {
-                action,
-                success,
-                message,
-            } => vec![log_event(
-                if *success {
-                    LogLevel::Info
-                } else {
-                    LogLevel::Warn
-                },
-                "gemini-action",
-                if *success {
-                    format!("/{}: {}", action, message)
-                } else {
-                    format!("/{}: FAILED — {}", action, message)
-                },
-            )],
+
 
             // ---- Turn lifecycle ----
             AppEvent::TurnStarted { turn, .. } => {
@@ -1090,50 +1073,7 @@ impl AppEventUpcaster {
                 }
             }
 
-            AppEvent::GeminiConfigChanged {
-                model,
-                model_cleared,
-                approval_mode,
-                sandbox,
-                extensions,
-                allowed_mcp_servers,
-                include_directories,
-                debug,
-            } => {
-                let mut parts: Vec<String> = Vec::new();
-                if let Some(v) = model {
-                    parts.push(format!("model={v}"));
-                } else if *model_cleared {
-                    parts.push("model=<default>".to_string());
-                }
-                if let Some(v) = approval_mode {
-                    parts.push(format!("approval_mode={v}"));
-                }
-                if let Some(v) = sandbox {
-                    parts.push(format!("sandbox={v}"));
-                }
-                if let Some(v) = extensions {
-                    parts.push(format!("extensions=[{} entry/entries]", v.len()));
-                }
-                if let Some(v) = allowed_mcp_servers {
-                    parts.push(format!("allowed_mcp_servers=[{} entry/entries]", v.len()));
-                }
-                if let Some(v) = include_directories {
-                    parts.push(format!("include_directories=[{} path(s)]", v.len()));
-                }
-                if let Some(v) = debug {
-                    parts.push(format!("debug={v}"));
-                }
-                if parts.is_empty() {
-                    vec![]
-                } else {
-                    vec![log_event(
-                        LogLevel::Info,
-                        "config",
-                        format!("gemini config: {}", parts.join(", ")),
-                    )]
-                }
-            }
+
 
             // ---- Budget / safety ----
             AppEvent::BudgetWarning { pct, remaining } => vec![log_event(
@@ -1508,23 +1448,7 @@ impl WireEventUpcaster {
                 },
             )],
 
-            OutboundEvent::GeminiThreadActionResult {
-                action,
-                success,
-                message,
-            } => vec![log_event(
-                if *success {
-                    LogLevel::Info
-                } else {
-                    LogLevel::Warn
-                },
-                "gemini-action",
-                if *success {
-                    format!("/{}: {}", action, message)
-                } else {
-                    format!("/{}: FAILED — {}", action, message)
-                },
-            )],
+
 
             // ---- Turn lifecycle ----
             OutboundEvent::TurnStarted { turn, .. } => {
@@ -2199,50 +2123,7 @@ impl WireEventUpcaster {
                 }
             }
 
-            OutboundEvent::GeminiConfigChanged {
-                model,
-                model_cleared,
-                approval_mode,
-                sandbox,
-                extensions,
-                allowed_mcp_servers,
-                include_directories,
-                debug,
-            } => {
-                let mut parts: Vec<String> = Vec::new();
-                if let Some(v) = model {
-                    parts.push(format!("model={v}"));
-                } else if *model_cleared {
-                    parts.push("model=<default>".to_string());
-                }
-                if let Some(v) = approval_mode {
-                    parts.push(format!("approval_mode={v}"));
-                }
-                if let Some(v) = sandbox {
-                    parts.push(format!("sandbox={v}"));
-                }
-                if let Some(v) = extensions {
-                    parts.push(format!("extensions=[{} entry/entries]", v.len()));
-                }
-                if let Some(v) = allowed_mcp_servers {
-                    parts.push(format!("allowed_mcp_servers=[{} entry/entries]", v.len()));
-                }
-                if let Some(v) = include_directories {
-                    parts.push(format!("include_directories=[{} path(s)]", v.len()));
-                }
-                if let Some(v) = debug {
-                    parts.push(format!("debug={v}"));
-                }
-                if parts.is_empty() {
-                    vec![]
-                } else {
-                    vec![log_event(
-                        LogLevel::Info,
-                        "config",
-                        format!("gemini config: {}", parts.join(", ")),
-                    )]
-                }
-            }
+
 
             // ---- Budget / safety ----
             OutboundEvent::BudgetWarning { pct, remaining } => vec![log_event(

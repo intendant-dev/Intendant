@@ -10,7 +10,7 @@ agent loop.
 > **The TUI is a display-only client of the control plane.** It renders state
 > and emits [`ControlMsg`](./integrations.md) values onto the `EventBus`; it does
 > **not** mutate shared state directly. The centralized `control_plane.rs` is the
-> single writer for autonomy level, external-agent backend, Codex/Gemini config,
+> single writer for autonomy level, external-agent backend, runtime config,
 > etc. Its module doc states this explicitly: *"Frontends remain display-only —
 > they render state changes but never write to shared state."* Approval
 > resolutions go through the shared `ApprovalRegistry`; everything else is a

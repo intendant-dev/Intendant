@@ -17022,24 +17022,6 @@ pub struct SettingsPayload {
     // command/path defaults.
     #[serde(default)]
     pub claude_command: Option<String>,
-    #[serde(default)]
-    pub gemini_command: Option<String>,
-    // Gemini runtime config (persisted to `[agent.gemini_cli]`). Mirrors
-    // the Codex fields above for the Activity → Control sub-tab.
-    #[serde(default)]
-    pub gemini_model: Option<String>,
-    #[serde(default = "default_settings_gemini_approval_mode")]
-    pub gemini_approval_mode: String,
-    #[serde(default)]
-    pub gemini_sandbox: bool,
-    #[serde(default)]
-    pub gemini_extensions: Vec<String>,
-    #[serde(default)]
-    pub gemini_allowed_mcp_servers: Vec<String>,
-    #[serde(default)]
-    pub gemini_include_directories: Vec<String>,
-    #[serde(default)]
-    pub gemini_debug: bool,
     // Per-category approval rules (persisted to `[approval]`). Exposed here
     // for the dashboard's "Approval rules" controls to populate the selects.
     // Live edits flow through the `set_approval_rule` ControlMsg, not through
@@ -17085,10 +17067,6 @@ fn normalize_settings_agent_command(input: Option<&str>, fallback: &str) -> Stri
     } else {
         trimmed.to_string()
     }
-}
-
-fn default_settings_gemini_approval_mode() -> String {
-    crate::project::normalize_gemini_approval_mode("")
 }
 
 fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> SettingsPayload {
@@ -17150,16 +17128,6 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
             &config.agent.codex.context_archive,
         )),
         claude_command: Some(config.agent.claude_code.command.clone()),
-        gemini_command: Some(config.agent.gemini_cli.command.clone()),
-        gemini_model: config.agent.gemini_cli.model.clone(),
-        gemini_approval_mode: crate::project::normalize_gemini_approval_mode(
-            &config.agent.gemini_cli.approval_mode,
-        ),
-        gemini_sandbox: config.agent.gemini_cli.sandbox,
-        gemini_extensions: config.agent.gemini_cli.extensions.clone(),
-        gemini_allowed_mcp_servers: config.agent.gemini_cli.allowed_mcp_servers.clone(),
-        gemini_include_directories: config.agent.gemini_cli.include_directories.clone(),
-        gemini_debug: config.agent.gemini_cli.debug,
         approval_file_read: config.approval.file_read.as_str().to_string(),
         approval_file_write: config.approval.file_write.as_str().to_string(),
         approval_file_delete: config.approval.file_delete.as_str().to_string(),
@@ -17267,10 +17235,6 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
     if payload.claude_command.is_some() {
         config.agent.claude_code.command =
             normalize_settings_agent_command(payload.claude_command.as_deref(), "claude");
-    }
-    if payload.gemini_command.is_some() {
-        config.agent.gemini_cli.command =
-            normalize_settings_agent_command(payload.gemini_command.as_deref(), "gemini");
     }
 }
 
@@ -35666,7 +35630,6 @@ mod tests {
         assert_eq!(payload.codex_sandbox, None);
         assert_eq!(payload.codex_approval_policy, None);
         assert_eq!(payload.codex_managed_context, None);
-        assert_eq!(payload.gemini_approval_mode, "default");
 
         let mut config = crate::project::ProjectConfig::default();
         config.agent.codex.command = "/opt/codex/bin/codex".to_string();
@@ -35674,7 +35637,6 @@ mod tests {
         config.agent.codex.approval_policy = "never".to_string();
         config.agent.codex.managed_context = "managed".to_string();
         config.agent.codex.service_tier = Some("priority".to_string());
-        config.agent.gemini_cli.approval_mode = "yolo".to_string();
         apply_settings_payload(&mut config, &payload);
 
         assert_eq!(config.agent.default_backend.as_deref(), Some("codex"));
@@ -35683,7 +35645,6 @@ mod tests {
         assert_eq!(config.agent.codex.approval_policy, "never");
         assert_eq!(config.agent.codex.managed_context, "managed");
         assert_eq!(config.agent.codex.service_tier.as_deref(), Some("priority"));
-        assert_eq!(config.agent.gemini_cli.approval_mode, "yolo");
     }
 
     #[test]
@@ -35693,7 +35654,6 @@ mod tests {
         config.agent.codex.managed_context = "managed".to_string();
         config.agent.codex.service_tier = Some("priority".to_string());
         config.agent.claude_code.command = "/usr/local/bin/claude".to_string();
-        config.agent.gemini_cli.command = "/usr/local/bin/gemini".to_string();
 
         let payload = settings_payload_from_config(&config);
         assert_eq!(
@@ -35707,10 +35667,6 @@ mod tests {
         assert_eq!(
             payload.claude_command.as_deref(),
             Some("/usr/local/bin/claude")
-        );
-        assert_eq!(
-            payload.gemini_command.as_deref(),
-            Some("/usr/local/bin/gemini")
         );
 
         let body = serde_json::json!({
@@ -35738,8 +35694,7 @@ mod tests {
             "codex_approval_policy": "never",
             "codex_service_tier": "normal",
             "codex_managed_context": "true",
-            "claude_command": "  /opt/claude/bin/claude  ",
-            "gemini_command": "  /opt/gemini/bin/gemini  "
+            "claude_command": "  /opt/claude/bin/claude  "
         })
         .to_string();
 
@@ -35752,7 +35707,6 @@ mod tests {
         assert_eq!(config.agent.codex.service_tier.as_deref(), Some("standard"));
         assert_eq!(config.agent.codex.managed_context, "managed");
         assert_eq!(config.agent.claude_code.command, "/opt/claude/bin/claude");
-        assert_eq!(config.agent.gemini_cli.command, "/opt/gemini/bin/gemini");
     }
 
     #[test]

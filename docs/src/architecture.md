@@ -112,9 +112,9 @@ stops at context exhaustion, an explicit `done` signal, or a 500-turn safety cap
 Selected with `--agent <backend>` or when an external backend is configured.
 Instead of running Intendant's own loop, the controller spawns and supervises an
 external coding CLI as a subordinate worker (`external_agent::AgentBackend`):
-`Codex`, `ClaudeCode`, or `GeminiCli`. Intendant translates its task,
-approval, and attachment surface onto each backend's native protocol (Codex
-app-server JSON-RPC, Claude Code, Gemini ACP) and surfaces their events back
+`Codex` or `ClaudeCode`. Intendant translates its task, approval, and
+attachment surface onto each backend's native protocol (Codex app-server
+JSON-RPC, Claude Code stream-json) and surfaces their events back
 onto the EventBus so every frontend renders them identically. This is a
 master/worker relationship — see [Multi-Agent Orchestration](./multi-agent.md).
 
@@ -153,7 +153,7 @@ In brief:
 
 - **Control plane** (`control_plane.rs`) is the *single writer* of shared mutable
   state: autonomy level, the active external-agent backend, and the runtime
-  Codex/Gemini configuration. It subscribes to the bus and is the only place
+  external-agent configuration. It subscribes to the bus and is the only place
   `ControlMsg` mutations land, so a setting changed from the dashboard, the TUI,
   or MCP takes effect identically (and persists to `intendant.toml` where
   relevant).

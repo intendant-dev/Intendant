@@ -230,17 +230,6 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             codex_service_tier: None,
             codex_home: None,
         },
-        AgentBackend::GeminiCli => SessionAgentConfig {
-            source: Some("gemini".to_string()),
-            project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
-            agent_command: Some(project.config.agent.gemini_cli.command.clone()),
-            codex_sandbox: None,
-            codex_approval_policy: None,
-            codex_managed_context: None,
-            codex_context_archive: None,
-            codex_service_tier: None,
-            codex_home: None,
-        },
     }
 }
 
@@ -273,11 +262,6 @@ pub fn apply_to_project(
         AgentBackend::ClaudeCode => {
             if let Some(command) = config.agent_command.clone() {
                 project.config.agent.claude_code.command = command;
-            }
-        }
-        AgentBackend::GeminiCli => {
-            if let Some(command) = config.agent_command.clone() {
-                project.config.agent.gemini_cli.command = command;
             }
         }
     }

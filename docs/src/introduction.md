@@ -1,6 +1,6 @@
 # Introduction
 
-Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop to work in — shell access, file editing, a graphical display it can see and control, voice interaction, and the ability to make phone calls — all wrapped in a layered human oversight system. Beyond running its own agent loop, Intendant also **supervises external coding agents** (Codex, Gemini CLI, Claude Code) as managed backends and **federates with peer machines** for multi-host display and task routing.
+Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop to work in — shell access, file editing, a graphical display it can see and control, voice interaction, and the ability to make phone calls — all wrapped in a layered human oversight system. Beyond running its own agent loop, Intendant also **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines** for multi-host display and task routing.
 
 It runs on **macOS, Linux, and Windows**, is **provider-agnostic** (OpenAI, Anthropic, Gemini), and is designed so that every capability is reachable from any interface — CLI, TUI, web dashboard, MCP, or voice.
 
@@ -33,7 +33,7 @@ Intendant is built around a few core ideas:
   │      ▲                        │                │                         │
   │      │ render          ┌──────┴──────┐   ┌─────┴───────────────┐         │
   │   presence ◄───────────┤ native loop │   │ external-agent       │        │
-  │   (mediator AI)        │ + sub-agents│   │ (Codex/Gemini/Claude)│        │
+  │   (mediator AI)        │ + sub-agents│   │ (Codex/Claude Code)  │        │
   │                        └──────┬──────┘   └─────┬───────────────┘         │
   └───────────────────────────────┼────────────────┼────────────────────────┘
               │                    │                │
@@ -50,7 +50,7 @@ See [Architecture](./architecture.md) for the full picture.
 ## Key Capabilities
 
 - **Multi-provider LLM integration** — native tool calling, streaming, prompt caching, and computer use across OpenAI, Anthropic, and Gemini ([Runtime Protocol](./runtime-protocol.md), [Multi-Agent Orchestration](./multi-agent.md))
-- **External-agent orchestration** — supervise Codex, Gemini CLI, or Claude Code as managed backends with steering, approvals, rollback, and cost accounting ([External-Agent Orchestration](./external-agent-orchestration.md))
+- **External-agent orchestration** — supervise Codex or Claude Code as managed backends with steering, approvals, rollback, and cost accounting ([External-Agent Orchestration](./external-agent-orchestration.md))
 - **WebRTC display pipeline** — a shared encoder pool (VP8 baseline + on-demand hardware H.264), tile-based dirty-region streaming, multi-monitor, and bidirectional clipboard ([Display Pipeline](./display-pipeline.md))
 - **Peer federation** — Agent Cards, capability-based task routing, and cross-machine display sharing over mTLS ([Peer Federation](./peer-federation.md))
 - **Computer use** — a provider-agnostic abstraction over X11, Wayland, macOS, and Windows backends ([Computer Use & Live Audio](./computer-use-and-audio.md))

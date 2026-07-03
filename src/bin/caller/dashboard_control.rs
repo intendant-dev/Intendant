@@ -9308,13 +9308,6 @@ fn dashboard_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::SetCodexWritableRoots { .. }
             | ControlMsg::SetCodexManagedContext { .. }
             | ControlMsg::SetCodexContextArchive { .. }
-            | ControlMsg::SetGeminiModel { .. }
-            | ControlMsg::SetGeminiApprovalMode { .. }
-            | ControlMsg::SetGeminiSandbox { .. }
-            | ControlMsg::SetGeminiExtensions { .. }
-            | ControlMsg::SetGeminiAllowedMcpServers { .. }
-            | ControlMsg::SetGeminiIncludeDirectories { .. }
-            | ControlMsg::SetGeminiDebug { .. }
             | ControlMsg::SetVerbosity { .. }
     )
 }
@@ -9346,7 +9339,6 @@ fn dashboard_action_msg_allowed(ctrl: &ControlMsg) -> bool {
     matches!(
         ctrl,
         ControlMsg::CodexThreadAction { .. }
-            | ControlMsg::GeminiThreadAction { .. }
             | ControlMsg::TakeDisplay { .. }
             | ControlMsg::ReleaseDisplay { .. }
             | ControlMsg::GrantUserDisplay { .. }
@@ -9396,14 +9388,6 @@ fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::StopSession { .. } => "stop_session",
         ControlMsg::RestartSession { .. } => "restart_session",
         ControlMsg::ResumeSession { .. } => "resume_session",
-        ControlMsg::SetGeminiModel { .. } => "set_gemini_model",
-        ControlMsg::SetGeminiApprovalMode { .. } => "set_gemini_approval_mode",
-        ControlMsg::SetGeminiSandbox { .. } => "set_gemini_sandbox",
-        ControlMsg::SetGeminiExtensions { .. } => "set_gemini_extensions",
-        ControlMsg::SetGeminiAllowedMcpServers { .. } => "set_gemini_allowed_mcp_servers",
-        ControlMsg::SetGeminiIncludeDirectories { .. } => "set_gemini_include_directories",
-        ControlMsg::SetGeminiDebug { .. } => "set_gemini_debug",
-        ControlMsg::GeminiThreadAction { .. } => "gemini_thread_action",
         ControlMsg::SetVerbosity { .. } => "set_verbosity",
         ControlMsg::ScheduleControllerRestart { .. } => "schedule_controller_restart",
         ControlMsg::ControllerTurnComplete { .. } => "controller_turn_complete",
