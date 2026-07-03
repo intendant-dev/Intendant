@@ -6,3 +6,5 @@ src = "src"
 
 [output.html]
 git-repository-url = "https://github.com/lovon-spec/intendant"
+default-theme = "navy"
+preferred-dark-theme = "navy"

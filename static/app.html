@@ -1714,6 +1714,14 @@ body.access-page #tab-access {
 .ui-empty-glyph svg { display: block; width: 26px; height: 26px; stroke: var(--overlay0); fill: none; stroke-width: 1.6; }
 .ui-empty-title { font-size: 13px; font-weight: 800; color: var(--subtext1); }
 .ui-empty-hint { max-width: 460px; font-size: 11.5px; line-height: 1.55; color: var(--subtext0); }
+.ui-empty-btn {
+  margin-top: 6px; padding: 7px 18px; border: 1px solid transparent; border-radius: 999px;
+  background: var(--blue); color: var(--crust); font-size: 12px; font-weight: 700; cursor: pointer;
+  /* .log-empty-overlay is pointer-events:none so idle clicks reach the
+     stream; the action button opts back in. */
+  pointer-events: auto;
+}
+.ui-empty-btn:hover { background: var(--sapphire); }
 .ui-empty-hint code { color: var(--blue); }
 .ui-empty-actions { display: flex; gap: 8px; margin-top: 6px; }
 /* Compact variant for empty slots inside cards (lists, small panes). */
@@ -13500,6 +13508,89 @@ function updateLogEmptyState() {
   const empty = document.getElementById('log-empty-state');
   if (empty) empty.classList.toggle('hidden', logEntryCount > 0);
 }
+
+/* First-run fueling nudge: when the daemon holds no provider credential,
+   the Activity empty state says so and points at the fix instead of
+   inviting a task that would only fail. Re-checked whenever the vault
+   lease state refreshes, so it clears the moment fuel lands. */
+const LOG_EMPTY_DEFAULT_TITLE = 'No activity yet';
+const LOG_EMPTY_DEFAULT_HINT = 'Send a task below to start the agent, or pick a session from Sessions.';
+let unfueledCheckInFlight = false;
+async function refreshUnfueledEmptyState() {
+  if (unfueledCheckInFlight) return true;
+  unfueledCheckInFlight = true;
+  try {
+    // Freshest first: an active lease means fueled, and the lease list
+    // updates live as the vault grants/revokes (credentials.manage).
+    if (vaultLeaseState.supported === true && vaultLeaseState.leases.length > 0) {
+      applyUnfueledEmptyState(false);
+      return true;
+    }
+    // The status frame carries an aggregate `fueled` flag readable by
+    // every binding; per-provider api_key_status needs settings.manage,
+    // which the default hosted (operator) binding does not hold.
+    const statusFueled = dashboardControlTransport?.lastStatus?.fueled;
+    if (typeof statusFueled === 'boolean') {
+      applyUnfueledEmptyState(!statusFueled);
+      return true;
+    }
+    const keys = await fetchApiKeyStatus();
+    if (!keys || typeof keys !== 'object') return false;
+    applyUnfueledEmptyState(!(keys.openai || keys.anthropic || keys.gemini));
+    return true;
+  } catch {
+    // Unknown (transport not up yet, or a daemon predating the flag):
+    // keep the default copy rather than guessing.
+    return false;
+  } finally {
+    unfueledCheckInFlight = false;
+  }
+}
+function applyUnfueledEmptyState(unfueled) {
+  const empty = document.getElementById('log-empty-state');
+  const title = empty?.querySelector('.ui-empty-title');
+  const hint = empty?.querySelector('.ui-empty-hint');
+  if (!empty || !title || !hint) return;
+  const action = document.getElementById('log-empty-fuel');
+  if (!unfueled) {
+    if (empty.dataset.unfueled) {
+      delete empty.dataset.unfueled;
+      title.textContent = LOG_EMPTY_DEFAULT_TITLE;
+      hint.textContent = LOG_EMPTY_DEFAULT_HINT;
+      if (action) action.remove();
+    }
+    return;
+  }
+  empty.dataset.unfueled = 'true';
+  title.textContent = 'This daemon has no fuel yet';
+  if (DASHBOARD_CONNECT_MODE) {
+    hint.textContent = 'It is claimed and connected, but holds no provider credential. '
+      + 'Grant a time-boxed lease from your vault and the agent can start working.';
+    if (!document.getElementById('log-empty-fuel')) {
+      const btn = document.createElement('button');
+      btn.id = 'log-empty-fuel';
+      btn.className = 'ui-empty-btn';
+      btn.textContent = 'Fuel from your vault';
+      btn.addEventListener('click', () => routeTo('access', 'advanced'));
+      hint.insertAdjacentElement('afterend', btn);
+    }
+  } else {
+    hint.textContent = 'The daemon found no provider API key. Add ANTHROPIC_API_KEY, '
+      + 'OPENAI_API_KEY, or GEMINI_API_KEY to .env and restart — or claim it through a '
+      + 'rendezvous and grant a lease from your vault.';
+  }
+}
+// Probe once the transport can answer; in connect mode the data channel
+// (possibly via TURN) can take a while, so keep retrying for ~40s rather
+// than racing it. First tick is deferred past script evaluation — the
+// probe reads lexical bindings (vaultLeaseState, the transport) that are
+// declared further down this script.
+function scheduleUnfueledProbe(attempt = 0) {
+  refreshUnfueledEmptyState().then(known => {
+    if (!known && attempt < 20) setTimeout(() => scheduleUnfueledProbe(attempt + 1), 2000);
+  });
+}
+setTimeout(scheduleUnfueledProbe, 0);
 let commandOutputGroupSeq = 0;
 const activeCommandOutputGroups = new Map();
 const commandOutputGroups = new Map();
@@ -15105,6 +15196,7 @@ async function vaultRefreshLeases({ force = false } = {}) {
     vaultLeaseState.fetchedAt = Date.now();
   }
   renderAccessVaultSection();
+  refreshUnfueledEmptyState().catch(() => {});
 }
 
 async function vaultFuelEntry(entry) {

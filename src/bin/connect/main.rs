@@ -5179,6 +5179,11 @@ fn landing_ui_html(origin: &str) -> String {
     .mark {{ display: flex; align-items: center; font-weight: 700; letter-spacing: .3px; font-size: 17px; color: var(--text); }}
     .mark img {{ width: 26px; height: 26px; display: block; margin-right: 9px; }}
     .mark span {{ color: var(--accent); }}
+    .mark .pill-alpha {{
+      margin-left: 10px; padding: 2px 9px; border: 1px solid var(--line-strong);
+      border-radius: 999px; font-size: 10.5px; font-weight: 700;
+      letter-spacing: .12em; text-transform: uppercase; color: var(--muted-2);
+    }}
     nav {{ display: flex; gap: 14px 20px; align-items: center; font-size: 14.5px; flex-wrap: wrap; }}
     nav a {{ color: var(--muted); white-space: nowrap; }}
     nav a:hover {{ color: var(--text); }}
@@ -5308,7 +5313,7 @@ fn landing_ui_html(origin: &str) -> String {
 <body>
   <div class="wrap">
     <header>
-      <div class="mark"><img src="/logo.svg" alt="">intendant<span>.dev</span></div>
+      <div class="mark"><img src="/logo.svg" alt="">intendant<span>.dev</span><span class="pill-alpha">pre-alpha</span></div>
       <nav>
         <a href="/trust">How trust works</a>
         <a href="{DOCS_URL}">Docs</a>
@@ -5325,8 +5330,8 @@ fn landing_ui_html(origin: &str) -> String {
         agents: a shell, files, a display it can see and control, voice, and
         phone calls — with layered human supervision, portable across
         OpenAI, Anthropic, and Gemini, and at home on macOS, Linux, and
-        Windows. It runs its own agent loop and supervises Codex, Gemini
-        CLI, and Claude Code as managed backends.
+        Windows. It runs its own agent loop and supervises Codex and
+        Claude Code as managed backends.
       </p>
       <div class="cta">
         <a class="btn" href="/connect">Open your dashboard</a>
@@ -5430,9 +5435,9 @@ fn landing_ui_html(origin: &str) -> String {
       <div class="grid">
         <div class="card">
           <h3>Bring your own agent</h3>
-          <p>Codex, Gemini CLI, and Claude Code run as managed backends —
-          under the same oversight, autonomy dial, and session logging as
-          the native agent loop.</p>
+          <p>Codex and Claude Code run as managed backends — under the
+          same oversight, autonomy dial, and session logging as the
+          native agent loop.</p>
         </div>
         <div class="card">
           <h3>Your keys stay yours</h3>
@@ -5602,6 +5607,9 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     .auth-row input {{ flex: 1 1 auto; }}
     .auth-row button {{ height: 42px; flex: 0 0 auto; }}
     .auth-alt {{ color: var(--muted); font-size: 13px; display: flex; gap: 6px; align-items: baseline; }}
+    .auth-note {{ font-size: 12.5px; line-height: 1.55; color: var(--muted-2); }}
+    .auth-note a {{ color: var(--muted); }}
+    .auth-note a:hover {{ color: var(--accent); }}
     .feature-strip {{ list-style: none; margin: 6px 0 0; padding: 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }}
     .feature-strip li {{ border: 1px solid var(--line); border-radius: 10px; background: rgba(24, 24, 37, .5); padding: 12px 13px; display: grid; gap: 4px; }}
     .feature-strip strong {{ font-size: 13px; }}
@@ -5745,6 +5753,12 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
         <div id="invite-row" class="hidden">
           <label for="invite-code">Invite code</label>
           <input id="invite-code" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="registration is invite-only during the alpha">
+        </div>
+        <div id="invite-note" class="auth-note hidden">
+          Intendant is in private pre-alpha &mdash; creating an account needs an
+          invite right now. No code yet? Follow the project on
+          <a href="{REPO_URL}" target="_blank" rel="noopener">GitHub</a>,
+          or run your own rendezvous (below) &mdash; self-hosting is never gated.
         </div>
         <div id="auth-actions" class="auth-alt">
           <span>New here?</span>
@@ -6355,6 +6369,7 @@ async function refreshAll() {{
 function renderAuth() {{
   const authed = Boolean(state.user);
   $('invite-row').classList.toggle('hidden', authed || !state.inviteRequired);
+  $('invite-note').classList.toggle('hidden', authed || !state.inviteRequired);
   document.body.classList.toggle('signed-out', !authed);
   document.body.classList.toggle('signed-in', authed);
   $('manage').classList.toggle('hidden', !authed);
@@ -6631,6 +6646,8 @@ $('claim-code').addEventListener('keydown', event => {{ if (event.key === 'Enter
 
 const params = new URLSearchParams(location.search);
 if (params.get('claim_code')) $('claim-code').value = params.get('claim_code');
+// Shareable invites: /connect?invite=CODE prefills the invite field.
+if (params.get('invite')) $('invite-code').value = params.get('invite');
 refreshAll().catch(() => renderAuth());
 </script>
 </body>
@@ -7346,6 +7363,23 @@ mod tests {
         }
         assert!(html.contains("location.origin + '/install.sh"));
         assert!(html.contains("--service"));
+        // Honest pre-alpha framing before anyone clicks Sign in.
+        assert!(html.contains(r#"<span class="pill-alpha">pre-alpha</span>"#));
+    }
+
+    #[test]
+    fn connect_page_frames_the_private_alpha() {
+        let html = connect_ui_html(
+            "https://intendant.dev",
+            "Intendant Connect",
+            "Rendezvous account",
+        );
+        // The invite dead-end explains itself and offers the two open paths.
+        assert!(html.contains("private pre-alpha"));
+        assert!(html.contains("self-hosting is never gated"));
+        assert!(html.contains(r#"$('invite-note').classList.toggle"#));
+        // Shareable invite links prefill the code.
+        assert!(html.contains("params.get('invite')"));
     }
 
     #[test]
