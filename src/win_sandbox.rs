@@ -15,12 +15,12 @@
 //!   allowed write roots; everything else stays readable, nothing else is
 //!   writable.
 //! - **Full restriction** (the scoped-shell posture — deny-by-default):
-//!   restricting SIDs `[RESTRICTED, BUILTIN\Users]` apply to every access.
-//!   System directories (`C:\Windows`, `Program Files`) carry `Users`/
-//!   `RESTRICTED` read ACEs out of the box so the shell can start; user
-//!   profiles grant only the specific user — never `Users` — so `$HOME` and
-//!   every other profile read as denied; stamped `RESTRICTED` ACEs on the
-//!   scope roots open exactly the granted subtrees.
+//!   restricting SIDs `[RESTRICTED, ALL APPLICATION PACKAGES]` apply to
+//!   every access. System directories (`C:\Windows`, `Program Files`) and
+//!   HKLM carry AAP read ACEs out of the box (AppContainer support) so the
+//!   shell can start; user profiles carry no AAP ACE, so `%USERPROFILE%`
+//!   and every other profile read as denied; stamped `RESTRICTED` ACEs on
+//!   the scope roots open exactly the granted subtrees.
 //!
 //! ACL stamping mutates the target directories' DACLs, so every grant is
 //! paired with removal (exact-ACE match, not trustee-wide revocation) and
@@ -45,19 +45,19 @@ use std::path::{Path, PathBuf};
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0,
+    CloseHandle, GetLastError, LocalFree, SetHandleInformation, ERROR_SUCCESS, HANDLE,
+    HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
     NO_MULTIPLE_TRUSTEE, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows::Win32::Security::{
-    CreateRestrictedToken, CreateWellKnownSid, EqualSid, GetAce, GetAclInformation,
-    AclSizeInformation, WinBuiltinUsersSid, WinRestrictedCodeSid, ACCESS_ALLOWED_ACE,
-    ACCESS_ALLOWED_ACE_TYPE, ACL as WIN_ACL, ACL_SIZE_INFORMATION,
-    CONTAINER_INHERIT_ACE, CREATE_RESTRICTED_TOKEN_FLAGS, DACL_SECURITY_INFORMATION, DeleteAce,
-    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+    AclSizeInformation, CreateRestrictedToken, CreateWellKnownSid, DeleteAce, EqualSid, GetAce,
+    GetAclInformation, WinBuiltinAnyPackageSid, WinRestrictedCodeSid, ACCESS_ALLOWED_ACE,
+    ACE_FLAGS, ACL as WIN_ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
+    CREATE_RESTRICTED_TOKEN_FLAGS, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
     TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, WELL_KNOWN_SID_TYPE, WRITE_RESTRICTED,
 };
 use windows::Win32::Storage::FileSystem::{
@@ -75,8 +75,7 @@ use windows::Win32::System::Threading::{
     PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 use windows::Win32::System::Console::{
-    GetStdHandle, SetHandleInformation, HANDLE_FLAG_INHERIT, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE,
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 
 /// Marker env var: present in the restricted re-exec child so it does not
@@ -207,7 +206,7 @@ fn add_restricted_ace(path: &Path, mask: u32) -> Result<(), String> {
     let explicit = EXPLICIT_ACCESS_W {
         grfAccessPermissions: mask,
         grfAccessMode: SET_ACCESS,
-        grfInheritance: (OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0),
+        grfInheritance: ACE_FLAGS(OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0),
         Trustee: TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
@@ -321,7 +320,9 @@ fn remove_restricted_ace(path: &Path, mask: u32) -> Result<(), String> {
         }
         // SAFETY: GetAce returned a pointer to an ACE header inside the ACL.
         let header = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
-        if header.Header.AceType != ACCESS_ALLOWED_ACE_TYPE.0 as u8 {
+        // ACCESS_ALLOWED_ACE_TYPE — stable Win32 ABI value (0x0); the crate
+        // does not export it under our feature set.
+        if header.Header.AceType != 0u8 {
             continue;
         }
         if header.Mask != mask {
@@ -609,7 +610,7 @@ fn create_restricted_token(restriction: TokenRestriction) -> Result<OwnedHandle,
     let primary = OwnedHandle(primary);
 
     let restricted_sid = Sid::well_known(WinRestrictedCodeSid)?;
-    let users_sid = Sid::well_known(WinBuiltinUsersSid)?;
+    let packages_sid = Sid::well_known(WinBuiltinAnyPackageSid)?;
     let mut restricting: Vec<SID_AND_ATTRIBUTES> = vec![SID_AND_ATTRIBUTES {
         Sid: restricted_sid.as_psid(),
         Attributes: 0,
@@ -617,11 +618,19 @@ fn create_restricted_token(restriction: TokenRestriction) -> Result<OwnedHandle,
     let flags = match restriction {
         TokenRestriction::WriteOnly => WRITE_RESTRICTED,
         TokenRestriction::Full => {
-            // Users in the restricting set is what lets the shell read
-            // system directories (they ACL `Users`) while user profiles
-            // (ACL'd to the specific user only) stay denied.
+            // ALL APPLICATION PACKAGES in the restricting set is what lets
+            // the shell read system directories and HKLM (they carry AAP
+            // read ACEs for AppContainer support) while user profiles stay
+            // denied. AAP beats BUILTIN\Users here: Users additionally
+            // holds create-directory/write ACEs on C:\ and parts of
+            // ProgramData (probed on Server 2022), which would let a
+            // scoped shell write outside its roots; AAP is read-only
+            // everywhere it appears and absent from those spots entirely.
+            // Path traversal through unreadable intermediate directories
+            // still works via SeChangeNotifyPrivilege, which restricted
+            // tokens keep.
             restricting.push(SID_AND_ATTRIBUTES {
-                Sid: users_sid.as_psid(),
+                Sid: packages_sid.as_psid(),
                 Attributes: 0,
             });
             CREATE_RESTRICTED_TOKEN_FLAGS(0)

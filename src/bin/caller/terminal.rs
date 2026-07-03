@@ -1166,6 +1166,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn scoped_shell_args_skip_rc_files_per_shell() {
         assert_eq!(scoped_shell_args("/bin/zsh"), vec!["-f"]);
@@ -1177,6 +1178,7 @@ mod tests {
         assert!(scoped_shell_args("/bin/sh").is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn scoped_shell_env_is_secret_free_and_home_lands_in_scope() {
         use crate::peer::access_policy::FilesystemAccessPolicy;
