@@ -183,7 +183,7 @@ managed browser cache used by CDP browser workspaces.
 
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
-| `windows.yml` | push/PR to `main` (Rust/Cargo paths) | Cross-platform `cargo check -p intendant` on Windows (`x86_64-pc-windows-msvc`), macOS (`aarch64-apple-darwin`), and Linux (`x86_64-unknown-linux-gnu`) to catch platform-specific build breaks |
+| `windows.yml` | push/PR to `main` (Rust/Cargo paths) | Cross-platform `cargo test -p intendant --bins` on Windows (`x86_64-pc-windows-msvc`), macOS (`aarch64-apple-darwin`), and Linux (`x86_64-unknown-linux-gnu`) to catch platform-specific build breaks and Unix-only test assumptions |
 | `audit.yml` | push/PR (Cargo paths) + weekly cron (Mon 08:00 UTC) | `cargo audit` against the RustSec advisory DB |
 | `docs.yml` | docs changes | Build and deploy this mdBook |
 

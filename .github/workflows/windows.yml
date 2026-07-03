@@ -1,21 +1,25 @@
-name: Cross-platform check
+name: Cross-platform tests
 
-# Type-checks the controller (`intendant`) on every supported platform so
-# cross-platform regressions surface in CI rather than only when someone
-# builds on a non-Linux box.
+# Runs the unit-test suite (`cargo test --bins`) for both binaries on every
+# supported platform so cross-platform regressions surface in CI rather than
+# only when someone builds on a non-Linux box.
 #
 # Windows is the point: the codebase is mostly developed on macOS/Linux, and
-# Unix-only APIs (`std::os::unix::fs::MetadataExt`, libc, /proc, …) slip in
-# unnoticed because they compile fine on the author's machine. This workflow
-# runs `cargo check -p intendant` for the `x86_64-pc-windows-msvc` target and
-# catches that whole class — e.g. an unconditional
-# `use std::os::unix::fs::MetadataExt;` plus `.blocks()`/`.dev()`/`.ino()`
-# calls that broke the MSVC build.
+# Unix-only APIs and path assumptions slip in unnoticed because they compile
+# — and pass tests — fine on the author's machine. This workflow started as
+# `cargo check` only, on the theory that the Windows runtime can't be
+# exercised on a headless runner. That theory is disproven: the full suite
+# passes on a headless Windows Server box (2026-07, the win_sandbox
+# verification), including the restricted-token/ACL sandbox tests and the
+# real-PTY tests. That first full-suite run on real Windows also surfaced
+# seven Unix-only test/product bugs that `cargo check` had waved through
+# (hardcoded `/tmp`, Unix absolute paths in fixtures, `HOME` vs
+# `USERPROFILE`, env-var test races) — running the tests here is what keeps
+# that class of debt from re-accumulating, since Windows dev boxes only
+# exist transiently in this project.
 #
-# `cargo check` (not full build/test) is deliberate: it does the type/cfg
-# resolution that catches platform breakage at a fraction of the cost, and
-# the Windows display/audio runtime can't be exercised on a headless runner
-# anyway. macOS and Linux jobs ride along as a bonus tripwire.
+# Unit tests need no API keys and no display (inline #[cfg(test)] modules
+# only — the tests/skills/ E2E scenarios stay out of CI by design).
 
 on:
   push:
@@ -41,15 +45,18 @@ permissions:
   contents: read
 
 # Don't pile up redundant runs on a fast-moving branch: a newer push to the
-# same ref cancels the in-flight check.
+# same ref cancels the in-flight run.
 concurrency:
-  group: cross-platform-check-${{ github.ref }}
+  group: cross-platform-tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  check:
-    name: check (${{ matrix.os }})
+  test:
+    name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Full test builds are much heavier than the old `cargo check`; a cold
+    # Windows runner can take a while, but a hung run shouldn't burn hours.
+    timeout-minutes: 90
     strategy:
       # One platform failing shouldn't mask the others — we want to see every
       # target's result on a regression.
@@ -106,8 +113,8 @@ jobs:
       # image ships neither pkg-config nor a `vpx.pc`; on a dev box setup-macos.sh
       # pulls both in transitively via `brew install ffmpeg`. Install them
       # directly here (leaner than all of ffmpeg). The other macOS FFI deps
-      # (ScreenCaptureKit, VideoToolbox, CoreFoundation) bind system frameworks
-      # at link time only, which `cargo check` never reaches.
+      # (ScreenCaptureKit, VideoToolbox, CoreFoundation) are system frameworks
+      # already present on the runner image.
       - name: Install macOS build deps
         if: runner.os == 'macOS'
         run: brew install pkg-config libvpx
@@ -122,10 +129,12 @@ jobs:
           key: ${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # Type-check the whole `intendant` package — both binaries (the
-      # `intendant` controller and the `intendant-runtime` executor) and their
-      # shared modules — for this target. `-p intendant` deliberately excludes
-      # the `presence-web` workspace member, which is a wasm32 crate with its
-      # own wasm-pack build and doesn't type-check against a native target.
-      - name: cargo check
-        run: cargo check -p intendant --target ${{ matrix.target }}
+      # Build and run the unit tests of the whole `intendant` package — both
+      # binaries (the `intendant` controller and the `intendant-runtime`
+      # executor) and their shared modules — for this target. `--bins` is the
+      # same invocation the repo docs prescribe locally; `-p intendant`
+      # deliberately excludes the wasm workspace members (`presence-web`,
+      # `station-web`), which have their own wasm-pack builds and don't build
+      # against a native target.
+      - name: cargo test
+        run: cargo test -p intendant --bins --target ${{ matrix.target }}
