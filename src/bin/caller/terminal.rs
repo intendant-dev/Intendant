@@ -1250,6 +1250,13 @@ mod tests {
         let root = tmp.path().join("scoped-root");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("inside.txt"), "inside_ok_7391\n").unwrap();
+        // The denial probe targets a test-owned sentinel in the real $HOME
+        // (outside every allowed root). Probing a pre-existing dotfile made
+        // the test depend on machine state — bare CI runners have no
+        // ~/.zshrc, and an unmatched glob reads as ENOENT, not a denial.
+        let home = std::path::PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let sentinel = home.join(format!(".intendant-sbx-deny-{}", std::process::id()));
+        std::fs::write(&sentinel, "deny_sentinel_9152\n").unwrap();
         let scope = FilesystemAccessPolicy {
             read_roots: Vec::new(),
             write_roots: vec![root.clone()],
@@ -1292,10 +1299,20 @@ mod tests {
         }
         assert!(!transcript.is_empty(), "scoped shell never painted a prompt");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        // The probe sentinel is computed by the shell so the ZLE echo of
-        // the typed command can never satisfy the completion check.
+        // The completion sentinel is computed by the shell so the ZLE echo
+        // of the typed command can never satisfy the completion check. The
+        // sentinel path is single-quoted (with the POSIX '\'' dance) so a
+        // HOME containing spaces or shell metacharacters cannot split or
+        // expand inside the typed command.
+        let sentinel_sh = format!(
+            "'{}'",
+            sentinel.display().to_string().replace('\'', r"'\''")
+        );
         session.write_input(
-            b"cat inside.txt; cat /Users/*/.zshrc 2>&1 | head -1; echo probe_$((41300+37))_done\r",
+            format!(
+                "cat inside.txt; cat {sentinel_sh} 2>&1 | head -1; echo probe_$((41300+37))_done\r"
+            )
+            .as_bytes(),
         );
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv()).await {
@@ -1313,13 +1330,18 @@ mod tests {
                 Err(_) => {}
             }
         }
+        let _ = std::fs::remove_file(&sentinel);
         assert!(
             transcript.contains("inside_ok_7391"),
             "scoped read inside root failed: {transcript}"
         );
         assert!(
-            transcript.contains("not permitted") || transcript.contains("no matches found"),
-            "expected $HOME dotfile read to be denied: {transcript}"
+            !transcript.contains("deny_sentinel_9152"),
+            "sandbox leaked a $HOME read: {transcript}"
+        );
+        assert!(
+            transcript.contains("not permitted"),
+            "expected sentinel read to be denied: {transcript}"
         );
         registry.close_visible(&key, &owner).await;
     }
