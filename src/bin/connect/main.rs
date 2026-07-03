@@ -109,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/fleet/targets/{target_id}/forget",
             post(api_fleet_target_forget),
         )
+        .route("/api/vault", get(api_vault_fetch).post(api_vault_publish))
         .route("/api/claims/claim", post(api_claim_start))
         .route("/api/claims/{claim_id}", get(api_claim_status))
         .route("/api/audit", get(api_audit))
@@ -142,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/daemon/error", post(daemon_error))
         .route("/api/daemon/ack", post(daemon_ack))
         .route("/api/daemon/claim-proof", post(daemon_claim_proof))
+        .route("/api/daemon/dry", post(daemon_dry))
         .route("/api/browser/offer", post(browser_offer))
         .route("/api/browser/ice", post(browser_ice))
         .route("/api/browser/close", post(browser_close))
@@ -330,6 +332,12 @@ struct Store {
     // only prevents rollback — consumers re-verify everything.
     #[serde(default)]
     orl_bulletins: Vec<OrlBulletinRecord>,
+    // Credential vault blobs (credential custody): one end-to-end
+    // encrypted vault per user, stored blind. The service sees only
+    // ciphertext + envelope metadata; the revision check prevents
+    // rollback (the ORL `seq` trick) — devices re-verify everything.
+    #[serde(default)]
+    vault_blobs: Vec<VaultBlobRecord>,
     // Invite codes for gated registration. Only hashes are stored; a
     // code is a bearer secret shown once at mint time.
     #[serde(default)]
@@ -447,6 +455,14 @@ struct OrlBulletinRecord {
     root_key: String,
     seq: u64,
     list: serde_json::Value,
+    updated_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VaultBlobRecord {
+    user_id: Uuid,
+    revision: u64,
+    vault: serde_json::Value,
     updated_unix_ms: u64,
 }
 
@@ -4070,6 +4086,104 @@ struct ClaimProofRequest {
     signature: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DaemonDryRequest {
+    daemon_id: String,
+    #[serde(default)]
+    credentials: Vec<serde_json::Value>,
+}
+
+/// A claimed daemon's credential leases expired with nothing covering
+/// them (credential custody). Web-Push the owner's subscribed browsers so
+/// they can reconnect a fueling session — the service only relays the
+/// daemon's own report; it can't see leases.
+fn dry_push_payload(
+    daemon_id: &str,
+    label: &str,
+    credentials: &[serde_json::Value],
+) -> serde_json::Value {
+    let mut names: Vec<String> = credentials
+        .iter()
+        .filter_map(|credential| {
+            credential
+                .get("label")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| credential.get("kind").and_then(|v| v.as_str()))
+                .map(str::to_string)
+        })
+        .take(6)
+        .collect();
+    if names.is_empty() {
+        names.push("credentials".to_string());
+    }
+    json!({
+        "title": format!("{label} is unfueled"),
+        "body": format!(
+            "Credential lease expired: {}. Reconnect a fueling session to re-grant from the vault.",
+            names.join(", ")
+        ),
+        "url": format!("/app?connect=1&daemon_id={daemon_id}"),
+    })
+}
+
+async fn daemon_dry(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DaemonDryRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_daemon_auth(&state, &headers)?;
+    check_rate_limit(&state, &headers, "daemon_dry", 30, 60_000).await?;
+    let daemon_id = body.daemon_id.trim().to_string();
+    if daemon_id.is_empty() {
+        return Err(ApiError::bad_request("daemon_id is required"));
+    }
+    let (label, owner, subscriptions) = {
+        let store = state.store.lock().await;
+        let Some(daemon) = store.daemons.iter().find(|d| d.daemon_id == daemon_id) else {
+            return Err(ApiError::not_found("unknown daemon"));
+        };
+        (
+            daemon.label.clone().unwrap_or_else(|| daemon_id.clone()),
+            daemon.owner_user_id,
+            store.push_subscriptions.clone(),
+        )
+    };
+    let Some(owner) = owner else {
+        // Nobody has claimed this daemon — nobody to notify.
+        return Ok(Json(json!({ "ok": true, "notified": 0 })));
+    };
+    let payload = dry_push_payload(&daemon_id, &label, &body.credentials);
+    let mut notified = 0usize;
+    let mut dead = Vec::new();
+    for subscription in subscriptions
+        .iter()
+        .filter(|s| s.notify_presence && s.user_id == owner)
+    {
+        match send_web_push(
+            &state.push_http,
+            &state.vapid,
+            &state.config.public_origin,
+            subscription,
+            &payload,
+        )
+        .await
+        {
+            Ok(true) => notified += 1,
+            Ok(false) => dead.push(subscription.endpoint.clone()),
+            Err(e) => eprintln!("[push] dry-daemon alert failed: {e}"),
+        }
+    }
+    if !dead.is_empty() {
+        let mut store = state.store.lock().await;
+        store
+            .push_subscriptions
+            .retain(|record| !dead.contains(&record.endpoint));
+        let _ = persist_locked(&state, &store);
+    }
+    Ok(Json(json!({ "ok": true, "notified": notified })))
+}
+
 async fn daemon_claim_proof(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -4387,6 +4501,136 @@ async fn orl_fetch(
             "orl": record.list,
         }))
         .into_response(),
+    ))
+}
+
+/* ── Credential vault sync (credential custody) ──
+   One end-to-end encrypted vault blob per account. The service stores it
+   blind: the body is ciphertext under the user's vault master key, and
+   that key travels only wrapped per enrolled unlocker (passkey PRF /
+   recovery phrase) — nothing here can be decrypted or forged
+   server-side. The monotonic revision check only prevents rollback (the
+   ORL `seq` trick); a malicious store can still withhold or serve stale,
+   detectably once any device has seen a newer revision. */
+
+const MAX_VAULT_BLOB_BYTES: usize = 128 * 1024;
+
+fn validate_vault_blob(revision: u64, vault: &serde_json::Value) -> Result<(), ApiError> {
+    if serde_json::to_string(vault)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
+        > MAX_VAULT_BLOB_BYTES
+    {
+        return Err(ApiError::bad_request("vault blob is too large"));
+    }
+    if vault.get("v").and_then(|v| v.as_u64()) != Some(1)
+        || vault.get("kind").and_then(|v| v.as_str()) != Some("intendant-vault")
+    {
+        return Err(ApiError::bad_request("not an intendant vault blob"));
+    }
+    if revision == 0 {
+        return Err(ApiError::bad_request("vault revision must be positive"));
+    }
+    if vault.get("revision").and_then(|v| v.as_u64()) != Some(revision) {
+        return Err(ApiError::bad_request("vault revision does not match blob"));
+    }
+    let has_envelopes = vault
+        .get("envelopes")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if !has_envelopes {
+        return Err(ApiError::bad_request("vault blob has no key envelopes"));
+    }
+    if !vault.get("body").map(|b| b.is_object()).unwrap_or(false) {
+        return Err(ApiError::bad_request("vault blob has no body"));
+    }
+    Ok(())
+}
+
+/// Store a user's vault blob if it is newer than what we hold. Returns
+/// `true` when stored, `false` for an idempotent same-revision republish
+/// of identical content. Rollback — and a same-revision write with
+/// different content (two devices bumped independently) — is rejected
+/// with 409 so the losing client refetches, merges, and bumps.
+fn apply_vault_publish(
+    store: &mut Store,
+    user_id: Uuid,
+    revision: u64,
+    vault: serde_json::Value,
+    now: u64,
+) -> Result<bool, ApiError> {
+    validate_vault_blob(revision, &vault)?;
+    if let Some(existing) = store.vault_blobs.iter_mut().find(|b| b.user_id == user_id) {
+        if revision < existing.revision || (revision == existing.revision && existing.vault != vault)
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "stale vault: revision {revision} conflicts with stored revision {}",
+                    existing.revision
+                ),
+            ));
+        }
+        let changed = revision > existing.revision;
+        if changed {
+            existing.revision = revision;
+            existing.vault = vault;
+            existing.updated_unix_ms = now;
+        }
+        Ok(changed)
+    } else {
+        store.vault_blobs.push(VaultBlobRecord {
+            user_id,
+            revision,
+            vault,
+            updated_unix_ms: now,
+        });
+        Ok(true)
+    }
+}
+
+async fn api_vault_fetch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    check_rate_limit(&state, &headers, "vault_fetch", 240, 60_000).await?;
+    let store = state.store.lock().await;
+    match store.vault_blobs.iter().find(|b| b.user_id == user.id) {
+        Some(record) => Ok(Json(json!({
+            "ok": true,
+            "revision": record.revision,
+            "updated_unix_ms": record.updated_unix_ms,
+            "vault": record.vault,
+        }))),
+        None => Ok(Json(
+            json!({ "ok": true, "revision": 0, "vault": serde_json::Value::Null }),
+        )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct VaultPublishRequest {
+    revision: u64,
+    vault: serde_json::Value,
+}
+
+async fn api_vault_publish(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<VaultPublishRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    require_csrf(&state, &headers).await?;
+    check_rate_limit(&state, &headers, "vault_publish", 60, 60_000).await?;
+    let mut store = state.store.lock().await;
+    let stored = apply_vault_publish(&mut store, user.id, body.revision, body.vault, now_unix_ms())?;
+    if stored {
+        persist_locked(&state, &store)?;
+    }
+    Ok(Json(
+        json!({ "ok": true, "stored": stored, "revision": body.revision }),
     ))
 }
 
@@ -6151,6 +6395,7 @@ mod tests {
             fleet_targets: Vec::new(),
             audit: Vec::new(),
             orl_bulletins: Vec::new(),
+            vault_blobs: Vec::new(),
             invites: Vec::new(),
             vapid_private_pk8_b64: None,
             push_subscriptions: Vec::new(),
@@ -6377,6 +6622,7 @@ mod tests {
             ],
             audit: Vec::new(),
             orl_bulletins: Vec::new(),
+            vault_blobs: Vec::new(),
             invites: Vec::new(),
             vapid_private_pk8_b64: None,
             push_subscriptions: Vec::new(),
@@ -6416,5 +6662,123 @@ mod tests {
             manual.get("source").and_then(|v| v.as_str()),
             Some("browser_fleet")
         );
+    }
+
+    #[test]
+    fn dry_push_payload_names_daemon_and_credentials() {
+        let payload = dry_push_payload(
+            "daemon-1",
+            "Workshop box",
+            &[
+                json!({ "kind": "api_key:anthropic", "label": "Personal Anthropic" }),
+                json!({ "kind": "oauth:codex" }),
+            ],
+        );
+        assert_eq!(
+            payload["title"].as_str(),
+            Some("Workshop box is unfueled")
+        );
+        let body = payload["body"].as_str().unwrap();
+        assert!(body.contains("Personal Anthropic"), "{body}");
+        assert!(body.contains("oauth:codex"), "{body}");
+        assert!(body.contains("Reconnect a fueling session"), "{body}");
+        assert_eq!(
+            payload["url"].as_str(),
+            Some("/app?connect=1&daemon_id=daemon-1")
+        );
+
+        // No names at all still produces a sensible message.
+        let fallback = dry_push_payload("d", "D", &[]);
+        assert!(fallback["body"].as_str().unwrap().contains("credentials"));
+    }
+
+    fn vault_blob(revision: u64, marker: &str) -> serde_json::Value {
+        json!({
+            "v": 1,
+            "kind": "intendant-vault",
+            "revision": revision,
+            "envelopes": [
+                { "kind": "prf", "id": "env-1", "iv": "aW4=", "wrapped": marker },
+            ],
+            "body": { "iv": "aW4=", "ct": marker },
+        })
+    }
+
+    #[test]
+    fn vault_publish_stores_bumps_and_is_idempotent() {
+        let mut store = Store::default();
+        let user = Uuid::new_v4();
+
+        assert!(apply_vault_publish(&mut store, user, 1, vault_blob(1, "a"), 10).unwrap());
+        assert_eq!(store.vault_blobs.len(), 1);
+        assert_eq!(store.vault_blobs[0].revision, 1);
+        assert_eq!(store.vault_blobs[0].updated_unix_ms, 10);
+
+        // Identical same-revision republish is an idempotent no-op.
+        assert!(!apply_vault_publish(&mut store, user, 1, vault_blob(1, "a"), 20).unwrap());
+        assert_eq!(store.vault_blobs[0].updated_unix_ms, 10);
+
+        // A newer revision replaces the blob.
+        assert!(apply_vault_publish(&mut store, user, 3, vault_blob(3, "b"), 30).unwrap());
+        assert_eq!(store.vault_blobs[0].revision, 3);
+        assert_eq!(store.vault_blobs[0].updated_unix_ms, 30);
+
+        // A second user gets an independent record.
+        let other = Uuid::new_v4();
+        assert!(apply_vault_publish(&mut store, other, 1, vault_blob(1, "c"), 40).unwrap());
+        assert_eq!(store.vault_blobs.len(), 2);
+        assert_eq!(store.vault_blobs[0].revision, 3);
+    }
+
+    #[test]
+    fn vault_publish_rejects_rollback_and_same_revision_conflicts() {
+        let mut store = Store::default();
+        let user = Uuid::new_v4();
+        apply_vault_publish(&mut store, user, 5, vault_blob(5, "a"), 10).unwrap();
+
+        // Rollback to an older revision is refused.
+        let err = apply_vault_publish(&mut store, user, 4, vault_blob(4, "b"), 20).unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+
+        // Same revision with different content is a conflict, not a
+        // silent drop — the losing device must refetch, merge, and bump.
+        let err = apply_vault_publish(&mut store, user, 5, vault_blob(5, "b"), 20).unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(store.vault_blobs[0].revision, 5);
+        assert_eq!(
+            store.vault_blobs[0]
+                .vault
+                .pointer("/body/ct")
+                .and_then(|v| v.as_str()),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn vault_publish_rejects_malformed_blobs() {
+        let mut store = Store::default();
+        let user = Uuid::new_v4();
+
+        // Wrong kind.
+        let mut wrong_kind = vault_blob(1, "a");
+        wrong_kind["kind"] = json!("something-else");
+        assert!(apply_vault_publish(&mut store, user, 1, wrong_kind, 10).is_err());
+
+        // Revision zero is reserved for "no vault yet".
+        assert!(apply_vault_publish(&mut store, user, 0, vault_blob(0, "a"), 10).is_err());
+
+        // Envelope-free blobs would be unrecoverable — refuse them.
+        let mut no_envelopes = vault_blob(1, "a");
+        no_envelopes["envelopes"] = json!([]);
+        assert!(apply_vault_publish(&mut store, user, 1, no_envelopes, 10).is_err());
+
+        // Blob revision must match the request revision.
+        assert!(apply_vault_publish(&mut store, user, 2, vault_blob(1, "a"), 10).is_err());
+
+        // Oversized blobs are refused before any store mutation.
+        let mut oversized = vault_blob(1, "a");
+        oversized["body"]["ct"] = json!("x".repeat(MAX_VAULT_BLOB_BYTES + 1));
+        assert!(apply_vault_publish(&mut store, user, 1, oversized, 10).is_err());
+        assert!(store.vault_blobs.is_empty());
     }
 }

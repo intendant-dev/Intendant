@@ -17,6 +17,7 @@ mod context_rewind;
 mod control;
 mod control_plane;
 mod conversation;
+mod credential_leases;
 mod ctl;
 mod daemon_identity;
 mod daemon_log_tee;
@@ -12134,6 +12135,10 @@ struct CliFlags {
     /// to wildcard dual-stack when available. Use 127.0.0.1 with --no-tls
     /// for local automation.
     web_bind: Option<IpAddr>,
+    /// --owner <CLIENT-KEY-FINGERPRINT>: seed a root grant pinned to that
+    /// browser identity key at startup (the install.sh bootstrap: authority
+    /// minted locally from first boot, no secrets on the wire).
+    owner: Option<String>,
     /// --no-tls: Explicitly serve the web dashboard over plain HTTP. The
     /// dashboard defaults to mTLS; this flag is the debug/programmatic escape
     /// hatch for callers that knowingly want cleartext.
@@ -12200,6 +12205,7 @@ fn print_help() {
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle starts daemon/no TUI)");
     println!("    --bind <ADDR>         IP address for the web dashboard listener");
+    println!("    --owner <FINGERPRINT> Pin root authority to a browser client key at startup (install bootstrap)");
     println!(
         "    --no-tls              Serve the web dashboard over plain HTTP (explicit debug escape)"
     );
@@ -12678,6 +12684,7 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         web: false,
         web_port: web_gateway::DEFAULT_PORT,
         web_bind: None,
+        owner: None,
         no_tls: false,
         allow_public_plaintext: false,
         tls: false,
@@ -12827,6 +12834,16 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                     i += 2;
                 } else {
                     return Err(CallerError::Config("Missing value for --bind".to_string()));
+                }
+            }
+            "--owner" => {
+                if i + 1 < args.len() {
+                    flags.owner = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    return Err(CallerError::Config(
+                        "Missing value for --owner (a client-key fingerprint)".to_string(),
+                    ));
                 }
             }
             "--no-tls" => {
@@ -20343,6 +20360,7 @@ Also: {"source": "bare"}"#;
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
             web_bind: None,
+            owner: None,
             no_tls: false,
             allow_public_plaintext: false,
             tls: false,
@@ -20728,6 +20746,7 @@ Also: {"source": "bare"}"#;
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
             web_bind: None,
+            owner: None,
             no_tls: false,
             allow_public_plaintext: false,
             tls: false,
@@ -20782,6 +20801,7 @@ Also: {"source": "bare"}"#;
             web: true,
             web_port: web_gateway::DEFAULT_PORT,
             web_bind: None,
+            owner: None,
             no_tls: false,
             allow_public_plaintext: false,
             tls: false,
@@ -20824,6 +20844,7 @@ Also: {"source": "bare"}"#;
             web: true,
             web_port: 9000,
             web_bind: None,
+            owner: None,
             no_tls: false,
             allow_public_plaintext: false,
             tls: false,
@@ -33894,6 +33915,35 @@ async fn main() -> Result<(), CallerError> {
 
     configure_sandbox_env(&flags, &project, &log_dir);
 
+    // --owner bootstrap: pin root authority to the given browser key
+    // before any surface comes up. Failing this with the flag present is
+    // fatal — an install whose only authority path silently failed would
+    // be an unclaimable box.
+    if let Some(owner) = flags.owner.as_deref() {
+        let cert_dir = access::backend::select_backend().cert_dir();
+        match access::iam::seed_owner_bootstrap_grant(&cert_dir, owner) {
+            Ok(true) => eprintln!("[access] owner bootstrap: root grant pinned to client key"),
+            Ok(false) => eprintln!("[access] owner bootstrap: client key already holds root"),
+            Err(e) => {
+                return Err(CallerError::Config(format!("--owner bootstrap failed: {e}")));
+            }
+        }
+    }
+
+    // Credential custody: leases never survive a restart, so stale
+    // materialized auth files (a crash's leftovers) are deleted before
+    // anything can spawn an external agent; the timer keeps expiry
+    // deleting materializations even when the lease store sees no calls.
+    credential_leases::startup_materialization_sweep();
+    tokio::spawn(async {
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            credential_leases::sweep_now();
+        }
+    });
+
     // CLI --transcription flag overrides config file setting
     if flags.transcription {
         project.config.transcription.enabled = true;
@@ -33938,6 +33988,9 @@ async fn main() -> Result<(), CallerError> {
                         cleaned_external_children
                     );
                 }
+                // Drop every credential lease (zeroizes memory, deletes
+                // materialized oauth auth files) before the process dies.
+                let _ = credential_leases::revoke(None);
                 // Clean up control socket
                 control::cleanup();
                 // Restore terminal (best-effort) so the shell isn't left in raw mode

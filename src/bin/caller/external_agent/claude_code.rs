@@ -519,6 +519,13 @@ impl ExternalAgent for ClaudeCodeAgent {
                 self.mcp_session_id.as_deref(),
             );
         }
+        // An active oauth:claude-code lease materializes a synthesized
+        // config dir (.credentials.json + carried-over settings.json);
+        // pointing CLAUDE_CONFIG_DIR at it means this spawn runs on the
+        // vault's leased identity, not whatever auth is on disk.
+        if let Some(dir) = crate::credential_leases::materialized_claude_config_dir() {
+            command.env("CLAUDE_CONFIG_DIR", dir);
+        }
         crate::platform::die_with_parent(&mut command);
         #[cfg(target_os = "linux")]
         crate::linux_display_env::apply_to_tokio_command(&mut command);

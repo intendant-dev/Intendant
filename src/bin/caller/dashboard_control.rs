@@ -2064,6 +2064,14 @@ fn dashboard_control_method_operation(
         | "api_access_iam_state"
         | "api_access_enrollment_requests"
         | "api_dashboard_targets" => Some(PeerOperation::AccessInspect),
+        // Credential leases (credential custody): granting, renewing,
+        // revoking, and even reading lease status all sit behind the
+        // dedicated gate — a scoped guest session can neither fuel nor
+        // drain a daemon, nor see which providers are fueled.
+        "api_credential_lease_grant"
+        | "api_credential_lease_renew"
+        | "api_credential_lease_revoke"
+        | "api_credential_lease_status" => Some(PeerOperation::CredentialsManage),
         "api_access_iam_upsert_user_client_grant"
         | "api_access_iam_update_grant"
         | "api_access_enrollment_decide"
@@ -2309,6 +2317,125 @@ fn control_frame_response(
             }
             match method {
                 "status" => Some(status_response_frame(id, runtime)),
+                "api_credential_lease_grant" => {
+                    let params_ref = params.as_ref();
+                    let kind = params_ref
+                        .and_then(|p| optional_string_param(p, &["kind"]))
+                        .unwrap_or_default();
+                    let label = params_ref
+                        .and_then(|p| optional_string_param(p, &["label"]))
+                        .unwrap_or_default();
+                    let material = params_ref
+                        .and_then(|p| optional_string_param(p, &["material", "secret"]))
+                        .unwrap_or_default();
+                    let ttl_ms = match params_ref {
+                        Some(p) => match optional_u64_param(p, &["ttl_ms"]) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return Some(dashboard_control_error_response(id, error))
+                            }
+                        },
+                        None => None,
+                    };
+                    let offline_ms = match params_ref {
+                        Some(p) => match optional_u64_param(p, &["offline_ms"]) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return Some(dashboard_control_error_response(id, error))
+                            }
+                        },
+                        None => None,
+                    };
+                    Some(
+                        match crate::credential_leases::grant(
+                            &kind,
+                            &label,
+                            &material,
+                            runtime.grant.label(),
+                            ttl_ms,
+                            offline_ms,
+                        ) {
+                            Ok(outcome) => serde_json::json!({
+                                "t": "response",
+                                "id": id,
+                                "ok": true,
+                                "result": {
+                                    "lease_id": outcome.lease_id,
+                                    "kind": outcome.kind,
+                                    "expires_at_unix_ms": outcome.expires_at_unix_ms,
+                                    "replaced": outcome.replaced,
+                                },
+                            }),
+                            Err(error) => dashboard_control_error_response(
+                                id,
+                                format!("credential lease grant failed: {error}"),
+                            ),
+                        },
+                    )
+                }
+                "api_credential_lease_renew" => {
+                    let lease_id = params
+                        .as_ref()
+                        .and_then(|p| optional_string_param(p, &["lease_id", "leaseId"]))
+                        .unwrap_or_default();
+                    Some(match crate::credential_leases::renew(&lease_id) {
+                        Ok(expires_at_unix_ms) => serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": true,
+                            "result": {
+                                "lease_id": lease_id,
+                                "expires_at_unix_ms": expires_at_unix_ms,
+                            },
+                        }),
+                        Err(error) => dashboard_control_error_response(
+                            id,
+                            format!("credential lease renew failed: {error}"),
+                        ),
+                    })
+                }
+                "api_credential_lease_revoke" => {
+                    // Selector: lease_id or kind revokes one; omitted
+                    // revokes every lease on this daemon.
+                    let selector = params
+                        .as_ref()
+                        .and_then(|p| optional_string_param(p, &["lease_id", "leaseId", "kind"]));
+                    let revoked = crate::credential_leases::revoke(selector.as_deref());
+                    Some(serde_json::json!({
+                        "t": "response",
+                        "id": id,
+                        "ok": true,
+                        "result": { "revoked": revoked },
+                    }))
+                }
+                "api_credential_lease_status" => {
+                    let leases: Vec<serde_json::Value> = crate::credential_leases::status_entries()
+                        .into_iter()
+                        .map(|entry| {
+                            serde_json::json!({
+                                "lease_id": entry.lease_id,
+                                "kind": entry.kind,
+                                "label": entry.label,
+                                "granted_by": entry.granted_by,
+                                "granted_at_unix_ms": entry.granted_at_unix_ms,
+                                "renewed_at_unix_ms": entry.renewed_at_unix_ms,
+                                "expires_at_unix_ms": entry.expires_at_unix_ms,
+                                "ttl_ms": entry.ttl_ms,
+                                "offline_ms": entry.offline_ms,
+                                "use_count": entry.use_count,
+                            })
+                        })
+                        .collect();
+                    Some(serde_json::json!({
+                        "t": "response",
+                        "id": id,
+                        "ok": true,
+                        "result": {
+                            "leases": leases,
+                            "expired_note": crate::credential_leases::expired_lease_note(),
+                        },
+                    }))
+                }
                 "api_peers" => match runtime.peer_registry.as_ref() {
                     Some(registry) => {
                         let result = serde_json::from_str::<serde_json::Value>(
@@ -10695,6 +10822,48 @@ mod tests {
             status["result"]["api_access_iam_update_grant_available"],
             false
         );
+    }
+
+    #[test]
+    fn credential_lease_methods_sit_behind_credentials_manage() {
+        use crate::peer::access_policy::PeerOperation;
+        for method in [
+            "api_credential_lease_grant",
+            "api_credential_lease_renew",
+            "api_credential_lease_revoke",
+            "api_credential_lease_status",
+        ] {
+            assert_eq!(
+                dashboard_control_method_operation(method),
+                Some(PeerOperation::CredentialsManage),
+                "{method} must ride the credentials.manage gate"
+            );
+        }
+
+        // A scoped guest session (role:scoped-human) can neither fuel nor
+        // inspect fueling; the trusted-local and operator lanes can.
+        let mut rt = runtime();
+        rt.grant = scoped_user_client_grant();
+        assert!(authorize_dashboard_control_method(
+            &rt,
+            "api_credential_lease_status",
+            None
+        )
+        .is_err());
+        assert!(authorize_dashboard_control_method(
+            &rt,
+            "api_credential_lease_grant",
+            None
+        )
+        .is_err());
+
+        rt.grant = DashboardControlGrant::TrustedLocal;
+        assert!(authorize_dashboard_control_method(
+            &rt,
+            "api_credential_lease_grant",
+            None
+        )
+        .is_ok());
     }
 
     #[test]

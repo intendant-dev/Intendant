@@ -618,7 +618,8 @@ impl LocalIamState {
                 // Builtin role definitions are owned by the binary, not the
                 // state file: refresh persisted copies to the current
                 // template so semantic migrations (e.g. the terminal.use →
-                // view/write/spawn split) propagate on upgrade. Roles under
+                // view/write/spawn split, or a permission added later like
+                // credentials.manage) propagate on upgrade. Roles under
                 // custom ids are untouched.
                 Some(existing) if existing.source == "builtin" => *existing = role,
                 Some(_) => {}
@@ -720,6 +721,45 @@ struct UserClientBinding {
     account: Option<Value>,
     organization: Option<Value>,
     authn: Vec<Value>,
+}
+
+/// `--owner <client-key-fingerprint>` bootstrap (credential custody):
+/// seed a root grant pinned to the given browser identity key so a fresh
+/// install is owned from first boot — authority minted locally, nothing
+/// secret on the wire (the fingerprint is public). Idempotent: an
+/// existing root binding for the key is left untouched, so restarting
+/// with the same flag neither duplicates grants nor grows the audit log.
+pub fn seed_owner_bootstrap_grant(cert_dir: &Path, fingerprint: &str) -> AccessResult<bool> {
+    let fingerprint = normalize_client_key_fingerprint(fingerprint);
+    if fingerprint.is_empty() {
+        return Err(AccessError(
+            "--owner requires a client-key fingerprint (shown in the Access drawer)".to_string(),
+        ));
+    }
+    let mut state = load_state(cert_dir)?;
+    if let Some(existing) = principal_for_client_key(&state, &fingerprint, "owner-bootstrap") {
+        if existing.role_id == "role:root" {
+            return Ok(false);
+        }
+    }
+    let actor = AccessPrincipal::root_dashboard_session("owner-bootstrap", "cli");
+    upsert_user_client_grant(
+        &mut state,
+        UserClientGrantUpsertRequest {
+            client_key_fingerprint: Some(fingerprint),
+            label: Some("Owner (bootstrap)".to_string()),
+            role_id: Some("role:root".to_string()),
+            status: Some("active".to_string()),
+            reason: Some(
+                "--owner bootstrap: root authority pinned to this browser key at install time"
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+        &actor,
+    )?;
+    save_state(cert_dir, &state)?;
+    Ok(true)
 }
 
 pub fn upsert_user_client_grant(
@@ -1707,6 +1747,7 @@ fn permission_label(id: &str) -> &'static str {
         "terminal.write" => "Terminal write",
         "shell.spawn" => "Shell spawn",
         "settings.manage" => "Settings manage",
+        "credentials.manage" => "Credentials manage",
         "runtime.control" => "Runtime control",
         "filesystem.read" => "Filesystem read",
         "filesystem.write" => "Filesystem write",
@@ -1740,6 +1781,9 @@ fn permission_summary(id: &str) -> &'static str {
         "terminal.write" => "Type into, resize, and close shell sessions you can see.",
         "shell.spawn" => "Create new shell sessions on this daemon.",
         "settings.manage" => "Read or write daemon settings and API keys.",
+        "credentials.manage" => {
+            "Grant, renew, revoke, and inspect borrowed provider-credential leases (vault fueling)."
+        }
         "runtime.control" => "Use runtime-control surfaces such as TUI, media, and recording controls.",
         "filesystem.read" => "Stat, list, and read files through dashboard APIs.",
         "filesystem.write" => "Create directories or write uploaded file content.",
@@ -1998,6 +2042,7 @@ pub fn operation_permission_id(op: crate::peer::access_policy::PeerOperation) ->
         PeerOperation::TerminalWrite => "terminal.write",
         PeerOperation::ShellSpawn => "shell.spawn",
         PeerOperation::Settings => "settings.manage",
+        PeerOperation::CredentialsManage => "credentials.manage",
         PeerOperation::RuntimeControl => "runtime.control",
         PeerOperation::FilesystemRead => "filesystem.read",
         PeerOperation::FilesystemWrite => "filesystem.write",
@@ -2214,6 +2259,11 @@ fn builtin_role_templates() -> Vec<IamRole> {
                 "terminal.view".to_string(),
                 "terminal.write".to_string(),
                 "shell.spawn".to_string(),
+                // Fueling from a hosted session is the core custody flow and
+                // the hosted ceiling defaults to operator — without this the
+                // vault bootstrap story dies at its last step. Scoped guest
+                // roles deliberately do not get it.
+                "credentials.manage".to_string(),
                 "filesystem.read".to_string(),
                 "filesystem.write".to_string(),
             ],
@@ -2241,6 +2291,7 @@ fn root_permission_ids() -> Vec<String> {
         "terminal.write",
         "shell.spawn",
         "settings.manage",
+        "credentials.manage",
         "runtime.control",
         "filesystem.read",
         "filesystem.write",
@@ -2717,6 +2768,127 @@ mod tests {
 
         assert!(matches!(loaded.status, IamStateStatus::Error(_)));
         assert_eq!(loaded.state.managed_grant_count(), 0);
+    }
+
+    #[test]
+    fn owner_bootstrap_seeds_root_once_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        assert!(seed_owner_bootstrap_grant(tmp.path(), "Owner_Key-Fp").unwrap());
+        let state = load_state(tmp.path()).unwrap();
+        let principal =
+            principal_for_client_key(&state, "Owner_Key-Fp", "test").expect("owner principal");
+        assert_eq!(principal.kind, "client_key");
+        assert_eq!(principal.role_id, "role:root");
+        let audit_after_first = state.audit_events.len();
+
+        // Restarting with the same flag must not duplicate anything.
+        assert!(!seed_owner_bootstrap_grant(tmp.path(), "Owner_Key-Fp").unwrap());
+        let state = load_state(tmp.path()).unwrap();
+        assert_eq!(state.audit_events.len(), audit_after_first);
+        assert_eq!(
+            state
+                .grants
+                .iter()
+                .filter(|grant| grant.principal_id == principal.id)
+                .count(),
+            1
+        );
+
+        // Whitespace-only fingerprints are refused.
+        assert!(seed_owner_bootstrap_grant(tmp.path(), "   ").is_err());
+    }
+
+    #[test]
+    fn normalize_refreshes_stale_builtin_roles_but_not_user_roles() {
+        // An on-disk state minted before credentials.manage existed: its
+        // role:operator is builtin but lacks the permission.
+        let mut state = LocalIamState::default();
+        let operator = state
+            .roles
+            .iter_mut()
+            .find(|role| role.id == "role:operator")
+            .expect("builtin operator role");
+        operator
+            .permissions
+            .retain(|permission| permission != "credentials.manage");
+        operator.summary = "stale on-disk summary".to_string();
+        state.roles.push(IamRole {
+            id: "role:custom".to_string(),
+            label: "Custom".to_string(),
+            status: "enforced".to_string(),
+            summary: "user-created".to_string(),
+            permissions: vec!["stats.read".to_string()],
+            source: "local_iam_state".to_string(),
+        });
+
+        let normalized = state.normalize();
+
+        let operator = normalized
+            .roles
+            .iter()
+            .find(|role| role.id == "role:operator")
+            .expect("operator survives");
+        assert!(
+            operator
+                .permissions
+                .iter()
+                .any(|permission| permission == "credentials.manage"),
+            "builtin operator was not refreshed from the template"
+        );
+        assert_ne!(operator.summary, "stale on-disk summary");
+        let custom = normalized
+            .roles
+            .iter()
+            .find(|role| role.id == "role:custom")
+            .expect("user role survives");
+        assert_eq!(custom.summary, "user-created");
+        assert_eq!(custom.permissions, vec!["stats.read".to_string()]);
+    }
+
+    #[test]
+    fn credentials_manage_is_root_and_operator_but_no_peer_profile() {
+        assert!(root_permission_ids()
+            .iter()
+            .any(|id| id == "credentials.manage"));
+        let templates = builtin_role_templates();
+        let has = |role_id: &str| {
+            templates
+                .iter()
+                .find(|role| role.id == role_id)
+                .map(|role| {
+                    role.permissions
+                        .iter()
+                        .any(|permission| permission == "credentials.manage")
+                })
+                .unwrap_or(false)
+        };
+        assert!(has("role:operator"), "operator must hold credentials.manage");
+        assert!(!has("role:observer"));
+        assert!(!has("role:session-reader"));
+        assert!(!has("role:terminal"));
+        assert!(!has("role:scoped-human"));
+        // The peer lane is excluded in v1 — not even admin peers may
+        // fuel or drain credentials.
+        for profile in [
+            "presence-only",
+            "stats",
+            "session-reader",
+            "read-only-display",
+            "file-operator",
+            "terminal-operator",
+            "task-runner",
+            "operator",
+            "admin-peer",
+        ] {
+            assert!(
+                !crate::peer::access_policy::profile_allows_operation(
+                    profile,
+                    crate::peer::access_policy::PeerOperation::CredentialsManage,
+                ),
+                "peer profile {profile} must not allow credentials.manage"
+            );
+        }
     }
 
     #[test]

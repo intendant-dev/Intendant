@@ -11,6 +11,7 @@
 - [Display Pipeline](./display-pipeline.md)
 - [Peer Federation](./peer-federation.md)
 - [Self-Hosted Rendezvous](./self-hosted-rendezvous.md)
+- [Credential Custody: the Vault and Leases](./credential-custody.md)
 - [Trust Architecture](./trust-architecture.md)
 - [Computer Use & Live Audio](./computer-use-and-audio.md)
 - [Presence Layer](./presence.md)
