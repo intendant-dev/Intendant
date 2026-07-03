@@ -285,15 +285,6 @@ Claude Code native file lookup:
 find "$HOME/.claude/projects" -name '<session-id>.jsonl' -type f -print 2>/dev/null
 ```
 
-Gemini native file lookup:
-
-```bash
-find "$HOME/.gemini/tmp" -path '*/chats/*.json' -type f -print0 2>/dev/null |
-while IFS= read -r -d '' f; do
-  jq -r 'select(.sessionId=="<session-id>") | input_filename' "$f"
-done
-```
-
 ## Display, Recordings, File History, and Managed Context
 
 Frames:
@@ -350,8 +341,8 @@ jq -c '{seq,peer,payload}' "$S/peers.jsonl" 2>/dev/null | tail -80
 
 Dashboard deep search:
 
-- Builds a session list from Intendant logs plus Codex/Claude/Gemini native logs.
-- Supports source filters `all`, `external`, `intendant`, `codex`, `claude-code`, and `gemini`.
+- Builds a session list from Intendant logs plus Codex/Claude Code native logs.
+- Supports source filters `all`, `external`, `intendant`, `codex`, and `claude-code`.
 - Supports modes `all_keywords`, `exact_phrase`, `any_keyword_session`, and `user_message_all_keywords`.
 - Searches full log files and recursively collects every JSON string field.
 - Searches beyond the recent-session display window.

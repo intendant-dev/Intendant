@@ -175,7 +175,7 @@ folded in), and the loop continues from the rehydrated turn. `session_meta.json`
 is updated with the new task.
 
 `conversation.jsonl` is specific to Intendant's **internal** agent. External
-backends (Codex / Claude Code / Gemini) own their own conversation history; the
+backends (Codex / Claude Code) own their own conversation history; the
 session supervisor resumes those through each backend's native resume token (see
 [Control Plane & Persistent Daemon](./control-plane-and-daemon.md) →
 `ResumeSession`), keyed by the session `source`.
@@ -198,8 +198,8 @@ session is an Intendant session or an external backend's. This lives in
 `session_names.rs`.
 
 - **Source normalization.** Free-form source strings collapse to a canonical set:
-  `intendant`, `codex`, `claude-code`, `gemini` (so `"claude code"`, `"cc"`,
-  `"gemini cli"`, etc. all map correctly).
+  `intendant`, `codex`, `claude-code` (so `"claude code"` and `"cc"` map
+  correctly).
 - **Intendant sessions** store the name directly in their own
   `session_meta.json` (`write_intendant_session_name`), located by id or prefix
   under `~/.intendant/logs/`.

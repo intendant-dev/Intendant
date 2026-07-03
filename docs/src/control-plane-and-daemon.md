@@ -49,9 +49,8 @@ state:
 | Field | Type | Notes |
 |-------|------|-------|
 | `autonomy` | `SharedAutonomy` | Global autonomy level + the user-display grant flag |
-| `external_agent` | `Arc<RwLock<Option<AgentBackend>>>` | Active backend: Codex / Claude Code / Gemini CLI, or `None` (internal) |
+| `external_agent` | `Arc<RwLock<Option<AgentBackend>>>` | Active backend: Codex / Claude Code, or `None` (internal) |
 | `codex_config` | `SharedCodexConfig` | Runtime Codex config (command, sandbox, approval policy, model, reasoning effort, web search, network access, writable roots) |
-| `gemini_config` | `SharedGeminiConfig` | Runtime Gemini config (model, approval mode, sandbox, extensions, allowed MCP servers, include dirs, debug) |
 | `project_root` | `Option<PathBuf>` | When set, state changes also persist to `intendant.toml` |
 
 It is spawned once, early in `main.rs`, from its own bus subscription:
@@ -59,29 +58,27 @@ It is spawned once, early in `main.rs`, from its own bus subscription:
 ```rust
 let _control_plane_handle = control_plane::spawn(
     bus.subscribe(),
-    control_plane::ControlPlaneState { autonomy, external_agent, codex_config, gemini_config, bus, project_root },
+    control_plane::ControlPlaneState { autonomy, external_agent, codex_config, bus, project_root },
 );
 ```
 
 ### The "applies on the NEXT task" rule
 
-A subtlety worth internalizing: most Codex and Gemini settings **latch at
-process spawn**. Codex locks its sandbox / approval / model / tool configuration
-at `thread/start`; Gemini latches `--model` and friends when its process is
-launched. So when a frontend flips, say, the Codex sandbox mode, the control
-plane updates the shared config and persists it, but an already-running Codex
-thread keeps its old values for the rest of its life. The change takes effect on
-the **next** task — the daemon loop re-reads the shared config at the start of
-each task and, for changes that cannot be applied mid-session, tears down the
-persistent agent so the next launch picks them up. Each `ControlMsg::SetCodex*`
-/ `SetGemini*` variant documents this in its doc comment.
+A subtlety worth internalizing: most Codex settings **latch at process spawn**.
+Codex locks its sandbox / approval / model / tool configuration at
+`thread/start`. So when a frontend flips, say, the Codex sandbox mode, the
+control plane updates the shared config and persists it, but an already-running
+Codex thread keeps its old values for the rest of its life. The change takes
+effect on the **next** task — the daemon loop re-reads the shared config at the
+start of each task and, for changes that cannot be applied mid-session, tears
+down the persistent agent so the next launch picks them up. Each
+`ControlMsg::SetCodex*` variant documents this in its doc comment.
 
 Two exceptions apply *immediately* rather than next-task, because the backend
 accepts them as live RPCs: `CodexThreadAction` (the `/new`, `/compact`, `/fast`, `/fork`,
-`/undo`, `/review`, … slash-command surface) and `GeminiThreadAction` (`/new`).
-The control plane does not own the persistent agent, so it merely *re-broadcasts*
-these as `CodexThreadActionRequested` / `GeminiThreadActionRequested` for the
-daemon-side watcher that does own it.
+`/undo`, `/review`, … slash-command surface). The control plane does not own the
+persistent agent, so it merely *re-broadcasts* these as
+`CodexThreadActionRequested` for the daemon-side watcher that does own it.
 
 ## Session Supervisor
 
@@ -97,7 +94,7 @@ It subscribes to the bus and handles the session-lifecycle `ControlMsg`s:
 | `CreateSession` | Explicitly create a new managed session and submit its first task (the forward-compatible primitive for parallel sessions). A task of exactly `/fast` is special-cased into a new idle Codex session with the fast service tier enabled. |
 | `StartTask { session_id: None }` | Start a new managed session (legacy clients). A task of exactly `/fast` follows the same idle fast Codex bootstrap path as `CreateSession`. |
 | `StartTask { session_id: Some(id) }` | Route the text as a follow-up turn into the named session |
-| `ResumeSession` | Re-attach an existing session by source (`intendant`/`codex`/`claude-code`/`gemini`) + id, optionally with a prompt |
+| `ResumeSession` | Re-attach an existing session by source (`intendant`/`codex`/`claude-code`) + id, optionally with a prompt |
 | `FollowUp` | Route text to a session's follow-up channel (target id, or the active session) |
 | `EditUserMessage` | Rewind a session to a user turn and submit replacement text (rollback-capable backends only) |
 | `Interrupt` / `Steer` | Mid-turn control of a running session. If a steer body is a supported Codex slash command, the supervisor converts it to a Codex thread action instead of injecting it as model text. |
@@ -129,7 +126,7 @@ When `start_new_session` runs, it:
    loads the `Project`;
 3. writes `session_meta.json` and activates the shared active-session handle;
 4. resolves the backend (one-shot `agent` override → configured default →
-   internal) and applies the runtime Codex/Gemini config;
+   internal) and applies the runtime external-agent config;
 5. resolves any dashboard attachments (frames/uploads) into agent content;
 6. spawns the agent session loop and emits `SessionStarted`.
 
@@ -179,7 +176,7 @@ by it, so the supervisor picks it up.
 ## File Watcher, Snapshots, and Rewind
 
 `file_watcher.rs` is a live filesystem watcher rooted at the project directory.
-It works for **all** agent types — internal, Codex, Claude Code, Gemini CLI —
+It works for **all** agent types — internal, Codex, Claude Code —
 because it watches the filesystem directly rather than diffing git, so an
 external CLI's edits show up the same as Intendant's own. It does two jobs:
 
@@ -241,8 +238,8 @@ supervisor:
 ```
 run_daemon_loop(DaemonConfig { bus, project_root, autonomy,
                                shared_external_agent, shared_codex_config,
-                               shared_gemini_config, frame_registry,
-                               web_port, flags_direct, shared_session })
+                               frame_registry, web_port, flags_direct,
+                               shared_session })
     └─▶ SessionSupervisor::new(..).run()   // owns every launch
 ```
 

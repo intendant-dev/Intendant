@@ -1,6 +1,7 @@
 use crate::error::CallerError;
 use crate::live_audio_types::QuarantinePayload;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// Base directory for all quarantine data.
@@ -12,8 +13,27 @@ fn quarantine_base() -> PathBuf {
 }
 
 /// Directory for a specific live audio session's quarantined payloads.
-fn quarantine_dir(live_audio_id: &str) -> PathBuf {
-    quarantine_base().join(live_audio_id)
+fn quarantine_dir(live_audio_id: &str) -> Result<PathBuf, CallerError> {
+    validate_quarantine_id("live_audio_id", live_audio_id)?;
+    Ok(quarantine_base().join(live_audio_id))
+}
+
+fn validate_quarantine_id(name: &str, id: &str) -> Result<(), CallerError> {
+    // Quarantine ids are single filesystem path components under quarantine_base().
+    let valid = !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(CallerError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be a non-empty safe slug ([A-Za-z0-9._-]+)"),
+        )))
+    }
 }
 
 /// Store a quarantined payload to disk. Returns a reference (without the content).
@@ -25,7 +45,7 @@ pub fn store_payload(
     content_type: &str,
     content: &str,
 ) -> Result<QuarantinePayload, CallerError> {
-    let dir = quarantine_dir(live_audio_id);
+    let dir = quarantine_dir(live_audio_id)?;
     std::fs::create_dir_all(&dir)?;
 
     let payload_id = Uuid::new_v4().to_string();
@@ -76,7 +96,7 @@ pub fn store_payload(
 /// List all quarantined payload references for a live audio session.
 /// Returns references only (no content).
 pub fn list_payloads(live_audio_id: &str) -> Result<Vec<QuarantinePayload>, CallerError> {
-    let dir = quarantine_dir(live_audio_id);
+    let dir = quarantine_dir(live_audio_id)?;
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -108,7 +128,8 @@ pub fn list_payloads(live_audio_id: &str) -> Result<Vec<QuarantinePayload>, Call
 /// This function intentionally returns the raw content string. It must NEVER
 /// be called from code that feeds the result back to an agent.
 pub fn read_payload(live_audio_id: &str, payload_id: &str) -> Result<String, CallerError> {
-    let file_path = quarantine_dir(live_audio_id).join(format!("{}.json", payload_id));
+    validate_quarantine_id("payload_id", payload_id)?;
+    let file_path = quarantine_dir(live_audio_id)?.join(format!("{}.json", payload_id));
     let data = std::fs::read_to_string(&file_path)?;
     let parsed: serde_json::Value = serde_json::from_str(&data)?;
     Ok(parsed["content"].as_str().unwrap_or("").to_string())
@@ -116,7 +137,7 @@ pub fn read_payload(live_audio_id: &str, payload_id: &str) -> Result<String, Cal
 
 /// Remove all quarantine data for a live audio session.
 pub fn cleanup_quarantine(live_audio_id: &str) -> Result<(), CallerError> {
-    let dir = quarantine_dir(live_audio_id);
+    let dir = quarantine_dir(live_audio_id)?;
     if dir.exists() {
         std::fs::remove_dir_all(&dir)?;
     }
@@ -128,7 +149,19 @@ pub fn cleanup_quarantine(live_audio_id: &str) -> Result<(), CallerError> {
 pub fn make_quarantine_fn(
     live_audio_id: String,
 ) -> impl FnMut(&str, &str, &str) -> QuarantinePayload {
+    let invalid_live_audio_id = validate_quarantine_id("live_audio_id", &live_audio_id)
+        .err()
+        .map(|e| e.to_string());
     move |_field: &str, content_type: &str, content: &str| {
+        if let Some(err) = invalid_live_audio_id.as_deref() {
+            return QuarantinePayload {
+                payload_id: "error".to_string(),
+                timestamp: String::new(),
+                live_audio_id: live_audio_id.clone(),
+                content_type: content_type.to_string(),
+                summary: format!("quarantine write failed: {}", err),
+            };
+        }
         store_payload(&live_audio_id, content_type, content).unwrap_or_else(|e| {
             // If quarantine write fails, return a placeholder reference
             QuarantinePayload {
@@ -209,7 +242,9 @@ mod tests {
         assert_eq!(payload.live_audio_id, live_id);
 
         // Verify the file exists
-        let file_path = quarantine_dir(&live_id).join(format!("{}.json", payload.payload_id));
+        let file_path = quarantine_dir(&live_id)
+            .unwrap()
+            .join(format!("{}.json", payload.payload_id));
         assert!(file_path.exists());
 
         // Verify content is on disk but not in the payload reference
@@ -219,7 +254,7 @@ mod tests {
 
         // Clean up
         cleanup_quarantine(&live_id).unwrap();
-        assert!(!quarantine_dir(&live_id).exists());
+        assert!(!quarantine_dir(&live_id).unwrap().exists());
     }
 
     #[test]
@@ -284,5 +319,13 @@ mod tests {
         assert_eq!(p3.summary, "quarantined: weird_thing");
 
         cleanup_quarantine(&live_id).unwrap();
+    }
+
+    #[test]
+    fn quarantine_ids_must_be_safe_slugs() {
+        assert!(store_payload("../escape", "test_type", "test content").is_err());
+        assert!(list_payloads("/tmp/escape").is_err());
+        assert!(read_payload("valid-session", "../payload").is_err());
+        assert!(cleanup_quarantine("..").is_err());
     }
 }

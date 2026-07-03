@@ -9,7 +9,6 @@ use tokio::sync::mpsc;
 
 pub mod claude_code;
 pub mod codex;
-pub mod gemini;
 
 static SPAWNED_CHILD_PROCESSES: OnceLock<StdMutex<HashSet<u32>>> = OnceLock::new();
 
@@ -324,21 +323,22 @@ fn human_bytes(n: u64) -> String {
 pub enum AgentBackend {
     Codex,
     ClaudeCode,
-    GeminiCli,
 }
 
 impl AgentBackend {
     pub fn from_str_loose(s: &str) -> Option<Self> {
         // Accept the canonical short forms (what the dashboard and new
-        // TOML writes use) plus the Display forms ("Claude Code",
-        // "Gemini CLI" — with spaces) so existing intendant.toml files
-        // that were written by earlier code still parse. Case-insensitive.
+        // TOML writes use) plus the Display forms ("Claude Code" — with a
+        // space) so existing intendant.toml files that were written by
+        // earlier code still parse. Case-insensitive. Retired backends
+        // (Gemini CLI) intentionally return None: persisted sessions and
+        // TOML defaults referencing them degrade to "unknown backend"
+        // instead of failing.
         match s.to_lowercase().as_str() {
             "codex" => Some(Self::Codex),
             "claude-code" | "claude_code" | "claudecode" | "cc" | "claude code" => {
                 Some(Self::ClaudeCode)
             }
-            "gemini" | "gemini-cli" | "gemini_cli" | "gemini cli" => Some(Self::GeminiCli),
             _ => None,
         }
     }
@@ -351,7 +351,6 @@ impl AgentBackend {
         match self {
             AgentBackend::Codex => "codex",
             AgentBackend::ClaudeCode => "claude-code",
-            AgentBackend::GeminiCli => "gemini",
         }
     }
 
@@ -361,7 +360,7 @@ impl AgentBackend {
             return false;
         }
         match self {
-            AgentBackend::Codex | AgentBackend::GeminiCli => true,
+            AgentBackend::Codex => true,
             // Claude Code does not expose a real session id during start_thread
             // today. Keep the Intendant log id as canonical until that backend
             // reports a usable native id.
@@ -389,7 +388,6 @@ impl std::fmt::Display for AgentBackend {
         match self {
             AgentBackend::Codex => write!(f, "Codex"),
             AgentBackend::ClaudeCode => write!(f, "Claude Code"),
-            AgentBackend::GeminiCli => write!(f, "Gemini CLI"),
         }
     }
 }
@@ -1062,20 +1060,12 @@ mod tests {
 
     #[test]
     fn from_str_loose_accepts_display_forms() {
-        // The Display impl produces "Codex" / "Claude Code" / "Gemini CLI".
-        // `from_str_loose` must accept those (lowercased) so TOML files
-        // written in the Display form by earlier code don't break startup.
-        assert_eq!(
-            AgentBackend::from_str_loose("Gemini CLI"),
-            Some(AgentBackend::GeminiCli)
-        );
+        // The Display impl produces "Codex" / "Claude Code". `from_str_loose`
+        // must accept those (lowercased) so TOML files written in the
+        // Display form by earlier code don't break startup.
         assert_eq!(
             AgentBackend::from_str_loose("Claude Code"),
             Some(AgentBackend::ClaudeCode)
-        );
-        assert_eq!(
-            AgentBackend::from_str_loose("gemini cli"),
-            Some(AgentBackend::GeminiCli)
         );
     }
 
@@ -1085,13 +1075,8 @@ mod tests {
         // dropdown or the TOML round-trip breaks.
         assert_eq!(AgentBackend::Codex.as_short_str(), "codex");
         assert_eq!(AgentBackend::ClaudeCode.as_short_str(), "claude-code");
-        assert_eq!(AgentBackend::GeminiCli.as_short_str(), "gemini");
         // And from_str_loose must round-trip every as_short_str output.
-        for v in [
-            AgentBackend::Codex,
-            AgentBackend::ClaudeCode,
-            AgentBackend::GeminiCli,
-        ] {
+        for v in [AgentBackend::Codex, AgentBackend::ClaudeCode] {
             assert_eq!(AgentBackend::from_str_loose(v.as_short_str()), Some(v));
         }
     }
@@ -1099,7 +1084,6 @@ mod tests {
     #[test]
     fn canonical_thread_ids_match_backend_capabilities() {
         assert!(AgentBackend::Codex.thread_id_is_canonical("019e37cf-34ad-7b08-8a1e-7ad5086eb39f"));
-        assert!(AgentBackend::GeminiCli.thread_id_is_canonical("session-2026-05-21T12-00"));
         assert!(!AgentBackend::ClaudeCode.thread_id_is_canonical("claude-code-session"));
         assert!(AgentBackend::ClaudeCode.thread_id_is_canonical("real-claude-session"));
         assert!(!source_session_id_is_canonical("unknown", "abc"));
@@ -1110,34 +1094,12 @@ mod tests {
     fn user_message_rewind_capability_is_explicit() {
         assert!(AgentBackend::Codex.supports_user_message_rewind());
         assert!(!AgentBackend::ClaudeCode.supports_user_message_rewind());
-        assert!(!AgentBackend::GeminiCli.supports_user_message_rewind());
     }
 
     #[test]
     fn item_anchor_rewind_capability_is_explicit() {
         assert!(AgentBackend::Codex.supports_item_anchor_rewind());
         assert!(!AgentBackend::ClaudeCode.supports_item_anchor_rewind());
-        assert!(!AgentBackend::GeminiCli.supports_item_anchor_rewind());
-    }
-
-    #[test]
-    fn from_str_loose_gemini_variants() {
-        assert_eq!(
-            AgentBackend::from_str_loose("gemini"),
-            Some(AgentBackend::GeminiCli)
-        );
-        assert_eq!(
-            AgentBackend::from_str_loose("gemini-cli"),
-            Some(AgentBackend::GeminiCli)
-        );
-        assert_eq!(
-            AgentBackend::from_str_loose("gemini_cli"),
-            Some(AgentBackend::GeminiCli)
-        );
-        assert_eq!(
-            AgentBackend::from_str_loose("GEMINI"),
-            Some(AgentBackend::GeminiCli)
-        );
     }
 
     #[test]
@@ -1145,13 +1107,16 @@ mod tests {
         assert_eq!(AgentBackend::from_str_loose(""), None);
         assert_eq!(AgentBackend::from_str_loose("gpt"), None);
         assert_eq!(AgentBackend::from_str_loose("claude"), None);
+        // Retired backend: persisted "gemini" sessions must degrade to
+        // unknown, never resolve to a live backend.
+        assert_eq!(AgentBackend::from_str_loose("gemini"), None);
+        assert_eq!(AgentBackend::from_str_loose("gemini-cli"), None);
     }
 
     #[test]
     fn display_impl() {
         assert_eq!(format!("{}", AgentBackend::Codex), "Codex");
         assert_eq!(format!("{}", AgentBackend::ClaudeCode), "Claude Code");
-        assert_eq!(format!("{}", AgentBackend::GeminiCli), "Gemini CLI");
     }
 
     #[test]
@@ -1167,12 +1132,6 @@ mod tests {
 
         let parsed: AgentBackend = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, AgentBackend::ClaudeCode);
-
-        let json = serde_json::to_string(&AgentBackend::GeminiCli).unwrap();
-        assert_eq!(json, r#""gemini_cli""#);
-
-        let parsed: AgentBackend = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, AgentBackend::GeminiCli);
     }
 
     /// Minimal backend that only implements the required trait methods, so

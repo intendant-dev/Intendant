@@ -4,7 +4,7 @@
 
 # Intendant
 
-An autonomous AI agent operating environment written in Rust. Intendant gives AI agents a full desktop to work in — shell access, file editing, a graphical display they can see and control via computer use, voice interaction, and the ability to make phone calls — all wrapped in a layered human oversight system. It can also supervise external coding agents (Codex, Gemini CLI, Claude Code) as managed backends and federate with peer machines. Provider-agnostic (OpenAI, Anthropic, Gemini), cross-platform (macOS, Linux, Windows), accessible through CLI, TUI, web dashboard, MCP, or voice.
+An autonomous AI agent operating environment written in Rust. Intendant gives AI agents a full desktop to work in — shell access, file editing, a graphical display they can see and control via computer use, voice interaction, and the ability to make phone calls — all wrapped in a layered human oversight system. It can also supervise external coding agents (Codex, Claude Code) as managed backends and federate with peer machines. Provider-agnostic (OpenAI, Anthropic, Gemini), cross-platform (macOS, Linux, Windows), accessible through CLI, TUI, web dashboard, MCP, or voice.
 
 ## Architecture
 
@@ -31,7 +31,7 @@ An autonomous AI agent operating environment written in Rust. Intendant gives AI
 
 **WebRTC display pipeline** — agents see and interact with graphical displays through a custom WebRTC transport (built on rtc-rs): a shared encoder pool with a VP8 baseline plus on-demand hardware H264 (VideoToolbox on macOS, VA-API/x264 on Linux, Media Foundation on Windows), tile-based dirty-region streaming, bidirectional clipboard, multi-monitor, and peer-to-peer display sharing across federated machines.
 
-**External-agent orchestration** — supervise Codex, Gemini CLI, or Claude Code as managed backends, with mid-turn steering, approval gates, rewind, and per-session cost accounting surfaced through the dashboard.
+**External-agent orchestration** — supervise Codex or Claude Code as managed backends, with mid-turn steering, approval gates, rewind, and per-session cost accounting surfaced through the dashboard.
 
 **Persistent daemon** — a control plane supervises many concurrent sessions and is the single writer of shared state; an idle web server runs headless. Federate with peer daemons for multi-host display and capability-based task routing.
 
@@ -69,7 +69,7 @@ echo 'OPENAI_API_KEY=sk-...' > .env
 # Web dashboard runs by default (port 8765); --web sets the port, --no-web disables it
 ./target/release/intendant --web 9000
 
-# Supervise an external coding agent (codex | claude-code | gemini)
+# Supervise an external coding agent (codex | claude-code)
 ./target/release/intendant --agent codex "Fix the tests"
 
 # Run as MCP server (for Claude Code, etc.)

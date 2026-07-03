@@ -295,16 +295,8 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::SetCodexManagedContext { .. }
         | ControlMsg::SetCodexContextArchive { .. }
         | ControlMsg::ConfigureSessionAgent { .. }
-        | ControlMsg::SetGeminiModel { .. }
-        | ControlMsg::SetGeminiApprovalMode { .. }
-        | ControlMsg::SetGeminiSandbox { .. }
-        | ControlMsg::SetGeminiExtensions { .. }
-        | ControlMsg::SetGeminiAllowedMcpServers { .. }
-        | ControlMsg::SetGeminiIncludeDirectories { .. }
-        | ControlMsg::SetGeminiDebug { .. }
         | ControlMsg::SetVerbosity { .. } => PeerOperation::Settings,
         ControlMsg::CodexThreadAction { .. }
-        | ControlMsg::GeminiThreadAction { .. }
         | ControlMsg::RenameSession { .. }
         | ControlMsg::StopSession { .. }
         | ControlMsg::RestartSession { .. }

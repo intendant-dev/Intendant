@@ -1,7 +1,7 @@
 # External-Agent Orchestration
 
-Intendant can hand a whole task to a third-party coding CLI — **OpenAI Codex**,
-**Claude Code**, or **Gemini CLI** — and supervise it as a subordinate worker. The
+Intendant can hand a whole task to a third-party coding CLI — **OpenAI Codex** or
+**Claude Code** — and supervise it as a subordinate worker. The
 external tool does the actual coding; Intendant wraps it in its own oversight,
 display, and computer-use surface by pointing the tool's MCP client at Intendant's
 own [MCP server](./mcp-server.md).
@@ -85,11 +85,14 @@ events when a backend (Codex) multiplexes several threads through one process.
 `web_search`, `network_access`, `writable_roots`). Backends that don't model a
 field ignore it.
 
-The three backend identities are the `AgentBackend` enum (`Codex`, `ClaudeCode`,
-`GeminiCli`). `from_str_loose()` accepts the canonical short forms plus older
-Display forms (`codex`, `claude-code`/`claude_code`/`cc`, `gemini`/`gemini-cli`,
-case-insensitive); `as_short_str()` emits the canonical wire form that matches the
-dashboard dropdown's `<option value>`.
+The supported backend identities are the `AgentBackend` enum (`Codex`,
+`ClaudeCode`). `from_str_loose()` accepts the canonical short forms plus older
+Display forms (`codex`, `claude-code`/`claude_code`/`cc`, case-insensitive);
+`as_short_str()` emits the canonical wire form that matches the dashboard
+dropdown's `<option value>`.
+
+Gemini CLI was previously supported as a backend and was retired in July 2026;
+persisted sessions from it remain readable but cannot be resumed.
 
 ## Per-Backend Reference
 
@@ -97,22 +100,22 @@ dashboard dropdown's `<option value>`.
 `[agent.<backend>]` config, then `run_external_agent_mode()` drives the supervise
 loop.
 
-| | **Codex** (reference impl) | **Claude Code** | **Gemini CLI** |
-|---|---|---|---|
-| Module | `external_agent/codex.rs` (~200 KB) | `external_agent/claude_code.rs` | `external_agent/gemini.rs` |
-| Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio` | `gemini --acp` |
-| Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio | ACP (Agent Client Protocol) |
-| MCP injection | Writes `.codex/config.toml` **and** passes `-c mcp_servers.intendant.{type,url}` flags | Inline `--mcp-config '{…}'` JSON string | Merges `mcpServers.intendant` into `$HOME/.gemini/settings.json` |
-| Multi-thread | Yes — many threads per process | No | No |
-| Native thread id | Yes | Yes — announced via `AgentEvent::NativeSessionId` on the first turn (placeholder `claude-code-session` until then; `--resume` keeps the id stable so resumed threads are canonical immediately) | Yes |
-| Mid-turn steer | Yes (`turn/steer`) | Yes — a user message written mid-turn is absorbed into the running turn | No → queue + next-turn fallback |
-| Mid-turn interrupt | Yes (`turn/cancel`) | Yes (`control_request` `interrupt`; the process survives for follow-up turns) | No → typed error, caller may escalate to `shutdown()` |
-| Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) | No |
-| Reasoning trace | Yes | Yes (`thinking` blocks) | No |
-| Rollback turns | Yes (`thread/rollback`) | No → session reset | No → session reset |
-| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | No | No |
+| | **Codex** (reference impl) | **Claude Code** |
+|---|---|---|
+| Module | `external_agent/codex.rs` (~200 KB) | `external_agent/claude_code.rs` |
+| Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio` |
+| Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio |
+| MCP injection | Writes `.codex/config.toml` **and** passes `-c mcp_servers.intendant.{type,url}` flags | Inline `--mcp-config '{…}'` JSON string |
+| Multi-thread | Yes — many threads per process | No |
+| Native thread id | Yes | Yes — announced via `AgentEvent::NativeSessionId` on the first turn (placeholder `claude-code-session` until then; `--resume` keeps the id stable so resumed threads are canonical immediately) |
+| Mid-turn steer | Yes (`turn/steer`) | Yes — a user message written mid-turn is absorbed into the running turn |
+| Mid-turn interrupt | Yes (`turn/cancel`) | Yes (`control_request` `interrupt`; the process survives for follow-up turns) |
+| Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) |
+| Reasoning trace | Yes | Yes (`thinking` blocks) |
+| Rollback turns | Yes (`thread/rollback`) | No → session reset |
+| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | No |
 
-All three spawn through `crate::platform::spawn_command(&cfg.command)` with the
+Both spawn through `crate::platform::spawn_command(&cfg.command)` with the
 working dir set to the project root and stdin/stdout/stderr piped; stderr is
 forwarded into the session activity log line-by-line
 (`spawn_stderr_forwarder` in `external_agent/mod.rs`), so transport/auth
@@ -122,25 +125,24 @@ failures are visible from every frontend.
 
 What each supervised backend actually receives:
 
-| | **Codex** | **Claude Code** | **Gemini CLI** |
-|---|---|---|---|
-| MCP tool exposure | `tool_profile=core` (bootstrap set) | `tool_profile=core` (bootstrap set) | full tool list (no profile) |
-| Loopback `mcp_token` in URL | yes | yes | via `mcp_token` query when configured |
-| `session_id` scope in URL | yes | yes | no |
-| `$INTENDANT` + `INTENDANT_MCP_URL` env (`ctl` bootstrap) | yes (+ `INTENDANT_MANAGED_CONTEXT`) | yes | no |
-| Guidance channel | managed-context developer message | first-prompt bootstrap addendum | none |
+| | **Codex** | **Claude Code** |
+|---|---|---|
+| MCP tool exposure | `tool_profile=core` (bootstrap set) | `tool_profile=core` (bootstrap set) |
+| Loopback `mcp_token` in URL | yes | yes |
+| `session_id` scope in URL | yes | yes |
+| `$INTENDANT` + `INTENDANT_MCP_URL` env (`ctl` bootstrap) | yes (+ `INTENDANT_MANAGED_CONTEXT`) | yes |
+| Guidance channel | managed-context developer message | first-prompt bootstrap addendum |
 
 The bootstrap set for both Codex and Claude Code includes the CU path
 (`read_screen`, `take_screenshot`, `execute_cu_actions`, `list_displays`,
 `grant_user_display`, `revoke_user_display`) and the shared-view tools
 regardless of managed context; managed-context/fission tools remain
-managed-only. Gemini CLI is currently **unmaintained** in Intendant and keeps
-its historical full-list behavior.
+managed-only.
 
 ### Codex (the reference backend)
 
-Codex is the most fully wired backend; the others fall back to defaults for
-features they lack.
+Codex is the most fully wired backend; Claude Code falls back to defaults for
+features it lacks.
 
 - **MCP injection — belt and suspenders.** On `initialize()`, Codex writes
   `<workspace>/.codex/config.toml`:
@@ -541,19 +543,6 @@ bootstrap addendum naming the MCP bootstrap tools
 `--permission-mode` (normalized — the legacy Intendant value `auto` maps to
 the CLI default) and `--allowedTools` are added from config when set.
 
-### Gemini CLI
-
-Spawned with `--acp` and driven over the Agent Client Protocol. Intendant merges an
-`mcpServers.intendant` entry into **`$HOME/.gemini/settings.json`** — deliberately
-the home settings file, not a project-local `.gemini/`, so it doesn't shadow the
-real config directory holding OAuth credentials. The prior value of
-`mcpServers.intendant` (present or absent) is remembered and restored on
-`shutdown()` (and on `Drop` as a safety net). Config knobs map to flags:
-`--model`, `--approval-mode`, `--sandbox`, `--extensions`,
-`--allowed-mcp-server-names`, `--include-directories`, `--debug`. If you set
-`allowed_mcp_servers`, you must include `intendant` or the injected tools won't be
-reachable.
-
 ## Approval Routing
 
 When a supervised agent asks to run a command or change a file, the backend emits
@@ -602,7 +591,7 @@ with just `default_backend` works.
 ```toml
 [agent]
 # Which backend to use when --agent is not passed. Omit/empty = native agent.
-# Accepts: "codex", "claude-code", "gemini".
+# Accepts: "codex", "claude-code".
 default_backend = "codex"
 
 [agent.codex]
@@ -623,33 +612,22 @@ command         = "claude"
 model           = "claude-sonnet-4-6"  # optional; any claude CLI --model value (e.g. "haiku")
 permission_mode = "default"           # default | acceptEdits | plan | bypassPermissions (legacy "auto" = default)
 allowed_tools   = []                  # e.g. ["Read", "Edit", "Bash"]; empty = all
-
-[agent.gemini_cli]
-command              = "gemini"
-model                = "gemini-2.5-pro"  # optional
-approval_mode        = "default"      # default | auto_edit | yolo | plan
-sandbox              = false          # pass --sandbox
-extensions           = []             # --extensions; empty = all installed
-allowed_mcp_servers  = []             # --allowed-mcp-server-names; if set, include "intendant"
-include_directories  = []             # --include-directories (absolute)
-debug                = false          # --debug (Gemini DevTools console)
 ```
 
 Values are normalized at dispatch (`normalize_sandbox_mode`,
 `normalize_approval_policy`, `normalize_reasoning_effort`,
-`normalize_codex_managed_context`, `normalize_codex_context_archive`,
-`normalize_gemini_approval_mode`): unknown or empty values fall back to the safe
+`normalize_codex_managed_context`, `normalize_codex_context_archive`): unknown
+or empty values fall back to the safe
 default rather than silently escalating privileges (e.g. a typo'd Codex sandbox
 becomes `workspace-write`, not `danger-full-access`; an unknown
 `managed_context` becomes `vanilla`; an unknown `context_archive` becomes
-`summary`; a bad Gemini approval mode becomes `default`, not `yolo`).
+`summary`).
 
 ### Selecting the backend with `--agent`
 
 ```bash
 intendant --agent codex "refactor the auth module"
 intendant --agent claude-code "add tests for the parser"
-intendant --agent gemini --web "investigate the flaky CI job"
 ```
 
 `--agent <name>` parses via `AgentBackend::from_str_loose` and overrides
@@ -659,19 +637,16 @@ shared state (when driven over MCP) → config default → native.
 
 ## Gotchas and Caveats
 
-- **Config-file mutation.** Codex (`.codex/config.toml`) and Gemini
-  (`$HOME/.gemini/settings.json`) have their config **mutated in place** and
-  restored on clean shutdown. Codex backs up a non-Intendant config and renames it
-  back; Gemini remembers and restores the prior `mcpServers.intendant` value (with a
-  `Drop` safety net). A hard kill that bypasses `shutdown()` can leave the
-  Intendant-generated entry behind — check for `config.toml.intendant-backup` /
-  a stray `mcpServers.intendant` if a session crashed.
+- **Config-file mutation.** Codex (`.codex/config.toml`) has its config
+  **mutated in place** and restored on clean shutdown. Codex backs up a
+  non-Intendant config and renames it back. A hard kill that bypasses
+  `shutdown()` can leave the Intendant-generated entry behind — check for
+  `config.toml.intendant-backup` if a session crashed.
 - **Settings latch at thread/process start.** Codex latches sandbox, approval
-  policy, model, reasoning effort, tool set, and writable roots at `thread/start`;
-  Gemini latches its flags at process spawn (no equivalent of `thread/start`).
-  Changing these mid-session requires a teardown + respawn. The daemon's
-  `codex_runtime_config_equal` / `gemini_runtime_config_equal` checks detect drift
-  across tasks and force a rebuild when any latched field changes.
+  policy, model, reasoning effort, tool set, and writable roots at `thread/start`.
+  Changing these mid-session requires a teardown + respawn. The daemon's runtime
+  config checks detect drift across tasks and force a rebuild when any latched
+  field changes.
 - **Codex resume cwd is thread-stateful.** Intendant sends `cwd` on
   `thread/resume`, and then sends `thread/settings/update` with the requested
   project root for resumed Codex threads. A non-running Codex thread can load
@@ -698,10 +673,12 @@ shared state (when driven over MCP) → config default → native.
   error* by default (`steer_turn`, `rollback_turns`, `interrupt_turn`,
   `thread_action`). `drain_external_agent_events` distinguishes "feature
   unsupported by this backend" from "feature attempted but failed" partly by these
-  error messages — e.g. mid-turn steering on Gemini returns the
+  error messages — a backend without native steering returns the
   unsupported error, and the caller falls back to **queueing** the text onto the
-  context-injection queue for delivery at the next turn (Codex and Claude Code
-  steer natively). Don't reword those strings without checking the drain logic.
+  context-injection queue for delivery at the next turn. Both current backends
+  (Codex, Claude Code) steer natively, so the fallback is dormant — but it is
+  the contract any future backend inherits. Don't reword those strings without
+  checking the drain logic.
 - **`--direct` does not bypass external mode.** It only forces single-agent
   execution of the *native* worker. If a backend is configured, the supervised CLI
   still runs.

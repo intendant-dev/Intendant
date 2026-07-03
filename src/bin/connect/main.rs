@@ -94,6 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/app", get(app_html))
         .route("/healthz", get(healthz))
         .route("/install.sh", get(install_sh))
+        .route("/favicon.png", get(favicon_png))
+        .route("/logo.svg", get(logo_svg))
         .route("/assets/landing/{name}", get(landing_asset))
         .route("/readyz", get(readyz))
         .route("/api/me", get(api_me))
@@ -527,7 +529,7 @@ fn record_presence_hour(hours: &mut Vec<u64>, now_unix_ms: u64) -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct FleetTargetRecord {
     user_id: Uuid,
     id: String,
@@ -928,6 +930,33 @@ async fn install_sh() -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         INSTALL_SH,
+    )
+}
+
+/// The canonical Intendant mark, embedded so every page this binary serves
+/// gets the real logo without a static root. `static/logo.svg` is the
+/// macOS icon vector (macos-app/icon.svg) with the dock margin cropped in
+/// viewBox space; the PNG fallback is rendered from it (`rsvg-convert -w 128`).
+const LOGO_SVG: &str = include_str!("../../../static/logo.svg");
+const BRAND_ICON_PNG: &[u8] = include_bytes!("../../../static/icon-128.png");
+
+async fn logo_svg() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        LOGO_SVG,
+    )
+}
+
+async fn favicon_png() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        BRAND_ICON_PNG,
     )
 }
 
@@ -3039,13 +3068,14 @@ async fn api_fleet_targets_sync(
             .map(|record| record.first_seen_unix_ms)
             .filter(|value| *value > 0)
             .unwrap_or(target.first_seen_unix_ms);
+        // Signature fields ride through verbatim (normalize bounded them):
+        // the browser signs its records and re-verifies after the round
+        // trip, so stripping them here would turn every synced row into
+        // "unverified" and defeat the provenance badges.
         by_host.insert(
             target.host_id.clone(),
             FleetTargetRecord {
-                record_key: String::new(),
-                    record_sig: String::new(),
-                    record_signed_at_unix_ms: 0,
-                    first_seen_unix_ms,
+                first_seen_unix_ms,
                 ..target
             },
         );
@@ -3177,8 +3207,18 @@ fn canonicalize_fleet_target_for_owned_daemon(
     else {
         return;
     };
+    if target.id == connect_daemon_id && target.host_id == connect_daemon_id {
+        return;
+    }
     target.id = connect_daemon_id.clone();
     target.host_id = connect_daemon_id;
+    // The owner signature covers host_id; rewriting it here makes that
+    // signature permanently unverifiable, so drop it — the record honestly
+    // reads as unsigned instead of carrying a signature that can never
+    // match again.
+    target.record_key = String::new();
+    target.record_sig = String::new();
+    target.record_signed_at_unix_ms = 0;
 }
 
 fn normalize_fleet_target_input(
@@ -4891,6 +4931,8 @@ fn trust_ui_html(origin: &str) -> String {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>How trust works — Intendant Connect</title>
+  <link rel="icon" type="image/svg+xml" href="/logo.svg">
+  <link rel="icon" type="image/png" href="/favicon.png">
   <style>
     :root {{
       color-scheme: dark;
@@ -4909,7 +4951,7 @@ fn trust_ui_html(origin: &str) -> String {
     code {{ color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }}
     header {{ border-bottom: 1px solid var(--line); background: rgba(24, 24, 37, .82); }}
     .topbar {{ width: min(760px, calc(100vw - 32px)); margin: 0 auto; min-height: 60px; display: flex; align-items: center; gap: 12px; }}
-    .brand-mark {{ width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--lavender); background: linear-gradient(160deg, #1e1e2e, #24273a); font-size: 11px; font-weight: 800; }}
+    .brand-mark {{ width: 30px; height: 30px; display: block; flex: 0 0 auto; }}
     .topbar a {{ color: var(--text); text-decoration: none; font-weight: 700; font-size: 15px; }}
     main {{ width: min(760px, calc(100vw - 32px)); margin: 0 auto; padding: 34px 0 72px; line-height: 1.62; font-size: 15px; }}
     h1 {{ font-size: 28px; letter-spacing: -.015em; line-height: 1.15; margin: 0 0 8px; }}
@@ -4925,7 +4967,7 @@ fn trust_ui_html(origin: &str) -> String {
   </style>
 </head>
 <body>
-  <header><div class="topbar"><div class="brand-mark" aria-hidden="true">IC</div><a href="/connect">Intendant Connect</a></div></header>
+  <header><div class="topbar"><img class="brand-mark" src="/logo.svg" alt=""><a href="/connect">Intendant Connect</a></div></header>
   <main>
     <h1>How trust works here</h1>
     <p class="lede">The short version: this service makes introductions and carries ciphertext. Authority over your computers never lives here &mdash; not even when you sign in.</p>
@@ -4970,6 +5012,111 @@ fn trust_ui_html(origin: &str) -> String {
 const DOCS_URL: &str = "https://lovon-spec.github.io/Intendant/";
 const REPO_URL: &str = "https://github.com/lovon-spec/intendant";
 
+/// The deployment advisor inside the landing install section: three
+/// questions -> the same one-liner (with `--service` where it belongs)
+/// plus an honest fueling plan for after the claim. A separate const so
+/// its CSS/JS braces stay out of the page-level `format!`; it derives
+/// the command from `location.origin` at runtime, so a self-hosted
+/// rendezvous advertises its own installer here too. Folded shut by
+/// default — the one-command story stays the headline.
+const LANDING_ADVISOR_HTML: &str = r##"<details class="advisor" id="advisor">
+        <style>
+          .advisor { margin-top: 26px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(30, 30, 46, .55); }
+          .advisor summary { cursor: pointer; padding: 14px 16px; font-size: 14.5px; color: var(--muted); list-style: none; }
+          .advisor summary::before { content: "?"; display: inline-block; width: 20px; height: 20px; margin-right: 10px; border-radius: 50%; background: var(--surface-2); color: var(--accent); font-weight: 700; font-size: 12.5px; text-align: center; line-height: 20px; }
+          .advisor summary::-webkit-details-marker { display: none; }
+          .advisor summary:hover { color: var(--text); }
+          .advisor[open] summary { border-bottom: 1px solid var(--line); color: var(--text); }
+          .advbody { padding: 16px; display: grid; gap: 14px; }
+          .advq { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+          .advq .ql { font-size: 13.5px; color: var(--muted-2); min-width: 200px; }
+          .advq button { background: transparent; border: 1px solid var(--line-strong); color: var(--muted); border-radius: 999px; padding: 5px 13px; font-size: 13px; cursor: pointer; }
+          .advq button:hover { color: var(--text); border-color: var(--accent); }
+          .advq button.on { background: var(--surface-2); color: var(--text); border-color: var(--accent); }
+          .advout { border-top: 1px solid var(--line); padding-top: 14px; display: grid; gap: 10px; }
+          .advout ul { margin: 0; padding-left: 20px; font-size: 14px; color: var(--muted); display: grid; gap: 6px; }
+          .advout ul b { color: var(--text); }
+        </style>
+        <summary>Not sure which shape fits? Answer three questions.</summary>
+        <div class="advbody">
+          <div class="advq" data-q="box">
+            <span class="ql">Where will it run?</span>
+            <button data-v="vps" class="on">A rented VPS</button>
+            <button data-v="server">My own always-on machine</button>
+            <button data-v="laptop">The machine I'm on now</button>
+          </div>
+          <div class="advq" data-q="fuel">
+            <span class="ql">What will fuel it?</span>
+            <button data-v="api" class="on">API keys</button>
+            <button data-v="sub">Subscriptions (Codex, Claude Code)</button>
+            <button data-v="both">Both</button>
+          </div>
+          <div class="advq" data-q="solo">
+            <span class="ql">Keep working with your browser closed?</span>
+            <button data-v="no" class="on">No — while I watch</button>
+            <button data-v="yes">Yes — unattended runs</button>
+          </div>
+          <div class="advout">
+            <div class="terminal">
+              <div class="tbar">
+                <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+                <span class="bftitle">still one command</span>
+                <button onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('advcmd').textContent)">copy</button>
+              </div>
+              <pre><span class="ps">$ </span><span id="advcmd"></span></pre>
+            </div>
+            <ul id="advplan"></ul>
+            <p class="installnote" id="advnote"></p>
+          </div>
+        </div>
+        <script>
+        (function () {
+          var pick = { box: 'vps', fuel: 'api', solo: 'no' };
+          function render() {
+            // </> keep raw angle brackets out of the inline
+            // script (the page-level invariant the tests pin).
+            var cmd = 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- --owner \u003cyour-key\u003e';
+            if (pick.box !== 'laptop') cmd += ' --service';
+            document.getElementById('advcmd').textContent = cmd;
+            var plan = [];
+            if (pick.box === 'laptop') {
+              plan.push('<b>Fueling is optional here.</b> A local .env key works as-is; the vault still adds cross-device sync and one-click revocation.');
+            } else {
+              var watched = pick.solo === 'no';
+              if (pick.fuel !== 'sub') {
+                plan.push(watched
+                  ? '<b>Anthropic & Gemini: client egress.</b> Calls relay through this browser — the box never holds a key at all. OpenAI’s API refuses browser relay, so lease it with the offline window at “while connected only”.'
+                  : '<b>API keys: leases with a 24 h offline window.</b> Borrowed in memory only, never on disk, revocable from any signed-in device.');
+              }
+              if (pick.fuel !== 'api') {
+                plan.push('<b>Subscriptions: access-token OAuth leases</b> (the default) — your browser refreshes the token and leases only the short-lived result. Codex works out of the box.');
+                plan.push(watched
+                  ? '<b>Claude Code</b> still needs the full-credential opt-in (Anthropic’s token endpoint refuses browser refresh) — decide per box.'
+                  : '<b>Unattended subscription runs</b> beyond the token’s life (≈ 1 h) need the full-credential opt-in: the honest trade is durable authority on the box for the lease window. Claude Code always needs it today.');
+              }
+            }
+            document.getElementById('advplan').innerHTML = plan.map(function (item) { return '<li>' + item + '</li>'; }).join('');
+            var note = { vps: 'A disposable box should hold nothing durable: with egress or access-token leases, wiping it loses nothing and leaks nothing.',
+                         server: 'Nothing rests on disk either way — leases only bound what a runtime compromise could spend before you revoke.',
+                         laptop: 'Custody buys the least on the machine your browser already runs on.' }[pick.box];
+            if (pick.box !== 'laptop') note += ' --service installs a systemd unit so the daemon outlives the SSH session; the claim phrase lands in journalctl.';
+            document.getElementById('advnote').textContent = note;
+          }
+          Array.prototype.forEach.call(document.querySelectorAll('#advisor .advq'), function (row) {
+            Array.prototype.forEach.call(row.querySelectorAll('button'), function (button) {
+              button.addEventListener('click', function () {
+                Array.prototype.forEach.call(row.querySelectorAll('button'), function (other) { other.classList.remove('on'); });
+                button.classList.add('on');
+                pick[row.getAttribute('data-q')] = button.getAttribute('data-v');
+                render();
+              });
+            });
+          });
+          render();
+        })();
+        </script>
+      </details>"##;
+
 /// The public landing page at `/`. Deliberately static and dependency-free;
 /// the install one-liner is origin-aware so a self-hosted rendezvous
 /// advertises its own installer.
@@ -4987,7 +5134,8 @@ fn landing_ui_html(origin: &str) -> String {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Intendant — an operating environment for autonomous AI agents</title>
   <meta name="description" content="Give an AI agent a full machine — shell, files, display, voice — under layered human oversight. Your keys stay yours.">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%231e1e2e'/><text x='32' y='44' font-family='system-ui' font-size='30' font-weight='700' text-anchor='middle' fill='%23b4befe'>in</text></svg>">
+  <link rel="icon" type="image/svg+xml" href="/logo.svg">
+  <link rel="icon" type="image/png" href="/favicon.png">
   <style>
     :root {{
       color-scheme: dark;
@@ -5028,7 +5176,8 @@ fn landing_ui_html(origin: &str) -> String {
       display: flex; align-items: center; justify-content: space-between;
       padding: 18px 0; flex-wrap: wrap; gap: 10px 18px;
     }}
-    .mark {{ font-weight: 700; letter-spacing: .3px; font-size: 17px; color: var(--text); }}
+    .mark {{ display: flex; align-items: center; font-weight: 700; letter-spacing: .3px; font-size: 17px; color: var(--text); }}
+    .mark img {{ width: 26px; height: 26px; display: block; margin-right: 9px; }}
     .mark span {{ color: var(--accent); }}
     nav {{ display: flex; gap: 14px 20px; align-items: center; font-size: 14.5px; flex-wrap: wrap; }}
     nav a {{ color: var(--muted); white-space: nowrap; }}
@@ -5159,7 +5308,7 @@ fn landing_ui_html(origin: &str) -> String {
 <body>
   <div class="wrap">
     <header>
-      <div class="mark">intendant<span>.dev</span></div>
+      <div class="mark"><img src="/logo.svg" alt="">intendant<span>.dev</span></div>
       <nav>
         <a href="/trust">How trust works</a>
         <a href="{DOCS_URL}">Docs</a>
@@ -5335,6 +5484,7 @@ fn landing_ui_html(origin: &str) -> String {
             Grant time-boxed credential leases from your encrypted vault — or relay calls through your browser and never hand over a key at all.</div>
         </div>
       </div>
+      {advisor}
     </section>
 
     <section class="trustrow">
@@ -5362,7 +5512,8 @@ fn landing_ui_html(origin: &str) -> String {
     </footer>
   </div>
 </body>
-</html>"##
+</html>"##,
+        advisor = LANDING_ADVISOR_HTML,
     )
 }
 
@@ -5374,6 +5525,8 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{product_title}</title>
+  <link rel="icon" type="image/svg+xml" href="/logo.svg">
+  <link rel="icon" type="image/png" href="/favicon.png">
   <style>
     :root {{
       color-scheme: dark;
@@ -5427,7 +5580,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     header {{ border-bottom: 1px solid var(--line); background: rgba(24, 24, 37, .82); backdrop-filter: blur(10px); position: sticky; top: 0; z-index: 5; }}
     .topbar {{ width: min(1180px, calc(100vw - 32px)); margin: 0 auto; min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }}
     .brand {{ display: flex; align-items: center; gap: 12px; min-width: 0; }}
-    .brand-mark {{ width: 34px; height: 34px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--line-strong); border-radius: 9px; color: var(--lavender); background: linear-gradient(160deg, #1e1e2e, #24273a); font-size: 12px; font-weight: 800; }}
+    .brand-mark {{ width: 34px; height: 34px; display: block; flex: 0 0 auto; }}
     .brand h1 {{ font-size: 17px; line-height: 1.15; margin: 0; }}
     .brand-sub {{ color: var(--muted-2); font-size: 12px; margin-top: 2px; }}
     .top-actions {{ display: flex; align-items: center; gap: 9px; }}
@@ -5441,7 +5594,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     /* ── Signed out: hero ── */
     body.signed-out main.shell {{ width: min(560px, calc(100vw - 32px)); padding-top: 7vh; }}
     .hero {{ text-align: center; display: grid; gap: 14px; justify-items: center; padding: 8px 0 22px; }}
-    .hero-mark {{ width: 58px; height: 58px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 16px; color: var(--lavender); background: linear-gradient(160deg, #1e1e2e, #24273a); font-size: 20px; font-weight: 800; box-shadow: var(--shadow); }}
+    .hero-mark {{ width: 58px; height: 58px; display: block; border-radius: 16px; box-shadow: var(--shadow); }}
     .hero-title {{ font-size: 32px; line-height: 1.12; margin: 6px 0 0; letter-spacing: -.015em; }}
     .hero-sub {{ color: var(--muted); font-size: 15px; line-height: 1.55; margin: 0; max-width: 46ch; }}
     .auth-card {{ border: 1px solid var(--line-strong); background: rgba(24, 24, 37, .72); border-radius: var(--radius); box-shadow: var(--shadow); padding: 22px; display: grid; gap: 14px; }}
@@ -5560,7 +5713,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
   <header>
     <div class="topbar">
       <div class="brand">
-        <div class="brand-mark" aria-hidden="true">IC</div>
+        <img class="brand-mark" src="/logo.svg" alt="">
         <div>
         <h1>{product_title}</h1>
           <div class="brand-sub">{account_subtitle}</div>
@@ -5577,7 +5730,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     <!-- ── Signed out: landing ── -->
     <section id="auth">
       <div class="hero">
-        <div class="hero-mark" aria-hidden="true">IC</div>
+        <img class="hero-mark" src="/logo.svg" alt="">
         <h2 class="hero-title">Your computers, anywhere.</h2>
         <p class="hero-sub">Sign in with a passkey and open any machine you own, from any browser. This service only makes the introduction &mdash; each computer verifies you itself and decides what you may do, end to end.</p>
       </div>
@@ -6533,6 +6686,45 @@ mod tests {
         assert_eq!(clamped.record_signed_at_unix_ms, 1_800_000_000_000);
     }
 
+    #[test]
+    fn canonicalize_drops_signature_only_when_it_rewrites_the_record() {
+        let signed = |id: &str, host_id: &str| FleetTargetRecord {
+            id: id.to_string(),
+            host_id: host_id.to_string(),
+            connect_daemon_id: Some("daemon-1".to_string()),
+            record_key: "PubKeyB64u".to_string(),
+            record_sig: "SigB64u".to_string(),
+            record_signed_at_unix_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let owned: HashSet<String> = ["daemon-1".to_string()].into_iter().collect();
+
+        // Not an owned daemon: untouched, signature intact.
+        let mut foreign = signed("alias", "alias");
+        canonicalize_fleet_target_for_owned_daemon(&mut foreign, &HashSet::new());
+        assert_eq!(foreign.host_id, "alias");
+        assert_eq!(foreign.record_sig, "SigB64u");
+
+        // Already canonical: nothing changes, so the signature still holds.
+        let mut canonical = signed("daemon-1", "daemon-1");
+        canonicalize_fleet_target_for_owned_daemon(&mut canonical, &owned);
+        assert_eq!(canonical.host_id, "daemon-1");
+        assert_eq!(canonical.record_key, "PubKeyB64u");
+        assert_eq!(canonical.record_sig, "SigB64u");
+        assert_eq!(canonical.record_signed_at_unix_ms, 1_700_000_000_000);
+
+        // Alias of an owned daemon: host_id is rewritten, which makes the
+        // owner signature (it covers host_id) permanently unverifiable —
+        // it must be dropped, not stored broken.
+        let mut alias = signed("alias", "alias");
+        canonicalize_fleet_target_for_owned_daemon(&mut alias, &owned);
+        assert_eq!(alias.id, "daemon-1");
+        assert_eq!(alias.host_id, "daemon-1");
+        assert!(alias.record_key.is_empty());
+        assert!(alias.record_sig.is_empty());
+        assert_eq!(alias.record_signed_at_unix_ms, 0);
+    }
+
     fn daemon_record(
         daemon_id: &str,
         owner_user_id: Option<Uuid>,
@@ -7139,6 +7331,43 @@ mod tests {
             );
         }
         assert!(html.contains("alt=\"The Intendant dashboard's Activity feed"));
+        // The canonical mark, not an ad-hoc monogram: favicon + header logo.
+        assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/logo.svg">"#));
+        assert!(html.contains(r#"<link rel="icon" type="image/png" href="/favicon.png">"#));
+        assert!(html.contains(r#"<img src="/logo.svg""#));
+        assert!(!html.contains("data:image/svg"));
+        // The deployment advisor: folded shut (the one-command story stays
+        // the headline), three questions, and a runtime-origin command so
+        // self-hosted rendezvous advertise their own installer there too.
+        assert!(html.contains("Not sure which shape fits?"));
+        assert!(!html.contains("<details class=\"advisor\" open"));
+        for question in ["Where will it run?", "What will fuel it?", "Keep working with your browser closed?"] {
+            assert!(html.contains(question), "advisor must ask: {question}");
+        }
+        assert!(html.contains("location.origin + '/install.sh"));
+        assert!(html.contains("--service"));
+    }
+
+    #[test]
+    fn every_page_serves_the_canonical_mark() {
+        // The embedded mark is the real artwork: SVG vector + PNG fallback
+        // (kept in lockstep with static/ by include_str!/include_bytes!).
+        assert!(LOGO_SVG.starts_with("<svg"));
+        assert!(
+            LOGO_SVG.contains(r#"viewBox="16 16 480 480""#),
+            "logo.svg must stay the margin-cropped view of the macOS icon"
+        );
+        assert_eq!(&BRAND_ICON_PNG[0..8], b"\x89PNG\r\n\x1a\n");
+        assert!(BRAND_ICON_PNG.len() > 2_048, "brand icon suspiciously small");
+        let svg_link = r#"<link rel="icon" type="image/svg+xml" href="/logo.svg">"#;
+        let png_link = r#"<link rel="icon" type="image/png" href="/favicon.png">"#;
+        let connect = connect_ui_html("https://x.example", "Intendant Connect", "Rendezvous account");
+        assert!(connect.contains(svg_link) && connect.contains(png_link));
+        assert!(connect.contains(r#"class="brand-mark" src="/logo.svg""#));
+        assert!(!connect.contains(">IC</div>"));
+        let trust = trust_ui_html("https://x.example");
+        assert!(trust.contains(svg_link) && trust.contains(png_link));
+        assert!(!trust.contains(">IC</div>"));
     }
 
     #[test]

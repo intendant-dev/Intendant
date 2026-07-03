@@ -731,38 +731,6 @@ pub enum AppEvent {
         context_archive: Option<String>,
     },
 
-    /// Emitted when one or more Gemini CLI runtime fields change. Mirror of
-    /// `CodexConfigChanged` — fields omitted were not touched, `model_cleared`
-    /// distinguishes "no change" from "model override removed".
-    GeminiConfigChanged {
-        model: Option<String>,
-        model_cleared: bool,
-        approval_mode: Option<String>,
-        sandbox: Option<bool>,
-        extensions: Option<Vec<String>>,
-        allowed_mcp_servers: Option<Vec<String>>,
-        include_directories: Option<Vec<String>>,
-        debug: Option<bool>,
-    },
-
-    /// Emitted by the control plane when a `ControlMsg::GeminiThreadAction`
-    /// arrives. Mirrors `CodexThreadActionRequested`. The outer loop in
-    /// `run_with_presence` picks this up to dispatch daemon-side (`/new`)
-    /// or agent-side (currently none; Gemini ACP doesn't expose them).
-    GeminiThreadActionRequested {
-        action: String,
-        params: serde_json::Value,
-    },
-
-    /// Result of a Gemini thread action, emitted after the daemon-side
-    /// watcher finishes dispatching. Carries the status back to the
-    /// dashboard for a success/error toast.
-    GeminiThreadActionResult {
-        action: String,
-        success: bool,
-        message: String,
-    },
-
     /// Log entry broadcast to external consumers (web UI, control socket).
     /// Emitted by the TUI's `log_sourced` for events without their own
     /// `OutboundEvent` variant, and by backend code (e.g.
@@ -1193,56 +1161,6 @@ pub enum ControlMsg {
         codex_managed_context: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_context_archive: Option<String>,
-    },
-    /// Set the Gemini model override. `None`/missing lets Gemini pick.
-    /// Applies to the NEXT task because Gemini latches `--model` at
-    /// process spawn.
-    SetGeminiModel {
-        #[serde(default)]
-        model: Option<String>,
-    },
-    /// Set the Gemini approval mode. Matches `gemini --approval-mode`:
-    /// `"default" | "auto_edit" | "yolo" | "plan"`. Applies to the NEXT task.
-    SetGeminiApprovalMode {
-        mode: String,
-    },
-    /// Toggle Gemini's `--sandbox` flag. Applies to the NEXT task.
-    SetGeminiSandbox {
-        enabled: bool,
-    },
-    /// Replace the list of Gemini extensions to enable (`--extensions`).
-    /// Empty list means "use all installed extensions" (Gemini's default).
-    /// Applies to the NEXT task.
-    SetGeminiExtensions {
-        #[serde(default)]
-        extensions: Vec<String>,
-    },
-    /// Replace the list of allowed MCP server names
-    /// (`--allowed-mcp-server-names`). Empty list = all servers allowed.
-    /// Applies to the NEXT task.
-    SetGeminiAllowedMcpServers {
-        #[serde(default)]
-        servers: Vec<String>,
-    },
-    /// Replace the list of extra workspace directories
-    /// (`--include-directories`). Applies to the NEXT task.
-    SetGeminiIncludeDirectories {
-        #[serde(default)]
-        directories: Vec<String>,
-    },
-    /// Toggle Gemini's `--debug` flag (opens DevTools console). Applies
-    /// to the NEXT task.
-    SetGeminiDebug {
-        enabled: bool,
-    },
-    /// Invoke a Gemini session-level action. Currently only `"new"` is
-    /// supported (tears down the persistent agent so the next task starts
-    /// a fresh Gemini process). Mirrors the shape of `CodexThreadAction`
-    /// so frontends can use the same pattern.
-    GeminiThreadAction {
-        op: String,
-        #[serde(default)]
-        params: serde_json::Value,
     },
     SetVerbosity {
         level: String,
@@ -2281,35 +2199,6 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             managed_context: managed_context.clone(),
             context_archive: context_archive.clone(),
         }),
-        AppEvent::GeminiConfigChanged {
-            model,
-            model_cleared,
-            approval_mode,
-            sandbox,
-            extensions,
-            allowed_mcp_servers,
-            include_directories,
-            debug,
-        } => Some(OutboundEvent::GeminiConfigChanged {
-            model: model.clone(),
-            model_cleared: *model_cleared,
-            approval_mode: approval_mode.clone(),
-            sandbox: *sandbox,
-            extensions: extensions.clone(),
-            allowed_mcp_servers: allowed_mcp_servers.clone(),
-            include_directories: include_directories.clone(),
-            debug: *debug,
-        }),
-        AppEvent::GeminiThreadActionResult {
-            action,
-            success,
-            message,
-        } => Some(OutboundEvent::GeminiThreadActionResult {
-            action: action.clone(),
-            success: *success,
-            message: message.clone(),
-        }),
-        AppEvent::GeminiThreadActionRequested { .. } => None,
         AppEvent::LogEntry {
             session_id,
             level,

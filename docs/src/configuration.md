@@ -216,7 +216,7 @@ Routes coding tasks to an external CLI agent instead of the native loop (see
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `default_backend` | string | unset (use native) | `codex`, `claude-code`, or `gemini` |
+| `default_backend` | string | unset (use native) | `codex` or `claude-code` |
 
 `[agent.codex]`:
 
@@ -250,22 +250,9 @@ preserve Codex's normal user configuration inheritance.
 | `permission_mode` | string | `default` | `default`, `acceptEdits`, `plan`, `bypassPermissions` (legacy `auto` = `default`) |
 | `allowed_tools` | array | `[]` (all) | Restrict the tool set |
 
-`[agent.gemini_cli]`:
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `command` | string | `gemini` | Path or command name |
-| `model` | string | unset | Model override |
-| `approval_mode` | string | `default` | `default`, `auto_edit`, `yolo`, `plan` (matches `gemini --approval-mode`) |
-| `sandbox` | bool | `false` | Pass `--sandbox` when spawning Gemini |
-| `extensions` | array | `[]` (all) | Extension names to enable (`--extensions`) |
-| `allowed_mcp_servers` | array | `[]` (all) | MCP server allowlist (`--allowed-mcp-server-names`); include `intendant` if you set one |
-| `include_directories` | array | `[]` | Extra workspace roots (`--include-directories`, absolute) |
-| `debug` | bool | `false` | Open Gemini's DevTools console (`--debug`) |
-
 Unknown or empty values for `approval_policy`, `sandbox`, `reasoning_effort`,
-and Gemini's `approval_mode` are normalized to the safe default so a config typo
-cannot silently escalate privileges.
+are normalized to the safe default so a config typo cannot silently escalate
+privileges.
 
 ### `[live_audio]`
 
@@ -777,10 +764,6 @@ writable_roots = []
 command = "claude"
 permission_mode = "default"
 allowed_tools = []
-
-[agent.gemini_cli]
-command = "gemini"
-approval_mode = "default"
 
 [live_audio]
 enabled = false
