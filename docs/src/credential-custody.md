@@ -1,18 +1,19 @@
 # Credential Custody: the Vault and Leases
 
-> Status: **shipped 2026-07-03** (rollout steps 1–4 and 6; client egress —
-> step 5 — is the one remaining step). The four sign-off decisions were
-> resolved as recommended: offline-lease default **24h**; full-credential
-> OAuth leases **built but off by default**; recovery phrase **mandatory**
-> at vault creation; scoping ships as the **single default rule** with
-> per-entry overrides deferred. One documented deviation: v1 OAuth fueling
-> is the full-credential opt-in only — the access-token lease mode
-> (browser-side token refresh) is a stated follow-up, so OAuth leasing is
-> entirely off until a daemon's toggle is flipped. End-to-end coverage:
-> `scripts/validate-vault.cjs` (vault custody, nine scenarios) and
-> `scripts/validate-credential-leases.cjs` (lease lifecycle, OAuth
-> materialization, UI fueling, `--owner` bootstrap). The access-control
-> counterpart (who may reach a daemon at all) is
+> Status: **shipped 2026-07-03, all six rollout steps.** The four sign-off
+> decisions were resolved as recommended: offline-lease default **24h**;
+> full-credential OAuth leases **built but off by default**; recovery
+> phrase **mandatory** at vault creation; scoping ships as the **single
+> default rule** with per-entry overrides deferred. One documented
+> deviation: v1 OAuth fueling is the full-credential opt-in only — the
+> access-token lease mode (browser-side token refresh) is a stated
+> follow-up, so OAuth leasing is entirely off until a daemon's toggle is
+> flipped. End-to-end coverage: `scripts/validate-vault.cjs` (vault
+> custody, nine scenarios), `scripts/validate-credential-leases.cjs`
+> (lease lifecycle, OAuth materialization, UI fueling, `--owner`
+> bootstrap), and `scripts/validate-client-egress.cjs` (browser-relayed
+> calls against a mock provider, custody + allowlist proofs). The
+> access-control counterpart (who may reach a daemon at all) is
 > [Trust Architecture](./trust-architecture.md); this chapter is about the
 > *other* secrets — the model-provider credentials a daemon spends.
 
@@ -197,6 +198,18 @@ the provider, and streams results back; the credential never leaves the
 browser. The mode advertises itself per-session so the UI can show which
 path is live.
 
+As shipped: a session holding `credentials.manage` registers as the
+relay per kind (`api_credential_egress_register`); the daemon ships each
+request auth-less (`egress_request` + 16 KiB chunks), the browser
+attaches the key from the unlocked vault, enforces a fixed per-provider
+host allowlist (a compromised daemon cannot turn the tab into an open
+proxy), performs the fetch, and streams the body back under a 1 MiB
+credit window with `egress_ack` refills. Response frames are bound to
+the registering session; relays die with their session; selection order
+is lease → `.env` → egress. The fueling panel carries the per-provider
+toggles, the live relay chips (the path indicator), and a Test-relay
+probe (`api_credential_egress_probe`).
+
 ## What this honestly buys (threat tiers)
 
 | Scenario | Today (`.env`) | With leases |
@@ -249,7 +262,9 @@ enforced by the daemon's own IAM from first boot.
    opt-in per daemon (OFF by default). Access-token mode: follow-up.
 4. ✅ Offline-lease knob, fueling panel (per-daemon status, revocation,
    usage audit fields), dry-daemon Web Push.
-5. Client-egress mode for Anthropic/Gemini; per-session path indicator.
+5. ✅ Client-egress mode for Anthropic/Gemini (host-allowlisted browser
+   relay, credit-windowed streaming, probe); per-session path indicator
+   in the fueling panel and lease status.
 6. ✅ `--owner` bootstrap flag + `scripts/install.sh`.
 
 ## Open questions for sign-off

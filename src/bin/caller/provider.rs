@@ -106,6 +106,94 @@ pub struct ChatResponse {
     pub raw_output: Option<Vec<serde_json::Value>>,
 }
 
+/// How a provider instance authenticates its requests: a real key
+/// (lease or environment) attached daemon-side, or the client-egress
+/// marker — a registered browser relay holds the credential, the daemon
+/// ships auth-less requests to it, and the browser attaches the key
+/// (credential custody, rollout step 5). `From<String>` keeps every
+/// existing key-shaped construction site source-compatible.
+#[derive(Debug, Clone)]
+pub enum ProviderAuth {
+    Key(String),
+    ClientEgress { kind: &'static str },
+}
+
+impl From<String> for ProviderAuth {
+    fn from(api_key: String) -> Self {
+        ProviderAuth::Key(api_key)
+    }
+}
+
+/// The credential a selector binds for a provider: a real key first
+/// (lease shadows env, as everywhere), else the egress marker when a
+/// browser relay is attached for the kind.
+fn provider_auth_for(env_name: &str, egress_kind: &'static str) -> Option<ProviderAuth> {
+    crate::credential_leases::provider_api_key(env_name)
+        .map(ProviderAuth::Key)
+        .or_else(|| {
+            crate::credential_egress::available(egress_kind)
+                .then_some(ProviderAuth::ClientEgress { kind: egress_kind })
+        })
+}
+
+/// A provider HTTP response from either path. Only the surface the
+/// provider parsers actually consume: status, text, JSON, chunk stream.
+enum ProviderHttpResponse {
+    Direct(reqwest::Response),
+    Egress(crate::credential_egress::EgressResponse),
+}
+
+impl ProviderHttpResponse {
+    fn status_success(&self) -> bool {
+        match self {
+            ProviderHttpResponse::Direct(response) => response.status().is_success(),
+            ProviderHttpResponse::Egress(response) => response.status_success(),
+        }
+    }
+
+    fn status_line(&self) -> String {
+        match self {
+            ProviderHttpResponse::Direct(response) => response.status().to_string(),
+            ProviderHttpResponse::Egress(response) => response.status.to_string(),
+        }
+    }
+
+    async fn body_text(self) -> String {
+        match self {
+            ProviderHttpResponse::Direct(response) => response.text().await.unwrap_or_default(),
+            ProviderHttpResponse::Egress(response) => {
+                response.body_text().await.unwrap_or_default()
+            }
+        }
+    }
+
+    async fn json<T: serde::de::DeserializeOwned>(self) -> Result<T, CallerError> {
+        match self {
+            ProviderHttpResponse::Direct(response) => Ok(response.json().await?),
+            ProviderHttpResponse::Egress(response) => {
+                let body = response
+                    .body_text()
+                    .await
+                    .map_err(CallerError::Provider)?;
+                serde_json::from_str(&body).map_err(CallerError::Json)
+            }
+        }
+    }
+
+    fn bytes_stream(
+        self,
+    ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Vec<u8>, String>> + Send>> {
+        match self {
+            ProviderHttpResponse::Direct(response) => Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|chunk| chunk.map(|bytes| bytes.to_vec()).map_err(|e| e.to_string())),
+            ),
+            ProviderHttpResponse::Egress(response) => Box::pin(response.bytes_stream()),
+        }
+    }
+}
+
 /// Events emitted during streaming responses.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
@@ -1195,7 +1283,8 @@ struct AnthropicUsage {
 
 pub struct AnthropicProvider {
     client: Client,
-    api_key: String,
+    auth: ProviderAuth,
+    endpoint: String,
     model: String,
     context_window: u64,
     max_output_tokens: u64,
@@ -1207,9 +1296,13 @@ pub struct AnthropicProvider {
     pub cu_display: Option<(u32, u32)>,
 }
 
+fn anthropic_endpoint() -> String {
+    env::var("ANTHROPIC_ENDPOINT").unwrap_or_else(|_| "https://api.anthropic.com".to_string())
+}
+
 impl AnthropicProvider {
     pub fn new(
-        api_key: String,
+        api_key: impl Into<ProviderAuth>,
         model: String,
         context_window: u64,
         max_output_tokens: u64,
@@ -1217,7 +1310,8 @@ impl AnthropicProvider {
         let use_tools = resolve_use_tools();
         Self {
             client: api_client(),
-            api_key,
+            auth: api_key.into(),
+            endpoint: anthropic_endpoint(),
             model,
             context_window,
             max_output_tokens,
@@ -1229,14 +1323,15 @@ impl AnthropicProvider {
     }
 
     pub fn new_plain(
-        api_key: String,
+        api_key: impl Into<ProviderAuth>,
         model: String,
         context_window: u64,
         max_output_tokens: u64,
     ) -> Self {
         Self {
             client: api_client(),
-            api_key,
+            auth: api_key.into(),
+            endpoint: anthropic_endpoint(),
             model,
             context_window,
             max_output_tokens,
@@ -1248,7 +1343,7 @@ impl AnthropicProvider {
     }
 
     pub fn new_with_tools(
-        api_key: String,
+        api_key: impl Into<ProviderAuth>,
         model: String,
         context_window: u64,
         max_output_tokens: u64,
@@ -1256,7 +1351,8 @@ impl AnthropicProvider {
     ) -> Self {
         Self {
             client: api_client(),
-            api_key,
+            auth: api_key.into(),
+            endpoint: anthropic_endpoint(),
             model,
             context_window,
             max_output_tokens,
@@ -1264,6 +1360,65 @@ impl AnthropicProvider {
             custom_tools: Some(tools),
             cu_enabled: false,
             cu_display: None,
+        }
+    }
+
+    /// A tool-less instance forced through the client-egress relay —
+    /// the probe path; normal selection converts availability into
+    /// `ProviderAuth::ClientEgress` instead.
+    pub fn new_client_egress(model: String, context_window: u64, max_output_tokens: u64) -> Self {
+        let mut provider = Self::new_plain(String::new(), model, context_window, max_output_tokens);
+        provider.auth = ProviderAuth::ClientEgress {
+            kind: crate::credential_egress::KIND_ANTHROPIC,
+        };
+        provider
+    }
+
+    /// Build the messages POST through whichever auth path this instance
+    /// carries. `headers` excludes credentials; the relay adds those.
+    async fn post_messages(
+        &self,
+        request_json: &serde_json::Value,
+        beta_header: &str,
+        streaming: bool,
+    ) -> Result<ProviderHttpResponse, CallerError> {
+        let url = format!("{}/v1/messages", self.endpoint);
+        match &self.auth {
+            ProviderAuth::Key(api_key) => {
+                let builder = || {
+                    let request = self
+                        .client
+                        .post(&url)
+                        .header("x-api-key", api_key)
+                        .header("anthropic-version", "2023-06-01")
+                        .header("anthropic-beta", beta_header)
+                        .header("content-type", "application/json")
+                        .json(request_json);
+                    if streaming {
+                        request.timeout(STREAM_TIMEOUT)
+                    } else {
+                        request
+                    }
+                };
+                let response = if streaming {
+                    builder().send().await?
+                } else {
+                    send_with_retry(&self.client, builder, MAX_RETRIES).await?
+                };
+                Ok(ProviderHttpResponse::Direct(response))
+            }
+            ProviderAuth::ClientEgress { kind } => {
+                let headers = vec![
+                    ("anthropic-version".to_string(), "2023-06-01".to_string()),
+                    ("anthropic-beta".to_string(), beta_header.to_string()),
+                    ("content-type".to_string(), "application/json".to_string()),
+                ];
+                let body = serde_json::to_vec(request_json).map_err(CallerError::Json)?;
+                crate::credential_egress::fetch(kind, "POST", &url, headers, body)
+                    .await
+                    .map(ProviderHttpResponse::Egress)
+                    .map_err(CallerError::Provider)
+            }
         }
     }
 }
@@ -1346,8 +1501,6 @@ impl ChatProvider for AnthropicProvider {
         };
 
         let request_json = serde_json::to_value(&request).map_err(CallerError::Json)?;
-        let client = &self.client;
-        let api_key = &self.api_key;
 
         let beta_header = if self.cu_enabled {
             "prompt-caching-2024-07-31,computer-use-2025-11-24"
@@ -1355,24 +1508,11 @@ impl ChatProvider for AnthropicProvider {
             "prompt-caching-2024-07-31"
         };
 
-        let response = send_with_retry(
-            client,
-            || {
-                client
-                    .post("https://api.anthropic.com/v1/messages")
-                    .header("x-api-key", api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .header("anthropic-beta", beta_header)
-                    .header("content-type", "application/json")
-                    .json(&request_json)
-            },
-            MAX_RETRIES,
-        )
-        .await?;
+        let response = self.post_messages(&request_json, beta_header, false).await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+        if !response.status_success() {
+            let status = response.status_line();
+            let body = response.body_text().await;
             return Err(CallerError::Provider(format!(
                 "{}: {}",
                 status,
@@ -1532,8 +1672,6 @@ impl ChatProvider for AnthropicProvider {
             stream: true,
         };
         let request_json = serde_json::to_value(&request).map_err(CallerError::Json)?;
-        let client = &self.client;
-        let api_key = &self.api_key;
 
         let beta_header = if self.cu_enabled {
             "prompt-caching-2024-07-31,computer-use-2025-11-24"
@@ -1541,20 +1679,11 @@ impl ChatProvider for AnthropicProvider {
             "prompt-caching-2024-07-31"
         };
 
-        let response = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", beta_header)
-            .header("content-type", "application/json")
-            .timeout(STREAM_TIMEOUT)
-            .json(&request_json)
-            .send()
-            .await?;
+        let response = self.post_messages(&request_json, beta_header, true).await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+        if !response.status_success() {
+            let status = response.status_line();
+            let body = response.body_text().await;
             return Err(CallerError::Provider(format!(
                 "{}: {}",
                 status,
@@ -1981,7 +2110,7 @@ fn build_anthropic_messages(messages: &[Message]) -> (serde_json::Value, Vec<Ant
 
 pub struct GeminiProvider {
     client: Client,
-    api_key: String,
+    auth: ProviderAuth,
     model: String,
     context_window: u64,
     max_output_tokens: u64,
@@ -1996,7 +2125,7 @@ pub struct GeminiProvider {
 
 impl GeminiProvider {
     pub fn new(
-        api_key: String,
+        api_key: impl Into<ProviderAuth>,
         model: String,
         context_window: u64,
         max_output_tokens: u64,
@@ -2006,7 +2135,7 @@ impl GeminiProvider {
             .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
         Self {
             client: api_client(),
-            api_key,
+            auth: api_key.into(),
             model,
             context_window,
             max_output_tokens,
@@ -2020,7 +2149,7 @@ impl GeminiProvider {
 
     /// Create a provider with native tool calling explicitly disabled.
     pub fn new_plain(
-        api_key: String,
+        api_key: impl Into<ProviderAuth>,
         model: String,
         context_window: u64,
         max_output_tokens: u64,
@@ -2029,7 +2158,7 @@ impl GeminiProvider {
             .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
         Self {
             client: api_client(),
-            api_key,
+            auth: api_key.into(),
             model,
             context_window,
             max_output_tokens,
@@ -2042,7 +2171,7 @@ impl GeminiProvider {
     }
 
     pub fn new_with_tools(
-        api_key: String,
+        api_key: impl Into<ProviderAuth>,
         model: String,
         context_window: u64,
         max_output_tokens: u64,
@@ -2052,7 +2181,7 @@ impl GeminiProvider {
             .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
         Self {
             client: api_client(),
-            api_key,
+            auth: api_key.into(),
             model,
             context_window,
             max_output_tokens,
@@ -2061,6 +2190,59 @@ impl GeminiProvider {
             endpoint,
             cu_enabled: false,
             cu_display: None,
+        }
+    }
+
+    /// A tool-less instance forced through the client-egress relay —
+    /// the probe path; normal selection converts availability into
+    /// `ProviderAuth::ClientEgress` instead.
+    pub fn new_client_egress(model: String, context_window: u64, max_output_tokens: u64) -> Self {
+        let mut provider = Self::new_plain(String::new(), model, context_window, max_output_tokens);
+        provider.auth = ProviderAuth::ClientEgress {
+            kind: crate::credential_egress::KIND_GEMINI,
+        };
+        provider
+    }
+
+    /// POST a generateContent-family request through whichever auth path
+    /// this instance carries. Auth never rides an egress request — the
+    /// relay attaches `x-goog-api-key` from the vault.
+    async fn post_generate(
+        &self,
+        url: &str,
+        request_body: &serde_json::Value,
+        streaming: bool,
+    ) -> Result<ProviderHttpResponse, CallerError> {
+        match &self.auth {
+            ProviderAuth::Key(api_key) => {
+                let builder = || {
+                    let request = self
+                        .client
+                        .post(url)
+                        .header("content-type", "application/json")
+                        .header("x-goog-api-key", api_key)
+                        .json(request_body);
+                    if streaming {
+                        request.timeout(STREAM_TIMEOUT)
+                    } else {
+                        request
+                    }
+                };
+                let response = if streaming {
+                    builder().send().await?
+                } else {
+                    send_with_retry(&self.client, builder, MAX_RETRIES).await?
+                };
+                Ok(ProviderHttpResponse::Direct(response))
+            }
+            ProviderAuth::ClientEgress { kind } => {
+                let headers = vec![("content-type".to_string(), "application/json".to_string())];
+                let body = serde_json::to_vec(request_body).map_err(CallerError::Json)?;
+                crate::credential_egress::fetch(kind, "POST", url, headers, body)
+                    .await
+                    .map(ProviderHttpResponse::Egress)
+                    .map_err(CallerError::Provider)
+            }
         }
     }
 }
@@ -2112,24 +2294,11 @@ impl ChatProvider for GeminiProvider {
             self.endpoint, self.model
         );
 
-        let client = &self.client;
-        let api_key = &self.api_key;
-        let response = send_with_retry(
-            client,
-            || {
-                client
-                    .post(&url)
-                    .header("content-type", "application/json")
-                    .header("x-goog-api-key", api_key)
-                    .json(&request_body)
-            },
-            MAX_RETRIES,
-        )
-        .await?;
+        let response = self.post_generate(&url, &request_body, false).await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+        if !response.status_success() {
+            let status = response.status_line();
+            let body = response.body_text().await;
             return Err(CallerError::Provider(format!(
                 "{}: {}",
                 status,
@@ -2294,20 +2463,11 @@ impl ChatProvider for GeminiProvider {
             self.endpoint, self.model
         );
 
-        let client = &self.client;
-        let api_key = &self.api_key;
-        let response = client
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("x-goog-api-key", api_key)
-            .timeout(STREAM_TIMEOUT)
-            .json(&request_body)
-            .send()
-            .await?;
+        let response = self.post_generate(&url, &request_body, true).await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+        if !response.status_success() {
+            let status = response.status_line();
+            let body = response.body_text().await;
             return Err(CallerError::Provider(format!(
                 "{}: {}",
                 status,
@@ -2864,8 +3024,9 @@ pub(crate) fn mask_api_keys(s: &str) -> String {
 
 pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
     let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
-    let anthropic_key = crate::credential_leases::provider_api_key("ANTHROPIC_API_KEY");
-    let gemini_key = crate::credential_leases::provider_api_key("GEMINI_API_KEY");
+    let anthropic_key =
+        provider_auth_for("ANTHROPIC_API_KEY", crate::credential_egress::KIND_ANTHROPIC);
+    let gemini_key = provider_auth_for("GEMINI_API_KEY", crate::credential_egress::KIND_GEMINI);
 
     let preferred = env::var("PROVIDER").ok();
 
@@ -2955,8 +3116,9 @@ pub fn select_provider_with_overrides(
         .or_else(|| env::var("PRESENCE_MODEL").ok());
 
     let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
-    let anthropic_key = crate::credential_leases::provider_api_key("ANTHROPIC_API_KEY");
-    let gemini_key = crate::credential_leases::provider_api_key("GEMINI_API_KEY");
+    let anthropic_key =
+        provider_auth_for("ANTHROPIC_API_KEY", crate::credential_egress::KIND_ANTHROPIC);
+    let gemini_key = provider_auth_for("GEMINI_API_KEY", crate::credential_egress::KIND_GEMINI);
 
     match provider_str.as_deref() {
         Some("gemini") => {
@@ -3018,8 +3180,9 @@ pub fn select_cu_provider(
         .or_else(|| env::var("CU_MODEL").ok());
 
     let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
-    let anthropic_key = crate::credential_leases::provider_api_key("ANTHROPIC_API_KEY");
-    let gemini_key = crate::credential_leases::provider_api_key("GEMINI_API_KEY");
+    let anthropic_key =
+        provider_auth_for("ANTHROPIC_API_KEY", crate::credential_egress::KIND_ANTHROPIC);
+    let gemini_key = provider_auth_for("GEMINI_API_KEY", crate::credential_egress::KIND_GEMINI);
 
     // CU providers get native CU tools + escalation function tool
     let escalate_tools = vec![crate::tools::escalate_to_agent_tool()];
@@ -3133,8 +3296,9 @@ pub fn select_presence_provider(
         .or_else(|| env::var("PRESENCE_MODEL").ok());
 
     let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
-    let anthropic_key = crate::credential_leases::provider_api_key("ANTHROPIC_API_KEY");
-    let gemini_key = crate::credential_leases::provider_api_key("GEMINI_API_KEY");
+    let anthropic_key =
+        provider_auth_for("ANTHROPIC_API_KEY", crate::credential_egress::KIND_ANTHROPIC);
+    let gemini_key = provider_auth_for("GEMINI_API_KEY", crate::credential_egress::KIND_GEMINI);
 
     let tools = presence::presence_tools();
 

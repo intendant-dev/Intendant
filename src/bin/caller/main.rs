@@ -17,6 +17,7 @@ mod context_rewind;
 mod control;
 mod control_plane;
 mod conversation;
+mod credential_egress;
 mod credential_leases;
 mod ctl;
 mod daemon_identity;
