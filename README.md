@@ -1,10 +1,32 @@
 <p align="center">
-  <img src="static/icon-128.png" width="96" alt="Intendant" />
+  <img src="static/logo-glyph.svg" width="120" alt="Intendant" />
 </p>
 
-# Intendant
+<h1 align="center">Intendant</h1>
+
+<p align="center">
+  Give an AI agent a full machine — under your oversight.
+</p>
+
+<p align="center">
+  <a href="https://intendant.dev"><b>intendant.dev</b></a> ·
+  <a href="https://lovon-spec.github.io/Intendant/">Docs</a> ·
+  <a href="https://intendant.dev/trust">How trust works</a>
+</p>
 
 An autonomous AI agent operating environment written in Rust. Intendant gives AI agents a full desktop to work in — shell access, file editing, a graphical display they can see and control via computer use, voice interaction, and the ability to make phone calls — all wrapped in a layered human oversight system. It can also supervise external coding agents (Codex, Gemini CLI, Claude Code) as managed backends and federate with peer machines. Provider-agnostic (OpenAI, Anthropic, Gemini), cross-platform (macOS, Linux, Windows), accessible through CLI, TUI, web dashboard, MCP, or voice.
+
+<p align="center">
+  <img src="src/bin/connect/assets/landing-hero.webp" alt="The Intendant dashboard's Activity feed: an agent diagnoses a failing job with an auto-approved command, proposes a diff, waits for an approval-gated run, and reports the verified result." />
+</p>
+
+Stand up an owned, keyless daemon on a fresh box with one command (registration on the hosted rendezvous is invite-only during the pre-alpha; self-hosting is never gated):
+
+```bash
+curl -fsSL https://intendant.dev/install.sh | sh -s -- --owner <your-key>
+```
+
+Root authority pins to your browser's passkey from first boot, you claim the daemon with a twelve-word phrase, and it borrows time-boxed credential leases from your end-to-end-encrypted vault — or relays provider calls through your browser and never holds a key at all.
 
 ## Architecture
 
