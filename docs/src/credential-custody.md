@@ -1,10 +1,17 @@
 # Credential Custody: the Vault and Leases
 
-> Status: **signed off 2026-07-02, build in progress.** The four open
-> decisions at the end were resolved as recommended: offline-lease default
-> **24h**; full-credential OAuth leases **built but off by default**;
-> recovery phrase **mandatory** at vault creation; scoping ships as the
-> **single default rule** with per-entry overrides deferred. The access-control
+> Status: **shipped 2026-07-03** (rollout steps 1–4 and 6; client egress —
+> step 5 — is the one remaining step). The four sign-off decisions were
+> resolved as recommended: offline-lease default **24h**; full-credential
+> OAuth leases **built but off by default**; recovery phrase **mandatory**
+> at vault creation; scoping ships as the **single default rule** with
+> per-entry overrides deferred. One documented deviation: v1 OAuth fueling
+> is the full-credential opt-in only — the access-token lease mode
+> (browser-side token refresh) is a stated follow-up, so OAuth leasing is
+> entirely off until a daemon's toggle is flipped. End-to-end coverage:
+> `scripts/validate-vault.cjs` (vault custody, nine scenarios) and
+> `scripts/validate-credential-leases.cjs` (lease lifecycle, OAuth
+> materialization, UI fueling, `--owner` bootstrap). The access-control
 > counterpart (who may reach a daemon at all) is
 > [Trust Architecture](./trust-architecture.md); this chapter is about the
 > *other* secrets — the model-provider credentials a daemon spends.
@@ -131,17 +138,20 @@ lane) telling the user which daemon went dry.
 suited to leasing than raw keys, because the protocol already separates
 durable from ephemeral authority:
 
-- **Access-token lease (default):** the browser keeps the **refresh
-  token** in the vault and never leases it. It performs token refresh
-  itself and leases only short-lived **access tokens** over the tunnel.
-  The daemon's maximum authority horizon is the provider's own access
-  TTL (typically ≤1h) past the offline-lease window, no matter what an
-  attacker does.
-- **Full-credential lease (opt-in per daemon):** for long unattended
-  autonomy, the refresh token itself is leased with a TTL we enforce.
-  Honest note in the UI: during that window the daemon holds durable
-  authority; revocation then depends on our lease discipline (and, worst
-  case, the provider's session-revocation page).
+- **Access-token lease (the intended default; not yet built):** the
+  browser keeps the **refresh token** in the vault and never leases it.
+  It performs token refresh itself and leases only short-lived **access
+  tokens** over the tunnel. The daemon's maximum authority horizon is
+  the provider's own access TTL (typically ≤1h) past the offline-lease
+  window, no matter what an attacker does. This mode needs per-provider
+  OAuth token plumbing in the browser and is the follow-up milestone;
+  until it lands, OAuth fueling is entirely off by default.
+- **Full-credential lease (opt-in per daemon — what v1 ships):** for
+  long unattended autonomy, the pasted auth-file JSON (refresh token
+  included) is leased with a TTL we enforce. Honest note in the UI:
+  during that window the daemon holds durable authority; revocation then
+  depends on our lease discipline (and, worst case, the provider's
+  session-revocation page).
 
 **External-agent materialization (a documented weakening).** Codex and
 Claude Code are child processes that read credentials from files, not
@@ -227,19 +237,20 @@ enforced by the daemon's own IAM from first boot.
 
 ## Rollout
 
-1. Vault v1: format, envelopes (PRF + recovery phrase), blind signed
-   sync with revision counter, Advanced-drawer UI (enroll, view entries,
-   recovery-phrase ceremony). Voice keys migrate in.
-2. Lease frames + controller-side memory custody + `credentials.manage`
-   gate + provider plumbing for the three native API keys. `.env`
-   fallback and "unfueled" state.
-3. OAuth leases: access-token mode for Codex and Claude Code
-   (browser-side refresh), session-scoped materialization with cleanup;
-   full-credential opt-in.
-4. Offline-lease knob, lease UI (per-daemon status, revocation, audit),
-   dry-daemon push notification.
+1. ✅ Vault v1: format, envelopes (PRF + recovery phrase), blind sync
+   with revision counter + rollback high-water mark, Advanced-drawer UI
+   (create ceremony, unlock, enroll, entries). Voice keys migrate in.
+2. ✅ Lease RPCs + controller-side memory custody + `credentials.manage`
+   gate (operator holds it; peer lane excluded) + lease-first provider
+   plumbing. `.env` fallback untouched; distinct "unfueled" error.
+3. ✅ OAuth materialization for Codex (`CODEX_HOME`) and Claude Code
+   (`CLAUDE_CONFIG_DIR`): private 0700/0600 files, deleted on expiry,
+   revocation, shutdown, and a startup recovery sweep; full-credential
+   opt-in per daemon (OFF by default). Access-token mode: follow-up.
+4. ✅ Offline-lease knob, fueling panel (per-daemon status, revocation,
+   usage audit fields), dry-daemon Web Push.
 5. Client-egress mode for Anthropic/Gemini; per-session path indicator.
-6. `install.sh --owner` bootstrap.
+6. ✅ `--owner` bootstrap flag + `scripts/install.sh`.
 
 ## Open questions for sign-off
 
