@@ -10742,6 +10742,48 @@ mod tests {
     }
 
     #[test]
+    fn credential_lease_methods_sit_behind_credentials_manage() {
+        use crate::peer::access_policy::PeerOperation;
+        for method in [
+            "api_credential_lease_grant",
+            "api_credential_lease_renew",
+            "api_credential_lease_revoke",
+            "api_credential_lease_status",
+        ] {
+            assert_eq!(
+                dashboard_control_method_operation(method),
+                Some(PeerOperation::CredentialsManage),
+                "{method} must ride the credentials.manage gate"
+            );
+        }
+
+        // A scoped guest session (role:scoped-human) can neither fuel nor
+        // inspect fueling; the trusted-local and operator lanes can.
+        let mut rt = runtime();
+        rt.grant = scoped_user_client_grant();
+        assert!(authorize_dashboard_control_method(
+            &rt,
+            "api_credential_lease_status",
+            None
+        )
+        .is_err());
+        assert!(authorize_dashboard_control_method(
+            &rt,
+            "api_credential_lease_grant",
+            None
+        )
+        .is_err());
+
+        rt.grant = DashboardControlGrant::TrustedLocal;
+        assert!(authorize_dashboard_control_method(
+            &rt,
+            "api_credential_lease_grant",
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn user_client_root_grant_reports_identity_without_scoping_permissions() {
         let mut rt = runtime();
         rt.grant = DashboardControlGrant::UserClientRoot {
