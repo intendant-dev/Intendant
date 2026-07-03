@@ -2825,6 +2825,7 @@ fn control_frame_response(
                 | "api_peer_pairing_request_decision"
                 | "api_peer_pairing_identities"
                 | "api_peer_pairing_identity_revoke"
+                | "api_credential_egress_probe"
                 | "api_coordinator_route" => {
                     spawn_control_request(
                         id,
