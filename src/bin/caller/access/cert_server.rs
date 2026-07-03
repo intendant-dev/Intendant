@@ -204,7 +204,7 @@ async fn accept_loop(
     gate: Arc<EnrollmentGate>,
 ) {
     loop {
-        let (stream, _peer) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -217,9 +217,12 @@ async fn accept_loop(
         tokio::spawn(async move {
             let stream = match acceptor.accept(stream).await {
                 Ok(stream) => stream,
-                Err(_) => return,
+                Err(err) => {
+                    eprintln!("[access/cert-server] TLS accept from {peer} failed: {err}");
+                    return;
+                }
             };
-            let _ = handle_conn(
+            if let Err(err) = handle_conn(
                 stream,
                 &cert_dir,
                 &p12_password,
@@ -228,7 +231,10 @@ async fn accept_loop(
                 https_port,
                 gate,
             )
-            .await;
+            .await
+            {
+                eprintln!("[access/cert-server] connection from {peer} failed: {err}");
+            }
         });
     }
 }

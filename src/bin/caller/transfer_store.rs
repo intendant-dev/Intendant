@@ -305,7 +305,18 @@ pub fn create_download_job_from_path(
         error: None,
         conflict_policy: TransferConflictPolicy::Fail,
     };
-    save_job(project_root, &job)?;
+    if let Err(err) = save_job(project_root, &job) {
+        if let Some(temp_path) = &job.temp_path {
+            if let Err(cleanup_err) = fs::remove_file(temp_path) {
+                eprintln!(
+                    "[transfer-store] failed to remove upload partial {} after metadata save failed: {}",
+                    temp_path.display(),
+                    cleanup_err
+                );
+            }
+        }
+        return Err(err);
+    }
     Ok(job)
 }
 

@@ -371,7 +371,7 @@ impl MediaFoundationEncoder {
         //      no effect (and leaves the encoder in its buffering default,
         //      which never emits under a per-frame ProcessInput/Output loop).
         //   2. Output media type before input media type.
-        Self::configure_codec_api(&transform);
+        Self::configure_codec_api(&transform)?;
         Self::configure_output_type(&transform, width, height, bitrate_kbps)?;
         Self::configure_input_type(&transform, width, height)?;
 
@@ -501,24 +501,22 @@ impl MediaFoundationEncoder {
     /// encoder is silent. We set it (and the older `AVEncCommonLowLatency`
     /// alias) before rate control because some MFT builds key other defaults
     /// off the latency mode.
-    fn configure_codec_api(transform: &IMFTransform) {
-        let Ok(codec_api) = transform.cast::<ICodecAPI>() else {
-            eprintln!(
-                "[display/h264_windows] WARN: MFT did not expose ICodecAPI — \
-                 cannot enable low-latency mode; encoder may buffer/stall"
-            );
-            return;
-        };
+    fn configure_codec_api(transform: &IMFTransform) -> Result<(), String> {
+        let codec_api = transform.cast::<ICodecAPI>().map_err(|e| {
+            format!("Media Foundation H264: MFT did not expose ICodecAPI for low-latency mode: {e}")
+        })?;
         // SAFETY: `codec_api` is a live `ICodecAPI` view of the MFT. Each
         // `SetValue` reads a CODECAPI GUID key and a `&VARIANT` we build inline
-        // (valid for the call); all are on the encoder thread. Failures are
-        // ignored by design (some keys are E_NOTIMPL on this MFT).
+        // (valid for the call); all are on the encoder thread. Low-latency mode
+        // is required; the other keys are optional and may be E_NOTIMPL.
         unsafe {
             // Low-latency mode — required for per-frame output (see doc above).
             // `AVLowLatencyMode` is the one the MS H.264 encoder honors;
             // `AVEncCommonLowLatency` is a legacy alias that returns
             // E_NOTIMPL on this encoder (harmless — ignored).
-            let _ = codec_api.SetValue(&CODECAPI_AVLowLatencyMode, &variant_bool(true));
+            codec_api
+                .SetValue(&CODECAPI_AVLowLatencyMode, &variant_bool(true))
+                .map_err(|e| format!("Media Foundation H264: set AVLowLatencyMode failed: {e}"))?;
             let _ = codec_api.SetValue(&CODECAPI_AVEncCommonLowLatency, &variant_bool(true));
             // CBR rate control (matches the low-latency screen-share intent;
             // VideoToolbox uses average_bitrate, libx264 uses -b:v).
@@ -530,6 +528,7 @@ impl MediaFoundationEncoder {
             // the per-frame force-keyframe path.
             let _ = codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &variant_u32(GOP_SIZE));
         }
+        Ok(())
     }
 
     /// Wrap the NV12 scratch buffer into an `IMFSample` with one memory buffer.

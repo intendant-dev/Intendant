@@ -312,8 +312,9 @@ fn record_terminal_status(
     let Some(route) = branch_route(session_id) else {
         return;
     };
-    record_branch_observation(&route, session_id, status, summary);
-    state.terminal_branches.insert(session_id.to_string());
+    if record_branch_observation(&route, session_id, status, summary) {
+        state.terminal_branches.insert(session_id.to_string());
+    }
 }
 
 /// `SessionEnded` mapping: a generic teardown must not downgrade a branch
@@ -354,8 +355,9 @@ fn record_session_ended(state: &mut LifecycleWatcherState, session_id: &str, rea
     } else {
         None
     };
-    record_branch_observation(&route, session_id, status, summary);
-    state.terminal_branches.insert(session_id.to_string());
+    if record_branch_observation(&route, session_id, status, summary) {
+        state.terminal_branches.insert(session_id.to_string());
+    }
 }
 
 /// True for `SessionEnded` reasons that describe a failure rather than a
@@ -376,13 +378,11 @@ fn record_branch_observation(
     branch_session_id: &str,
     status: &str,
     summary: Option<String>,
-) {
+) -> bool {
     let Ok(Some((group, _detached))) = read_group(&route.log_dir, &route.group_id) else {
-        return;
+        return true;
     };
-    // Best-effort: the watcher must never crash the daemon over a transient
-    // ledger I/O failure; the next lifecycle event retries naturally.
-    let _ = fission_ledger::record_fission_observation(
+    match fission_ledger::record_fission_observation(
         &route.log_dir,
         fission_ledger::FissionObservation {
             parent_session_id: group.parent_session_id.clone(),
@@ -398,7 +398,16 @@ fn record_branch_observation(
                 summary,
             }],
         },
-    );
+    ) {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!(
+                "[fission-lifecycle] failed to record terminal observation for branch {}: {}",
+                branch_session_id, err
+            );
+            false
+        }
+    }
 }
 
 /// Accumulate a project `FileChanged` path into the work metadata of every

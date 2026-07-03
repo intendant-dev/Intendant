@@ -108,7 +108,13 @@ impl WasmCrate {
         // it up front and pass an absolute path: a relative CARGO_TARGET_DIR
         // would resolve against the wasm crate dir, not the repo root.
         let wasm_target = Path::new("target/wasm-build");
-        let _ = std::fs::create_dir_all(wasm_target);
+        if let Err(err) = std::fs::create_dir_all(wasm_target) {
+            println!(
+                "cargo:warning=failed to create WASM target dir {}: {}",
+                wasm_target.display(),
+                err
+            );
+        }
         let wasm_target_abs = std::fs::canonicalize(wasm_target).unwrap_or_else(|_| {
             std::env::current_dir()
                 .map(|d| d.join(wasm_target))
@@ -177,10 +183,15 @@ impl WasmCrate {
 
         let mut hasher = DefaultHasher::new();
         for path in [self.wasm_bin(), self.js_glue()] {
-            if let Ok(mut f) = std::fs::File::open(path) {
+            if let Ok(mut f) = std::fs::File::open(&path) {
                 let mut buf = Vec::new();
-                let _ = f.read_to_end(&mut buf);
-                buf.hash(&mut hasher);
+                match f.read_to_end(&mut buf) {
+                    Ok(_) => buf.hash(&mut hasher),
+                    Err(err) => println!(
+                        "cargo:warning=failed to read WASM artifact {} for hashing: {}",
+                        path, err
+                    ),
+                }
             }
         }
         let hash = format!("{:016x}", hasher.finish());
@@ -189,7 +200,13 @@ impl WasmCrate {
         // Only write if changed, to avoid unnecessary rebuilds
         let existing = std::fs::read_to_string(&hash_path).unwrap_or_default();
         if existing.trim() != hash {
-            let _ = std::fs::write(&hash_path, &hash);
+            if let Err(err) = std::fs::write(&hash_path, &hash) {
+                println!(
+                    "cargo:warning=failed to write WASM artifact hash {}: {}",
+                    hash_path.display(),
+                    err
+                );
+            }
         }
     }
 }

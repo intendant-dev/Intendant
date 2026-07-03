@@ -2240,7 +2240,9 @@ async fn presence_alert_monitor(state: Arc<AppState>) {
             store
                 .push_subscriptions
                 .retain(|record| !dead.contains(&record.endpoint));
-            let _ = persist_locked(&state, &store);
+            if let Err(err) = persist_locked(&state, &store) {
+                eprintln!("[push] failed to persist pruned subscriptions: {err:?}");
+            }
         }
     }
 }
@@ -2309,7 +2311,9 @@ async fn handle_reclaim_monitor(state: Arc<AppState>) {
             );
             eprintln!("[reclaim] freed dormant handle {freed} (account renamed to {renamed_to})");
         }
-        let _ = persist_locked(&state, &store);
+        if let Err(err) = persist_locked(&state, &store) {
+            eprintln!("[reclaim] failed to persist dormant-handle reclamation: {err:?}");
+        }
     }
 }
 

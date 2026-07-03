@@ -240,6 +240,38 @@ pub(crate) fn ensure_project_uploads_ignored(project_root: &Path) -> io::Result<
     append_intendant_ignore_rule(&project_gitignore)
 }
 
+fn persist_upload_tempfile(temp_file: tempfile::NamedTempFile, dest_path: &Path) -> io::Result<()> {
+    match temp_file.persist(dest_path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.error.kind() == io::ErrorKind::CrossesDevices => {
+            copy_upload_tempfile_across_filesystems(err.file, dest_path)
+        }
+        Err(err) => Err(err.error),
+    }
+}
+
+fn copy_upload_tempfile_across_filesystems(
+    temp_file: tempfile::NamedTempFile,
+    dest_path: &Path,
+) -> io::Result<()> {
+    let dest_dir = dest_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "upload destination has no parent",
+        )
+    })?;
+    let mut source = temp_file.reopen()?;
+    let mut dest_temp = tempfile::Builder::new()
+        .prefix(".intendant-upload-")
+        .suffix(".tmp")
+        .tempfile_in(dest_dir)?;
+    io::copy(&mut source, &mut dest_temp)?;
+    dest_temp.flush()?;
+    dest_temp.as_file_mut().sync_all()?;
+    dest_temp.persist(dest_path).map_err(|err| err.error)?;
+    Ok(())
+}
+
 /// Commit a pending temp file into the upload store as a new descriptor.
 ///
 /// The caller is responsible for having streamed the bytes into a tempfile
@@ -275,9 +307,7 @@ pub fn commit_upload(
     // Prefer rename (atomic on the same filesystem); fall back to copy if
     // the tempdir lives elsewhere (common on Linux when TMPDIR is tmpfs
     // and the session dir is on a regular disk).
-    temp_file
-        .persist(&dest_path)
-        .map_err(|e| CallerError::Io(e.error))?;
+    persist_upload_tempfile(temp_file, &dest_path)?;
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -301,8 +331,16 @@ pub fn commit_upload(
     let sidecar = descriptor
         .path
         .with_extension(descriptor_extension(&descriptor.path));
-    if let Ok(json) = serde_json::to_string_pretty(&descriptor) {
-        let _ = fs::write(&sidecar, json);
+    let json = serde_json::to_vec_pretty(&descriptor)?;
+    if let Err(err) = crate::file_watcher::atomic_write(&sidecar, &json) {
+        if let Err(cleanup_err) = fs::remove_file(&descriptor.path) {
+            eprintln!(
+                "[upload-store] failed to remove upload blob {} after sidecar write failed: {}",
+                descriptor.path.display(),
+                cleanup_err
+            );
+        }
+        return Err(CallerError::Io(err));
     }
 
     Ok(descriptor)
