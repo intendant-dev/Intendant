@@ -21,6 +21,52 @@ pub(crate) fn seatbelt_path_literal(path: &Path) -> Result<String, String> {
     ))
 }
 
+/// Seatbelt deny rules for the user-secret directories the runtime's
+/// `validate_path` denylist protects (`~/.ssh`, `~/.gnupg`). The denylist
+/// only guards structured tool arguments (editFile/inspectPath) — command
+/// strings run by executeCommand bypass it entirely, and no string
+/// inspection can close that honestly. This clause closes it at the OS
+/// level: appended LAST to a profile it wins over every allow
+/// (last-match-wins), so secrets stay denied even when a write path or
+/// `(allow default)` would otherwise cover them. `/proc`, `/sys`, and
+/// `/etc/shadow` from the denylist are Linux paths with no macOS
+/// counterpart, and `/dev` cannot be blanket-denied (every process needs
+/// its tty and /dev/null). Returns an empty clause when there is no
+/// resolvable home directory — nothing exists to protect.
+///
+/// Linux has no equivalent: Landlock is allowlist-only and cannot
+/// subtract read access from a granted tree, so there the denylist on
+/// structured tools plus the write sandbox remain the whole story (see
+/// docs/src/architecture.md).
+#[cfg(target_os = "macos")]
+pub(crate) fn seatbelt_sensitive_deny_clause() -> Result<String, String> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(String::new());
+    };
+    let home = std::fs::canonicalize(&home).unwrap_or(home);
+    let literals = [home.join(".ssh"), home.join(".gnupg")]
+        .iter()
+        .map(|path| seatbelt_path_literal(path).map(|literal| format!("(subpath {literal})")))
+        .collect::<Result<Vec<_>, _>>()?
+        .join(" ");
+    Ok(format!("(deny file-read* file-write* {literals})\n"))
+}
+
+/// The always-on macOS profile for the agent runtime when no write
+/// sandbox is configured: everything allowed except the user-secret
+/// directories. This is the executeCommand twin of `validate_path` —
+/// policy the structured tools already enforce, extended to the whole
+/// process tree.
+#[cfg(target_os = "macos")]
+pub(crate) fn seatbelt_sensitive_only_profile() -> Result<String, String> {
+    Ok(format!(
+        "(version 1)\n\
+         (allow default)\n\
+         {}",
+        seatbelt_sensitive_deny_clause()?
+    ))
+}
+
 /// Configuration for Landlock filesystem sandboxing.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -105,7 +151,9 @@ impl SandboxConfig {
             "(version 1)\n\
              (allow default)\n\
              (deny file-write*)\n\
-             (allow file-write* {subpaths})\n"
+             (allow file-write* {subpaths})\n\
+             {sensitive}",
+            sensitive = seatbelt_sensitive_deny_clause()?,
         ))
     }
 
@@ -248,6 +296,68 @@ mod tests {
         assert!(stdout.contains("WRITE_OUT_DENIED"), "{stdout}");
         assert!(stdout.contains("READ_OK"), "{stdout}");
         assert!(!outside.join("probe.txt").exists());
+    }
+
+    /// The always-on macOS runtime profile: user-secret directories are
+    /// denied to the whole process tree — including plain shell commands,
+    /// the executeCommand lane validate_path never sees — while normal
+    /// reads and writes stay open. Probed through the real kernel.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_sensitive_only_profile_blocks_secret_dirs_for_exec() {
+        let home = dirs::home_dir().expect("home dir");
+        if !home.join(".ssh").exists() {
+            eprintln!("skipping: no ~/.ssh on this machine");
+            return;
+        }
+        let profile = seatbelt_sensitive_only_profile().unwrap();
+        assert!(profile.contains("(allow default)"));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = format!(
+            "ls {ssh} 2>/dev/null && echo SSH_LISTED || echo SSH_DENIED; \
+             echo w > {tmp}/w.txt && echo WRITE_OK; \
+             head -c 1 /etc/hosts > /dev/null && echo READ_OK",
+            ssh = home.join(".ssh").display(),
+            tmp = tmp.path().display(),
+        );
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("sandbox-exec runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("SSH_DENIED"), "{stdout} / {profile}");
+        assert!(stdout.contains("WRITE_OK"), "{stdout}");
+        assert!(stdout.contains("READ_OK"), "{stdout}");
+    }
+
+    /// The write-only profile carries the sensitive clause appended last,
+    /// so ~/.ssh stays denied even when a configured write path (e.g. a
+    /// project rooted at $HOME) would otherwise cover it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_write_only_profile_keeps_secrets_denied_inside_write_paths() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let config = SandboxConfig {
+            read_paths: vec![PathBuf::from("/")],
+            write_paths: vec![home.clone()],
+            enabled: true,
+        };
+        let profile = config.seatbelt_write_only_profile().unwrap();
+        let canonical_home = std::fs::canonicalize(&home).unwrap_or(home);
+        let deny_line = profile
+            .lines()
+            .find(|line| line.starts_with("(deny file-read* file-write*"))
+            .expect("sensitive deny clause present");
+        assert!(deny_line.contains(&format!("{}/.ssh", canonical_home.display())));
+        // Appended last: the deny clause is the final rule, after the
+        // write-path allow that covers $HOME.
+        assert_eq!(profile.trim_end().lines().last().unwrap(), deny_line);
     }
 
     #[test]

@@ -353,10 +353,15 @@ fn seatbelt_profile(
          (allow file-read-metadata)\n\
          (allow file-map-executable {exec})\n\
          (allow file-read* {read})\n\
-         (allow file-write* {write})\n",
+         (allow file-write* {write})\n\
+         {sensitive}",
         exec = subpaths(&exec_paths),
         read = subpaths(&read_paths),
         write = subpaths(&write_paths),
+        // Deny-default already excludes user secrets, but a scope rooted
+        // at $HOME would cover ~/.ssh — this keeps secret directories
+        // denied even then (appended last = wins over the root's allow).
+        sensitive = crate::sandbox::seatbelt_sensitive_deny_clause()?,
     ))
 }
 

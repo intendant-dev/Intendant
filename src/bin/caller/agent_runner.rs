@@ -78,21 +78,25 @@ async fn run_agent_inner(
 
     // macOS parity with the Linux Landlock posture: the runtime child is
     // wrapped in sandbox-exec with a write-restricting Seatbelt profile
-    // (reads stay open, writes confined to the configured paths). Linux
-    // applies the equivalent inside the runtime itself via the env var
-    // below; a profile that fails to generate fails the spawn rather than
-    // silently running unconfined.
+    // (reads stay open, writes confined to the configured paths). With no
+    // write sandbox configured the child is still wrapped in the
+    // sensitive-only profile — user-secret directories (~/.ssh, ~/.gnupg)
+    // are denied at the OS level, closing the executeCommand bypass of the
+    // runtime's validate_path denylist (which only sees structured tool
+    // arguments). Linux applies its write restriction inside the runtime
+    // via the env var below; Landlock cannot subtract read access, so the
+    // secret-directory guard has no Linux equivalent. A profile that fails
+    // to generate fails the spawn rather than silently running unconfined.
     #[cfg(target_os = "macos")]
-    let mut cmd = match sandbox.filter(|sandbox| sandbox.enabled) {
-        Some(sandbox) => {
-            let profile = sandbox
-                .seatbelt_write_only_profile()
-                .map_err(|e| CallerError::Agent(format!("sandbox profile: {e}")))?;
-            let mut cmd = Command::new("/usr/bin/sandbox-exec");
-            cmd.arg("-p").arg(profile).arg(&agent_path);
-            cmd
+    let mut cmd = {
+        let profile = match sandbox.filter(|sandbox| sandbox.enabled) {
+            Some(sandbox) => sandbox.seatbelt_write_only_profile(),
+            None => crate::sandbox::seatbelt_sensitive_only_profile(),
         }
-        None => Command::new(&agent_path),
+        .map_err(|e| CallerError::Agent(format!("sandbox profile: {e}")))?;
+        let mut cmd = Command::new("/usr/bin/sandbox-exec");
+        cmd.arg("-p").arg(profile).arg(&agent_path);
+        cmd
     };
     #[cfg(not(target_os = "macos"))]
     let mut cmd = Command::new(&agent_path);

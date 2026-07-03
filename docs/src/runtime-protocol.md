@@ -136,6 +136,20 @@ which blocks `..` traversal and a fixed set of sensitive locations
 (`/etc/shadow`, `/etc/gshadow`, `/proc`, `/sys`, `/dev`, and any `.ssh` / `.gnupg`
 component), checking both the raw and canonicalized forms.
 
+Command strings (`execAsAgent`, `execPty`) do **not** pass through
+`validate_path()` — no string inspection could do so honestly (shell
+expansion, variables, indirection). The secret-directory portion of that
+policy is instead enforced at the OS level where the platform can express
+it: on macOS the controller always wraps the runtime in a Seatbelt profile
+denying `~/.ssh` and `~/.gnupg` to the whole process tree (composed into
+the write-restriction profile when the sandbox is enabled), so shell
+commands hit `Operation not permitted` on those paths. On Linux, Landlock
+is allowlist-only and cannot subtract read access from a granted tree —
+there, command strings are bounded by autonomy/approvals plus the write
+sandbox (`INTENDANT_SANDBOX_WRITE_PATHS`), and the secret-directory
+denylist genuinely covers only the structured tools. On Windows the
+runtime has no OS sandbox yet.
+
 ### `editFile` Operations
 
 | Operation | Description | Required fields |

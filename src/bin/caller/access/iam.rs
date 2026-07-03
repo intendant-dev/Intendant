@@ -608,7 +608,8 @@ impl LocalIamState {
         if self.schema_version == 0 {
             self.schema_version = IAM_SCHEMA_VERSION;
         }
-        for role in builtin_role_templates() {
+        let templates = builtin_role_templates();
+        for role in templates.iter().cloned() {
             match self
                 .roles
                 .iter_mut()
@@ -624,6 +625,14 @@ impl LocalIamState {
                 None => self.roles.push(role),
             }
         }
+        // The same ownership cuts the other way: a persisted builtin role
+        // the binary no longer ships (e.g. the never-enforced
+        // role:directory-files, superseded by grant-level fs scopes) is
+        // dropped on load. Grants could never reference planned roles, and
+        // a grant on any removed role fails closed in the evaluator.
+        self.roles.retain(|role| {
+            role.source != "builtin" || templates.iter().any(|template| template.id == role.id)
+        });
         self.principals.retain(|p| !p.id.trim().is_empty());
         self.roles.retain(|r| !r.id.trim().is_empty());
         self.grants
@@ -1532,7 +1541,6 @@ pub fn policy_for_role(role_id: &str) -> String {
         "role:files-read" => "policy:files-read".to_string(),
         "role:files-write" => "policy:files-write".to_string(),
         "role:operator" => "policy:operator".to_string(),
-        "role:directory-files" => "policy:directory-files".to_string(),
         other => format!("policy:{}", slug_component(other)),
     }
 }
@@ -2211,14 +2219,6 @@ fn builtin_role_templates() -> Vec<IamRole> {
             ],
             source: "builtin".to_string(),
         },
-        IamRole {
-            id: "role:directory-files".to_string(),
-            label: "Directory scoped files".to_string(),
-            status: "planned".to_string(),
-            summary: "Future file role bounded by selected roots and operations.".to_string(),
-            permissions: vec!["filesystem.read".to_string()],
-            source: "builtin".to_string(),
-        },
     ]
 }
 
@@ -2621,7 +2621,10 @@ mod tests {
             .iter()
             .any(|permission| permission == "shell.spawn"));
 
-        // Custom roles are never rewritten.
+        // Custom roles are never rewritten — and never dropped, while a
+        // RETIRED builtin (role:directory-files shipped as a planned
+        // placeholder before grant-level fs scopes superseded it) is
+        // removed from persisted state on load.
         let mut custom_state = LocalIamState::default();
         custom_state.roles.push(IamRole {
             id: "role:custom-legacy".to_string(),
@@ -2631,6 +2634,14 @@ mod tests {
             permissions: vec!["terminal.use".to_string()],
             source: "local".to_string(),
         });
+        custom_state.roles.push(IamRole {
+            id: "role:directory-files".to_string(),
+            label: "Directory scoped files".to_string(),
+            status: "planned".to_string(),
+            summary: String::new(),
+            permissions: vec!["filesystem.read".to_string()],
+            source: "builtin".to_string(),
+        });
         let normalized = custom_state.normalize();
         let custom = normalized
             .roles
@@ -2638,6 +2649,13 @@ mod tests {
             .find(|role| role.id == "role:custom-legacy")
             .unwrap();
         assert_eq!(custom.permissions, vec!["terminal.use".to_string()]);
+        assert!(
+            !normalized
+                .roles
+                .iter()
+                .any(|role| role.id == "role:directory-files"),
+            "retired builtin role should be dropped on load"
+        );
     }
 
     #[test]

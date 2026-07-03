@@ -35500,13 +35500,6 @@ function accessFallbackIamRoles() {
     summary: 'Operate sessions, display, shell, files, and approvals without access/settings administration.',
     permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'filesystem.read', 'filesystem.write'],
     source: 'builtin',
-  }, {
-    id: 'role:directory-files',
-    label: 'Directory scoped files',
-    status: 'planned',
-    summary: 'Future file role bounded by selected roots and operations.',
-    permissions: ['filesystem.read'],
-    source: 'builtin',
   }];
 }
 
@@ -35521,7 +35514,6 @@ function accessFallbackPolicyIdForRole(roleId) {
     'role:files-read': 'policy:files-read',
     'role:files-write': 'policy:files-write',
     'role:operator': 'policy:operator',
-    'role:directory-files': 'policy:directory-files',
   }[roleId] || `policy:${String(roleId || 'role').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase()}`;
 }
 
@@ -37080,7 +37072,6 @@ const ACCESS_ROLE_META = {
   'role:session-reader': { cls: 'role-sessions', short: 'Read sessions, logs, and status.' },
   'role:observer': { cls: 'role-observer', short: 'Watch read-only, including live displays.' },
   'role:scoped-human': { cls: 'role-scoped', short: 'Inspect the access model only. A safe first grant.' },
-  'role:directory-files': { cls: 'role-planned', short: 'Planned: file access bounded to chosen directories.' },
   'role:peer-profile': { cls: 'role-peer', short: 'Daemon-to-daemon authority bounded by the peer profile.' },
 };
 
