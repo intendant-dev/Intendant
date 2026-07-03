@@ -35,14 +35,11 @@ pub async fn run_agent(
     log_dir: &std::path::Path,
 ) -> Result<AgentOutput, CallerError> {
     // Linux enforces this via Landlock inside the runtime; macOS wraps the
-    // runtime in sandbox-exec (see run_agent_inner). Windows has no
-    // process sandbox yet, so the config is not built there.
-    #[cfg(unix)]
+    // runtime in sandbox-exec; Windows re-execs inside the runtime under a
+    // write-restricted token (win_sandbox.rs) — see run_agent_inner.
     if let Ok(raw_paths) = std::env::var("INTENDANT_SANDBOX_WRITE_PATHS") {
-        let write_paths: Vec<PathBuf> = raw_paths
-            .split(':')
-            .filter(|p| !p.trim().is_empty())
-            .map(PathBuf::from)
+        let write_paths: Vec<PathBuf> = std::env::split_paths(&raw_paths)
+            .filter(|p| !p.as_os_str().is_empty())
             .collect();
         if !write_paths.is_empty() {
             let sandbox = SandboxConfig {
@@ -106,17 +103,15 @@ async fn run_agent_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // If sandbox config is provided, serialize it as an env var.
-    // The runtime will apply Landlock restrictions at startup.
-    #[cfg(target_os = "linux")]
+    // If sandbox config is provided, serialize it as an env var. The
+    // runtime applies the restriction itself at startup — Landlock on
+    // Linux, a write-restricted token re-exec on Windows.
+    #[cfg(any(target_os = "linux", windows))]
     if let Some(sandbox) = sandbox {
         if sandbox.enabled {
-            let write_paths: Vec<String> = sandbox
-                .write_paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect();
-            cmd.env("INTENDANT_SANDBOX_WRITE_PATHS", write_paths.join(":"));
+            if let Ok(joined) = std::env::join_paths(&sandbox.write_paths) {
+                cmd.env("INTENDANT_SANDBOX_WRITE_PATHS", joined);
+            }
         }
     }
 
