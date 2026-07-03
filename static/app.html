@@ -13706,6 +13706,10 @@ let accessFleetHostedCsrfToken = '';
 let dashboardControlTransport = null;
 let dashboardTransport = null;
 let dashboardServerMessageDispatcher = null;
+// Frame types the daemon has denied for this connection's grant — each
+// surfaces one toast per page load (the server re-sends the denial frame
+// on every attempt; repeating the toast would just nag).
+const wsDeniedToastShown = new Set();
 let dashboardControlEventsActive = false;
 let dashboardControlLastError = '';
 let dashboardConnectReconnectTimer = null;
@@ -21462,6 +21466,14 @@ async function main() {
     try {
       const d = typeof msg === 'string' ? JSON.parse(msg) : msg;
       if (dashboardShouldDropDuplicateServerMessage(d)) return;
+      if (d.t === 'ws_denied') {
+        const frame = String(d.frame || '');
+        if (!wsDeniedToastShown.has(frame)) {
+          wsDeniedToastShown.add(frame);
+          showControlToast?.('error', 'Not allowed by your access grant: ' + (d.permission || frame || 'operation'));
+        }
+        return;
+      }
       if (d.event === 'context_snapshot') {
         const contextSid = sessionWindowTargetForLogSession(d.session_id);
         if (contextSid) markSessionWindowPendingActive(contextSid);

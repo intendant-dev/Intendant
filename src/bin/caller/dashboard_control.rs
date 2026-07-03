@@ -276,7 +276,7 @@ impl DashboardControlGrant {
         }
     }
 
-    fn access_decision(
+    pub(crate) fn access_decision(
         &self,
         op: crate::peer::access_policy::PeerOperation,
     ) -> crate::access::iam::AccessDecision {
@@ -291,7 +291,7 @@ impl DashboardControlGrant {
         }
     }
 
-    fn wire_kind(&self) -> &'static str {
+    pub(crate) fn wire_kind(&self) -> &'static str {
         match self {
             Self::TrustedLocal => "trusted-local",
             Self::UserClientRoot { .. } => "user-client-root",
