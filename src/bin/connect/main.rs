@@ -5330,8 +5330,8 @@ fn landing_ui_html(origin: &str) -> String {
         agents: a shell, files, a display it can see and control, voice, and
         phone calls — with layered human supervision, portable across
         OpenAI, Anthropic, and Gemini, and at home on macOS, Linux, and
-        Windows. It runs its own agent loop and supervises Codex, Gemini
-        CLI, and Claude Code as managed backends.
+        Windows. It runs its own agent loop and supervises Codex and
+        Claude Code as managed backends.
       </p>
       <div class="cta">
         <a class="btn" href="/connect">Open your dashboard</a>
@@ -5435,9 +5435,9 @@ fn landing_ui_html(origin: &str) -> String {
       <div class="grid">
         <div class="card">
           <h3>Bring your own agent</h3>
-          <p>Codex, Gemini CLI, and Claude Code run as managed backends —
-          under the same oversight, autonomy dial, and session logging as
-          the native agent loop.</p>
+          <p>Codex and Claude Code run as managed backends — under the
+          same oversight, autonomy dial, and session logging as the
+          native agent loop.</p>
         </div>
         <div class="card">
           <h3>Your keys stay yours</h3>
