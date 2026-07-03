@@ -1,6 +1,6 @@
 ---
 name: intendant-log-search
-description: Use when investigating Intendant run history, session logs, dashboard replay/search behavior, external-agent wrapper logs, Codex/Claude/Gemini backend logs, context rewind/fission sidecars, display frames, recordings, or task artifacts under ~/.intendant/logs. Teaches how to find sessions, search session.jsonl and sidecars, follow turn-file byte spans, map wrapper sessions to backend ids, and interpret what each log artifact provides.
+description: Use when investigating Intendant run history, session logs, dashboard replay/search behavior, external-agent wrapper logs, Codex/Claude backend logs, context rewind/fission sidecars, display frames, recordings, or task artifacts under ~/.intendant/logs. Teaches how to find sessions, search session.jsonl and sidecars, follow turn-file byte spans, map wrapper sessions to backend ids, and interpret what each log artifact provides.
 ---
 
 # Intendant Log Search
@@ -80,15 +80,15 @@ For stderr spans, use `file2`, `data.stderr_offset`, and `data.stderr_bytes`. Fo
 - Runtime side files: `<nonce>_stdout.log`, `<nonce>_stderr.log`, `screenshot_<nonce>.png`, temporary human-question files.
 - Visual artifacts: `frames/frames.jsonl`, `frames/*.jpg`, `recordings/<stream>/manifest.json`, `segments.csv`, `seg_*.mp4`, `ffmpeg.log`.
 - Managed-context sidecars: `context_rewinds/*.json`, `context_rewinds/*-source-rollout.jsonl`, `fission_ledger.json`, `model-request-traces/`.
-- External-agent indexes and native logs: `~/.intendant/external_wrapper_index.json`, `session_agent_config.json`, Codex rollout JSONL, Claude Code JSONL, Gemini chat JSON.
+- External-agent indexes and native logs: `~/.intendant/external_wrapper_index.json`, `session_agent_config.json`, Codex rollout JSONL, Claude Code JSONL.
 
 ## External Sessions
 
-Intendant wrapper logs normalize Codex, Claude Code, and Gemini activity into the Intendant `session.jsonl` shape. Use `session_identity` rows or `~/.intendant/external_wrapper_index.json` to map:
+Intendant wrapper logs normalize Codex and Claude Code activity into the Intendant `session.jsonl` shape. Use `session_identity` rows or `~/.intendant/external_wrapper_index.json` to map:
 
 - `intendant_session_id`: wrapper log directory under `~/.intendant/logs/`.
-- `backend_session_id`: native Codex/Claude/Gemini id.
-- `source`: `codex`, `claude-code`, or `gemini`.
+- `backend_session_id`: native Codex/Claude Code id.
+- `source`: `codex` or `claude-code`.
 
 For Codex, inspect `session_agent_config.json` for `codex_home`; otherwise use `$CODEX_HOME` or `~/.codex`. Codex native logs are rollout JSONL files under `sessions/` and `archived_sessions/`, identified by a `session_meta` row whose `payload.id` equals the backend id.
 

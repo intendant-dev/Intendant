@@ -11,7 +11,7 @@
 
 ## What Intendant Is
 
-Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. Beyond running its own agent loop, it **supervises external coding agents** (Codex, Gemini CLI, Claude Code) as managed backends and **federates with peer machines**. Provider-agnostic (OpenAI, Anthropic, Gemini); cross-platform (macOS, Linux, Windows — all first-class); every capability reachable from any interface (CLI, TUI, web dashboard, MCP, voice).
+Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. Beyond running its own agent loop, it **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines**. Provider-agnostic (OpenAI, Anthropic, Gemini); cross-platform (macOS, Linux, Windows — all first-class); every capability reachable from any interface (CLI, TUI, web dashboard, MCP, voice).
 
 ## The Two Binaries (security boundary)
 
@@ -30,7 +30,7 @@ Read the relevant chapter before changing a subsystem:
 |---|---|
 | Whole-system overview, the agent loop, streaming, caching | `docs/src/architecture.md` |
 | Native multi-agent orchestration (modes, sub-agents, worktrees) | `docs/src/multi-agent.md` |
-| Supervising Codex / Gemini CLI / Claude Code | `docs/src/external-agent-orchestration.md` |
+| Supervising Codex / Claude Code | `docs/src/external-agent-orchestration.md` |
 | Control plane, persistent daemon, session lifecycle | `docs/src/control-plane-and-daemon.md` |
 | Runtime stdin/stdout JSON protocol | `docs/src/runtime-protocol.md` |
 | WebRTC display (shared encoder pool, tile streaming) | `docs/src/display-pipeline.md` |
@@ -87,7 +87,7 @@ src/
     ├── session_supervisor.rs, task_dispatch.rs, file_watcher.rs   # daemon: sessions, dispatch, rewind snapshots
     ├── provider.rs, conversation.rs, tools.rs, prompts.rs, skills.rs, autonomy.rs, approval.rs
     ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, user_mode.rs, agent_runner.rs   # native multi-agent
-    ├── external_agent/         # supervise Codex / Claude Code / Gemini CLI
+    ├── external_agent/         # supervise Codex / Claude Code
     ├── peer/, lan/, web_tls.rs # peer federation; mTLS LAN proxy; native HTTPS/WSS
     ├── display/                # WebRTC: encode/{pool,vp8,h264_*}, tile/, capture/, webrtc, {x11,wayland,macos,windows}
     ├── computer_use.rs, ax.rs, vision.rs, recording.rs, frames.rs

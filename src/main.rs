@@ -64,7 +64,12 @@ fn apply_sandbox_from_env() -> Result<(), AgentError> {
         .restrict_self()
         .map_err(|e| AgentError::Process(format!("Landlock restrict_self failed: {}", e)))?;
     if status.ruleset == landlock::RulesetStatus::NotEnforced {
-        eprintln!("Sandbox requested but Landlock not enforced by kernel");
+        // Fail closed: a requested sandbox must never silently degrade to
+        // unrestricted execution (scoped shells and the Windows runtime
+        // already refuse in this situation).
+        return Err(AgentError::Process(
+            "Sandbox requested but Landlock is not enforced by this kernel; refusing to run unsandboxed".to_string(),
+        ));
     }
     Ok(())
 }

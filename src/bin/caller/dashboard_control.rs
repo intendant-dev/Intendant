@@ -2052,7 +2052,12 @@ fn dashboard_control_frame_operation(t: &str) -> Option<crate::peer::access_poli
             Some(PeerOperation::RuntimeControl)
         }
         "presence_frame" => Some(PeerOperation::Message),
-        "upload_start" | "upload_chunk" | "upload_end" => Some(PeerOperation::FilesystemWrite),
+        // Upload frames carry no blanket authority: upload_start is
+        // authorized by the operation of the method it delivers (a media
+        // annotation is runtime control, a transfer chunk is a filesystem
+        // write, …) inside control_upload_start_frame, and chunk/end only
+        // act on an entry an authorized start created on this connection.
+        "upload_start" | "upload_chunk" | "upload_end" => None,
         // Client-egress response frames: only a session that could have
         // registered as a relay (credentials.manage) may answer, and the
         // handler additionally binds each frame to the request's own
@@ -2236,6 +2241,30 @@ fn authorize_dashboard_control_method(
     authorize_dashboard_control_filesystem(runtime, op, params)
 }
 
+/// Upload frames are authorized by the method they deliver — the same
+/// operation that method needs on the direct routes — not by a blanket
+/// filesystem grant. Transfer chunks skip path scoping: their destination
+/// was scoped when the transfer job was created and the chunk only names
+/// that job.
+fn authorize_dashboard_control_upload(
+    runtime: &ControlRuntime,
+    method: &str,
+) -> Result<(), String> {
+    use crate::peer::access_policy::PeerOperation;
+    let op = match method {
+        "api_session_current_upload" => PeerOperation::SessionManage,
+        "api_transfer_upload_chunk" => PeerOperation::FilesystemWrite,
+        "api_media_annotation_attach"
+        | "api_media_annotation_submit"
+        | "api_media_clip_frame"
+        | "api_presence_video_frame" => PeerOperation::RuntimeControl,
+        _ => return Err(format!("unknown upload method: {method}")),
+    };
+    runtime_operation_decision(runtime, op)
+        .ensure_allowed()
+        .map_err(|reason| format!("dashboard-control upload {method} is not allowed: {reason}"))
+}
+
 fn authorize_dashboard_control_frame(
     runtime: &ControlRuntime,
     frame_type: &str,
@@ -2319,7 +2348,9 @@ fn control_frame_response(
             crate::credential_egress::handle_browser_frame(&runtime.session_id, t, &parsed);
             None
         }
-        "upload_start" => control_upload_start_frame(id, parsed, pending_requests, inbound_uploads),
+        "upload_start" => {
+            control_upload_start_frame(id, parsed, runtime, pending_requests, inbound_uploads)
+        }
         "upload_chunk" => control_upload_chunk_frame(id, parsed, pending_requests, inbound_uploads),
         "upload_end" => control_upload_end_frame(
             id,
@@ -2907,6 +2938,7 @@ fn control_upload_error_response(
 fn control_upload_start_frame(
     id: String,
     frame: serde_json::Value,
+    runtime: &ControlRuntime,
     pending_requests: &mut HashMap<String, CancellationToken>,
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
 ) -> Option<serde_json::Value> {
@@ -2921,12 +2953,16 @@ fn control_upload_start_frame(
             | "api_media_annotation_attach"
             | "api_media_annotation_submit"
             | "api_media_clip_frame"
+            | "api_presence_video_frame"
     ) {
         return Some(control_upload_error_response(
             id,
             400,
             format!("unknown upload method: {method}"),
         ));
+    }
+    if let Err(error) = authorize_dashboard_control_upload(runtime, method) {
+        return Some(control_upload_error_response(id, 403, error));
     }
     let total_bytes = frame
         .get("total_bytes")
@@ -4458,7 +4494,12 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ),
         ("api_dashboard_bootstrap_available", session_inspect),
         ("byte_streams_available", true),
-        ("upload_frames_available", fs_write),
+        // Upload frames authorize per delivered method; the transport is
+        // available as soon as any upload-capable operation is granted.
+        (
+            "upload_frames_available",
+            fs_write || session_manage || runtime_control,
+        ),
         ("terminal_frames_available", terminal),
         ("tui_frames_available", runtime.web_tui_tx.is_some()),
         ("presence_frames_available", message),
@@ -9316,13 +9357,6 @@ fn dashboard_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::SetCodexWritableRoots { .. }
             | ControlMsg::SetCodexManagedContext { .. }
             | ControlMsg::SetCodexContextArchive { .. }
-            | ControlMsg::SetGeminiModel { .. }
-            | ControlMsg::SetGeminiApprovalMode { .. }
-            | ControlMsg::SetGeminiSandbox { .. }
-            | ControlMsg::SetGeminiExtensions { .. }
-            | ControlMsg::SetGeminiAllowedMcpServers { .. }
-            | ControlMsg::SetGeminiIncludeDirectories { .. }
-            | ControlMsg::SetGeminiDebug { .. }
             | ControlMsg::SetVerbosity { .. }
     )
 }
@@ -9354,7 +9388,6 @@ fn dashboard_action_msg_allowed(ctrl: &ControlMsg) -> bool {
     matches!(
         ctrl,
         ControlMsg::CodexThreadAction { .. }
-            | ControlMsg::GeminiThreadAction { .. }
             | ControlMsg::TakeDisplay { .. }
             | ControlMsg::ReleaseDisplay { .. }
             | ControlMsg::GrantUserDisplay { .. }
@@ -9404,14 +9437,6 @@ fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::StopSession { .. } => "stop_session",
         ControlMsg::RestartSession { .. } => "restart_session",
         ControlMsg::ResumeSession { .. } => "resume_session",
-        ControlMsg::SetGeminiModel { .. } => "set_gemini_model",
-        ControlMsg::SetGeminiApprovalMode { .. } => "set_gemini_approval_mode",
-        ControlMsg::SetGeminiSandbox { .. } => "set_gemini_sandbox",
-        ControlMsg::SetGeminiExtensions { .. } => "set_gemini_extensions",
-        ControlMsg::SetGeminiAllowedMcpServers { .. } => "set_gemini_allowed_mcp_servers",
-        ControlMsg::SetGeminiIncludeDirectories { .. } => "set_gemini_include_directories",
-        ControlMsg::SetGeminiDebug { .. } => "set_gemini_debug",
-        ControlMsg::GeminiThreadAction { .. } => "gemini_thread_action",
         ControlMsg::SetVerbosity { .. } => "set_verbosity",
         ControlMsg::ScheduleControllerRestart { .. } => "schedule_controller_restart",
         ControlMsg::ControllerTurnComplete { .. } => "controller_turn_complete",
@@ -11944,6 +11969,91 @@ mod tests {
             invalid.frame["result"]["error"],
             "range start beyond upload size"
         );
+    }
+
+    #[test]
+    fn upload_start_authorizes_by_delivered_method_not_blanket_fs_write() {
+        let file_operator = ControlRuntime {
+            grant: DashboardControlGrant::Peer {
+                fingerprint: "aabbccdd".into(),
+                label: "peer".into(),
+                profile: "file-operator".into(),
+                filesystem: Default::default(),
+            },
+            ..runtime()
+        };
+        let mut pending = HashMap::new();
+        let mut inbound_uploads = HashMap::new();
+
+        // A filesystem-write grant must not reach runtime-control surface
+        // (media annotations inject content into the session).
+        let denied = control_upload_start_frame(
+            "up-media".into(),
+            serde_json::json!({
+                "t": "upload_start",
+                "id": "up-media",
+                "method": "api_media_annotation_submit",
+                "total_bytes": 4,
+                "chunks": 1,
+            }),
+            &file_operator,
+            &mut pending,
+            &mut inbound_uploads,
+        )
+        .expect("denied uploads answer immediately");
+        assert_eq!(denied["result"]["_httpStatus"], 403);
+        assert!(
+            denied["result"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("not allowed"),
+            "{denied}"
+        );
+        assert!(inbound_uploads.is_empty());
+
+        // The same grant covers what it actually names: transfer chunks.
+        assert!(control_upload_start_frame(
+            "up-chunk".into(),
+            serde_json::json!({
+                "t": "upload_start",
+                "id": "up-chunk",
+                "method": "api_transfer_upload_chunk",
+                "total_bytes": 4,
+                "chunks": 1,
+            }),
+            &file_operator,
+            &mut pending,
+            &mut inbound_uploads,
+        )
+        .is_none());
+        assert!(inbound_uploads.contains_key("up-chunk"));
+
+        // api_presence_video_frame is a first-class upload method (it has
+        // an upload-end handler); runtime control admits it at start.
+        let admin = ControlRuntime {
+            grant: DashboardControlGrant::Peer {
+                fingerprint: "aabbccdd".into(),
+                label: "peer".into(),
+                profile: "admin".into(),
+                filesystem: Default::default(),
+            },
+            ..runtime()
+        };
+        assert!(control_upload_start_frame(
+            "up-video".into(),
+            serde_json::json!({
+                "t": "upload_start",
+                "id": "up-video",
+                "method": "api_presence_video_frame",
+                "total_bytes": 4,
+                "chunks": 1,
+            }),
+            &admin,
+            &mut pending,
+            &mut inbound_uploads,
+        )
+        .is_none());
+        assert!(inbound_uploads.contains_key("up-video"));
     }
 
     #[tokio::test]

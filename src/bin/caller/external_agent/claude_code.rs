@@ -401,15 +401,29 @@ async fn reader_task(
                             category,
                         });
                     } else {
-                        // Unknown control request — auto-allow to avoid hanging
+                        // Unknown control request — deny. Auto-allowing here
+                        // would let any new permission-request subtype bypass
+                        // the approval layer entirely; a denial keeps Claude
+                        // Code unblocked (it treats it as a refused tool) while
+                        // failing closed.
+                        let _ = event_tx.send(AgentEvent::Log {
+                            level: "warn".into(),
+                            message: format!(
+                                "Claude Code sent an unrecognized control_request subtype '{}' — denied (fail-closed). Update Intendant if this subtype should be supported.",
+                                subtype
+                            ),
+                        });
                         let response = CcControlResponse {
                             msg_type: "control_response".into(),
                             response: CcControlResponseInner {
                                 subtype: "success".into(),
                                 request_id: cc_request_id,
                                 response: CcPermissionDecision {
-                                    behavior: "allow".into(),
-                                    message: None,
+                                    behavior: "deny".into(),
+                                    message: Some(format!(
+                                        "Intendant does not recognize the '{}' permission request and denies it by default",
+                                        subtype
+                                    )),
                                 },
                             },
                         };

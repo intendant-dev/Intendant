@@ -54,7 +54,10 @@ fn default_buffer_secs() -> f32 {
 impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // Off by default (matches the module contract and the serde
+            // field default): transcribing user audio costs API spend and
+            // has privacy weight, so it requires explicit opt-in.
+            enabled: false,
             provider: default_provider(),
             model: default_model(),
             endpoint: None,
@@ -254,7 +257,7 @@ mod tests {
     #[test]
     fn default_transcription_config() {
         let config = TranscriptionConfig::default();
-        assert!(config.enabled);
+        assert!(!config.enabled, "transcription must be opt-in");
         assert_eq!(config.provider, "openai");
         assert_eq!(config.model, "whisper-1");
         assert!(config.endpoint.is_none());

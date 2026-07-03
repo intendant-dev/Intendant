@@ -946,22 +946,6 @@ fn codex_runtime_config_equal(
         && a.context_archive == b.context_archive
 }
 
-/// Structural equality for `GeminiRuntimeConfig`. Every field here is a
-/// command-line arg Gemini latches at process spawn, so any drift forces a
-/// teardown + respawn on the next task.
-fn gemini_runtime_config_equal(
-    a: &control_plane::GeminiRuntimeConfig,
-    b: &control_plane::GeminiRuntimeConfig,
-) -> bool {
-    a.model == b.model
-        && a.approval_mode == b.approval_mode
-        && a.sandbox == b.sandbox
-        && a.extensions == b.extensions
-        && a.allowed_mcp_servers == b.allowed_mcp_servers
-        && a.include_directories == b.include_directories
-        && a.debug == b.debug
-}
-
 fn normalize_diff_file_path(path: &str) -> Option<String> {
     let path = path.split('\t').next().unwrap_or(path).trim();
     if path == "/dev/null" {
@@ -1363,50 +1347,6 @@ async fn create_external_agent(
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
                 codex_home,
-            };
-            (agent, config)
-        }
-        AgentBackend::GeminiCli => {
-            let cfg = &project.config.agent.gemini_cli;
-            let approval_mode = project::normalize_gemini_approval_mode(&cfg.approval_mode);
-            let launch = external_agent::gemini::GeminiLaunchConfig {
-                model: cfg.model.clone(),
-                approval_mode: approval_mode.clone(),
-                sandbox: cfg.sandbox,
-                extensions: cfg.extensions.clone(),
-                allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
-                include_directories: cfg.include_directories.clone(),
-                debug: cfg.debug,
-            };
-            let agent = Box::new(external_agent::gemini::GeminiAgent::new(
-                cfg.command.clone(),
-                launch,
-                web_port,
-            ));
-            let config = AgentConfig {
-                model: cfg.model.clone(),
-                working_dir: project.root.clone(),
-                request_trace_dir: None,
-                request_trace_temporary: false,
-                context_archive: "off".to_string(),
-                // `AgentConfig.approval_policy` is Codex's `-a` flag; for
-                // Gemini we reuse the field as the ACP approval hint so the
-                // sandbox/prompt layer can adjust if needed. Storing the
-                // normalized Gemini approval mode keeps the two backends
-                // schema-compatible at the trait level.
-                approval_policy: approval_mode,
-                sandbox: String::new(),
-                reasoning_effort: None,
-                service_tier: None,
-                web_search: false,
-                network_access: false,
-                writable_roots: Vec::new(),
-                codex_managed_context: false,
-                web_port,
-                mcp_auth_token: mcp_auth_token.clone(),
-                mcp_session_id: None,
-                resume_session: resume_session.clone(),
-                codex_home: None,
             };
             (agent, config)
         }
@@ -11039,16 +10979,7 @@ async fn drain_external_agent_events_with_prefetched(
                 if managed_context_blocked_tool_items.contains(&item_id) {
                     continue;
                 }
-                // Gemini CLI strips images from ACP, sending "[Image: image/png]".
-                // Substitute with the latest screenshot from disk so the Activity
-                // tab can render it.
-                let stdout = if text.contains("[Image: image/png]")
-                    || text.contains("[Image: image/jpeg]")
-                {
-                    substitute_screenshot_from_disk(&text, config.log_dir)
-                } else {
-                    text
-                };
+                let stdout = text;
                 if let Some(stdout) = tool_output_limiter.filter(&item_id, stdout) {
                     emit_external_tool_output(config, config.session_id.as_deref(), stdout);
                 }
@@ -11697,7 +11628,6 @@ struct DaemonConfig {
     autonomy: SharedAutonomy,
     shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     shared_codex_config: control_plane::SharedCodexConfig,
-    shared_gemini_config: control_plane::SharedGeminiConfig,
     frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     session_registry: Option<display::SharedSessionRegistry>,
     web_port: Option<u16>,
@@ -11722,7 +11652,6 @@ async fn run_daemon_loop(config: DaemonConfig) {
         autonomy: config.autonomy,
         shared_external_agent: config.shared_external_agent,
         shared_codex_config: config.shared_codex_config,
-        shared_gemini_config: config.shared_gemini_config,
         frame_registry: config.frame_registry,
         session_registry: config.session_registry,
         web_port: config.web_port,
@@ -13385,56 +13314,6 @@ fn has_exec_command(json_str: &str) -> bool {
 
 /// Try to encode a captureScreen result as base64 image data.
 /// Returns `Some(vec![ImageData])` on success, `None` on any failure.
-/// Replace "[Image: image/png]" placeholders in Gemini agent output with
-/// the actual screenshot data from disk, formatted as MCP JSON so the Activity
-/// tab's format_agent_output can extract and lazy-load the images.
-fn substitute_screenshot_from_disk(text: &str, log_dir: &std::path::Path) -> String {
-    let screenshots_dir = log_dir.join("screenshots");
-    // Find the latest cu_screenshot_*.png by modification time
-    let latest = std::fs::read_dir(&screenshots_dir)
-        .ok()
-        .and_then(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_name()
-                        .to_str()
-                        .map(|n| n.starts_with("cu_screenshot_") && n.ends_with(".png"))
-                        .unwrap_or(false)
-                })
-                .max_by_key(|e| e.metadata().ok().and_then(|m| m.modified().ok()))
-        });
-
-    let Some(entry) = latest else {
-        return text.to_string();
-    };
-
-    let Ok(png_bytes) = std::fs::read(entry.path()) else {
-        return text.to_string();
-    };
-
-    let base64_data =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_bytes);
-
-    // Build MCP-style JSON with both text and image content blocks
-    let text_part = text
-        .replace("[Image: image/png]", "")
-        .replace("[Image: image/jpeg]", "");
-    let text_part = text_part.trim();
-
-    let mut content = Vec::new();
-    if !text_part.is_empty() {
-        content.push(serde_json::json!({"text": text_part, "type": "text"}));
-    }
-    content.push(serde_json::json!({
-        "data": base64_data,
-        "type": "image",
-        "mimeType": "image/png",
-    }));
-
-    serde_json::json!({"content": content}).to_string()
-}
-
 fn encode_screenshot(result_text: &str) -> Option<Vec<conversation::ImageData>> {
     let parsed: serde_json::Value = serde_json::from_str(result_text).ok()?;
     if parsed.get("success").and_then(|v| v.as_bool()) != Some(true) {
@@ -13675,6 +13554,32 @@ async fn start_external_display_recordings(
             }
             Err(e) => eprintln!("Failed to start recording for :{}: {}", id, e),
         }
+    }
+}
+
+/// Side effects a user approval carries beyond unblocking the waiting
+/// command: dedup recording for plain approvals, autonomy escalation for
+/// approve-all, and the first DisplayControl approval granting user-display
+/// access session-wide. Every approval surface (JSON stdin slot, TUI/MCP
+/// registry) must apply these identically, or an approval "succeeds" and
+/// the action still fails its grant check afterwards.
+async fn apply_user_approval(
+    response: event::ApprovalResponse,
+    cat: autonomy::ActionCategory,
+    preview: &str,
+    autonomy: &SharedAutonomy,
+    bus: &EventBus,
+) {
+    let mut state = autonomy.write().await;
+    match response {
+        event::ApprovalResponse::Approve => state.record_approved_command(preview),
+        event::ApprovalResponse::ApproveAll => state.level = AutonomyLevel::Full,
+        event::ApprovalResponse::Skip | event::ApprovalResponse::Deny => return,
+    }
+    if cat == autonomy::ActionCategory::DisplayControl && !state.user_display_granted {
+        state.user_display_granted = true;
+        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
     }
 }
 
@@ -21082,6 +20987,60 @@ Also: {"source": "bare"}"#;
         );
     }
 
+    #[tokio::test]
+    async fn user_approval_side_effects_apply_on_every_surface() {
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+
+        // Plain approval records the command for dedup; a DisplayControl
+        // approval grants the user display session-wide. The TUI/MCP
+        // registry path used to skip both, so approving there left the
+        // action failing its grant check afterwards.
+        apply_user_approval(
+            event::ApprovalResponse::Approve,
+            autonomy::ActionCategory::DisplayControl,
+            "cu: click",
+            &autonomy,
+            &bus,
+        )
+        .await;
+        {
+            let state = autonomy.read().await;
+            assert!(state.was_command_approved("cu: click"));
+            assert!(state.user_display_granted);
+        }
+        let mut saw_grant = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, AppEvent::UserDisplayGranted { .. }) {
+                saw_grant = true;
+            }
+        }
+        assert!(saw_grant, "UserDisplayGranted must be announced");
+
+        // Approve-all escalates autonomy for the rest of the session.
+        apply_user_approval(
+            event::ApprovalResponse::ApproveAll,
+            autonomy::ActionCategory::CommandExec,
+            "rm -rf target",
+            &autonomy,
+            &bus,
+        )
+        .await;
+        assert_eq!(autonomy.read().await.level, AutonomyLevel::Full);
+
+        // Deny and skip carry no side effects.
+        apply_user_approval(
+            event::ApprovalResponse::Deny,
+            autonomy::ActionCategory::CommandExec,
+            "never ran",
+            &autonomy,
+            &bus,
+        )
+        .await;
+        assert!(!autonomy.read().await.was_command_approved("never ran"));
+    }
+
     #[test]
     fn format_command_preview_exec() {
         let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls -la /tmp"}]}"#;
@@ -25326,17 +25285,14 @@ async fn run_agent_loop(
                                     id: turn as u64,
                                     action: "approve".to_string(),
                                 });
-                                // Record approved command for dedup
-                                autonomy.write().await.record_approved_command(&preview);
-                                // Session-grant: first DisplayControl approval unlocks the session
-                                if cat == autonomy::ActionCategory::DisplayControl {
-                                    let mut state = autonomy.write().await;
-                                    if !state.user_display_granted {
-                                        state.user_display_granted = true;
-                                        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
-                                    }
-                                }
+                                apply_user_approval(
+                                    event::ApprovalResponse::Approve,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::ApproveAll) => {
                                 slog(&session_log, |l| {
@@ -25347,16 +25303,14 @@ async fn run_agent_loop(
                                     id: turn as u64,
                                     action: "approve_all".to_string(),
                                 });
-                                let mut state = autonomy.write().await;
-                                state.level = AutonomyLevel::Full;
-                                // Session-grant: DisplayControl approval also unlocks user display
-                                if cat == autonomy::ActionCategory::DisplayControl
-                                    && !state.user_display_granted
-                                {
-                                    state.user_display_granted = true;
-                                    std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                    bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
-                                }
+                                apply_user_approval(
+                                    event::ApprovalResponse::ApproveAll,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::Skip) => {
                                 slog(&session_log, |l| {
@@ -25411,13 +25365,27 @@ async fn run_agent_loop(
                                 slog(&session_log, |l| {
                                     l.approval(&cat.to_string(), &preview, "approved")
                                 });
+                                apply_user_approval(
+                                    event::ApprovalResponse::Approve,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::ApproveAll) => {
                                 slog(&session_log, |l| {
                                     l.approval(&cat.to_string(), &preview, "approve-all")
                                 });
-                                let mut state = autonomy.write().await;
-                                state.level = AutonomyLevel::Full;
+                                apply_user_approval(
+                                    event::ApprovalResponse::ApproveAll,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::Skip) => {
                                 slog(&session_log, |l| {
@@ -25760,17 +25728,14 @@ Proceed with explicit assumptions and continue without additional questions."
                                     id: turn as u64,
                                     action: "approve".to_string(),
                                 });
-                                // Record approved command for dedup
-                                autonomy.write().await.record_approved_command(&preview);
-                                // Session-grant: first DisplayControl approval unlocks the session
-                                if cat == autonomy::ActionCategory::DisplayControl {
-                                    let mut state = autonomy.write().await;
-                                    if !state.user_display_granted {
-                                        state.user_display_granted = true;
-                                        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
-                                    }
-                                }
+                                apply_user_approval(
+                                    event::ApprovalResponse::Approve,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::ApproveAll) => {
                                 slog(&session_log, |l| {
@@ -25781,16 +25746,14 @@ Proceed with explicit assumptions and continue without additional questions."
                                     id: turn as u64,
                                     action: "approve_all".to_string(),
                                 });
-                                let mut state = autonomy.write().await;
-                                state.level = AutonomyLevel::Full;
-                                // Session-grant: DisplayControl approval also unlocks user display
-                                if cat == autonomy::ActionCategory::DisplayControl
-                                    && !state.user_display_granted
-                                {
-                                    state.user_display_granted = true;
-                                    std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                    bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
-                                }
+                                apply_user_approval(
+                                    event::ApprovalResponse::ApproveAll,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::Skip) => {
                                 slog(&session_log, |l| {
@@ -25845,13 +25808,27 @@ Proceed with explicit assumptions and continue without additional questions."
                                 slog(&session_log, |l| {
                                     l.approval(&cat.to_string(), &preview, "approved")
                                 });
+                                apply_user_approval(
+                                    event::ApprovalResponse::Approve,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::ApproveAll) => {
                                 slog(&session_log, |l| {
                                     l.approval(&cat.to_string(), &preview, "approve-all")
                                 });
-                                let mut state = autonomy.write().await;
-                                state.level = AutonomyLevel::Full;
+                                apply_user_approval(
+                                    event::ApprovalResponse::ApproveAll,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::Skip) => {
                                 slog(&session_log, |l| {
@@ -26450,7 +26427,6 @@ async fn run_with_presence(
     agent_backend_override: Option<external_agent::AgentBackend>,
     shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     shared_codex_config: control_plane::SharedCodexConfig,
-    shared_gemini_config: control_plane::SharedGeminiConfig,
     web_port: Option<u16>,
     resume_session: Option<String>,
     resume_session_config: Option<session_config::SessionAgentConfig>,
@@ -26666,11 +26642,6 @@ async fn run_with_presence(
     // `shared_codex_config` when a new task arrives, we tear the agent down
     // and build a fresh one. Only meaningful when the backend is Codex.
     let mut persistent_codex_config: Option<control_plane::CodexRuntimeConfig> = None;
-    // Same idea for Gemini, but even more strict: Gemini latches every knob
-    // at process spawn (not at session/new), so a changed --approval-mode
-    // or --sandbox flag forces a kill + respawn of the gemini CLI process
-    // on the next task. Only meaningful when the backend is GeminiCli.
-    let mut persistent_gemini_config: Option<control_plane::GeminiRuntimeConfig> = None;
 
     // Side channel for thread actions (Codex slash commands) dispatched from
     // the dashboard / MCP between tasks. We subscribe to the bus here (not
@@ -26691,13 +26662,6 @@ async fn run_with_presence(
         Task(presence::TaskEnvelope),
         ThreadAction {
             session_id: Option<String>,
-            op: String,
-            params: serde_json::Value,
-        },
-        /// Gemini thread action — carried separately from Codex's so we can
-        /// pick the right result event (`GeminiThreadActionResult` vs
-        /// `CodexThreadActionResult`) downstream.
-        GeminiThreadAction {
             op: String,
             params: serde_json::Value,
         },
@@ -26742,9 +26706,6 @@ async fn run_with_presence(
                         op: action,
                         params,
                     }
-                }
-                Ok(AppEvent::GeminiThreadActionRequested { action, params }) => {
-                    OuterSignal::GeminiThreadAction { op: action, params }
                 }
                 Ok(AppEvent::ConversationRollbackRequested {
                     round_id,
@@ -27439,40 +27400,6 @@ async fn run_with_presence(
                 turn_bus_rx = bus.subscribe();
                 continue;
             }
-            OuterSignal::GeminiThreadAction { op, params: _ } => {
-                // Gemini currently has only one daemon-side action: `/new`.
-                // The CLI doesn't expose mid-session RPCs via ACP that map
-                // to Codex's /compact, /fork, /undo — if that changes we'll
-                // extend the trait's `thread_action` for Gemini.
-                let result = if op == "new" {
-                    persistent_agent = None;
-                    persistent_thread = None;
-                    persistent_event_rx = None;
-                    persistent_gemini_config = None;
-                    Ok("agent torn down; next task will spawn a fresh Gemini process".to_string())
-                } else {
-                    Err(format!("gemini thread action /{} not supported", op))
-                };
-                let (success, message) = match result {
-                    Ok(msg) => (true, msg),
-                    Err(e) => (false, e),
-                };
-                slog(&session_log, |l| {
-                    l.info(&format!(
-                        "Gemini thread action /{}: {} — {}",
-                        op,
-                        if success { "ok" } else { "FAILED" },
-                        message
-                    ))
-                });
-                bus.send(AppEvent::GeminiThreadActionResult {
-                    action: op,
-                    success,
-                    message,
-                });
-                turn_bus_rx = bus.subscribe();
-                continue;
-            }
             OuterSignal::ConversationRollback {
                 round_id,
                 target_native_message_count,
@@ -27516,7 +27443,6 @@ async fn run_with_presence(
                             persistent_thread = None;
                             persistent_event_rx = None;
                             persistent_codex_config = None;
-                            persistent_gemini_config = None;
                             bus.send(AppEvent::ConversationRolledBack {
                                 round_id,
                                 turns_removed: turns_to_drop,
@@ -27687,47 +27613,32 @@ async fn run_with_presence(
 
         // Re-read the agent backend each task: the web UI may have changed it.
         let agent_backend = shared_external_agent.read().await.clone();
-        // Snapshot the current Codex + Gemini runtime configs. Both backends
-        // latch their per-session config at spawn/thread-start — a toggle in
-        // the UI takes effect on the NEXT task by forcing an agent rebuild.
+        // Snapshot the current Codex runtime config. The backend latches its
+        // per-session config at spawn/thread-start — a toggle in the UI takes
+        // effect on the NEXT task by forcing an agent rebuild.
         let current_codex_config = shared_codex_config.read().await.clone();
-        let current_gemini_config = shared_gemini_config.read().await.clone();
 
         // Teardown conditions:
         //  - backend changed (any agent)
         //  - backend is Codex and any of the Codex-locked fields differ
-        //  - backend is Gemini and any of the Gemini-locked fields differ
         let codex_config_changed =
             matches!(agent_backend, Some(external_agent::AgentBackend::Codex))
                 && persistent_codex_config
                     .as_ref()
                     .is_some_and(|prev| !codex_runtime_config_equal(prev, &current_codex_config));
-        let gemini_config_changed =
-            matches!(agent_backend, Some(external_agent::AgentBackend::GeminiCli))
-                && persistent_gemini_config
-                    .as_ref()
-                    .is_some_and(|prev| !gemini_runtime_config_equal(prev, &current_gemini_config));
 
         if persistent_agent.is_some()
-            && (agent_backend != persistent_agent_backend
-                || codex_config_changed
-                || gemini_config_changed)
+            && (agent_backend != persistent_agent_backend || codex_config_changed)
         {
             if codex_config_changed {
                 slog(&session_log, |l| {
                     l.info("Codex config changed; rebuilding agent for next task")
                 });
             }
-            if gemini_config_changed {
-                slog(&session_log, |l| {
-                    l.info("Gemini config changed; rebuilding agent for next task")
-                });
-            }
             persistent_agent = None;
             persistent_thread = None;
             persistent_event_rx = None;
             persistent_codex_config = None;
-            persistent_gemini_config = None;
             persistent_diff_tracker = ExternalDiffDeltaTracker::default();
             persistent_pending_runtime_steers.clear();
             persistent_handled_steer_ids.clear();
@@ -27774,16 +27685,6 @@ async fn run_with_presence(
                     cx.writable_roots = current_codex_config.writable_roots.clone();
                     cx.managed_context = current_codex_config.managed_context.clone();
                     cx.context_archive = current_codex_config.context_archive.clone();
-                }
-                if matches!(backend, external_agent::AgentBackend::GeminiCli) {
-                    let gm = &mut proj.config.agent.gemini_cli;
-                    gm.model = current_gemini_config.model.clone();
-                    gm.approval_mode = current_gemini_config.approval_mode.clone();
-                    gm.sandbox = current_gemini_config.sandbox;
-                    gm.extensions = current_gemini_config.extensions.clone();
-                    gm.allowed_mcp_servers = current_gemini_config.allowed_mcp_servers.clone();
-                    gm.include_directories = current_gemini_config.include_directories.clone();
-                    gm.debug = current_gemini_config.debug;
                 }
                 // The first agent build may be resuming a session from a
                 // startup `--resume`/`--continue`. That session's persisted
@@ -27858,12 +27759,6 @@ async fn run_with_presence(
                 persistent_codex_config =
                     if matches!(agent_backend, Some(external_agent::AgentBackend::Codex)) {
                         Some(current_codex_config.clone())
-                    } else {
-                        None
-                    };
-                persistent_gemini_config =
-                    if matches!(agent_backend, Some(external_agent::AgentBackend::GeminiCli)) {
-                        Some(current_gemini_config.clone())
                     } else {
                         None
                     };
@@ -34343,27 +34238,12 @@ async fn main() -> Result<(), CallerError> {
                 },
             ))
         };
-        let shared_gemini_config: control_plane::SharedGeminiConfig = {
-            let cfg = &project.config.agent.gemini_cli;
-            Arc::new(tokio::sync::RwLock::new(
-                control_plane::GeminiRuntimeConfig {
-                    model: cfg.model.clone(),
-                    approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
-                    sandbox: cfg.sandbox,
-                    extensions: cfg.extensions.clone(),
-                    allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
-                    include_directories: cfg.include_directories.clone(),
-                    debug: cfg.debug,
-                },
-            ))
-        };
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
                 codex_config: shared_codex_config.clone(),
-                gemini_config: shared_gemini_config.clone(),
                 bus: bus.clone(),
                 project_root: Some(project.root.clone()),
             },
@@ -34375,7 +34255,6 @@ async fn main() -> Result<(), CallerError> {
             autonomy,
             shared_external_agent,
             shared_codex_config,
-            shared_gemini_config,
             frame_registry,
             session_registry: Some(session_registry.clone()),
             web_port: web_port_for_agent,
@@ -35235,27 +35114,12 @@ async fn main() -> Result<(), CallerError> {
                 },
             ))
         };
-        let shared_gemini_config: control_plane::SharedGeminiConfig = {
-            let cfg = &project.config.agent.gemini_cli;
-            Arc::new(tokio::sync::RwLock::new(
-                control_plane::GeminiRuntimeConfig {
-                    model: cfg.model.clone(),
-                    approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
-                    sandbox: cfg.sandbox,
-                    extensions: cfg.extensions.clone(),
-                    allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
-                    include_directories: cfg.include_directories.clone(),
-                    debug: cfg.debug,
-                },
-            ))
-        };
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
                 codex_config: shared_codex_config.clone(),
-                gemini_config: shared_gemini_config.clone(),
                 bus: bus.clone(),
                 project_root: Some(project.root.clone()),
             },
@@ -35269,7 +35133,6 @@ async fn main() -> Result<(), CallerError> {
                         autonomy: autonomy.clone(),
                         shared_external_agent: shared_external_agent.clone(),
                         shared_codex_config: shared_codex_config.clone(),
-                        shared_gemini_config: shared_gemini_config.clone(),
                         frame_registry: frame_registry.clone(),
                         session_registry: Some(session_registry.clone()),
                         web_port: web_port_for_agent,
@@ -35339,7 +35202,6 @@ async fn main() -> Result<(), CallerError> {
             let agent_backend_for_presence = agent_backend.clone();
             let shared_external_agent_for_presence = shared_external_agent.clone();
             let shared_codex_config_for_presence = shared_codex_config.clone();
-            let shared_gemini_config_for_presence = shared_gemini_config.clone();
             let session_registry_for_presence = session_registry.clone();
             tokio::spawn(async move {
                 let result = run_with_presence(
@@ -35364,7 +35226,6 @@ async fn main() -> Result<(), CallerError> {
                     agent_backend_for_presence,
                     shared_external_agent_for_presence,
                     shared_codex_config_for_presence,
-                    shared_gemini_config_for_presence,
                     if use_web { Some(web_port) } else { None },
                     startup_external_resume_session.clone(),
                     startup_external_resume_overrides,
@@ -35561,7 +35422,6 @@ async fn main() -> Result<(), CallerError> {
                 autonomy: autonomy.clone(),
                 shared_external_agent: shared_external_agent.clone(),
                 shared_codex_config: shared_codex_config.clone(),
-                shared_gemini_config: shared_gemini_config.clone(),
                 frame_registry: frame_registry_for_events.clone(),
                 session_registry: Some(session_registry.clone()),
                 web_port: web_port_for_agent,
@@ -35878,27 +35738,12 @@ async fn main() -> Result<(), CallerError> {
                 },
             ))
         };
-        let shared_gemini_config: control_plane::SharedGeminiConfig = {
-            let cfg = &project.config.agent.gemini_cli;
-            Arc::new(tokio::sync::RwLock::new(
-                control_plane::GeminiRuntimeConfig {
-                    model: cfg.model.clone(),
-                    approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
-                    sandbox: cfg.sandbox,
-                    extensions: cfg.extensions.clone(),
-                    allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
-                    include_directories: cfg.include_directories.clone(),
-                    debug: cfg.debug,
-                },
-            ))
-        };
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
                 codex_config: shared_codex_config.clone(),
-                gemini_config: shared_gemini_config.clone(),
                 bus: bus.clone(),
                 project_root: Some(project.root.clone()),
             },
@@ -36025,7 +35870,6 @@ async fn main() -> Result<(), CallerError> {
                 autonomy: autonomy_for_daemon.clone(),
                 shared_external_agent: shared_external_agent.clone(),
                 shared_codex_config: shared_codex_config.clone(),
-                shared_gemini_config: shared_gemini_config.clone(),
                 frame_registry: frame_registry.clone(),
                 session_registry: Some(session_registry.clone()),
                 web_port: web_port_for_agent,

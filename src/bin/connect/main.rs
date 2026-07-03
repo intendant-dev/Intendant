@@ -529,7 +529,7 @@ fn record_presence_hour(hours: &mut Vec<u64>, now_unix_ms: u64) -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct FleetTargetRecord {
     user_id: Uuid,
     id: String,
@@ -3068,13 +3068,14 @@ async fn api_fleet_targets_sync(
             .map(|record| record.first_seen_unix_ms)
             .filter(|value| *value > 0)
             .unwrap_or(target.first_seen_unix_ms);
+        // Signature fields ride through verbatim (normalize bounded them):
+        // the browser signs its records and re-verifies after the round
+        // trip, so stripping them here would turn every synced row into
+        // "unverified" and defeat the provenance badges.
         by_host.insert(
             target.host_id.clone(),
             FleetTargetRecord {
-                record_key: String::new(),
-                    record_sig: String::new(),
-                    record_signed_at_unix_ms: 0,
-                    first_seen_unix_ms,
+                first_seen_unix_ms,
                 ..target
             },
         );
@@ -3206,8 +3207,18 @@ fn canonicalize_fleet_target_for_owned_daemon(
     else {
         return;
     };
+    if target.id == connect_daemon_id && target.host_id == connect_daemon_id {
+        return;
+    }
     target.id = connect_daemon_id.clone();
     target.host_id = connect_daemon_id;
+    // The owner signature covers host_id; rewriting it here makes that
+    // signature permanently unverifiable, so drop it — the record honestly
+    // reads as unsigned instead of carrying a signature that can never
+    // match again.
+    target.record_key = String::new();
+    target.record_sig = String::new();
+    target.record_signed_at_unix_ms = 0;
 }
 
 fn normalize_fleet_target_input(
@@ -6690,6 +6701,45 @@ mod tests {
         )
         .expect("record normalizes");
         assert_eq!(clamped.record_signed_at_unix_ms, 1_800_000_000_000);
+    }
+
+    #[test]
+    fn canonicalize_drops_signature_only_when_it_rewrites_the_record() {
+        let signed = |id: &str, host_id: &str| FleetTargetRecord {
+            id: id.to_string(),
+            host_id: host_id.to_string(),
+            connect_daemon_id: Some("daemon-1".to_string()),
+            record_key: "PubKeyB64u".to_string(),
+            record_sig: "SigB64u".to_string(),
+            record_signed_at_unix_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let owned: HashSet<String> = ["daemon-1".to_string()].into_iter().collect();
+
+        // Not an owned daemon: untouched, signature intact.
+        let mut foreign = signed("alias", "alias");
+        canonicalize_fleet_target_for_owned_daemon(&mut foreign, &HashSet::new());
+        assert_eq!(foreign.host_id, "alias");
+        assert_eq!(foreign.record_sig, "SigB64u");
+
+        // Already canonical: nothing changes, so the signature still holds.
+        let mut canonical = signed("daemon-1", "daemon-1");
+        canonicalize_fleet_target_for_owned_daemon(&mut canonical, &owned);
+        assert_eq!(canonical.host_id, "daemon-1");
+        assert_eq!(canonical.record_key, "PubKeyB64u");
+        assert_eq!(canonical.record_sig, "SigB64u");
+        assert_eq!(canonical.record_signed_at_unix_ms, 1_700_000_000_000);
+
+        // Alias of an owned daemon: host_id is rewritten, which makes the
+        // owner signature (it covers host_id) permanently unverifiable —
+        // it must be dropped, not stored broken.
+        let mut alias = signed("alias", "alias");
+        canonicalize_fleet_target_for_owned_daemon(&mut alias, &owned);
+        assert_eq!(alias.id, "daemon-1");
+        assert_eq!(alias.host_id, "daemon-1");
+        assert!(alias.record_key.is_empty());
+        assert!(alias.record_sig.is_empty());
+        assert_eq!(alias.record_signed_at_unix_ms, 0);
     }
 
     fn daemon_record(

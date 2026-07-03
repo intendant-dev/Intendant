@@ -311,9 +311,15 @@ impl ViewState {
         // user can browse logs while an approval is pending.
         match app.mode {
             AppMode::Approval => {
-                // Let scroll/view keys work during approval
+                // The approval prompt owns Enter (approve, as advertised in
+                // help); the view layer would otherwise consume it to toggle
+                // turn expansion — Right still expands. Everything else
+                // scrolls/expands so the user can browse logs while deciding,
+                // and unconsumed keys fall through to handle_approval_key.
+                if key.code == KeyCode::Enter {
+                    return false;
+                }
                 self.handle_normal_view_key(key, app)
-                // If not consumed, falls through to App::handle_approval_key
             }
             AppMode::AskHuman | AppMode::FollowUp => false,
             AppMode::Normal | AppMode::Help | AppMode::Inspect => {
@@ -553,6 +559,30 @@ pub struct App {
     // as a single log entry when a boundary event arrives or after an idle period.
     voice_transcript_buffer: String,
     voice_transcript_idle_ticks: usize,
+}
+
+fn resolve_project_file_for_read(
+    project_root: &std::path::Path,
+    target: &str,
+) -> Result<std::path::PathBuf, String> {
+    let root = std::fs::canonicalize(project_root)
+        .map_err(|e| format!("Failed to resolve project root: {}", e))?;
+    let requested = std::path::Path::new(target);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let canonical =
+        std::fs::canonicalize(&candidate).map_err(|e| format!("Failed to resolve file: {}", e))?;
+    // query_detail file reads are confined to the project root.
+    if !canonical.starts_with(&root) {
+        return Err(format!(
+            "Refusing to read file outside project root: {}",
+            candidate.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 impl App {
@@ -1335,79 +1365,6 @@ impl App {
                     format!("Rename session {} → {}", session_id, name),
                 );
             }
-            ControlMsg::SetGeminiModel { ref model } => {
-                let label = model
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or("<default>");
-                self.log(
-                    LogLevel::Info,
-                    format!("Gemini model → {} (applies on next task)", label),
-                );
-            }
-            ControlMsg::SetGeminiApprovalMode { ref mode } => {
-                self.log(
-                    LogLevel::Info,
-                    format!("Gemini approval mode → {} (applies on next task)", mode),
-                );
-            }
-            ControlMsg::SetGeminiSandbox { enabled } => {
-                self.log(
-                    LogLevel::Info,
-                    format!(
-                        "Gemini sandbox {} (applies on next task)",
-                        if enabled { "ON" } else { "OFF" }
-                    ),
-                );
-            }
-            ControlMsg::SetGeminiExtensions { ref extensions } => {
-                let summary = if extensions.is_empty() {
-                    "<all>".to_string()
-                } else {
-                    format!("{} entry/entries", extensions.len())
-                };
-                self.log(
-                    LogLevel::Info,
-                    format!("Gemini extensions → {} (applies on next task)", summary),
-                );
-            }
-            ControlMsg::SetGeminiAllowedMcpServers { ref servers } => {
-                let summary = if servers.is_empty() {
-                    "<all>".to_string()
-                } else {
-                    format!("{} entry/entries", servers.len())
-                };
-                self.log(
-                    LogLevel::Info,
-                    format!("Gemini MCP allowlist → {} (applies on next task)", summary),
-                );
-            }
-            ControlMsg::SetGeminiIncludeDirectories { ref directories } => {
-                let summary = if directories.is_empty() {
-                    "<project root only>".to_string()
-                } else {
-                    format!("{} path(s)", directories.len())
-                };
-                self.log(
-                    LogLevel::Info,
-                    format!(
-                        "Gemini include-directories → {} (applies on next task)",
-                        summary
-                    ),
-                );
-            }
-            ControlMsg::SetGeminiDebug { enabled } => {
-                self.log(
-                    LogLevel::Info,
-                    format!(
-                        "Gemini debug {} (applies on next task)",
-                        if enabled { "ON" } else { "OFF" }
-                    ),
-                );
-            }
-            ControlMsg::GeminiThreadAction { ref op, .. } => {
-                self.log(LogLevel::Info, format!("Gemini thread action: {}", op));
-            }
             ControlMsg::SetVerbosity { level } => {
                 let new_verbosity = match level.to_lowercase().as_str() {
                     "quiet" => Some(Verbosity::Quiet),
@@ -1615,9 +1572,19 @@ impl App {
                         }
                     }
                     "file" => match target.as_deref() {
-                        Some(path) => match std::fs::read_to_string(path) {
-                            Ok(content) => content.lines().take(200).collect::<Vec<_>>().join("\n"),
-                            Err(e) => format!("Failed to read file: {}", e),
+                        Some(path) => match self
+                            .project_root
+                            .as_deref()
+                            .ok_or_else(|| "No project root available.".to_string())
+                            .and_then(|root| resolve_project_file_for_read(root, path))
+                        {
+                            Ok(path) => match std::fs::read_to_string(path) {
+                                Ok(content) => {
+                                    content.lines().take(200).collect::<Vec<_>>().join("\n")
+                                }
+                                Err(e) => format!("Failed to read file: {}", e),
+                            },
+                            Err(e) => e,
                         },
                         None => "Error: target file path is required".to_string(),
                     },
@@ -2502,9 +2469,6 @@ impl App {
             | AppEvent::SessionRelationship { .. }
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::SessionAgentConfigResult { .. }
-            | AppEvent::GeminiConfigChanged { .. }
-            | AppEvent::GeminiThreadActionRequested { .. }
-            | AppEvent::GeminiThreadActionResult { .. }
             | AppEvent::SharedView { .. }
             | AppEvent::BrowserWorkspaceChanged { .. }
             | AppEvent::FileChanged { .. }
@@ -2892,6 +2856,20 @@ mod tests {
     }
 
     #[test]
+    fn query_detail_file_path_must_stay_under_project_root() {
+        let base = tempfile::tempdir().unwrap();
+        let project = base.path().join("project");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+
+        let err = resolve_project_file_for_read(&project, "../outside/secret.txt").unwrap_err();
+
+        assert!(err.contains("outside project root"), "got: {err}");
+    }
+
+    #[test]
     fn app_log_adds_entries() {
         let mut app = test_app();
         app.log(LogLevel::Info, "hello".to_string());
@@ -2968,6 +2946,23 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.handle_key(key));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn approval_mode_enter_reaches_the_approval_handler() {
+        let mut app = test_app();
+        app.mode = AppMode::Approval;
+        let mut view = ViewState::default();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        // The view layer must not consume Enter during approval — help
+        // advertises y/Enter as approve, so it has to fall through to
+        // App::handle_approval_key.
+        assert!(!view.handle_key(enter, &app));
+        // Browsing keys still work while the prompt is up.
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        assert!(view.handle_key(right, &app));
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        assert!(view.handle_key(down, &app));
     }
 
     #[test]

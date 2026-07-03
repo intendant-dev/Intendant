@@ -21,7 +21,6 @@ pub struct SessionSupervisorConfig {
     pub autonomy: SharedAutonomy,
     pub shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     pub shared_codex_config: control_plane::SharedCodexConfig,
-    pub shared_gemini_config: control_plane::SharedGeminiConfig,
     pub frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     /// Live display sessions, when the daemon runs a display pipeline. CU
     /// screenshots prefer their in-memory frames over subprocess capture.
@@ -3467,17 +3466,6 @@ impl SessionSupervisor {
                 cfg.managed_context = current.managed_context;
                 cfg.context_archive = current.context_archive;
             }
-            Some(external_agent::AgentBackend::GeminiCli) => {
-                let current = self.config.shared_gemini_config.read().await.clone();
-                let cfg = &mut project.config.agent.gemini_cli;
-                cfg.model = current.model;
-                cfg.approval_mode = current.approval_mode;
-                cfg.sandbox = current.sandbox;
-                cfg.extensions = current.extensions;
-                cfg.allowed_mcp_servers = current.allowed_mcp_servers;
-                cfg.include_directories = current.include_directories;
-                cfg.debug = current.debug;
-            }
             Some(external_agent::AgentBackend::ClaudeCode) | None => {}
         }
         Ok(project)
@@ -3656,7 +3644,7 @@ impl SessionAgentSelection {
             .map(Self::External)
             .ok_or_else(|| {
                 format!(
-                    "unknown agent '{}' (expected internal, codex, claude-code, or gemini)",
+                    "unknown agent '{}' (expected internal, codex, or claude-code)",
                     trimmed
                 )
             })
@@ -3730,9 +3718,6 @@ fn apply_session_agent_command(
         }
         external_agent::AgentBackend::ClaudeCode => {
             project.config.agent.claude_code.command = command;
-        }
-        external_agent::AgentBackend::GeminiCli => {
-            project.config.agent.gemini_cli.command = command;
         }
     }
 }
@@ -4497,17 +4482,6 @@ mod tests {
                     writable_roots: Vec::new(),
                     managed_context: "vanilla".to_string(),
                     context_archive: "summary".to_string(),
-                },
-            )),
-            shared_gemini_config: Arc::new(tokio::sync::RwLock::new(
-                control_plane::GeminiRuntimeConfig {
-                    model: None,
-                    approval_mode: "default".to_string(),
-                    sandbox: false,
-                    extensions: Vec::new(),
-                    allowed_mcp_servers: Vec::new(),
-                    include_directories: Vec::new(),
-                    debug: false,
                 },
             )),
             frame_registry: Arc::new(tokio::sync::RwLock::new(frames::FrameRegistry::new(
@@ -5897,10 +5871,14 @@ mod tests {
             "codex".to_string()
         );
 
-        let err = codex_fast_new_session_agent(Some("gemini")).unwrap_err();
+        let err = codex_fast_new_session_agent(Some("claude-code")).unwrap_err();
         assert!(err.contains("Codex"), "got: {err}");
         let err = codex_fast_new_session_agent(Some("internal")).unwrap_err();
         assert!(err.contains("Codex"), "got: {err}");
+        // Retired backend: "gemini" fails as an unknown agent, not a
+        // non-Codex selection.
+        let err = codex_fast_new_session_agent(Some("gemini")).unwrap_err();
+        assert!(err.contains("unknown agent"), "got: {err}");
     }
 
     #[test]
@@ -5958,10 +5936,8 @@ mod tests {
             SessionAgentSelection::from_wire(Some("internal")).unwrap(),
             SessionAgentSelection::Internal
         );
-        assert_eq!(
-            SessionAgentSelection::from_wire(Some("gemini")).unwrap(),
-            SessionAgentSelection::External(external_agent::AgentBackend::GeminiCli)
-        );
+        // Retired backend: "gemini" must no longer resolve to a live backend.
+        assert!(SessionAgentSelection::from_wire(Some("gemini")).is_err());
         assert!(SessionAgentSelection::from_wire(Some("unknown")).is_err());
     }
 
@@ -6043,7 +6019,7 @@ mod tests {
 
         let err = apply_session_codex_managed_context(
             &mut project,
-            &external_agent::AgentBackend::GeminiCli,
+            &external_agent::AgentBackend::ClaudeCode,
             "managed".to_string(),
         )
         .unwrap_err();
@@ -6066,7 +6042,7 @@ mod tests {
 
         let err = apply_session_codex_context_archive(
             &mut project,
-            &external_agent::AgentBackend::GeminiCli,
+            &external_agent::AgentBackend::ClaudeCode,
             "summary".to_string(),
         )
         .unwrap_err();

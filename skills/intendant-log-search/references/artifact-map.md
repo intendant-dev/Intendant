@@ -207,7 +207,7 @@ Uploads:
 
 Wrapper logs:
 
-- External Codex, Claude Code, and Gemini sessions also get Intendant wrapper dirs under `~/.intendant/logs/<uuid>/`.
+- External Codex and Claude Code sessions also get Intendant wrapper dirs under `~/.intendant/logs/<uuid>/`.
 - The wrapper `session.jsonl` normalizes backend activity into Intendant events.
 - `session_identity` rows map wrapper id to backend-native id.
 - `session_agent_config.json` persists launch config: `source`, `project_root`, `agent_command`, Codex sandbox/approval/managed-context/service-tier values, `codex_context_archive`, and `codex_home`.
@@ -239,11 +239,6 @@ Claude Code native logs:
 
 - Dashboard lookup scans `~/.claude/projects/**/*.jsonl`.
 - It matches files whose stem equals the session id.
-
-Gemini native logs:
-
-- Dashboard lookup scans `~/.gemini/tmp/**/chats/*.json`.
-- It matches JSON files whose top-level `sessionId` equals the session id.
 
 ## Managed-Context Sidecars
 

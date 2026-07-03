@@ -3,7 +3,7 @@
 Intendant can run a task four different ways. The simplest is a single agent loop;
 the richest is an orchestrator that decomposes a task and delegates pieces to
 specialized child agents, each in its own git worktree. A fourth mode hands the
-whole task to a third-party coding CLI (Codex, Claude Code, Gemini) and supervises
+whole task to a third-party coding CLI (Codex or Claude Code) and supervises
 it — that path has its own chapter, [External-Agent Orchestration](./external-agent-orchestration.md).
 
 This chapter covers Intendant's *native* execution: the four modes, how one is

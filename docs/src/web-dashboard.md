@@ -744,7 +744,7 @@ by `api_media_annotation_attach` or `api_media_annotation_submit`; clips use
 `api_media_clip_start`, ordered `api_media_clip_frame` uploads keyed by
 `clip_id`, then `api_media_clip_end` or `api_media_clip_cancel`.
 Allowlisted settings-style `ControlMsg`s, such as autonomy, approval-rule,
-external-agent, Codex, Gemini, and verbosity settings, can also dispatch over
+external-agent, Codex, and verbosity settings, can also dispatch over
 the DataChannel when it is verified. Display input authority uses dedicated
 DataChannel RPCs and a `display_input` frame rather than the generic
 `ControlMsg` allowlist. The standalone Shell terminal subtab uses dedicated
@@ -759,7 +759,7 @@ steering, approvals, interrupt, resume, stop/restart, rename, and launch-config
 changes use a separate
 `api_session_control_msg` RPC with its own allowlist instead of broadening the
 generic settings-style `api_control_msg`. Smaller dashboard action controls use
-`api_dashboard_action_msg`; this includes Codex/Gemini thread actions, display
+`api_dashboard_action_msg`; this includes Codex thread actions, display
 take/release/grant/revoke, the diagnostics visual-marker toggle, recording and
 debug toggles, and browser workspace create/acquire/close/release. It has its
 own allowlist and the same no-replay fallback rule as the other mutation RPCs.
@@ -1399,7 +1399,7 @@ used by late WebSocket joiners. When no active session log exists it returns an
 empty replay with `available: false`.
 `api_external_session_activity_replay` returns an envelope whose `frames` array
 contains compact external attached-session activity replay frames for currently
-attached Codex/Claude/Gemini sessions. It uses the same transcript payloads as
+attached Codex/Claude Code sessions. It uses the same transcript payloads as
 WebSocket bootstrap. The combined bootstrap skips an attached external session
 when the active Intendant session log replay already names the same
 `external_session_id`, avoiding duplicate transcript hydration.
@@ -1546,7 +1546,7 @@ falls back to the WebSocket before it has attempted the RPC; once a verified
 DataChannel write is sent, an error is surfaced to the operator instead of
 replaying a potentially duplicated action.
 Small dashboard action controls use `api_dashboard_action_msg`. This covers
-Codex/Gemini attached-thread actions, local display authority toggles, the
+Codex attached-thread actions, local display authority toggles, the
 diagnostics visual-marker toggle, recording and debug screen controls, and
 browser workspace create/acquire/close/release. The browser applies the same
 no-replay fallback rule: use the WebSocket only before a verified DataChannel

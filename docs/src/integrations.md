@@ -58,11 +58,11 @@ trust framing applies to the MCP *server* side — see
 ## External coding-agent CLIs
 
 Instead of the native agent loop, Intendant can delegate coding work to an
-external CLI agent — **Codex**, **Claude Code**, or **Gemini CLI** — selected
-per-invocation with `--agent <codex|claude-code|gemini>` or by default via
+external CLI agent — **Codex** or **Claude Code** — selected per-invocation with
+`--agent <codex|claude-code>` or by default via
 `[agent] default_backend`. Each backend's binary path, model, sandbox/approval
-policy, and tool restrictions are configured under `[agent.codex]`,
-`[agent.claude_code]`, and `[agent.gemini_cli]` (full key reference in
+policy, and tool restrictions are configured under `[agent.codex]` and
+`[agent.claude_code]` (full key reference in
 [Configuration](./configuration.md#agent-and-external-backends)).
 
 Notable details:
@@ -71,9 +71,6 @@ Notable details:
   `approval_policy`, `reasoning_effort`, `web_search`, `network_access`, and
   `writable_roots` keys map onto Codex's own CLI flags. Approval prompts from
   Codex are surfaced through Intendant's normal approval UI.
-- **Gemini CLI** has Intendant's MCP entry merged into
-  `$HOME/.gemini/settings.json` so the Gemini session can reach Intendant's
-  tools; if you set `allowed_mcp_servers`, include `intendant`.
 
 This is a deep topic with its own chapter — see
 [External Agent Orchestration](./external-agent-orchestration.md).

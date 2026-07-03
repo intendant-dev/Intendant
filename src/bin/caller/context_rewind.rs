@@ -93,25 +93,46 @@ pub fn records_dir(log_dir: &Path) -> PathBuf {
     log_dir.join("context_rewinds")
 }
 
-pub fn record_path(log_dir: &Path, record_id: &str) -> PathBuf {
-    records_dir(log_dir).join(format!("{record_id}.json"))
+pub fn record_path(log_dir: &Path, record_id: &str) -> io::Result<PathBuf> {
+    validate_record_id(record_id)?;
+    Ok(records_dir(log_dir).join(format!("{record_id}.json")))
 }
 
-pub fn recovery_rollout_path(log_dir: &Path, record_id: &str) -> PathBuf {
-    records_dir(log_dir).join(format!("{record_id}-source-rollout.jsonl"))
+pub fn recovery_rollout_path(log_dir: &Path, record_id: &str) -> io::Result<PathBuf> {
+    validate_record_id(record_id)?;
+    Ok(records_dir(log_dir).join(format!("{record_id}-source-rollout.jsonl")))
+}
+
+fn validate_record_id(record_id: &str) -> io::Result<()> {
+    // Context rewind record ids are single filesystem path components.
+    let valid = !record_id.is_empty()
+        && record_id != "."
+        && record_id != ".."
+        && record_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "record_id must be a non-empty safe slug ([A-Za-z0-9._-]+)",
+        ))
+    }
 }
 
 pub fn persist_record(log_dir: &Path, record: &ContextRewindRecord) -> io::Result<()> {
+    let path = record_path(log_dir, &record.record_id)?;
     let dir = records_dir(log_dir);
     fs::create_dir_all(&dir)?;
     let bytes = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
     // Atomic write so a crash mid-write can't leave a truncated record that
     // `list_records` would silently skip (defeating durable recovery).
-    crate::file_watcher::atomic_write(&record_path(log_dir, &record.record_id), &bytes)
+    crate::file_watcher::atomic_write(&path, &bytes)
 }
 
 pub fn read_record(log_dir: &Path, record_id: &str) -> io::Result<ContextRewindRecord> {
-    let bytes = fs::read(record_path(log_dir, record_id))?;
+    let bytes = fs::read(record_path(log_dir, record_id)?)?;
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
@@ -145,7 +166,7 @@ pub fn copy_recovery_rollout(
     record_id: &str,
     source_rollout_path: &Path,
 ) -> io::Result<PathBuf> {
-    let target = recovery_rollout_path(log_dir, record_id);
+    let target = recovery_rollout_path(log_dir, record_id)?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -157,7 +178,7 @@ pub fn copy_recovery_rollout(
 /// artifact when a rewind's rollback fails, so a failed rewind leaves no
 /// orphaned files behind. A missing file is not an error.
 pub fn remove_recovery_rollout(log_dir: &Path, record_id: &str) -> io::Result<()> {
-    match fs::remove_file(recovery_rollout_path(log_dir, record_id)) {
+    match fs::remove_file(recovery_rollout_path(log_dir, record_id)?) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
@@ -376,7 +397,7 @@ mod tests {
         assert!(record.detached_fission_group_ids.is_empty());
 
         persist_record(dir.path(), &record).unwrap();
-        let raw = fs::read_to_string(record_path(dir.path(), "rewind-2")).unwrap();
+        let raw = fs::read_to_string(record_path(dir.path(), "rewind-2").unwrap()).unwrap();
         assert!(!raw.contains("detached_fission_group_ids"));
         assert!(!raw.contains("used_tokens_at_rewind"));
         assert!(!raw.contains("context_window_at_rewind"));
@@ -399,7 +420,7 @@ mod tests {
         record.surgical = true;
 
         persist_record(dir.path(), &record).unwrap();
-        let raw = fs::read_to_string(record_path(dir.path(), "rewind-surgical")).unwrap();
+        let raw = fs::read_to_string(record_path(dir.path(), "rewind-surgical").unwrap()).unwrap();
         assert!(raw.contains("\"surgical\": true"));
         assert_eq!(read_record(dir.path(), "rewind-surgical").unwrap(), record);
 
@@ -434,7 +455,7 @@ mod tests {
         record.pressure_band_at_rewind = Some("high".to_string());
 
         persist_record(dir.path(), &record).unwrap();
-        let raw = fs::read_to_string(record_path(dir.path(), "rewind-3")).unwrap();
+        let raw = fs::read_to_string(record_path(dir.path(), "rewind-3").unwrap()).unwrap();
         assert!(raw.contains("used_tokens_at_rewind"));
         assert!(raw.contains("context_window_at_rewind"));
         assert!(raw.contains("pressure_band_at_rewind"));
@@ -551,6 +572,39 @@ mod tests {
 
         fs::write(&source, "mutated\n").unwrap();
         assert_eq!(fs::read_to_string(copied).unwrap(), "pre-rewind-history\n");
+    }
+
+    #[test]
+    fn context_rewind_record_ids_must_be_safe_slugs() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.jsonl");
+        fs::write(&source, "pre-rewind-history\n").unwrap();
+        let record = minimal_record("../escape", "2026-05-25T00:00:00Z", None, "thread-1");
+
+        assert_eq!(
+            record_path(dir.path(), "../escape").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            persist_record(dir.path(), &record).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            read_record(dir.path(), "../escape").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            copy_recovery_rollout(dir.path(), "../escape", &source)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            remove_recovery_rollout(dir.path(), "../escape")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
