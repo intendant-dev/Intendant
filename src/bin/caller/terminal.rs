@@ -72,6 +72,53 @@ pub enum TerminalEvent {
     Exited { status: i32 },
 }
 
+/// Who is acting on a terminal session, resolved from the connection's
+/// access grant. `Root` is the owner lane (trusted local dashboards,
+/// unbound mTLS root certificates) and sees every session; everyone else
+/// acts as their IAM principal id and sees only sessions they own or
+/// sessions marked shared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalActor {
+    Root,
+    Principal(String),
+}
+
+impl TerminalActor {
+    fn owner_tag(&self) -> Option<String> {
+        match self {
+            Self::Root => None,
+            Self::Principal(id) => Some(id.clone()),
+        }
+    }
+}
+
+/// Why a scoped `open_or_attach` was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalOpenError {
+    /// The session exists but belongs to another principal and is not
+    /// shared. Worded identically to the missing-session spawn refusal so
+    /// the existence of foreign private sessions is not observable.
+    NotVisible,
+    /// The session would have to be created and the caller lacks
+    /// shell.spawn.
+    SpawnNotAllowed,
+    /// PTY/shell spawn failure.
+    Spawn(String),
+}
+
+impl std::fmt::Display for TerminalOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotVisible | Self::SpawnNotAllowed => write!(
+                f,
+                "not allowed: opening this terminal requires shell.spawn \
+                 (or a shared session you can view)"
+            ),
+            Self::Spawn(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// Fixed-capacity byte ring used for reconnect scrollback replay.
 struct Scrollback {
     buf: Vec<u8>,
@@ -108,12 +155,24 @@ pub struct PtySession {
     listeners: StdMutex<Vec<mpsc::UnboundedSender<TerminalEvent>>>,
     scrollback: StdMutex<Scrollback>,
     alive: StdMutex<bool>,
+    /// The IAM principal id this session belongs to; `None` is the
+    /// owner/root lane. Fixed at spawn.
+    owner: Option<String>,
+    /// Shared sessions are visible to (and, with terminal.write, usable
+    /// by) principals other than the owner. Toggled by the owner or root.
+    shared: std::sync::atomic::AtomicBool,
 }
 
 impl PtySession {
     /// Spawn a new shell under a fresh PTY. The shell defaults to
     /// `$SHELL`, falling back to `/bin/bash`.
-    fn spawn(cols: u16, rows: u16, cwd: Option<std::path::PathBuf>) -> Result<Arc<Self>, String> {
+    fn spawn(
+        cols: u16,
+        rows: u16,
+        cwd: Option<std::path::PathBuf>,
+        owner: Option<String>,
+        shared: bool,
+    ) -> Result<Arc<Self>, String> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -167,6 +226,8 @@ impl PtySession {
             listeners: StdMutex::new(Vec::new()),
             scrollback: StdMutex::new(Scrollback::new(SCROLLBACK_LIMIT)),
             alive: StdMutex::new(true),
+            owner,
+            shared: std::sync::atomic::AtomicBool::new(shared),
         });
 
         // Reader: dedicated OS thread (portable_pty's reader is blocking).
@@ -272,6 +333,38 @@ impl PtySession {
     pub fn is_alive(&self) -> bool {
         self.alive.lock().map(|g| *g).unwrap_or(false)
     }
+
+    pub fn shared(&self) -> bool {
+        self.shared.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The owning principal id (`None` = owner/root lane), for acks and
+    /// UI badges.
+    pub fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
+    }
+
+    /// Whether `actor` may see (attach to / act on) this session: root
+    /// sees everything, owners see their own, everyone sees shared
+    /// sessions.
+    pub fn visible_to(&self, actor: &TerminalActor) -> bool {
+        match actor {
+            TerminalActor::Root => true,
+            TerminalActor::Principal(id) => {
+                self.shared() || self.owner.as_deref() == Some(id.as_str())
+            }
+        }
+    }
+
+    /// Whether `actor` may change this session's sharing: root or the
+    /// owner. (Root-lane sessions have no owner id, so only root
+    /// qualifies.)
+    pub fn managed_by(&self, actor: &TerminalActor) -> bool {
+        match actor {
+            TerminalActor::Root => true,
+            TerminalActor::Principal(id) => self.owner.as_deref() == Some(id.as_str()),
+        }
+    }
 }
 
 /// Process-wide registry of live shell sessions, keyed by
@@ -290,20 +383,38 @@ impl TerminalRegistry {
         }
     }
 
-    /// Returns the session for `key`, spawning a new shell if it doesn't
-    /// exist yet. Dead sessions (child has exited) are replaced on the
-    /// next open so the user can type `exit` and get a fresh shell.
+    /// Returns the session for `key` — attaching when it exists and is
+    /// visible to `actor`, spawning a new shell (owned by `actor`, shared
+    /// per `shared`) when it doesn't. Dead sessions (child has exited) are
+    /// replaced on the next open so the user can type `exit` and get a
+    /// fresh shell — replacement is a spawn and follows spawn rules.
+    ///
+    /// `may_spawn` is the caller's shell.spawn decision; the registry
+    /// enforces it on exactly the paths that create a PTY so a
+    /// check-then-open race can never spawn for a caller that was only
+    /// allowed to attach. The `bool` in the Ok tuple is `true` when a new
+    /// shell was spawned.
     pub async fn open_or_attach(
         &self,
         key: TerminalKey,
         cols: u16,
         rows: u16,
-    ) -> Result<Arc<PtySession>, String> {
+        actor: &TerminalActor,
+        may_spawn: bool,
+        shared: bool,
+    ) -> Result<(Arc<PtySession>, bool), TerminalOpenError> {
+        let attach = |existing: &Arc<PtySession>| {
+            if existing.visible_to(actor) {
+                Ok((existing.clone(), false))
+            } else {
+                Err(TerminalOpenError::NotVisible)
+            }
+        };
         {
             let guard = self.sessions.read().await;
             if let Some(existing) = guard.get(&key) {
                 if existing.is_alive() {
-                    return Ok(existing.clone());
+                    return attach(existing);
                 }
             }
         }
@@ -313,26 +424,79 @@ impl TerminalRegistry {
         // spawned the session concurrently.
         if let Some(existing) = guard.get(&key) {
             if existing.is_alive() {
-                return Ok(existing.clone());
+                return attach(existing);
             }
         }
 
-        let session = PtySession::spawn(cols, rows, Some(self.project_root.clone()))?;
+        if !may_spawn {
+            return Err(TerminalOpenError::SpawnNotAllowed);
+        }
+        let session = PtySession::spawn(
+            cols,
+            rows,
+            Some(self.project_root.clone()),
+            actor.owner_tag(),
+            shared,
+        )
+        .map_err(TerminalOpenError::Spawn)?;
         guard.insert(key, session.clone());
-        Ok(session)
+        Ok((session, true))
     }
 
-    pub async fn get(&self, key: &TerminalKey) -> Option<Arc<PtySession>> {
-        self.sessions.read().await.get(key).cloned()
+    /// The live session for `key`, only when `actor` may see it. Invisible
+    /// sessions read as absent so foreign private sessions are not
+    /// observable.
+    pub async fn get_visible(
+        &self,
+        key: &TerminalKey,
+        actor: &TerminalActor,
+    ) -> Option<Arc<PtySession>> {
+        self.sessions
+            .read()
+            .await
+            .get(key)
+            .filter(|session| session.visible_to(actor))
+            .cloned()
     }
 
-    pub async fn close(&self, key: &TerminalKey) {
-        if let Some(session) = self.sessions.write().await.remove(key) {
+    /// Close `key` if `actor` may see it. Returns whether a session was
+    /// closed.
+    pub async fn close_visible(&self, key: &TerminalKey, actor: &TerminalActor) -> bool {
+        let mut guard = self.sessions.write().await;
+        let visible = guard
+            .get(key)
+            .map(|session| session.visible_to(actor))
+            .unwrap_or(false);
+        if !visible {
+            return false;
+        }
+        if let Some(session) = guard.remove(key) {
             // Writing EOF (Ctrl-D) to the shell's stdin tells it to exit
             // cleanly; if it ignores, the session is simply dropped and
             // the reader thread hits read error → broadcasts Exited.
             session.write_input(&[0x04]);
         }
+        true
+    }
+
+    /// Toggle sharing on `key`. Only root or the owning principal may;
+    /// returns the new shared state, or `None` when the session is absent
+    /// or `actor` may not manage it.
+    pub async fn set_shared(
+        &self,
+        key: &TerminalKey,
+        actor: &TerminalActor,
+        shared: bool,
+    ) -> Option<bool> {
+        let guard = self.sessions.read().await;
+        let session = guard.get(key)?;
+        if !session.managed_by(actor) {
+            return None;
+        }
+        session
+            .shared
+            .store(shared, std::sync::atomic::Ordering::Relaxed);
+        Some(shared)
     }
 
     #[cfg(test)]
@@ -349,7 +513,11 @@ mod tests {
     async fn open_attach_write_and_receive_output() {
         let registry = TerminalRegistry::new(std::env::temp_dir());
         let key = TerminalKey::local("test-0");
-        let session = registry.open_or_attach(key.clone(), 80, 24).await.unwrap();
+        let (session, created) = registry
+            .open_or_attach(key.clone(), 80, 24, &TerminalActor::Root, true, false)
+            .await
+            .unwrap();
+        assert!(created);
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         session.attach(tx);
@@ -381,7 +549,10 @@ mod tests {
     async fn attach_replays_scrollback() {
         let registry = TerminalRegistry::new(std::env::temp_dir());
         let key = TerminalKey::local("test-1");
-        let session = registry.open_or_attach(key, 80, 24).await.unwrap();
+        let (session, _) = registry
+            .open_or_attach(key, 80, 24, &TerminalActor::Root, true, false)
+            .await
+            .unwrap();
 
         // Drive a command through the first listener, then detach.
         let (tx1, mut rx1) = mpsc::unbounded_channel();
@@ -421,9 +592,74 @@ mod tests {
     async fn open_or_attach_reuses_live_session() {
         let registry = TerminalRegistry::new(std::env::temp_dir());
         let key = TerminalKey::local("test-2");
-        let a = registry.open_or_attach(key.clone(), 80, 24).await.unwrap();
-        let b = registry.open_or_attach(key, 80, 24).await.unwrap();
+        let (a, created_a) = registry
+            .open_or_attach(key.clone(), 80, 24, &TerminalActor::Root, true, false)
+            .await
+            .unwrap();
+        let (b, created_b) = registry
+            .open_or_attach(key, 80, 24, &TerminalActor::Root, true, false)
+            .await
+            .unwrap();
+        assert!(created_a);
+        assert!(!created_b);
         assert!(Arc::ptr_eq(&a, &b), "expected same Arc on re-open");
         assert_eq!(registry.len().await, 1);
+    }
+
+    /// The ownership model end to end: private sessions are invisible to
+    /// other principals (attach, input, close all read as absent), spawn
+    /// requires shell.spawn, and sharing — toggled only by owner or root —
+    /// opens visibility without transferring management.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ownership_scopes_visibility_spawn_and_sharing() {
+        let registry = TerminalRegistry::new(std::env::temp_dir());
+        let owner = TerminalActor::Principal("principal:client-key:alice".to_string());
+        let other = TerminalActor::Principal("principal:client-key:bob".to_string());
+        let key = TerminalKey::local("test-owned");
+
+        // A collaborator without shell.spawn cannot create.
+        let denied = registry
+            .open_or_attach(key.clone(), 80, 24, &other, false, false)
+            .await;
+        assert!(matches!(denied, Err(TerminalOpenError::SpawnNotAllowed)));
+
+        // The owner spawns a private session.
+        let (session, created) = registry
+            .open_or_attach(key.clone(), 80, 24, &owner, true, false)
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!(session.owner(), Some("principal:client-key:alice"));
+        assert!(!session.shared());
+
+        // Invisible to another principal: attach refused, session reads
+        // as absent for writes and close, sharing refused.
+        assert!(matches!(
+            registry
+                .open_or_attach(key.clone(), 80, 24, &other, true, false)
+                .await,
+            Err(TerminalOpenError::NotVisible)
+        ));
+        assert!(registry.get_visible(&key, &other).await.is_none());
+        assert!(!registry.close_visible(&key, &other).await);
+        assert!(registry.set_shared(&key, &other, true).await.is_none());
+
+        // Root sees it; the owner shares it; now the collaborator attaches
+        // (no spawn right needed) but still cannot manage sharing... and a
+        // root close works on someone else's session.
+        assert!(registry.get_visible(&key, &TerminalActor::Root).await.is_some());
+        assert_eq!(registry.set_shared(&key, &owner, true).await, Some(true));
+        let (attached, created) = registry
+            .open_or_attach(key.clone(), 80, 24, &other, false, false)
+            .await
+            .unwrap();
+        assert!(!created);
+        assert!(Arc::ptr_eq(&session, &attached));
+        assert!(registry.get_visible(&key, &other).await.is_some());
+        assert!(registry.set_shared(&key, &other, false).await.is_none());
+        assert!(session.managed_by(&owner));
+        assert!(!session.managed_by(&other));
+        assert!(registry.close_visible(&key, &TerminalActor::Root).await);
+        assert_eq!(registry.len().await, 0);
     }
 }

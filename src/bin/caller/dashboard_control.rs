@@ -276,6 +276,19 @@ impl DashboardControlGrant {
         }
     }
 
+    /// The terminal actor lane for this connection: root-equivalent
+    /// grants (trusted local, unbound mTLS root) own the root lane and
+    /// see every shell session; everyone else acts as their principal id
+    /// and sees only owned or shared sessions.
+    pub(crate) fn terminal_actor(&self) -> crate::terminal::TerminalActor {
+        let principal = self.access_principal();
+        if principal.kind == "root_session" {
+            crate::terminal::TerminalActor::Root
+        } else {
+            crate::terminal::TerminalActor::Principal(principal.id)
+        }
+    }
+
     pub(crate) fn access_decision(
         &self,
         op: crate::peer::access_policy::PeerOperation,
@@ -2020,8 +2033,13 @@ fn dashboard_control_frame_operation(t: &str) -> Option<crate::peer::access_poli
     use crate::peer::access_policy::PeerOperation;
     match t {
         "display_input" => Some(PeerOperation::DisplayInput),
-        "terminal_open" | "terminal_input" | "terminal_resize" | "terminal_close" => {
-            Some(PeerOperation::Terminal)
+        // Floor operations: terminal_open may additionally require
+        // shell.spawn (when the session doesn't exist yet) and every
+        // terminal frame is scoped to sessions the actor can see — both
+        // enforced statefully in the frame handlers.
+        "terminal_open" => Some(PeerOperation::TerminalView),
+        "terminal_input" | "terminal_resize" | "terminal_close" | "terminal_share" => {
+            Some(PeerOperation::TerminalWrite)
         }
         "tui_subscribe" | "tui_key" | "tui_resize" | "tui_unsubscribe" | "tui_close" => {
             Some(PeerOperation::RuntimeControl)
@@ -2263,6 +2281,7 @@ fn control_frame_response(
         "terminal_input" => control_terminal_input_frame(parsed, runtime),
         "terminal_resize" => control_terminal_resize_frame(parsed, runtime),
         "terminal_close" => control_terminal_close_frame(parsed, runtime, terminal_forwarders),
+        "terminal_share" => control_terminal_share_frame(parsed, runtime, terminal_events_tx),
         "tui_subscribe" => {
             control_tui_subscribe_frame(parsed, runtime, terminal_events_tx, tui_connections)
         }
@@ -2931,19 +2950,37 @@ fn control_terminal_open_frame(
     }
     let registry = runtime.terminal_registry.clone();
     let terminal_events_tx = terminal_events_tx.clone();
+    // Attach needs only the terminal.view floor already enforced by the
+    // frame table; creating a shell needs shell.spawn, decided at frame
+    // time so expiry mid-connection is honored.
+    let actor = runtime.grant.terminal_actor();
+    let may_spawn = runtime_operation_decision(
+        runtime,
+        crate::peer::access_policy::PeerOperation::ShellSpawn,
+    )
+    .allowed;
+    let shared = frame
+        .get("shared")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let handle = tokio::spawn(async move {
         let key = crate::terminal::TerminalKey {
             host_id: host_id.clone(),
             terminal_id: terminal_id.clone(),
         };
-        match registry.open_or_attach(key, cols, rows).await {
-            Ok(session) => {
+        match registry
+            .open_or_attach(key, cols, rows, &actor, may_spawn, shared)
+            .await
+        {
+            Ok((session, _created)) => {
                 let (tx, mut rx) = mpsc::unbounded_channel();
                 session.attach(tx);
                 let _ = terminal_events_tx.send(serde_json::json!({
                     "t": "terminal_opened",
                     "host_id": host_id.clone(),
                     "terminal_id": terminal_id.clone(),
+                    "shared": session.shared(),
+                    "can_share": session.managed_by(&actor),
                 }));
                 while let Some(event) = rx.recv().await {
                     let frame = match event {
@@ -2975,7 +3012,7 @@ fn control_terminal_open_frame(
                     "t": "terminal_error",
                     "host_id": host_id,
                     "terminal_id": terminal_id,
-                    "error": e,
+                    "error": e.to_string(),
                 }));
             }
         }
@@ -2997,12 +3034,13 @@ fn control_terminal_input_frame(
         return None;
     };
     let registry = runtime.terminal_registry.clone();
+    let actor = runtime.grant.terminal_actor();
     tokio::spawn(async move {
         let key = crate::terminal::TerminalKey {
             host_id,
             terminal_id,
         };
-        if let Some(session) = registry.get(&key).await {
+        if let Some(session) = registry.get_visible(&key, &actor).await {
             session.write_input(&data);
         }
     });
@@ -3017,12 +3055,13 @@ fn control_terminal_resize_frame(
     let cols = terminal_frame_dimension(&frame, "cols", 80);
     let rows = terminal_frame_dimension(&frame, "rows", 24);
     let registry = runtime.terminal_registry.clone();
+    let actor = runtime.grant.terminal_actor();
     tokio::spawn(async move {
         let key = crate::terminal::TerminalKey {
             host_id,
             terminal_id,
         };
-        if let Some(session) = registry.get(&key).await {
+        if let Some(session) = registry.get_visible(&key, &actor).await {
             session.resize(cols, rows);
         }
     });
@@ -3039,12 +3078,50 @@ fn control_terminal_close_frame(
         handle.abort();
     }
     let registry = runtime.terminal_registry.clone();
+    let actor = runtime.grant.terminal_actor();
     tokio::spawn(async move {
         let key = crate::terminal::TerminalKey {
             host_id,
             terminal_id,
         };
-        registry.close(&key).await;
+        registry.close_visible(&key, &actor).await;
+    });
+    None
+}
+
+fn control_terminal_share_frame(
+    frame: serde_json::Value,
+    runtime: &ControlRuntime,
+    terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let (host_id, terminal_id) = terminal_frame_key(&frame);
+    let shared = frame
+        .get("shared")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let registry = runtime.terminal_registry.clone();
+    let actor = runtime.grant.terminal_actor();
+    let terminal_events_tx = terminal_events_tx.clone();
+    tokio::spawn(async move {
+        let key = crate::terminal::TerminalKey {
+            host_id: host_id.clone(),
+            terminal_id: terminal_id.clone(),
+        };
+        let msg = match registry.set_shared(&key, &actor, shared).await {
+            Some(state) => serde_json::json!({
+                "t": "terminal_shared",
+                "host_id": host_id,
+                "terminal_id": terminal_id,
+                "shared": state,
+            }),
+            None => serde_json::json!({
+                "t": "terminal_error",
+                "host_id": host_id,
+                "terminal_id": terminal_id,
+                "error": "not allowed: only the session owner or root can change sharing",
+            }),
+        };
+        let _ = terminal_events_tx.send(msg);
     });
     None
 }
@@ -4059,8 +4136,10 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         runtime,
         crate::peer::access_policy::PeerOperation::FilesystemWrite,
     );
-    let terminal =
-        runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Terminal);
+    let terminal = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::TerminalView,
+    );
     let display_view = runtime_allows_operation(
         runtime,
         crate::peer::access_policy::PeerOperation::DisplayView,

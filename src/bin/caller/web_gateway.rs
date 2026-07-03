@@ -19269,6 +19269,11 @@ pub fn spawn_web_gateway(
                         let mut ws_denied_logged: std::collections::HashSet<String> =
                             std::collections::HashSet::new();
 
+                        // Shell-session lane for this connection: root sees
+                        // every session, scoped principals see owned/shared.
+                        let ws_terminal_actor =
+                            dashboard_control_grant_inbound.terminal_actor();
+
                         // Per-connection audio transcription buffer.
                         // PCM16 bytes are accumulated and drained every ~3s.
                         let mut audio_buf: Vec<u8> = Vec::new();
@@ -20799,11 +20804,30 @@ pub fn spawn_web_gateway(
                                                 terminal_id: terminal_id.clone(),
                                             };
 
+                                            // Attach needs only the terminal.view
+                                            // floor already enforced; creating a
+                                            // shell needs shell.spawn, decided at
+                                            // frame time so expiry mid-connection
+                                            // is honored.
+                                            let may_spawn = dashboard_control_grant_inbound
+                                                .access_decision(
+                                                    crate::peer::access_policy::PeerOperation::ShellSpawn,
+                                                )
+                                                .allowed;
+                                            let shared =
+                                                json["shared"].as_bool().unwrap_or(false);
                                             match terminal_registry_inbound
-                                                .open_or_attach(key.clone(), cols, rows)
+                                                .open_or_attach(
+                                                    key.clone(),
+                                                    cols,
+                                                    rows,
+                                                    &ws_terminal_actor,
+                                                    may_spawn,
+                                                    shared,
+                                                )
                                                 .await
                                             {
-                                                Ok(session) => {
+                                                Ok((session, _created)) => {
                                                     // Spawn a forwarder task that drains the session's
                                                     // per-listener channel and sends base64-encoded
                                                     // output to this WS connection.
@@ -20849,6 +20873,9 @@ pub fn spawn_web_gateway(
                                                         "t": "terminal_opened",
                                                         "host_id": host_id,
                                                         "terminal_id": terminal_id,
+                                                        "shared": session.shared(),
+                                                        "can_share": session
+                                                            .managed_by(&ws_terminal_actor),
                                                     });
                                                     let _ = direct_tx_inbound.send(ack.to_string());
                                                 }
@@ -20857,7 +20884,7 @@ pub fn spawn_web_gateway(
                                                         "t": "terminal_error",
                                                         "host_id": host_id,
                                                         "terminal_id": terminal_id,
-                                                        "error": e,
+                                                        "error": e.to_string(),
                                                     });
                                                     let _ = direct_tx_inbound.send(err.to_string());
                                                 }
@@ -20883,8 +20910,9 @@ pub fn spawn_web_gateway(
                                                     host_id,
                                                     terminal_id,
                                                 };
-                                                if let Some(session) =
-                                                    terminal_registry_inbound.get(&key).await
+                                                if let Some(session) = terminal_registry_inbound
+                                                    .get_visible(&key, &ws_terminal_actor)
+                                                    .await
                                                 {
                                                     session.write_input(&data);
                                                 }
@@ -20906,8 +20934,9 @@ pub fn spawn_web_gateway(
                                                 host_id,
                                                 terminal_id,
                                             };
-                                            if let Some(session) =
-                                                terminal_registry_inbound.get(&key).await
+                                            if let Some(session) = terminal_registry_inbound
+                                                .get_visible(&key, &ws_terminal_actor)
+                                                .await
                                             {
                                                 session.resize(cols, rows);
                                             }
@@ -20926,7 +20955,44 @@ pub fn spawn_web_gateway(
                                                 host_id,
                                                 terminal_id,
                                             };
-                                            terminal_registry_inbound.close(&key).await;
+                                            terminal_registry_inbound
+                                                .close_visible(&key, &ws_terminal_actor)
+                                                .await;
+                                        }
+                                        Some("terminal_share") => {
+                                            // {"t":"terminal_share","host_id":"local","terminal_id":"shell-0","shared":true}
+                                            let host_id = json["host_id"]
+                                                .as_str()
+                                                .unwrap_or("local")
+                                                .to_string();
+                                            let terminal_id = json["terminal_id"]
+                                                .as_str()
+                                                .unwrap_or("shell-0")
+                                                .to_string();
+                                            let shared =
+                                                json["shared"].as_bool().unwrap_or(true);
+                                            let key = crate::terminal::TerminalKey {
+                                                host_id: host_id.clone(),
+                                                terminal_id: terminal_id.clone(),
+                                            };
+                                            let msg = match terminal_registry_inbound
+                                                .set_shared(&key, &ws_terminal_actor, shared)
+                                                .await
+                                            {
+                                                Some(state) => serde_json::json!({
+                                                    "t": "terminal_shared",
+                                                    "host_id": host_id,
+                                                    "terminal_id": terminal_id,
+                                                    "shared": state,
+                                                }),
+                                                None => serde_json::json!({
+                                                    "t": "terminal_error",
+                                                    "host_id": host_id,
+                                                    "terminal_id": terminal_id,
+                                                    "error": "not allowed: only the session owner or root can change sharing",
+                                                }),
+                                            };
+                                            let _ = direct_tx_inbound.send(msg.to_string());
                                         }
                                         Some("display_input") => {
                                             // Input event (keyboard/mouse) for a display session.
@@ -29307,9 +29373,14 @@ fn peer_identity_allows_ws_control(
 fn ws_frame_operation(frame_type: &str) -> Option<crate::peer::access_policy::PeerOperation> {
     use crate::peer::access_policy::PeerOperation;
     match frame_type {
-        // Same frame names as the dashboard-control tunnel table.
-        "terminal_open" | "terminal_input" | "terminal_resize" | "terminal_close" => {
-            Some(PeerOperation::Terminal)
+        // Same frame names as the dashboard-control tunnel table. Floor
+        // operations: terminal_open may additionally require shell.spawn
+        // (when the session doesn't exist yet) and every terminal frame is
+        // scoped to sessions the actor can see — both enforced statefully
+        // in the frame handlers.
+        "terminal_open" => Some(PeerOperation::TerminalView),
+        "terminal_input" | "terminal_resize" | "terminal_close" | "terminal_share" => {
+            Some(PeerOperation::TerminalWrite)
         }
         "display_input" => Some(PeerOperation::DisplayInput),
         // Parity: api_diagnostics_visual_freshness → DisplayInput. The
@@ -36228,7 +36299,7 @@ mod tests {
         );
         assert!(
             !local
-                .decision(crate::peer::access_policy::PeerOperation::Terminal)
+                .decision(crate::peer::access_policy::PeerOperation::TerminalWrite)
                 .allowed
         );
 
@@ -40599,11 +40670,15 @@ mod tests {
         use crate::peer::access_policy::PeerOperation;
         assert_eq!(
             ws_frame_operation("terminal_open"),
-            Some(PeerOperation::Terminal)
+            Some(PeerOperation::TerminalView)
         );
         assert_eq!(
             ws_frame_operation("terminal_input"),
-            Some(PeerOperation::Terminal)
+            Some(PeerOperation::TerminalWrite)
+        );
+        assert_eq!(
+            ws_frame_operation("terminal_share"),
+            Some(PeerOperation::TerminalWrite)
         );
         assert_eq!(
             ws_frame_operation("display_input"),
