@@ -41,7 +41,7 @@ use crate::frontend::{
     StatusSnapshot, UserAction,
 };
 use crate::types::OutboundEvent;
-use crate::types::{LogLevel, Phase, Verbosity};
+use crate::types::{truncate_str, LogLevel, Phase, Verbosity};
 use crate::FollowUpMessage;
 
 const CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT: f64 = 85.0;
@@ -5477,7 +5477,7 @@ pub fn spawn_event_listener(
                     } => {
                         s.session_tokens += usage.total_tokens;
                         let preview = if content.len() > 500 {
-                            format!("{}...", &content[..500])
+                            format!("{}...", truncate_str(&content, 500))
                         } else {
                             content
                         };
@@ -5485,7 +5485,7 @@ pub fn spawn_event_listener(
                         if let Some(r) = reasoning {
                             s.push_log(
                                 LogLevel::Debug,
-                                format!("[T{}] reasoning: {}...", turn, &r[..r.len().min(100)]),
+                                format!("[T{}] reasoning: {}...", turn, truncate_str(&r, 100)),
                             );
                         }
                         resource_changed = Some("intendant://logs");
@@ -11196,7 +11196,7 @@ fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
         CuAction::Click { x, y, button } => format!("(click {},{} {:?})", x, y, button),
         CuAction::DoubleClick { x, y, button } => format!("(dblclick {},{} {:?})", x, y, button),
         CuAction::Type { text } => {
-            let preview = if text.len() > 30 { &text[..30] } else { text };
+            let preview = truncate_str(text, 30);
             format!("(type \"{}\")", preview)
         }
         CuAction::Key { key } => format!("(key {})", key),
@@ -11223,7 +11223,7 @@ fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
         CuAction::MouseDown { x, y, button } => format!("(mousedown {},{} {:?})", x, y, button),
         CuAction::MouseUp { x, y, button } => format!("(mouseup {},{} {:?})", x, y, button),
         CuAction::Paste { text } => {
-            let preview = if text.len() > 30 { &text[..30] } else { text };
+            let preview = truncate_str(text, 30);
             format!("(paste \"{}\")", preview)
         }
         CuAction::HoldKey { key, ms } => format!("(holdkey {} {}ms)", key, ms),
@@ -11417,6 +11417,23 @@ mod tests {
     use tokio::time::{timeout, Duration};
 
     static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn format_cu_action_brief_truncates_multibyte_text_on_char_boundary() {
+        let text = "\u{1f980}".repeat(8);
+        let expected_preview = "\u{1f980}".repeat(7);
+        let action = crate::computer_use::CuAction::Type { text: text.clone() };
+        assert_eq!(
+            format_cu_action_brief(&action),
+            format!("(type \"{}\")", expected_preview)
+        );
+
+        let action = crate::computer_use::CuAction::Paste { text };
+        assert_eq!(
+            format_cu_action_brief(&action),
+            format!("(paste \"{}\")", expected_preview)
+        );
+    }
 
     fn test_state() -> SharedMcpState {
         test_state_with_log_dir(std::path::PathBuf::from("/tmp/test_session"))

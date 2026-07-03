@@ -61,6 +61,18 @@ pub struct LiveUsage {
     pub output_audio_tokens: u64,
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm_impl {
     use super::*;
@@ -209,7 +221,7 @@ mod wasm_impl {
                 let tool = msg["tool"].as_str().unwrap_or("query");
                 let result_text = msg["result"].as_str().unwrap_or("");
                 let truncated = if result_text.len() > 2000 {
-                    format!("{}...(truncated)", &result_text[..2000])
+                    format!("{}...(truncated)", truncate_str(result_text, 2000))
                 } else {
                     result_text.to_string()
                 };
@@ -530,7 +542,7 @@ mod wasm_impl {
                             let tool = msg["tool"].as_str().unwrap_or("query");
                             let result_text = msg["result"].as_str().unwrap_or("");
                             let truncated = if result_text.len() > 2000 {
-                                format!("{}...(truncated)", &result_text[..2000])
+                                format!("{}...(truncated)", truncate_str(result_text, 2000))
                             } else {
                                 result_text.to_string()
                             };
@@ -1442,6 +1454,12 @@ mod wasm_impl {
 
 #[cfg(test)]
 mod authority_wire_tests {
+    #[test]
+    fn truncate_str_stops_at_char_boundary() {
+        let text = format!("{}{}", "a".repeat(1999), "\u{00e9}");
+        assert_eq!(super::truncate_str(&text, 2000), "a".repeat(1999));
+    }
+
     /// The dispatch in `connect_server` matches `t == "display_input_authority_state"`
     /// and reads `display_id: u64` + `state: &str`.  This test pins
     /// that exact shape against the JSON the gateway actually emits,
