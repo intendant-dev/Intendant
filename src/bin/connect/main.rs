@@ -93,6 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/access", get(access_ui))
         .route("/app", get(app_html))
         .route("/healthz", get(healthz))
+        .route("/install.sh", get(install_sh))
         .route("/readyz", get(readyz))
         .route("/api/me", get(api_me))
         .route("/api/logout", post(api_logout))
@@ -911,6 +912,22 @@ fn audit(
 
 async fn healthz() -> impl IntoResponse {
     Json(json!({ "ok": true }))
+}
+
+/// The bootstrap installer (credential custody, rollout step 6), embedded
+/// at build time so the service — hosted or self-hosted — serves the
+/// installer that matches its own version:
+///   curl -fsSL <origin>/install.sh | sh -s -- --owner <fingerprint>
+const INSTALL_SH: &str = include_str!("../../../scripts/install.sh");
+
+async fn install_sh() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        INSTALL_SH,
+    )
 }
 
 async fn readyz(State(state): State<Arc<AppState>>) -> Response {
@@ -6661,6 +6678,16 @@ mod tests {
         assert_eq!(
             manual.get("source").and_then(|v| v.as_str()),
             Some("browser_fleet")
+        );
+    }
+
+    #[test]
+    fn embedded_installer_is_the_bootstrap_script() {
+        assert!(INSTALL_SH.starts_with("#!/bin/sh"), "installer must be a sh script");
+        assert!(INSTALL_SH.contains("--owner"), "installer must support the owner bootstrap");
+        assert!(
+            INSTALL_SH.contains("cargo build --release"),
+            "installer must build release binaries"
         );
     }
 
