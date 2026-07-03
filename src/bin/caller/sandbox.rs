@@ -1,5 +1,26 @@
 use std::path::{Path, PathBuf};
 
+/// Escape a path for a double-quoted Seatbelt profile string literal.
+/// Paths that cannot be represented safely (non-UTF-8 or control bytes)
+/// are refused — the caller fails loudly rather than producing a profile
+/// that means something else.
+#[cfg(target_os = "macos")]
+pub(crate) fn seatbelt_path_literal(path: &Path) -> Result<String, String> {
+    let Some(text) = path.to_str() else {
+        return Err(format!(
+            "sandbox path {} is not valid UTF-8",
+            path.display()
+        ));
+    };
+    if text.chars().any(|c| c.is_control()) {
+        return Err(format!("sandbox path {text:?} contains control characters"));
+    }
+    Ok(format!(
+        "\"{}\"",
+        text.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
 /// Configuration for Landlock filesystem sandboxing.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -50,6 +71,42 @@ impl SandboxConfig {
             write_paths: vec![session_log_dir.to_path_buf(), quarantine_dir.to_path_buf()],
             enabled: true,
         }
+    }
+
+    /// Generate a Seatbelt (sandbox-exec) profile mirroring this config's
+    /// Landlock posture on macOS: reads stay open (`read_paths` is `/` for
+    /// the agent runtime), writes are denied everywhere except
+    /// `write_paths` plus the scratch locations every Unix process assumes
+    /// (`/dev` tty nodes, `/tmp`, `/var/tmp`, the per-user `TMPDIR`).
+    /// Seatbelt rules are last-match-wins and evaluate REAL paths, so
+    /// write paths are canonicalized first — a rule on a symlinked root
+    /// (`/tmp`, `/var`, `/etc`) would otherwise never match.
+    #[cfg(target_os = "macos")]
+    pub fn seatbelt_write_only_profile(&self) -> Result<String, String> {
+        let mut write_literals: Vec<String> = Vec::new();
+        for path in ["/dev", "/private/tmp", "/private/var/tmp"] {
+            write_literals.push(seatbelt_path_literal(Path::new(path))?);
+        }
+        if let Ok(tmpdir) = std::env::var("TMPDIR") {
+            let canonical =
+                std::fs::canonicalize(&tmpdir).unwrap_or_else(|_| PathBuf::from(&tmpdir));
+            write_literals.push(seatbelt_path_literal(&canonical)?);
+        }
+        for path in &self.write_paths {
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            write_literals.push(seatbelt_path_literal(&canonical)?);
+        }
+        let subpaths = write_literals
+            .iter()
+            .map(|literal| format!("(subpath {literal})"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(format!(
+            "(version 1)\n\
+             (allow default)\n\
+             (deny file-write*)\n\
+             (allow file-write* {subpaths})\n"
+        ))
     }
 
     /// Apply Landlock restrictions to the current process.
@@ -118,6 +175,80 @@ impl SandboxConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_write_only_profile_embeds_canonical_write_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let config = SandboxConfig {
+            read_paths: vec![PathBuf::from("/")],
+            write_paths: vec![project.clone()],
+            enabled: true,
+        };
+        let profile = config.seatbelt_write_only_profile().unwrap();
+        assert!(profile.contains("(allow default)"));
+        assert!(profile.contains("(deny file-write*)"));
+        // TempDir lives under the /var/folders symlink; the profile must
+        // carry the real /private/var path or the rule would never match.
+        let canonical = std::fs::canonicalize(&project).unwrap();
+        assert!(
+            profile.contains(&format!("(subpath \"{}\")", canonical.display())),
+            "profile missing canonicalized project path: {profile}"
+        );
+        assert!(profile.contains("(subpath \"/dev\")"));
+    }
+
+    /// Run the generated profile through the real Seatbelt compiler and
+    /// kernel: writes inside the configured path succeed, writes outside
+    /// are denied, reads stay open — the Linux Landlock posture.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_write_only_profile_enforces_like_landlock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let allowed = tmp.path().join("allowed");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let config = SandboxConfig {
+            read_paths: vec![PathBuf::from("/")],
+            write_paths: vec![allowed.clone()],
+            enabled: true,
+        };
+        // TMPDIR is allowed wholesale in the profile (runtime scratch), and
+        // TempDir lives under it — probe with TMPDIR pointed elsewhere so
+        // the `outside` write exercises the deny rule.
+        let profile = {
+            let saved = std::env::var("TMPDIR").ok();
+            std::env::remove_var("TMPDIR");
+            let profile = config.seatbelt_write_only_profile().unwrap();
+            if let Some(saved) = saved {
+                std::env::set_var("TMPDIR", saved);
+            }
+            profile
+        };
+        let script = format!(
+            "echo in > {allowed}/probe.txt && echo WRITE_IN_OK; \
+             echo out > {outside}/probe.txt 2>/dev/null || echo WRITE_OUT_DENIED; \
+             head -c 1 /etc/hosts > /dev/null && echo READ_OK",
+            allowed = allowed.display(),
+            outside = outside.display(),
+        );
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("sandbox-exec runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("WRITE_IN_OK"), "{stdout} / {profile}");
+        assert!(stdout.contains("WRITE_OUT_DENIED"), "{stdout}");
+        assert!(stdout.contains("READ_OK"), "{stdout}");
+        assert!(!outside.join("probe.txt").exists());
+    }
 
     #[test]
     fn default_config_includes_project_and_tmp() {

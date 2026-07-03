@@ -114,7 +114,12 @@ pub enum PeerOperation {
     PeerManage,
     SessionInspect,
     SessionManage,
-    Terminal,
+    /// Attach to a visible shell session: scrollback replay + live output.
+    TerminalView,
+    /// Send input to (or resize/close) an existing visible shell session.
+    TerminalWrite,
+    /// Create a new PTY shell session on this daemon.
+    ShellSpawn,
     Settings,
     RuntimeControl,
     FilesystemRead,
@@ -148,7 +153,7 @@ pub fn normalize_profile(raw: &str) -> Result<String, CallerError> {
     Ok(profile.to_ascii_lowercase())
 }
 
-pub const ALL_OPERATIONS: [PeerOperation; 18] = [
+pub const ALL_OPERATIONS: [PeerOperation; 20] = [
     PeerOperation::PresenceRead,
     PeerOperation::StatsRead,
     PeerOperation::DisplayView,
@@ -162,7 +167,9 @@ pub const ALL_OPERATIONS: [PeerOperation; 18] = [
     PeerOperation::PeerManage,
     PeerOperation::SessionInspect,
     PeerOperation::SessionManage,
-    PeerOperation::Terminal,
+    PeerOperation::TerminalView,
+    PeerOperation::TerminalWrite,
+    PeerOperation::ShellSpawn,
     PeerOperation::Settings,
     PeerOperation::RuntimeControl,
     PeerOperation::FilesystemRead,
@@ -217,7 +224,10 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
             op,
             PresenceRead | StatsRead | FilesystemRead | FilesystemWrite
         ),
-        TerminalOperator => matches!(op, PresenceRead | StatsRead | SessionInspect | Terminal),
+        TerminalOperator => matches!(
+            op,
+            PresenceRead | StatsRead | SessionInspect | TerminalView | TerminalWrite | ShellSpawn
+        ),
         TaskRunner => matches!(op, PresenceRead | StatsRead | Message | Task),
         Operator => matches!(
             op,

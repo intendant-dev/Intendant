@@ -1539,6 +1539,10 @@ body.access-page #tab-access {
 .acc-role-card .p { font-size: 10px; color: var(--overlay1); }
 .acc-grant-flow-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
 .acc-grant-flow-msg { font-size: 11.5px; color: var(--subtext0); }
+.acc-grant-fs-scope { border: 1px solid var(--surface1); border-radius: 8px; padding: 8px 10px; margin-top: 8px; }
+.acc-grant-fs-scope summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--subtext1); }
+.acc-grant-fs-roots { display: grid; gap: 3px; margin-top: 7px; font-size: 11.5px; color: var(--subtext0); }
+.acc-grant-fs-roots textarea { background: var(--mantle); color: var(--text); border: 1px solid var(--surface1); border-radius: 6px; padding: 5px 7px; font-family: var(--mono, monospace); font-size: 11.5px; resize: vertical; }
 .acc-status-toggle { display: inline-flex; border: 1px solid var(--surface1); border-radius: 6px; overflow: hidden; }
 .acc-status-toggle label { position: relative; cursor: pointer; }
 .acc-status-toggle input { position: absolute; opacity: 0; pointer-events: none; }
@@ -8848,6 +8852,25 @@ body.context-focus-active {
   font-size: 12px;
   padding: 4px 8px;
 }
+
+.shell-share-btn {
+  background: var(--bg-tertiary, #2a2a2e);
+  color: var(--text-secondary, #b8b8bc);
+  border: 1px solid var(--border-color, #3a3a3e);
+  border-radius: 4px;
+  padding: 2px 10px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.shell-share-btn:hover {
+  color: var(--text-primary, #e8e8ec);
+}
+
+.shell-share-btn.is-shared {
+  color: var(--accent-green, #4ade80);
+  border-color: var(--accent-green, #4ade80);
+}
 .shell-host-status {
   min-width: 0;
   color: var(--subtext0);
@@ -11719,6 +11742,7 @@ body.display-fullscreen-open {
             <label for="shell-host-select">Target</label>
             <select id="shell-host-select" title="Shell target"></select>
             <span class="shell-host-status" id="shell-host-status"></span>
+            <button id="shell-share-btn" class="shell-share-btn hidden" title="Share this shell session so scoped collaborators (terminal.view / terminal.write) can attach">Share</button>
             <div id="shell-target-summary" class="target-summary" aria-live="polite"></div>
           </div>
           <div class="terminal-container" id="shell-container"></div>
@@ -13702,6 +13726,10 @@ let accessFleetHostedCsrfToken = '';
 let dashboardControlTransport = null;
 let dashboardTransport = null;
 let dashboardServerMessageDispatcher = null;
+// Frame types the daemon has denied for this connection's grant — each
+// surfaces one toast per page load (the server re-sends the denial frame
+// on every attempt; repeating the toast would just nag).
+const wsDeniedToastShown = new Set();
 let dashboardControlEventsActive = false;
 let dashboardControlLastError = '';
 let dashboardConnectReconnectTimer = null;
@@ -14482,6 +14510,10 @@ let shellFitAddon = null;
 let shellInitialized = false;
 let shellOpenSent = false;
 let shellOpenAcked = false;
+// Sharing state of the current shell session (from terminal_opened /
+// terminal_shared acks). can_share is true for the session owner or root.
+let shellShared = false;
+let shellCanShare = false;
 const SHELL_HOST_ID = 'local';
 const SHELL_TERMINAL_ID = 'shell-0';
 let selectedShellHostId = SHELL_HOST_ID;
@@ -21458,6 +21490,14 @@ async function main() {
     try {
       const d = typeof msg === 'string' ? JSON.parse(msg) : msg;
       if (dashboardShouldDropDuplicateServerMessage(d)) return;
+      if (d.t === 'ws_denied') {
+        const frame = String(d.frame || '');
+        if (!wsDeniedToastShown.has(frame)) {
+          wsDeniedToastShown.add(frame);
+          showControlToast?.('error', 'Not allowed by your access grant: ' + (d.permission || frame || 'operation'));
+        }
+        return;
+      }
       if (d.event === 'context_snapshot') {
         const contextSid = sessionWindowTargetForLogSession(d.session_id);
         if (contextSid) markSessionWindowPendingActive(contextSid);
@@ -21632,7 +21672,13 @@ async function main() {
       }
       if (d.t === 'terminal_opened') {
         if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
-          handleShellOpened();
+          handleShellOpened(d);
+        }
+        return;
+      }
+      if (d.t === 'terminal_shared') {
+        if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
+          handleShellShared(d);
         }
         return;
       }
@@ -35390,7 +35436,7 @@ function accessIamEnforcementReason(iam) {
 }
 
 function accessFallbackIamRoles() {
-  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.use', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'];
+  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'];
   return [{
     id: 'role:root',
     label: 'Root',
@@ -35403,7 +35449,7 @@ function accessFallbackIamRoles() {
     label: 'Peer profile',
     status: 'enforced',
     summary: 'Daemon-to-daemon grants enforced by the approved peer identity profile.',
-    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.use', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'],
+    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'],
     source: 'builtin',
   }, {
     id: 'role:scoped-human',
@@ -35430,8 +35476,8 @@ function accessFallbackIamRoles() {
     id: 'role:terminal',
     label: 'Terminal',
     status: 'enforced',
-    summary: 'Open and use shell sessions without broader dashboard mutation rights.',
-    permissions: ['presence.read', 'stats.read', 'access.inspect', 'session.inspect', 'terminal.use'],
+    summary: 'Collaborate in shared shell sessions (view and type) without spawning new shells or broader dashboard mutation rights.',
+    permissions: ['presence.read', 'stats.read', 'access.inspect', 'session.inspect', 'terminal.view', 'terminal.write'],
     source: 'builtin',
   }, {
     id: 'role:files-read',
@@ -35452,7 +35498,7 @@ function accessFallbackIamRoles() {
     label: 'Operator',
     status: 'enforced',
     summary: 'Operate sessions, display, shell, files, and approvals without access/settings administration.',
-    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'session.inspect', 'session.manage', 'terminal.use', 'filesystem.read', 'filesystem.write'],
+    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'filesystem.read', 'filesystem.write'],
     source: 'builtin',
   }, {
     id: 'role:directory-files',
@@ -35515,7 +35561,10 @@ function accessFallbackPermissions() {
     'peer.manage': ['Peer manage', 'peer', 'Create, remove, pair, and use daemon peer routes.'],
     'session.inspect': ['Session inspect', 'session', 'Read session lists, logs, reports, recordings, and replay metadata.'],
     'session.manage': ['Session manage', 'session', 'Delete, rewind, prune, upload to, or otherwise mutate sessions.'],
-    'terminal.use': ['Terminal use', 'terminal', 'Open and operate dashboard shell sessions.'],
+    'terminal.use': ['Terminal (legacy)', 'terminal', 'Legacy aggregate: implies terminal.view, terminal.write, and shell.spawn.'],
+    'terminal.view': ['Terminal view', 'terminal', 'Attach to shared shell sessions read-only (scrollback and live output).'],
+    'terminal.write': ['Terminal write', 'terminal', 'Type into, resize, and close shell sessions you can see.'],
+    'shell.spawn': ['Shell spawn', 'terminal', 'Create new shell sessions on this daemon.'],
     'settings.manage': ['Settings manage', 'settings', 'Read or write daemon settings and API keys.'],
     'runtime.control': ['Runtime control', 'runtime', 'Use runtime-control surfaces such as TUI, media, and recording controls.'],
     'filesystem.read': ['Filesystem read', 'filesystem', 'Stat, list, and read files through dashboard APIs.'],
@@ -36582,6 +36631,36 @@ function renderAccessUserClientGrantForm() {
   }
   form.appendChild(fanoutRow);
 
+  // Filesystem scope (optional): roots the grant may read/write through
+  // the mediated file surfaces. Leave both empty for no restriction.
+  const fsFold = document.createElement('details');
+  fsFold.className = 'acc-grant-fs-scope';
+  const fsSummary = document.createElement('summary');
+  fsSummary.textContent = 'Filesystem scope (optional)';
+  fsSummary.title = 'Confine file browsing, reads, and writes to specific folders. Leave empty for no restriction. Note: a grant that also allows the terminal can still reach everything through the shell — scoped shells land in a later phase.';
+  fsFold.appendChild(fsSummary);
+  const fsHint = document.createElement('div');
+  fsHint.className = 'acc-grant-flow-msg';
+  fsHint.textContent = 'One absolute path per line. Read roots allow browsing and reading below them; write roots allow creating and modifying. Empty = unrestricted.';
+  fsFold.appendChild(fsHint);
+  for (const [id, label] of [
+    ['access-user-client-fs-read', 'Read roots'],
+    ['access-user-client-fs-write', 'Write roots'],
+  ]) {
+    const wrap = document.createElement('label');
+    wrap.className = 'acc-grant-fs-roots';
+    const caption = document.createElement('span');
+    caption.textContent = label;
+    const area = document.createElement('textarea');
+    area.id = id;
+    area.rows = 2;
+    area.placeholder = label === 'Read roots' ? '/home/user/projects' : '/home/user/projects/scratch';
+    area.spellcheck = false;
+    wrap.append(caption, area);
+    fsFold.appendChild(wrap);
+  }
+  form.appendChild(fsFold);
+
   const actions = document.createElement('div');
   actions.className = 'acc-grant-flow-actions';
   const statusToggle = document.createElement('div');
@@ -36738,6 +36817,10 @@ async function accessSubmitUserClientGrant(event) {
       const delta = Number(form.querySelector('#access-user-client-expiry')?.value || 0);
       return delta > 0 ? Date.now() + delta : null;
     })(),
+    fs_read_roots: (form.querySelector('#access-user-client-fs-read')?.value || '')
+      .split('\n').map(line => line.trim()).filter(Boolean),
+    fs_write_roots: (form.querySelector('#access-user-client-fs-write')?.value || '')
+      .split('\n').map(line => line.trim()).filter(Boolean),
   };
   if (kind === 'browser_certificate' && !payload.fingerprint) {
     showControlToast?.('error', 'Fingerprint is required');
@@ -37811,6 +37894,17 @@ function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) 
     chip.title = `Sessions authenticated by this principal's ${capped.binding.replace(/_/g, ' ')} binding are capped at ${capped.ceiling} by this daemon's role_ceilings policy, regardless of the granted role.`;
     row.appendChild(chip);
   }
+  const fsScope = grant.fs_scope;
+  if (fsScope && ((fsScope.read_roots || []).length || (fsScope.write_roots || []).length)) {
+    const chip = document.createElement('span');
+    chip.className = 'acc-chip route-local';
+    const reads = (fsScope.read_roots || []).length;
+    const writes = (fsScope.write_roots || []).length;
+    chip.textContent = `fs: ${reads}r/${writes}w roots`;
+    chip.title = 'Filesystem scope\nread:\n  ' + ((fsScope.read_roots || []).join('\n  ') || '(none)')
+      + '\nwrite:\n  ' + ((fsScope.write_roots || []).join('\n  ') || '(none)');
+    row.appendChild(chip);
+  }
   const expiresAt = Number(grant.expires_at_unix_ms || 0);
   if (expiresAt) {
     const expires = document.createElement('span');
@@ -38837,10 +38931,13 @@ function handleShellExited(status) {
   shellWaitingNoticeShown = false;
 }
 
-function handleShellOpened() {
+function handleShellOpened(ack) {
   shellOpenSent = true;
   shellOpenAcked = true;
   shellWaitingNoticeShown = false;
+  shellShared = !!(ack && ack.shared);
+  shellCanShare = !!(ack && ack.can_share);
+  renderShellShareState();
   const resize = shellPendingResize || {
     cols: shellTerm?.cols || 80,
     rows: shellTerm?.rows || 24,
@@ -38851,7 +38948,36 @@ function handleShellOpened() {
   flushQueuedShellInput();
 }
 
+function handleShellShared(d) {
+  shellShared = !!d.shared;
+  renderShellShareState();
+  showControlToast?.('success', shellShared ? 'Shell session shared' : 'Shell session unshared');
+}
+
+function renderShellShareState() {
+  const btn = document.getElementById('shell-share-btn');
+  if (!btn) return;
+  btn.classList.toggle('hidden', !shellCanShare);
+  btn.classList.toggle('is-shared', shellShared);
+  btn.textContent = shellShared ? 'Shared' : 'Share';
+  btn.title = shellShared
+    ? 'Shared: scoped collaborators with terminal.view / terminal.write can attach. Click to make private.'
+    : 'Share this shell session so scoped collaborators (terminal.view / terminal.write) can attach';
+}
+
+function toggleShellShare() {
+  if (!shellCanShare) return;
+  sendShellMessage({
+    t: 'terminal_share',
+    host_id: currentShellHostId(),
+    terminal_id: SHELL_TERMINAL_ID,
+    shared: !shellShared,
+  });
+}
+
 function handleShellError(error) {
+  shellCanShare = false;
+  renderShellShareState();
   shellOpenSent = false;
   shellOpenAcked = false;
   setShellHostStatus(String(error || 'shell unavailable'), 'error');
@@ -44573,6 +44699,8 @@ document.getElementById('shell-host-select')?.addEventListener('change', ev => {
   setShellHost(ev.target?.value || SHELL_HOST_ID);
 });
 
+document.getElementById('shell-share-btn')?.addEventListener('click', toggleShellShare);
+
 // Settings sub-tab switching (Account | Agent | Debug).
 document.querySelectorAll('#tab-settings .subtab-btn[data-settings-tab]').forEach(btn => {
   btn.addEventListener('click', () => routeTo('settings', btn.dataset.settingsTab));
@@ -49096,12 +49224,16 @@ class DashboardControlTransport {
       }
       return;
     }
-    if (msg.t === 'terminal_output' || msg.t === 'terminal_exited' || msg.t === 'terminal_opened' || msg.t === 'terminal_error') {
+    if (msg.t === 'terminal_output' || msg.t === 'terminal_exited' || msg.t === 'terminal_opened' || msg.t === 'terminal_error' || msg.t === 'terminal_shared') {
       try {
         window.dispatchEvent(new CustomEvent('intendant-dashboard-terminal-frame', { detail: msg }));
       } catch (_) {}
       if (msg.t === 'terminal_opened' && shellFrameMatchesCurrent(msg.host_id, msg.terminal_id)) {
-        handleShellOpened();
+        handleShellOpened(msg);
+        return;
+      }
+      if (msg.t === 'terminal_shared' && shellFrameMatchesCurrent(msg.host_id, msg.terminal_id)) {
+        handleShellShared(msg);
         return;
       }
       if (msg.t === 'terminal_error' && shellFrameMatchesCurrent(msg.host_id, msg.terminal_id)) {

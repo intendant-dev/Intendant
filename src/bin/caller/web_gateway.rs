@@ -19271,6 +19271,17 @@ pub fn spawn_web_gateway(
                         let mut peer_display_ids: Vec<u32> = Vec::new();
                         let mut dashboard_control_session_ids: Vec<String> = Vec::new();
 
+                        // Frame types already denied+logged once on this
+                        // connection — dedupes the warn log only; the denial
+                        // frame itself is sent for every rejected frame.
+                        let mut ws_denied_logged: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+
+                        // Shell-session lane for this connection: root sees
+                        // every session, scoped principals see owned/shared.
+                        let ws_terminal_actor =
+                            dashboard_control_grant_inbound.terminal_actor();
+
                         // Per-connection audio transcription buffer.
                         // PCM16 bytes are accumulated and drained every ~3s.
                         let mut audio_buf: Vec<u8> = Vec::new();
@@ -19287,6 +19298,20 @@ pub fn spawn_web_gateway(
                                 // Try to parse as JSON for type-tagged messages
                                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed)
                                 {
+                                    // Per-frame IAM enforcement on the direct
+                                    // /ws path — the same frame→operation
+                                    // table the dashboard-control tunnel
+                                    // enforces, so a scoped grant means the
+                                    // same thing on every transport.
+                                    if deny_ws_frame_if_unauthorized(
+                                        &dashboard_control_grant_inbound,
+                                        &json,
+                                        &direct_tx_inbound,
+                                        &bus_inbound,
+                                        &mut ws_denied_logged,
+                                    ) {
+                                        continue;
+                                    }
                                     match json.get("t").and_then(|v| v.as_str()) {
                                         Some("key") => {
                                             // Route key events to this connection's
@@ -20787,11 +20812,36 @@ pub fn spawn_web_gateway(
                                                 terminal_id: terminal_id.clone(),
                                             };
 
+                                            // Attach needs only the terminal.view
+                                            // floor already enforced; creating a
+                                            // shell needs shell.spawn, decided at
+                                            // frame time so expiry mid-connection
+                                            // is honored. A grant-level fs scope
+                                            // makes the new shell a sandboxed one.
+                                            let spawn_policy = crate::terminal::ShellSpawnPolicy {
+                                                may_spawn: dashboard_control_grant_inbound
+                                                    .access_decision(
+                                                        crate::peer::access_policy::PeerOperation::ShellSpawn,
+                                                    )
+                                                    .allowed,
+                                                shared: json["shared"]
+                                                    .as_bool()
+                                                    .unwrap_or(false),
+                                                scope: dashboard_control_grant_inbound
+                                                    .filesystem()
+                                                    .cloned(),
+                                            };
                                             match terminal_registry_inbound
-                                                .open_or_attach(key.clone(), cols, rows)
+                                                .open_or_attach(
+                                                    key.clone(),
+                                                    cols,
+                                                    rows,
+                                                    &ws_terminal_actor,
+                                                    spawn_policy,
+                                                )
                                                 .await
                                             {
-                                                Ok(session) => {
+                                                Ok((session, _created)) => {
                                                     // Spawn a forwarder task that drains the session's
                                                     // per-listener channel and sends base64-encoded
                                                     // output to this WS connection.
@@ -20837,6 +20887,9 @@ pub fn spawn_web_gateway(
                                                         "t": "terminal_opened",
                                                         "host_id": host_id,
                                                         "terminal_id": terminal_id,
+                                                        "shared": session.shared(),
+                                                        "can_share": session
+                                                            .managed_by(&ws_terminal_actor),
                                                     });
                                                     let _ = direct_tx_inbound.send(ack.to_string());
                                                 }
@@ -20845,7 +20898,7 @@ pub fn spawn_web_gateway(
                                                         "t": "terminal_error",
                                                         "host_id": host_id,
                                                         "terminal_id": terminal_id,
-                                                        "error": e,
+                                                        "error": e.to_string(),
                                                     });
                                                     let _ = direct_tx_inbound.send(err.to_string());
                                                 }
@@ -20871,8 +20924,9 @@ pub fn spawn_web_gateway(
                                                     host_id,
                                                     terminal_id,
                                                 };
-                                                if let Some(session) =
-                                                    terminal_registry_inbound.get(&key).await
+                                                if let Some(session) = terminal_registry_inbound
+                                                    .get_visible(&key, &ws_terminal_actor)
+                                                    .await
                                                 {
                                                     session.write_input(&data);
                                                 }
@@ -20894,8 +20948,9 @@ pub fn spawn_web_gateway(
                                                 host_id,
                                                 terminal_id,
                                             };
-                                            if let Some(session) =
-                                                terminal_registry_inbound.get(&key).await
+                                            if let Some(session) = terminal_registry_inbound
+                                                .get_visible(&key, &ws_terminal_actor)
+                                                .await
                                             {
                                                 session.resize(cols, rows);
                                             }
@@ -20914,7 +20969,44 @@ pub fn spawn_web_gateway(
                                                 host_id,
                                                 terminal_id,
                                             };
-                                            terminal_registry_inbound.close(&key).await;
+                                            terminal_registry_inbound
+                                                .close_visible(&key, &ws_terminal_actor)
+                                                .await;
+                                        }
+                                        Some("terminal_share") => {
+                                            // {"t":"terminal_share","host_id":"local","terminal_id":"shell-0","shared":true}
+                                            let host_id = json["host_id"]
+                                                .as_str()
+                                                .unwrap_or("local")
+                                                .to_string();
+                                            let terminal_id = json["terminal_id"]
+                                                .as_str()
+                                                .unwrap_or("shell-0")
+                                                .to_string();
+                                            let shared =
+                                                json["shared"].as_bool().unwrap_or(true);
+                                            let key = crate::terminal::TerminalKey {
+                                                host_id: host_id.clone(),
+                                                terminal_id: terminal_id.clone(),
+                                            };
+                                            let msg = match terminal_registry_inbound
+                                                .set_shared(&key, &ws_terminal_actor, shared)
+                                                .await
+                                            {
+                                                Some(state) => serde_json::json!({
+                                                    "t": "terminal_shared",
+                                                    "host_id": host_id,
+                                                    "terminal_id": terminal_id,
+                                                    "shared": state,
+                                                }),
+                                                None => serde_json::json!({
+                                                    "t": "terminal_error",
+                                                    "host_id": host_id,
+                                                    "terminal_id": terminal_id,
+                                                    "error": "not allowed: only the session owner or root can change sharing",
+                                                }),
+                                            };
+                                            let _ = direct_tx_inbound.send(msg.to_string());
                                         }
                                         Some("display_input") => {
                                             // Input event (keyboard/mouse) for a display session.
@@ -21028,6 +21120,13 @@ pub fn spawn_web_gateway(
                                             match serde_json::from_value::<ControlMsg>(json) {
                                                 Ok(ctrl)
                                                     if !peer_identity_allows_ws_control(
+                                                        peer_identity_inbound.as_ref(),
+                                                        &ctrl,
+                                                        &bus_inbound,
+                                                    ) => {}
+                                                Ok(ctrl)
+                                                    if !ws_grant_allows_control(
+                                                        &dashboard_control_grant_inbound,
                                                         peer_identity_inbound.as_ref(),
                                                         &ctrl,
                                                         &bus_inbound,
@@ -29068,7 +29167,30 @@ fn authorize_http_filesystem_access(
     }
 
     let Some(identity) = identity else {
-        return Ok(());
+        // Not a peer connection: enforce the session grant's fs scope, if
+        // the active grant carries one (None = unrestricted).
+        let Some(scope) = access
+            .iam_state
+            .as_ref()
+            .and_then(|state| crate::access::iam::fs_scope_for_principal(state, &access.principal))
+        else {
+            return Ok(());
+        };
+        let path = expand_dashboard_fs_path(raw_path)?;
+        return match crate::peer::access_policy::filesystem_access_allowed(scope, kind, &path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                bus.send(AppEvent::PresenceLog {
+                    message: format!(
+                        "[grant-fs] denied principal={} op={:?} path={} detail={}",
+                        access.principal.label, op, raw_path, e
+                    ),
+                    level: Some(LogLevel::Warn),
+                    turn: None,
+                });
+                Err(e)
+            }
+        };
     };
 
     let denied = |message: String| {
@@ -29247,6 +29369,137 @@ fn peer_identity_allows_ws_control(
         message: format!(
             "[ws] denied peer control frame from {}: profile={} permission={} reason={}",
             identity.label, identity.profile, decision.permission, decision.reason,
+        ),
+        level: Some(LogLevel::Warn),
+        turn: None,
+    });
+    false
+}
+
+/// Map a typed `/ws` frame to the `PeerOperation` it exercises — the
+/// direct-WebSocket mirror of `dashboard_control_frame_operation` and
+/// `dashboard_control_method_operation` (dashboard_control.rs), so the same
+/// IAM grant answers the same way whichever transport a client speaks.
+/// `None` means the frame carries no authority of its own: replies, pings,
+/// and the `dashboard_control_*` signaling frames (the tunnel they establish
+/// enforces this very grant per-frame itself, and scoped clients must be
+/// able to reach their allowed surface through it).
+fn ws_frame_operation(frame_type: &str) -> Option<crate::peer::access_policy::PeerOperation> {
+    use crate::peer::access_policy::PeerOperation;
+    match frame_type {
+        // Same frame names as the dashboard-control tunnel table. Floor
+        // operations: terminal_open may additionally require shell.spawn
+        // (when the session doesn't exist yet) and every terminal frame is
+        // scoped to sessions the actor can see — both enforced statefully
+        // in the frame handlers.
+        "terminal_open" => Some(PeerOperation::TerminalView),
+        "terminal_input" | "terminal_resize" | "terminal_close" | "terminal_share" => {
+            Some(PeerOperation::TerminalWrite)
+        }
+        "display_input" => Some(PeerOperation::DisplayInput),
+        // Parity: api_diagnostics_visual_freshness → DisplayInput. The
+        // marker is stamped pre-encoder and lands in every viewer's stream,
+        // so it is display mutation, not viewing.
+        "set_diagnostics_visual_marker" => Some(PeerOperation::DisplayInput),
+        // Parity: api_display_bootstrap / api_display_webrtc_signal.
+        "display_offer" | "display_ice" => Some(PeerOperation::DisplayView),
+        // The embedded web TUI drives the daemon's own runtime — the direct
+        // twins of the tunnel's tui_* frames.
+        "key" | "resize" | "term_subscribe" | "term_unsubscribe" => {
+            Some(PeerOperation::RuntimeControl)
+        }
+        // Live voice/media session machinery. Parity: api_voice_session,
+        // api_presence_video_frame, api_media_annotation_*, api_media_clip_*.
+        "presence_connect" | "presence_disconnect" | "make_active" | "user_audio"
+        | "video_frame" | "voice_log" | "voice_diagnostic" | "presence_checkpoint"
+        | "live_usage_update" | "annotation_attach" | "annotation_submit" | "clip_start"
+        | "clip_frame" | "clip_end" => Some(PeerOperation::RuntimeControl),
+        // Presence tool dispatch. Parity: api_mcp_tool_call → Message.
+        "tool_request" | "async_query" => Some(PeerOperation::Message),
+        _ => None,
+    }
+}
+
+/// Per-frame IAM gate for the direct `/ws` path. Returns `true` when the
+/// frame was denied and fully handled — a denial frame has been sent (plus
+/// the pane-visible `terminal_error` shape for terminal frames) and a
+/// once-per-frame-type warning logged — so the caller drops the frame.
+/// Root-equivalent grants (plain local dashboards, unbound mTLS root
+/// certificates) short-circuit to allow inside the evaluator; the check is
+/// pure in-memory, safe at keystroke/audio-frame rates.
+fn deny_ws_frame_if_unauthorized(
+    grant: &crate::dashboard_control::DashboardControlGrant,
+    json: &serde_json::Value,
+    direct_tx: &mpsc::UnboundedSender<String>,
+    bus: &EventBus,
+    logged_denials: &mut std::collections::HashSet<String>,
+) -> bool {
+    let Some(frame_type) = json.get("t").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let Some(op) = ws_frame_operation(frame_type) else {
+        return false;
+    };
+    let decision = grant.access_decision(op);
+    if decision.allowed {
+        return false;
+    }
+    if frame_type.starts_with("terminal_") {
+        let err = serde_json::json!({
+            "t": "terminal_error",
+            "host_id": json.get("host_id").and_then(|v| v.as_str()).unwrap_or("local"),
+            "terminal_id": json.get("terminal_id").and_then(|v| v.as_str()).unwrap_or(""),
+            "error": format!("not allowed: {}", decision.reason),
+        });
+        let _ = direct_tx.send(err.to_string());
+    }
+    let denied = serde_json::json!({
+        "t": "ws_denied",
+        "frame": frame_type,
+        "permission": decision.permission,
+        "reason": decision.reason,
+    });
+    let _ = direct_tx.send(denied.to_string());
+    if logged_denials.insert(frame_type.to_string()) {
+        bus.send(AppEvent::PresenceLog {
+            message: format!(
+                "[ws] denied {frame_type} frame for {}: permission={} reason={}",
+                grant.wire_kind(),
+                decision.permission,
+                decision.reason,
+            ),
+            level: Some(LogLevel::Warn),
+            turn: None,
+        });
+    }
+    true
+}
+
+/// Grant-lane twin of `peer_identity_allows_ws_control` for the ControlMsg
+/// fall-through on the direct `/ws` path: peer connections keep their
+/// identity-based gate (which already ran in the preceding match guard),
+/// every other connection answers to its dashboard-control grant through
+/// the same ControlMsg→operation table the peer lane uses.
+fn ws_grant_allows_control(
+    grant: &crate::dashboard_control::DashboardControlGrant,
+    peer_identity: Option<&PeerConnectionIdentity>,
+    ctrl: &ControlMsg,
+    bus: &EventBus,
+) -> bool {
+    if peer_identity.is_some() {
+        return true;
+    }
+    let op = crate::peer::access_policy::control_msg_operation(ctrl);
+    let decision = grant.access_decision(op);
+    if decision.allowed {
+        return true;
+    }
+    bus.send(AppEvent::PresenceLog {
+        message: format!(
+            "[ws] denied {} control frame: permission={} reason={}",
+            grant.wire_kind(),
+            decision.permission,
+            decision.reason,
         ),
         level: Some(LogLevel::Warn),
         turn: None,
@@ -36073,7 +36326,7 @@ mod tests {
         );
         assert!(
             !local
-                .decision(crate::peer::access_policy::PeerOperation::Terminal)
+                .decision(crate::peer::access_policy::PeerOperation::TerminalWrite)
                 .allowed
         );
 
@@ -39474,6 +39727,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
+            fs_scope: None,
         });
         let loaded = crate::access::iam::LoadedIamState {
             path: std::path::PathBuf::from("iam.json"),
@@ -40146,6 +40400,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
+            fs_scope: None,
         });
         crate::access::iam::save_state(tmp.path(), &state).unwrap();
 
@@ -40435,6 +40690,184 @@ mod tests {
     #[test]
     fn extract_token_query_param_handles_no_request_line() {
         assert_eq!(extract_token_query_param(""), None);
+    }
+
+    #[test]
+    fn ws_frame_operation_mirrors_dashboard_control_tables() {
+        use crate::peer::access_policy::PeerOperation;
+        assert_eq!(
+            ws_frame_operation("terminal_open"),
+            Some(PeerOperation::TerminalView)
+        );
+        assert_eq!(
+            ws_frame_operation("terminal_input"),
+            Some(PeerOperation::TerminalWrite)
+        );
+        assert_eq!(
+            ws_frame_operation("terminal_share"),
+            Some(PeerOperation::TerminalWrite)
+        );
+        assert_eq!(
+            ws_frame_operation("display_input"),
+            Some(PeerOperation::DisplayInput)
+        );
+        assert_eq!(
+            ws_frame_operation("set_diagnostics_visual_marker"),
+            Some(PeerOperation::DisplayInput)
+        );
+        assert_eq!(
+            ws_frame_operation("display_offer"),
+            Some(PeerOperation::DisplayView)
+        );
+        assert_eq!(ws_frame_operation("key"), Some(PeerOperation::RuntimeControl));
+        assert_eq!(
+            ws_frame_operation("term_subscribe"),
+            Some(PeerOperation::RuntimeControl)
+        );
+        assert_eq!(
+            ws_frame_operation("presence_connect"),
+            Some(PeerOperation::RuntimeControl)
+        );
+        assert_eq!(
+            ws_frame_operation("user_audio"),
+            Some(PeerOperation::RuntimeControl)
+        );
+        assert_eq!(ws_frame_operation("tool_request"), Some(PeerOperation::Message));
+        assert_eq!(ws_frame_operation("async_query"), Some(PeerOperation::Message));
+        // Tunnel signaling stays open: the tunnel enforces the same grant
+        // per-frame itself, and scoped clients must be able to establish it.
+        assert_eq!(ws_frame_operation("dashboard_control_offer"), None);
+        assert_eq!(ws_frame_operation("dashboard_control_ice"), None);
+        assert_eq!(ws_frame_operation("dashboard_control_close"), None);
+        assert_eq!(ws_frame_operation("ping"), None);
+    }
+
+    /// A terminal-role browser certificate can drive terminal frames over
+    /// the direct /ws path but is denied display input and agent-steering
+    /// control messages; the denial frame is sent every time while the warn
+    /// log is deduped per frame type.
+    #[test]
+    fn ws_frame_gate_scopes_bound_certificates_and_leaves_local_open() {
+        let mut state = crate::access::iam::LocalIamState::default();
+        let actor =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("test", "http");
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:22".to_string()),
+                role_id: Some("role:terminal".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let principal =
+            crate::access::iam::principal_for_browser_mtls_cert(&state, "AA:22", "ws")
+                .expect("bound principal resolves");
+        let scoped = crate::dashboard_control::DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state,
+        };
+
+        let bus = EventBus::new();
+        let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<String>();
+        let mut logged: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // terminal.use is in role:terminal — terminal frames pass.
+        let open = serde_json::json!({
+            "t": "terminal_open", "host_id": "local", "terminal_id": "shell-0",
+        });
+        assert!(!deny_ws_frame_if_unauthorized(
+            &scoped, &open, &direct_tx, &bus, &mut logged,
+        ));
+        assert!(direct_rx.try_recv().is_err(), "allowed frame sends nothing");
+
+        // display_input is not — denied with a denial frame, twice, while
+        // the log dedupe set records the frame type once.
+        let input = serde_json::json!({ "t": "display_input", "display_id": 1 });
+        for _ in 0..2 {
+            assert!(deny_ws_frame_if_unauthorized(
+                &scoped, &input, &direct_tx, &bus, &mut logged,
+            ));
+            let denied = direct_rx.try_recv().expect("denial frame sent");
+            let denied: serde_json::Value = serde_json::from_str(&denied).unwrap();
+            assert_eq!(denied["t"], "ws_denied");
+            assert_eq!(denied["frame"], "display_input");
+        }
+        assert_eq!(logged.len(), 1);
+
+        // Denied terminal-lane example: a files-read-style frame the role
+        // lacks surfaces the pane-visible terminal_error shape when the
+        // frame is a terminal frame. Simulate by evaluating a terminal
+        // frame against a grant without terminal.use.
+        let mut observer_state = crate::access::iam::LocalIamState::default();
+        crate::access::iam::upsert_user_client_grant(
+            &mut observer_state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("BB:33".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let observer_principal =
+            crate::access::iam::principal_for_browser_mtls_cert(&observer_state, "BB:33", "ws")
+                .expect("bound principal resolves");
+        let observer = crate::dashboard_control::DashboardControlGrant::UserClient {
+            principal: observer_principal,
+            iam_state: observer_state,
+        };
+        assert!(deny_ws_frame_if_unauthorized(
+            &observer, &open, &direct_tx, &bus, &mut logged,
+        ));
+        let first = direct_rx.try_recv().expect("terminal_error sent");
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first["t"], "terminal_error");
+        assert_eq!(first["terminal_id"], "shell-0");
+        let second = direct_rx.try_recv().expect("ws_denied sent");
+        let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(second["t"], "ws_denied");
+        // Observer can still view displays over /ws.
+        let offer = serde_json::json!({ "t": "display_offer", "display_id": 1 });
+        assert!(!deny_ws_frame_if_unauthorized(
+            &observer, &offer, &direct_tx, &bus, &mut logged,
+        ));
+
+        // Plain local dashboards (no client certificate) stay fully open.
+        let local = crate::dashboard_control::DashboardControlGrant::TrustedLocal;
+        assert!(!deny_ws_frame_if_unauthorized(
+            &local, &input, &direct_tx, &bus, &mut logged,
+        ));
+
+        // ControlMsg fall-through: role:terminal cannot steer the agent...
+        let steer = ControlMsg::Input {
+            text: "hello".to_string(),
+        };
+        assert!(!ws_grant_allows_control(&scoped, None, &steer, &bus));
+        // ...local dashboards can, and peer connections defer to the peer
+        // gate that already ran.
+        assert!(ws_grant_allows_control(&local, None, &steer, &bus));
+        let peer_grant = crate::dashboard_control::DashboardControlGrant::Peer {
+            fingerprint: "fp".to_string(),
+            label: "peer".to_string(),
+            profile: "viewer".to_string(),
+            filesystem: Default::default(),
+        };
+        let peer_identity = PeerConnectionIdentity {
+            fingerprint: "fp".to_string(),
+            label: "peer".to_string(),
+            profile: "viewer".to_string(),
+            filesystem: Default::default(),
+        };
+        assert!(ws_grant_allows_control(
+            &peer_grant,
+            Some(&peer_identity),
+            &steer,
+            &bus
+        ));
     }
 
     #[test]

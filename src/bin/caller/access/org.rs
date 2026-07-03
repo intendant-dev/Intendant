@@ -618,10 +618,8 @@ pub fn materialize_org_grant(
             "trusted org max_role {max_role_id} is not defined; failing closed"
         )));
     };
-    if let Some(excess) = role
-        .permissions
-        .iter()
-        .find(|permission| !max_role.permissions.contains(permission))
+    if let Some(excess) =
+        crate::access::iam::permissions_excess(&role.permissions, &max_role.permissions)
     {
         return Err(AccessError(format!(
             "org grant role {} exceeds this daemon's cap for org {handle} (max {max_role_id}; {excess} is not allowed)",
@@ -692,6 +690,7 @@ pub fn materialize_org_grant(
         revoked_at_unix_ms: None,
         expires_at_unix_ms: Some(doc.expires_at_unix_ms),
         issued_via: doc.chain.first().map(|cert| cert.issuer_key.trim().to_string()),
+        fs_scope: None,
     };
     let grant = if let Some(existing) = state.grants.iter_mut().find(|grant| grant.id == grant_id)
     {

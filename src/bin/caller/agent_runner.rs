@@ -34,7 +34,10 @@ pub async fn run_agent(
     json_input: &str,
     log_dir: &std::path::Path,
 ) -> Result<AgentOutput, CallerError> {
-    #[cfg(target_os = "linux")]
+    // Linux enforces this via Landlock inside the runtime; macOS wraps the
+    // runtime in sandbox-exec (see run_agent_inner). Windows has no
+    // process sandbox yet, so the config is not built there.
+    #[cfg(unix)]
     if let Ok(raw_paths) = std::env::var("INTENDANT_SANDBOX_WRITE_PATHS") {
         let write_paths: Vec<PathBuf> = raw_paths
             .split(':')
@@ -73,7 +76,27 @@ async fn run_agent_inner(
         .and_then(|p| p.parent().map(|d| d.join("intendant-runtime")))
         .unwrap_or_else(|| std::path::PathBuf::from("./target/debug/intendant-runtime"));
 
+    // macOS parity with the Linux Landlock posture: the runtime child is
+    // wrapped in sandbox-exec with a write-restricting Seatbelt profile
+    // (reads stay open, writes confined to the configured paths). Linux
+    // applies the equivalent inside the runtime itself via the env var
+    // below; a profile that fails to generate fails the spawn rather than
+    // silently running unconfined.
+    #[cfg(target_os = "macos")]
+    let mut cmd = match sandbox.filter(|sandbox| sandbox.enabled) {
+        Some(sandbox) => {
+            let profile = sandbox
+                .seatbelt_write_only_profile()
+                .map_err(|e| CallerError::Agent(format!("sandbox profile: {e}")))?;
+            let mut cmd = Command::new("/usr/bin/sandbox-exec");
+            cmd.arg("-p").arg(profile).arg(&agent_path);
+            cmd
+        }
+        None => Command::new(&agent_path),
+    };
+    #[cfg(not(target_os = "macos"))]
     let mut cmd = Command::new(&agent_path);
+
     cmd.env("INTENDANT_LOG_DIR", log_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

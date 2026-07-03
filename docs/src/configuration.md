@@ -671,6 +671,16 @@ visible in the same Access overview so daemon peer grants and human grants can
 be compared, but it is daemon-to-daemon only and cannot be assigned to a
 browser certificate or Connect account.
 
+Terminal capability is three separate permissions: `terminal.view` (attach to
+a visible session, scrollback + live output), `terminal.write` (type into,
+resize, or close a visible session), and `shell.spawn` (create new shells).
+`role:terminal` carries view+write only — a collaborator role; spawning is
+reserved for `role:operator` and above. Shell sessions belong to the
+principal that spawned them and are private by default; the owner (or a root
+session) can mark one shared from the Terminal tab, which is what makes it
+visible to other principals. The pre-split aggregate id `terminal.use` is
+still honored in custom roles and org grant caps as implying all three.
+
 ### `mcp_servers`
 
 External MCP servers to connect to as a client (see

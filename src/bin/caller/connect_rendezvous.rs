@@ -835,6 +835,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
+            fs_scope: None,
         });
 
         let grant =
@@ -917,6 +918,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
+            fs_scope: None,
         });
 
         let key = crate::access::client_key::VerifiedClientKey {
@@ -943,7 +945,7 @@ mod tests {
             crate::access::iam::evaluate_principal_operation_with_state(
                 &iam_state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::Terminal,
+                crate::peer::access_policy::PeerOperation::TerminalWrite,
             )
             .allowed
         );
@@ -1005,6 +1007,7 @@ mod tests {
             revoked_at_unix_ms: Some(102),
             expires_at_unix_ms: None,
             issued_via: None,
+            fs_scope: None,
         });
 
         let grant =
