@@ -731,6 +731,16 @@ pub enum AppEvent {
         context_archive: Option<String>,
     },
 
+    /// Emitted when one or more Claude Code runtime fields change. Mirror of
+    /// `GeminiConfigChanged` — fields omitted were not touched,
+    /// `model_cleared` distinguishes "no change" from "override removed".
+    ClaudeConfigChanged {
+        model: Option<String>,
+        model_cleared: bool,
+        permission_mode: Option<String>,
+        allowed_tools: Option<Vec<String>>,
+    },
+
     /// Emitted when one or more Gemini CLI runtime fields change. Mirror of
     /// `CodexConfigChanged` — fields omitted were not touched, `model_cleared`
     /// distinguishes "no change" from "model override removed".
@@ -1193,6 +1203,26 @@ pub enum ControlMsg {
         codex_managed_context: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_context_archive: Option<String>,
+    },
+    /// Set the Claude Code model override (`--model`). `None`/missing lets
+    /// the claude CLI pick its configured default. Applies to the NEXT task
+    /// because the model is latched at process spawn.
+    SetClaudeModel {
+        #[serde(default)]
+        model: Option<String>,
+    },
+    /// Set the Claude Code permission mode (`--permission-mode`):
+    /// `"default" | "acceptEdits" | "plan" | "bypassPermissions"` (legacy
+    /// `"auto"` normalizes to `"default"`). Applies to the NEXT task.
+    SetClaudePermissionMode {
+        mode: String,
+    },
+    /// Replace the Claude Code allowed-tools list (`--allowedTools`).
+    /// Empty list = all tools available, gated by the permission flow.
+    /// Applies to the NEXT task.
+    SetClaudeAllowedTools {
+        #[serde(default)]
+        tools: Vec<String>,
     },
     /// Set the Gemini model override. `None`/missing lets Gemini pick.
     /// Applies to the NEXT task because Gemini latches `--model` at
@@ -2280,6 +2310,17 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             writable_roots: writable_roots.clone(),
             managed_context: managed_context.clone(),
             context_archive: context_archive.clone(),
+        }),
+        AppEvent::ClaudeConfigChanged {
+            model,
+            model_cleared,
+            permission_mode,
+            allowed_tools,
+        } => Some(OutboundEvent::ClaudeConfigChanged {
+            model: model.clone(),
+            model_cleared: *model_cleared,
+            permission_mode: permission_mode.clone(),
+            allowed_tools: allowed_tools.clone(),
         }),
         AppEvent::GeminiConfigChanged {
             model,
