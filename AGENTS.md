@@ -172,7 +172,7 @@ to proceed.
 ## CI/CD
 
 GitHub Actions on push / PR to `main`:
-- **`windows.yml`** — cross-platform `cargo check -p intendant` on Windows + macOS + Linux (catches platform-specific build breaks; excludes the WASM `presence-web` crate).
+- **`windows.yml`** — cross-platform `cargo test -p intendant --bins` on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Headless-safe: the unit suite needs no display or API keys.
 - **`audit.yml`** — `cargo audit` on push/PR plus a weekly cron (Mondays 08:00 UTC).
 - **`docs.yml`** — mdBook (`docs/`) deploy to GitHub Pages.
 

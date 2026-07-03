@@ -83,13 +83,18 @@ pub struct SandboxConfig {
 impl SandboxConfig {
     /// Build a default config for the given project.
     /// - Read: `/` (everything)
-    /// - Write: project root, `/tmp`, log directory, home `.intendant`
+    /// - Write: project root, the OS scratch dir, log directory, home `.intendant`
     pub fn default_for_project(project_root: &Path, log_dir: &Path) -> Self {
-        let mut write_paths = vec![
-            project_root.to_path_buf(),
-            PathBuf::from("/tmp"),
-            log_dir.to_path_buf(),
-        ];
+        // The scratch dir stays the literal `/tmp` on Unix (macOS `TMPDIR`
+        // aliases are composed into the Seatbelt profile separately); on
+        // Windows the equivalent is the profile-local `%TEMP%`, which has
+        // no fixed root.
+        let scratch = if cfg!(windows) {
+            std::env::temp_dir()
+        } else {
+            PathBuf::from("/tmp")
+        };
+        let mut write_paths = vec![project_root.to_path_buf(), scratch, log_dir.to_path_buf()];
 
         // Allow writes to ~/.intendant
         if let Some(home) = dirs::home_dir() {
@@ -370,7 +375,12 @@ mod tests {
         assert!(config
             .write_paths
             .contains(&PathBuf::from("/home/user/project")));
-        assert!(config.write_paths.contains(&PathBuf::from("/tmp")));
+        let scratch = if cfg!(windows) {
+            std::env::temp_dir()
+        } else {
+            PathBuf::from("/tmp")
+        };
+        assert!(config.write_paths.contains(&scratch));
         assert!(config.write_paths.contains(&PathBuf::from("/tmp/logs")));
         assert!(config.read_paths.contains(&PathBuf::from("/")));
     }

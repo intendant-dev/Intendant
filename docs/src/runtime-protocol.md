@@ -147,8 +147,10 @@ commands hit `Operation not permitted` on those paths. On Linux, Landlock
 is allowlist-only and cannot subtract read access from a granted tree —
 there, command strings are bounded by autonomy/approvals plus the write
 sandbox (`INTENDANT_SANDBOX_WRITE_PATHS`), and the secret-directory
-denylist genuinely covers only the structured tools. On Windows the
-runtime has no OS sandbox yet.
+denylist genuinely covers only the structured tools. Windows mirrors the
+Linux posture with a `WRITE_RESTRICTED` token (`win_sandbox.rs`): reads
+stay open (so, like Linux, the secret-directory denylist covers only the
+structured tools) while writes are confined to the granted roots.
 
 ### `editFile` Operations
 
@@ -251,25 +253,35 @@ This directory holds per-command stdout/stderr logs, screenshots
 (`screenshot_<nonce>.png`), the `askHuman` question/response files, and (on
 Linux/X11) the merged `session.Xauthority` cookie file.
 
-## Filesystem Sandboxing (Landlock)
+## Filesystem Sandboxing
 
-On Linux the runtime applies a Landlock ruleset **before running any command**,
-driven entirely by the `INTENDANT_SANDBOX_WRITE_PATHS` environment variable
-(`apply_sandbox_from_env` in `src/main.rs`):
+The runtime's write boundary is driven by the `INTENDANT_SANDBOX_WRITE_PATHS`
+environment variable (a platform path-list: `:`-separated on Unix,
+`;`-separated on Windows; empty/unset → no sandbox). The controller
+(`agent_runner.rs`) populates it from its `SandboxConfig` when `--sandbox` is
+in effect; each platform then enforces the same posture — whole filesystem
+readable, only the listed paths writable — with its native primitive:
 
-- The value is a `:`-separated list of writable paths.
-- Empty/unset → no sandbox is applied.
-- When set, the whole filesystem is granted **read** access and only the listed
-  paths (that exist) get **write** access (ABI v5).
-- If the kernel doesn't enforce Landlock, a warning is printed and execution
-  continues.
+- **Linux** — a Landlock ruleset applied in-process **before running any
+  command** (`apply_sandbox_from_env` in `src/main.rs`, ABI v5). Nonexistent
+  paths are skipped. If the kernel doesn't enforce Landlock, a warning is
+  printed and execution continues.
+- **macOS** — the controller wraps the runtime child in `sandbox-exec` with a
+  generated Seatbelt profile (write-restriction composed with the always-on
+  secret-directory denial; see `sandbox.rs`).
+- **Windows** — the runtime re-execs itself under a `WRITE_RESTRICTED`
+  restricted token before reading stdin (`win_sandbox.rs`): an access check
+  then requires both the user's normal grants *and* a restricting-SID grant
+  for every write, and the controller holds temporary ACL entries granting
+  the `RESTRICTED` SID on exactly the allowed write roots (refcounted,
+  journaled, crash-swept). The token also drops every privilege except
+  `SeChangeNotifyPrivilege`, so backup/restore-intent opens from elevated
+  parents cannot bypass the DACL. Failure to restrict is fail-closed: the
+  runtime refuses to run unconfined.
 
-The controller (`agent_runner.rs`) is what populates this variable from its
-`SandboxConfig` when `--sandbox` is in effect. On non-Linux platforms the sandbox
-call is a no-op (the OS-level confinement differs — see
-[Architecture](./architecture.md)). This is the runtime's primary write-boundary;
-combined with the key-stripping and path validation above, it bounds what an agent
-command can touch even though it runs with the user's privileges.
+This is the runtime's primary write-boundary; combined with the key-stripping
+and path validation above, it bounds what an agent command can touch even
+though it runs with the user's privileges.
 
 ## Knowledge System
 

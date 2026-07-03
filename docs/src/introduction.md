@@ -10,7 +10,7 @@ It runs on **macOS, Linux, and Windows**, is **provider-agnostic** (OpenAI, Anth
 
 Intendant is built around a few core ideas:
 
-**Security through process isolation.** Two separate binaries form a trust boundary. The *runtime* that executes arbitrary commands runs under Landlock filesystem restrictions and never holds API keys. The *controller* that manages model conversations never executes user-requested shell commands directly. See [Architecture](./architecture.md).
+**Security through process isolation.** Two separate binaries form a trust boundary. The *runtime* that executes arbitrary commands runs under OS filesystem restrictions (Landlock on Linux, Seatbelt on macOS, restricted tokens on Windows) and never holds API keys. The *controller* that manages model conversations never executes user-requested shell commands directly. See [Architecture](./architecture.md).
 
 **Provider agnosticism.** OpenAI, Anthropic, and Gemini are all first-class providers with native tool calling, streaming, prompt caching, and computer use. The system is not locked to any single vendor — and through [external-agent orchestration](./external-agent-orchestration.md) it can also drive whole third-party coding CLIs.
 
@@ -39,8 +39,8 @@ Intendant is built around a few core ideas:
               │                    │                │
               ▼                    ▼                ▼
         Voice / Model APIs   intendant-runtime   external CLI subprocess
-        (live + streaming)   (sandboxed exec,    (wired to Intendant's
-                              Landlock)            MCP server)
+        (live + streaming)   (sandboxed exec)    (wired to Intendant's
+                                                   MCP server)
 
         ◄─── WebRTC display + peer federation ───►  browsers / peer daemons
 ```
@@ -57,7 +57,7 @@ See [Architecture](./architecture.md) for the full picture.
 - **Live voice & phone calls** — Gemini Live / OpenAI Realtime via a WASM browser client, and outbound SIP calls ([Presence Layer](./presence.md), [Computer Use & Live Audio](./computer-use-and-audio.md))
 - **Persistent daemon** — long-lived session supervision, a multi-session dashboard, and content-addressed file snapshots with rewind ([Control Plane & Daemon](./control-plane-and-daemon.md), [Web Dashboard](./web-dashboard.md))
 - **MCP server and client** — expose Intendant's control surface as MCP tools, and connect to external MCP servers ([MCP Server](./mcp-server.md))
-- **Filesystem sandboxing** via Landlock (Linux), session persistence with structured JSONL logging and resume ([Session Logging](./session-logging.md)), and a skills system for named instruction sets
+- **Filesystem sandboxing** via Landlock (Linux), Seatbelt (macOS), and restricted tokens (Windows); session persistence with structured JSONL logging and resume ([Session Logging](./session-logging.md)), and a skills system for named instruction sets
 
 ## Where to Go Next
 

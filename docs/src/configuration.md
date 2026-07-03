@@ -97,7 +97,7 @@ you normally never set them by hand (see
 | `INTENDANT_PROGRESS_FILE` | Where the sub-agent writes periodic progress |
 | `INTENDANT_PARENT_KNOWLEDGE` | Path to the parent's knowledge store for inheritance |
 | `INTENDANT_INHERIT_MEMORY` | `1` to inherit project memory |
-| `INTENDANT_SANDBOX_WRITE_PATHS` | Landlock write paths (set by the caller when sandboxing) |
+| `INTENDANT_SANDBOX_WRITE_PATHS` | Sandbox write paths (set by the caller when sandboxing; enforced by Landlock on Linux, Seatbelt on macOS, restricted tokens on Windows) |
 | `INTENDANT_MAX_PARALLEL_AGENTS` | Max concurrent sub-agents (from `[orchestrator]`) |
 | `INTENDANT_LOG_DIR` | Session log directory (set by the caller for the runtime) |
 
@@ -282,15 +282,17 @@ and live voice (see [Computer Use & Live Audio](./computer-use-and-audio.md)).
 
 ### `[sandbox]`
 
-Landlock filesystem sandboxing for the runtime (Linux). Also enabled by
-`--sandbox`.
+Filesystem sandboxing for the runtime — Landlock on Linux, Seatbelt on
+macOS, restricted tokens on Windows. Also enabled by `--sandbox`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable Landlock sandboxing |
-| `extra_write_paths` | array | `[]` | Extra writable paths beyond project root, `/tmp`, the log dir, and `~/.intendant` |
+| `enabled` | bool | `false` | Enable filesystem sandboxing |
+| `extra_write_paths` | array | `[]` | Extra writable paths beyond project root, the OS scratch dir (`/tmp` / `%TEMP%`), the log dir, and `~/.intendant` |
 
-On kernels without Landlock support, sandboxing is silently skipped.
+On Linux kernels without Landlock support, sandboxing is silently skipped;
+on macOS and Windows a sandbox that fails to apply fails the run rather
+than continuing unconfined.
 
 ### `[webrtc]`
 

@@ -7,6 +7,8 @@ mod agent;
 mod error;
 mod models;
 mod utils;
+#[cfg(windows)]
+mod win_sandbox;
 
 /// Maximum bytes to read from stdin (64 MB).
 const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -21,10 +23,8 @@ fn apply_sandbox_from_env() -> Result<(), AgentError> {
         return Ok(());
     }
 
-    let write_paths: Vec<PathBuf> = paths
-        .split(':')
-        .filter(|p| !p.trim().is_empty())
-        .map(PathBuf::from)
+    let write_paths: Vec<PathBuf> = std::env::split_paths(&paths)
+        .filter(|p| !p.as_os_str().is_empty())
         .collect();
 
     if write_paths.is_empty() {
@@ -83,6 +83,22 @@ fn write_line(stdout: &mut io::StdoutLock, line: &str) -> bool {
 async fn main() -> Result<(), AgentError> {
     // Initialize logging
     env_logger::init();
+
+    // Windows write-restriction re-exec — MUST run before stdin is read:
+    // the restricted child inherits and consumes the still-unread stdin
+    // pipe, while this parent only waits and proxies the exit code. Linux
+    // restricts in-process below (Landlock needs no re-exec); macOS is
+    // wrapped externally in sandbox-exec by the caller. Fail closed.
+    #[cfg(windows)]
+    match win_sandbox::reexec_write_restricted_if_configured() {
+        Ok(None) => {}
+        Ok(Some(code)) => std::process::exit(code),
+        Err(e) => {
+            return Err(AgentError::Process(format!(
+                "Windows write sandbox failed (refusing to run unconfined): {e}"
+            )));
+        }
+    }
 
     // Read entire JSON input (bounded)
     let mut buffer = String::new();

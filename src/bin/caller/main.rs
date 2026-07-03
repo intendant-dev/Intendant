@@ -65,6 +65,9 @@ mod terminal;
 mod tool_batch;
 mod tools;
 mod transcription;
+#[cfg(windows)]
+#[path = "../../win_sandbox.rs"]
+mod win_sandbox;
 mod transfer_store;
 mod tui;
 mod types;
@@ -1103,10 +1106,10 @@ fn parse_session_diff_file_paths(log_dir: &Path) -> Vec<String> {
 fn resolve_diff_file_path(project_root: &Path, display_path: &str) -> Option<PathBuf> {
     let path = Path::new(display_path);
     if path.is_absolute() {
-        return (path.starts_with(project_root)
-            || path.starts_with("/tmp")
-            || path.starts_with("/private/tmp"))
-        .then(|| path.to_path_buf());
+        let allowed = path.starts_with(project_root)
+            || path.starts_with(std::env::temp_dir())
+            || (cfg!(unix) && (path.starts_with("/tmp") || path.starts_with("/private/tmp")));
+        return allowed.then(|| path.to_path_buf());
     }
 
     if path.components().any(|component| {
@@ -19858,17 +19861,34 @@ diff --git a/two.rs b/two.rs
 
     #[test]
     fn resolve_diff_file_path_allows_project_and_tmp_absolute_paths() {
-        let project_root = Path::new("/work/project");
+        // Platform-absolute fixture paths: `/work/project` is not absolute
+        // on Windows, so prefix a drive there.
+        fn abs(p: &str) -> PathBuf {
+            if cfg!(windows) {
+                PathBuf::from(format!("C:{}", p.replace('/', "\\")))
+            } else {
+                PathBuf::from(p)
+            }
+        }
+        let project_root = abs("/work/project");
+        let inside = abs("/work/project/src/main.rs");
         assert_eq!(
-            resolve_diff_file_path(project_root, "/work/project/src/main.rs").unwrap(),
-            PathBuf::from("/work/project/src/main.rs")
+            resolve_diff_file_path(&project_root, inside.to_str().unwrap()).unwrap(),
+            inside
         );
+        let temp_file = std::env::temp_dir().join("intendant-edit.txt");
         assert_eq!(
-            resolve_diff_file_path(project_root, "/tmp/intendant-edit.txt").unwrap(),
+            resolve_diff_file_path(&project_root, temp_file.to_str().unwrap()).unwrap(),
+            temp_file
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            resolve_diff_file_path(&project_root, "/tmp/intendant-edit.txt").unwrap(),
             PathBuf::from("/tmp/intendant-edit.txt")
         );
-        assert!(resolve_diff_file_path(project_root, "/etc/passwd").is_none());
-        assert!(resolve_diff_file_path(project_root, "../outside.txt").is_none());
+        let outside = abs("/etc/passwd");
+        assert!(resolve_diff_file_path(&project_root, outside.to_str().unwrap()).is_none());
+        assert!(resolve_diff_file_path(&project_root, "../outside.txt").is_none());
     }
 
     #[test]
@@ -33475,20 +33495,71 @@ fn configure_sandbox_env(flags: &CliFlags, project: &Project, log_dir: &std::pat
     sandbox_cfg.write_paths.sort();
     sandbox_cfg.write_paths.dedup();
 
-    let write_paths: Vec<String> = sandbox_cfg
+    // Platform-correct list encoding (':' on Unix, ';' on Windows — Windows
+    // paths contain ':') via env::join_paths. A path containing the list
+    // separator cannot be encoded; drop it loudly — the runtime then simply
+    // never allows writes there (fail-closed).
+    let encodable: Vec<&PathBuf> = sandbox_cfg
         .write_paths
         .iter()
-        .map(|p| p.display().to_string())
+        .filter(|p| {
+            let ok = env::join_paths([p]).is_ok();
+            if !ok {
+                eprintln!(
+                    "[sandbox] write path {} contains the PATH separator and cannot                      be passed to the runtime; writes there will be denied",
+                    p.display()
+                );
+            }
+            ok
+        })
         .collect();
-    env::set_var("INTENDANT_SANDBOX_WRITE_PATHS", write_paths.join(":"));
+    match env::join_paths(encodable) {
+        Ok(joined) => env::set_var("INTENDANT_SANDBOX_WRITE_PATHS", joined),
+        Err(e) => {
+            eprintln!("[sandbox] failed to encode write paths ({e}); sandbox disabled");
+            env::remove_var("INTENDANT_SANDBOX_WRITE_PATHS");
+            return;
+        }
+    }
+
+    // Windows: the runtime child enforces writes via a WRITE_RESTRICTED
+    // token, which needs RESTRICTED-write ACEs on the allowed paths. Stamp
+    // them once for the daemon's lifetime (per-spawn stamping would race
+    // concurrent runtime spawns sharing these paths); the guard's Drop and
+    // the startup journal sweep handle removal.
+    #[cfg(windows)]
+    {
+        static DAEMON_WRITE_GRANTS: std::sync::Mutex<Option<win_sandbox::AceGuard>> =
+            std::sync::Mutex::new(None);
+        match win_sandbox::stamp_daemon_write_grants(&sandbox_cfg.write_paths) {
+            Ok(guard) => {
+                *DAEMON_WRITE_GRANTS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(guard);
+            }
+            Err(e) => {
+                // Fail closed: without the grants the restricted runtime
+                // cannot write anywhere and its operations will error.
+                eprintln!(
+                    "[sandbox] failed to stamp Windows write grants ({e});                      sandboxed runtime writes will be denied"
+                );
+            }
+        }
+    }
 }
 
 /// The `--scoped-shell-exec` wrapper (see terminal::scoped_shell_command):
-/// apply the Landlock policy from INTENDANT_SCOPED_SHELL_POLICY to this
-/// process, then exec the shell given in argv. Never returns — on any
-/// failure it exits non-zero with a message on stderr (which lands in the
-/// terminal pane), and it FAILS CLOSED: a kernel without Landlock refuses
-/// to run the shell rather than running it unconfined.
+/// confine this PTY to the filesystem scope in INTENDANT_SCOPED_SHELL_POLICY
+/// and run the shell given in argv. Never returns — on any failure it exits
+/// non-zero with a message on stderr (which lands in the terminal pane),
+/// and it FAILS CLOSED rather than running an unconfined shell.
+///
+/// Linux: apply Landlock to this process, then exec the shell in place.
+/// Windows: stamp temporary RESTRICTED ACEs on the scope roots, spawn the
+/// shell under a fully-restricted token (inheriting this wrapper's ConPTY),
+/// wait, remove the ACEs, and exit with the shell's code — see
+/// win_sandbox.rs for the model. macOS never reaches this wrapper (scoped
+/// shells run under sandbox-exec directly).
 fn run_scoped_shell_exec() -> ! {
     let fail = |message: String| -> ! {
         eprintln!("scoped shell: {message}");
@@ -33534,11 +33605,26 @@ fn run_scoped_shell_exec() -> ! {
         let e = command.exec();
         fail(format!("exec {shell}: {e}"));
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        // The scope-root ACEs were stamped daemon-side (held by the
+        // PtySession) — this wrapper only creates the restricted token,
+        // runs the shell under the ConPTY it inherited, and proxies the
+        // exit code.
+        let args: Vec<String> = env::args().skip(2).collect();
+        let Some((shell, shell_args)) = args.split_first() else {
+            fail("no shell given".to_string());
+        };
+        match win_sandbox::run_scoped_shell(shell, shell_args) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => fail(format!("Windows scoped shell failed: {e}")),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         fail(
-            "--scoped-shell-exec is the Linux Landlock wrapper; macOS scoped shells use \
-             sandbox-exec and Windows does not support scoped shells yet"
+            "--scoped-shell-exec is the Linux/Windows scoped-shell wrapper; macOS scoped \
+             shells run under sandbox-exec directly"
                 .to_string(),
         );
     }
@@ -33608,6 +33694,12 @@ async fn main() -> Result<(), CallerError> {
     if env::args().nth(1).as_deref() == Some("--scoped-shell-exec") {
         run_scoped_shell_exec();
     }
+
+    // Windows: replay ACE journals orphaned by crashed scoped-shell
+    // wrappers or runtime parents, so temporary RESTRICTED grants never
+    // outlive a crash (see win_sandbox.rs).
+    #[cfg(windows)]
+    win_sandbox::sweep_stale_journals(&win_sandbox::journal_dir());
 
     // `intendant lan` was removed when the native dashboard certificate flow
     // became `intendant access`. Fail explicitly so the old command cannot be

@@ -2005,10 +2005,39 @@ mod tests {
         assert_eq!(mouse_up_flag(2), MOUSEEVENTF_RIGHTUP);
     }
 
+    /// `INTENDANT_WINDOWS_CAPTURE` is process-global and tests run in
+    /// parallel threads: the two tests that touch it must serialize, and
+    /// each must restore whatever was set before it ran.
+    static CAPTURE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct CaptureEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    impl CaptureEnvGuard {
+        fn lock() -> Self {
+            Self {
+                _lock: CAPTURE_ENV.lock().unwrap_or_else(|e| e.into_inner()),
+                prev: std::env::var("INTENDANT_WINDOWS_CAPTURE").ok(),
+            }
+        }
+    }
+
+    impl Drop for CaptureEnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("INTENDANT_WINDOWS_CAPTURE", v),
+                None => std::env::remove_var("INTENDANT_WINDOWS_CAPTURE"),
+            }
+        }
+    }
+
     #[test]
     fn default_capture_method_is_gdi() {
         // GDI is the robust default; DXGI captures black on cloud/RDP/headless.
         // The constructors must default to GDI (absent an env override).
+        let _env = CaptureEnvGuard::lock();
         std::env::remove_var("INTENDANT_WINDOWS_CAPTURE");
         assert_eq!(CaptureMethod::from_env_or_default(), CaptureMethod::Gdi);
         assert_eq!(WindowsBackend::new().method, CaptureMethod::Gdi);
@@ -2021,6 +2050,7 @@ mod tests {
     #[test]
     fn capture_method_env_override_opts_into_dxgi() {
         // The override is the documented runtime opt-in for the fast path.
+        let _env = CaptureEnvGuard::lock();
         std::env::set_var("INTENDANT_WINDOWS_CAPTURE", "dxgi");
         assert_eq!(CaptureMethod::from_env_or_default(), CaptureMethod::Dxgi);
         std::env::set_var("INTENDANT_WINDOWS_CAPTURE", "GDI");
@@ -2028,7 +2058,6 @@ mod tests {
         // Anything unrecognized falls back to the GDI default.
         std::env::set_var("INTENDANT_WINDOWS_CAPTURE", "nonsense");
         assert_eq!(CaptureMethod::from_env_or_default(), CaptureMethod::Gdi);
-        std::env::remove_var("INTENDANT_WINDOWS_CAPTURE");
     }
 
     #[test]

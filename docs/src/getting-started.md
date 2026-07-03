@@ -268,7 +268,7 @@ value is missing.
 | `--verbose`, `-v` | — | Show debug-level log entries |
 | `--control-socket` | — | Enable the Unix control socket at `/tmp/intendant-<pid>.sock` |
 | `--json` | — | Emit JSONL events to stdout (implies `--no-tui`; disables dashboard) |
-| `--sandbox` | — | Enable Landlock filesystem sandboxing for the runtime (Linux 5.13+) |
+| `--sandbox` | — | Enable filesystem sandboxing for the runtime (Landlock on Linux 5.13+, Seatbelt on macOS, restricted tokens on Windows) |
 | `--direct` | — | Force single-agent mode (skip the orchestrator / sub-agent delegation) |
 | `--no-presence` | — | Disable the presence layer (talk to the worker agent directly) |
 | `--web` | `[port]` | Start the web dashboard. **On by default**; optional numeric port (default 8765) |

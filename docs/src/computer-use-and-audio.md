@@ -209,7 +209,7 @@ access**. Three layers protect the rest of the system:
   for an unknown tool, oversized strings, off-schema payloads — is written to
   `~/.intendant/quarantine/<live_audio_id>/<payload_id>.json` and **only a
   reference is returned**; the raw content is never surfaced to the agent.
-- **Sandbox**: under Landlock, live-audio processes can write only to the session
+- **Sandbox**: when the write sandbox is enabled, live-audio processes can write only to the session
   log and quarantine directories — no project root, no `/tmp`.
 
 ### Silence Watchdog

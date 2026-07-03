@@ -168,11 +168,13 @@ mod tests {
 
     #[test]
     fn append_creates_parent_dirs_and_writes_body() {
-        // Sandbox HOME to a tempdir so the test doesn't write into the
-        // user's real .intendant directory.
+        // Sandbox the home dir to a tempdir so the test doesn't write into
+        // the user's real .intendant directory — HOME on Unix, USERPROFILE
+        // on Windows (the variable `platform::home_dir()` honors there).
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", tmp.path());
+        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let prev_home = std::env::var(home_var).ok();
+        std::env::set_var(home_var, tmp.path());
 
         let session_id = "phase0-test-12345";
         let body = b"{\"t\":\"transition\",\"v\":1}\n{\"t\":\"transition\",\"v\":2}\n";
@@ -192,10 +194,10 @@ mod tests {
         assert!(read2.starts_with(body));
         assert!(read2.ends_with(body2));
 
-        // Restore HOME.
+        // Restore the home variable.
         match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
+            Some(v) => std::env::set_var(home_var, v),
+            None => std::env::remove_var(home_var),
         }
     }
 

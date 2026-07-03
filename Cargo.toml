@@ -209,6 +209,19 @@ windows = { version = "0.59", features = [
     "Win32_Media_MediaFoundation",
     "Win32_System_Variant",
     "Win32_System_Ole",
+    # Windows filesystem sandbox (win_sandbox.rs): restricted tokens
+    # (Win32_Security), DACL editing (Security_Authorization +
+    # Storage_FileSystem access masks), CreateProcessAsUserW + std-handle
+    # plumbing (System_Threading + System_Console), kill-on-close job
+    # objects (System_JobObjects), and GetCommandLineW for the runtime
+    # re-exec (System_Environment).
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Environment",
 ] }
 # Cross-platform network-interface enumeration. On Windows it wraps
 # GetAdaptersAddresses; this backs `lan::routable_local_addrs`, which feeds

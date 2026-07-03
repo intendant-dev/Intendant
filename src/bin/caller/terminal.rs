@@ -97,8 +97,8 @@ impl TerminalActor {
 /// shared, and the grant's filesystem scope. A scope turns the shell into
 /// a sandboxed one — the PTY child is confined to the scope's roots (plus
 /// read-only system paths) at the OS level: Landlock on Linux, a Seatbelt
-/// profile on macOS. Windows has no equivalent yet and refuses scoped
-/// spawns with a clear error. `None` scope = today's full shell.
+/// profile on macOS, a restricted token + temporary RESTRICTED ACEs on
+/// Windows (see win_sandbox.rs). `None` scope = today's full shell.
 #[derive(Debug, Clone, Default)]
 pub struct ShellSpawnPolicy {
     pub may_spawn: bool,
@@ -134,13 +134,13 @@ impl std::fmt::Display for TerminalOpenError {
 }
 
 /// Environment variable carrying the sandbox policy from the daemon to the
-/// Linux `--scoped-shell-exec` wrapper (JSON `{"read":[...],"write":[...]}`
-/// with the final path lists — system baseline already merged in).
+/// `--scoped-shell-exec` wrapper (JSON `{"read":[...],"write":[...]}`).
 pub const SCOPED_SHELL_POLICY_ENV: &str = "INTENDANT_SCOPED_SHELL_POLICY";
 
-/// Wire form of [`SCOPED_SHELL_POLICY_ENV`]. Only the Linux wrapper path
-/// constructs it; other platforms carry the definition so the protocol is
-/// one type.
+/// Wire form of [`SCOPED_SHELL_POLICY_ENV`], consumed by the Linux
+/// `--scoped-shell-exec` wrapper (baseline + scope roots merged). The
+/// Windows wrapper needs no policy — grants are stamped daemon-side — and
+/// macOS passes Seatbelt profiles inline; both carry the definition unused.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScopedShellPolicy {
@@ -175,6 +175,7 @@ fn scoped_shell_cwd(
 /// Startup args for a scoped shell. Scoped shells skip rc/profile files:
 /// `$HOME` is outside the sandbox, so a login shell would spray permission
 /// errors trying to read dotfiles it must not see.
+#[cfg(unix)]
 fn scoped_shell_args(shell: &str) -> Vec<String> {
     let name = std::path::Path::new(shell)
         .file_name()
@@ -193,6 +194,7 @@ fn scoped_shell_args(shell: &str) -> Vec<String> {
 /// not see any of it, so the child env is cleared and rebuilt. `HOME`
 /// points at the first writable root (shell history, tool caches, and
 /// dotfile writes land inside the scope instead of erroring).
+#[cfg(unix)]
 fn scoped_shell_env(
     scope: &crate::peer::access_policy::FilesystemAccessPolicy,
     shell: &str,
@@ -228,6 +230,61 @@ fn scoped_shell_env(
         // The daemon's per-user temp dir is allowed read-write in the
         // Seatbelt profile below.
         env.push(("TMPDIR".to_string(), tmpdir));
+    }
+    env
+}
+
+/// Windows twin of [`scoped_shell_env`]: minimal, secret-free environment
+/// for a scoped shell. `SystemRoot` and `PATHEXT` are load-bearing (process
+/// startup and DLL/command resolution break without them); the profile
+/// family (`USERPROFILE`, `APPDATA`, …) and temp point into the first
+/// writable root so PSReadLine history, tool caches, and temp files land
+/// inside the scope instead of erroring — the real profile is invisible to
+/// the restricted token anyway.
+#[cfg(windows)]
+fn windows_scoped_shell_env(
+    scope: &crate::peer::access_policy::FilesystemAccessPolicy,
+) -> Vec<(String, String)> {
+    let profile = scope
+        .write_roots
+        .first()
+        .or_else(|| scope.read_roots.first())
+        .map(|root| root.display().to_string())
+        .unwrap_or_else(|| std::env::temp_dir().display().to_string());
+    let system_root =
+        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let mut env = vec![
+        ("SystemRoot".to_string(), system_root.clone()),
+        (
+            "SystemDrive".to_string(),
+            std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string()),
+        ),
+        (
+            "PATH".to_string(),
+            format!(
+                "{sr}\\System32;{sr};{sr}\\System32\\WindowsPowerShell\\v1.0",
+                sr = system_root
+            ),
+        ),
+        (
+            "PATHEXT".to_string(),
+            std::env::var("PATHEXT")
+                .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.PS1".to_string()),
+        ),
+        ("USERPROFILE".to_string(), profile.clone()),
+        ("APPDATA".to_string(), format!("{profile}\\AppData\\Roaming")),
+        (
+            "LOCALAPPDATA".to_string(),
+            format!("{profile}\\AppData\\Local"),
+        ),
+        ("TEMP".to_string(), format!("{profile}\\Temp")),
+        ("TMP".to_string(), format!("{profile}\\Temp")),
+        ("TERM".to_string(), "xterm-256color".to_string()),
+    ];
+    for key in ["USERNAME", "COMPUTERNAME", "NUMBER_OF_PROCESSORS", "OS"] {
+        if let Ok(value) = std::env::var(key) {
+            env.push((key.to_string(), value));
+        }
     }
     env
 }
@@ -401,6 +458,13 @@ pub struct PtySession {
     listeners: StdMutex<Vec<mpsc::UnboundedSender<TerminalEvent>>>,
     scrollback: StdMutex<Scrollback>,
     alive: StdMutex<bool>,
+    /// Windows: the refcounted RESTRICTED ACE grants for this session's
+    /// scope roots. Held for the session's lifetime so overlapping scoped
+    /// shells never lose a shared grant early; dropped (and the ACEs
+    /// removed at refcount zero) when the session goes away.
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    scope_grants: Option<crate::win_sandbox::AceGuard>,
     /// The IAM principal id this session belongs to; `None` is the
     /// owner/root lane. Fixed at spawn.
     owner: Option<String>,
@@ -437,6 +501,17 @@ impl PtySession {
         // builder is consumed by `spawn_command`, so build a fresh one per
         // spawn attempt.
         let (shell, shell_args) = crate::platform::interactive_pty_shell();
+        // Windows scoped shells: acquire the scope-root grants BEFORE the
+        // shell starts (its first directory access must already pass) and
+        // keep them alive with the session.
+        #[cfg(windows)]
+        let scope_grants = match scope {
+            Some(scope) => Some(
+                crate::win_sandbox::AceGuard::stamp(&scope.read_roots, &scope.write_roots)
+                    .map_err(|e| format!("stamp scope grants: {e}"))?,
+            ),
+            None => None,
+        };
         let child = if let Some(scope) = scope {
             let cmd = Self::scoped_shell_command(scope, cwd.as_deref())?;
             pair.slave
@@ -484,6 +559,8 @@ impl PtySession {
             listeners: StdMutex::new(Vec::new()),
             scrollback: StdMutex::new(Scrollback::new(SCROLLBACK_LIMIT)),
             alive: StdMutex::new(true),
+            #[cfg(windows)]
+            scope_grants,
             owner,
             shared: std::sync::atomic::AtomicBool::new(shared),
         });
@@ -515,13 +592,40 @@ impl PtySession {
     ) -> Result<PtyCommandBuilder, String> {
         #[cfg(windows)]
         {
-            let _ = (scope, project_root);
-            return Err(
-                "scoped shells are not supported on Windows yet: this grant carries a \
-                 filesystem scope, and Intendant cannot confine a Windows shell to it. \
-                 Remove the filesystem scope or use the file APIs instead."
-                    .to_string(),
+            // Windows twin of the Linux wrapper: re-exec this binary as
+            // `--scoped-shell-exec`, which runs the shell under a fully
+            // restricted token (win_sandbox.rs). The scope-root ACEs are
+            // stamped daemon-side and held by the PtySession; system
+            // access comes from the Users restricting SID, not a path
+            // baseline like Linux.
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("resolve current executable: {e}"))?;
+            let (shell, _) = crate::platform::interactive_pty_shell();
+            // -NoProfile: the real profile is invisible to the restricted
+            // token; loading it would only spray errors.
+            let shell_args = vec!["-NoLogo".to_string(), "-NoProfile".to_string()];
+            let cwd = scoped_shell_cwd(
+                scope,
+                project_root.unwrap_or_else(|| std::path::Path::new("C:\\")),
             );
+            // Pre-create the in-scope profile skeleton (Temp, AppData)
+            // while we are still unrestricted, so the shell's history and
+            // temp writes have somewhere to land.
+            if let Some(root) = scope.write_roots.first() {
+                for sub in ["Temp", "AppData\\Roaming", "AppData\\Local"] {
+                    let _ = std::fs::create_dir_all(root.join(sub));
+                }
+            }
+            let mut cmd = PtyCommandBuilder::new(exe);
+            let mut args = vec!["--scoped-shell-exec".to_string(), shell.clone()];
+            args.extend(shell_args);
+            cmd.args(&args);
+            cmd.env_clear();
+            for (key, value) in windows_scoped_shell_env(scope) {
+                cmd.env(key, value);
+            }
+            cmd.cwd(cwd);
+            return Ok(cmd);
         }
         #[cfg(unix)]
         {
@@ -1062,6 +1166,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn scoped_shell_args_skip_rc_files_per_shell() {
         assert_eq!(scoped_shell_args("/bin/zsh"), vec!["-f"]);
@@ -1073,6 +1178,7 @@ mod tests {
         assert!(scoped_shell_args("/bin/sh").is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn scoped_shell_env_is_secret_free_and_home_lands_in_scope() {
         use crate::peer::access_policy::FilesystemAccessPolicy;
@@ -1144,6 +1250,13 @@ mod tests {
         let root = tmp.path().join("scoped-root");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("inside.txt"), "inside_ok_7391\n").unwrap();
+        // The denial probe targets a test-owned sentinel in the real $HOME
+        // (outside every allowed root). Probing a pre-existing dotfile made
+        // the test depend on machine state — bare CI runners have no
+        // ~/.zshrc, and an unmatched glob reads as ENOENT, not a denial.
+        let home = std::path::PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let sentinel = home.join(format!(".intendant-sbx-deny-{}", std::process::id()));
+        std::fs::write(&sentinel, "deny_sentinel_9152\n").unwrap();
         let scope = FilesystemAccessPolicy {
             read_roots: Vec::new(),
             write_roots: vec![root.clone()],
@@ -1186,10 +1299,20 @@ mod tests {
         }
         assert!(!transcript.is_empty(), "scoped shell never painted a prompt");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        // The probe sentinel is computed by the shell so the ZLE echo of
-        // the typed command can never satisfy the completion check.
+        // The completion sentinel is computed by the shell so the ZLE echo
+        // of the typed command can never satisfy the completion check. The
+        // sentinel path is single-quoted (with the POSIX '\'' dance) so a
+        // HOME containing spaces or shell metacharacters cannot split or
+        // expand inside the typed command.
+        let sentinel_sh = format!(
+            "'{}'",
+            sentinel.display().to_string().replace('\'', r"'\''")
+        );
         session.write_input(
-            b"cat inside.txt; cat /Users/*/.zshrc 2>&1 | head -1; echo probe_$((41300+37))_done\r",
+            format!(
+                "cat inside.txt; cat {sentinel_sh} 2>&1 | head -1; echo probe_$((41300+37))_done\r"
+            )
+            .as_bytes(),
         );
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv()).await {
@@ -1207,13 +1330,18 @@ mod tests {
                 Err(_) => {}
             }
         }
+        let _ = std::fs::remove_file(&sentinel);
         assert!(
             transcript.contains("inside_ok_7391"),
             "scoped read inside root failed: {transcript}"
         );
         assert!(
-            transcript.contains("not permitted") || transcript.contains("no matches found"),
-            "expected $HOME dotfile read to be denied: {transcript}"
+            !transcript.contains("deny_sentinel_9152"),
+            "sandbox leaked a $HOME read: {transcript}"
+        );
+        assert!(
+            transcript.contains("not permitted"),
+            "expected sentinel read to be denied: {transcript}"
         );
         registry.close_visible(&key, &owner).await;
     }
