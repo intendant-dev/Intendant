@@ -3647,8 +3647,7 @@ pub(crate) fn session_agent_output_post_response(
 
 fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
     if session_id.contains('/') {
-        let dir = PathBuf::from(session_id);
-        return dir.is_dir().then_some(dir);
+        return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
     }
 
     let logs_dir = home.join(".intendant").join("logs");
@@ -35413,6 +35412,26 @@ mod tests {
         assert!(replay["entries"].as_array().unwrap().iter().any(|entry| {
             entry["event"] == "model_response" && entry["summary"] == "internal history"
         }));
+    }
+
+    #[test]
+    fn resume_session_open_rejects_intendant_slash_path_outside_logs_root() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let log_dir = outside.path().join("session-escape");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.model_response("outside history", 0, 0, 0, 0, None);
+        drop(log);
+
+        assert!(resume_session_activity_replay_from_home(
+            home.path(),
+            "intendant",
+            &log_dir.to_string_lossy(),
+            None,
+            None,
+            80,
+        )
+        .is_none());
     }
 
     #[test]

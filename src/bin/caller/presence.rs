@@ -5,7 +5,7 @@ use crate::knowledge::{self, KnowledgeQuery};
 use crate::provider::ChatProvider;
 use crate::session_log;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -505,7 +505,7 @@ impl PresenceLayer {
 /// Handle a `query_detail` tool call: returns agent state, git diff, logs, or file content.
 pub async fn query_detail(
     agent_state: &Arc<Mutex<AgentStateSnapshot>>,
-    project_root: &std::path::Path,
+    project_root: &Path,
     log_dir: &std::path::Path,
     args: &Value,
 ) -> String {
@@ -575,6 +575,10 @@ pub async fn query_detail(
                 Some(p) => p,
                 None => return "Error: target file path is required".to_string(),
             };
+            let path = match resolve_project_file_for_read(project_root, path) {
+                Ok(path) => path,
+                Err(e) => return e,
+            };
             match tokio::fs::read_to_string(path).await {
                 Ok(content) => {
                     let lines: Vec<&str> = content.lines().take(200).collect();
@@ -592,6 +596,27 @@ pub async fn query_detail(
         }
         _ => format!("Unknown scope: {}", scope),
     }
+}
+
+fn resolve_project_file_for_read(project_root: &Path, target: &str) -> Result<PathBuf, String> {
+    let root = std::fs::canonicalize(project_root)
+        .map_err(|e| format!("Failed to resolve project root: {}", e))?;
+    let requested = Path::new(target);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let canonical =
+        std::fs::canonicalize(&candidate).map_err(|e| format!("Failed to resolve file: {}", e))?;
+    // query_detail file reads are confined to the project root.
+    if !canonical.starts_with(&root) {
+        return Err(format!(
+            "Refusing to read file outside project root: {}",
+            candidate.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 /// Handle a `recall_memory` tool call: query knowledge store AND voice transcripts.
@@ -1469,6 +1494,30 @@ mod tests {
         assert!(state.last_output_summary.is_empty());
         assert!(state.last_command_preview.is_empty());
         assert!(state.active_workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_detail_file_rejects_paths_outside_project_root() {
+        let base = tempfile::tempdir().unwrap();
+        let project = base.path().join("project");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        let state = Arc::new(Mutex::new(AgentStateSnapshot::default()));
+
+        let result = query_detail(
+            &state,
+            &project,
+            &project,
+            &json!({
+                "scope": "file",
+                "target": "../outside/secret.txt"
+            }),
+        )
+        .await;
+
+        assert!(result.contains("outside project root"), "got: {result}");
     }
 
     #[test]

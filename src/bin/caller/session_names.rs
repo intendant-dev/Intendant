@@ -188,8 +188,7 @@ fn write_intendant_session_name(home: &Path, session_id: &str, name: &str) -> Re
 
 fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
     if session_id.contains('/') {
-        let dir = PathBuf::from(session_id);
-        return dir.is_dir().then_some(dir);
+        return intendant_session_dir_from_slash_path(home, session_id);
     }
 
     let logs_dir = home.join(".intendant").join("logs");
@@ -224,6 +223,21 @@ fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<Path
     }
 
     None
+}
+
+pub(crate) fn intendant_session_dir_from_slash_path(
+    home: &Path,
+    session_id: &str,
+) -> Option<PathBuf> {
+    let candidate = PathBuf::from(session_id);
+    if !candidate.is_dir() {
+        return None;
+    }
+    let logs_dir = home.join(".intendant").join("logs");
+    let logs_dir = std::fs::canonicalize(logs_dir).ok()?;
+    let candidate = std::fs::canonicalize(candidate).ok()?;
+    // Slash-form session paths must resolve inside the Intendant logs root.
+    candidate.starts_with(&logs_dir).then_some(candidate)
 }
 
 #[cfg(test)]
@@ -270,5 +284,35 @@ mod tests {
         .unwrap();
         assert_eq!(meta["name"], "Renamed");
         assert_eq!(meta["task"], "Original task");
+    }
+
+    #[test]
+    fn intendant_slash_session_path_must_stay_under_logs_root() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let session_dir = outside.path().join("session-escape");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        assert!(
+            intendant_session_dir_from_slash_path(home.path(), &session_dir.to_string_lossy())
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intendant_slash_session_path_rejects_symlink_escape() {
+        let home = tempfile::tempdir().unwrap();
+        let logs_dir = home.path().join(".intendant").join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_session = outside.path().join("session-escape");
+        std::fs::create_dir_all(&outside_session).unwrap();
+        let link = logs_dir.join("link-session");
+        std::os::unix::fs::symlink(&outside_session, &link).unwrap();
+
+        assert!(
+            intendant_session_dir_from_slash_path(home.path(), &link.to_string_lossy()).is_none()
+        );
     }
 }

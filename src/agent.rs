@@ -552,6 +552,22 @@ impl Agent {
         Ok(raw)
     }
 
+    fn validate_memory_file(path_str: &str) -> Result<PathBuf, AgentError> {
+        let path = Self::validate_path(path_str)?;
+        let file_name = path.file_name().and_then(|name| name.to_str());
+        let parent_name = path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str());
+        // Runtime memory files must use the project .intendant/memory.json shape.
+        if file_name != Some("memory.json") || parent_name != Some(".intendant") {
+            return Err(AgentError::Process(
+                "memory_file must point to .intendant/memory.json".to_string(),
+            ));
+        }
+        Ok(path)
+    }
+
     fn inspect_path(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
         let path_str = cmd
             .path
@@ -1157,7 +1173,7 @@ impl Agent {
             .as_ref()
             .ok_or_else(|| AgentError::Process("storeMemory requires memory_file".to_string()))?;
 
-        let path = PathBuf::from(memory_file);
+        let path = Self::validate_memory_file(memory_file)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1291,7 +1307,7 @@ impl Agent {
             .as_ref()
             .ok_or_else(|| AgentError::Process("recallMemory requires memory_file".to_string()))?;
 
-        let path = PathBuf::from(memory_file);
+        let path = Self::validate_memory_file(memory_file)?;
         if !path.exists() {
             return Ok(serde_json::json!({
                 "success": true,
@@ -1600,6 +1616,10 @@ mod tests {
         let log_dir = TempDir::new().unwrap();
         let agent = Agent::new_with_paths(log_dir.path().to_path_buf()).unwrap();
         (agent, log_dir)
+    }
+
+    fn memory_file_for(tmp: &TempDir) -> std::path::PathBuf {
+        tmp.path().join(".intendant").join("memory.json")
     }
 
     #[tokio::test]
@@ -2266,7 +2286,7 @@ mod tests {
     async fn store_memory_create() {
         let (agent, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
-        let mf = tmp.path().join("mem.json");
+        let mf = memory_file_for(&tmp);
         let cmd = AgentCommand {
             function: "storeMemory".to_string(),
             nonce: 1,
@@ -2285,7 +2305,7 @@ mod tests {
     async fn store_memory_update() {
         let (agent, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
-        let mf = tmp.path().join("mem.json");
+        let mf = memory_file_for(&tmp);
         let cmd = AgentCommand {
             function: "storeMemory".to_string(),
             nonce: 1,
@@ -2320,11 +2340,13 @@ mod tests {
     #[tokio::test]
     async fn recall_memory_empty() {
         let (agent, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let mf = memory_file_for(&tmp);
         let cmd = AgentCommand {
             function: "recallMemory".to_string(),
             nonce: 1,
             memory_query: Some("anything".to_string()),
-            memory_file: Some("/nonexistent/mem.json".to_string()),
+            memory_file: Some(mf.to_string_lossy().to_string()),
             ..Default::default()
         };
         let result = agent.recall_memory(&cmd).unwrap();
@@ -2337,7 +2359,7 @@ mod tests {
     async fn recall_memory_finds_matches() {
         let (agent, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
-        let mf = tmp.path().join("mem.json");
+        let mf = memory_file_for(&tmp);
         // Store some memories
         agent
             .store_memory(&AgentCommand {
@@ -2392,7 +2414,7 @@ mod tests {
     async fn store_memory_with_tags_and_channel() {
         let (agent, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
-        let mf = tmp.path().join("knowledge.json");
+        let mf = memory_file_for(&tmp);
         let cmd = AgentCommand {
             function: "storeMemory".to_string(),
             nonce: 1,
@@ -2414,7 +2436,7 @@ mod tests {
     async fn recall_memory_with_tag_filter() {
         let (agent, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
-        let mf = tmp.path().join("knowledge.json");
+        let mf = memory_file_for(&tmp);
         // Store with tags
         agent
             .store_memory(&AgentCommand {
@@ -2461,7 +2483,7 @@ mod tests {
     async fn recall_memory_with_channel_filter() {
         let (agent, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
-        let mf = tmp.path().join("knowledge.json");
+        let mf = memory_file_for(&tmp);
         agent
             .store_memory(&AgentCommand {
                 function: "storeMemory".to_string(),
@@ -2492,7 +2514,7 @@ mod tests {
     async fn store_memory_backward_compat_old_format() {
         let (agent, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
-        let mf = tmp.path().join("old_mem.json");
+        let mf = memory_file_for(&tmp);
         // No tags/channel/source => should use old format
         let cmd = AgentCommand {
             function: "storeMemory".to_string(),
@@ -2512,7 +2534,7 @@ mod tests {
     async fn store_memory_process_input_integration() {
         let (agent, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
-        let mf = tmp.path().join("mem.json");
+        let mf = memory_file_for(&tmp);
         let input = AgentInput {
             commands: vec![AgentCommand {
                 function: "storeMemory".to_string(),
@@ -2530,17 +2552,58 @@ mod tests {
     #[tokio::test]
     async fn recall_memory_process_input_integration() {
         let (agent, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let mf = memory_file_for(&tmp);
         let input = AgentInput {
             commands: vec![AgentCommand {
                 function: "recallMemory".to_string(),
                 nonce: 1,
                 memory_query: Some("test".to_string()),
-                memory_file: Some("/nonexistent/mem.json".to_string()),
+                memory_file: Some(mf.to_string_lossy().to_string()),
                 ..Default::default()
             }],
         };
         let results = agent.process_input(input).await.unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_file_must_be_project_memory_shape_and_no_traversal() {
+        let (agent, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let arbitrary = tmp.path().join("mem.json");
+        let traversal = tmp.path().join(".intendant").join("..").join("memory.json");
+
+        let arbitrary_err = agent
+            .store_memory(&AgentCommand {
+                function: "storeMemory".to_string(),
+                nonce: 1,
+                memory_key: Some("test".to_string()),
+                memory_summary: Some("value".to_string()),
+                memory_file: Some(arbitrary.to_string_lossy().to_string()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(
+            arbitrary_err,
+            AgentError::Process(ref msg)
+                if msg.contains("memory_file must point to .intendant/memory.json")
+        ));
+
+        let traversal_err = agent
+            .store_memory(&AgentCommand {
+                function: "storeMemory".to_string(),
+                nonce: 2,
+                memory_key: Some("test".to_string()),
+                memory_summary: Some("value".to_string()),
+                memory_file: Some(traversal.to_string_lossy().to_string()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(
+            traversal_err,
+            AgentError::Process(ref msg) if msg.contains("path traversal blocked")
+        ));
     }
 
     #[tokio::test]

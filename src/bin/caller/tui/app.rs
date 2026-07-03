@@ -555,6 +555,30 @@ pub struct App {
     voice_transcript_idle_ticks: usize,
 }
 
+fn resolve_project_file_for_read(
+    project_root: &std::path::Path,
+    target: &str,
+) -> Result<std::path::PathBuf, String> {
+    let root = std::fs::canonicalize(project_root)
+        .map_err(|e| format!("Failed to resolve project root: {}", e))?;
+    let requested = std::path::Path::new(target);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let canonical =
+        std::fs::canonicalize(&candidate).map_err(|e| format!("Failed to resolve file: {}", e))?;
+    // query_detail file reads are confined to the project root.
+    if !canonical.starts_with(&root) {
+        return Err(format!(
+            "Refusing to read file outside project root: {}",
+            candidate.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 impl App {
     pub fn new(
         provider_name: String,
@@ -1542,9 +1566,19 @@ impl App {
                         }
                     }
                     "file" => match target.as_deref() {
-                        Some(path) => match std::fs::read_to_string(path) {
-                            Ok(content) => content.lines().take(200).collect::<Vec<_>>().join("\n"),
-                            Err(e) => format!("Failed to read file: {}", e),
+                        Some(path) => match self
+                            .project_root
+                            .as_deref()
+                            .ok_or_else(|| "No project root available.".to_string())
+                            .and_then(|root| resolve_project_file_for_read(root, path))
+                        {
+                            Ok(path) => match std::fs::read_to_string(path) {
+                                Ok(content) => {
+                                    content.lines().take(200).collect::<Vec<_>>().join("\n")
+                                }
+                                Err(e) => format!("Failed to read file: {}", e),
+                            },
+                            Err(e) => e,
                         },
                         None => "Error: target file path is required".to_string(),
                     },
@@ -2813,6 +2847,20 @@ mod tests {
         assert_eq!(view.verbosity, Verbosity::Normal);
         assert!(view.auto_scroll);
         assert!(app.log_entries.is_empty());
+    }
+
+    #[test]
+    fn query_detail_file_path_must_stay_under_project_root() {
+        let base = tempfile::tempdir().unwrap();
+        let project = base.path().join("project");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+
+        let err = resolve_project_file_for_read(&project, "../outside/secret.txt").unwrap_err();
+
+        assert!(err.contains("outside project root"), "got: {err}");
     }
 
     #[test]
