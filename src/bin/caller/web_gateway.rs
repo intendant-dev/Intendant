@@ -17392,6 +17392,14 @@ pub(crate) fn api_key_status_response_body() -> String {
     get_api_key_status_json()
 }
 
+/// Whether any provider credential is usable at all — the aggregate of
+/// [`get_api_key_status_json`], safe to expose at presence level.
+pub(crate) fn any_provider_credential_usable() -> bool {
+    ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+        .iter()
+        .any(|name| crate::credential_leases::provider_api_key(name).is_some())
+}
+
 pub(crate) fn project_root_response_body(project_root: Option<&Path>) -> String {
     serde_json::json!({
         "project_root": project_root.map(|root| root.to_string_lossy().to_string())

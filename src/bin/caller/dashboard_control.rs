@@ -4331,6 +4331,14 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
     }
     let access_principal = runtime.grant.access_principal();
     result.insert("access_principal".to_string(), access_principal.as_value());
+    // Whether ANY provider credential is usable (.env key or active lease).
+    // A single aggregate boolean — deliberately not per-provider — so every
+    // binding can drive the first-run "fuel this daemon" nudge without the
+    // settings.manage permission the per-provider api_key_status needs.
+    result.insert(
+        "fueled".to_string(),
+        serde_json::json!(crate::web_gateway::any_provider_credential_usable()),
+    );
     result.insert(
         "iam_enforcement".to_string(),
         serde_json::json!({
