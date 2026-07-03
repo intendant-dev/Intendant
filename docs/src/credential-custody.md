@@ -1,8 +1,10 @@
 # Credential Custody: the Vault and Leases
 
-> Status: **proposed design, awaiting sign-off**. Nothing below is built.
-> This chapter follows the trust-architecture convention: spec first, open
-> decisions listed at the end, code only after sign-off. The access-control
+> Status: **signed off 2026-07-02, build in progress.** The four open
+> decisions at the end were resolved as recommended: offline-lease default
+> **24h**; full-credential OAuth leases **built but off by default**;
+> recovery phrase **mandatory** at vault creation; scoping ships as the
+> **single default rule** with per-entry overrides deferred. The access-control
 > counterpart (who may reach a daemon at all) is
 > [Trust Architecture](./trust-architecture.md); this chapter is about the
 > *other* secrets — the model-provider credentials a daemon spends.
