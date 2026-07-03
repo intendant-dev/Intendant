@@ -88,6 +88,10 @@ user controls — the **anchor**:
   Face ID / Touch ID gesture unlocks the local identity key. No server is in
   the authentication loop at all.
 
+A companion chapter, [Credential Custody](./credential-custody.md),
+applies the same discipline to the *other* secret class — the model
+provider credentials a daemon spends (proposed, not yet built).
+
 The hosted service keeps exactly four jobs, all zero-authority:
 introductions (signaling for endpoints that authenticate each other
 end-to-end), blind relay, encrypted/signed fleet-metadata backup, and a name
