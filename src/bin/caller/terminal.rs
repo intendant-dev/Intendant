@@ -263,29 +263,6 @@ fn scoped_shell_write_baseline() -> Vec<std::path::PathBuf> {
     .collect()
 }
 
-/// Escape a path for a double-quoted Seatbelt profile string literal.
-/// Paths that cannot be represented safely (non-UTF-8 or control bytes)
-/// are refused — the spawn fails loudly rather than producing a profile
-/// that means something else.
-#[cfg(target_os = "macos")]
-fn seatbelt_path_literal(path: &std::path::Path) -> Result<String, String> {
-    let Some(text) = path.to_str() else {
-        return Err(format!(
-            "scoped shell root {} is not valid UTF-8",
-            path.display()
-        ));
-    };
-    if text.chars().any(|c| c.is_control()) {
-        return Err(format!(
-            "scoped shell root {text:?} contains control characters"
-        ));
-    }
-    Ok(format!(
-        "\"{}\"",
-        text.replace('\\', "\\\\").replace('"', "\\\"")
-    ))
-}
-
 /// Generate the Seatbelt (sandbox-exec) profile for a scoped shell on
 /// macOS: deny-default, Apple's own dyld bootstrap rules, read-only system
 /// paths, read access on the scope's roots, write access on the write
@@ -311,17 +288,17 @@ fn seatbelt_profile(
         "/private/var/select",
         "/dev",
     ] {
-        read_paths.push(seatbelt_path_literal(std::path::Path::new(path))?);
+        read_paths.push(crate::sandbox::seatbelt_path_literal(std::path::Path::new(path))?);
     }
     let mut exec_paths = read_paths.clone();
     let mut write_paths: Vec<String> = Vec::new();
     for path in ["/dev", "/private/tmp", "/private/var/tmp"] {
-        write_paths.push(seatbelt_path_literal(std::path::Path::new(path))?);
+        write_paths.push(crate::sandbox::seatbelt_path_literal(std::path::Path::new(path))?);
     }
     if let Ok(tmpdir) = std::env::var("TMPDIR") {
         let canonical = std::fs::canonicalize(&tmpdir)
             .unwrap_or_else(|_| std::path::PathBuf::from(&tmpdir));
-        write_paths.push(seatbelt_path_literal(&canonical)?);
+        write_paths.push(crate::sandbox::seatbelt_path_literal(&canonical)?);
     }
     // Seatbelt matches the REAL path of a file: a rule on a symlinked root
     // (`/tmp/...`, `/var/...`, `/etc/...` on macOS) would never match, so
@@ -332,13 +309,13 @@ fn seatbelt_profile(
         std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
     };
     for root in scope.read_roots.iter().chain(scope.write_roots.iter()) {
-        let literal = seatbelt_path_literal(&canonical(root))?;
+        let literal = crate::sandbox::seatbelt_path_literal(&canonical(root))?;
         read_paths.push(literal.clone());
         // Repos carry their own executables (build outputs, scripts).
         exec_paths.push(literal);
     }
     for root in &scope.write_roots {
-        write_paths.push(seatbelt_path_literal(&canonical(root))?);
+        write_paths.push(crate::sandbox::seatbelt_path_literal(&canonical(root))?);
     }
 
     let subpaths =
