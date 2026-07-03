@@ -33746,6 +33746,20 @@ async fn main() -> Result<(), CallerError> {
 
     configure_sandbox_env(&flags, &project, &log_dir);
 
+    // Credential custody: leases never survive a restart, so stale
+    // materialized auth files (a crash's leftovers) are deleted before
+    // anything can spawn an external agent; the timer keeps expiry
+    // deleting materializations even when the lease store sees no calls.
+    credential_leases::startup_materialization_sweep();
+    tokio::spawn(async {
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            credential_leases::sweep_now();
+        }
+    });
+
     // CLI --transcription flag overrides config file setting
     if flags.transcription {
         project.config.transcription.enabled = true;
@@ -33790,6 +33804,9 @@ async fn main() -> Result<(), CallerError> {
                         cleaned_external_children
                     );
                 }
+                // Drop every credential lease (zeroizes memory, deletes
+                // materialized oauth auth files) before the process dies.
+                let _ = credential_leases::revoke(None);
                 // Clean up control socket
                 control::cleanup();
                 // Restore terminal (best-effort) so the shell isn't left in raw mode

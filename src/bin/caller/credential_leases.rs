@@ -9,6 +9,7 @@
 //! merely shadows them.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 pub const DEFAULT_TTL_MS: u64 = 15 * 60 * 1000;
@@ -103,7 +104,159 @@ fn sweep_locked(leases: &mut HashMap<String, CredentialLease>, now: u64) {
     let mut graves = tombstones().write().expect("lease tombstones poisoned");
     for kind in expired {
         if let Some(lease) = leases.remove(&kind) {
-            graves.insert(kind, lease.expires_at_unix_ms());
+            graves.insert(kind.clone(), lease.expires_at_unix_ms());
+        }
+        drop_materialization(&materialization_root(), &kind);
+    }
+}
+
+/* ── OAuth materialization (external agents) ──
+   Codex and Claude Code are child processes that read credentials from
+   files, not from memory we control — the documented weakening in the
+   custody chapter. An active oauth lease therefore materializes a
+   private home directory (0700) holding exactly the leased auth file
+   (0600); spawns point the agent at it (CODEX_HOME / CLAUDE_CONFIG_DIR)
+   and it is deleted on lease expiry, revocation, and the startup
+   recovery sweep. Non-secret configuration (config.toml /
+   settings.json) is copied in so behavior is preserved; the user's own
+   auth files never are. The directory lives under ~/.intendant, outside
+   any project worktree, so the rewind/snapshot machinery never sees it. */
+
+fn materialization_root() -> PathBuf {
+    crate::platform::home_dir()
+        .join(".intendant")
+        .join("leased-auth")
+}
+
+fn restrict_dir(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o700);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn restrict_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+struct MaterializationPlan {
+    dir_name: &'static str,
+    auth_name: &'static str,
+    /// Non-secret config carried over from the agent's real home
+    /// (source home, file name) so behavior is preserved.
+    carry_over: Option<(PathBuf, &'static str)>,
+}
+
+fn materialization_plan(kind: &str) -> Option<MaterializationPlan> {
+    match kind {
+        "oauth:codex" => Some(MaterializationPlan {
+            dir_name: "codex-home",
+            auth_name: "auth.json",
+            carry_over: crate::session_config::effective_codex_home()
+                .map(|home| (PathBuf::from(home), "config.toml")),
+        }),
+        "oauth:claude-code" => Some(MaterializationPlan {
+            dir_name: "claude-home",
+            auth_name: ".credentials.json",
+            carry_over: Some((crate::platform::home_dir().join(".claude"), "settings.json")),
+        }),
+        _ => None,
+    }
+}
+
+fn materialize_kind(root: &Path, kind: &str, material: &str) -> Result<(), String> {
+    let Some(plan) = materialization_plan(kind) else {
+        return Ok(());
+    };
+    let dir = root.join(plan.dir_name);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    restrict_dir(root);
+    restrict_dir(&dir);
+    let auth_path = dir.join(plan.auth_name);
+    std::fs::write(&auth_path, material.as_bytes())
+        .map_err(|e| format!("write {}: {e}", auth_path.display()))?;
+    restrict_file(&auth_path);
+    if let Some((source_home, config_name)) = plan.carry_over {
+        let source = source_home.join(config_name);
+        let target = dir.join(config_name);
+        if source != target && source.is_file() {
+            let _ = std::fs::copy(&source, &target);
+        }
+    }
+    Ok(())
+}
+
+fn drop_materialization(root: &Path, kind: &str) {
+    if let Some(plan) = materialization_plan(kind) {
+        let _ = std::fs::remove_dir_all(root.join(plan.dir_name));
+    }
+}
+
+fn kind_is_active(kind: &str) -> bool {
+    let now = now_unix_ms();
+    store()
+        .read()
+        .expect("lease store poisoned")
+        .get(kind)
+        .map(|lease| lease.expires_at_unix_ms() > now)
+        .unwrap_or(false)
+}
+
+/// The synthesized CODEX_HOME while an oauth:codex lease is active.
+pub fn materialized_codex_home() -> Option<PathBuf> {
+    if !kind_is_active("oauth:codex") {
+        return None;
+    }
+    let dir = materialization_root().join("codex-home");
+    dir.is_dir().then_some(dir)
+}
+
+/// The synthesized CLAUDE_CONFIG_DIR while an oauth:claude-code lease
+/// is active.
+pub fn materialized_claude_config_dir() -> Option<PathBuf> {
+    if !kind_is_active("oauth:claude-code") {
+        return None;
+    }
+    let dir = materialization_root().join("claude-home");
+    dir.is_dir().then_some(dir)
+}
+
+/// Expiry is otherwise enforced lazily on lease-API calls; the daemon
+/// runs this on a timer so an expired oauth materialization is deleted
+/// promptly even when nothing touches the lease store.
+pub fn sweep_now() {
+    let now = now_unix_ms();
+    let mut leases = store().write().expect("lease store poisoned");
+    sweep_locked(&mut leases, now);
+}
+
+/// Crash recovery: no lease survives a restart, so no materialization
+/// may either. Call once at daemon startup.
+pub fn startup_materialization_sweep() {
+    let root = materialization_root();
+    if root.exists() {
+        if let Err(err) = std::fs::remove_dir_all(&root) {
+            eprintln!(
+                "[credential-leases] startup sweep of {} failed: {err}",
+                root.display()
+            );
         }
     }
 }
@@ -157,6 +310,11 @@ pub fn grant(
     };
     let mut leases = store().write().expect("lease store poisoned");
     sweep_locked(&mut leases, now);
+    // An oauth lease without its materialized auth file is useless to the
+    // child process — refuse the grant rather than hold a dead lease.
+    if let Err(error) = materialize_kind(&materialization_root(), kind, material) {
+        return Err(format!("credential materialization failed: {error}"));
+    }
     let replaced = leases.insert(kind.to_string(), lease).is_some();
     tombstones()
         .write()
@@ -183,11 +341,24 @@ pub fn renew(lease_id: &str) -> Result<u64, String> {
 pub fn revoke(selector: Option<&str>) -> usize {
     let mut leases = store().write().expect("lease store poisoned");
     let before = leases.len();
+    let mut dropped: Vec<String> = Vec::new();
     match selector {
-        None => leases.clear(),
-        Some(selector) => {
-            leases.retain(|kind, lease| kind != selector && lease.lease_id != selector);
+        None => {
+            dropped.extend(leases.keys().cloned());
+            leases.clear();
         }
+        Some(selector) => {
+            leases.retain(|kind, lease| {
+                let keep = kind != selector && lease.lease_id != selector;
+                if !keep {
+                    dropped.push(kind.clone());
+                }
+                keep
+            });
+        }
+    }
+    for kind in dropped {
+        drop_materialization(&materialization_root(), &kind);
     }
     before - leases.len()
 }
@@ -369,6 +540,47 @@ mod tests {
         grant("api_key:gemini", "Gemini", "gm-key-2", "root", None, None).unwrap();
         assert!(expired_lease_note().is_none());
         reset();
+    }
+
+    #[test]
+    fn oauth_materialization_writes_restricted_auth_and_cleans_up() {
+        let root = tempfile::TempDir::new().unwrap();
+        materialize_kind(root.path(), "oauth:codex", r#"{"tokens":{}}"#).unwrap();
+        let auth = root.path().join("codex-home").join("auth.json");
+        assert!(auth.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&auth).unwrap(),
+            r#"{"tokens":{}}"#
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(&auth).unwrap().permissions().mode() & 0o777;
+            assert_eq!(file_mode, 0o600, "auth file must be private");
+            let dir_mode = std::fs::metadata(root.path().join("codex-home"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700, "materialization dir must be private");
+        }
+
+        materialize_kind(root.path(), "oauth:claude-code", r#"{"claudeAiOauth":{}}"#).unwrap();
+        let creds = root.path().join("claude-home").join(".credentials.json");
+        assert!(creds.is_file());
+
+        // API-key kinds are memory-only — nothing materializes.
+        materialize_kind(root.path(), "api_key:anthropic", "sk-ant").unwrap();
+        let dirs: Vec<_> = std::fs::read_dir(root.path()).unwrap().collect();
+        assert_eq!(dirs.len(), 2, "only the two oauth kinds may materialize");
+
+        drop_materialization(root.path(), "oauth:codex");
+        assert!(!root.path().join("codex-home").exists());
+        assert!(creds.is_file(), "dropping one kind must not touch the other");
+        drop_materialization(root.path(), "oauth:claude-code");
+        assert!(!root.path().join("claude-home").exists());
+        // Dropping an already-gone kind is a quiet no-op.
+        drop_materialization(root.path(), "oauth:claude-code");
     }
 
     #[test]

@@ -322,6 +322,43 @@ async function main() {
     assert(keysAfterRevoke, 'key status did not flip back after revoke');
     console.log('PASS lease-revoke material dropped, daemon unfueled again');
 
+    // ── OAuth materialization lifecycle (Codex + Claude Code) ──
+    // OAuth leases materialize a private auth file for the child process;
+    // revocation must delete it.
+    const codexGrant = await rpc('api_credential_lease_grant', {
+      kind: 'oauth:codex',
+      label: 'E2E Codex OAuth',
+      material: JSON.stringify({ tokens: { access_token: 'at-codex-e2e' } }),
+      ttl_ms: 120000,
+      offline_ms: 0,
+    });
+    const codexAuthPath = path.join(daemonHome, '.intendant', 'leased-auth', 'codex-home', 'auth.json');
+    await waitFor(() => fs.existsSync(codexAuthPath), STEP_TIMEOUT_MS, 'materialized codex auth.json');
+    assert(fs.readFileSync(codexAuthPath, 'utf8').includes('at-codex-e2e'), 'codex auth.json missing leased material');
+    if (process.platform !== 'win32') {
+      assert.strictEqual(fs.statSync(codexAuthPath).mode & 0o777, 0o600, 'codex auth.json must be 0600');
+      assert.strictEqual(fs.statSync(path.dirname(codexAuthPath)).mode & 0o777, 0o700, 'codex home dir must be 0700');
+    }
+
+    const claudeGrant = await rpc('api_credential_lease_grant', {
+      kind: 'oauth:claude-code',
+      label: 'E2E Claude Code OAuth',
+      material: JSON.stringify({ claudeAiOauth: { accessToken: 'at-claude-e2e' } }),
+      ttl_ms: 120000,
+      offline_ms: 0,
+    });
+    const claudeCredsPath = path.join(daemonHome, '.intendant', 'leased-auth', 'claude-home', '.credentials.json');
+    await waitFor(() => fs.existsSync(claudeCredsPath), STEP_TIMEOUT_MS, 'materialized claude .credentials.json');
+    assert(fs.readFileSync(claudeCredsPath, 'utf8').includes('at-claude-e2e'), 'claude credentials missing leased material');
+    console.log('PASS lease-oauth-materialize private auth files written for both agents');
+
+    await rpc('api_credential_lease_revoke', { lease_id: codexGrant.lease_id });
+    await waitFor(() => !fs.existsSync(codexAuthPath), STEP_TIMEOUT_MS, 'codex materialization deleted on revoke');
+    assert(fs.existsSync(claudeCredsPath), 'revoking codex must not touch the claude materialization');
+    await rpc('api_credential_lease_revoke', { lease_id: claudeGrant.lease_id });
+    await waitFor(() => !fs.existsSync(claudeCredsPath), STEP_TIMEOUT_MS, 'claude materialization deleted on revoke');
+    console.log('PASS lease-oauth-revoke materialized auth deleted per kind');
+
     console.log('PASS validate-credential-leases all scenarios');
   } catch (err) {
     console.error(`FAIL validate-credential-leases reason="${err.message}"`);

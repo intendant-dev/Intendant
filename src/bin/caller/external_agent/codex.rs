@@ -6688,7 +6688,15 @@ impl ExternalAgent for CodexAgent {
             .stderr(std::process::Stdio::piped());
         crate::platform::die_with_parent(&mut command);
         self.add_intendant_ctl_env(&mut command, effective_web_port);
-        Self::apply_codex_home_env(&mut command, self.codex_home.as_deref());
+        // An active oauth:codex lease materializes a synthesized
+        // CODEX_HOME (auth.json + carried-over config.toml) that shadows
+        // both the configured home and ~/.codex — the vault fuels this
+        // spawn, not whatever auth happens to be on disk.
+        let leased_codex_home = crate::credential_leases::materialized_codex_home();
+        Self::apply_codex_home_env(
+            &mut command,
+            leased_codex_home.as_deref().or(self.codex_home.as_deref()),
+        );
         #[cfg(target_os = "linux")]
         crate::linux_display_env::apply_to_tokio_command(&mut command);
         if let Some(root) = &self.request_trace_root {
