@@ -13,12 +13,14 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**/Cargo.toml"
+      - ".cargo/audit.toml"
       - ".github/workflows/audit.yml"
   pull_request:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**/Cargo.toml"
+      - ".cargo/audit.toml"
   schedule:
     # Mondays at 08:00 UTC.
     - cron: "0 8 * * 1"

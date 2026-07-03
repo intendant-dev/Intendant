@@ -4,4 +4,14 @@ ignore = [
     # rsa only for local keypair generation when minting access certificates,
     # not as a network-observable RSA decrypt/sign oracle.
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml < 0.41 DoS (quadratic
+    # duplicate-attribute check; unbounded namespace allocation in NsReader).
+    # quick-xml reaches Intendant only via atspi -> zbus-lockstep -> zbus_xml,
+    # which parses AT-SPI introspection XML from the local D-Bus session bus
+    # (Linux accessibility reader) — worst case is a local DoS, no network
+    # surface. No released zbus_xml allows quick-xml 0.41 yet (5.1.1 pins
+    # ^0.39, checked 2026-07-03); the bump is already merged on zbus git main.
+    # REMOVE these two ignores and `cargo update` once zbus_xml > 5.1.1 ships.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
