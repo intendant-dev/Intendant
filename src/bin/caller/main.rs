@@ -6939,6 +6939,37 @@ fn emit_codex_session_capabilities_for_drain(
     });
 }
 
+/// Capabilities of a supervised Claude Code session: follow-up turns,
+/// native mid-turn steering (a user message written mid-turn is absorbed
+/// into the running turn), and native interrupts (stream-json
+/// `control_request`). The Codex-specific knobs stay unset so frontends
+/// keep those controls hidden.
+fn claude_code_external_session_capabilities() -> types::SessionCapabilities {
+    types::SessionCapabilities {
+        follow_up: true,
+        steer: true,
+        interrupt: true,
+        codex_thread_actions: Vec::new(),
+        codex_managed_context: None,
+        codex_sandbox: None,
+        codex_approval_policy: None,
+        codex_context_archive: None,
+        codex_command: None,
+        codex_fast_mode: None,
+        codex_service_tier: None,
+    }
+}
+
+fn emit_claude_code_session_capabilities(bus: &EventBus, session_id: Option<&str>) {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    bus.send(AppEvent::SessionCapabilities {
+        session_id: session_id.to_string(),
+        capabilities: claude_code_external_session_capabilities(),
+    });
+}
+
 fn side_session_prompt_from_params(params: &serde_json::Value) -> Option<String> {
     ["prompt", "message", "text", "task"]
         .iter()
@@ -9299,6 +9330,56 @@ fn emit_external_session_goal(
     }
 }
 
+/// A backend announced its native conversation id after thread start
+/// (Claude Code reveals it on the first stdout message of the first turn).
+/// Upgrade Intendant's identity and resume records from the placeholder
+/// thread id: frontends re-key via `AppEvent::SessionIdentity` and the
+/// external overlay makes `--continue`/resume find the native id.
+fn persist_native_backend_session_id(config: &DrainConfig<'_>, native_id: &str) {
+    let native_id = native_id.trim();
+    let Some(backend) = config
+        .agent_source
+        .as_deref()
+        .and_then(external_agent::AgentBackend::from_str_loose)
+    else {
+        return;
+    };
+    if !backend.thread_id_is_canonical(native_id) {
+        return;
+    }
+    emit_external_session_identity(
+        config.bus,
+        config
+            .session_id
+            .clone()
+            .or_else(|| config.alias_session_id.clone()),
+        backend.as_short_str(),
+        native_id,
+    );
+    if backend == external_agent::AgentBackend::ClaudeCode {
+        // Frontends may address the session by either id after the
+        // identity upgrade; advertise capabilities under the native id too.
+        emit_claude_code_session_capabilities(config.bus, Some(native_id));
+    }
+    let mut launch = crate::session_config::read_log_dir_config(config.log_dir).unwrap_or_default();
+    if launch.source.is_none() {
+        launch.source = Some(backend.as_short_str().to_string());
+    }
+    if let Err(e) = crate::session_config::write_external_overlay(
+        &platform::home_dir(),
+        backend.as_short_str(),
+        native_id,
+        &launch,
+    ) {
+        slog(config.session_log, |l| {
+            l.debug(&format!(
+                "Persist external overlay for native session id {} failed: {e}",
+                short_external_session_id(native_id)
+            ))
+        });
+    }
+}
+
 fn handle_idle_codex_subagent_event(
     config: &DrainConfig<'_>,
     stats: &mut LoopStats,
@@ -9307,6 +9388,10 @@ fn handle_idle_codex_subagent_event(
 ) {
     let session_id = Some(child_thread_id.clone());
     match event {
+        external_agent::AgentEvent::NativeSessionId { .. } => {
+            // Native-id announcements describe the primary conversation;
+            // a Codex subagent child never re-keys the session.
+        }
         external_agent::AgentEvent::MessageDelta { text } => {
             config
                 .bus
@@ -10397,6 +10482,11 @@ async fn drain_external_agent_events_with_prefetched(
         };
 
         match event {
+            external_agent::AgentEvent::NativeSessionId { session_id } => {
+                if event_is_primary {
+                    persist_native_backend_session_id(config, &session_id);
+                }
+            }
             external_agent::AgentEvent::MessageDelta { text } => {
                 mark_pending_runtime_steers_delivered_at_model_checkpoint(
                     config,
@@ -27843,6 +27933,12 @@ async fn run_with_presence(
                     backend.as_short_str(),
                     &thread.thread_id,
                 );
+                if *backend == external_agent::AgentBackend::ClaudeCode {
+                    emit_claude_code_session_capabilities(
+                        &bus,
+                        session_log_id(&session_log).as_deref(),
+                    );
+                }
                 persistent_agent = Some(agent);
                 persistent_thread = Some(thread);
                 persistent_event_rx = Some(event_rx);
@@ -29225,6 +29321,8 @@ async fn run_external_agent_mode(
             &project,
             effective_codex_service_tier.as_deref(),
         );
+    } else if backend == external_agent::AgentBackend::ClaudeCode {
+        emit_claude_code_session_capabilities(&bus, intendant_session_id.as_deref());
     }
     let (mut agent, thread, mut event_rx) = match create_external_agent(
         &backend,
@@ -29308,6 +29406,11 @@ async fn run_external_agent_mode(
                 &project,
                 service_tier.as_deref(),
             );
+        }
+    } else if backend == external_agent::AgentBackend::ClaudeCode {
+        emit_claude_code_session_capabilities(&bus, intendant_session_id.as_deref());
+        if live_session_id != intendant_session_id {
+            emit_claude_code_session_capabilities(&bus, live_session_id.as_deref());
         }
     }
     if emit_session_started_after_identity {
@@ -29459,6 +29562,12 @@ async fn run_external_agent_mode(
                                     continue;
                                 }
                                 match event {
+                                    external_agent::AgentEvent::NativeSessionId { session_id } => {
+                                        persist_native_backend_session_id(
+                                            &drain_config,
+                                            &session_id,
+                                        );
+                                    }
                                     external_agent::AgentEvent::GoalUpdated { goal } => {
                                         emit_external_session_goal(
                                             &drain_config,
@@ -34107,22 +34216,24 @@ async fn main() -> Result<(), CallerError> {
             });
             Some(p)
         }
-        Err(ref e) if use_web || flags.mcp => {
-            // No API keys — start the dashboard anyway.
-            // Display control, session browsing, annotations, and clipping
-            // all work without inference.
+        Err(ref e) if use_web || flags.mcp || initial_agent_backend.is_some() => {
+            // No API keys — this is not an error. External backends bring
+            // their own authentication, and the dashboard's display control,
+            // session browsing, annotations, and clipping all work without
+            // inference. Keep the console note calm and free of error-shaped
+            // text ("No API key found…") — automation reading stderr kept
+            // mistaking that for a fatal startup failure. The full cause
+            // stays in the session log.
             if let Some(backend) = &initial_agent_backend {
                 eprintln!(
-                    "Warning: no native model provider: {}. Native-provider features are unavailable, \
-                     but the {} external agent can run with its own authentication.",
-                    e,
+                    "Note: running without a native model provider — {} authenticates on its own. \
+                     Native-model features (presence, sub-agents, voice) stay off until an API key is configured.",
                     backend
                 );
             } else {
                 eprintln!(
-                    "Warning: {} AI features will be unavailable. \
-                     The web dashboard is starting without a model provider.",
-                    e
+                    "Note: starting without a model provider — AI features stay off until an API key is configured. \
+                     The dashboard, display control, and session browsing still work.",
                 );
             }
             slog(&session_log, |l| {
