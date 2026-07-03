@@ -58,25 +58,11 @@ pub struct GeminiRuntimeConfig {
 
 pub type SharedGeminiConfig = Arc<RwLock<GeminiRuntimeConfig>>;
 
-/// Runtime-adjustable Claude Code launch settings. Like the Gemini config,
-/// these map to claude CLI flags latched at process spawn (`--model`,
-/// `--permission-mode`, `--allowedTools`), so a change forces the daemon
-/// loop to tear down the persistent agent before the next task.
-#[derive(Debug, Clone)]
-pub struct ClaudeRuntimeConfig {
-    pub model: Option<String>,
-    pub permission_mode: String,
-    pub allowed_tools: Vec<String>,
-}
-
-pub type SharedClaudeConfig = Arc<RwLock<ClaudeRuntimeConfig>>;
-
 pub struct ControlPlaneState {
     pub autonomy: SharedAutonomy,
     pub external_agent: Arc<RwLock<Option<external_agent::AgentBackend>>>,
     pub codex_config: SharedCodexConfig,
     pub gemini_config: SharedGeminiConfig,
-    pub claude_config: SharedClaudeConfig,
     pub bus: EventBus,
     /// Project root for `intendant.toml` writes. When set, changes to
     /// `external_agent` (from any frontend) also persist to the config
@@ -478,82 +464,6 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 context_archive: Some(normalized),
                 ..Default::default()
             }));
-        }
-        ControlMsg::SetClaudeModel { model } => {
-            // Empty/whitespace clears the override — matches the dashboard
-            // input semantics for the Codex/Gemini model fields.
-            let normalized: Option<String> = model
-                .as_ref()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            {
-                let mut guard = state.claude_config.write().await;
-                guard.model = normalized.clone();
-            }
-            if let Some(ref root) = state.project_root {
-                if let Err(e) = persist_claude_field(root, |cfg| {
-                    cfg.model = normalized.clone();
-                }) {
-                    eprintln!(
-                        "[control_plane] failed to persist claude_code.model to intendant.toml: {e}"
-                    );
-                }
-            }
-            state
-                .bus
-                .send(claude_config_changed_event(ClaudeConfigDelta {
-                    model: normalized.clone(),
-                    model_cleared: normalized.is_none(),
-                    ..Default::default()
-                }));
-        }
-        ControlMsg::SetClaudePermissionMode { mode } => {
-            let normalized = crate::project::normalize_claude_permission_mode(mode);
-            {
-                let mut guard = state.claude_config.write().await;
-                guard.permission_mode = normalized.clone();
-            }
-            if let Some(ref root) = state.project_root {
-                if let Err(e) = persist_claude_field(root, |cfg| {
-                    cfg.permission_mode = normalized.clone();
-                }) {
-                    eprintln!(
-                        "[control_plane] failed to persist claude_code.permission_mode to intendant.toml: {e}"
-                    );
-                }
-            }
-            state
-                .bus
-                .send(claude_config_changed_event(ClaudeConfigDelta {
-                    permission_mode: Some(normalized),
-                    ..Default::default()
-                }));
-        }
-        ControlMsg::SetClaudeAllowedTools { tools } => {
-            let normalized: Vec<String> = tools
-                .iter()
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect();
-            {
-                let mut guard = state.claude_config.write().await;
-                guard.allowed_tools = normalized.clone();
-            }
-            if let Some(ref root) = state.project_root {
-                if let Err(e) = persist_claude_field(root, |cfg| {
-                    cfg.allowed_tools = normalized.clone();
-                }) {
-                    eprintln!(
-                        "[control_plane] failed to persist claude_code.allowed_tools to intendant.toml: {e}"
-                    );
-                }
-            }
-            state
-                .bus
-                .send(claude_config_changed_event(ClaudeConfigDelta {
-                    allowed_tools: Some(normalized),
-                    ..Default::default()
-                }));
         }
         ControlMsg::SetGeminiModel { model } => {
             // Treat empty/whitespace as "clear the override", matching the
@@ -994,37 +904,6 @@ where
     proj.save_config()
 }
 
-fn persist_claude_field<F>(
-    project_root: &std::path::Path,
-    mutate: F,
-) -> Result<(), crate::error::CallerError>
-where
-    F: FnOnce(&mut crate::project::ClaudeCodeConfig),
-{
-    let mut proj = crate::project::Project::from_root(project_root.to_path_buf())?;
-    mutate(&mut proj.config.agent.claude_code);
-    proj.save_config()
-}
-
-/// Delta describing which Claude Code config fields changed. Mirrors
-/// `GeminiConfigDelta`; `Option::None` across the board means "no change".
-#[derive(Debug, Default)]
-struct ClaudeConfigDelta {
-    model: Option<String>,
-    model_cleared: bool,
-    permission_mode: Option<String>,
-    allowed_tools: Option<Vec<String>>,
-}
-
-fn claude_config_changed_event(delta: ClaudeConfigDelta) -> AppEvent {
-    AppEvent::ClaudeConfigChanged {
-        model: delta.model,
-        model_cleared: delta.model_cleared,
-        permission_mode: delta.permission_mode,
-        allowed_tools: delta.allowed_tools,
-    }
-}
-
 /// Delta describing which Gemini config fields changed. Mirrors
 /// `CodexConfigDelta`; `Option::None` across the board means "no change".
 #[derive(Debug, Default)]
@@ -1112,14 +991,6 @@ mod tests {
         }))
     }
 
-    fn test_claude_config() -> SharedClaudeConfig {
-        Arc::new(RwLock::new(ClaudeRuntimeConfig {
-            model: None,
-            permission_mode: "default".to_string(),
-            allowed_tools: Vec::new(),
-        }))
-    }
-
     #[tokio::test]
     async fn set_autonomy_updates_shared_state() {
         let bus = EventBus::new();
@@ -1134,7 +1005,6 @@ mod tests {
                 external_agent: external_agent.clone(),
                 codex_config: test_codex_config(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1181,7 +1051,6 @@ mod tests {
                 external_agent: external_agent.clone(),
                 codex_config: test_codex_config(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1215,7 +1084,6 @@ mod tests {
                 external_agent: external_agent.clone(),
                 codex_config: test_codex_config(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1261,7 +1129,6 @@ mod tests {
                 external_agent: external_agent.clone(),
                 codex_config: test_codex_config(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1293,7 +1160,6 @@ mod tests {
                 external_agent: external_agent.clone(),
                 codex_config: test_codex_config(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1325,7 +1191,6 @@ mod tests {
                 external_agent,
                 codex_config: codex_config.clone(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1360,7 +1225,6 @@ mod tests {
                 external_agent,
                 codex_config: codex_config.clone(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1398,7 +1262,6 @@ mod tests {
                 external_agent,
                 codex_config: codex_config.clone(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1429,7 +1292,6 @@ mod tests {
                 external_agent,
                 codex_config: codex_config.clone(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1465,7 +1327,6 @@ mod tests {
                 external_agent,
                 codex_config: codex_config.clone(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1508,7 +1369,6 @@ mod tests {
                 external_agent,
                 codex_config: codex_config.clone(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1555,7 +1415,6 @@ mod tests {
                 external_agent,
                 codex_config: codex_config.clone(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1599,7 +1458,6 @@ mod tests {
                 external_agent,
                 codex_config,
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1656,7 +1514,6 @@ mod tests {
                 external_agent,
                 codex_config,
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1714,7 +1571,6 @@ mod tests {
                 external_agent,
                 codex_config: codex_config.clone(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1752,7 +1608,6 @@ mod tests {
                 external_agent,
                 codex_config: codex_config.clone(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1791,7 +1646,6 @@ mod tests {
                 external_agent,
                 codex_config: codex_config.clone(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1832,7 +1686,6 @@ mod tests {
                 external_agent,
                 codex_config: test_codex_config(),
                 gemini_config: gemini_config.clone(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1869,7 +1722,6 @@ mod tests {
                 external_agent: Arc::new(RwLock::new(None)),
                 codex_config: test_codex_config(),
                 gemini_config: gemini_config.clone(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1907,7 +1759,6 @@ mod tests {
                 external_agent: Arc::new(RwLock::new(None)),
                 codex_config: test_codex_config(),
                 gemini_config: gemini_config.clone(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1937,7 +1788,6 @@ mod tests {
                 external_agent: Arc::new(RwLock::new(None)),
                 codex_config: test_codex_config(),
                 gemini_config: gemini_config.clone(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -1972,7 +1822,6 @@ mod tests {
                 external_agent: Arc::new(RwLock::new(None)),
                 codex_config: test_codex_config(),
                 gemini_config: test_gemini_config(),
-                claude_config: test_claude_config(),
                 bus: bus.clone(),
                 project_root: None,
             },

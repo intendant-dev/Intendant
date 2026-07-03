@@ -8722,17 +8722,7 @@ fn claude_session_list_row_from_file(path: &Path) -> Option<serde_json::Value> {
             if task.is_none() {
                 if let Some(msg) = obj.get("message") {
                     if let Some(content) = msg.get("content").and_then(message_content_text) {
-                        // Supervised sessions carry the Intendant bootstrap
-                        // addendum on their first prompt; keep it out of the
-                        // session title.
-                        let user_text = content
-                            .split(
-                                crate::external_agent::claude_code::CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER,
-                            )
-                            .next()
-                            .unwrap_or(&content)
-                            .trim_end();
-                        task = Some(compact_text(user_text, 180));
+                        task = Some(compact_text(&content, 180));
                     }
                 }
             }
@@ -17032,14 +17022,6 @@ pub struct SettingsPayload {
     // command/path defaults.
     #[serde(default)]
     pub claude_command: Option<String>,
-    // Claude Code runtime config (persisted to `[agent.claude_code]`).
-    // Mirrors the Codex/Gemini fields for the Activity → Control sub-tab.
-    #[serde(default)]
-    pub claude_model: Option<String>,
-    #[serde(default)]
-    pub claude_permission_mode: Option<String>,
-    #[serde(default)]
-    pub claude_allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     pub gemini_command: Option<String>,
     // Gemini runtime config (persisted to `[agent.gemini_cli]`). Mirrors
@@ -17168,11 +17150,6 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
             &config.agent.codex.context_archive,
         )),
         claude_command: Some(config.agent.claude_code.command.clone()),
-        claude_model: config.agent.claude_code.model.clone(),
-        claude_permission_mode: Some(crate::project::normalize_claude_permission_mode(
-            &config.agent.claude_code.permission_mode,
-        )),
-        claude_allowed_tools: Some(config.agent.claude_code.allowed_tools.clone()),
         gemini_command: Some(config.agent.gemini_cli.command.clone()),
         gemini_model: config.agent.gemini_cli.model.clone(),
         gemini_approval_mode: crate::project::normalize_gemini_approval_mode(
@@ -17290,26 +17267,6 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
     if payload.claude_command.is_some() {
         config.agent.claude_code.command =
             normalize_settings_agent_command(payload.claude_command.as_deref(), "claude");
-    }
-    if payload.claude_model.is_some() {
-        // Empty clears the override (claude picks its configured default).
-        config.agent.claude_code.model = payload
-            .claude_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string);
-    }
-    if let Some(mode) = payload.claude_permission_mode.as_deref() {
-        config.agent.claude_code.permission_mode =
-            crate::project::normalize_claude_permission_mode(mode);
-    }
-    if let Some(tools) = payload.claude_allowed_tools.as_ref() {
-        config.agent.claude_code.allowed_tools = tools
-            .iter()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect();
     }
     if payload.gemini_command.is_some() {
         config.agent.gemini_cli.command =

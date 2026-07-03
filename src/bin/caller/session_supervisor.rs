@@ -22,7 +22,6 @@ pub struct SessionSupervisorConfig {
     pub shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     pub shared_codex_config: control_plane::SharedCodexConfig,
     pub shared_gemini_config: control_plane::SharedGeminiConfig,
-    pub shared_claude_config: control_plane::SharedClaudeConfig,
     pub frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     /// Live display sessions, when the daemon runs a display pipeline. CU
     /// screenshots prefer their in-memory frames over subprocess capture.
@@ -3479,14 +3478,7 @@ impl SessionSupervisor {
                 cfg.include_directories = current.include_directories;
                 cfg.debug = current.debug;
             }
-            Some(external_agent::AgentBackend::ClaudeCode) => {
-                let current = self.config.shared_claude_config.read().await.clone();
-                let cfg = &mut project.config.agent.claude_code;
-                cfg.model = current.model;
-                cfg.permission_mode = current.permission_mode;
-                cfg.allowed_tools = current.allowed_tools;
-            }
-            None => {}
+            Some(external_agent::AgentBackend::ClaudeCode) | None => {}
         }
         Ok(project)
     }
@@ -4516,13 +4508,6 @@ mod tests {
                     allowed_mcp_servers: Vec::new(),
                     include_directories: Vec::new(),
                     debug: false,
-                },
-            )),
-            shared_claude_config: Arc::new(tokio::sync::RwLock::new(
-                control_plane::ClaudeRuntimeConfig {
-                    model: None,
-                    permission_mode: "default".to_string(),
-                    allowed_tools: Vec::new(),
                 },
             )),
             frame_registry: Arc::new(tokio::sync::RwLock::new(frames::FrameRegistry::new(

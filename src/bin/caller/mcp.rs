@@ -4255,51 +4255,6 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
-        ControlMsg::SetClaudeModel { model } => {
-            let label = model
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("<default>");
-            emit_control_result(
-                control_tx,
-                "set_claude_model",
-                true,
-                format!("Claude Code model set to {} (applies on next task)", label),
-                None,
-            );
-            Some(RESOURCE_STATUS_URI)
-        }
-        ControlMsg::SetClaudePermissionMode { mode } => {
-            emit_control_result(
-                control_tx,
-                "set_claude_permission_mode",
-                true,
-                format!(
-                    "Claude Code permission mode set to {} (applies on next task)",
-                    crate::project::normalize_claude_permission_mode(mode.as_str())
-                ),
-                None,
-            );
-            Some(RESOURCE_STATUS_URI)
-        }
-        ControlMsg::SetClaudeAllowedTools { tools } => {
-            emit_control_result(
-                control_tx,
-                "set_claude_allowed_tools",
-                true,
-                if tools.is_empty() {
-                    "Claude Code allowed tools cleared — all tools available (applies on next task)"
-                        .to_string()
-                } else {
-                    format!(
-                        "Claude Code allowed tools set to {} (applies on next task)",
-                        tools.join(", ")
-                    )
-                },
-                None,
-            );
-            Some(RESOURCE_STATUS_URI)
-        }
         ControlMsg::SetGeminiModel { model } => {
             let label = model
                 .as_deref()
@@ -5426,7 +5381,6 @@ pub fn spawn_event_listener(
                     | AppEvent::SessionGoal { .. }
                     | AppEvent::SessionRenameResult { .. }
                     | AppEvent::SessionAgentConfigResult { .. }
-                    | AppEvent::ClaudeConfigChanged { .. }
                     | AppEvent::GeminiConfigChanged { .. }
                     | AppEvent::GeminiThreadActionRequested { .. }
                     | AppEvent::GeminiThreadActionResult { .. }

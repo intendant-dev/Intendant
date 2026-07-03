@@ -430,24 +430,6 @@ fn default_claude_code_permission_mode() -> String {
     "default".to_string()
 }
 
-/// Canonicalize a Claude Code permission mode. The CLI's real modes are
-/// `default`, `acceptEdits`, `plan`, and `bypassPermissions`; the legacy
-/// Intendant default "auto" (never a real mode — the CLI silently coerces
-/// it) maps to `default`. Unknown values pass through trimmed for forward
-/// compatibility with newer CLIs.
-pub fn normalize_claude_permission_mode(mode: &str) -> String {
-    let trimmed = mode.trim();
-    match trimmed.to_ascii_lowercase().as_str() {
-        "" | "default" | "auto" => "default".to_string(),
-        "acceptedits" | "accept-edits" | "accept_edits" => "acceptEdits".to_string(),
-        "plan" => "plan".to_string(),
-        "bypasspermissions" | "bypass-permissions" | "bypass_permissions" => {
-            "bypassPermissions".to_string()
-        }
-        _ => trimmed.to_string(),
-    }
-}
-
 impl Default for ClaudeCodeConfig {
     fn default() -> Self {
         Self {
