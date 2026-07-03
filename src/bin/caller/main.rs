@@ -2,12 +2,16 @@ mod access;
 mod agent_runner;
 mod app_state_pricing;
 mod approval;
+mod atspi_read;
 mod audio_routing;
 mod autonomy;
 #[cfg(target_os = "macos")]
 mod ax;
 mod browser_workspace;
 mod computer_use;
+mod windows_uia;
+#[cfg(target_os = "linux")]
+mod x11_input;
 mod connect_rendezvous;
 mod context_rewind;
 mod control;

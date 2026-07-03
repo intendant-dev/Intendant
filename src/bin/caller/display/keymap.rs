@@ -135,9 +135,71 @@ pub fn dom_code_to_evdev(code: &str) -> Option<u32> {
     })
 }
 
+/// Returns the X11 keycode for a DOM `KeyboardEvent.code`, or `None` if the
+/// code is unrecognised.
+///
+/// X11 keycodes on evdev-based servers (Xorg with evdev/libinput, Xvfb with
+/// the default "evdev" XKB rules) are the kernel evdev keycode plus 8 — the
+/// historic X minimum-keycode offset. This holds for every server intendant
+/// targets; callers should still bounds-check against the server's
+/// `min_keycode..=max_keycode` from the connection setup.
+// Consumers (x11_input, wayland) are Linux-gated; the table stays ungated so
+// its unit tests run on every host.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn dom_code_to_x11_keycode(code: &str) -> Option<u8> {
+    let evdev = dom_code_to_evdev(code)?;
+    u8::try_from(evdev + 8).ok()
+}
+
+/// Map a character to the X11 keysym that produces it.
+///
+/// ASCII and Latin-1 map directly to their codepoint; a handful of control
+/// characters map to their editing keysyms (Return, Tab, BackSpace, Escape);
+/// everything else uses the standard Unicode keysym rule
+/// (`0x01000000 | codepoint`). Shared by the Wayland portal keysym path and
+/// the in-process X11 `type_text` path.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn char_to_x11_keysym(ch: char) -> Option<i32> {
+    match ch {
+        '\n' | '\r' => Some(0xff0d),
+        '\t' => Some(0xff09),
+        '\u{8}' => Some(0xff08),
+        '\u{1b}' => Some(0xff1b),
+        ' '..='~' => Some(ch as i32),
+        '\u{a0}'..='\u{ff}' => Some(ch as i32),
+        _ => {
+            let code = ch as u32;
+            if code <= 0x10ffff {
+                Some((0x01000000 | code) as i32)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn x11_keycode_is_evdev_plus_eight() {
+        assert_eq!(dom_code_to_x11_keycode("KeyA"), Some(38));
+        assert_eq!(dom_code_to_x11_keycode("ControlLeft"), Some(37));
+        assert_eq!(dom_code_to_x11_keycode("KeyV"), Some(55));
+        assert_eq!(dom_code_to_x11_keycode("Enter"), Some(36));
+        assert_eq!(dom_code_to_x11_keycode("BogusKey"), None);
+    }
+
+    #[test]
+    fn char_keysyms_cover_ascii_and_specials() {
+        assert_eq!(char_to_x11_keysym('g'), Some(0x67));
+        assert_eq!(char_to_x11_keysym('C'), Some(0x43));
+        assert_eq!(char_to_x11_keysym(' '), Some(0x20));
+        assert_eq!(char_to_x11_keysym('\n'), Some(0xff0d));
+        assert_eq!(char_to_x11_keysym('é'), Some(0xe9));
+        assert_eq!(char_to_x11_keysym('€'), Some(0x0100_20ac));
+    }
 
     #[test]
     fn letter_keys() {
