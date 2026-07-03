@@ -232,7 +232,7 @@ With custody and leases in place, standing up a new daemon copies no
 secrets, installs nothing on the user's device, and takes about ninety
 seconds from a phone:
 
-1. **Install**: `curl -fsSL https://connect.intendant.dev/install.sh | sh -s --
+1. **Install**: `curl -fsSL https://intendant.dev/install.sh | sh -s --
    --owner <client-key-fingerprint>` on the fresh box (every rendezvous —
    hosted or self-run — serves its own version-matched installer at
    `/install.sh`). The fingerprint
