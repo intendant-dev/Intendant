@@ -1,24 +1,25 @@
 # CLAUDE.md
 
-> **Living document — last verified 2026-05-24 against `main` @ `58c264d`.**
+> **Living document — last verified 2026-07-03 against `main` @ `2800e1ce`.**
 > This is a *tight orientation* for working in the repo. The deep reference lives in
 > the mdBook under `docs/src/` (mapped below). **Both this file and those docs lag the
 > code** — Intendant moves fast (~500 commits/month) and the docs are *not* updated on
 > every change. When this file, the docs, and the source disagree, **trust the source**,
 > then fix the doc. See what changed since this was written with
-> `git log --oneline 58c264d..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
+> `git log --oneline 2800e1ce..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
 > file — when you edit CLAUDE.md, run `cp CLAUDE.md AGENTS.md` in the same commit; CI enforces they match.)
 
 ## What Intendant Is
 
 Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. Beyond running its own agent loop, it **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines**. Provider-agnostic (OpenAI, Anthropic, Gemini); cross-platform (macOS, Linux, Windows — all first-class); every capability reachable from any interface (CLI, TUI, web dashboard, MCP, voice).
 
-## The Two Binaries (security boundary)
+## The Three Binaries (security boundary)
 
-- **intendant-runtime** (`src/main.rs`, `src/agent.rs`) — sandboxed executor. Reads one JSON `AgentInput` from stdin, runs commands sequentially, writes JSONL results. Landlock-restricted. **Never holds API keys.**
+- **intendant-runtime** (`src/main.rs`, `src/agent.rs`) — sandboxed executor. Reads one JSON `AgentInput` from stdin, runs commands sequentially, writes JSONL results. Landlock-restricted on Linux, Seatbelt-wrapped on macOS, restricted-token re-exec on Windows (`src/win_sandbox.rs`). **Never holds API keys.**
 - **intendant** (`src/bin/caller/main.rs`) — controller. Drives the LLM loop, calls model APIs, dispatches tool calls to the runtime subprocess, supervises external agents, and runs every frontend.
+- **intendant-connect** (`src/bin/connect/main.rs`) — hosted rendezvous + account/metadata service (deployed to intendant.dev; self-hostable, see `docs/src/self-hosted-rendezvous.md`). Stores only what daemons and browsers publish; fleet records are browser-signed and re-verified client-side so the service cannot invent or alter them. Holds no daemon secrets and no API keys.
 
-A compromised model conversation can't reach API keys; the runtime can't exfiltrate through model APIs. This split is the load-bearing security decision — preserve it.
+The runtime/controller split is the load-bearing security decision: a compromised model conversation can't reach API keys; the runtime can't exfiltrate through model APIs. Preserve it.
 
 ## Architecture at a Glance
 
@@ -36,6 +37,8 @@ Read the relevant chapter before changing a subsystem:
 | WebRTC display (shared encoder pool, tile streaming) | `docs/src/display-pipeline.md` |
 | Peer federation, cross-machine display, LAN/mTLS | `docs/src/peer-federation.md` |
 | Trust model: anchor daemons, client identity keys, role ceilings, IAM | `docs/src/trust-architecture.md` |
+| Credential custody: leases, vault, egress relay, OAuth modes | `docs/src/credential-custody.md` |
+| Hosted rendezvous (intendant-connect), claims, self-hosting | `docs/src/self-hosted-rendezvous.md` |
 | Computer use, live audio, phone/voice-call skills | `docs/src/computer-use-and-audio.md` |
 | Presence layer (server text + browser voice) | `docs/src/presence.md` |
 | TUI + the autonomy/approval model | `docs/src/tui.md` |
@@ -80,22 +83,28 @@ Requires an API key in `.env` (searched: cwd + parents → project root → `~/.
 ```
 src/
 ├── main.rs, agent.rs           # intendant-runtime (sandboxed executor)
-├── models.rs, error.rs, utils.rs
-└── bin/caller/                 # the intendant controller:
-    ├── main.rs                 # entry: CLI parsing, agent + daemon loops
-    ├── control_plane.rs, event.rs, frontend.rs   # single-writer state; EventBus; UserAction/ControlMsg
-    ├── session_supervisor.rs, task_dispatch.rs, file_watcher.rs   # daemon: sessions, dispatch, rewind snapshots
-    ├── provider.rs, conversation.rs, tools.rs, prompts.rs, skills.rs, autonomy.rs, approval.rs
-    ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, user_mode.rs, agent_runner.rs   # native multi-agent
-    ├── external_agent/         # supervise Codex / Claude Code
-    ├── peer/, lan/, web_tls.rs # peer federation; mTLS LAN proxy; native HTTPS/WSS
-    ├── display/                # WebRTC: encode/{pool,vp8,h264_*}, tile/, capture/, webrtc, {x11,wayland,macos,windows}
-    ├── computer_use.rs, ax.rs, vision.rs, recording.rs, frames.rs
-    ├── presence.rs, live_audio.rs, audio_routing.rs, transcription.rs, quarantine.rs, schema_validator.rs
-    ├── web_gateway.rs, mcp.rs, mcp_client.rs, control.rs
-    ├── session_log.rs, session_names.rs, knowledge.rs, project.rs, app_state_pricing.rs
-    ├── sandbox.rs, platform.rs, daemon_log_tee.rs, diagnostics.rs, …
-    └── tui/                    # ratatui TUI (display-only client of the control plane)
+├── models.rs, error.rs, utils.rs, win_sandbox.rs
+├── bin/caller/                 # the intendant controller:
+│   ├── main.rs                 # entry: CLI parsing, agent + daemon loops
+│   ├── control_plane.rs, event.rs, frontend.rs   # single-writer state; EventBus; UserAction/ControlMsg
+│   ├── session_supervisor.rs, task_dispatch.rs, file_watcher.rs   # daemon: sessions, dispatch, rewind snapshots
+│   ├── provider.rs, conversation.rs, tools.rs, prompts.rs, skills.rs, autonomy.rs, approval.rs
+│   ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, user_mode.rs, agent_runner.rs   # native multi-agent
+│   ├── context_rewind.rs, fission_ledger.rs, fission_lifecycle.rs, lineage_ledger.rs   # managed context: rewinds, fission, lineage
+│   ├── external_agent/         # supervise Codex / Claude Code (+ external_wrapper_index.rs)
+│   ├── access/                 # trust architecture: client keys, IAM, org roots/issuers/ORL, enrollment, platform keystores
+│   ├── credential_leases.rs, credential_egress.rs, daemon_identity.rs, connect_rendezvous.rs   # credential custody; Connect client
+│   ├── peer/, web_tls.rs       # peer federation (transport, pairing, access profiles); native HTTPS/WSS
+│   ├── display/                # WebRTC: encode/{pool,vp8,h264_*}, tile/, capture/, webrtc, {x11,wayland,macos,windows}
+│   ├── computer_use.rs, ax.rs, vision.rs, recording.rs, frames.rs
+│   ├── presence.rs, live_audio.rs, audio_routing.rs, transcription.rs, quarantine.rs, schema_validator.rs
+│   ├── web_gateway.rs, dashboard_control.rs, terminal.rs, browser_workspace.rs   # HTTP/WS gateway; dashboard tunnel; PTY registry; agent browser
+│   ├── mcp.rs, mcp_client.rs, control.rs
+│   ├── transfer_store.rs, upload_store.rs, peer_file_transfer.rs   # transfer jobs; upload/attachment stores
+│   ├── session_log.rs, session_names.rs, knowledge.rs, project.rs, app_state_pricing.rs
+│   ├── sandbox.rs, platform.rs, daemon_log_tee.rs, diagnostics.rs, …
+│   └── tui/                    # ratatui TUI (display-only client of the control plane)
+└── bin/connect/                # intendant-connect: hosted rendezvous (accounts, daemon claims, fleet sync, vault blobs, push, transparency log)
 crates/{presence-core, presence-web, station-web}   # WASM: shared presence types/tools/dispatch, browser presence client, Station renderer
 static/         # app.html dashboard SPA + compiled wasm-web/ + wasm-station/
 macos-app/      # native macOS WKWebView wrapper (built by scripts/bundle-macos.sh)
@@ -112,7 +121,7 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
 - snake_case functions/modules, PascalCase types, SCREAMING_SNAKE_CASE constants
 - `thiserror`-based error enums (`AgentError`, `CallerError`)
 - tokio (full features), `Arc<RwLock/Mutex<T>>` for shared state, `mpsc` for channels
-- TLS/cert code is **pure-Rust `ring`/`rcgen`/`rustls`** (`web_tls.rs`, `lan/certs.rs`) — no OpenSSL; prefer that path when touching crypto/cert code
+- TLS/cert code is **pure-Rust `ring`/`rcgen`/`rustls`** (`web_tls.rs`, `access/certs.rs`) — no OpenSSL; prefer that path when touching crypto/cert code
 - Tests live in inline `#[cfg(test)]` modules only
 - WASM boundary: `serde_wasm_bindgen` with `serialize_maps_as_objects(true)`
 - Pure-safe Rust by default. The Unix (macOS / Linux) code paths contain no
