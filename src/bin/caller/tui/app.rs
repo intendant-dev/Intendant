@@ -311,9 +311,15 @@ impl ViewState {
         // user can browse logs while an approval is pending.
         match app.mode {
             AppMode::Approval => {
-                // Let scroll/view keys work during approval
+                // The approval prompt owns Enter (approve, as advertised in
+                // help); the view layer would otherwise consume it to toggle
+                // turn expansion — Right still expands. Everything else
+                // scrolls/expands so the user can browse logs while deciding,
+                // and unconsumed keys fall through to handle_approval_key.
+                if key.code == KeyCode::Enter {
+                    return false;
+                }
                 self.handle_normal_view_key(key, app)
-                // If not consumed, falls through to App::handle_approval_key
             }
             AppMode::AskHuman | AppMode::FollowUp => false,
             AppMode::Normal | AppMode::Help | AppMode::Inspect => {
@@ -2940,6 +2946,23 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.handle_key(key));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn approval_mode_enter_reaches_the_approval_handler() {
+        let mut app = test_app();
+        app.mode = AppMode::Approval;
+        let mut view = ViewState::default();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        // The view layer must not consume Enter during approval — help
+        // advertises y/Enter as approve, so it has to fall through to
+        // App::handle_approval_key.
+        assert!(!view.handle_key(enter, &app));
+        // Browsing keys still work while the prompt is up.
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        assert!(view.handle_key(right, &app));
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        assert!(view.handle_key(down, &app));
     }
 
     #[test]

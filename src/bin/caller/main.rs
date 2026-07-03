@@ -13557,6 +13557,32 @@ async fn start_external_display_recordings(
     }
 }
 
+/// Side effects a user approval carries beyond unblocking the waiting
+/// command: dedup recording for plain approvals, autonomy escalation for
+/// approve-all, and the first DisplayControl approval granting user-display
+/// access session-wide. Every approval surface (JSON stdin slot, TUI/MCP
+/// registry) must apply these identically, or an approval "succeeds" and
+/// the action still fails its grant check afterwards.
+async fn apply_user_approval(
+    response: event::ApprovalResponse,
+    cat: autonomy::ActionCategory,
+    preview: &str,
+    autonomy: &SharedAutonomy,
+    bus: &EventBus,
+) {
+    let mut state = autonomy.write().await;
+    match response {
+        event::ApprovalResponse::Approve => state.record_approved_command(preview),
+        event::ApprovalResponse::ApproveAll => state.level = AutonomyLevel::Full,
+        event::ApprovalResponse::Skip | event::ApprovalResponse::Deny => return,
+    }
+    if cat == autonomy::ActionCategory::DisplayControl && !state.user_display_granted {
+        state.user_display_granted = true;
+        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
+    }
+}
+
 /// Format a human-readable command preview from raw JSON (for approval display).
 fn format_command_preview(json_str: &str) -> String {
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
@@ -20961,6 +20987,60 @@ Also: {"source": "bare"}"#;
         );
     }
 
+    #[tokio::test]
+    async fn user_approval_side_effects_apply_on_every_surface() {
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+
+        // Plain approval records the command for dedup; a DisplayControl
+        // approval grants the user display session-wide. The TUI/MCP
+        // registry path used to skip both, so approving there left the
+        // action failing its grant check afterwards.
+        apply_user_approval(
+            event::ApprovalResponse::Approve,
+            autonomy::ActionCategory::DisplayControl,
+            "cu: click",
+            &autonomy,
+            &bus,
+        )
+        .await;
+        {
+            let state = autonomy.read().await;
+            assert!(state.was_command_approved("cu: click"));
+            assert!(state.user_display_granted);
+        }
+        let mut saw_grant = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, AppEvent::UserDisplayGranted { .. }) {
+                saw_grant = true;
+            }
+        }
+        assert!(saw_grant, "UserDisplayGranted must be announced");
+
+        // Approve-all escalates autonomy for the rest of the session.
+        apply_user_approval(
+            event::ApprovalResponse::ApproveAll,
+            autonomy::ActionCategory::CommandExec,
+            "rm -rf target",
+            &autonomy,
+            &bus,
+        )
+        .await;
+        assert_eq!(autonomy.read().await.level, AutonomyLevel::Full);
+
+        // Deny and skip carry no side effects.
+        apply_user_approval(
+            event::ApprovalResponse::Deny,
+            autonomy::ActionCategory::CommandExec,
+            "never ran",
+            &autonomy,
+            &bus,
+        )
+        .await;
+        assert!(!autonomy.read().await.was_command_approved("never ran"));
+    }
+
     #[test]
     fn format_command_preview_exec() {
         let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls -la /tmp"}]}"#;
@@ -25205,17 +25285,14 @@ async fn run_agent_loop(
                                     id: turn as u64,
                                     action: "approve".to_string(),
                                 });
-                                // Record approved command for dedup
-                                autonomy.write().await.record_approved_command(&preview);
-                                // Session-grant: first DisplayControl approval unlocks the session
-                                if cat == autonomy::ActionCategory::DisplayControl {
-                                    let mut state = autonomy.write().await;
-                                    if !state.user_display_granted {
-                                        state.user_display_granted = true;
-                                        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
-                                    }
-                                }
+                                apply_user_approval(
+                                    event::ApprovalResponse::Approve,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::ApproveAll) => {
                                 slog(&session_log, |l| {
@@ -25226,16 +25303,14 @@ async fn run_agent_loop(
                                     id: turn as u64,
                                     action: "approve_all".to_string(),
                                 });
-                                let mut state = autonomy.write().await;
-                                state.level = AutonomyLevel::Full;
-                                // Session-grant: DisplayControl approval also unlocks user display
-                                if cat == autonomy::ActionCategory::DisplayControl
-                                    && !state.user_display_granted
-                                {
-                                    state.user_display_granted = true;
-                                    std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                    bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
-                                }
+                                apply_user_approval(
+                                    event::ApprovalResponse::ApproveAll,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::Skip) => {
                                 slog(&session_log, |l| {
@@ -25290,13 +25365,27 @@ async fn run_agent_loop(
                                 slog(&session_log, |l| {
                                     l.approval(&cat.to_string(), &preview, "approved")
                                 });
+                                apply_user_approval(
+                                    event::ApprovalResponse::Approve,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::ApproveAll) => {
                                 slog(&session_log, |l| {
                                     l.approval(&cat.to_string(), &preview, "approve-all")
                                 });
-                                let mut state = autonomy.write().await;
-                                state.level = AutonomyLevel::Full;
+                                apply_user_approval(
+                                    event::ApprovalResponse::ApproveAll,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::Skip) => {
                                 slog(&session_log, |l| {
@@ -25639,17 +25728,14 @@ Proceed with explicit assumptions and continue without additional questions."
                                     id: turn as u64,
                                     action: "approve".to_string(),
                                 });
-                                // Record approved command for dedup
-                                autonomy.write().await.record_approved_command(&preview);
-                                // Session-grant: first DisplayControl approval unlocks the session
-                                if cat == autonomy::ActionCategory::DisplayControl {
-                                    let mut state = autonomy.write().await;
-                                    if !state.user_display_granted {
-                                        state.user_display_granted = true;
-                                        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
-                                    }
-                                }
+                                apply_user_approval(
+                                    event::ApprovalResponse::Approve,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::ApproveAll) => {
                                 slog(&session_log, |l| {
@@ -25660,16 +25746,14 @@ Proceed with explicit assumptions and continue without additional questions."
                                     id: turn as u64,
                                     action: "approve_all".to_string(),
                                 });
-                                let mut state = autonomy.write().await;
-                                state.level = AutonomyLevel::Full;
-                                // Session-grant: DisplayControl approval also unlocks user display
-                                if cat == autonomy::ActionCategory::DisplayControl
-                                    && !state.user_display_granted
-                                {
-                                    state.user_display_granted = true;
-                                    std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                    bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
-                                }
+                                apply_user_approval(
+                                    event::ApprovalResponse::ApproveAll,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::Skip) => {
                                 slog(&session_log, |l| {
@@ -25724,13 +25808,27 @@ Proceed with explicit assumptions and continue without additional questions."
                                 slog(&session_log, |l| {
                                     l.approval(&cat.to_string(), &preview, "approved")
                                 });
+                                apply_user_approval(
+                                    event::ApprovalResponse::Approve,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::ApproveAll) => {
                                 slog(&session_log, |l| {
                                     l.approval(&cat.to_string(), &preview, "approve-all")
                                 });
-                                let mut state = autonomy.write().await;
-                                state.level = AutonomyLevel::Full;
+                                apply_user_approval(
+                                    event::ApprovalResponse::ApproveAll,
+                                    cat,
+                                    &preview,
+                                    &autonomy,
+                                    &bus,
+                                )
+                                .await;
                             }
                             Ok(event::ApprovalResponse::Skip) => {
                                 slog(&session_log, |l| {
