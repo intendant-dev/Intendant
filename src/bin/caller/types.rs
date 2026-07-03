@@ -421,6 +421,19 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         context_archive: Option<String>,
     },
+    /// Mirror of `CodexConfigChanged` for the Claude Code backend. Fields
+    /// omitted (or `Option::None`) mean "no change since the last emission".
+    /// See `ControlMsg::SetClaude*` variants for the write side.
+    ClaudeConfigChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        model_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_tools: Option<Vec<String>>,
+    },
     Usage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,

@@ -4367,6 +4367,14 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
     }
     let access_principal = runtime.grant.access_principal();
     result.insert("access_principal".to_string(), access_principal.as_value());
+    // Whether ANY provider credential is usable (.env key or active lease).
+    // A single aggregate boolean — deliberately not per-provider — so every
+    // binding can drive the first-run "fuel this daemon" nudge without the
+    // settings.manage permission the per-provider api_key_status needs.
+    result.insert(
+        "fueled".to_string(),
+        serde_json::json!(crate::web_gateway::any_provider_credential_usable()),
+    );
     result.insert(
         "iam_enforcement".to_string(),
         serde_json::json!({
@@ -9349,6 +9357,9 @@ fn dashboard_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::SetCodexWritableRoots { .. }
             | ControlMsg::SetCodexManagedContext { .. }
             | ControlMsg::SetCodexContextArchive { .. }
+            | ControlMsg::SetClaudeModel { .. }
+            | ControlMsg::SetClaudePermissionMode { .. }
+            | ControlMsg::SetClaudeAllowedTools { .. }
             | ControlMsg::SetVerbosity { .. }
     )
 }
@@ -9429,6 +9440,9 @@ fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::StopSession { .. } => "stop_session",
         ControlMsg::RestartSession { .. } => "restart_session",
         ControlMsg::ResumeSession { .. } => "resume_session",
+        ControlMsg::SetClaudeModel { .. } => "set_claude_model",
+        ControlMsg::SetClaudePermissionMode { .. } => "set_claude_permission_mode",
+        ControlMsg::SetClaudeAllowedTools { .. } => "set_claude_allowed_tools",
         ControlMsg::SetVerbosity { .. } => "set_verbosity",
         ControlMsg::ScheduleControllerRestart { .. } => "schedule_controller_restart",
         ControlMsg::ControllerTurnComplete { .. } => "controller_turn_complete",

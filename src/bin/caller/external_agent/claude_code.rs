@@ -1,9 +1,10 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, Mutex};
@@ -11,8 +12,8 @@ use tokio::sync::{mpsc, Mutex};
 use crate::error::CallerError;
 
 use super::{
-    AgentConfig, AgentEvent, AgentThread, ApprovalCategory, ApprovalDecision, ExternalAgent,
-    ToolCompletionStatus,
+    AgentConfig, AgentEvent, AgentThread, AgentUsageSnapshot, ApprovalCategory, ApprovalDecision,
+    ExternalAgent, ToolCompletionStatus,
 };
 
 /// Appended to the first user message when an Intendant web port is
@@ -34,36 +35,26 @@ This session runs under Intendant, which adds desktop and display capabilities b
 For browser/dashboard/Station validation, use `node scripts/validate-dashboard.cjs` and prefer its named probes such as `--station-probe rendered` over ad-hoc Chromium/CDP scripts; its `--help` is the authoritative flag reference, and docs/src/external-agent-orchestration.md has the full Station QA recipes. For a temporary dashboard, use the helper's owned lifecycle: `--launch-dashboard --port <throwaway_port>` for a one-shot smoke, or `--hold-dashboard` kept in the foreground while separate CU/browser steps run against the printed URL, then interrupted for helper-owned cleanup. Do not start a separate foreground/nohup/setsid dashboard just so another tool can connect.
 "#;
 
-// ---------------------------------------------------------------------------
-// Claude Code JSONL protocol types (stdin/stdout)
-// ---------------------------------------------------------------------------
+/// First heading of [`CLAUDE_CODE_BOOTSTRAP_ADDENDUM`]. Consumers deriving
+/// task labels from a supervised session's first user message strip
+/// everything from this marker on — the addendum rides the first prompt and
+/// otherwise leaks supervision boilerplate into session titles.
+pub const CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER: &str = "### Intendant Supervision";
 
-/// Incoming message from Claude Code stdout (JSONL).
-#[derive(Deserialize)]
-struct CcMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    #[serde(default)]
-    subtype: Option<String>,
-    /// For assistant messages: the API message object.
-    #[serde(default)]
-    message: Option<serde_json::Value>,
-    /// For stream_event: the streaming delta event.
-    #[serde(default)]
-    event: Option<serde_json::Value>,
-    /// For result: the final text result.
-    #[serde(default)]
-    result: Option<String>,
-    /// For result: the session ID.
-    #[serde(default)]
-    session_id: Option<String>,
-    /// For control_request: the request ID.
-    #[serde(default)]
-    request_id: Option<String>,
-    /// For control_request: the request payload.
-    #[serde(default)]
-    request: Option<serde_json::Value>,
-}
+/// Claude models currently ship a 200k context window; the authoritative
+/// value arrives with the first `result` message's `modelUsage` map and
+/// replaces this default.
+const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
+
+/// Placeholder thread id used until Claude Code reveals the native session
+/// id (it stamps one on every stdout message once the first turn begins).
+/// `AgentBackend::ClaudeCode::thread_id_is_canonical` treats exactly this
+/// value as non-canonical.
+const PLACEHOLDER_THREAD_ID: &str = "claude-code-session";
+
+// ---------------------------------------------------------------------------
+// Outbound JSONL types (stdin)
+// ---------------------------------------------------------------------------
 
 /// User message written to Claude Code stdin (JSONL).
 #[derive(Serialize)]
@@ -71,8 +62,6 @@ struct CcUserMessage {
     #[serde(rename = "type")]
     msg_type: String,
     message: CcMessageContent,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session_id: Option<String>,
     parent_tool_use_id: Option<String>,
 }
 
@@ -89,7 +78,9 @@ struct CcContentBlock {
     text: String,
 }
 
-/// Control response written to stdin for permission requests.
+/// Control response written to stdin, answering a CLI→client
+/// `control_request` (permission prompts arrive this way with
+/// `--permission-prompt-tool stdio`).
 #[derive(Serialize)]
 struct CcControlResponse {
     #[serde(rename = "type")]
@@ -101,105 +92,763 @@ struct CcControlResponse {
 struct CcControlResponseInner {
     subtype: String,
     request_id: String,
-    response: CcPermissionDecision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
+/// Client→CLI control request. Interrupt is the only subtype Intendant
+/// sends: it aborts the running turn (the turn's `result` arrives with
+/// subtype `error_during_execution`) while the process stays usable for
+/// follow-up turns.
 #[derive(Serialize)]
-struct CcPermissionDecision {
-    behavior: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
+struct CcControlRequest {
+    #[serde(rename = "type")]
+    msg_type: String,
+    request_id: String,
+    request: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
-// Shared writer
+// Shared state
 // ---------------------------------------------------------------------------
 
 type SharedWriter = Arc<Mutex<BufWriter<ChildStdin>>>;
 
-/// Pending approval requests: our request_id → CC's request_id
-type PendingApprovals = Arc<Mutex<HashMap<String, String>>>;
-
-// ---------------------------------------------------------------------------
-// ClaudeCodeAgent
-// ---------------------------------------------------------------------------
-
-pub struct ClaudeCodeAgent {
-    command: String,
-    model: Option<String>,
-    permission_mode: String,
-    allowed_tools: Vec<String>,
-    web_port: Option<u16>,
-    working_dir: Option<std::path::PathBuf>,
-    child: Option<Child>,
-    writer: Option<SharedWriter>,
-    event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
-    pending_approvals: PendingApprovals,
-    reader_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Session ID from the first result message, used for multi-turn.
-    session_id: Option<String>,
-    /// Whether the first prompt (carrying the bootstrap addendum) was sent.
-    prompt_sent: bool,
-    /// Loopback MCP auth token from the daemon, baked into the injected URL.
-    mcp_auth_token: Option<String>,
-    /// Intendant session id scoping the injected MCP URL and ctl env.
-    mcp_session_id: Option<String>,
+/// One in-flight `can_use_tool` permission request.
+struct PendingCcApproval {
+    /// Claude Code's control request id (Intendant hands frontends its own).
+    cc_request_id: String,
+    /// Original tool input. The allow response must echo it back as
+    /// `updatedInput` — Claude Code 2.x validates the field's presence and
+    /// fails the permission request without it.
+    tool_input: serde_json::Value,
+    /// `addRules`/allow entries from the request's own
+    /// `permission_suggestions`, retargeted at the `session` destination.
+    /// AcceptForSession returns these so the standing grant is exactly
+    /// Claude Code's generalization of this call, held in process memory —
+    /// never written into the checkout's settings files.
+    session_rules: Vec<serde_json::Value>,
 }
 
-impl ClaudeCodeAgent {
-    pub fn new(
-        command: String,
-        model: Option<String>,
-        permission_mode: String,
-        allowed_tools: Vec<String>,
-        web_port: Option<u16>,
-    ) -> Self {
+/// Pending approvals: Intendant request_id → the Claude Code request state.
+type PendingApprovals = Arc<StdMutex<HashMap<String, PendingCcApproval>>>;
+
+fn lock_pending(
+    pending: &PendingApprovals,
+) -> StdMutexGuard<'_, HashMap<String, PendingCcApproval>> {
+    match pending.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// State shared between the adapter and its stdout reader task.
+struct CcShared {
+    /// Backend-native session id, captured from the first stdout message
+    /// that carries one. `--resume` keeps the id stable across processes.
+    session_id: StdMutex<Option<String>>,
+    /// Set by `interrupt_turn`. The interrupted turn ends with a `result`
+    /// of subtype `error_during_execution`; this flag keeps that expected
+    /// outcome from being reported as a backend error.
+    interrupt_pending: AtomicBool,
+}
+
+impl CcShared {
+    fn new(resume_session: Option<String>) -> Self {
         Self {
-            command,
-            model,
-            permission_mode,
-            allowed_tools,
-            web_port,
-            working_dir: None,
-            child: None,
-            writer: None,
-            event_tx: None,
-            pending_approvals: Arc::new(Mutex::new(HashMap::new())),
-            reader_handle: None,
-            session_id: None,
-            prompt_sent: false,
-            mcp_auth_token: None,
-            mcp_session_id: None,
+            session_id: StdMutex::new(resume_session),
+            interrupt_pending: AtomicBool::new(false),
         }
     }
 
-    /// The scoped loopback MCP URL injected into `--mcp-config` and the ctl
-    /// env. Claude Code has no managed-context mode, so the server treats the
-    /// session as vanilla; `tool_profile=core` keeps the advertised tool list
-    /// to the bootstrap set (full surface stays callable via `ctl tools`).
-    fn intendant_mcp_url(&self, port: u16) -> String {
-        super::intendant_bootstrap_mcp_url(
-            port,
-            self.mcp_session_id.as_deref(),
-            None,
-            self.mcp_auth_token.as_deref(),
-        )
+    fn session_id(&self) -> Option<String> {
+        match self.session_id.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn set_session_id(&self, id: &str) {
+        let mut guard = match self.session_id.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(id.to_string());
     }
 }
 
 // ---------------------------------------------------------------------------
-// Reader task: parse stdout JSONL
+// Pure protocol helpers
+// ---------------------------------------------------------------------------
+
+/// Human preview for a tool invocation: shell command, file path (plus the
+/// model's own description when present), or a truncated JSON dump.
+fn tool_input_preview(input: &serde_json::Value) -> String {
+    let raw = if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
+        cmd.to_string()
+    } else if let Some(path) = input.get("file_path").and_then(|p| p.as_str()) {
+        match input.get("description").and_then(|d| d.as_str()) {
+            Some(desc) => format!("{path} — {desc}"),
+            None => path.to_string(),
+        }
+    } else if let serde_json::Value::String(s) = input {
+        s.clone()
+    } else {
+        input.to_string()
+    };
+    raw.chars().take(200).collect()
+}
+
+fn approval_category_for_tool(tool_name: &str) -> ApprovalCategory {
+    match tool_name {
+        "Edit" | "Write" | "NotebookEdit" => ApprovalCategory::FileChange,
+        name if name.starts_with("mcp__") => ApprovalCategory::McpTool,
+        _ => ApprovalCategory::CommandExecution,
+    }
+}
+
+/// Extract the `addRules`/allow suggestions from a `can_use_tool` request,
+/// retargeted at the `session` destination. Claude Code's own suggestions
+/// default to `localSettings`, which would persist policy into the
+/// supervised checkout's `.claude/settings.local.json` — a supervised
+/// backend must never mutate on-disk approval policy, so `session`
+/// (process-memory, this run only) is the only destination ever returned.
+fn session_scoped_permission_rules(request: &serde_json::Value) -> Vec<serde_json::Value> {
+    let Some(suggestions) = request
+        .get("permission_suggestions")
+        .and_then(|s| s.as_array())
+    else {
+        return Vec::new();
+    };
+    suggestions
+        .iter()
+        .filter(|s| {
+            s.get("type").and_then(|t| t.as_str()) == Some("addRules")
+                && s.get("behavior").and_then(|b| b.as_str()) == Some("allow")
+        })
+        .map(|s| {
+            let mut rule = s.clone();
+            if let Some(obj) = rule.as_object_mut() {
+                obj.insert(
+                    "destination".into(),
+                    serde_json::Value::String("session".into()),
+                );
+            }
+            rule
+        })
+        .collect()
+}
+
+/// PermissionResult payload answering a `can_use_tool` request.
+fn approval_response_payload(
+    pending: &PendingCcApproval,
+    decision: &ApprovalDecision,
+) -> serde_json::Value {
+    match decision {
+        ApprovalDecision::Accept => serde_json::json!({
+            "behavior": "allow",
+            "updatedInput": pending.tool_input,
+        }),
+        ApprovalDecision::AcceptForSession => {
+            let mut payload = serde_json::json!({
+                "behavior": "allow",
+                "updatedInput": pending.tool_input,
+            });
+            if !pending.session_rules.is_empty() {
+                payload["updatedPermissions"] =
+                    serde_json::Value::Array(pending.session_rules.clone());
+            }
+            payload
+        }
+        ApprovalDecision::Decline => serde_json::json!({
+            "behavior": "deny",
+            "message": "Denied by the Intendant supervisor",
+        }),
+        // Cancel aborts the whole turn, not just this tool call.
+        ApprovalDecision::Cancel => serde_json::json!({
+            "behavior": "deny",
+            "message": "Cancelled by the Intendant supervisor",
+            "interrupt": true,
+        }),
+    }
+}
+
+/// Context-meter snapshot from an Anthropic API usage object. The same
+/// shape arrives on `message_delta` stream events, assistant messages, and
+/// the turn's `result`; prompt-side tokens (fresh + cached) approximate the
+/// live context footprint.
+fn usage_snapshot_from_api_usage(
+    usage: &serde_json::Value,
+    model: &str,
+    context_window: u64,
+) -> Option<AgentUsageSnapshot> {
+    let read = |key: &str| usage.get(key).and_then(|v| v.as_u64());
+    let input = read("input_tokens")?;
+    let output = read("output_tokens").unwrap_or(0);
+    let cache_read = read("cache_read_input_tokens").unwrap_or(0);
+    let cache_creation = read("cache_creation_input_tokens").unwrap_or(0);
+    let prompt_tokens = input + cache_read + cache_creation;
+    let tokens_used = prompt_tokens + output;
+    let usage_pct = if context_window > 0 {
+        (tokens_used as f64 / context_window as f64) * 100.0
+    } else {
+        0.0
+    };
+    Some(AgentUsageSnapshot {
+        provider: "anthropic".to_string(),
+        model: model.to_string(),
+        tokens_used,
+        context_window,
+        hard_context_window: Some(context_window),
+        usage_pct,
+        prompt_tokens,
+        completion_tokens: output,
+        cached_tokens: cache_read,
+    })
+}
+
+/// The per-model `contextWindow` from a result's `modelUsage` map. Prefers
+/// the entry for `model`, falls back to the first entry (the map usually
+/// has exactly one).
+fn context_window_from_model_usage(model_usage: &serde_json::Value, model: &str) -> Option<u64> {
+    let map = model_usage.as_object()?;
+    let entry = map.get(model).or_else(|| map.values().next())?;
+    entry.get("contextWindow").and_then(|v| v.as_u64())
+}
+
+/// Map Intendant's configured permission mode onto Claude Code's CLI
+/// values. `None` means "don't pass `--permission-mode`" (the CLI default).
+/// Canonicalization lives in [`crate::project::normalize_claude_permission_mode`]
+/// so the settings surfaces and this adapter agree on the vocabulary.
+fn normalize_permission_mode(mode: &str) -> Option<String> {
+    let canonical = crate::project::normalize_claude_permission_mode(mode);
+    if canonical == "default" {
+        None
+    } else {
+        Some(canonical)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stream interpreter
+// ---------------------------------------------------------------------------
+
+/// Events to emit and JSONL lines to write back for one stdout line.
+#[derive(Default)]
+struct CcLineOutcome {
+    events: Vec<AgentEvent>,
+    outbound: Vec<String>,
+}
+
+impl CcLineOutcome {
+    fn log(&mut self, level: &str, message: impl Into<String>) {
+        self.events.push(AgentEvent::Log {
+            level: level.to_string(),
+            message: message.into(),
+        });
+    }
+}
+
+/// Line-by-line interpreter for Claude Code's stream-json stdout. Pure with
+/// respect to I/O — `process_line` returns the events to emit and any
+/// auto-responses to write — so the protocol mapping is unit-testable
+/// without a child process.
+struct CcReader {
+    shared: Arc<CcShared>,
+    pending_approvals: PendingApprovals,
+    /// True when an Intendant MCP endpoint was injected, so a missing or
+    /// unhealthy `intendant` entry in the init message warrants a warning.
+    expect_intendant_mcp: bool,
+    approval_counter: u64,
+    /// tool_use ids started but not yet completed. Force-closed as
+    /// cancelled at turn end: an interrupted turn never reports results
+    /// for its in-flight tools.
+    open_tools: HashSet<String>,
+    /// Most recent model name seen (init message / message_start).
+    model: String,
+    context_window: u64,
+    last_intendant_mcp_status: Option<String>,
+    init_logged: bool,
+    announced_session_id: Option<String>,
+}
+
+impl CcReader {
+    fn new(
+        shared: Arc<CcShared>,
+        pending_approvals: PendingApprovals,
+        expect_intendant_mcp: bool,
+    ) -> Self {
+        Self {
+            shared,
+            pending_approvals,
+            expect_intendant_mcp,
+            approval_counter: 0,
+            open_tools: HashSet::new(),
+            model: "claude".to_string(),
+            context_window: DEFAULT_CONTEXT_WINDOW,
+            last_intendant_mcp_status: None,
+            init_logged: false,
+            announced_session_id: None,
+        }
+    }
+
+    fn process_line(&mut self, line: &str) -> CcLineOutcome {
+        let mut out = CcLineOutcome::default();
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            return out;
+        };
+        self.capture_session_id(&msg, &mut out);
+        match msg.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "system" => self.handle_system(&msg, &mut out),
+            "assistant" => self.handle_assistant(&msg, &mut out),
+            "user" => self.handle_user(&msg, &mut out),
+            "stream_event" => self.handle_stream_event(&msg, &mut out),
+            "result" => self.handle_result(&msg, &mut out),
+            "control_request" => self.handle_control_request(&msg, &mut out),
+            "control_response" => self.handle_control_response(&msg, &mut out),
+            "rate_limit_event" => self.handle_rate_limit(&msg, &mut out),
+            _ => {}
+        }
+        out
+    }
+
+    /// Claude Code stamps the native session id on every stdout message
+    /// once the first turn begins. Announce it the first time it appears
+    /// (and again if it ever changes) so the controller can upgrade its
+    /// identity and resume records from the placeholder thread id.
+    fn capture_session_id(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        let Some(id) = msg
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        if self.announced_session_id.as_deref() == Some(id) {
+            return;
+        }
+        self.announced_session_id = Some(id.to_string());
+        self.shared.set_session_id(id);
+        out.events.push(AgentEvent::NativeSessionId {
+            session_id: id.to_string(),
+        });
+    }
+
+    fn handle_system(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        if msg.get("subtype").and_then(|s| s.as_str()) != Some("init") {
+            return;
+        }
+        if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
+            self.model = model.to_string();
+        }
+        if !self.init_logged {
+            self.init_logged = true;
+            let permission_mode = msg
+                .get("permissionMode")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown");
+            let tool_count = msg
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .map(|t| t.len())
+                .unwrap_or(0);
+            out.log(
+                "info",
+                format!(
+                    "Claude Code ready: model {}, permission mode {}, {} tools",
+                    self.model, permission_mode, tool_count
+                ),
+            );
+        }
+        if self.expect_intendant_mcp {
+            self.report_intendant_mcp_status(msg, out);
+        }
+    }
+
+    /// Surface the injected Intendant MCP server's health from the init
+    /// message. A failed loopback connection was previously invisible: the
+    /// backend simply ran without display/CU tools and nobody could tell
+    /// why from a frontend.
+    fn report_intendant_mcp_status(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        let status = msg
+            .get("mcp_servers")
+            .and_then(|s| s.as_array())
+            .and_then(|servers| {
+                servers.iter().find(|server| {
+                    server.get("name").and_then(|n| n.as_str()) == Some("intendant")
+                })
+            })
+            .and_then(|server| server.get("status").and_then(|s| s.as_str()))
+            .unwrap_or("missing")
+            .to_string();
+        if self.last_intendant_mcp_status.as_deref() == Some(status.as_str()) {
+            return;
+        }
+        self.last_intendant_mcp_status = Some(status.clone());
+        match status.as_str() {
+            "connected" => out.log("info", "Intendant MCP server connected"),
+            "missing" => out.log(
+                "warn",
+                "Intendant MCP server missing from Claude Code's MCP config — display/CU tools unavailable",
+            ),
+            other => out.log(
+                "warn",
+                format!("Intendant MCP server status: {other} — display/CU tools may be unavailable"),
+            ),
+        }
+    }
+
+    fn handle_assistant(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        let Some(content) = msg
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            return;
+        };
+        for block in content {
+            match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "text" => {
+                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                        out.events.push(AgentEvent::Message {
+                            text: text.to_string(),
+                        });
+                    }
+                }
+                "thinking" => {
+                    if let Some(text) = block.get("thinking").and_then(|t| t.as_str()) {
+                        if !text.trim().is_empty() {
+                            out.events.push(AgentEvent::Reasoning {
+                                text: text.to_string(),
+                            });
+                        }
+                    }
+                }
+                "tool_use" => {
+                    let tool_id = block
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let tool_name = block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let input = block.get("input").cloned().unwrap_or_default();
+                    if !tool_id.is_empty() {
+                        self.open_tools.insert(tool_id.clone());
+                    }
+                    out.events.push(AgentEvent::ToolStarted {
+                        item_id: tool_id,
+                        tool_name,
+                        preview: tool_input_preview(&input),
+                    });
+                }
+                "tool_result" => self.tool_result_events(block, out),
+                _ => {}
+            }
+        }
+    }
+
+    /// Tool results arrive as `user`-type messages carrying `tool_result`
+    /// content blocks (not on assistant messages). Synthetic text markers
+    /// like "[Request interrupted by user]" also ride user messages and are
+    /// intentionally dropped — the `result` message carries the outcome.
+    fn handle_user(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        let Some(content) = msg
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            return;
+        };
+        for block in content {
+            if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                self.tool_result_events(block, out);
+            }
+        }
+    }
+
+    fn tool_result_events(&mut self, block: &serde_json::Value, out: &mut CcLineOutcome) {
+        let tool_id = block
+            .get("tool_use_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let is_error = block
+            .get("is_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let content_text = block
+            .get("content")
+            .and_then(|c| {
+                if let serde_json::Value::String(s) = c {
+                    Some(s.clone())
+                } else if let Some(arr) = c.as_array() {
+                    Some(
+                        arr.iter()
+                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        if !content_text.is_empty() {
+            out.events.push(AgentEvent::ToolOutputDelta {
+                item_id: tool_id.clone(),
+                text: content_text.clone(),
+            });
+        }
+
+        self.open_tools.remove(&tool_id);
+        let status = if is_error {
+            let message: String = content_text.chars().take(200).collect();
+            ToolCompletionStatus::Failed {
+                message: if message.trim().is_empty() {
+                    "tool error".into()
+                } else {
+                    message
+                },
+            }
+        } else {
+            ToolCompletionStatus::Success
+        };
+        out.events.push(AgentEvent::ToolCompleted {
+            item_id: tool_id,
+            status,
+        });
+    }
+
+    fn handle_stream_event(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        let Some(event) = msg.get("event") else {
+            return;
+        };
+        match event.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "content_block_delta" => {
+                if let Some(delta) = event.get("delta") {
+                    if delta.get("type").and_then(|t| t.as_str()) == Some("text_delta") {
+                        if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                            out.events.push(AgentEvent::MessageDelta {
+                                text: text.to_string(),
+                            });
+                        }
+                    }
+                    // thinking_delta is skipped: reasoning is emitted once
+                    // per completed block from the assistant message.
+                }
+            }
+            "message_start" => {
+                if let Some(model) = event
+                    .get("message")
+                    .and_then(|m| m.get("model"))
+                    .and_then(|m| m.as_str())
+                {
+                    self.model = model.to_string();
+                }
+            }
+            "message_delta" => {
+                // Final usage for one API call within the turn — the live
+                // context-footprint signal during long multi-tool turns.
+                if let Some(usage) = event.get("usage") {
+                    if let Some(snapshot) =
+                        usage_snapshot_from_api_usage(usage, &self.model, self.context_window)
+                    {
+                        out.events.push(AgentEvent::Usage { usage: snapshot });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_result(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        let was_interrupt = self
+            .shared
+            .interrupt_pending
+            .swap(false, Ordering::SeqCst);
+
+        if let Some(model_usage) = msg.get("modelUsage") {
+            if let Some(window) = context_window_from_model_usage(model_usage, &self.model) {
+                self.context_window = window;
+            }
+        }
+        if let Some(usage) = msg.get("usage") {
+            if let Some(snapshot) =
+                usage_snapshot_from_api_usage(usage, &self.model, self.context_window)
+            {
+                out.events.push(AgentEvent::Usage { usage: snapshot });
+            }
+        }
+
+        // An aborted turn never reports results for in-flight tools; close
+        // them so frontends don't show tools running forever.
+        for tool_id in std::mem::take(&mut self.open_tools) {
+            out.events.push(AgentEvent::ToolCompleted {
+                item_id: tool_id,
+                status: ToolCompletionStatus::Cancelled,
+            });
+        }
+
+        let subtype = msg
+            .get("subtype")
+            .and_then(|s| s.as_str())
+            .unwrap_or("success");
+        let is_error = msg
+            .get("is_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let message = msg
+            .get("result")
+            .and_then(|r| r.as_str())
+            .map(str::to_string);
+
+        if is_error || subtype != "success" {
+            if was_interrupt {
+                out.log("info", "Claude Code turn interrupted");
+            } else {
+                out.events.push(AgentEvent::BackendError {
+                    message: message
+                        .clone()
+                        .filter(|m| !m.trim().is_empty())
+                        .unwrap_or_else(|| format!("Claude Code turn failed: {subtype}")),
+                    code: Some(subtype.to_string()),
+                    details: None,
+                    will_retry: false,
+                    likely_generation_starvation: false,
+                    recovery_hint: None,
+                });
+            }
+        }
+        out.events.push(AgentEvent::TurnCompleted { message });
+    }
+
+    fn handle_control_request(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        let cc_request_id = msg
+            .get("request_id")
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Some(request) = msg.get("request") else {
+            return;
+        };
+        let subtype = request.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+
+        if subtype == "can_use_tool" {
+            let tool_name = request
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let input = request.get("input").cloned().unwrap_or_default();
+            let preview = tool_input_preview(&input);
+
+            self.approval_counter += 1;
+            let our_id = format!("cc-approval-{}", self.approval_counter);
+
+            lock_pending(&self.pending_approvals).insert(
+                our_id.clone(),
+                PendingCcApproval {
+                    cc_request_id,
+                    tool_input: input,
+                    session_rules: session_scoped_permission_rules(request),
+                },
+            );
+
+            out.events.push(AgentEvent::ApprovalRequest {
+                request_id: our_id,
+                command: format!("{}: {}", tool_name, preview),
+                category: approval_category_for_tool(&tool_name),
+            });
+        } else {
+            // Fail closed: never auto-approve a control request Intendant
+            // doesn't understand (a future permission-shaped subtype must
+            // not slip through as an implicit allow). The error response
+            // unblocks the CLI's pending promise.
+            out.log(
+                "warn",
+                format!("Rejecting unsupported Claude Code control request subtype '{subtype}'"),
+            );
+            let response = CcControlResponse {
+                msg_type: "control_response".into(),
+                response: CcControlResponseInner {
+                    subtype: "error".into(),
+                    request_id: cc_request_id,
+                    response: None,
+                    error: Some(format!(
+                        "control request subtype '{subtype}' is not supported by the Intendant supervisor"
+                    )),
+                },
+            };
+            if let Ok(line) = serde_json::to_string(&response) {
+                out.outbound.push(line);
+            }
+        }
+    }
+
+    fn handle_control_response(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        let Some(response) = msg.get("response") else {
+            return;
+        };
+        let request_id = response
+            .get("request_id")
+            .and_then(|r| r.as_str())
+            .unwrap_or("?");
+        if response.get("subtype").and_then(|s| s.as_str()) == Some("error") {
+            let error = response
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown error");
+            out.log(
+                "warn",
+                format!("Claude Code control request {request_id} failed: {error}"),
+            );
+        } else {
+            out.log(
+                "detail",
+                format!("Claude Code acknowledged control request {request_id}"),
+            );
+        }
+    }
+
+    fn handle_rate_limit(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        let Some(info) = msg.get("rate_limit_info") else {
+            return;
+        };
+        let status = info.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        if status.is_empty() || status == "allowed" {
+            return;
+        }
+        let kind = info
+            .get("rateLimitType")
+            .and_then(|t| t.as_str())
+            .unwrap_or("unknown");
+        out.log(
+            "warn",
+            format!("Claude Code rate limit: status {status} ({kind} window)"),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reader task
 // ---------------------------------------------------------------------------
 
 async fn reader_task(
     stdout: tokio::process::ChildStdout,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
     writer: SharedWriter,
-    pending_approvals: PendingApprovals,
+    mut reader_state: CcReader,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
-    let approval_counter = AtomicU64::new(1);
 
     loop {
         let line = match lines.next_line().await {
@@ -220,229 +869,121 @@ async fn reader_task(
             }
         };
 
-        let raw_msg: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let msg: CcMessage = match serde_json::from_value(raw_msg) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        match msg.msg_type.as_str() {
-            "assistant" => {
-                // Full assistant turn — extract text and tool_use blocks
-                if let Some(ref message) = msg.message {
-                    if let Some(content) = message.get("content").and_then(|c| c.as_array()) {
-                        for block in content {
-                            let block_type =
-                                block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                            match block_type {
-                                "text" => {
-                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                        let _ = event_tx.send(AgentEvent::Message {
-                                            text: text.to_string(),
-                                        });
-                                    }
-                                }
-                                "tool_use" => {
-                                    let tool_id = block
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let tool_name = block
-                                        .get("name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unknown")
-                                        .to_string();
-                                    let input = block.get("input").cloned().unwrap_or_default();
-                                    let preview: String =
-                                        if let serde_json::Value::String(s) = &input {
-                                            s.chars().take(200).collect()
-                                        } else {
-                                            let s = input.to_string();
-                                            s.chars().take(200).collect()
-                                        };
-                                    let _ = event_tx.send(AgentEvent::ToolStarted {
-                                        item_id: tool_id,
-                                        tool_name,
-                                        preview,
-                                    });
-                                }
-                                "tool_result" => {
-                                    let tool_id = block
-                                        .get("tool_use_id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let is_error = block
-                                        .get("is_error")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false);
-                                    let content_text = block
-                                        .get("content")
-                                        .and_then(|c| {
-                                            if let serde_json::Value::String(s) = c {
-                                                Some(s.clone())
-                                            } else if let Some(arr) = c.as_array() {
-                                                Some(
-                                                    arr.iter()
-                                                        .filter_map(|b| {
-                                                            b.get("text").and_then(|t| t.as_str())
-                                                        })
-                                                        .collect::<Vec<_>>()
-                                                        .join("\n"),
-                                                )
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .unwrap_or_default();
-
-                                    if !content_text.is_empty() {
-                                        let _ = event_tx.send(AgentEvent::ToolOutputDelta {
-                                            item_id: tool_id.clone(),
-                                            text: content_text,
-                                        });
-                                    }
-
-                                    let status = if is_error {
-                                        ToolCompletionStatus::Failed {
-                                            message: "tool error".into(),
-                                        }
-                                    } else {
-                                        ToolCompletionStatus::Success
-                                    };
-                                    let _ = event_tx.send(AgentEvent::ToolCompleted {
-                                        item_id: tool_id,
-                                        status,
-                                    });
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-
-            "stream_event" => {
-                // Streaming delta — extract text deltas
-                if let Some(ref event) = msg.event {
-                    let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    if event_type == "content_block_delta" {
-                        if let Some(delta) = event.get("delta") {
-                            let delta_type =
-                                delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                            if delta_type == "text_delta" {
-                                if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                    let _ = event_tx.send(AgentEvent::MessageDelta {
-                                        text: text.to_string(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            "result" => {
-                let _ = event_tx.send(AgentEvent::TurnCompleted {
-                    message: msg.result.clone(),
-                });
-            }
-
-            "control_request" => {
-                if let Some(ref request) = msg.request {
-                    let subtype = request
-                        .get("subtype")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("");
-                    let cc_request_id = msg.request_id.clone().unwrap_or_default();
-
-                    if subtype == "can_use_tool" {
-                        let tool_name = request
-                            .get("tool_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let input = request.get("input").cloned().unwrap_or_default();
-                        let preview: String =
-                            if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
-                                cmd.chars().take(200).collect()
-                            } else {
-                                let s = input.to_string();
-                                s.chars().take(200).collect()
-                            };
-
-                        let our_id = format!(
-                            "cc-approval-{}",
-                            approval_counter.fetch_add(1, Ordering::Relaxed)
-                        );
-
-                        // Determine category from tool name
-                        let category = if tool_name == "Edit"
-                            || tool_name == "Write"
-                            || tool_name == "NotebookEdit"
-                        {
-                            ApprovalCategory::FileChange
-                        } else {
-                            ApprovalCategory::CommandExecution
-                        };
-
-                        pending_approvals
-                            .lock()
-                            .await
-                            .insert(our_id.clone(), cc_request_id);
-
-                        let _ = event_tx.send(AgentEvent::ApprovalRequest {
-                            request_id: our_id,
-                            command: format!("{}: {}", tool_name, preview),
-                            category,
-                        });
-                    } else {
-                        // Unknown control request — deny. Auto-allowing here
-                        // would let any new permission-request subtype bypass
-                        // the approval layer entirely; a denial keeps Claude
-                        // Code unblocked (it treats it as a refused tool) while
-                        // failing closed.
-                        let _ = event_tx.send(AgentEvent::Log {
-                            level: "warn".into(),
-                            message: format!(
-                                "Claude Code sent an unrecognized control_request subtype '{}' — denied (fail-closed). Update Intendant if this subtype should be supported.",
-                                subtype
-                            ),
-                        });
-                        let response = CcControlResponse {
-                            msg_type: "control_response".into(),
-                            response: CcControlResponseInner {
-                                subtype: "success".into(),
-                                request_id: cc_request_id,
-                                response: CcPermissionDecision {
-                                    behavior: "deny".into(),
-                                    message: Some(format!(
-                                        "Intendant does not recognize the '{}' permission request and denies it by default",
-                                        subtype
-                                    )),
-                                },
-                            },
-                        };
-                        if let Ok(line) = serde_json::to_string(&response) {
-                            let mut w = writer.lock().await;
-                            let _ = w.write_all(line.as_bytes()).await;
-                            let _ = w.write_all(b"\n").await;
-                            let _ = w.flush().await;
-                        }
-                    }
-                }
-            }
-
-            "system" => {
-                // Status updates — log but don't emit events
-            }
-
-            _ => {}
+        let outcome = reader_state.process_line(&line);
+        for event in outcome.events {
+            let _ = event_tx.send(event);
         }
+        if !outcome.outbound.is_empty() {
+            let mut w = writer.lock().await;
+            for line in outcome.outbound {
+                let _ = w.write_all(line.as_bytes()).await;
+                let _ = w.write_all(b"\n").await;
+            }
+            let _ = w.flush().await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClaudeCodeAgent
+// ---------------------------------------------------------------------------
+
+pub struct ClaudeCodeAgent {
+    command: String,
+    model: Option<String>,
+    permission_mode: String,
+    allowed_tools: Vec<String>,
+    web_port: Option<u16>,
+    working_dir: Option<PathBuf>,
+    child: Option<Child>,
+    writer: Option<SharedWriter>,
+    event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+    pending_approvals: PendingApprovals,
+    reader_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Backend session id to resume via `--resume`. Claude Code keeps the
+    /// same id across resumed processes, so this doubles as the known
+    /// native id until the stream confirms it.
+    resume_session: Option<String>,
+    /// Whether the first prompt (carrying the bootstrap addendum) was sent.
+    prompt_sent: bool,
+    /// Loopback MCP auth token from the daemon, baked into the injected URL.
+    mcp_auth_token: Option<String>,
+    /// Intendant session id scoping the injected MCP URL and ctl env.
+    mcp_session_id: Option<String>,
+    /// State shared with the stdout reader task.
+    shared: Arc<CcShared>,
+    /// Ids for client→CLI control requests (interrupts).
+    control_counter: AtomicU64,
+}
+
+impl ClaudeCodeAgent {
+    pub fn new(
+        command: String,
+        model: Option<String>,
+        permission_mode: String,
+        allowed_tools: Vec<String>,
+        web_port: Option<u16>,
+    ) -> Self {
+        Self {
+            command,
+            model,
+            permission_mode,
+            allowed_tools,
+            web_port,
+            working_dir: None,
+            child: None,
+            writer: None,
+            event_tx: None,
+            pending_approvals: Arc::new(StdMutex::new(HashMap::new())),
+            reader_handle: None,
+            resume_session: None,
+            prompt_sent: false,
+            mcp_auth_token: None,
+            mcp_session_id: None,
+            shared: Arc::new(CcShared::new(None)),
+            control_counter: AtomicU64::new(0),
+        }
+    }
+
+    /// The scoped loopback MCP URL injected into `--mcp-config` and the ctl
+    /// env. Claude Code has no managed-context mode, so the server treats the
+    /// session as vanilla; `tool_profile=core` keeps the advertised tool list
+    /// to the bootstrap set (full surface stays callable via `ctl tools`).
+    fn intendant_mcp_url(&self, port: u16) -> String {
+        super::intendant_bootstrap_mcp_url(
+            port,
+            self.mcp_session_id.as_deref(),
+            None,
+            self.mcp_auth_token.as_deref(),
+        )
+    }
+
+    async fn write_line(&self, line: &str) -> Result<(), CallerError> {
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?;
+        let mut w = writer.lock().await;
+        w.write_all(line.as_bytes()).await?;
+        w.write_all(b"\n").await?;
+        w.flush().await?;
+        Ok(())
+    }
+
+    async fn write_user_message(&self, text: &str) -> Result<(), CallerError> {
+        let user_msg = CcUserMessage {
+            msg_type: "user".into(),
+            message: CcMessageContent {
+                role: "user".into(),
+                content: vec![CcContentBlock {
+                    block_type: "text".into(),
+                    text: text.to_string(),
+                }],
+            },
+            parent_tool_use_id: None,
+        };
+        let line = serde_json::to_string(&user_msg)?;
+        self.write_line(&line).await
     }
 }
 
@@ -461,9 +1002,15 @@ impl ExternalAgent for ClaudeCodeAgent {
         config: AgentConfig,
     ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, CallerError> {
         self.working_dir = Some(config.working_dir.clone());
-        self.session_id = config.resume_session;
+        self.resume_session = config
+            .resume_session
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         self.mcp_auth_token = config.mcp_auth_token;
         self.mcp_session_id = config.mcp_session_id;
+        self.shared = Arc::new(CcShared::new(self.resume_session.clone()));
 
         // Build command args
         let mut args = vec![
@@ -483,14 +1030,14 @@ impl ExternalAgent for ClaudeCodeAgent {
             args.push(model.to_string());
         }
 
-        if let Some(ref session_id) = self.session_id {
+        if let Some(ref session_id) = self.resume_session {
             args.push("--resume".into());
             args.push(session_id.clone());
         }
 
-        if !self.permission_mode.is_empty() && self.permission_mode != "default" {
+        if let Some(mode) = normalize_permission_mode(&self.permission_mode) {
             args.push("--permission-mode".into());
-            args.push(self.permission_mode.clone());
+            args.push(mode);
         }
 
         if !self.allowed_tools.is_empty() {
@@ -571,8 +1118,12 @@ impl ExternalAgent for ClaudeCodeAgent {
             super::spawn_stderr_forwarder("claude", stderr, event_tx.clone());
         }
 
-        let pending_approvals = Arc::clone(&self.pending_approvals);
-        let handle = tokio::spawn(reader_task(stdout, event_tx, writer, pending_approvals));
+        let reader_state = CcReader::new(
+            Arc::clone(&self.shared),
+            Arc::clone(&self.pending_approvals),
+            web_port.is_some(),
+        );
+        let handle = tokio::spawn(reader_task(stdout, event_tx, writer, reader_state));
         self.reader_handle = Some(handle);
 
         // No handshake needed — Claude Code starts immediately.
@@ -582,11 +1133,16 @@ impl ExternalAgent for ClaudeCodeAgent {
     }
 
     async fn start_thread(&mut self) -> Result<AgentThread, CallerError> {
-        // Claude Code doesn't have an explicit thread/session creation step.
-        // The session is implicit — created when the first message is sent.
-        // We use a placeholder ID; the real session_id comes from the first result.
+        // Claude Code has no explicit thread-creation step: the session is
+        // implicit, and its id first appears on the stream once the first
+        // prompt is sent (announced via `AgentEvent::NativeSessionId`). On
+        // resume the id is already known — and stays stable — so it can be
+        // returned as canonical immediately.
         Ok(AgentThread {
-            thread_id: "claude-code-session".into(),
+            thread_id: self
+                .shared
+                .session_id()
+                .unwrap_or_else(|| PLACEHOLDER_THREAD_ID.into()),
         })
     }
 
@@ -604,36 +1160,52 @@ impl ExternalAgent for ClaudeCodeAgent {
         } else {
             message.to_string()
         };
-        let user_msg = CcUserMessage {
-            msg_type: "user".into(),
-            message: CcMessageContent {
-                role: "user".into(),
-                content: vec![CcContentBlock {
-                    block_type: "text".into(),
-                    text: augmented,
-                }],
-            },
-            session_id: self.session_id.clone(),
-            parent_tool_use_id: None,
-        };
-
-        let line = serde_json::to_string(&user_msg)?;
-        let writer = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?;
-
-        let mut w = writer.lock().await;
-        w.write_all(line.as_bytes()).await?;
-        w.write_all(b"\n").await?;
-        w.flush().await?;
-
-        // send_message is non-blocking. The reader task will emit events
-        // (MessageDelta, ToolStarted, etc.) as they arrive, and TurnCompleted
-        // when a "result" message appears. No deadlock risk because CC's
+        // send_message is non-blocking. The reader task emits events
+        // (MessageDelta, ToolStarted, …) as they arrive and TurnCompleted
+        // when a "result" message appears. No deadlock risk because the
         // approval flow uses the same stdout stream (control_request), not
         // a blocking request/response pair.
+        self.write_user_message(&augmented).await
+    }
 
+    async fn steer_turn(&mut self, text: &str) -> Result<(), CallerError> {
+        // A user message written while a turn is running is absorbed into
+        // the running turn — Claude Code queues it and the model reads it
+        // between tool calls (verified against 2.1.200). That matches
+        // Intendant's steer contract exactly; no separate protocol needed.
+        if self.writer.is_none() {
+            return Err(CallerError::ExternalAgent("Not initialized".into()));
+        }
+        self.write_user_message(text).await
+    }
+
+    async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
+        if self.writer.is_none() {
+            return Err(CallerError::ExternalAgent("Not initialized".into()));
+        }
+        let request_id = format!(
+            "intendant-interrupt-{}",
+            self.control_counter.fetch_add(1, Ordering::Relaxed) + 1
+        );
+        // Flag first: the aborted turn's `result` can arrive before this
+        // method returns, and the reader must classify it as an interrupt
+        // rather than a backend failure.
+        self.shared.interrupt_pending.store(true, Ordering::SeqCst);
+        // Claude Code discards its in-flight permission promises on abort;
+        // drop ours so stale entries can't shadow future requests.
+        lock_pending(&self.pending_approvals).clear();
+        let request = CcControlRequest {
+            msg_type: "control_request".into(),
+            request_id,
+            request: serde_json::json!({ "subtype": "interrupt" }),
+        };
+        let line = serde_json::to_string(&request)?;
+        if let Err(e) = self.write_line(&line).await {
+            self.shared
+                .interrupt_pending
+                .store(false, Ordering::SeqCst);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -642,9 +1214,9 @@ impl ExternalAgent for ClaudeCodeAgent {
         request_id: &str,
         decision: ApprovalDecision,
     ) -> Result<(), CallerError> {
-        let cc_request_id = {
-            let mut pending = self.pending_approvals.lock().await;
-            pending.remove(request_id).ok_or_else(|| {
+        let pending = {
+            let mut map = lock_pending(&self.pending_approvals);
+            map.remove(request_id).ok_or_else(|| {
                 CallerError::ExternalAgent(format!(
                     "No pending approval for request_id '{}'",
                     request_id
@@ -652,35 +1224,18 @@ impl ExternalAgent for ClaudeCodeAgent {
             })?
         };
 
-        let behavior = match decision {
-            ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => "allow",
-            ApprovalDecision::Decline | ApprovalDecision::Cancel => "deny",
-        };
-
         let response = CcControlResponse {
             msg_type: "control_response".into(),
             response: CcControlResponseInner {
                 subtype: "success".into(),
-                request_id: cc_request_id,
-                response: CcPermissionDecision {
-                    behavior: behavior.into(),
-                    message: None,
-                },
+                request_id: pending.cc_request_id.clone(),
+                response: Some(approval_response_payload(&pending, &decision)),
+                error: None,
             },
         };
 
         let line = serde_json::to_string(&response)?;
-        let writer = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?;
-
-        let mut w = writer.lock().await;
-        w.write_all(line.as_bytes()).await?;
-        w.write_all(b"\n").await?;
-        w.flush().await?;
-
-        Ok(())
+        self.write_line(&line).await
     }
 
     async fn shutdown(&mut self) -> Result<(), CallerError> {
@@ -727,6 +1282,14 @@ impl Drop for ClaudeCodeAgent {
 mod tests {
     use super::*;
 
+    fn test_reader() -> CcReader {
+        CcReader::new(
+            Arc::new(CcShared::new(None)),
+            Arc::new(StdMutex::new(HashMap::new())),
+            true,
+        )
+    }
+
     #[test]
     fn claude_code_agent_defaults() {
         let agent = ClaudeCodeAgent::new("claude".into(), None, "auto".into(), vec![], None);
@@ -735,6 +1298,22 @@ mod tests {
         assert_eq!(agent.permission_mode, "auto");
         assert!(agent.allowed_tools.is_empty());
         assert!(agent.web_port.is_none());
+    }
+
+    #[test]
+    fn claude_code_agent_with_options() {
+        let agent = ClaudeCodeAgent::new(
+            "/usr/local/bin/claude".into(),
+            Some("claude-sonnet-4-6".into()),
+            "acceptEdits".into(),
+            vec!["Read".into(), "Edit".into(), "Bash".into()],
+            Some(8765),
+        );
+        assert_eq!(agent.command, "/usr/local/bin/claude");
+        assert_eq!(agent.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(agent.permission_mode, "acceptEdits");
+        assert_eq!(agent.allowed_tools, vec!["Read", "Edit", "Bash"]);
+        assert_eq!(agent.web_port, Some(8765));
     }
 
     #[tokio::test]
@@ -764,20 +1343,20 @@ mod tests {
         assert!(snapshot.is_none());
     }
 
-    #[test]
-    fn claude_code_agent_with_options() {
-        let agent = ClaudeCodeAgent::new(
-            "/usr/local/bin/claude".into(),
-            Some("claude-sonnet-4-6".into()),
-            "acceptEdits".into(),
-            vec!["Read".into(), "Edit".into(), "Bash".into()],
-            Some(8765),
-        );
-        assert_eq!(agent.command, "/usr/local/bin/claude");
-        assert_eq!(agent.model.as_deref(), Some("claude-sonnet-4-6"));
-        assert_eq!(agent.permission_mode, "acceptEdits");
-        assert_eq!(agent.allowed_tools, vec!["Read", "Edit", "Bash"]);
-        assert_eq!(agent.web_port, Some(8765));
+    #[tokio::test]
+    async fn interrupt_before_initialize_errors() {
+        // interrupt_turn is a real protocol message now, but it still needs
+        // a live child; before initialize it must fail without touching the
+        // interrupt flag.
+        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], None);
+        assert!(agent.interrupt_turn().await.is_err());
+        assert!(!agent.shared.interrupt_pending.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn steer_before_initialize_errors() {
+        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], None);
+        assert!(agent.steer_turn("more context").await.is_err());
     }
 
     #[test]
@@ -791,7 +1370,6 @@ mod tests {
                     text: "fix the bug".into(),
                 }],
             },
-            session_id: None,
             parent_tool_use_id: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
@@ -799,106 +1377,558 @@ mod tests {
         assert_eq!(json["message"]["role"], "user");
         assert_eq!(json["message"]["content"][0]["type"], "text");
         assert_eq!(json["message"]["content"][0]["text"], "fix the bug");
+        // The field must serialize (as null) — the CLI expects its presence.
+        assert!(json.as_object().unwrap().contains_key("parent_tool_use_id"));
     }
 
     #[test]
-    fn control_response_serialization() {
-        let resp = CcControlResponse {
-            msg_type: "control_response".into(),
-            response: CcControlResponseInner {
-                subtype: "success".into(),
-                request_id: "req-123".into(),
-                response: CcPermissionDecision {
-                    behavior: "allow".into(),
-                    message: None,
-                },
-            },
+    fn allow_response_echoes_updated_input() {
+        // Claude Code 2.x validates `updatedInput` on allow; a bare
+        // {"behavior":"allow"} fails the permission request with a ZodError
+        // and the tool never runs.
+        let pending = PendingCcApproval {
+            cc_request_id: "req-1".into(),
+            tool_input: serde_json::json!({"command": "echo hi"}),
+            session_rules: vec![],
         };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["type"], "control_response");
-        assert_eq!(json["response"]["subtype"], "success");
-        assert_eq!(json["response"]["request_id"], "req-123");
-        assert_eq!(json["response"]["response"]["behavior"], "allow");
+        let payload = approval_response_payload(&pending, &ApprovalDecision::Accept);
+        assert_eq!(payload["behavior"], "allow");
+        assert_eq!(payload["updatedInput"]["command"], "echo hi");
+        assert!(payload.get("updatedPermissions").is_none());
     }
 
     #[test]
-    fn control_response_deny() {
-        let resp = CcControlResponse {
-            msg_type: "control_response".into(),
-            response: CcControlResponseInner {
-                subtype: "success".into(),
-                request_id: "req-456".into(),
-                response: CcPermissionDecision {
-                    behavior: "deny".into(),
-                    message: Some("Not allowed".into()),
-                },
-            },
+    fn accept_for_session_carries_session_scoped_rules() {
+        let pending = PendingCcApproval {
+            cc_request_id: "req-2".into(),
+            tool_input: serde_json::json!({"command": "cargo test"}),
+            session_rules: vec![serde_json::json!({
+                "type": "addRules",
+                "rules": [{"toolName": "Bash", "ruleContent": "cargo test *"}],
+                "behavior": "allow",
+                "destination": "session",
+            })],
         };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["response"]["response"]["behavior"], "deny");
-        assert_eq!(json["response"]["response"]["message"], "Not allowed");
+        let payload = approval_response_payload(&pending, &ApprovalDecision::AcceptForSession);
+        assert_eq!(payload["behavior"], "allow");
+        assert_eq!(payload["updatedInput"]["command"], "cargo test");
+        assert_eq!(payload["updatedPermissions"][0]["destination"], "session");
     }
 
     #[test]
-    fn parse_assistant_message() {
-        let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"session_id":"sess-1"}"#;
-        let msg: CcMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.msg_type, "assistant");
-        let content = msg.message.unwrap()["content"].as_array().unwrap().clone();
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[1]["type"], "tool_use");
-        assert_eq!(content[1]["name"], "Bash");
+    fn accept_for_session_without_rules_degrades_to_plain_allow() {
+        let pending = PendingCcApproval {
+            cc_request_id: "req-3".into(),
+            tool_input: serde_json::json!({"command": "ls"}),
+            session_rules: vec![],
+        };
+        let payload = approval_response_payload(&pending, &ApprovalDecision::AcceptForSession);
+        assert_eq!(payload["behavior"], "allow");
+        assert!(payload.get("updatedPermissions").is_none());
     }
 
     #[test]
-    fn parse_stream_event() {
-        let json = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}}"#;
-        let msg: CcMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.msg_type, "stream_event");
-        let event = msg.event.unwrap();
-        let delta_text = event["delta"]["text"].as_str().unwrap();
-        assert_eq!(delta_text, "hello");
+    fn decline_and_cancel_deny_payloads() {
+        let pending = PendingCcApproval {
+            cc_request_id: "req-4".into(),
+            tool_input: serde_json::json!({"command": "rm -rf /"}),
+            session_rules: vec![],
+        };
+        let decline = approval_response_payload(&pending, &ApprovalDecision::Decline);
+        assert_eq!(decline["behavior"], "deny");
+        assert!(decline["message"].as_str().unwrap().contains("Denied"));
+        assert!(decline.get("interrupt").is_none());
+
+        // Cancel aborts the whole turn.
+        let cancel = approval_response_payload(&pending, &ApprovalDecision::Cancel);
+        assert_eq!(cancel["behavior"], "deny");
+        assert_eq!(cancel["interrupt"], true);
     }
 
     #[test]
-    fn parse_result() {
-        let json = r#"{"type":"result","subtype":"success","result":"Done","session_id":"sess-1","duration_ms":5000}"#;
-        let msg: CcMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.msg_type, "result");
-        assert_eq!(msg.result.as_deref(), Some("Done"));
-        assert_eq!(msg.session_id.as_deref(), Some("sess-1"));
+    fn session_rules_retarget_suggestions_to_session_destination() {
+        // The CLI's own suggestions default to localSettings — persisting a
+        // supervised run's grants into the checkout's settings files is
+        // never acceptable, so every rule is forced to `session`.
+        let request = serde_json::json!({
+            "subtype": "can_use_tool",
+            "tool_name": "Bash",
+            "input": {"command": "echo probe-ok > marker.txt"},
+            "permission_suggestions": [
+                {
+                    "type": "addRules",
+                    "rules": [{"toolName": "Bash", "ruleContent": "echo probe-ok *"}],
+                    "behavior": "allow",
+                    "destination": "localSettings",
+                },
+                {
+                    "type": "addDirectories",
+                    "directories": ["/tmp/ws"],
+                    "destination": "session",
+                }
+            ],
+        });
+        let rules = session_scoped_permission_rules(&request);
+        assert_eq!(rules.len(), 1, "only addRules/allow suggestions are kept");
+        assert_eq!(rules[0]["destination"], "session");
+        assert_eq!(rules[0]["rules"][0]["ruleContent"], "echo probe-ok *");
     }
 
     #[test]
-    fn parse_control_request() {
-        let json = r#"{"type":"control_request","request_id":"cr-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -rf /"}}}"#;
-        let msg: CcMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.msg_type, "control_request");
-        assert_eq!(msg.request_id.as_deref(), Some("cr-1"));
-        let req = msg.request.unwrap();
-        assert_eq!(req["subtype"], "can_use_tool");
-        assert_eq!(req["tool_name"], "Bash");
-        assert_eq!(req["input"]["command"], "rm -rf /");
+    fn approval_categories_by_tool_name() {
+        assert_eq!(
+            approval_category_for_tool("Edit"),
+            ApprovalCategory::FileChange
+        );
+        assert_eq!(
+            approval_category_for_tool("Write"),
+            ApprovalCategory::FileChange
+        );
+        assert_eq!(
+            approval_category_for_tool("NotebookEdit"),
+            ApprovalCategory::FileChange
+        );
+        assert_eq!(
+            approval_category_for_tool("mcp__intendant__take_screenshot"),
+            ApprovalCategory::McpTool
+        );
+        assert_eq!(
+            approval_category_for_tool("Bash"),
+            ApprovalCategory::CommandExecution
+        );
     }
 
-    #[tokio::test]
-    async fn interrupt_turn_returns_default_unsupported_error() {
-        // Claude Code's JSONL protocol has no documented mid-turn cancel
-        // today. We keep the trait default so the caller sees a typed error
-        // and can log/escalate without triggering unsafe shutdowns.
-        use crate::external_agent::ExternalAgent;
-        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], None);
-        let err = agent.interrupt_turn().await.unwrap_err();
-        match err {
-            CallerError::ExternalAgent(msg) => {
-                assert!(
-                    msg.contains("interruption not supported"),
-                    "expected 'interruption not supported' error, got: {}",
-                    msg
-                );
-            }
-            other => panic!("expected ExternalAgent error, got {:?}", other),
-        }
+    #[test]
+    fn tool_input_previews() {
+        assert_eq!(
+            tool_input_preview(&serde_json::json!({"command": "ls -la"})),
+            "ls -la"
+        );
+        assert_eq!(
+            tool_input_preview(&serde_json::json!({
+                "file_path": "/tmp/a.rs",
+                "description": "Fix imports"
+            })),
+            "/tmp/a.rs — Fix imports"
+        );
+        let long = "x".repeat(300);
+        assert_eq!(
+            tool_input_preview(&serde_json::json!({ "command": long })).chars().count(),
+            200
+        );
+        assert!(tool_input_preview(&serde_json::json!({"other": 1})).contains("other"));
+    }
+
+    #[test]
+    fn permission_mode_normalization() {
+        // The legacy Intendant default "auto" is not a Claude Code mode;
+        // the CLI coerces it to default, so we don't pass the flag at all.
+        assert_eq!(normalize_permission_mode("auto"), None);
+        assert_eq!(normalize_permission_mode("default"), None);
+        assert_eq!(normalize_permission_mode(""), None);
+        assert_eq!(
+            normalize_permission_mode("acceptEdits").as_deref(),
+            Some("acceptEdits")
+        );
+        assert_eq!(
+            normalize_permission_mode("acceptedits").as_deref(),
+            Some("acceptEdits")
+        );
+        assert_eq!(
+            normalize_permission_mode("bypassPermissions").as_deref(),
+            Some("bypassPermissions")
+        );
+        assert_eq!(normalize_permission_mode("plan").as_deref(), Some("plan"));
+        // Forward-compat: unknown modes pass through untouched.
+        assert_eq!(
+            normalize_permission_mode("futureMode").as_deref(),
+            Some("futureMode")
+        );
+    }
+
+    #[test]
+    fn reader_announces_native_session_id_once() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"status","status":"requesting","session_id":"sess-uuid-1"}"#,
+        );
+        assert!(matches!(
+            out.events.first(),
+            Some(AgentEvent::NativeSessionId { session_id }) if session_id == "sess-uuid-1"
+        ));
+        assert_eq!(reader.shared.session_id().as_deref(), Some("sess-uuid-1"));
+
+        // Subsequent messages with the same id stay quiet.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","result":"ok","session_id":"sess-uuid-1"}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::NativeSessionId { .. })));
+    }
+
+    #[test]
+    fn reader_parses_assistant_blocks() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"pondering"},{"type":"text","text":"Hello"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"session_id":"s1"}"#,
+        );
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Reasoning { text } if text == "pondering")));
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Message { text } if text == "Hello")));
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolStarted { item_id, tool_name, preview }
+                if item_id == "t1" && tool_name == "Bash" && preview == "ls"
+        )));
+        assert!(reader.open_tools.contains("t1"));
+    }
+
+    #[test]
+    fn reader_completes_tools_from_user_message_results() {
+        // Tool results ride user-type messages; missing this left every
+        // Claude Code tool "running" forever in the frontends.
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t9","name":"Bash","input":{"command":"echo hi"}}]},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t9","content":"hi","is_error":false}]},"session_id":"s1"}"#,
+        );
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolOutputDelta { item_id, text } if item_id == "t9" && text == "hi")));
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCompleted { item_id, status }
+                if item_id == "t9" && *status == ToolCompletionStatus::Success
+        )));
+        assert!(reader.open_tools.is_empty());
+    }
+
+    #[test]
+    fn reader_marks_error_tool_results_failed() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"Denied by supervisor","is_error":true}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCompleted { item_id, status: ToolCompletionStatus::Failed { message } }
+                if item_id == "t2" && message.contains("Denied")
+        )));
+    }
+
+    #[test]
+    fn reader_streams_text_deltas() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hel"}},"session_id":"s1"}"#,
+        );
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::MessageDelta { text } if text == "hel")));
+    }
+
+    #[test]
+    fn reader_emits_usage_from_message_delta_and_result() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"cache_creation_input_tokens":62,"cache_read_input_tokens":25028,"output_tokens":37}},"session_id":"s1"}"#,
+        );
+        let usage = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Usage { usage } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.tokens_used, 10 + 62 + 25028 + 37);
+        assert_eq!(usage.cached_tokens, 25028);
+        assert_eq!(usage.completion_tokens, 37);
+        assert_eq!(usage.context_window, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(usage.provider, "anthropic");
+
+        // The result's modelUsage refines the context window for later
+        // snapshots.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","result":"done","session_id":"s1","usage":{"input_tokens":10,"cache_creation_input_tokens":62,"cache_read_input_tokens":25028,"output_tokens":37},"modelUsage":{"claude-haiku-4-5-20251001":{"contextWindow":150000}}}"#,
+        );
+        let usage = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Usage { usage } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.context_window, 150_000);
+        assert_eq!(reader.context_window, 150_000);
+    }
+
+    #[test]
+    fn reader_tracks_model_from_init_and_message_start() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"system","subtype":"init","model":"claude-haiku-4-5-20251001","tools":[],"mcp_servers":[{"name":"intendant","status":"connected"}],"permissionMode":"default","session_id":"s1"}"#,
+        );
+        assert_eq!(reader.model, "claude-haiku-4-5-20251001");
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-8"}},"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.model, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn reader_reports_intendant_mcp_status_changes_only() {
+        let mut reader = test_reader();
+        let init_failed = r#"{"type":"system","subtype":"init","model":"m","tools":[],"mcp_servers":[{"name":"intendant","status":"failed"}],"session_id":"s1"}"#;
+        let out = reader.process_line(init_failed);
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message } if level == "warn" && message.contains("status: failed")
+        )));
+        // Same status again: quiet.
+        let out = reader.process_line(init_failed);
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Log { message, .. } if message.contains("failed"))));
+        // Recovery is reported.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"init","model":"m","tools":[],"mcp_servers":[{"name":"intendant","status":"connected"}],"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message } if level == "info" && message.contains("connected")
+        )));
+    }
+
+    #[test]
+    fn reader_missing_intendant_mcp_warns_when_expected() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"init","model":"m","tools":[],"mcp_servers":[],"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message } if level == "warn" && message.contains("missing")
+        )));
+
+        // Not expected (no web port) → no MCP reporting at all.
+        let mut reader = CcReader::new(
+            Arc::new(CcShared::new(None)),
+            Arc::new(StdMutex::new(HashMap::new())),
+            false,
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"init","model":"m","tools":[],"mcp_servers":[],"session_id":"s1"}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Log { message, .. } if message.contains("MCP"))));
+    }
+
+    #[test]
+    fn reader_success_result_completes_turn() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Done","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnCompleted { message: Some(m) } if m == "Done"
+        )));
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::BackendError { .. })));
+    }
+
+    #[test]
+    fn reader_error_result_emits_backend_error_then_turn_completed() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s1"}"#,
+        );
+        let backend_error_pos = out
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::BackendError { code: Some(c), .. } if c == "error_max_turns"));
+        let turn_completed_pos = out
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::TurnCompleted { .. }));
+        assert!(backend_error_pos.is_some(), "expected BackendError");
+        assert!(
+            backend_error_pos < turn_completed_pos,
+            "BackendError must precede TurnCompleted"
+        );
+    }
+
+    #[test]
+    fn reader_interrupted_result_is_not_a_backend_error() {
+        let reader_shared = Arc::new(CcShared::new(None));
+        let mut reader = CcReader::new(
+            Arc::clone(&reader_shared),
+            Arc::new(StdMutex::new(HashMap::new())),
+            true,
+        );
+        reader_shared.interrupt_pending.store(true, Ordering::SeqCst);
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s1"}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::BackendError { .. })));
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+        // The flag is consumed.
+        assert!(!reader_shared.interrupt_pending.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn reader_cancels_open_tools_at_turn_end() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t5","name":"Bash","input":{"command":"sleep 30"}}]},"session_id":"s1"}"#,
+        );
+        assert!(reader.open_tools.contains("t5"));
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCompleted { item_id, status: ToolCompletionStatus::Cancelled }
+                if item_id == "t5"
+        )));
+        assert!(reader.open_tools.is_empty());
+    }
+
+    #[test]
+    fn reader_approval_request_stores_input_and_rules() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"control_request","request_id":"cc-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"echo hi > f.txt"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"echo hi *"}],"behavior":"allow","destination":"localSettings"}]},"session_id":"s1"}"#,
+        );
+        let request_id = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ApprovalRequest {
+                    request_id,
+                    command,
+                    category,
+                } => {
+                    assert!(command.starts_with("Bash: echo hi"));
+                    assert_eq!(*category, ApprovalCategory::CommandExecution);
+                    Some(request_id.clone())
+                }
+                _ => None,
+            })
+            .expect("approval request event");
+
+        let map = lock_pending(&reader.pending_approvals);
+        let pending = map.get(&request_id).expect("pending approval stored");
+        assert_eq!(pending.cc_request_id, "cc-1");
+        assert_eq!(pending.tool_input["command"], "echo hi > f.txt");
+        assert_eq!(pending.session_rules.len(), 1);
+        assert_eq!(pending.session_rules[0]["destination"], "session");
+    }
+
+    #[test]
+    fn reader_rejects_unknown_control_request_subtypes() {
+        // Fail closed: an unrecognized control request must never be
+        // auto-approved (it could be a future permission-shaped subtype).
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"control_request","request_id":"cc-9","request":{"subtype":"hook_callback","data":{}},"session_id":"s1"}"#,
+        );
+        assert_eq!(out.outbound.len(), 1);
+        let response: serde_json::Value = serde_json::from_str(&out.outbound[0]).unwrap();
+        assert_eq!(response["type"], "control_response");
+        assert_eq!(response["response"]["subtype"], "error");
+        assert_eq!(response["response"]["request_id"], "cc-9");
+        assert!(response["response"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("hook_callback"));
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Log { level, .. } if level == "warn")));
+    }
+
+    #[test]
+    fn reader_logs_failed_control_responses() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"intendant-interrupt-1","error":"no active turn"},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message } if level == "warn" && message.contains("no active turn")
+        )));
+    }
+
+    #[test]
+    fn reader_warns_on_non_allowed_rate_limit() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().all(|e| !matches!(e, AgentEvent::Log { .. })));
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message } if level == "warn" && message.contains("rejected")
+        )));
+    }
+
+    #[test]
+    fn interrupt_control_request_serialization() {
+        let request = CcControlRequest {
+            msg_type: "control_request".into(),
+            request_id: "intendant-interrupt-1".into(),
+            request: serde_json::json!({ "subtype": "interrupt" }),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["type"], "control_request");
+        assert_eq!(json["request_id"], "intendant-interrupt-1");
+        assert_eq!(json["request"]["subtype"], "interrupt");
+    }
+
+    #[test]
+    fn context_window_prefers_matching_model_entry() {
+        let model_usage = serde_json::json!({
+            "claude-haiku-4-5-20251001": {"contextWindow": 200000},
+            "claude-opus-4-8": {"contextWindow": 500000},
+        });
+        assert_eq!(
+            context_window_from_model_usage(&model_usage, "claude-opus-4-8"),
+            Some(500_000)
+        );
+        // Unknown model falls back to the first entry.
+        assert!(context_window_from_model_usage(&model_usage, "other").is_some());
+        assert_eq!(
+            context_window_from_model_usage(&serde_json::json!({}), "m"),
+            None
+        );
     }
 
     #[test]
@@ -932,6 +1962,21 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn start_thread_returns_resume_id_as_canonical() {
+        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], None);
+        // Fresh start: placeholder until the stream announces the real id.
+        let thread = agent.start_thread().await.unwrap();
+        assert_eq!(thread.thread_id, PLACEHOLDER_THREAD_ID);
+
+        // Resumed session: the id is known up front and stays stable.
+        agent.shared = Arc::new(CcShared::new(Some("f00d-1234".into())));
+        let thread = agent.start_thread().await.unwrap();
+        assert_eq!(thread.thread_id, "f00d-1234");
+        assert!(crate::external_agent::AgentBackend::ClaudeCode
+            .thread_id_is_canonical(&thread.thread_id));
+    }
+
     #[test]
     fn bootstrap_addendum_names_ctl_and_bootstrap_tools() {
         // The addendum is Claude Code's capability-discovery entry point;
@@ -949,5 +1994,11 @@ mod tests {
                 "bootstrap addendum lost its pointer to {needle}"
             );
         }
+        // Task-label stripping keys off the marker being the addendum's
+        // first heading.
+        assert!(
+            CLAUDE_CODE_BOOTSTRAP_ADDENDUM.contains(CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER),
+            "bootstrap addendum no longer contains its strip marker"
+        );
     }
 }
