@@ -937,6 +937,7 @@ async fn install_sh() -> impl IntoResponse {
 fn landing_asset_bytes(name: &str) -> Option<&'static [u8]> {
     match name {
         "hero.webp" => Some(include_bytes!("assets/landing-hero.webp")),
+        "video.webp" => Some(include_bytes!("assets/landing-video.webp")),
         "vault.webp" => Some(include_bytes!("assets/landing-vault.webp")),
         "station.webp" => Some(include_bytes!("assets/landing-station.webp")),
         "claim.webp" => Some(include_bytes!("assets/landing-claim.webp")),
@@ -5201,6 +5202,24 @@ fn landing_ui_html(origin: &str) -> String {
     </section>
 
     <section class="tour">
+      <div class="trow">
+        <div class="txt">
+          <div class="eyebrow">The desktop</div>
+          <h3>A real desktop, watched</h3>
+          <p>The agent gets a display it can see and drive — a browser, a
+          terminal, whatever the task needs — and you watch it stream live
+          over WebRTC. Input stays yours to share: take control at any
+          moment, annotate what you see, record what happened.</p>
+        </div>
+        <div class="pic">
+          <div class="shot">
+            <img loading="lazy" src="/assets/landing/video.webp" width="2000" height="1119"
+                 alt="The dashboard's Video tab streaming a live agent desktop over WebRTC: a browser and a terminal scrolling a build, with view-only, annotate, record, and take-control affordances.">
+          </div>
+          <div class="shotnote">Watching atlas's display, live — view-only until you hand input over.</div>
+        </div>
+      </div>
+
       <div class="trow rev">
         <div class="txt">
           <div class="eyebrow">Mission control</div>
@@ -5261,10 +5280,10 @@ fn landing_ui_html(origin: &str) -> String {
       <h2>What's in the box</h2>
       <div class="grid">
         <div class="card">
-          <h3>A real desktop, watched</h3>
-          <p>The agent gets a display it can see and drive — streamed live to
-          you over WebRTC. Autonomy is a dial, approvals are explicit, and
-          every session is logged and replayable.</p>
+          <h3>Bring your own agent</h3>
+          <p>Codex, Gemini CLI, and Claude Code run as managed backends —
+          under the same oversight, autonomy dial, and session logging as
+          the native agent loop.</p>
         </div>
         <div class="card">
           <h3>Your keys stay yours</h3>
@@ -7113,7 +7132,7 @@ mod tests {
         assert!(html.contains("Built to be distrusted"));
         // The tour shows the product: every embedded screenshot is referenced,
         // with alt text so the page reads without images.
-        for asset in ["hero.webp", "station.webp", "vault.webp", "claim.webp"] {
+        for asset in ["hero.webp", "video.webp", "station.webp", "vault.webp", "claim.webp"] {
             assert!(
                 html.contains(&format!("/assets/landing/{asset}")),
                 "landing page must reference {asset}"
@@ -7124,7 +7143,7 @@ mod tests {
 
     #[test]
     fn landing_assets_are_embedded_webp() {
-        for asset in ["hero.webp", "station.webp", "vault.webp", "claim.webp"] {
+        for asset in ["hero.webp", "video.webp", "station.webp", "vault.webp", "claim.webp"] {
             let bytes = landing_asset_bytes(asset)
                 .unwrap_or_else(|| panic!("missing embedded landing asset {asset}"));
             // RIFF....WEBP container magic.
