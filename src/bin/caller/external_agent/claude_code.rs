@@ -35,6 +35,12 @@ This session runs under Intendant, which adds desktop and display capabilities b
 For browser/dashboard/Station validation, use `node scripts/validate-dashboard.cjs` and prefer its named probes such as `--station-probe rendered` over ad-hoc Chromium/CDP scripts; its `--help` is the authoritative flag reference, and docs/src/external-agent-orchestration.md has the full Station QA recipes. For a temporary dashboard, use the helper's owned lifecycle: `--launch-dashboard --port <throwaway_port>` for a one-shot smoke, or `--hold-dashboard` kept in the foreground while separate CU/browser steps run against the printed URL, then interrupted for helper-owned cleanup. Do not start a separate foreground/nohup/setsid dashboard just so another tool can connect.
 "#;
 
+/// First heading of [`CLAUDE_CODE_BOOTSTRAP_ADDENDUM`]. Consumers deriving
+/// task labels from a supervised session's first user message strip
+/// everything from this marker on — the addendum rides the first prompt and
+/// otherwise leaks supervision boilerplate into session titles.
+pub const CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER: &str = "### Intendant Supervision";
+
 /// Claude models currently ship a 200k context window; the authoritative
 /// value arrives with the first `result` message's `modelUsage` map and
 /// replaces this default.
@@ -314,19 +320,14 @@ fn context_window_from_model_usage(model_usage: &serde_json::Value, model: &str)
 
 /// Map Intendant's configured permission mode onto Claude Code's CLI
 /// values. `None` means "don't pass `--permission-mode`" (the CLI default).
-/// The legacy Intendant default "auto" was never a real Claude Code mode —
-/// the CLI silently coerces it to default — so it maps to default here.
-/// Unknown values pass through untouched for forward compatibility.
+/// Canonicalization lives in [`crate::project::normalize_claude_permission_mode`]
+/// so the settings surfaces and this adapter agree on the vocabulary.
 fn normalize_permission_mode(mode: &str) -> Option<String> {
-    let trimmed = mode.trim();
-    match trimmed.to_ascii_lowercase().as_str() {
-        "" | "default" | "auto" => None,
-        "acceptedits" | "accept-edits" | "accept_edits" => Some("acceptEdits".into()),
-        "plan" => Some("plan".into()),
-        "bypasspermissions" | "bypass-permissions" | "bypass_permissions" => {
-            Some("bypassPermissions".into())
-        }
-        _ => Some(trimmed.to_string()),
+    let canonical = crate::project::normalize_claude_permission_mode(mode);
+    if canonical == "default" {
+        None
+    } else {
+        Some(canonical)
     }
 }
 
@@ -1993,5 +1994,11 @@ mod tests {
                 "bootstrap addendum lost its pointer to {needle}"
             );
         }
+        // Task-label stripping keys off the marker being the addendum's
+        // first heading.
+        assert!(
+            CLAUDE_CODE_BOOTSTRAP_ADDENDUM.contains(CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER),
+            "bootstrap addendum no longer contains its strip marker"
+        );
     }
 }

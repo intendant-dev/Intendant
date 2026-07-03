@@ -295,6 +295,9 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::SetCodexManagedContext { .. }
         | ControlMsg::SetCodexContextArchive { .. }
         | ControlMsg::ConfigureSessionAgent { .. }
+        | ControlMsg::SetClaudeModel { .. }
+        | ControlMsg::SetClaudePermissionMode { .. }
+        | ControlMsg::SetClaudeAllowedTools { .. }
         | ControlMsg::SetVerbosity { .. } => PeerOperation::Settings,
         ControlMsg::CodexThreadAction { .. }
         | ControlMsg::RenameSession { .. }

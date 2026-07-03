@@ -946,6 +946,15 @@ fn codex_runtime_config_equal(
         && a.context_archive == b.context_archive
 }
 
+fn claude_runtime_config_equal(
+    a: &control_plane::ClaudeRuntimeConfig,
+    b: &control_plane::ClaudeRuntimeConfig,
+) -> bool {
+    a.model == b.model
+        && a.permission_mode == b.permission_mode
+        && a.allowed_tools == b.allowed_tools
+}
+
 fn normalize_diff_file_path(path: &str) -> Option<String> {
     let path = path.split('\t').next().unwrap_or(path).trim();
     if path == "/dev/null" {
@@ -11711,6 +11720,19 @@ fn codex_subagent_parent_threads_from_log(log_dir: &std::path::Path) -> HashMap<
     parents
 }
 
+/// Build the control plane's live Claude Code runtime config from the
+/// project TOML. Mirrors the inline Codex/Gemini seeding blocks.
+fn shared_claude_config_from_project(project: &Project) -> control_plane::SharedClaudeConfig {
+    let cfg = &project.config.agent.claude_code;
+    Arc::new(tokio::sync::RwLock::new(
+        control_plane::ClaudeRuntimeConfig {
+            model: cfg.model.clone(),
+            permission_mode: project::normalize_claude_permission_mode(&cfg.permission_mode),
+            allowed_tools: cfg.allowed_tools.clone(),
+        },
+    ))
+}
+
 /// Configuration for `run_daemon_loop`.
 struct DaemonConfig {
     bus: EventBus,
@@ -11718,6 +11740,7 @@ struct DaemonConfig {
     autonomy: SharedAutonomy,
     shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     shared_codex_config: control_plane::SharedCodexConfig,
+    shared_claude_config: control_plane::SharedClaudeConfig,
     frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     session_registry: Option<display::SharedSessionRegistry>,
     web_port: Option<u16>,
@@ -11742,6 +11765,7 @@ async fn run_daemon_loop(config: DaemonConfig) {
         autonomy: config.autonomy,
         shared_external_agent: config.shared_external_agent,
         shared_codex_config: config.shared_codex_config,
+        shared_claude_config: config.shared_claude_config,
         frame_registry: config.frame_registry,
         session_registry: config.session_registry,
         web_port: config.web_port,
@@ -26517,6 +26541,7 @@ async fn run_with_presence(
     agent_backend_override: Option<external_agent::AgentBackend>,
     shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     shared_codex_config: control_plane::SharedCodexConfig,
+    shared_claude_config: control_plane::SharedClaudeConfig,
     web_port: Option<u16>,
     resume_session: Option<String>,
     resume_session_config: Option<session_config::SessionAgentConfig>,
@@ -26732,6 +26757,7 @@ async fn run_with_presence(
     // `shared_codex_config` when a new task arrives, we tear the agent down
     // and build a fresh one. Only meaningful when the backend is Codex.
     let mut persistent_codex_config: Option<control_plane::CodexRuntimeConfig> = None;
+    let mut persistent_claude_config: Option<control_plane::ClaudeRuntimeConfig> = None;
 
     // Side channel for thread actions (Codex slash commands) dispatched from
     // the dashboard / MCP between tasks. We subscribe to the bus here (not
@@ -27533,6 +27559,7 @@ async fn run_with_presence(
                             persistent_thread = None;
                             persistent_event_rx = None;
                             persistent_codex_config = None;
+                            persistent_claude_config = None;
                             bus.send(AppEvent::ConversationRolledBack {
                                 round_id,
                                 turns_removed: turns_to_drop,
@@ -27707,6 +27734,7 @@ async fn run_with_presence(
         // per-session config at spawn/thread-start — a toggle in the UI takes
         // effect on the NEXT task by forcing an agent rebuild.
         let current_codex_config = shared_codex_config.read().await.clone();
+        let current_claude_config = shared_claude_config.read().await.clone();
 
         // Teardown conditions:
         //  - backend changed (any agent)
@@ -27716,19 +27744,32 @@ async fn run_with_presence(
                 && persistent_codex_config
                     .as_ref()
                     .is_some_and(|prev| !codex_runtime_config_equal(prev, &current_codex_config));
+        let claude_config_changed =
+            matches!(agent_backend, Some(external_agent::AgentBackend::ClaudeCode))
+                && persistent_claude_config
+                    .as_ref()
+                    .is_some_and(|prev| !claude_runtime_config_equal(prev, &current_claude_config));
 
         if persistent_agent.is_some()
-            && (agent_backend != persistent_agent_backend || codex_config_changed)
+            && (agent_backend != persistent_agent_backend
+                || codex_config_changed
+                || claude_config_changed)
         {
             if codex_config_changed {
                 slog(&session_log, |l| {
                     l.info("Codex config changed; rebuilding agent for next task")
                 });
             }
+            if claude_config_changed {
+                slog(&session_log, |l| {
+                    l.info("Claude Code config changed; rebuilding agent for next task")
+                });
+            }
             persistent_agent = None;
             persistent_thread = None;
             persistent_event_rx = None;
             persistent_codex_config = None;
+            persistent_claude_config = None;
             persistent_diff_tracker = ExternalDiffDeltaTracker::default();
             persistent_pending_runtime_steers.clear();
             persistent_handled_steer_ids.clear();
@@ -27775,6 +27816,12 @@ async fn run_with_presence(
                     cx.writable_roots = current_codex_config.writable_roots.clone();
                     cx.managed_context = current_codex_config.managed_context.clone();
                     cx.context_archive = current_codex_config.context_archive.clone();
+                }
+                if matches!(backend, external_agent::AgentBackend::ClaudeCode) {
+                    let cc = &mut proj.config.agent.claude_code;
+                    cc.model = current_claude_config.model.clone();
+                    cc.permission_mode = current_claude_config.permission_mode.clone();
+                    cc.allowed_tools = current_claude_config.allowed_tools.clone();
                 }
                 // The first agent build may be resuming a session from a
                 // startup `--resume`/`--continue`. That session's persisted
@@ -27855,6 +27902,12 @@ async fn run_with_presence(
                 persistent_codex_config =
                     if matches!(agent_backend, Some(external_agent::AgentBackend::Codex)) {
                         Some(current_codex_config.clone())
+                    } else {
+                        None
+                    };
+                persistent_claude_config =
+                    if matches!(agent_backend, Some(external_agent::AgentBackend::ClaudeCode)) {
+                        Some(current_claude_config.clone())
                     } else {
                         None
                     };
@@ -34349,12 +34402,14 @@ async fn main() -> Result<(), CallerError> {
                 },
             ))
         };
+        let shared_claude_config = shared_claude_config_from_project(&project);
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
                 codex_config: shared_codex_config.clone(),
+                claude_config: shared_claude_config.clone(),
                 bus: bus.clone(),
                 project_root: Some(project.root.clone()),
             },
@@ -34366,6 +34421,7 @@ async fn main() -> Result<(), CallerError> {
             autonomy,
             shared_external_agent,
             shared_codex_config,
+            shared_claude_config,
             frame_registry,
             session_registry: Some(session_registry.clone()),
             web_port: web_port_for_agent,
@@ -35225,12 +35281,14 @@ async fn main() -> Result<(), CallerError> {
                 },
             ))
         };
+        let shared_claude_config = shared_claude_config_from_project(&project);
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
                 codex_config: shared_codex_config.clone(),
+                claude_config: shared_claude_config.clone(),
                 bus: bus.clone(),
                 project_root: Some(project.root.clone()),
             },
@@ -35244,6 +35302,7 @@ async fn main() -> Result<(), CallerError> {
                         autonomy: autonomy.clone(),
                         shared_external_agent: shared_external_agent.clone(),
                         shared_codex_config: shared_codex_config.clone(),
+                        shared_claude_config: shared_claude_config.clone(),
                         frame_registry: frame_registry.clone(),
                         session_registry: Some(session_registry.clone()),
                         web_port: web_port_for_agent,
@@ -35313,6 +35372,7 @@ async fn main() -> Result<(), CallerError> {
             let agent_backend_for_presence = agent_backend.clone();
             let shared_external_agent_for_presence = shared_external_agent.clone();
             let shared_codex_config_for_presence = shared_codex_config.clone();
+            let shared_claude_config_for_presence = shared_claude_config.clone();
             let session_registry_for_presence = session_registry.clone();
             tokio::spawn(async move {
                 let result = run_with_presence(
@@ -35337,6 +35397,7 @@ async fn main() -> Result<(), CallerError> {
                     agent_backend_for_presence,
                     shared_external_agent_for_presence,
                     shared_codex_config_for_presence,
+                    shared_claude_config_for_presence,
                     if use_web { Some(web_port) } else { None },
                     startup_external_resume_session.clone(),
                     startup_external_resume_overrides,
@@ -35533,6 +35594,7 @@ async fn main() -> Result<(), CallerError> {
                 autonomy: autonomy.clone(),
                 shared_external_agent: shared_external_agent.clone(),
                 shared_codex_config: shared_codex_config.clone(),
+                shared_claude_config: shared_claude_config.clone(),
                 frame_registry: frame_registry_for_events.clone(),
                 session_registry: Some(session_registry.clone()),
                 web_port: web_port_for_agent,
@@ -35849,12 +35911,14 @@ async fn main() -> Result<(), CallerError> {
                 },
             ))
         };
+        let shared_claude_config = shared_claude_config_from_project(&project);
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
                 codex_config: shared_codex_config.clone(),
+                claude_config: shared_claude_config.clone(),
                 bus: bus.clone(),
                 project_root: Some(project.root.clone()),
             },
@@ -35981,6 +36045,7 @@ async fn main() -> Result<(), CallerError> {
                 autonomy: autonomy_for_daemon.clone(),
                 shared_external_agent: shared_external_agent.clone(),
                 shared_codex_config: shared_codex_config.clone(),
+                shared_claude_config: shared_claude_config.clone(),
                 frame_registry: frame_registry.clone(),
                 session_registry: Some(session_registry.clone()),
                 web_port: web_port_for_agent,

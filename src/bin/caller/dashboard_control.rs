@@ -9349,6 +9349,9 @@ fn dashboard_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::SetCodexWritableRoots { .. }
             | ControlMsg::SetCodexManagedContext { .. }
             | ControlMsg::SetCodexContextArchive { .. }
+            | ControlMsg::SetClaudeModel { .. }
+            | ControlMsg::SetClaudePermissionMode { .. }
+            | ControlMsg::SetClaudeAllowedTools { .. }
             | ControlMsg::SetVerbosity { .. }
     )
 }
@@ -9429,6 +9432,9 @@ fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::StopSession { .. } => "stop_session",
         ControlMsg::RestartSession { .. } => "restart_session",
         ControlMsg::ResumeSession { .. } => "resume_session",
+        ControlMsg::SetClaudeModel { .. } => "set_claude_model",
+        ControlMsg::SetClaudePermissionMode { .. } => "set_claude_permission_mode",
+        ControlMsg::SetClaudeAllowedTools { .. } => "set_claude_allowed_tools",
         ControlMsg::SetVerbosity { .. } => "set_verbosity",
         ControlMsg::ScheduleControllerRestart { .. } => "schedule_controller_restart",
         ControlMsg::ControllerTurnComplete { .. } => "controller_turn_complete",

@@ -1379,6 +1379,39 @@ impl App {
                     format!("Rename session {} → {}", session_id, name),
                 );
             }
+            ControlMsg::SetClaudeModel { ref model } => {
+                let label = model
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("<default>");
+                self.log(
+                    LogLevel::Info,
+                    format!("Claude Code model → {} (applies on next task)", label),
+                );
+            }
+            ControlMsg::SetClaudePermissionMode { ref mode } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Claude Code permission mode → {} (applies on next task)",
+                        mode
+                    ),
+                );
+            }
+            ControlMsg::SetClaudeAllowedTools { ref tools } => {
+                self.log(
+                    LogLevel::Info,
+                    if tools.is_empty() {
+                        "Claude Code allowed tools cleared — all tools (applies on next task)"
+                            .to_string()
+                    } else {
+                        format!(
+                            "Claude Code allowed tools → {} (applies on next task)",
+                            tools.join(", ")
+                        )
+                    },
+                );
+            }
             ControlMsg::SetVerbosity { level } => {
                 let new_verbosity = match level.to_lowercase().as_str() {
                     "quiet" => Some(Verbosity::Quiet),
@@ -2513,6 +2546,7 @@ impl App {
             | AppEvent::SessionRelationship { .. }
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::SessionAgentConfigResult { .. }
+            | AppEvent::ClaudeConfigChanged { .. }
             | AppEvent::SharedView { .. }
             | AppEvent::BrowserWorkspaceChanged { .. }
             | AppEvent::FileChanged { .. }
