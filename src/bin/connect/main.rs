@@ -143,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/daemon/error", post(daemon_error))
         .route("/api/daemon/ack", post(daemon_ack))
         .route("/api/daemon/claim-proof", post(daemon_claim_proof))
+        .route("/api/daemon/dry", post(daemon_dry))
         .route("/api/browser/offer", post(browser_offer))
         .route("/api/browser/ice", post(browser_ice))
         .route("/api/browser/close", post(browser_close))
@@ -4085,6 +4086,104 @@ struct ClaimProofRequest {
     signature: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DaemonDryRequest {
+    daemon_id: String,
+    #[serde(default)]
+    credentials: Vec<serde_json::Value>,
+}
+
+/// A claimed daemon's credential leases expired with nothing covering
+/// them (credential custody). Web-Push the owner's subscribed browsers so
+/// they can reconnect a fueling session — the service only relays the
+/// daemon's own report; it can't see leases.
+fn dry_push_payload(
+    daemon_id: &str,
+    label: &str,
+    credentials: &[serde_json::Value],
+) -> serde_json::Value {
+    let mut names: Vec<String> = credentials
+        .iter()
+        .filter_map(|credential| {
+            credential
+                .get("label")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| credential.get("kind").and_then(|v| v.as_str()))
+                .map(str::to_string)
+        })
+        .take(6)
+        .collect();
+    if names.is_empty() {
+        names.push("credentials".to_string());
+    }
+    json!({
+        "title": format!("{label} is unfueled"),
+        "body": format!(
+            "Credential lease expired: {}. Reconnect a fueling session to re-grant from the vault.",
+            names.join(", ")
+        ),
+        "url": format!("/app?connect=1&daemon_id={daemon_id}"),
+    })
+}
+
+async fn daemon_dry(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DaemonDryRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_daemon_auth(&state, &headers)?;
+    check_rate_limit(&state, &headers, "daemon_dry", 30, 60_000).await?;
+    let daemon_id = body.daemon_id.trim().to_string();
+    if daemon_id.is_empty() {
+        return Err(ApiError::bad_request("daemon_id is required"));
+    }
+    let (label, owner, subscriptions) = {
+        let store = state.store.lock().await;
+        let Some(daemon) = store.daemons.iter().find(|d| d.daemon_id == daemon_id) else {
+            return Err(ApiError::not_found("unknown daemon"));
+        };
+        (
+            daemon.label.clone().unwrap_or_else(|| daemon_id.clone()),
+            daemon.owner_user_id,
+            store.push_subscriptions.clone(),
+        )
+    };
+    let Some(owner) = owner else {
+        // Nobody has claimed this daemon — nobody to notify.
+        return Ok(Json(json!({ "ok": true, "notified": 0 })));
+    };
+    let payload = dry_push_payload(&daemon_id, &label, &body.credentials);
+    let mut notified = 0usize;
+    let mut dead = Vec::new();
+    for subscription in subscriptions
+        .iter()
+        .filter(|s| s.notify_presence && s.user_id == owner)
+    {
+        match send_web_push(
+            &state.push_http,
+            &state.vapid,
+            &state.config.public_origin,
+            subscription,
+            &payload,
+        )
+        .await
+        {
+            Ok(true) => notified += 1,
+            Ok(false) => dead.push(subscription.endpoint.clone()),
+            Err(e) => eprintln!("[push] dry-daemon alert failed: {e}"),
+        }
+    }
+    if !dead.is_empty() {
+        let mut store = state.store.lock().await;
+        store
+            .push_subscriptions
+            .retain(|record| !dead.contains(&record.endpoint));
+        let _ = persist_locked(&state, &store);
+    }
+    Ok(Json(json!({ "ok": true, "notified": notified })))
+}
+
 async fn daemon_claim_proof(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -6563,6 +6662,34 @@ mod tests {
             manual.get("source").and_then(|v| v.as_str()),
             Some("browser_fleet")
         );
+    }
+
+    #[test]
+    fn dry_push_payload_names_daemon_and_credentials() {
+        let payload = dry_push_payload(
+            "daemon-1",
+            "Workshop box",
+            &[
+                json!({ "kind": "api_key:anthropic", "label": "Personal Anthropic" }),
+                json!({ "kind": "oauth:codex" }),
+            ],
+        );
+        assert_eq!(
+            payload["title"].as_str(),
+            Some("Workshop box is unfueled")
+        );
+        let body = payload["body"].as_str().unwrap();
+        assert!(body.contains("Personal Anthropic"), "{body}");
+        assert!(body.contains("oauth:codex"), "{body}");
+        assert!(body.contains("Reconnect a fueling session"), "{body}");
+        assert_eq!(
+            payload["url"].as_str(),
+            Some("/app?connect=1&daemon_id=daemon-1")
+        );
+
+        // No names at all still produces a sensible message.
+        let fallback = dry_push_payload("d", "D", &[]);
+        assert!(fallback["body"].as_str().unwrap().contains("credentials"));
     }
 
     fn vault_blob(revision: u64, marker: &str) -> serde_json::Value {

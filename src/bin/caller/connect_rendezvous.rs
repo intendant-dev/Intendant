@@ -187,6 +187,7 @@ async fn run_connect_rendezvous_client(
                     .await;
                 }
                 Ok(None) => {
+                    report_dry_credentials(&client, &base_url, &config, &daemon_id).await;
                     if last_register.elapsed() >= REGISTER_REFRESH_INTERVAL {
                         match register(&client, &base_url, &config, &daemon_id, &daemon_public_key)
                             .await
@@ -209,6 +210,47 @@ async fn run_connect_rendezvous_client(
                 }
             }
         }
+    }
+}
+
+/// Report leases that expired without an .env fallback (credential
+/// custody): the service turns this into a Web Push telling the owner
+/// which daemon went dry. Best-effort — a failed report is dropped, the
+/// dashboard lease status still shows the expired note.
+async fn report_dry_credentials(
+    client: &Client,
+    base_url: &Url,
+    config: &ConnectConfig,
+    daemon_id: &str,
+) {
+    let notices = crate::credential_leases::take_dry_notices();
+    if notices.is_empty() {
+        return;
+    }
+    let credentials: Vec<serde_json::Value> = notices
+        .iter()
+        .map(|notice| {
+            serde_json::json!({ "kind": notice.kind, "label": notice.label })
+        })
+        .collect();
+    let url = match join_url(base_url, "api/daemon/dry") {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("[connect] dry-credential report skipped: {e}");
+            return;
+        }
+    };
+    let result = authenticated(config, client.post(url))
+        .json(&serde_json::json!({
+            "daemon_id": daemon_id,
+            "credentials": credentials,
+        }))
+        .send()
+        .await;
+    match result {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => eprintln!("[connect] dry-credential report failed: HTTP {}", resp.status()),
+        Err(e) => eprintln!("[connect] dry-credential report failed: {e}"),
     }
 }
 

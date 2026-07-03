@@ -105,9 +105,66 @@ fn sweep_locked(leases: &mut HashMap<String, CredentialLease>, now: u64) {
     for kind in expired {
         if let Some(lease) = leases.remove(&kind) {
             graves.insert(kind.clone(), lease.expires_at_unix_ms());
+            queue_dry_notice(&kind, &lease.label);
         }
         drop_materialization(&materialization_root(), &kind);
     }
+}
+
+/* ── Dry-daemon notices ──
+   When a lease expires and no .env key covers the same kind, the daemon
+   has genuinely gone dry for it. The sweep queues a notice here; the
+   rendezvous client drains the queue and reports it, and the hosted
+   service turns that into a Web Push ("reconnect a fueling session") to
+   the owner's subscribed browsers. Revocation queues nothing — the user
+   just did it themselves. */
+
+#[derive(Debug, Clone)]
+pub struct DryNotice {
+    pub kind: String,
+    pub label: String,
+}
+
+const MAX_PENDING_DRY_NOTICES: usize = 16;
+
+fn dry_notices() -> &'static RwLock<Vec<DryNotice>> {
+    static NOTICES: OnceLock<RwLock<Vec<DryNotice>>> = OnceLock::new();
+    NOTICES.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn kind_has_env_fallback(kind: &str) -> bool {
+    let names: &[&str] = match kind {
+        "api_key:anthropic" => &["ANTHROPIC_API_KEY", "ANTHROPIC"],
+        "api_key:openai" => &["OPENAI_API_KEY", "OPENAI"],
+        "api_key:gemini" => &["GEMINI_API_KEY", "GEMINI"],
+        // The external agents have no env fallback — an expired oauth
+        // lease always means dry.
+        _ => &[],
+    };
+    names
+        .iter()
+        .any(|name| std::env::var(name).map(|v| !v.trim().is_empty()).unwrap_or(false))
+}
+
+fn queue_dry_notice(kind: &str, label: &str) {
+    if kind_has_env_fallback(kind) {
+        return;
+    }
+    let mut notices = dry_notices().write().expect("dry notices poisoned");
+    if notices.len() >= MAX_PENDING_DRY_NOTICES {
+        return;
+    }
+    notices.push(DryNotice {
+        kind: kind.to_string(),
+        label: label.to_string(),
+    });
+}
+
+/// Drain pending dry notices (called by the rendezvous client; on report
+/// failure they are simply dropped — the lease-status expired note still
+/// carries the state in the dashboard).
+pub fn take_dry_notices() -> Vec<DryNotice> {
+    std::mem::take(&mut *dry_notices().write().expect("dry notices poisoned"))
 }
 
 /* ── OAuth materialization (external agents) ──
