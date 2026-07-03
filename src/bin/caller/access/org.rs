@@ -627,6 +627,29 @@ pub fn materialize_org_grant(
         )));
     }
 
+    // A delegated issuer's `role:*` scope caps the human roles it may sign.
+    // verify_org_grant can only check subject-kind fit (it has no role
+    // catalog); the permission-subset half of the scope lives here, where
+    // the roles exist.
+    if let Some(cert) = doc.chain.first() {
+        let scope = cert.max_role.trim();
+        if scope.starts_with("role:") {
+            let Some(scoped_role) = state.roles.iter().find(|role| role.id == scope) else {
+                return Err(AccessError(format!(
+                    "issuer scope {scope} is not defined on this daemon; failing closed"
+                )));
+            };
+            if let Some(excess) =
+                crate::access::iam::permissions_excess(&role.permissions, &scoped_role.permissions)
+            {
+                return Err(AccessError(format!(
+                    "org grant role {} exceeds the issuer's scope {scope} ({excess} is not allowed)",
+                    doc.role_id
+                )));
+            }
+        }
+    }
+
     let principal_id = format!("principal:client-key:{fingerprint}");
     let label = if doc.subject.label.trim().is_empty() {
         format!("{handle} member")
@@ -1313,6 +1336,57 @@ pub fn apply_orl(
         .map(|principal| principal.id.clone())
         .collect();
 
+    // Peer identities materialized from this org are swept by the same
+    // lists: subject fingerprints and document grant ids. This runs BEFORE
+    // any state mutation and fails the whole apply on a write error —
+    // advancing last_orl_seq past an unrecorded revocation would make the
+    // idempotent re-apply a no-op and leave the peer approved forever.
+    let mut revoked_peer_identities = 0;
+    let identities = crate::peer::access_policy::list_identities(cert_dir).map_err(|e| {
+        AccessError(format!(
+            "cannot apply org {handle} revocation list: peer identity store unreadable: {e}"
+        ))
+    })?;
+    let now_unix = (now_unix_ms / 1000) as i64;
+    let mut failed_peer_writes: Vec<String> = Vec::new();
+    for mut record in identities {
+        let from_org = record.source.as_deref() == Some(&format!("org:{handle}") as &str);
+        let listed = revoked_subjects.iter().any(|s| s == &record.fingerprint)
+            || record
+                .org_grant_id
+                .as_deref()
+                .map(|id| revoked_grant_ids.iter().any(|g| g == id))
+                .unwrap_or(false)
+            || record
+                .issued_via
+                .as_deref()
+                .map(|key| revoked_issuer_keys.iter().any(|k| k == key))
+                .unwrap_or(false);
+        if from_org
+            && listed
+            && matches!(
+                record.status,
+                crate::peer::access_policy::PeerIdentityStatus::Approved
+            )
+        {
+            let fingerprint = record.fingerprint.clone();
+            record.status = crate::peer::access_policy::PeerIdentityStatus::Revoked;
+            record.revoked_at_unix = Some(now_unix);
+            match crate::peer::access_policy::write_identity_record(cert_dir, &record) {
+                Ok(()) => revoked_peer_identities += 1,
+                Err(e) => failed_peer_writes.push(format!("{fingerprint}: {e}")),
+            }
+        }
+    }
+    if !failed_peer_writes.is_empty() {
+        return Err(AccessError(format!(
+            "org {handle} revocation list seq {} was NOT recorded: {} peer identity record(s) could not be revoked ({}); fix the store and re-apply the list",
+            orl.seq,
+            failed_peer_writes.len(),
+            failed_peer_writes.join(", ")
+        )));
+    }
+
     let source = format!("org:{handle}");
     let local_grant_ids: Vec<String> = revoked_grant_ids
         .iter()
@@ -1333,40 +1407,6 @@ pub fn apply_orl(
         grant.status = "revoked".to_string();
         grant.revoked_at_unix_ms = Some(now_unix_ms);
         revoked += 1;
-    }
-
-    // Peer identities materialized from this org are swept by the same
-    // lists: subject fingerprints and document grant ids.
-    let mut revoked_peer_identities = 0;
-    if let Ok(identities) = crate::peer::access_policy::list_identities(cert_dir) {
-        let now_unix = (now_unix_ms / 1000) as i64;
-        for mut record in identities {
-            let from_org = record.source.as_deref() == Some(&format!("org:{handle}") as &str);
-            let listed = revoked_subjects.iter().any(|s| s == &record.fingerprint)
-                || record
-                    .org_grant_id
-                    .as_deref()
-                    .map(|id| revoked_grant_ids.iter().any(|g| g == id))
-                    .unwrap_or(false)
-                || record
-                    .issued_via
-                    .as_deref()
-                    .map(|key| revoked_issuer_keys.iter().any(|k| k == key))
-                    .unwrap_or(false);
-            if from_org
-                && listed
-                && matches!(
-                    record.status,
-                    crate::peer::access_policy::PeerIdentityStatus::Approved
-                )
-            {
-                record.status = crate::peer::access_policy::PeerIdentityStatus::Revoked;
-                record.revoked_at_unix = Some(now_unix);
-                if crate::peer::access_policy::write_identity_record(cert_dir, &record).is_ok() {
-                    revoked_peer_identities += 1;
-                }
-            }
-        }
     }
 
     let entry = &mut state.trusted_orgs[index];
@@ -2241,6 +2281,140 @@ mod tests {
 
     fn identity_ref<'a>(identity: &'a DaemonIdentity, _dir: &Path) -> &'a DaemonIdentity {
         identity
+    }
+
+    #[test]
+    fn issuer_role_scope_caps_materialization() {
+        let root = org_identity();
+        let mut state = LocalIamState::default();
+        trust_org(&mut state, "acme", &root.public_key_b64u(), None, None, test_now()).unwrap();
+
+        let issuer_dir = tempfile::tempdir().unwrap();
+        let issuer = DaemonIdentity::load_or_create(issuer_dir.path().join("issuer.pk8")).unwrap();
+        let cert = delegate_org_issuer(
+            &root,
+            "acme",
+            &issuer.public_key_b64u(),
+            "readers only",
+            "role:session-reader",
+            None,
+            test_now(),
+        )
+        .unwrap();
+
+        // A document within the issuer's scope materializes.
+        let within = issue_org_grant_via(
+            &issuer,
+            &cert,
+            &state,
+            IssueOrgGrantRequest {
+                handle: "acme",
+                client_key_fingerprint: "member-key",
+                peer_fingerprint: "",
+                subject_label: "Alice",
+                role_id: "role:session-reader",
+                targets: vec!["*".to_string()],
+                ttl_ms: None,
+            },
+            test_now(),
+        )
+        .unwrap();
+        materialize_org_grant(&mut state, &within, &["*".to_string()], test_now()).unwrap();
+
+        // A document for a broader role verifies (the payload is honestly
+        // signed) but must be refused at materialization: the issuer's
+        // scope caps what it may sign even under a permissive org cap.
+        let above = issue_org_grant_via(
+            &issuer,
+            &cert,
+            &state,
+            IssueOrgGrantRequest {
+                handle: "acme",
+                client_key_fingerprint: "other-key",
+                peer_fingerprint: "",
+                subject_label: "Mallory",
+                role_id: "role:operator",
+                targets: vec!["*".to_string()],
+                ttl_ms: None,
+            },
+            test_now(),
+        )
+        .unwrap();
+        verify_org_grant(&above, test_now()).unwrap();
+        let err = materialize_org_grant(&mut state, &above, &["*".to_string()], test_now())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds the issuer's scope"),
+            "{err}"
+        );
+        // An unknown scope fails closed rather than silently uncapping.
+        let ghost_cert = delegate_org_issuer(
+            &root,
+            "acme",
+            &issuer.public_key_b64u(),
+            "ghost scope",
+            "role:does-not-exist",
+            None,
+            test_now(),
+        )
+        .unwrap();
+        let mut ghost = within.clone();
+        ghost.chain = vec![ghost_cert];
+        ghost.sig = issuer.sign_b64u(&org_grant_signing_payload(&ghost));
+        let err = materialize_org_grant(&mut state, &ghost, &["*".to_string()], test_now())
+            .unwrap_err();
+        assert!(err.to_string().contains("failing closed"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orl_apply_does_not_advance_seq_past_failed_peer_revocations() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, root) = org_identity_with_dir();
+        let mut state = LocalIamState::default();
+        trust_org(&mut state, "acme", &root.public_key_b64u(), None, None, test_now()).unwrap();
+
+        // An approved org-materialized peer identity that the list revokes.
+        let record = crate::peer::access_policy::PeerIdentityRecord {
+            version: 1,
+            fingerprint: "aabbccdd".to_string(),
+            label: "peer".to_string(),
+            profile: "session-reader".to_string(),
+            status: crate::peer::access_policy::PeerIdentityStatus::Approved,
+            card_url: None,
+            request_id: None,
+            filesystem: Default::default(),
+            created_at_unix: 0,
+            revoked_at_unix: None,
+            expires_at_unix: None,
+            source: Some("org:acme".to_string()),
+            org_grant_id: Some("g-1".to_string()),
+            issued_via: None,
+        };
+        crate::peer::access_policy::write_identity_record(dir.path(), &record).unwrap();
+
+        let orl = orl_revoke(&root, dir.path(), "acme", &["g-1".to_string()], &[], &[], test_now())
+            .unwrap();
+
+        // Make the identity record unwritable (the file, not the directory —
+        // truncating an existing file never consults directory permissions):
+        // the apply must fail loudly and must NOT advance the org's
+        // revocation sequence, so a later re-apply still performs the sweep.
+        let record_path = dir.path().join("peer-access-identities").join("aabbccdd.json");
+        let writable = std::fs::metadata(&record_path).unwrap().permissions();
+        let mut readonly = writable.clone();
+        readonly.set_mode(0o444);
+        std::fs::set_permissions(&record_path, readonly).unwrap();
+        let err = apply_orl(&mut state, dir.path(), &orl, test_now()).unwrap_err();
+        std::fs::set_permissions(&record_path, writable).unwrap();
+        assert!(err.to_string().contains("NOT recorded"), "{err}");
+        assert_eq!(state.trusted_orgs[0].last_orl_seq, 0);
+
+        // Once the store is writable the same list applies cleanly.
+        let applied = apply_orl(&mut state, dir.path(), &orl, test_now()).unwrap();
+        assert_eq!(applied.revoked_peer_identities, 1);
+        assert_eq!(state.trusted_orgs[0].last_orl_seq, orl.seq);
     }
 
     #[test]

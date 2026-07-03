@@ -1562,7 +1562,10 @@ args = ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
     #[test]
     fn parse_transcription_config_defaults() {
         let config: ProjectConfig = toml::from_str("").unwrap();
-        assert!(config.transcription.enabled);
+        assert!(
+            !config.transcription.enabled,
+            "transcription must be opt-in"
+        );
         assert_eq!(config.transcription.provider, "openai");
         assert_eq!(config.transcription.model, "whisper-1");
         assert!(config.transcription.endpoint.is_none());
