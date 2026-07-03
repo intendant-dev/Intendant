@@ -2863,15 +2863,9 @@ pub(crate) fn mask_api_keys(s: &str) -> String {
 }
 
 pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
-    let openai_key = env::var("OPENAI_API_KEY")
-        .or_else(|_| env::var("OPENAI"))
-        .ok();
-    let anthropic_key = env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| env::var("ANTHROPIC"))
-        .ok();
-    let gemini_key = env::var("GEMINI_API_KEY")
-        .or_else(|_| env::var("GEMINI"))
-        .ok();
+    let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
+    let anthropic_key = crate::credential_leases::provider_api_key("ANTHROPIC_API_KEY");
+    let gemini_key = crate::credential_leases::provider_api_key("GEMINI_API_KEY");
 
     let preferred = env::var("PROVIDER").ok();
 
@@ -2928,11 +2922,19 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
             "Unknown PROVIDER value: '{}'. Expected 'openai', 'anthropic', or 'gemini'.",
             other
         ))),
-        (None, None, _) => Err(CallerError::Config(
-            "No API key found. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY in your environment, \
-             a .env file in your project root, or ~/.config/intendant/.env for global use."
-                .to_string(),
-        )),
+        (None, None, _) => Err(CallerError::Config(unfueled_error_text())),
+    }
+}
+
+/// The daemon is unfueled: no leased credential and no local key. When a
+/// lease recently expired, say so — "reconnect a fueling session" is the
+/// fix, not editing .env.
+fn unfueled_error_text() -> String {
+    let base = "No API key found. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY in your environment, \
+         a .env file in your project root, or ~/.config/intendant/.env for global use.";
+    match crate::credential_leases::expired_lease_note() {
+        Some(note) => format!("Unfueled: {note}. {base}"),
+        None => base.to_string(),
     }
 }
 
@@ -2952,15 +2954,9 @@ pub fn select_provider_with_overrides(
         .map(|s| s.to_string())
         .or_else(|| env::var("PRESENCE_MODEL").ok());
 
-    let openai_key = env::var("OPENAI_API_KEY")
-        .or_else(|_| env::var("OPENAI"))
-        .ok();
-    let anthropic_key = env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| env::var("ANTHROPIC"))
-        .ok();
-    let gemini_key = env::var("GEMINI_API_KEY")
-        .or_else(|_| env::var("GEMINI"))
-        .ok();
+    let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
+    let anthropic_key = crate::credential_leases::provider_api_key("ANTHROPIC_API_KEY");
+    let gemini_key = crate::credential_leases::provider_api_key("GEMINI_API_KEY");
 
     match provider_str.as_deref() {
         Some("gemini") => {
@@ -3021,15 +3017,9 @@ pub fn select_cu_provider(
         .map(String::from)
         .or_else(|| env::var("CU_MODEL").ok());
 
-    let openai_key = env::var("OPENAI_API_KEY")
-        .or_else(|_| env::var("OPENAI"))
-        .ok();
-    let anthropic_key = env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| env::var("ANTHROPIC"))
-        .ok();
-    let gemini_key = env::var("GEMINI_API_KEY")
-        .or_else(|_| env::var("GEMINI"))
-        .ok();
+    let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
+    let anthropic_key = crate::credential_leases::provider_api_key("ANTHROPIC_API_KEY");
+    let gemini_key = crate::credential_leases::provider_api_key("GEMINI_API_KEY");
 
     // CU providers get native CU tools + escalation function tool
     let escalate_tools = vec![crate::tools::escalate_to_agent_tool()];
@@ -3142,15 +3132,9 @@ pub fn select_presence_provider(
         .map(|s| s.to_string())
         .or_else(|| env::var("PRESENCE_MODEL").ok());
 
-    let openai_key = env::var("OPENAI_API_KEY")
-        .or_else(|_| env::var("OPENAI"))
-        .ok();
-    let anthropic_key = env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| env::var("ANTHROPIC"))
-        .ok();
-    let gemini_key = env::var("GEMINI_API_KEY")
-        .or_else(|_| env::var("GEMINI"))
-        .ok();
+    let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
+    let anthropic_key = crate::credential_leases::provider_api_key("ANTHROPIC_API_KEY");
+    let gemini_key = crate::credential_leases::provider_api_key("GEMINI_API_KEY");
 
     let tools = presence::presence_tools();
 

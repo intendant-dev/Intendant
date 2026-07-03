@@ -116,6 +116,7 @@ pub enum PeerOperation {
     SessionManage,
     Terminal,
     Settings,
+    CredentialsManage,
     RuntimeControl,
     FilesystemRead,
     FilesystemWrite,
@@ -148,7 +149,7 @@ pub fn normalize_profile(raw: &str) -> Result<String, CallerError> {
     Ok(profile.to_ascii_lowercase())
 }
 
-pub const ALL_OPERATIONS: [PeerOperation; 18] = [
+pub const ALL_OPERATIONS: [PeerOperation; 19] = [
     PeerOperation::PresenceRead,
     PeerOperation::StatsRead,
     PeerOperation::DisplayView,
@@ -164,6 +165,7 @@ pub const ALL_OPERATIONS: [PeerOperation; 18] = [
     PeerOperation::SessionManage,
     PeerOperation::Terminal,
     PeerOperation::Settings,
+    PeerOperation::CredentialsManage,
     PeerOperation::RuntimeControl,
     PeerOperation::FilesystemRead,
     PeerOperation::FilesystemWrite,
@@ -230,7 +232,10 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
                 | Task
                 | Approval
         ),
-        AdminPeer => !matches!(op, AccessManage),
+        // Credential leases stay out of the peer lane entirely in v1: a
+        // peer daemon never fuels or drains another daemon's credentials,
+        // matching the org peer-cap philosophy for access.manage.
+        AdminPeer => !matches!(op, AccessManage | CredentialsManage),
     }
 }
 

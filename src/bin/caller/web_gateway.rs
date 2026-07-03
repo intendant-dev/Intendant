@@ -1824,8 +1824,8 @@ pub const DEFAULT_PORT: u16 = 8765;
 pub(crate) async fn mint_session_token(provider: &str, model: &str) -> Result<String, String> {
     match provider {
         "openai" => {
-            let api_key = std::env::var("OPENAI_API_KEY")
-                .map_err(|_| "OPENAI_API_KEY not set on server".to_string())?;
+            let api_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY")
+                .ok_or_else(|| "OPENAI_API_KEY not set on server".to_string())?;
             let body = serde_json::json!({
                 "model": model,
             });
@@ -1861,8 +1861,8 @@ pub(crate) async fn mint_session_token(provider: &str, model: &str) -> Result<St
             .to_string())
         }
         "gemini" => {
-            let api_key = std::env::var("GEMINI_API_KEY")
-                .map_err(|_| "GEMINI_API_KEY not set on server".to_string())?;
+            let api_key = crate::credential_leases::provider_api_key("GEMINI_API_KEY")
+                .ok_or_else(|| "GEMINI_API_KEY not set on server".to_string())?;
             let body = serde_json::json!({
                 "uses": 1,
                 "bidi_generate_content_setup": {
@@ -17366,17 +17366,12 @@ fn dispatch_codex_settings_control_msgs(bus: &EventBus, payload: &SettingsPayloa
     }
 }
 
-/// Return JSON with boolean flags indicating which API keys are configured.
+/// Return JSON with boolean flags indicating which API keys are usable —
+/// an active credential lease counts the same as a configured .env key.
 fn get_api_key_status_json() -> String {
-    let openai = std::env::var("OPENAI_API_KEY")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let anthropic = std::env::var("ANTHROPIC_API_KEY")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let gemini = std::env::var("GEMINI_API_KEY")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
+    let openai = crate::credential_leases::provider_api_key("OPENAI_API_KEY").is_some();
+    let anthropic = crate::credential_leases::provider_api_key("ANTHROPIC_API_KEY").is_some();
+    let gemini = crate::credential_leases::provider_api_key("GEMINI_API_KEY").is_some();
     serde_json::json!({
         "openai": openai,
         "anthropic": anthropic,
@@ -29812,8 +29807,10 @@ fn build_config_inner(
         };
     }
 
-    // Fall back to env var detection
-    if std::env::var("OPENAI_API_KEY").is_ok() && std::env::var("GEMINI_API_KEY").is_err() {
+    // Fall back to usable-key detection (leases shadow env vars).
+    if crate::credential_leases::provider_api_key("OPENAI_API_KEY").is_some()
+        && crate::credential_leases::provider_api_key("GEMINI_API_KEY").is_none()
+    {
         WebGatewayConfig {
             provider: "openai".to_string(),
             model: "gpt-4o-realtime-preview".to_string(),
