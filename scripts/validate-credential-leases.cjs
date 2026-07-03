@@ -359,6 +359,70 @@ async function main() {
     await waitFor(() => !fs.existsSync(claudeCredsPath), STEP_TIMEOUT_MS, 'claude materialization deleted on revoke');
     console.log('PASS lease-oauth-revoke materialized auth deleted per kind');
 
+    // ── The full custody story through the rendered UI ──
+    // register → create vault (phrase ceremony) → store a key → fuel the
+    // daemon from the fueling panel → lease visible → revoke → unfueled.
+    const uiClick = async needle => {
+      const clicked = await page.evaluate(text => {
+        const buttons = Array.from(document.querySelectorAll('#access-vault-section button'));
+        const button = buttons.find(b => b.textContent.trim().startsWith(text) && !b.disabled);
+        if (!button) return false;
+        button.click();
+        return true;
+      }, needle);
+      assert(clicked, `vault button not found or disabled: ${needle}`);
+    };
+    const vaultState = () => page.evaluate(() => window.intendantVault?.state() || null);
+
+    await waitFor(async () => (await vaultState())?.status === 'none', STEP_TIMEOUT_MS, 'vault ready to create');
+    await uiClick('Create vault');
+    await waitFor(() => page.evaluate(() =>
+      document.querySelectorAll('#access-vault-section .vault-words .w').length === 12
+    ), STEP_TIMEOUT_MS, 'phrase ceremony');
+    await uiClick('I saved the phrase — create the vault');
+    await waitFor(async () => (await vaultState())?.status === 'unlocked', STEP_TIMEOUT_MS, 'vault unlocked');
+
+    const uiKey = 'sk-ant-ui-custody-story';
+    const addOutcome = await page.evaluate(secret => {
+      const section = document.getElementById('access-vault-section');
+      const fold = Array.from(section.querySelectorAll('details summary'))
+        .find(s => s.textContent.trim() === 'Add a credential');
+      if (!fold) return 'no add fold';
+      fold.parentElement.open = true;
+      const selects = section.querySelectorAll('.vault-form-grid select');
+      const inputs = section.querySelectorAll('.vault-form-grid input');
+      if (selects.length < 2 || inputs.length < 2) return 'form fields missing';
+      selects[0].value = 'api_key';
+      selects[1].value = 'anthropic';
+      inputs[0].value = 'UI Anthropic';
+      inputs[1].value = secret;
+      const button = Array.from(section.querySelectorAll('button'))
+        .find(b => b.textContent.trim() === 'Add to vault');
+      if (!button) return 'no add button';
+      button.click();
+      return 'ok';
+    }, uiKey);
+    assert.strictEqual(addOutcome, 'ok', `UI add-entry failed: ${addOutcome}`);
+    await waitFor(async () => (await vaultState())?.entries.some(e => e.label === 'UI Anthropic'), STEP_TIMEOUT_MS, 'entry stored');
+
+    await uiClick('Fuel: UI Anthropic');
+    await waitFor(async () => {
+      const leases = await page.evaluate(() => window.intendantVault.leases());
+      return leases.leases.some(l => l.kind === 'api_key:anthropic' && l.label === 'UI Anthropic');
+    }, STEP_TIMEOUT_MS, 'lease visible in the fueling panel');
+    const keysAfterUiFuel = await fetch(`${daemonOrigin}/api/api-key-status`).then(r => r.json());
+    assert.strictEqual(keysAfterUiFuel.anthropic, true, 'UI fueling did not reach the daemon');
+    const ownIds = await page.evaluate(() => window.intendantVault.leases().ownLeaseIds);
+    assert.strictEqual(ownIds.length, 1, 'the granting tab must track its own lease for renewal');
+    console.log('PASS lease-ui-fuel vault entry fuels the daemon through the panel');
+
+    await uiClick('Revoke');
+    await waitFor(async () => {
+      const keys = await fetch(`${daemonOrigin}/api/api-key-status`).then(r => r.json());
+      return keys.anthropic === false;
+    }, STEP_TIMEOUT_MS, 'daemon unfueled after UI revoke');
+    console.log('PASS lease-ui-revoke panel revocation unfuels the daemon');
+
     console.log('PASS validate-credential-leases all scenarios');
   } catch (err) {
     console.error(`FAIL validate-credential-leases reason="${err.message}"`);

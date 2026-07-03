@@ -15317,15 +15317,31 @@ function vaultRenderAddForm(card) {
   const grid = document.createElement('div');
   grid.className = 'vault-form-grid';
 
+  const kindLabel = document.createElement('label');
+  kindLabel.textContent = 'Kind';
+  const kindSelect = document.createElement('select');
+  for (const [value, label] of [['api_key', 'API key'], ['oauth', 'Subscription OAuth (auth-file JSON)']]) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    kindSelect.appendChild(option);
+  }
   const providerLabel = document.createElement('label');
   providerLabel.textContent = 'Provider';
   const providerSelect = document.createElement('select');
-  for (const provider of ['anthropic', 'openai', 'gemini']) {
-    const option = document.createElement('option');
-    option.value = provider;
-    option.textContent = vaultProviderLabel(provider);
-    providerSelect.appendChild(option);
-  }
+  const fillProviders = () => {
+    providerSelect.innerHTML = '';
+    const providers = kindSelect.value === 'oauth'
+      ? ['codex', 'claude-code']
+      : ['anthropic', 'openai', 'gemini'];
+    for (const provider of providers) {
+      const option = document.createElement('option');
+      option.value = provider;
+      option.textContent = vaultProviderLabel(provider);
+      providerSelect.appendChild(option);
+    }
+  };
+  fillProviders();
   const labelLabel = document.createElement('label');
   labelLabel.textContent = 'Label';
   const labelInput = document.createElement('input');
@@ -15338,23 +15354,48 @@ function vaultRenderAddForm(card) {
   secretInput.type = 'password';
   secretInput.placeholder = 'sk-…';
   secretInput.autocomplete = 'off';
-  grid.append(providerLabel, providerSelect, labelLabel, labelInput, secretLabel, secretInput);
+  const secretArea = document.createElement('textarea');
+  secretArea.className = 'vault-phrase-input';
+  secretArea.rows = 4;
+  secretArea.placeholder = 'Paste the agent auth file JSON (Codex: ~/.codex/auth.json · Claude Code: ~/.claude/.credentials.json)';
+  secretArea.style.display = 'none';
+  kindSelect.addEventListener('change', () => {
+    fillProviders();
+    const oauth = kindSelect.value === 'oauth';
+    secretLabel.textContent = oauth ? 'Auth JSON' : 'API key';
+    secretInput.style.display = oauth ? 'none' : '';
+    secretArea.style.display = oauth ? '' : 'none';
+  });
+  grid.append(kindLabel, kindSelect, providerLabel, providerSelect, labelLabel, labelInput, secretLabel, secretInput);
   body.appendChild(grid);
+  body.appendChild(secretArea);
 
   const actions = document.createElement('div');
   actions.className = 'vault-actions';
   actions.style.marginTop = '8px';
   actions.appendChild(
     vaultButton('Add to vault', () => {
-      const secretValue = secretInput.value.trim();
+      const oauth = kindSelect.value === 'oauth';
+      const secretValue = (oauth ? secretArea.value : secretInput.value).trim();
       if (!secretValue) return;
+      if (oauth) {
+        try {
+          JSON.parse(secretValue);
+        } catch {
+          vaultState.lastError = 'That does not parse as JSON — paste the whole auth file.';
+          renderAccessVaultSection();
+          return;
+        }
+      }
       vaultUpsertEntry({
-        kind: 'api_key',
+        kind: kindSelect.value,
         provider: providerSelect.value,
-        label: labelInput.value.trim() || `${vaultProviderLabel(providerSelect.value)} key`,
+        label: labelInput.value.trim() ||
+          (oauth ? vaultProviderLabel(providerSelect.value) : `${vaultProviderLabel(providerSelect.value)} key`),
         secret: secretValue,
       });
       secretInput.value = '';
+      secretArea.value = '';
       labelInput.value = '';
       fold.open = false;
       renderAccessVaultSection();
@@ -15365,9 +15406,156 @@ function vaultRenderAddForm(card) {
   card.appendChild(fold);
 }
 
+/* Fueling panel: this daemon's active leases + a fuel button per
+   fuelable vault entry. Rendered only in connect mode. */
+function vaultRenderFueling(card) {
+  if (!DASHBOARD_CONNECT_MODE) return;
+  const head = document.createElement('div');
+  head.className = 'vault-status-line';
+  const title = document.createElement('span');
+  title.className = 'lbl';
+  title.style.fontWeight = '600';
+  title.textContent = 'Fueling — this daemon';
+  head.appendChild(title);
+  card.appendChild(head);
+
+  if (!vaultLeaseTransportReady()) {
+    const note = document.createElement('div');
+    note.className = 'vault-note';
+    note.textContent = 'Connect to the daemon to fuel it — leases travel only over the verified tunnel.';
+    card.appendChild(note);
+    return;
+  }
+  vaultRefreshLeases().catch(() => {});
+  if (vaultLeaseState.supported === false) {
+    const note = document.createElement('div');
+    note.className = 'vault-note';
+    note.textContent = `This session cannot manage credential leases: ${vaultLeaseState.lastError || 'the daemon predates leases or this role lacks credentials.manage.'}`;
+    card.appendChild(note);
+    return;
+  }
+
+  if (vaultLeaseState.expiredNote) {
+    const warning = document.createElement('div');
+    warning.className = 'vault-warning';
+    warning.textContent = vaultLeaseState.expiredNote;
+    card.appendChild(warning);
+  }
+  if (vaultLeaseState.lastError && vaultLeaseState.supported) {
+    const error = document.createElement('div');
+    error.className = 'vault-error';
+    error.textContent = vaultLeaseState.lastError;
+    card.appendChild(error);
+  }
+
+  const list = document.createElement('div');
+  list.className = 'vault-entry-list';
+  if (!vaultLeaseState.leases.length) {
+    const empty = document.createElement('div');
+    empty.className = 'vault-note';
+    empty.textContent = 'No active leases. This daemon is running on its own local keys, or is unfueled.';
+    list.appendChild(empty);
+  }
+  for (const lease of vaultLeaseState.leases) {
+    const row = document.createElement('div');
+    row.className = 'vault-entry-row';
+    const lbl = document.createElement('span');
+    lbl.className = 'lbl';
+    lbl.textContent = lease.label || lease.kind;
+    const kindChip = document.createElement('span');
+    kindChip.className = 'vault-chip ok';
+    kindChip.textContent = lease.kind;
+    const detail = document.createElement('span');
+    detail.className = 'secret';
+    const renewing = vaultOwnLeaseIds.has(lease.lease_id) ? ', renewing from this tab' : '';
+    detail.textContent = `${vaultLeaseExpiryText(lease)} · granted by ${lease.granted_by || 'unknown'} · used ${lease.use_count}×${renewing}`;
+    const actions = document.createElement('span');
+    actions.className = 'vault-entry-actions';
+    actions.appendChild(
+      vaultButton('Revoke', () => vaultRevokeLease(lease.lease_id), { danger: true })
+    );
+    row.append(lbl, kindChip, detail, actions);
+    list.appendChild(row);
+  }
+  card.appendChild(list);
+
+  // The offline knob IS the autonomy/security dial — surfaced at fueling
+  // time, applying to grants made after the change.
+  const knobRow = document.createElement('div');
+  knobRow.className = 'vault-actions';
+  const knobLabel = document.createElement('span');
+  knobLabel.className = 'vault-note';
+  knobLabel.textContent = 'After the last fueling session detaches, keep working:';
+  const knob = document.createElement('select');
+  for (const [value, label] of VAULT_OFFLINE_CHOICES) {
+    const option = document.createElement('option');
+    option.value = String(value);
+    option.textContent = label;
+    knob.appendChild(option);
+  }
+  knob.value = String(vaultOfflineMs());
+  knob.addEventListener('change', () => {
+    vaultSetOfflineMs(Number(knob.value));
+  });
+  knobRow.append(knobLabel, knob);
+  card.appendChild(knobRow);
+
+  const fuelable = vaultState.entries
+    .map(entry => ({ entry, kind: vaultEntryLeaseKind(entry) }))
+    .filter(item => item.kind);
+  const fuelRow = document.createElement('div');
+  fuelRow.className = 'vault-actions';
+  for (const { entry, kind } of fuelable) {
+    const oauthBlocked = kind.startsWith('oauth:') && !vaultOauthLeasesEnabled();
+    const active = vaultLeaseState.leases.some(lease => lease.kind === kind);
+    const button = vaultButton(
+      `${active ? 'Re-fuel' : 'Fuel'}: ${entry.label || vaultProviderLabel(entry.provider)}`,
+      () => vaultFuelEntry(entry),
+      { primary: !active }
+    );
+    button.disabled = vaultLeaseState.busy || oauthBlocked;
+    if (oauthBlocked) button.title = 'Enable full-credential OAuth leases below first.';
+    fuelRow.appendChild(button);
+  }
+  if (!fuelable.length) {
+    const hint = document.createElement('span');
+    hint.className = 'vault-note';
+    hint.textContent = 'Add a provider credential above to fuel this daemon from the vault.';
+    fuelRow.appendChild(hint);
+  }
+  card.appendChild(fuelRow);
+
+  if (fuelable.some(item => item.kind.startsWith('oauth:'))) {
+    const oauthRow = document.createElement('div');
+    oauthRow.className = 'vault-actions';
+    const toggle = document.createElement('input');
+    toggle.type = 'checkbox';
+    toggle.id = 'vault-oauth-lease-toggle';
+    toggle.checked = vaultOauthLeasesEnabled();
+    toggle.addEventListener('change', () => {
+      vaultSetOauthLeasesEnabled(toggle.checked);
+      renderAccessVaultSection();
+    });
+    const label = document.createElement('label');
+    label.htmlFor = 'vault-oauth-lease-toggle';
+    label.className = 'vault-note';
+    label.textContent =
+      'Allow full-credential OAuth leases to this daemon. While such a lease is live the daemon holds durable subscription authority; revocation then depends on lease discipline (worst case: the provider’s session-revocation page).';
+    oauthRow.append(toggle, label);
+    card.appendChild(oauthRow);
+  }
+
+  const renewNote = document.createElement('div');
+  renewNote.className = 'vault-note';
+  renewNote.textContent =
+    'Leases renew every 5 minutes from this tab while it stays connected; material lives only in the daemon’s memory and dies on expiry, revocation, or restart.';
+  card.appendChild(renewNote);
+}
+
 function vaultRenderUnlocked(card) {
   vaultRenderEntries(card);
   vaultRenderAddForm(card);
+  vaultRenderFueling(card);
   vaultRenderUnlockers(card);
 
   const actions = document.createElement('div');
@@ -15491,6 +15679,20 @@ window.intendantVault = {
   unlockWithPasskey: () => vaultUnlockWithPasskey(),
   unlockWithPhrase: phrase => vaultUnlockWithPhrase(phrase),
   voiceApiKeyGet: storageKey => voiceApiKeyGet(storageKey),
+  leases: () => ({
+    supported: vaultLeaseState.supported,
+    leases: vaultLeaseState.leases.map(lease => ({ ...lease })),
+    expiredNote: vaultLeaseState.expiredNote,
+    lastError: vaultLeaseState.lastError,
+    ownLeaseIds: Array.from(vaultOwnLeaseIds),
+  }),
+  refreshLeases: () => vaultRefreshLeases({ force: true }),
+  fuelEntry: entryId => {
+    const entry = vaultState.entries.find(e => e.id === entryId);
+    if (!entry) return Promise.reject(new Error('no such vault entry'));
+    return vaultFuelEntry(entry);
+  },
+  revokeLease: leaseId => vaultRevokeLease(leaseId),
 };
 
 /* Sign an offer. Absence is legacy-compatible (the daemon falls back to

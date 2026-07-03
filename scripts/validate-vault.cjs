@@ -204,10 +204,11 @@ async function main() {
         .find(s => s.textContent.trim() === 'Add a credential');
       if (!fold) return 'no add fold';
       fold.parentElement.open = true;
-      const select = section.querySelector('.vault-form-grid select');
+      const selects = section.querySelectorAll('.vault-form-grid select');
       const inputs = section.querySelectorAll('.vault-form-grid input');
-      if (!select || inputs.length < 2) return 'form fields missing';
-      select.value = 'anthropic';
+      if (selects.length < 2 || inputs.length < 2) return 'form fields missing';
+      selects[0].value = 'api_key';
+      selects[1].value = 'anthropic';
       inputs[0].value = 'Validator Anthropic';
       inputs[1].value = secret;
       const button = Array.from(section.querySelectorAll('button'))
