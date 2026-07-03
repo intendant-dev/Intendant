@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(handle_reclaim_monitor(state.clone()));
 
     let app = Router::new()
-        .route("/", get(connect_ui))
+        .route("/", get(landing_ui))
         .route("/connect", get(connect_ui))
         .route("/access", get(access_ui))
         .route("/app", get(app_html))
@@ -954,6 +954,10 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Response {
         })),
     )
         .into_response()
+}
+
+async fn landing_ui(State(state): State<Arc<AppState>>) -> Html<String> {
+    Html(landing_ui_html(&state.config.public_origin))
 }
 
 async fn connect_ui(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -4933,6 +4937,238 @@ fn trust_ui_html(origin: &str) -> String {
     )
 }
 
+const DOCS_URL: &str = "https://lovon-spec.github.io/Intendant/";
+const REPO_URL: &str = "https://github.com/lovon-spec/intendant";
+
+/// The public landing page at `/`. Deliberately static and dependency-free;
+/// the install one-liner is origin-aware so a self-hosted rendezvous
+/// advertises its own installer.
+fn landing_ui_html(origin: &str) -> String {
+    let install_cmd = format!("curl -fsSL {origin}/install.sh | sh -s -- --owner <your-key>");
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Intendant — an operating environment for autonomous AI agents</title>
+  <meta name="description" content="Give an AI agent a full machine — shell, files, display, voice — under layered human oversight. Your keys stay yours.">
+  <style>
+    :root {{
+      color-scheme: dark;
+      --bg: #11111b;
+      --top: #181825;
+      --surface: #1e1e2e;
+      --surface-2: #313244;
+      --line: rgba(205, 214, 244, 0.09);
+      --line-strong: rgba(205, 214, 244, 0.16);
+      --text: #cdd6f4;
+      --muted: #a6adc8;
+      --muted-2: #6c7086;
+      --accent: #89b4fa;
+      --accent-hover: #74c7ec;
+      --accent-ink: #11111b;
+      --lavender: #b4befe;
+      --ok: #a6e3a1;
+      --warn: #f9e2af;
+      --radius: 12px;
+      --shadow: 0 18px 50px rgba(0, 0, 0, .35);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background:
+        radial-gradient(1200px 500px at 70% -10%, rgba(137, 180, 250, .10), transparent 60%),
+        radial-gradient(900px 420px at 10% 0%, rgba(180, 190, 254, .07), transparent 55%),
+        var(--bg);
+      color: var(--text);
+      font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }}
+    a {{ color: var(--accent); text-decoration: none; }}
+    a:hover {{ color: var(--accent-hover); }}
+    .wrap {{ max-width: 1060px; margin: 0 auto; padding: 0 22px; }}
+    header {{
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 18px 0;
+    }}
+    .mark {{ font-weight: 700; letter-spacing: .3px; font-size: 17px; color: var(--text); }}
+    .mark span {{ color: var(--accent); }}
+    nav {{ display: flex; gap: 20px; align-items: center; font-size: 14.5px; }}
+    nav a {{ color: var(--muted); }}
+    nav a:hover {{ color: var(--text); }}
+    .btn {{
+      display: inline-block; padding: 9px 18px; border-radius: 999px;
+      background: var(--accent); color: var(--accent-ink); font-weight: 600;
+      border: 1px solid transparent;
+    }}
+    .btn:hover {{ background: var(--accent-hover); color: var(--accent-ink); }}
+    .btn.ghost {{ background: transparent; color: var(--text); border-color: var(--line-strong); }}
+    .btn.ghost:hover {{ border-color: var(--accent); color: var(--accent); }}
+    .hero {{ padding: 72px 0 30px; max-width: 780px; }}
+    .hero h1 {{
+      margin: 0 0 18px; font-size: clamp(30px, 5.4vw, 46px); line-height: 1.14;
+      letter-spacing: -.5px;
+    }}
+    .hero h1 em {{ font-style: normal; color: var(--lavender); }}
+    .hero p {{ margin: 0 0 26px; font-size: 18px; color: var(--muted); max-width: 640px; }}
+    .cta {{ display: flex; gap: 12px; flex-wrap: wrap; }}
+    .install {{
+      margin: 46px 0 8px; background: var(--top); border: 1px solid var(--line-strong);
+      border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden;
+    }}
+    .install .bar {{
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px 14px; border-bottom: 1px solid var(--line);
+      font-size: 12px; color: var(--muted-2); letter-spacing: .4px; text-transform: uppercase;
+    }}
+    .install button {{
+      background: transparent; border: 1px solid var(--line-strong); color: var(--muted);
+      border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer;
+    }}
+    .install button:hover {{ color: var(--text); border-color: var(--accent); }}
+    .install pre {{
+      margin: 0; padding: 16px 18px; overflow-x: auto;
+      font: 13.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--ok);
+    }}
+    .install .note {{ padding: 0 18px 14px; font-size: 13px; color: var(--muted-2); }}
+    .steps {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin: 26px 0 0; }}
+    .step {{
+      border: 1px solid var(--line); border-radius: var(--radius);
+      background: rgba(30, 30, 46, .55); padding: 14px 16px; font-size: 14px; color: var(--muted);
+    }}
+    .step b {{ display: block; color: var(--text); margin-bottom: 4px; font-size: 14.5px; }}
+    .step .n {{ color: var(--accent); font-weight: 700; margin-right: 6px; }}
+    section.features {{ padding: 58px 0 8px; }}
+    .features h2, .trustrow h2 {{ font-size: 22px; margin: 0 0 18px; letter-spacing: -.2px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }}
+    .card {{
+      border: 1px solid var(--line); border-radius: var(--radius);
+      background: var(--surface); padding: 18px 18px 16px;
+    }}
+    .card h3 {{ margin: 0 0 8px; font-size: 16px; }}
+    .card p {{ margin: 0; font-size: 14px; color: var(--muted); }}
+    .trustrow {{ padding: 46px 0 20px; }}
+    .trustrow .card {{ background: rgba(166, 227, 161, .05); border-color: rgba(166, 227, 161, .18); }}
+    footer {{
+      margin-top: 56px; padding: 26px 0 40px; border-top: 1px solid var(--line);
+      display: flex; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+      font-size: 13.5px; color: var(--muted-2);
+    }}
+    footer nav {{ gap: 16px; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="mark">intendant<span>.dev</span></div>
+      <nav>
+        <a href="/trust">How trust works</a>
+        <a href="{DOCS_URL}">Docs</a>
+        <a href="{REPO_URL}">GitHub</a>
+        <a class="btn ghost" href="/connect">Sign in</a>
+      </nav>
+    </header>
+
+    <section class="hero">
+      <h1>Give an AI agent a full machine — <em>under your oversight</em></h1>
+      <p>
+        Intendant is an open-source operating environment for autonomous AI
+        agents: a shell, files, a display it can see and control, voice, and
+        phone calls — with layered human supervision, portable across
+        OpenAI, Anthropic, and Gemini, and at home on macOS, Linux, and
+        Windows. It runs its own agent loop and supervises Codex, Gemini
+        CLI, and Claude Code as managed backends.
+      </p>
+      <div class="cta">
+        <a class="btn" href="/connect">Open your dashboard</a>
+        <a class="btn ghost" href="{DOCS_URL}">Read the docs</a>
+      </div>
+    </section>
+
+    <section class="install">
+      <div class="bar">
+        <span>Stand up a daemon in about ninety seconds</span>
+        <button onclick="navigator.clipboard&amp;&amp;navigator.clipboard.writeText(document.getElementById('cmd').textContent)">copy</button>
+      </div>
+      <pre id="cmd">{install_cmd}</pre>
+      <div class="note">
+        New here? <a href="/connect">Sign in</a> first — your key is in the
+        dashboard's Access drawer. Nothing sensitive travels in this command
+        or lands on the box: the daemon boots already owned by you, you claim
+        it with a twelve-word phrase, and it borrows credentials from your
+        vault only while you let it.
+      </div>
+    </section>
+
+    <div class="steps">
+      <div class="step"><b><span class="n">1</span>Install</b>
+        One command on a fresh box pins root authority to your browser's key. Nothing sensitive travels.</div>
+      <div class="step"><b><span class="n">2</span>Claim</b>
+        The daemon prints a twelve-word phrase; claim it from the browser you're already holding.</div>
+      <div class="step"><b><span class="n">3</span>Fuel</b>
+        Grant time-boxed credential leases from your encrypted vault — or relay calls through your browser and never hand over a key at all.</div>
+    </div>
+
+    <section class="features">
+      <h2>What's in the box</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>A real desktop, watched</h3>
+          <p>The agent gets a display it can see and drive — streamed live to
+          you over WebRTC. Autonomy is a dial, approvals are explicit, and
+          every session is logged and replayable.</p>
+        </div>
+        <div class="card">
+          <h3>Your keys stay yours</h3>
+          <p>Provider keys and subscription OAuth live end-to-end encrypted
+          behind your passkeys. Daemons borrow leases that expire, or relay
+          calls through your browser; disks hold nothing worth stealing.</p>
+        </div>
+        <div class="card">
+          <h3>Every interface</h3>
+          <p>Web dashboard, terminal TUI, CLI, MCP, live voice, and phone
+          calls — every capability reachable from each of them, on macOS,
+          Linux, and Windows alike.</p>
+        </div>
+        <div class="card">
+          <h3>A fleet, not a box</h3>
+          <p>Daemons federate: shared displays, cross-machine sessions, and
+          organization-signed access — all enforced locally by each daemon's
+          own IAM, never by this service.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="trustrow">
+      <h2>Built to be distrusted</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>This service holds no authority</h3>
+          <p>The rendezvous stores ciphertext and relays signaling. Your
+          daemons mint and enforce their own access; passkeys and a
+          transparency log keep the service honest — and you can
+          <a href="/trust">read exactly what it can and cannot do</a>,
+          or run your own.</p>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <div>Intendant — open source, self-hostable, provider-agnostic.</div>
+      <nav>
+        <a href="/trust">Trust</a>
+        <a href="/install.sh">install.sh</a>
+        <a href="{DOCS_URL}">Docs</a>
+        <a href="{REPO_URL}">GitHub</a>
+      </nav>
+    </footer>
+  </div>
+</body>
+</html>"#
+    )
+}
+
 fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) -> String {
     format!(
         r#"<!doctype html>
@@ -6679,6 +6915,21 @@ mod tests {
             manual.get("source").and_then(|v| v.as_str()),
             Some("browser_fleet")
         );
+    }
+
+    #[test]
+    fn landing_page_states_the_product_and_reuses_the_origin() {
+        let html = landing_ui_html("https://rendezvous.example");
+        assert!(html.contains("<title>Intendant — an operating environment"));
+        // The install one-liner advertises the serving origin, so a
+        // self-hosted rendezvous shows its own installer.
+        assert!(html.contains("curl -fsSL https://rendezvous.example/install.sh"));
+        // Beginner path and depth are both one click away.
+        assert!(html.contains(r#"href="/connect""#));
+        assert!(html.contains(r#"href="/trust""#));
+        assert!(html.contains(DOCS_URL));
+        assert!(html.contains(REPO_URL));
+        assert!(html.contains("Built to be distrusted"));
     }
 
     #[test]
