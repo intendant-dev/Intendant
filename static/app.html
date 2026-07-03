@@ -14600,6 +14600,12 @@ function vaultLock(notice) {
   vaultState.settings = {};
   vaultState.matchedEnvelopeId = null;
   vaultRevealedEntries.clear();
+  // A locked vault cannot serve relays: withdraw this tab's egress
+  // registrations so the daemon fails over to a clear error.
+  if (vaultEgressState.registered.size && vaultLeaseTransportReady()) {
+    vaultLeaseRpc('api_credential_egress_unregister', {}).catch(() => {});
+  }
+  vaultEgressState.registered.clear();
   if (vaultState.blob) vaultState.status = 'locked';
   vaultState.lastError = notice || '';
   vaultSyncVoiceMirror();
@@ -14983,6 +14989,7 @@ const VAULT_OFFLINE_DEFAULT_MS = 24 * 60 * 60 * 1000;
 const vaultLeaseState = {
   supported: null,   // null until first probe; false when the daemon lacks the RPCs / gate
   leases: [],
+  egress: [],        // active client-egress relays (the path indicator)
   expiredNote: '',
   lastError: '',
   fetchedAt: 0,
@@ -15048,12 +15055,14 @@ async function vaultRefreshLeases({ force = false } = {}) {
     const result = await vaultLeaseRpc('api_credential_lease_status');
     vaultLeaseState.supported = true;
     vaultLeaseState.leases = Array.isArray(result?.leases) ? result.leases : [];
+    vaultLeaseState.egress = Array.isArray(result?.egress) ? result.egress : [];
     vaultLeaseState.expiredNote = String(result?.expired_note || '');
     vaultLeaseState.lastError = '';
     vaultLeaseState.fetchedAt = Date.now();
     for (const id of Array.from(vaultOwnLeaseIds)) {
       if (!vaultLeaseState.leases.some(lease => lease.lease_id === id)) vaultOwnLeaseIds.delete(id);
     }
+    vaultEgressEnsure().catch(() => {});
   } catch (err) {
     const message = String(err?.message || err);
     // A daemon predating the lease RPCs, or a session without the
@@ -15135,6 +15144,255 @@ function vaultLeaseExpiryText(lease) {
   if (remaining < 60 * 60 * 1000) return `expires in ${Math.round(remaining / 60000)} min`;
   if (remaining < 48 * 60 * 60 * 1000) return `expires in ${Math.round(remaining / 3600000)} h`;
   return `expires in ${Math.round(remaining / 86400000)} d`;
+}
+
+/* ── Client egress: relay provider calls through this browser ──
+   The zero-lease fueling mode (credential custody, rollout step 5): the
+   daemon ships each provider request here auth-less over the verified
+   tunnel; this tab attaches the key from the unlocked vault, performs
+   the fetch against the provider's fixed origin, and streams the body
+   back under the daemon's credit window. The credential never leaves
+   the browser, and the capability dies the moment this tab detaches.
+   Anthropic and Gemini only — OpenAI refuses browser CORS. */
+
+const VAULT_EGRESS_HOSTS = {
+  'api_key:anthropic': 'api.anthropic.com',
+  'api_key:gemini': 'generativelanguage.googleapis.com',
+};
+const VAULT_EGRESS_CHUNK_BYTES = 16 * 1024;
+const vaultEgressJobs = new Map();
+const vaultEgressState = {
+  enabled: new Set(),    // kinds enabled for this daemon (persisted)
+  registered: new Set(), // kinds the daemon acknowledged this session
+  allowHosts: {},        // validator-only host overrides (debug handle)
+  lastError: '',
+};
+
+function vaultEgressLoadEnabled() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(vaultLeaseDaemonKey('egress_kinds')) || '[]');
+    vaultEgressState.enabled = new Set(Array.isArray(stored) ? stored.map(String) : []);
+  } catch {
+    vaultEgressState.enabled = new Set();
+  }
+}
+vaultEgressLoadEnabled();
+
+function vaultEgressPersistEnabled() {
+  localStorage.setItem(
+    vaultLeaseDaemonKey('egress_kinds'),
+    JSON.stringify(Array.from(vaultEgressState.enabled))
+  );
+}
+
+/* The vault entry that fuels a relay kind; API-key entries only. */
+function vaultEgressEntryFor(kind) {
+  if (vaultState.status !== 'unlocked') return null;
+  const provider = String(kind || '').startsWith('api_key:') ? String(kind).slice(8) : '';
+  if (!provider) return null;
+  return (
+    vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.secret && !e.voice) ||
+    vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.secret) ||
+    null
+  );
+}
+
+function vaultEgressDesiredKinds() {
+  return Array.from(vaultEgressState.enabled).filter(kind => vaultEgressEntryFor(kind));
+}
+
+/* Reconcile the daemon-side registry with what this tab wants to relay.
+   Registration is idempotent and re-run on every lease refresh, so a
+   reconnected session (new session id) heals itself within one cycle. */
+let vaultEgressEnsureInFlight = false;
+async function vaultEgressEnsure() {
+  if (!vaultLeaseTransportReady() || vaultEgressEnsureInFlight) return;
+  vaultEgressEnsureInFlight = true;
+  try {
+    const desired = vaultEgressDesiredKinds();
+    const stale = Array.from(vaultEgressState.registered).filter(kind => !desired.includes(kind));
+    if (stale.length) {
+      await vaultLeaseRpc('api_credential_egress_unregister', { kinds: stale }).catch(() => {});
+      for (const kind of stale) vaultEgressState.registered.delete(kind);
+    }
+    if (desired.length) {
+      const result = await vaultLeaseRpc('api_credential_egress_register', { kinds: desired });
+      vaultEgressState.registered = new Set(result?.registered || desired);
+      vaultEgressState.lastError = '';
+    }
+  } catch (err) {
+    vaultEgressState.lastError = String(err?.message || err);
+  } finally {
+    vaultEgressEnsureInFlight = false;
+  }
+}
+
+function vaultEgressSendFrame(frame) {
+  try {
+    dashboardControlTransport?.sendFrame?.(frame);
+  } catch (err) {
+    console.warn('[vault-egress] frame send failed:', err?.message || err);
+  }
+}
+
+function vaultEgressB64Decode(data) {
+  const bin = atob(String(data || ''));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function vaultEgressB64Encode(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+function vaultEgressFail(id, error) {
+  if (vaultEgressJobs.delete(id)) {
+    vaultEgressSendFrame({ t: 'egress_error', id, error: String(error).slice(0, 400) });
+  }
+}
+
+function vaultEgressHandleFrame(msg) {
+  const id = String(msg.id || '');
+  if (!id) return;
+  if (msg.t === 'egress_request') {
+    vaultEgressJobs.set(id, {
+      kind: String(msg.kind || ''),
+      method: String(msg.method || 'POST'),
+      url: String(msg.url || ''),
+      headers: Array.isArray(msg.headers) ? msg.headers : [],
+      credit: Number(msg.credit) || 1024 * 1024,
+      chunks: [],
+      controller: null,
+      creditWaiter: null,
+      canceled: false,
+    });
+    return;
+  }
+  const job = vaultEgressJobs.get(id);
+  if (!job) return;
+  if (msg.t === 'egress_request_chunk') {
+    try {
+      job.chunks.push(vaultEgressB64Decode(msg.data));
+    } catch {
+      vaultEgressFail(id, 'malformed request chunk');
+    }
+    return;
+  }
+  if (msg.t === 'egress_request_end') {
+    vaultEgressExecute(id).catch(err => vaultEgressFail(id, String(err?.message || err)));
+    return;
+  }
+  if (msg.t === 'egress_ack') {
+    job.credit += Number(msg.bytes) || 0;
+    if (job.creditWaiter) {
+      const wake = job.creditWaiter;
+      job.creditWaiter = null;
+      wake();
+    }
+    return;
+  }
+  if (msg.t === 'egress_cancel') {
+    job.canceled = true;
+    try {
+      job.controller?.abort();
+    } catch (_) {}
+    if (job.creditWaiter) {
+      const wake = job.creditWaiter;
+      job.creditWaiter = null;
+      wake();
+    }
+    vaultEgressJobs.delete(id);
+  }
+}
+
+async function vaultEgressExecute(id) {
+  const job = vaultEgressJobs.get(id);
+  if (!job) return;
+  if (!vaultEgressState.enabled.has(job.kind)) {
+    return vaultEgressFail(id, `relaying ${job.kind} is not enabled in this tab`);
+  }
+  const entry = vaultEgressEntryFor(job.kind);
+  if (!entry) {
+    return vaultEgressFail(id, 'the vault is locked or holds no key for this kind — unlock it and retry');
+  }
+  let host = '';
+  try {
+    host = new URL(job.url).host;
+  } catch {
+    return vaultEgressFail(id, 'malformed egress URL');
+  }
+  // The relay only ever talks to the provider's own origin — a
+  // compromised daemon cannot turn this tab into an open proxy.
+  const allowedHost = vaultEgressState.allowHosts[job.kind] || VAULT_EGRESS_HOSTS[job.kind];
+  if (!allowedHost || host !== allowedHost) {
+    return vaultEgressFail(id, `egress to ${host} is not allowed for ${job.kind} (expected ${allowedHost})`);
+  }
+
+  const headers = {};
+  for (const pair of job.headers) {
+    if (Array.isArray(pair) && pair.length === 2) headers[String(pair[0])] = String(pair[1]);
+  }
+  if (job.kind === 'api_key:anthropic') {
+    headers['x-api-key'] = String(entry.secret);
+    headers['anthropic-dangerous-direct-browser-access'] = 'true';
+  } else if (job.kind === 'api_key:gemini') {
+    headers['x-goog-api-key'] = String(entry.secret);
+  }
+
+  let total = 0;
+  for (const chunk of job.chunks) total += chunk.length;
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of job.chunks) {
+    body.set(chunk, offset);
+    offset += chunk.length;
+  }
+  job.chunks = [];
+  job.controller = new AbortController();
+
+  let resp;
+  try {
+    resp = await fetch(job.url, {
+      method: job.method,
+      headers,
+      body: total ? body : undefined,
+      signal: job.controller.signal,
+    });
+  } catch (err) {
+    return vaultEgressFail(id, `fetch failed: ${err?.message || err}`);
+  }
+  vaultEgressSendFrame({ t: 'egress_response', id, status: resp.status });
+  try {
+    const reader = resp.body?.getReader();
+    if (reader) {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done || job.canceled) break;
+        for (let i = 0; i < value.length && !job.canceled; i += VAULT_EGRESS_CHUNK_BYTES) {
+          const slice = value.subarray(i, Math.min(i + VAULT_EGRESS_CHUNK_BYTES, value.length));
+          while (job.credit < slice.length && !job.canceled) {
+            await new Promise(resolve => {
+              job.creditWaiter = resolve;
+            });
+          }
+          if (job.canceled) break;
+          job.credit -= slice.length;
+          vaultEgressSendFrame({ t: 'egress_chunk', id, data: vaultEgressB64Encode(slice) });
+        }
+      }
+    }
+    if (!job.canceled) vaultEgressSendFrame({ t: 'egress_end', id });
+    vaultEgressJobs.delete(id);
+  } catch (err) {
+    if (job.canceled) {
+      vaultEgressJobs.delete(id);
+    } else {
+      vaultEgressFail(id, `response stream failed: ${err?.message || err}`);
+    }
+  }
 }
 
 /* ── Vault UI (Access → Advanced) ── */
@@ -15545,11 +15803,104 @@ function vaultRenderFueling(card) {
     card.appendChild(oauthRow);
   }
 
+  vaultRenderEgress(card);
+
   const renewNote = document.createElement('div');
   renewNote.className = 'vault-note';
   renewNote.textContent =
     'Leases renew every 5 minutes from this tab while it stays connected; material lives only in the daemon’s memory and dies on expiry, revocation, or restart.';
   card.appendChild(renewNote);
+}
+
+/* Client-egress section of the fueling panel: active relays (the path
+   indicator) plus per-provider toggles for relaying through this tab. */
+function vaultRenderEgress(card) {
+  const relayable = ['api_key:anthropic', 'api_key:gemini'].filter(kind => vaultEgressEntryFor(kind));
+  const relays = vaultLeaseState.egress || [];
+  if (!relayable.length && !relays.length) return;
+
+  const head = document.createElement('div');
+  head.className = 'vault-status-line';
+  const title = document.createElement('span');
+  title.className = 'lbl';
+  title.style.fontWeight = '600';
+  title.textContent = 'Client egress — calls relayed through a browser';
+  head.appendChild(title);
+  card.appendChild(head);
+
+  let mySessionId = '';
+  try {
+    mySessionId = String(window.intendantDashboardControl?.status?.()?.sessionId || '');
+  } catch (_) {}
+
+  if (relays.length) {
+    const list = document.createElement('div');
+    list.className = 'vault-entry-list';
+    for (const relay of relays) {
+      const row = document.createElement('div');
+      row.className = 'vault-entry-row';
+      const lbl = document.createElement('span');
+      lbl.className = 'lbl';
+      lbl.textContent = relay.kind;
+      const chip = document.createElement('span');
+      chip.className = 'vault-chip ok';
+      chip.textContent = relay.session_id === mySessionId ? 'relaying via this tab' : `relaying via ${relay.label || 'another session'}`;
+      const detail = document.createElement('span');
+      detail.className = 'secret';
+      detail.textContent = 'the daemon sends requests here; the key never leaves the relaying browser';
+      row.append(lbl, chip, detail);
+      list.appendChild(row);
+    }
+    card.appendChild(list);
+  }
+
+  const toggles = document.createElement('div');
+  toggles.className = 'vault-actions';
+  for (const kind of relayable) {
+    const provider = kind.slice(8);
+    const toggleId = `vault-egress-toggle-${provider}`;
+    const wrap = document.createElement('span');
+    wrap.className = 'vault-note';
+    const toggle = document.createElement('input');
+    toggle.type = 'checkbox';
+    toggle.id = toggleId;
+    toggle.checked = vaultEgressState.enabled.has(kind);
+    toggle.addEventListener('change', () => {
+      if (toggle.checked) vaultEgressState.enabled.add(kind);
+      else vaultEgressState.enabled.delete(kind);
+      vaultEgressPersistEnabled();
+      vaultEgressEnsure()
+        .then(() => vaultRefreshLeases({ force: true }))
+        .catch(() => {});
+    });
+    const label = document.createElement('label');
+    label.htmlFor = toggleId;
+    label.textContent = ` Relay ${vaultProviderLabel(provider)} via this browser`;
+    wrap.append(toggle, label);
+    toggles.appendChild(wrap);
+  }
+  if (relayable.length) {
+    toggles.appendChild(
+      vaultButton('Test relay', async () => {
+        const kind = relayable.find(k => vaultEgressState.enabled.has(k)) || relayable[0];
+        vaultLeaseState.lastError = '';
+        try {
+          const result = await vaultLeaseRpc('api_credential_egress_probe', { kind });
+          vaultLeaseState.lastError = `Relay test OK (${kind}): ${String(result?.text || '').slice(0, 120)}`;
+        } catch (err) {
+          vaultLeaseState.lastError = `Relay test failed: ${err?.message || err}`;
+        }
+        renderAccessVaultSection();
+      })
+    );
+  }
+  card.appendChild(toggles);
+  if (vaultEgressState.lastError) {
+    const error = document.createElement('div');
+    error.className = 'vault-error';
+    error.textContent = `Egress: ${vaultEgressState.lastError}`;
+    card.appendChild(error);
+  }
 }
 
 function vaultRenderUnlocked(card) {
@@ -15693,6 +16044,22 @@ window.intendantVault = {
     return vaultFuelEntry(entry);
   },
   revokeLease: leaseId => vaultRevokeLease(leaseId),
+  setEgress: (kinds, opts = {}) => {
+    vaultEgressState.enabled = new Set((Array.isArray(kinds) ? kinds : []).map(String));
+    vaultEgressPersistEnabled();
+    if (opts.allowHosts && typeof opts.allowHosts === 'object') {
+      vaultEgressState.allowHosts = { ...opts.allowHosts };
+    }
+    return vaultEgressEnsure().then(() => vaultRefreshLeases({ force: true }));
+  },
+  egress: () => ({
+    enabled: Array.from(vaultEgressState.enabled),
+    registered: Array.from(vaultEgressState.registered),
+    relays: (vaultLeaseState.egress || []).map(relay => ({ ...relay })),
+    lastError: vaultEgressState.lastError,
+    jobs: vaultEgressJobs.size,
+  }),
+  probeEgress: kind => vaultLeaseRpc('api_credential_egress_probe', { kind }),
 };
 
 /* Sign an offer. Absence is legacy-compatible (the daemon falls back to
@@ -50686,6 +51053,11 @@ class DashboardControlTransport {
   handleFrame(msg) {
     if (msg.t === 'hello_ack') {
       console.info('[dashboard-control] hello_ack', msg.session_id || '');
+      return;
+    }
+    if (msg.t === 'egress_request' || msg.t === 'egress_request_chunk' ||
+        msg.t === 'egress_request_end' || msg.t === 'egress_ack' || msg.t === 'egress_cancel') {
+      vaultEgressHandleFrame(msg);
       return;
     }
     if (msg.t === 'tui_term' || msg.t === 'tui_error') {

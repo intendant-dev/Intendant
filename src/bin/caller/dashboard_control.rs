@@ -1438,6 +1438,9 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
         let _ = handle.await;
     }
     close_dashboard_tui_connections(&runtime, &mut tui_connections).await;
+    // Egress relays die with their session: no more frames can arrive,
+    // so drop the registration and fail any in-flight relayed requests.
+    crate::credential_egress::unregister_session(&runtime.session_id);
     if let Some(bridge) = &runtime.presence {
         bridge.cleanup(runtime.session_id.clone()).await;
     }
@@ -2046,6 +2049,13 @@ fn dashboard_control_frame_operation(t: &str) -> Option<crate::peer::access_poli
         }
         "presence_frame" => Some(PeerOperation::Message),
         "upload_start" | "upload_chunk" | "upload_end" => Some(PeerOperation::FilesystemWrite),
+        // Client-egress response frames: only a session that could have
+        // registered as a relay (credentials.manage) may answer, and the
+        // handler additionally binds each frame to the request's own
+        // registering session.
+        "egress_response" | "egress_chunk" | "egress_end" | "egress_error" => {
+            Some(PeerOperation::CredentialsManage)
+        }
         _ => None,
     }
 }
@@ -2071,7 +2081,10 @@ fn dashboard_control_method_operation(
         "api_credential_lease_grant"
         | "api_credential_lease_renew"
         | "api_credential_lease_revoke"
-        | "api_credential_lease_status" => Some(PeerOperation::CredentialsManage),
+        | "api_credential_lease_status"
+        | "api_credential_egress_register"
+        | "api_credential_egress_unregister"
+        | "api_credential_egress_probe" => Some(PeerOperation::CredentialsManage),
         "api_access_iam_upsert_user_client_grant"
         | "api_access_iam_update_grant"
         | "api_access_enrollment_decide"
@@ -2298,6 +2311,10 @@ fn control_frame_response(
         "tui_unsubscribe" => control_tui_unsubscribe_frame(parsed, runtime, tui_connections),
         "tui_close" => control_tui_close_frame(parsed, runtime, tui_connections),
         "presence_frame" => control_presence_frame(parsed, runtime.clone()),
+        "egress_response" | "egress_chunk" | "egress_end" | "egress_error" => {
+            crate::credential_egress::handle_browser_frame(&runtime.session_id, t, &parsed);
+            None
+        }
         "upload_start" => control_upload_start_frame(id, parsed, pending_requests, inbound_uploads),
         "upload_chunk" => control_upload_chunk_frame(id, parsed, pending_requests, inbound_uploads),
         "upload_end" => control_upload_end_frame(
@@ -2426,14 +2443,86 @@ fn control_frame_response(
                             })
                         })
                         .collect();
+                    // The per-session path indicator: which providers are
+                    // currently fueled by a browser relay instead of a lease.
+                    let egress: Vec<serde_json::Value> = crate::credential_egress::relay_status()
+                        .into_iter()
+                        .map(|relay| {
+                            serde_json::json!({
+                                "kind": relay.kind,
+                                "label": relay.label,
+                                "session_id": relay.session_id,
+                                "since_unix_ms": relay.since_unix_ms,
+                            })
+                        })
+                        .collect();
                     Some(serde_json::json!({
                         "t": "response",
                         "id": id,
                         "ok": true,
                         "result": {
                             "leases": leases,
+                            "egress": egress,
                             "expired_note": crate::credential_leases::expired_lease_note(),
                         },
+                    }))
+                }
+                "api_credential_egress_register" => {
+                    let kinds: Vec<String> = params
+                        .as_ref()
+                        .and_then(|p| p.get("kinds"))
+                        .and_then(|v| v.as_array())
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(match runtime.control_frames_tx.clone() {
+                        None => dashboard_control_error_response(
+                            id,
+                            "this transport cannot carry egress frames",
+                        ),
+                        Some(frames_tx) => match crate::credential_egress::register(
+                            &runtime.session_id,
+                            runtime.grant.label(),
+                            &kinds,
+                            frames_tx,
+                        ) {
+                            Ok(registered) => serde_json::json!({
+                                "t": "response",
+                                "id": id,
+                                "ok": true,
+                                "result": { "registered": registered },
+                            }),
+                            Err(error) => dashboard_control_error_response(
+                                id,
+                                format!("egress registration failed: {error}"),
+                            ),
+                        },
+                    })
+                }
+                "api_credential_egress_unregister" => {
+                    let kinds: Option<Vec<String>> = params
+                        .as_ref()
+                        .and_then(|p| p.get("kinds"))
+                        .and_then(|v| v.as_array())
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(str::to_string)
+                                .collect()
+                        });
+                    let unregistered = crate::credential_egress::unregister(
+                        &runtime.session_id,
+                        kinds.as_deref(),
+                    );
+                    Some(serde_json::json!({
+                        "t": "response",
+                        "id": id,
+                        "ok": true,
+                        "result": { "unregistered": unregistered },
                     }))
                 }
                 "api_peers" => match runtime.peer_registry.as_ref() {
@@ -4579,6 +4668,62 @@ fn spawn_control_stream(
     });
 }
 
+/// Test the client-egress path end to end: force a tiny provider call
+/// through the relay for `kind` — even when a local key or lease exists —
+/// and return the model's reply. The fueling panel's "test relay" button
+/// and the E2E validator's deterministic hook.
+async fn api_credential_egress_probe_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let kind = params
+        .and_then(|p| optional_string_param(p, &["kind"]))
+        .unwrap_or_default();
+    let model = params.and_then(|p| optional_string_param(p, &["model"]));
+    let provider: Box<dyn crate::provider::ChatProvider> = match kind.as_str() {
+        crate::credential_egress::KIND_ANTHROPIC => {
+            Box::new(crate::provider::AnthropicProvider::new_client_egress(
+                model.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string()),
+                200_000,
+                256,
+            ))
+        }
+        crate::credential_egress::KIND_GEMINI => {
+            Box::new(crate::provider::GeminiProvider::new_client_egress(
+                model.unwrap_or_else(|| "gemini-2.5-flash".to_string()),
+                200_000,
+                256,
+            ))
+        }
+        other => {
+            return dashboard_control_error_response(
+                id,
+                format!(
+                    "egress probe supports {} and {}, not {other:?}",
+                    crate::credential_egress::KIND_ANTHROPIC,
+                    crate::credential_egress::KIND_GEMINI
+                ),
+            )
+        }
+    };
+    let probe_message = crate::conversation::Message {
+        role: "user".to_string(),
+        content: "Reply with the single word: pong".to_string(),
+        ..Default::default()
+    };
+    match provider.chat(&[probe_message]).await {
+        Ok(response) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": true,
+            "result": { "text": response.content, "model": provider.model() },
+        }),
+        Err(error) => {
+            dashboard_control_error_response(id, format!("egress probe failed: {error}"))
+        }
+    }
+}
+
 async fn control_request_response(
     id: String,
     method: String,
@@ -4590,6 +4735,9 @@ async fn control_request_response(
         return cancelled_control_response(id, true);
     }
     match method.as_str() {
+        "api_credential_egress_probe" => {
+            api_credential_egress_probe_response(id, params.as_ref()).await
+        }
         "api_sessions" => api_sessions_response(id, params.as_ref()).await,
         "api_session_detail" => api_session_detail_response(id, params.as_ref()).await,
         "api_session_delete" => api_session_delete_response(id, params.as_ref()).await,
