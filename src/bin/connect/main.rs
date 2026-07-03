@@ -94,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/app", get(app_html))
         .route("/healthz", get(healthz))
         .route("/install.sh", get(install_sh))
+        .route("/assets/landing/{name}", get(landing_asset))
         .route("/readyz", get(readyz))
         .route("/api/me", get(api_me))
         .route("/api/logout", post(api_logout))
@@ -930,6 +931,33 @@ async fn install_sh() -> impl IntoResponse {
     )
 }
 
+/// Product screenshots for the landing page, embedded like the installer so
+/// every deployment serves visuals that match its own UI. Captured from a
+/// staged local rig (daemon "atlas", account "@ada") — synthetic content only.
+fn landing_asset_bytes(name: &str) -> Option<&'static [u8]> {
+    match name {
+        "hero.webp" => Some(include_bytes!("assets/landing-hero.webp")),
+        "vault.webp" => Some(include_bytes!("assets/landing-vault.webp")),
+        "station.webp" => Some(include_bytes!("assets/landing-station.webp")),
+        "claim.webp" => Some(include_bytes!("assets/landing-claim.webp")),
+        _ => None,
+    }
+}
+
+async fn landing_asset(AxumPath(name): AxumPath<String>) -> Response {
+    match landing_asset_bytes(&name) {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, "image/webp"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     let app_html = state.config.static_root.join("app.html");
     let static_ok = app_html.is_file();
@@ -1044,6 +1072,7 @@ fn content_type_for_path(path: &Path) -> &'static str {
         "json" => "application/json; charset=utf-8",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
         "svg" => "image/svg+xml",
         "ico" => "image/x-icon",
         _ => "application/octet-stream",
@@ -4947,14 +4976,17 @@ fn landing_ui_html(origin: &str) -> String {
     // The placeholder must be entity-escaped or the browser eats it as a tag.
     let install_cmd =
         format!("curl -fsSL {origin}/install.sh | sh -s -- --owner &lt;your-key&gt;");
+    // r## because the page contains fragment links (`href="#install"`),
+    // whose `"#` would terminate a plain r#-string.
     format!(
-        r#"<!doctype html>
+        r##"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Intendant — an operating environment for autonomous AI agents</title>
   <meta name="description" content="Give an AI agent a full machine — shell, files, display, voice — under layered human oversight. Your keys stay yours.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%231e1e2e'/><text x='32' y='44' font-family='system-ui' font-size='30' font-weight='700' text-anchor='middle' fill='%23b4befe'>in</text></svg>">
   <style>
     :root {{
       color-scheme: dark;
@@ -4977,6 +5009,8 @@ fn landing_ui_html(origin: &str) -> String {
       --shadow: 0 18px 50px rgba(0, 0, 0, .35);
     }}
     * {{ box-sizing: border-box; }}
+    html {{ scroll-behavior: smooth; }}
+    @media (prefers-reduced-motion: reduce) {{ html {{ scroll-behavior: auto; }} }}
     body {{
       margin: 0;
       background:
@@ -4988,7 +5022,7 @@ fn landing_ui_html(origin: &str) -> String {
     }}
     a {{ color: var(--accent); text-decoration: none; }}
     a:hover {{ color: var(--accent-hover); }}
-    .wrap {{ max-width: 1060px; margin: 0 auto; padding: 0 22px; }}
+    .wrap {{ max-width: 1080px; margin: 0 auto; padding: 0 22px; }}
     header {{
       display: flex; align-items: center; justify-content: space-between;
       padding: 18px 0; flex-wrap: wrap; gap: 10px 18px;
@@ -5006,43 +5040,62 @@ fn landing_ui_html(origin: &str) -> String {
     .btn:hover {{ background: var(--accent-hover); color: var(--accent-ink); }}
     .btn.ghost {{ background: transparent; color: var(--text); border-color: var(--line-strong); }}
     .btn.ghost:hover {{ border-color: var(--accent); color: var(--accent); }}
-    .hero {{ padding: 72px 0 30px; max-width: 780px; }}
+    .hero {{ padding: 64px 0 10px; text-align: center; }}
     .hero h1 {{
-      margin: 0 0 18px; font-size: clamp(30px, 5.4vw, 46px); line-height: 1.14;
-      letter-spacing: -.5px;
+      margin: 0 auto 18px; font-size: clamp(31px, 5.5vw, 49px); line-height: 1.13;
+      letter-spacing: -.6px; max-width: 21ch;
     }}
     .hero h1 em {{ font-style: normal; color: var(--lavender); }}
-    .hero p {{ margin: 0 0 26px; font-size: 18px; color: var(--muted); max-width: 640px; }}
-    .cta {{ display: flex; gap: 12px; flex-wrap: wrap; }}
-    .install {{
-      margin: 46px 0 8px; background: var(--top); border: 1px solid var(--line-strong);
-      border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden;
+    .hero p {{ margin: 0 auto 28px; font-size: 17.5px; color: var(--muted); max-width: 680px; }}
+    .cta {{ display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }}
+    /* Framed product shots */
+    .heroshot {{ position: relative; margin: 50px 0 0; }}
+    .heroshot::before {{
+      content: ""; position: absolute; inset: -60px 0 auto; height: 340px;
+      background: radial-gradient(640px 260px at 50% 20%, rgba(137, 180, 250, .16), transparent 70%);
+      pointer-events: none;
     }}
-    .install .bar {{
-      display: flex; justify-content: space-between; align-items: center;
-      padding: 8px 14px; border-bottom: 1px solid var(--line);
-      font-size: 12px; color: var(--muted-2); letter-spacing: .4px; text-transform: uppercase;
+    .browserframe {{
+      position: relative; background: var(--top); border: 1px solid var(--line-strong);
+      border-radius: 14px; box-shadow: var(--shadow); overflow: hidden;
     }}
-    .install button {{
-      background: transparent; border: 1px solid var(--line-strong); color: var(--muted);
-      border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer;
+    .bfbar {{
+      display: flex; align-items: center; gap: 7px; padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
     }}
-    .install button:hover {{ color: var(--text); border-color: var(--accent); }}
-    .install pre {{
-      margin: 0; padding: 16px 18px; overflow-x: auto;
-      font: 13.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      color: var(--ok);
+    .dot {{ width: 10px; height: 10px; border-radius: 50%; }}
+    .dot.r {{ background: rgba(243, 139, 168, .75); }}
+    .dot.y {{ background: rgba(249, 226, 175, .75); }}
+    .dot.g {{ background: rgba(166, 227, 161, .75); }}
+    .bftitle {{
+      margin-left: 8px; font: 12.5px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--muted-2); letter-spacing: .3px;
     }}
-    .install .note {{ padding: 0 18px 14px; font-size: 13px; color: var(--muted-2); }}
-    .steps {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin: 26px 0 0; }}
-    .step {{
-      border: 1px solid var(--line); border-radius: var(--radius);
-      background: rgba(30, 30, 46, .55); padding: 14px 16px; font-size: 14px; color: var(--muted);
+    .browserframe img, .shot img {{ display: block; width: 100%; height: auto; }}
+    .shotcaption {{
+      margin: 14px auto 0; max-width: 740px; text-align: center;
+      font-size: 13.5px; color: var(--muted-2);
     }}
-    .step b {{ display: block; color: var(--text); margin-bottom: 4px; font-size: 14.5px; }}
-    .step .n {{ color: var(--accent); font-weight: 700; margin-right: 6px; }}
-    section.features {{ padding: 58px 0 8px; }}
-    .features h2, .trustrow h2 {{ font-size: 22px; margin: 0 0 18px; letter-spacing: -.2px; }}
+    /* The tour: alternating text/screenshot rows */
+    .tour {{ padding: 84px 0 0; }}
+    .trow {{
+      display: grid; grid-template-columns: minmax(0, .92fr) minmax(0, 1.08fr);
+      gap: 48px; align-items: center; padding: 30px 0;
+    }}
+    .trow.rev .txt {{ order: 2; }}
+    .eyebrow {{
+      font-size: 12px; font-weight: 700; letter-spacing: .14em;
+      text-transform: uppercase; color: var(--accent); margin-bottom: 10px;
+    }}
+    .trow h3 {{ margin: 0 0 12px; font-size: 23px; letter-spacing: -.3px; }}
+    .trow .txt p {{ margin: 0; font-size: 15.5px; color: var(--muted); }}
+    .shot {{
+      background: var(--top); border: 1px solid var(--line-strong);
+      border-radius: 12px; box-shadow: var(--shadow); overflow: hidden;
+    }}
+    .shotnote {{ margin-top: 10px; font-size: 13px; color: var(--muted-2); }}
+    section h2 {{ font-size: 24px; margin: 0 0 20px; letter-spacing: -.3px; }}
+    section.features {{ padding: 78px 0 0; }}
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }}
     .card {{
       border: 1px solid var(--line); border-radius: var(--radius);
@@ -5050,14 +5103,56 @@ fn landing_ui_html(origin: &str) -> String {
     }}
     .card h3 {{ margin: 0 0 8px; font-size: 16px; }}
     .card p {{ margin: 0; font-size: 14px; color: var(--muted); }}
-    .trustrow {{ padding: 46px 0 20px; }}
+    /* Install */
+    .install-section {{ padding: 84px 0 0; }}
+    .igrid {{ display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr); gap: 30px; align-items: start; }}
+    .terminal {{
+      background: var(--top); border: 1px solid var(--line-strong);
+      border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden;
+    }}
+    .tbar {{
+      display: flex; align-items: center; gap: 7px; padding: 9px 14px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .tbar .bftitle {{ flex: 1; }}
+    .tbar button {{
+      background: transparent; border: 1px solid var(--line-strong); color: var(--muted);
+      border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer;
+    }}
+    .tbar button:hover {{ color: var(--text); border-color: var(--accent); }}
+    .terminal pre {{
+      margin: 0; padding: 16px 18px;
+      font: 13.5px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--ok);
+      white-space: pre-wrap; overflow-wrap: break-word;
+    }}
+    .terminal pre .ps {{ color: var(--muted-2); user-select: none; }}
+    .installnote {{ margin: 14px 2px 0; font-size: 13px; color: var(--muted-2); }}
+    .steps {{ display: grid; gap: 12px; }}
+    .step {{
+      border: 1px solid var(--line); border-radius: var(--radius);
+      background: rgba(30, 30, 46, .55); padding: 14px 16px; font-size: 14px; color: var(--muted);
+    }}
+    .step b {{ display: block; color: var(--text); margin-bottom: 4px; font-size: 14.5px; }}
+    .step .n {{ color: var(--accent); font-weight: 700; margin-right: 6px; }}
+    .trustrow {{ padding: 78px 0 20px; }}
     .trustrow .card {{ background: rgba(166, 227, 161, .05); border-color: rgba(166, 227, 161, .18); }}
     footer {{
-      margin-top: 56px; padding: 26px 0 40px; border-top: 1px solid var(--line);
+      margin-top: 64px; padding: 26px 0 40px; border-top: 1px solid var(--line);
       display: flex; justify-content: space-between; gap: 14px; flex-wrap: wrap;
       font-size: 13.5px; color: var(--muted-2);
     }}
     footer nav {{ gap: 16px; }}
+    @media (max-width: 920px) {{
+      .hero {{ padding-top: 46px; }}
+      /* minmax(0, …) everywhere: a bare 1fr keeps the min-content floor and
+         lets wide content (the install one-liner) stretch the page. */
+      .trow {{ grid-template-columns: minmax(0, 1fr); gap: 16px; padding: 24px 0; }}
+      .trow.rev .txt {{ order: 0; }}
+      .tour {{ padding-top: 60px; }}
+      .igrid {{ grid-template-columns: minmax(0, 1fr); }}
+      section.features, .install-section, .trustrow {{ padding-top: 56px; }}
+    }}
   </style>
 </head>
 <body>
@@ -5068,6 +5163,7 @@ fn landing_ui_html(origin: &str) -> String {
         <a href="/trust">How trust works</a>
         <a href="{DOCS_URL}">Docs</a>
         <a href="{REPO_URL}">GitHub</a>
+        <a href="#install">Install</a>
         <a class="btn ghost" href="/connect">Sign in</a>
       </nav>
     </header>
@@ -5084,33 +5180,82 @@ fn landing_ui_html(origin: &str) -> String {
       </p>
       <div class="cta">
         <a class="btn" href="/connect">Open your dashboard</a>
-        <a class="btn ghost" href="{DOCS_URL}">Read the docs</a>
+        <a class="btn ghost" href="#install">Install a daemon</a>
       </div>
     </section>
 
-    <section class="install">
-      <div class="bar">
-        <span>Stand up a daemon in about ninety seconds</span>
-        <button onclick="navigator.clipboard&amp;&amp;navigator.clipboard.writeText(document.getElementById('cmd').textContent)">copy</button>
+    <section class="heroshot">
+      <div class="browserframe">
+        <div class="bfbar">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="bftitle">atlas — Intendant dashboard</span>
+        </div>
+        <img src="/assets/landing/hero.webp" width="2200" height="1192" fetchpriority="high"
+             alt="The Intendant dashboard's Activity feed: an agent diagnoses a failing nightly job with an auto-approved tail command, proposes a one-line diff to jobs/rollup.py, waits for an approval-gated backfill run, and reports the verified result.">
       </div>
-      <pre id="cmd">{install_cmd}</pre>
-      <div class="note">
-        New here? <a href="/connect">Sign in</a> first — your key is in the
-        dashboard's Access drawer. Nothing sensitive travels in this command
-        or lands on the box: the daemon boots already owned by you, you claim
-        it with a twelve-word phrase, and it borrows credentials from your
-        vault only while you let it.
-      </div>
+      <p class="shotcaption">
+        The Activity feed on a claimed daemon: autonomy is a dial, approvals
+        are explicit, and every command, diff, and decision is logged and
+        replayable.
+      </p>
     </section>
 
-    <div class="steps">
-      <div class="step"><b><span class="n">1</span>Install</b>
-        One command on a fresh box pins root authority to your browser's key. Nothing sensitive travels.</div>
-      <div class="step"><b><span class="n">2</span>Claim</b>
-        The daemon prints a twelve-word phrase; claim it from the browser you're already holding.</div>
-      <div class="step"><b><span class="n">3</span>Fuel</b>
-        Grant time-boxed credential leases from your encrypted vault — or relay calls through your browser and never hand over a key at all.</div>
-    </div>
+    <section class="tour">
+      <div class="trow rev">
+        <div class="txt">
+          <div class="eyebrow">Mission control</div>
+          <h3>Every agent, one canvas</h3>
+          <p>Station renders the whole machine live — sessions, approvals,
+          context budgets, changes, and worktrees orbiting one WebGPU canvas.
+          The same state is a keystroke away in the terminal TUI and the CLI,
+          and a glance away from your phone.</p>
+        </div>
+        <div class="pic">
+          <div class="shot">
+            <img loading="lazy" src="/assets/landing/station.webp" width="2000" height="1014"
+                 alt="The Station tab: a radar-style WebGPU control room showing live nodes for peers, sessions, activity, context, changes, view, controls, and worktrees.">
+          </div>
+          <div class="shotnote">Station — the fleet and every session's state, rendered live.</div>
+        </div>
+      </div>
+
+      <div class="trow">
+        <div class="txt">
+          <div class="eyebrow">Credential custody</div>
+          <h3>Fueling, not surrendering</h3>
+          <p>Provider keys and subscription OAuth live end-to-end encrypted
+          behind your passkeys. Daemons borrow time-boxed leases that renew
+          from your browser and expire on their own — or relay calls through
+          the browser so a key never leaves it. Either way the machine's disk
+          holds nothing worth stealing, and revocation is immediate.</p>
+        </div>
+        <div class="pic">
+          <div class="shot">
+            <img loading="lazy" src="/assets/landing/vault.webp" width="1800" height="975"
+                 alt="The credential vault panel: three credentials with masked secrets, two active leases expiring in 15 minutes granted by @ada, re-fuel buttons, and a client-egress relay option.">
+          </div>
+          <div class="shotnote">Leases expire on their own; Revoke is always one click away.</div>
+        </div>
+      </div>
+
+      <div class="trow rev">
+        <div class="txt">
+          <div class="eyebrow">Arrival</div>
+          <h3>Claim a machine with twelve words</h3>
+          <p>Start the daemon anywhere and it prints a claim phrase. Paste it
+          in the browser you're already holding and the box is yours — owned
+          by your key from first boot, reachable from every device you sign
+          in on, with the powerful knobs one fold away when you want them.</p>
+        </div>
+        <div class="pic">
+          <div class="shot">
+            <img loading="lazy" src="/assets/landing/claim.webp" width="1800" height="635"
+                 alt="Intendant Connect: a claimed computer named atlas shown online with uptime history, next to the add-a-computer flow that accepts a twelve-word claim phrase.">
+          </div>
+          <div class="shotnote">atlas, online seconds after its claim phrase was pasted.</div>
+        </div>
+      </div>
+    </section>
 
     <section class="features">
       <h2>What's in the box</h2>
@@ -5142,6 +5287,37 @@ fn landing_ui_html(origin: &str) -> String {
       </div>
     </section>
 
+    <section class="install-section" id="install">
+      <h2>Stand up a daemon in about ninety seconds</h2>
+      <div class="igrid">
+        <div>
+          <div class="terminal">
+            <div class="tbar">
+              <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+              <span class="bftitle">fresh box — sh</span>
+              <button onclick="navigator.clipboard&amp;&amp;navigator.clipboard.writeText(document.getElementById('cmd').textContent.replace(/^\$ /,''))">copy</button>
+            </div>
+            <pre id="cmd"><span class="ps">$ </span>{install_cmd}</pre>
+          </div>
+          <p class="installnote">
+            New here? <a href="/connect">Sign in</a> first — your key is in the
+            dashboard's Access drawer. Nothing sensitive travels in this command
+            or lands on the box: the daemon boots already owned by you, you claim
+            it with a twelve-word phrase, and it borrows credentials from your
+            vault only while you let it.
+          </p>
+        </div>
+        <div class="steps">
+          <div class="step"><b><span class="n">1</span>Install</b>
+            One command on a fresh box pins root authority to your browser's key. Nothing sensitive travels.</div>
+          <div class="step"><b><span class="n">2</span>Claim</b>
+            The daemon prints a twelve-word phrase; claim it from the browser you're already holding.</div>
+          <div class="step"><b><span class="n">3</span>Fuel</b>
+            Grant time-boxed credential leases from your encrypted vault — or relay calls through your browser and never hand over a key at all.</div>
+        </div>
+      </div>
+    </section>
+
     <section class="trustrow">
       <h2>Built to be distrusted</h2>
       <div class="grid">
@@ -5167,7 +5343,7 @@ fn landing_ui_html(origin: &str) -> String {
     </footer>
   </div>
 </body>
-</html>"#
+</html>"##
     )
 }
 
@@ -6935,6 +7111,29 @@ mod tests {
         assert!(html.contains(DOCS_URL));
         assert!(html.contains(REPO_URL));
         assert!(html.contains("Built to be distrusted"));
+        // The tour shows the product: every embedded screenshot is referenced,
+        // with alt text so the page reads without images.
+        for asset in ["hero.webp", "station.webp", "vault.webp", "claim.webp"] {
+            assert!(
+                html.contains(&format!("/assets/landing/{asset}")),
+                "landing page must reference {asset}"
+            );
+        }
+        assert!(html.contains("alt=\"The Intendant dashboard's Activity feed"));
+    }
+
+    #[test]
+    fn landing_assets_are_embedded_webp() {
+        for asset in ["hero.webp", "station.webp", "vault.webp", "claim.webp"] {
+            let bytes = landing_asset_bytes(asset)
+                .unwrap_or_else(|| panic!("missing embedded landing asset {asset}"));
+            // RIFF....WEBP container magic.
+            assert!(bytes.len() > 8_192, "{asset} suspiciously small");
+            assert_eq!(&bytes[0..4], b"RIFF", "{asset} is not a RIFF container");
+            assert_eq!(&bytes[8..12], b"WEBP", "{asset} is not WebP");
+        }
+        assert!(landing_asset_bytes("nope.webp").is_none());
+        assert!(landing_asset_bytes("../secrets").is_none());
     }
 
     #[test]
