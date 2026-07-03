@@ -1,10 +1,10 @@
 //! Windows UI Automation element-tree reader (read-only observation).
 //!
-//! Maps UIA element properties (Name / ControlType / BoundingRectangle /
-//! focus / enabled) into the portable [`ScreenElements`] shape used by
-//! `read_screen`, honoring the same depth/node caps as the macOS AX reader
-//! in `ax.rs`. Strictly read-only: no input injection, no background tasks —
-//! one bounded walk per call.
+//! Maps UIA element properties (Name / Value / ControlType /
+//! BoundingRectangle / focus / enabled) into the portable [`ScreenElements`]
+//! shape used by `read_screen`, honoring the same depth/node caps as the
+//! macOS AX reader in `ax.rs`. Strictly read-only: no input injection, no
+//! background tasks — one bounded walk per call. Password fields are skipped.
 //!
 //! Layout follows the keymap precedent: the pure control-type/field mapping
 //! stays ungated so its unit tests run on every host; only the actual UIA
@@ -124,6 +124,7 @@ mod imp {
     };
     use windows::Win32::UI::Accessibility::{
         CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
+        IUIAutomationValuePattern, UIA_ValuePatternId,
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
 
@@ -238,7 +239,7 @@ mod imp {
         map_element(
             current_control_type(element),
             current_name(element),
-            None,
+            current_value(element),
             current_rect(element),
             current_focused(element),
             current_enabled(element),
@@ -332,6 +333,30 @@ mod imp {
             .and_then(|s| String::try_from(s).ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+    }
+
+    fn current_value(element: &IUIAutomationElement) -> Option<String> {
+        if current_is_password(element) {
+            return None;
+        }
+        // SAFETY: GetCurrentPatternAs is a read-only UIA query. UIA returns an
+        // error when the element does not support ValuePattern.
+        let value_pattern: IUIAutomationValuePattern =
+            unsafe { element.GetCurrentPatternAs(UIA_ValuePatternId) }.ok()?;
+        // SAFETY: Read-only UIA pattern property getter. windows-rs owns the
+        // returned BSTR and frees it on drop.
+        unsafe { value_pattern.CurrentValue() }
+            .ok()
+            .and_then(|s| String::try_from(s).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn current_is_password(element: &IUIAutomationElement) -> bool {
+        // SAFETY: Read-only UIA property getter.
+        unsafe { element.CurrentIsPassword() }
+            .map(bool_from)
+            .unwrap_or(false)
     }
 
     fn current_process_id(element: &IUIAutomationElement) -> i32 {

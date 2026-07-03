@@ -5,17 +5,48 @@
 //! session-level D-Bus service independent of the display server. Honors the
 //! same depth/node caps as the macOS AX reader.
 //!
-//! Privacy posture (see the read_screen docs): UI metadata only, from the
-//! operator's own session, one bounded walk per explicit call — no background
-//! polling, no tree caches. Enabling `org.a11y.Status.IsEnabled` (the
-//! platform's mechanism for making toolkits expose trees) happens on demand
-//! at first use, never at daemon startup.
+//! Privacy posture (see the read_screen docs): from the operator's own
+//! session, one bounded walk per explicit call — no background polling, no
+//! tree caches. Labels and readable values are capped; password fields are
+//! skipped. Enabling `org.a11y.Status.IsEnabled` (the platform's mechanism for
+//! making toolkits expose trees) happens on demand at first use, never at
+//! daemon startup.
 //!
 //! Layout follows the keymap precedent: pure role/field mapping stays ungated
 //! so its unit tests run on every host; the D-Bus walk is Linux-only (the
 //! `atspi` crate is a Linux-target dependency).
 
-use crate::computer_use::{ScreenElements, UiElement};
+use crate::computer_use::UiElement;
+
+/// Cap for label/value text carried per element.
+const TEXT_CAP: usize = 80;
+
+fn normalized_role_key(atspi_role_name: &str) -> String {
+    atspi_role_name
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-'))
+        .collect::<String>()
+        .to_lowercase()
+}
+
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn role_is_password_text(atspi_role_name: &str) -> bool {
+    normalized_role_key(atspi_role_name) == "passwordtext"
+}
+
+fn truncate(text: &str, cap: usize) -> String {
+    if text.chars().count() <= cap {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(cap).collect();
+    format!("{cut}...")
+}
+
+fn clean_text(text: Option<String>) -> Option<String> {
+    text.map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate(&s, TEXT_CAP))
+}
 
 /// Map an AT-SPI role name to the lowercase role vocabulary shared with the
 /// macOS AX and Windows UIA readers (`format_screen_elements` keys its
@@ -26,11 +57,7 @@ use crate::computer_use::{ScreenElements, UiElement};
 /// PascalCase spellings match too. Unmatched roles pass through normalized —
 /// AT-SPI's vocabulary is already descriptive.
 fn role_to_shared(atspi_role_name: &str) -> String {
-    let normalized: String = atspi_role_name
-        .chars()
-        .filter(|c| !matches!(c, ' ' | '_' | '-'))
-        .collect::<String>()
-        .to_lowercase();
+    let normalized = normalized_role_key(atspi_role_name);
     let mapped = match normalized.as_str() {
         "pushbutton" | "togglebutton" => "button",
         "checkbox" => "checkbox",
@@ -41,9 +68,9 @@ fn role_to_shared(atspi_role_name: &str) -> String {
         "link" => "link",
         "frame" | "window" => "window",
         "dialog" | "filechooser" | "colorchooser" | "alert" => "dialog",
-        "panel" | "filler" | "section" | "scrollpane" | "viewport" | "splitpane"
-        | "glasspane" | "rootpane" | "layeredpane" | "internalframe" | "desktopframe"
-        | "form" | "grouping" | "embedded" | "canvas" => "group",
+        "panel" | "filler" | "section" | "scrollpane" | "viewport" | "splitpane" | "glasspane"
+        | "rootpane" | "layeredpane" | "internalframe" | "desktopframe" | "form" | "grouping"
+        | "embedded" | "canvas" => "group",
         "menubar" => "menubar",
         "menu" => "menu",
         "menuitem" | "checkmenuitem" | "radiomenuitem" | "tearoffmenuitem" => "menuitem",
@@ -68,8 +95,12 @@ fn role_to_shared(atspi_role_name: &str) -> String {
         "image" | "icon" => "image",
         "separator" => "separator",
         "tooltip" => "tooltip",
-        "documentframe" | "documentweb" | "documenttext" | "documentemail"
-        | "documentpresentation" | "documentspreadsheet" => "document",
+        "documentframe"
+        | "documentweb"
+        | "documenttext"
+        | "documentemail"
+        | "documentpresentation"
+        | "documentspreadsheet" => "document",
         "application" => "application",
         "unknown" | "invalid" | "extended" | "redundantobject" => "unknown",
         _ => "",
@@ -105,8 +136,8 @@ fn make_element(
     let (x, y, w, h) = extents;
     UiElement {
         role: role_to_shared(atspi_role_name),
-        label: name.filter(|s| !s.trim().is_empty()),
-        value: value.filter(|s| !s.trim().is_empty()),
+        label: clean_text(name),
+        value: clean_text(value),
         frame: (x, y, w.max(0) as u32, h.max(0) as u32),
         focused,
         enabled,
@@ -127,7 +158,10 @@ const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// that makes toolkits expose trees); apps already running may need a restart
 /// to honor it, which the result's hint text explains.
 #[cfg(target_os = "linux")]
-pub async fn read_frontmost(max_depth: usize, max_nodes: usize) -> Result<ScreenElements, String> {
+pub async fn read_frontmost(
+    max_depth: usize,
+    max_nodes: usize,
+) -> Result<crate::computer_use::ScreenElements, String> {
     tokio::time::timeout(READ_DEADLINE, walk::read_frontmost(max_depth, max_nodes))
         .await
         .map_err(|_| {
@@ -141,10 +175,13 @@ pub async fn read_frontmost(max_depth: usize, max_nodes: usize) -> Result<Screen
 
 #[cfg(target_os = "linux")]
 mod walk {
-    use super::{make_element, ScreenElements, UiElement};
+    use super::{make_element, role_is_password_text, UiElement, TEXT_CAP};
+    use crate::computer_use::ScreenElements;
     use atspi::connection::AccessibilityConnection;
     use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
     use atspi::proxy::component::ComponentProxy;
+    use atspi::proxy::text::TextProxy;
+    use atspi::proxy::value::ValueProxy;
     use atspi::{CoordType, State};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -198,7 +235,10 @@ mod walk {
         let mut active_candidates = Vec::new();
         let mut other_windows: Vec<String> = Vec::new();
         for app_ref in apps.into_iter().take(MAX_APPS) {
-            let Ok(app_proxy) = app_ref.clone().into_accessible_proxy(conn.connection()).await
+            let Ok(app_proxy) = app_ref
+                .clone()
+                .into_accessible_proxy(conn.connection())
+                .await
             else {
                 continue;
             };
@@ -217,8 +257,7 @@ mod walk {
                     continue;
                 }
                 let title = win.name().await.unwrap_or_default();
-                if states.contains(State::Active)
-                    && active_candidates.len() < MAX_ACTIVE_CANDIDATES
+                if states.contains(State::Active) && active_candidates.len() < MAX_ACTIVE_CANDIDATES
                 {
                     active_candidates.push((app_name.clone(), win, title));
                 } else if !title.trim().is_empty() && other_windows.len() < MAX_OTHER_WINDOWS {
@@ -277,9 +316,8 @@ mod walk {
         let root = walk_element(&conn, window, max_depth, &budget, &truncated).await;
         let truncated = truncated.load(Ordering::SeqCst);
 
-        let mut truncated_msg = truncated.then(|| {
-            format!("element tree truncated at {max_nodes} nodes / depth {max_depth}")
-        });
+        let mut truncated_msg = truncated
+            .then(|| format!("element tree truncated at {max_nodes} nodes / depth {max_depth}"));
         if let Some(root_el) = &root {
             if root_el.children.is_empty() && truncated_msg.is_none() {
                 truncated_msg = Some(
@@ -316,11 +354,9 @@ mod walk {
             .unwrap_or(0)
     }
 
-    /// Depth-first bounded walk. Values (field contents) are deliberately not
-    /// collected — roles, labels, and geometry are enough to act on, and keep
-    /// the observation metadata-only. Proxies borrow the connection (`'a`);
-    /// the budget/truncated flags are atomics so the recursive boxed future
-    /// stays `Send` without `&mut` reborrow gymnastics.
+    /// Depth-first bounded walk. Proxies borrow the connection (`'a`); the
+    /// budget/truncated flags are atomics so the recursive boxed future stays
+    /// `Send` without `&mut` reborrow gymnastics.
     fn walk_element<'a>(
         conn: &'a AccessibilityConnection,
         el: AccessibleProxy<'a>,
@@ -352,6 +388,7 @@ mod walk {
                 return None;
             }
 
+            let value = element_value(conn, &el, &role).await;
             let extents = component_extents(conn, &el).await.unwrap_or((0, 0, 0, 0));
 
             let mut children = Vec::new();
@@ -362,8 +399,7 @@ mod walk {
                             truncated.store(true, Ordering::SeqCst);
                             break;
                         }
-                        let Ok(child) =
-                            child_ref.into_accessible_proxy(conn.connection()).await
+                        let Ok(child) = child_ref.into_accessible_proxy(conn.connection()).await
                         else {
                             continue;
                         };
@@ -379,7 +415,7 @@ mod walk {
             }
 
             Some(make_element(
-                &role, name, None, extents, focused, enabled, children,
+                &role, name, value, extents, focused, enabled, children,
             ))
         })
     }
@@ -399,6 +435,93 @@ mod walk {
             .await
             .ok()?;
         component.get_extents(CoordType::Screen).await.ok()
+    }
+
+    async fn element_value(
+        conn: &AccessibilityConnection,
+        el: &AccessibleProxy<'_>,
+        role: &str,
+    ) -> Option<String> {
+        if role_is_password_text(role) {
+            return None;
+        }
+        if let Some(text) = text_contents(conn, el).await {
+            return Some(text);
+        }
+        if let Some(text) = value_text(conn, el).await {
+            return Some(text);
+        }
+        numeric_value(conn, el).await
+    }
+
+    async fn text_contents(
+        conn: &AccessibilityConnection,
+        el: &AccessibleProxy<'_>,
+    ) -> Option<String> {
+        let text = TextProxy::builder(conn.connection())
+            .destination(el.inner().destination().to_owned())
+            .ok()?
+            .path(el.inner().path().to_owned())
+            .ok()?
+            .build()
+            .await
+            .ok()?;
+        let character_count = text.character_count().await.ok()?;
+        if character_count <= 0 {
+            return None;
+        }
+        text.get_text(0, character_count.min(TEXT_CAP as i32 + 1))
+            .await
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    async fn value_text(
+        conn: &AccessibilityConnection,
+        el: &AccessibleProxy<'_>,
+    ) -> Option<String> {
+        let value = ValueProxy::builder(conn.connection())
+            .destination(el.inner().destination().to_owned())
+            .ok()?
+            .path(el.inner().path().to_owned())
+            .ok()?
+            .build()
+            .await
+            .ok()?;
+        value
+            .text()
+            .await
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    async fn numeric_value(
+        conn: &AccessibilityConnection,
+        el: &AccessibleProxy<'_>,
+    ) -> Option<String> {
+        let value = ValueProxy::builder(conn.connection())
+            .destination(el.inner().destination().to_owned())
+            .ok()?
+            .path(el.inner().path().to_owned())
+            .ok()?
+            .build()
+            .await
+            .ok()?;
+        let number = value.current_value().await.ok()?;
+        if !number.is_finite() {
+            return None;
+        }
+        let formatted = if number.fract() == 0.0 {
+            format!("{number:.0}")
+        } else {
+            format!("{number:.3}")
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string()
+        };
+        Some(formatted).filter(|s| !s.is_empty())
     }
 }
 
@@ -422,6 +545,8 @@ mod tests {
         // Unmatched roles pass through normalized rather than degrading.
         assert_eq!(role_to_shared("notification"), "notification");
         assert_eq!(role_to_shared(""), "unknown");
+        assert!(role_is_password_text("password text"));
+        assert!(role_is_password_text("PasswordText"));
     }
 
     /// Live test — needs a session accessibility bus and a focused window.
@@ -432,10 +557,7 @@ mod tests {
     #[ignore]
     async fn live_read_frontmost() {
         let elements = super::read_frontmost(12, 400).await.expect("AT-SPI read");
-        println!(
-            "{}",
-            crate::computer_use::format_screen_elements(&elements)
-        );
+        println!("{}", crate::computer_use::format_screen_elements(&elements));
     }
 
     #[test]
@@ -453,5 +575,21 @@ mod tests {
         assert_eq!(el.label.as_deref(), Some("Open"));
         assert_eq!(el.frame, (5, 10, 80, 0), "negative height clamps to zero");
         assert!(el.enabled);
+    }
+
+    #[test]
+    fn make_element_cleans_value_text() {
+        let el = make_element(
+            "entry",
+            Some(" Query ".to_string()),
+            Some(" value ".to_string()),
+            (0, 0, 10, 10),
+            true,
+            true,
+            Vec::new(),
+        );
+        assert_eq!(el.role, "textfield");
+        assert_eq!(el.label.as_deref(), Some("Query"));
+        assert_eq!(el.value.as_deref(), Some("value"));
     }
 }
