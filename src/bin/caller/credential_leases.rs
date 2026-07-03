@@ -19,11 +19,35 @@ const MAX_TTL_MS: u64 = 60 * 60 * 1000;
 const MAX_OFFLINE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_MATERIAL_BYTES: usize = 64 * 1024;
 
+/// How a lease was fueled — the custody-relevant distinction for the
+/// oauth kinds between borrowing a short-lived access token (the browser
+/// keeps the refresh token and performs provider refresh on its side)
+/// and borrowing the full auth file (durable authority for the lease
+/// window; the explicit per-daemon opt-in). API-key kinds are plain
+/// strings with no such split.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LeaseMode {
+    ApiKey,
+    OauthAccessToken,
+    OauthFullCredential,
+}
+
+impl LeaseMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LeaseMode::ApiKey => "api_key",
+            LeaseMode::OauthAccessToken => "access_token",
+            LeaseMode::OauthFullCredential => "full_credential",
+        }
+    }
+}
+
 pub struct CredentialLease {
     pub lease_id: String,
     pub kind: String,
     pub label: String,
     material: Box<[u8]>,
+    pub mode: LeaseMode,
     pub granted_by: String,
     pub granted_at_unix_ms: u64,
     pub renewed_at_unix_ms: u64,
@@ -318,6 +342,61 @@ pub fn startup_materialization_sweep() {
     }
 }
 
+/// Why access-token-mode material is refused, or None when it is clean.
+/// The browser strips the refresh token before granting in access-token
+/// mode; this check makes that invariant fail-closed against custodian
+/// bugs instead of trusting the label — material that still carries
+/// durable authority must be granted as what it is (full-credential).
+fn access_token_material_error(kind: &str, material: &str) -> Option<String> {
+    let parsed: serde_json::Value = match serde_json::from_str(material) {
+        Ok(value) => value,
+        Err(err) => {
+            return Some(format!(
+                "access-token lease material must be the auth-file JSON: {err}"
+            ))
+        }
+    };
+    let durable: &[(&str, &str)] = match kind {
+        // Codex auth files can carry a plain API key alongside the
+        // token bundle — every durable field must be clean, not just
+        // the refresh token.
+        "oauth:codex" => &[
+            ("/tokens/refresh_token", "a refresh token"),
+            ("/OPENAI_API_KEY", "an API key"),
+        ],
+        "oauth:claude-code" => &[("/claudeAiOauth/refreshToken", "a refresh token")],
+        _ => &[],
+    };
+    for (pointer, what) in durable {
+        if let Some(serde_json::Value::String(value)) = parsed.pointer(pointer) {
+            if !value.trim().is_empty() {
+                return Some(format!(
+                    "access-token lease material may not contain {what} — grant it as a full-credential lease instead"
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn resolve_mode(kind: &str, mode: Option<&str>, material: &str) -> Result<LeaseMode, String> {
+    if !kind.starts_with("oauth:") {
+        return Ok(LeaseMode::ApiKey);
+    }
+    match mode.map(str::trim).filter(|m| !m.is_empty()) {
+        // Grants predating the mode split (or omitting it) are what they
+        // always were: the full pasted auth file.
+        None | Some("full_credential") => Ok(LeaseMode::OauthFullCredential),
+        Some("access_token") => match access_token_material_error(kind, material) {
+            Some(error) => Err(error),
+            None => Ok(LeaseMode::OauthAccessToken),
+        },
+        Some(other) => Err(format!("unknown lease mode: {other}")),
+    }
+}
+
+/// No secret material — safe to Debug (tests unwrap_err on it).
+#[derive(Debug)]
 pub struct GrantOutcome {
     pub lease_id: String,
     pub kind: String,
@@ -330,6 +409,7 @@ pub fn grant(
     kind: &str,
     label: &str,
     material: &str,
+    mode: Option<&str>,
     granted_by: &str,
     ttl_ms: Option<u64>,
     offline_ms: Option<u64>,
@@ -344,6 +424,7 @@ pub fn grant(
     if material.len() > MAX_MATERIAL_BYTES {
         return Err("credential material is too large".to_string());
     }
+    let mode = resolve_mode(kind, mode, material)?;
     let ttl_ms = ttl_ms.unwrap_or(DEFAULT_TTL_MS).clamp(MIN_TTL_MS, MAX_TTL_MS);
     let offline_ms = offline_ms.unwrap_or(DEFAULT_OFFLINE_MS).min(MAX_OFFLINE_MS);
     let now = now_unix_ms();
@@ -352,6 +433,7 @@ pub fn grant(
         kind: kind.to_string(),
         label: label.trim().to_string(),
         material: material.as_bytes().to_vec().into_boxed_slice(),
+        mode,
         granted_by: granted_by.trim().to_string(),
         granted_at_unix_ms: now,
         renewed_at_unix_ms: now,
@@ -424,6 +506,7 @@ pub struct LeaseStatusEntry {
     pub lease_id: String,
     pub kind: String,
     pub label: String,
+    pub mode: LeaseMode,
     pub granted_by: String,
     pub granted_at_unix_ms: u64,
     pub renewed_at_unix_ms: u64,
@@ -443,6 +526,7 @@ pub fn status_entries() -> Vec<LeaseStatusEntry> {
             lease_id: lease.lease_id.clone(),
             kind: lease.kind.clone(),
             label: lease.label.clone(),
+            mode: lease.mode,
             granted_by: lease.granted_by.clone(),
             granted_at_unix_ms: lease.granted_at_unix_ms,
             renewed_at_unix_ms: lease.renewed_at_unix_ms,
@@ -527,6 +611,7 @@ mod tests {
             "api_key:anthropic",
             "Personal Anthropic",
             "sk-ant-lease-material",
+            None,
             "connect:alice",
             None,
             None,
@@ -559,13 +644,13 @@ mod tests {
     fn regrant_replaces_and_unknown_kinds_are_refused() {
         let _guard = lock();
         reset();
-        grant("api_key:openai", "a", "first", "root", None, None).unwrap();
-        let outcome = grant("api_key:openai", "b", "second", "root", None, None).unwrap();
+        grant("api_key:openai", "a", "first", None, "root", None, None).unwrap();
+        let outcome = grant("api_key:openai", "b", "second", None, "root", None, None).unwrap();
         assert!(outcome.replaced);
         assert_eq!(leased_secret("api_key:openai").as_deref(), Some("second"));
 
-        assert!(grant("api_key:mystery", "x", "y", "root", None, None).is_err());
-        assert!(grant("api_key:gemini", "x", "", "root", None, None).is_err());
+        assert!(grant("api_key:mystery", "x", "y", None, "root", None, None).is_err());
+        assert!(grant("api_key:gemini", "x", "", None, "root", None, None).is_err());
         reset();
     }
 
@@ -577,6 +662,7 @@ mod tests {
             "api_key:gemini",
             "Gemini",
             "gm-key",
+            None,
             "root",
             Some(0), // clamps to MIN_TTL_MS
             Some(0), // offline 0: dies one TTL after the last renewal
@@ -594,7 +680,7 @@ mod tests {
         assert!(note.contains("api_key:gemini"), "{note}");
 
         // A fresh grant clears the tombstone.
-        grant("api_key:gemini", "Gemini", "gm-key-2", "root", None, None).unwrap();
+        grant("api_key:gemini", "Gemini", "gm-key-2", None, "root", None, None).unwrap();
         assert!(expired_lease_note().is_none());
         reset();
     }
@@ -641,6 +727,114 @@ mod tests {
     }
 
     #[test]
+    fn access_token_mode_is_fail_closed_about_refresh_tokens() {
+        let _guard = lock();
+        reset();
+        // Material still carrying durable authority must be refused —
+        // whichever oauth kind's field it hides in.
+        let err = grant(
+            "oauth:codex",
+            "Codex",
+            r#"{"tokens":{"access_token":"at","refresh_token":"rt"}}"#,
+            Some("access_token"),
+            "root",
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("refresh token"), "{err}");
+        let err = grant(
+            "oauth:claude-code",
+            "Claude",
+            r#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt"}}"#,
+            Some("access_token"),
+            "root",
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("refresh token"), "{err}");
+        // A durable API key riding in the codex auth file is refused too.
+        let err = grant(
+            "oauth:codex",
+            "Codex",
+            r#"{"OPENAI_API_KEY":"sk-live","tokens":{"access_token":"at"}}"#,
+            Some("access_token"),
+            "root",
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("API key"), "{err}");
+        // Uninspectable material cannot prove it is refresh-free.
+        assert!(grant(
+            "oauth:codex",
+            "Codex",
+            "not json",
+            Some("access_token"),
+            "root",
+            None,
+            None
+        )
+        .is_err());
+        assert!(grant(
+            "oauth:codex",
+            "Codex",
+            r#"{"tokens":{}}"#,
+            Some("sideways"),
+            "root",
+            None,
+            None
+        )
+        .is_err());
+
+        // A stripped auth file passes: refresh field absent or empty
+        // (empty keeps the child agent's deserializer happy). Success
+        // paths use resolve_mode directly — an oauth grant() would
+        // materialize into the real ~/.intendant.
+        assert_eq!(
+            resolve_mode(
+                "oauth:codex",
+                Some("access_token"),
+                r#"{"tokens":{"access_token":"at","refresh_token":""}}"#,
+            ),
+            Ok(LeaseMode::OauthAccessToken)
+        );
+        assert_eq!(
+            resolve_mode(
+                "oauth:claude-code",
+                Some("access_token"),
+                r#"{"claudeAiOauth":{"accessToken":"at"}}"#,
+            ),
+            Ok(LeaseMode::OauthAccessToken)
+        );
+        // Omitting the mode keeps the pre-split meaning: full credential.
+        assert_eq!(
+            resolve_mode(
+                "oauth:claude-code",
+                None,
+                r#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt"}}"#,
+            ),
+            Ok(LeaseMode::OauthFullCredential)
+        );
+
+        // API-key kinds have no mode split; the label is implicit, and
+        // the status entry carries it through.
+        grant("api_key:gemini", "g", "gm", Some("access_token"), "root", None, None).unwrap();
+        assert_eq!(
+            status_entries()
+                .into_iter()
+                .find(|entry| entry.kind == "api_key:gemini")
+                .unwrap()
+                .mode
+                .as_str(),
+            "api_key"
+        );
+        revoke(None);
+        reset();
+    }
+
+    #[test]
     fn provider_api_key_prefers_active_lease() {
         let _guard = lock();
         reset();
@@ -648,6 +842,7 @@ mod tests {
             "api_key:anthropic",
             "Work",
             "sk-ant-from-lease",
+            None,
             "root",
             None,
             None,

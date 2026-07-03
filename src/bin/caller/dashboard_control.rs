@@ -2349,6 +2349,10 @@ fn control_frame_response(
                     let material = params_ref
                         .and_then(|p| optional_string_param(p, &["material", "secret"]))
                         .unwrap_or_default();
+                    // Oauth kinds only: "access_token" (browser-refreshed,
+                    // refresh token never leaves the vault) vs the
+                    // "full_credential" opt-in; omitted means full.
+                    let mode = params_ref.and_then(|p| optional_string_param(p, &["mode"]));
                     let ttl_ms = match params_ref {
                         Some(p) => match optional_u64_param(p, &["ttl_ms"]) {
                             Ok(value) => value,
@@ -2372,6 +2376,7 @@ fn control_frame_response(
                             &kind,
                             &label,
                             &material,
+                            mode.as_deref(),
                             runtime.grant.label(),
                             ttl_ms,
                             offline_ms,
@@ -2437,6 +2442,7 @@ fn control_frame_response(
                                 "lease_id": entry.lease_id,
                                 "kind": entry.kind,
                                 "label": entry.label,
+                                "mode": entry.mode.as_str(),
                                 "granted_by": entry.granted_by,
                                 "granted_at_unix_ms": entry.granted_at_unix_ms,
                                 "renewed_at_unix_ms": entry.renewed_at_unix_ms,
