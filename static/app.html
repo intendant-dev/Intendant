@@ -14944,6 +14944,179 @@ async function vaultMigrateVoiceKeys() {
   renderAccessVaultSection();
 }
 
+/* ── Fueling: vault entries → credential leases on this daemon ──
+   The connected daemon borrows credentials over the verified tunnel:
+   grants carry the material + TTL + offline window, this tab renews
+   every 5 minutes while attached, and the offline knob decides how long
+   the daemon keeps working after the last fueling session detaches. */
+
+const VAULT_LEASE_TTL_MS = 15 * 60 * 1000;
+const VAULT_LEASE_RENEW_EVERY_MS = 5 * 60 * 1000;
+const VAULT_OFFLINE_CHOICES = [
+  [0, 'while connected only'],
+  [60 * 60 * 1000, '1 hour offline'],
+  [24 * 60 * 60 * 1000, '24 hours offline'],
+  [72 * 60 * 60 * 1000, '3 days offline'],
+];
+const VAULT_OFFLINE_DEFAULT_MS = 24 * 60 * 60 * 1000;
+
+const vaultLeaseState = {
+  supported: null,   // null until first probe; false when the daemon lacks the RPCs / gate
+  leases: [],
+  expiredNote: '',
+  lastError: '',
+  fetchedAt: 0,
+  busy: false,
+};
+const vaultOwnLeaseIds = new Set(); // leases granted by this tab — the ones we renew
+let vaultRenewTimer = null;
+
+function vaultLeaseDaemonKey(suffix) {
+  return `intendant_vault_${suffix}_${DASHBOARD_CONNECT_DAEMON_ID || 'local'}`;
+}
+
+function vaultOfflineMs() {
+  const raw = Number(localStorage.getItem(vaultLeaseDaemonKey('offline_ms')));
+  return Number.isFinite(raw) && raw >= 0 ? raw : VAULT_OFFLINE_DEFAULT_MS;
+}
+
+function vaultSetOfflineMs(value) {
+  localStorage.setItem(vaultLeaseDaemonKey('offline_ms'), String(value));
+}
+
+/* Full-credential OAuth leases are an explicit per-daemon opt-in (the
+   sign-off default is OFF): leasing a pasted auth-file JSON hands the
+   daemon durable authority for the lease window. */
+function vaultOauthLeasesEnabled() {
+  return localStorage.getItem(vaultLeaseDaemonKey('oauth_leases')) === 'true';
+}
+
+function vaultSetOauthLeasesEnabled(enabled) {
+  localStorage.setItem(vaultLeaseDaemonKey('oauth_leases'), enabled ? 'true' : 'false');
+}
+
+function vaultLeaseTransportReady() {
+  if (!DASHBOARD_CONNECT_MODE) return false;
+  try {
+    const status = window.intendantDashboardControl?.status?.();
+    return Boolean(status?.connected && status?.verifiedBinding?.ok);
+  } catch {
+    return false;
+  }
+}
+
+function vaultLeaseRpc(method, params = {}) {
+  return window.intendantDashboardControl.request(method, params, { timeoutMs: 15000 });
+}
+
+/* The lease kind a vault entry fuels, or null when it cannot fuel. */
+function vaultEntryLeaseKind(entry) {
+  if (!entry || !entry.secret) return null;
+  if (entry.kind === 'api_key' && ['anthropic', 'openai', 'gemini'].includes(entry.provider)) {
+    return `api_key:${entry.provider}`;
+  }
+  if (entry.kind === 'oauth' && ['codex', 'claude-code'].includes(entry.provider)) {
+    return `oauth:${entry.provider}`;
+  }
+  return null;
+}
+
+async function vaultRefreshLeases({ force = false } = {}) {
+  if (!vaultLeaseTransportReady()) return;
+  if (!force && Date.now() - vaultLeaseState.fetchedAt < 30_000) return;
+  try {
+    const result = await vaultLeaseRpc('api_credential_lease_status');
+    vaultLeaseState.supported = true;
+    vaultLeaseState.leases = Array.isArray(result?.leases) ? result.leases : [];
+    vaultLeaseState.expiredNote = String(result?.expired_note || '');
+    vaultLeaseState.lastError = '';
+    vaultLeaseState.fetchedAt = Date.now();
+    for (const id of Array.from(vaultOwnLeaseIds)) {
+      if (!vaultLeaseState.leases.some(lease => lease.lease_id === id)) vaultOwnLeaseIds.delete(id);
+    }
+  } catch (err) {
+    const message = String(err?.message || err);
+    // A daemon predating the lease RPCs, or a session without the
+    // credentials.manage gate, reads as unsupported rather than broken.
+    vaultLeaseState.supported = false;
+    vaultLeaseState.lastError = message;
+    vaultLeaseState.fetchedAt = Date.now();
+  }
+  renderAccessVaultSection();
+}
+
+async function vaultFuelEntry(entry) {
+  const kind = vaultEntryLeaseKind(entry);
+  if (!kind) return;
+  vaultLeaseState.lastError = '';
+  vaultLeaseState.busy = true;
+  renderAccessVaultSection();
+  try {
+    const result = await vaultLeaseRpc('api_credential_lease_grant', {
+      kind,
+      label: entry.label || vaultProviderLabel(entry.provider),
+      material: String(entry.secret),
+      ttl_ms: VAULT_LEASE_TTL_MS,
+      offline_ms: vaultOfflineMs(),
+    });
+    if (result?.lease_id) {
+      vaultOwnLeaseIds.add(result.lease_id);
+      vaultEnsureRenewLoop();
+    }
+    await vaultRefreshLeases({ force: true });
+  } catch (err) {
+    vaultLeaseState.lastError = `Fueling failed: ${err?.message || err}`;
+  } finally {
+    vaultLeaseState.busy = false;
+    renderAccessVaultSection();
+  }
+}
+
+async function vaultRevokeLease(leaseId) {
+  vaultLeaseState.lastError = '';
+  try {
+    await vaultLeaseRpc('api_credential_lease_revoke', { lease_id: leaseId });
+    vaultOwnLeaseIds.delete(leaseId);
+    await vaultRefreshLeases({ force: true });
+  } catch (err) {
+    vaultLeaseState.lastError = `Revocation failed: ${err?.message || err}`;
+    renderAccessVaultSection();
+  }
+}
+
+/* Connected renewal: every granting tab renews its own leases while the
+   tunnel is up; a failed renewal (revoked elsewhere, expiry, detach)
+   just drops the lease from this tab's renew set. */
+function vaultEnsureRenewLoop() {
+  if (vaultRenewTimer || !vaultOwnLeaseIds.size) return;
+  vaultRenewTimer = window.setInterval(async () => {
+    if (!vaultOwnLeaseIds.size) {
+      window.clearInterval(vaultRenewTimer);
+      vaultRenewTimer = null;
+      return;
+    }
+    if (!vaultLeaseTransportReady()) return;
+    for (const leaseId of Array.from(vaultOwnLeaseIds)) {
+      try {
+        await vaultLeaseRpc('api_credential_lease_renew', { lease_id: leaseId });
+      } catch (err) {
+        console.warn(`[vault] lease renewal failed for ${leaseId}:`, err?.message || err);
+        vaultOwnLeaseIds.delete(leaseId);
+      }
+    }
+    vaultRefreshLeases({ force: true }).catch(() => {});
+  }, VAULT_LEASE_RENEW_EVERY_MS);
+}
+
+function vaultLeaseExpiryText(lease) {
+  const remaining = Number(lease.expires_at_unix_ms || 0) - Date.now();
+  if (remaining <= 0) return 'expiring';
+  if (remaining < 90 * 1000) return 'expires in under 2 min';
+  if (remaining < 60 * 60 * 1000) return `expires in ${Math.round(remaining / 60000)} min`;
+  if (remaining < 48 * 60 * 60 * 1000) return `expires in ${Math.round(remaining / 3600000)} h`;
+  return `expires in ${Math.round(remaining / 86400000)} d`;
+}
+
 /* ── Vault UI (Access → Advanced) ── */
 
 function vaultProviderLabel(provider) {
