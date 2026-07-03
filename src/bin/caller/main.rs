@@ -1106,10 +1106,10 @@ fn parse_session_diff_file_paths(log_dir: &Path) -> Vec<String> {
 fn resolve_diff_file_path(project_root: &Path, display_path: &str) -> Option<PathBuf> {
     let path = Path::new(display_path);
     if path.is_absolute() {
-        return (path.starts_with(project_root)
-            || path.starts_with("/tmp")
-            || path.starts_with("/private/tmp"))
-        .then(|| path.to_path_buf());
+        let allowed = path.starts_with(project_root)
+            || path.starts_with(std::env::temp_dir())
+            || (cfg!(unix) && (path.starts_with("/tmp") || path.starts_with("/private/tmp")));
+        return allowed.then(|| path.to_path_buf());
     }
 
     if path.components().any(|component| {
@@ -19861,17 +19861,34 @@ diff --git a/two.rs b/two.rs
 
     #[test]
     fn resolve_diff_file_path_allows_project_and_tmp_absolute_paths() {
-        let project_root = Path::new("/work/project");
+        // Platform-absolute fixture paths: `/work/project` is not absolute
+        // on Windows, so prefix a drive there.
+        fn abs(p: &str) -> PathBuf {
+            if cfg!(windows) {
+                PathBuf::from(format!("C:{}", p.replace('/', "\\")))
+            } else {
+                PathBuf::from(p)
+            }
+        }
+        let project_root = abs("/work/project");
+        let inside = abs("/work/project/src/main.rs");
         assert_eq!(
-            resolve_diff_file_path(project_root, "/work/project/src/main.rs").unwrap(),
-            PathBuf::from("/work/project/src/main.rs")
+            resolve_diff_file_path(&project_root, inside.to_str().unwrap()).unwrap(),
+            inside
         );
+        let temp_file = std::env::temp_dir().join("intendant-edit.txt");
         assert_eq!(
-            resolve_diff_file_path(project_root, "/tmp/intendant-edit.txt").unwrap(),
+            resolve_diff_file_path(&project_root, temp_file.to_str().unwrap()).unwrap(),
+            temp_file
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            resolve_diff_file_path(&project_root, "/tmp/intendant-edit.txt").unwrap(),
             PathBuf::from("/tmp/intendant-edit.txt")
         );
-        assert!(resolve_diff_file_path(project_root, "/etc/passwd").is_none());
-        assert!(resolve_diff_file_path(project_root, "../outside.txt").is_none());
+        let outside = abs("/etc/passwd");
+        assert!(resolve_diff_file_path(&project_root, outside.to_str().unwrap()).is_none());
+        assert!(resolve_diff_file_path(&project_root, "../outside.txt").is_none());
     }
 
     #[test]

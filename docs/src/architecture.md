@@ -19,7 +19,7 @@ supervisor** that owns the lifecycle of every session launched at runtime.
 │ intendant-runtime │◀────────┤     ├─ ratatui TUI    ─┐                        │
 │  (sandboxed exec) │  Agent  │     ├─ Web dashboard  ─┤ ControlMsg            │
 │                   │  Input  │     ├─ MCP server      ─┤  (intents)            │
-│  - Landlock (Lx)  │  (JSON) │     └─ Control socket  ─┘     │                 │
+│  - OS sandbox     │  (JSON) │     └─ Control socket  ─┘     │                 │
 │  - no API keys    │────────▶│                                ▼                 │
 │  - exec/edit/PTY  │ results │            ┌──────────────────────────────┐    │
 │  - screenshot     │         │            │          EventBus            │    │
@@ -66,7 +66,8 @@ Two facts about this diagram drive everything below:
 The two-binary split is a deliberate security boundary:
 
 - **intendant-runtime** executes arbitrary shell commands but runs under
-  Landlock filesystem restrictions (Linux) and **never holds API keys**. It
+  OS filesystem restrictions (Landlock on Linux, Seatbelt on macOS, restricted
+  tokens on Windows) and **never holds API keys**. It
   reads JSON commands from stdin, executes them sequentially, and writes results
   to stdout.
 - **intendant** (the controller) holds API keys and manages model conversations

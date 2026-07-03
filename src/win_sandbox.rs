@@ -15,12 +15,25 @@
 //!   allowed write roots; everything else stays readable, nothing else is
 //!   writable.
 //! - **Full restriction** (the scoped-shell posture — deny-by-default):
-//!   restricting SIDs `[RESTRICTED, ALL APPLICATION PACKAGES]` apply to
-//!   every access. System directories (`C:\Windows`, `Program Files`) and
-//!   HKLM carry AAP read ACEs out of the box (AppContainer support) so the
-//!   shell can start; user profiles carry no AAP ACE, so `%USERPROFILE%`
-//!   and every other profile read as denied; stamped `RESTRICTED` ACEs on
-//!   the scope roots open exactly the granted subtrees.
+//!   restricting SIDs `[RESTRICTED, BUILTIN\Users, Everyone]` apply to
+//!   every access. System directories carry `Users` read ACEs so the shell
+//!   can start; `Everyone` covers device objects (`NUL`, `CON` — every
+//!   shell redirect needs them); user profiles carry neither, so
+//!   `%USERPROFILE%` and every other profile read as denied; stamped
+//!   `RESTRICTED` ACEs on the scope roots open exactly the granted
+//!   subtrees. Accepted surface: `Users`-writable OS spots (directory
+//!   creation at `C:\`, parts of `ProgramData`) remain writable — user
+//!   data does not.
+//!
+//! Both postures also pass `DISABLE_MAX_PRIVILEGE`: restricted tokens keep
+//! the parent's privileges unless told otherwise, and elevated parents
+//! (OpenSSH admin sessions run with everything enabled) would hand the
+//! sandbox `SeBackupPrivilege` / `SeRestorePrivilege` — which bypass DACLs
+//! entirely for backup-intent opens (`FindFirstFile` enumerates directories
+//! that way, so `dir %USERPROFILE%` walks straight through the restricting
+//! SIDs) — plus `SeDebugPrivilege` and worse. The flag strips every
+//! privilege except `SeChangeNotifyPrivilege`, whose traverse-bypass the
+//! allowlist model needs (verified by unit test).
 //!
 //! ACL stamping mutates the target directories' DACLs, so every grant is
 //! paired with removal (exact-ACE match, not trustee-wide revocation) and
@@ -54,11 +67,13 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{
     AclSizeInformation, CreateRestrictedToken, CreateWellKnownSid, DeleteAce, EqualSid, GetAce,
-    GetAclInformation, WinBuiltinAnyPackageSid, WinRestrictedCodeSid, ACCESS_ALLOWED_ACE,
+    GetAclInformation, WinBuiltinUsersSid, WinRestrictedCodeSid, WinWorldSid,
+    ACCESS_ALLOWED_ACE,
     ACE_FLAGS, ACL as WIN_ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
-    CREATE_RESTRICTED_TOKEN_FLAGS, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
-    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, WELL_KNOWN_SID_TYPE, WRITE_RESTRICTED,
+    DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+    DISABLE_MAX_PRIVILEGE, PSECURITY_DESCRIPTOR, PSID, SECURITY_MAX_SID_SIZE,
+    SID_AND_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
+    WRITE_RESTRICTED,
 };
 use windows::Win32::Storage::FileSystem::{
     DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -610,30 +625,52 @@ fn create_restricted_token(restriction: TokenRestriction) -> Result<OwnedHandle,
     let primary = OwnedHandle(primary);
 
     let restricted_sid = Sid::well_known(WinRestrictedCodeSid)?;
-    let packages_sid = Sid::well_known(WinBuiltinAnyPackageSid)?;
-    let mut restricting: Vec<SID_AND_ATTRIBUTES> = vec![SID_AND_ATTRIBUTES {
-        Sid: restricted_sid.as_psid(),
-        Attributes: 0,
-    }];
+    let world_sid = Sid::well_known(WinWorldSid)?;
+    let users_sid = Sid::well_known(WinBuiltinUsersSid)?;
+    // Everyone (World) rides along in BOTH postures for device objects:
+    // without it, opening `NUL`/`CON` fails the restricting-SID pass and
+    // every `>nul` redirect in shell commands dies (probed on Server 2022).
+    // Everyone-write ACEs on the default filesystem are essentially absent,
+    // so this reopens devices, not user data. (ALL APPLICATION PACKAGES
+    // would have been a tighter read carrier than Users for the full
+    // posture, but the kernel rejects capability SIDs in SidsToRestrict —
+    // ERROR_INVALID_PARAMETER.)
+    let mut restricting: Vec<SID_AND_ATTRIBUTES> = vec![
+        SID_AND_ATTRIBUTES {
+            Sid: restricted_sid.as_psid(),
+            Attributes: 0,
+        },
+        SID_AND_ATTRIBUTES {
+            Sid: world_sid.as_psid(),
+            Attributes: 0,
+        },
+    ];
+    // DISABLE_MAX_PRIVILEGE in both postures: the parent may be elevated
+    // (an OpenSSH admin session has SeBackup/SeRestore/SeDebug/… ENABLED),
+    // and restricted tokens inherit privileges verbatim. SeBackupPrivilege
+    // alone defeats the DACL for reads — FindFirstFile opens directories
+    // with backup intent, so profile listing sails past the restricting
+    // SIDs; SeRestorePrivilege is the write-side twin. The flag deletes
+    // everything except SeChangeNotifyPrivilege (traverse-bypass), which
+    // path traversal to the granted roots relies on.
     let flags = match restriction {
-        TokenRestriction::WriteOnly => WRITE_RESTRICTED,
+        TokenRestriction::WriteOnly => WRITE_RESTRICTED | DISABLE_MAX_PRIVILEGE,
         TokenRestriction::Full => {
-            // ALL APPLICATION PACKAGES in the restricting set is what lets
-            // the shell read system directories and HKLM (they carry AAP
-            // read ACEs for AppContainer support) while user profiles stay
-            // denied. AAP beats BUILTIN\Users here: Users additionally
-            // holds create-directory/write ACEs on C:\ and parts of
-            // ProgramData (probed on Server 2022), which would let a
-            // scoped shell write outside its roots; AAP is read-only
-            // everywhere it appears and absent from those spots entirely.
-            // Path traversal through unreadable intermediate directories
-            // still works via SeChangeNotifyPrivilege, which restricted
-            // tokens keep.
+            // BUILTIN\Users is the system-read carrier: C:\Windows and
+            // Program Files ACL it read+execute, user profiles never do —
+            // so the shell starts while %USERPROFILE% and every other
+            // profile stay denied. KNOWN, ACCEPTED SURFACE: Users also
+            // holds create-directory ACEs on C:\ and write ACEs on parts
+            // of ProgramData, so a scoped shell can write those OS-shared
+            // spots (which any unsandboxed user code can write anyway).
+            // User data stays sealed; path traversal through unreadable
+            // intermediate dirs works via SeChangeNotifyPrivilege, which
+            // restricted tokens keep.
             restricting.push(SID_AND_ATTRIBUTES {
-                Sid: packages_sid.as_psid(),
+                Sid: users_sid.as_psid(),
                 Attributes: 0,
             });
-            CREATE_RESTRICTED_TOKEN_FLAGS(0)
+            DISABLE_MAX_PRIVILEGE
         }
     };
 
@@ -918,18 +955,72 @@ fn which_shell(shell: &str) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
-    fn run_under(
-        restriction: TokenRestriction,
-        script: &str,
-    ) -> (i32, String) {
+    /// The grant table, journal file, and temp-dir ACEs are process-global
+    /// — these tests must not interleave.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The restricted token must carry exactly one privilege —
+    /// `SeChangeNotifyPrivilege`. Anything else surviving from an elevated
+    /// parent (SeBackup/SeRestore/SeDebug/…) reopens kernel DACL bypasses
+    /// the restricting SIDs never see.
+    fn assert_privileges_stripped(restriction: TokenRestriction) {
+        use windows::core::w;
+        use windows::Win32::Foundation::LUID;
+        use windows::Win32::Security::{
+            GetTokenInformation, LookupPrivilegeValueW, TokenPrivileges, TOKEN_PRIVILEGES,
+        };
         let token = create_restricted_token(restriction).expect("token");
-        let cmd = std::env::var("ComSpec").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string());
+        let mut len = 0u32;
+        // SAFETY: sizing call; failure expected (insufficient buffer).
+        unsafe {
+            let _ = GetTokenInformation(token.0, TokenPrivileges, None, 0, &mut len);
+        }
+        let mut buf = vec![0u8; len as usize];
+        // SAFETY: buf is len bytes, written by the call.
+        unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenPrivileges,
+                Some(buf.as_mut_ptr() as *mut _),
+                len,
+                &mut len,
+            )
+        }
+        .expect("query token privileges");
+        // SAFETY: buffer holds a TOKEN_PRIVILEGES written by the kernel.
+        let privs = unsafe { &*(buf.as_ptr() as *const TOKEN_PRIVILEGES) };
+        let mut change_notify = LUID::default();
+        // SAFETY: out-pointer valid; the privilege name is a static wide string.
+        unsafe {
+            LookupPrivilegeValueW(PCWSTR::null(), w!("SeChangeNotifyPrivilege"), &mut change_notify)
+        }
+        .expect("lookup SeChangeNotifyPrivilege");
+        for i in 0..privs.PrivilegeCount as usize {
+            // SAFETY: Privileges is a flexible array with PrivilegeCount entries.
+            let la = unsafe { *privs.Privileges.as_ptr().add(i) };
+            assert!(
+                la.Luid.LowPart == change_notify.LowPart
+                    && la.Luid.HighPart == change_notify.HighPart,
+                "privilege LUID {}:{} survived token restriction",
+                la.Luid.HighPart,
+                la.Luid.LowPart
+            );
+        }
+    }
+
+    fn run_under(restriction: TokenRestriction, script: &str) -> (i32, String) {
+        let token = create_restricted_token(restriction).expect("token");
+        let cmd = std::env::var("ComSpec")
+            .unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string());
         let out = std::env::temp_dir().join(format!("win-sbx-out-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&out);
         // cmd.exe writes the script's combined output to a file we read
         // back — the restricted child shares our console, so capturing via
         // std handles would interleave with the test harness.
-        let cmdline = format!("\"{cmd}\" /d /s /c \"({script}) > \"{}\" 2>&1\"", out.display());
+        let cmdline = format!(
+            "\"{cmd}\" /d /s /c \"({script}) > \"{}\" 2>&1\"",
+            out.display()
+        );
         let (process, _job) =
             spawn_restricted(&token, Path::new(&cmd), std::ffi::OsStr::new(&cmdline), None)
                 .expect("spawn");
@@ -939,14 +1030,10 @@ mod tests {
         (code, text)
     }
 
-    /// WRITE_RESTRICTED + a stamped write grant = the Landlock/Seatbelt
-    /// write-only posture, proven against the real kernel: writes inside
-    /// the granted root succeed, writes outside are denied, reads stay
-    /// open. NOTE: the output-capture file lives in %TEMP%, which the
-    /// write-restricted child can only reach through the grant — so the
-    /// "outside" probe targets the user profile instead.
     #[test]
     fn write_restricted_token_confines_writes_to_granted_paths() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert_privileges_stripped(TokenRestriction::WriteOnly);
         let root = std::env::temp_dir().join(format!("win-sbx-wr-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("mkdir");
         // Grant the whole temp dir: the capture file needs it, and the
@@ -977,10 +1064,16 @@ mod tests {
     /// after the grant drops to refcount zero the root is denied again.
     #[test]
     fn full_restriction_denies_profile_and_honors_scoped_grants() {
-        let scope = std::env::temp_dir().join(format!("win-sbx-full-{}", std::process::id()));
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert_privileges_stripped(TokenRestriction::Full);
+        // The scope lives INSIDE the denied profile: its stamped grant —
+        // not inheritance from the temp-dir grant that keeps the output
+        // capture writable — is what opens it, and reaching it exercises
+        // traverse-through-denied-parents (SeChangeNotifyPrivilege).
+        let profile = std::env::var("USERPROFILE").expect("USERPROFILE");
+        let scope = Path::new(&profile).join(format!("win-sbx-full-{}", std::process::id()));
         std::fs::create_dir_all(&scope).expect("mkdir");
         std::fs::write(scope.join("inside.txt"), "inside_ok_9282").expect("write");
-        let profile = std::env::var("USERPROFILE").expect("USERPROFILE");
 
         // Overlapping guards: the grant must survive the first drop.
         let g1 = AceGuard::stamp(&[scope.clone()], &[std::env::temp_dir()]).expect("stamp1");
@@ -1018,6 +1111,7 @@ mod tests {
     /// is replayed and removed.
     #[test]
     fn journal_tracks_grants_and_sweep_skips_live_owners() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = journal_dir();
         let scope = std::env::temp_dir().join(format!("win-sbx-jrnl-{}", std::process::id()));
         std::fs::create_dir_all(&scope).expect("mkdir");
@@ -1048,4 +1142,5 @@ mod tests {
         assert!(pid_alive(std::process::id()));
         let _ = std::fs::remove_dir_all(&scope);
     }
+
 }

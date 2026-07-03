@@ -1734,6 +1734,13 @@ mod fs_scope_grant_tests {
 
     #[test]
     fn user_client_grant_resolves_fs_scope_and_owner_paths_stay_open() {
+        // Platform-absolute fixture path: `/srv/shared` is not absolute on
+        // Windows, so prefix a drive and flip separators there.
+        let srv_shared = if cfg!(windows) {
+            "C:\\srv\\shared"
+        } else {
+            "/srv/shared"
+        };
         let mut state = crate::access::iam::LocalIamState::default();
         let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
             "test",
@@ -1745,7 +1752,7 @@ mod fs_scope_grant_tests {
                 kind: "browser_certificate".to_string(),
                 fingerprint: Some("AA:11".to_string()),
                 role_id: Some("role:files-read".to_string()),
-                fs_read_roots: vec!["/srv/shared".to_string()],
+                fs_read_roots: vec![srv_shared.to_string()],
                 ..Default::default()
             },
             &actor,
@@ -1763,10 +1770,7 @@ mod fs_scope_grant_tests {
             iam_state: state.clone(),
         };
         let scope = scoped.filesystem().expect("scoped grant exposes fs scope");
-        assert_eq!(
-            scope.read_roots,
-            vec![std::path::PathBuf::from("/srv/shared")]
-        );
+        assert_eq!(scope.read_roots, vec![std::path::PathBuf::from(srv_shared)]);
 
         // Owner surfaces stay unrestricted.
         assert!(DashboardControlGrant::TrustedLocal.filesystem().is_none());

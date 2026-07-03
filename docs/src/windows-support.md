@@ -265,8 +265,22 @@ than a panic or silent no-op.
 - **No virtual-display equivalent.** There is no Windows analogue of Xvfb, so
   the lazily-launched virtual displays the Linux pipeline uses do not exist on
   Windows. Capture targets the real interactive desktop only.
-- **Landlock sandboxing is Linux-only.** The `--sandbox` filesystem-restriction
-  flag has no effect on Windows (it is a Linux LSM feature).
+- **Filesystem sandboxing uses restricted tokens.** `--sandbox` and scoped
+  shells work on Windows, enforced by `CreateRestrictedToken` plus temporary
+  ACL entries for the `RESTRICTED` SID (S-1-5-12) on the granted roots
+  (`win_sandbox.rs`) — the Windows twin of Landlock (Linux) and Seatbelt
+  (macOS). The runtime re-execs itself under a `WRITE_RESTRICTED` token
+  (reads open, writes confined); scoped shells run under a fully-restricted
+  token (deny-by-default; system dirs readable via `BUILTIN\Users`, devices
+  via `Everyone`). Both postures strip every token privilege except
+  `SeChangeNotifyPrivilege` — otherwise elevated parents (e.g. OpenSSH admin
+  sessions) would leak `SeBackup`/`SeRestore` into the sandbox, whose
+  backup-intent opens (`FindFirstFile` enumerates directories that way)
+  bypass DACLs entirely. Grant ACEs are refcounted and journaled to disk
+  before stamping; a crashed daemon's leftover grants are swept on the next
+  start. Accepted surface: `Users`-writable OS spots (directory creation at
+  `C:\`, parts of `ProgramData`) stay writable inside scoped shells — user
+  profiles do not.
 
 ## See Also
 

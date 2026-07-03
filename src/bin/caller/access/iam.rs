@@ -3743,6 +3743,16 @@ mod tests {
         );
     }
 
+    /// Platform-absolute fixture path: `/srv/data` is not absolute on
+    /// Windows, so prefix a drive and flip separators there.
+    fn abs_root(p: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{}", p.replace('/', "\\"))
+        } else {
+            p.to_string()
+        }
+    }
+
     #[test]
     fn fs_scope_is_stored_normalized_and_resolvable() {
         let mut state = LocalIamState::default();
@@ -3754,21 +3764,24 @@ mod tests {
                 fingerprint: Some("AA:BB".to_string()),
                 role_id: Some("role:files-read".to_string()),
                 fs_read_roots: vec![
-                    "/srv/data".to_string(),
-                    "  /srv/data  ".to_string(),
+                    abs_root("/srv/data"),
+                    format!("  {}  ", abs_root("/srv/data")),
                     String::new(),
                 ],
-                fs_write_roots: vec!["/srv/data/inbox".to_string()],
+                fs_write_roots: vec![abs_root("/srv/data/inbox")],
                 ..Default::default()
             },
             &actor,
         )
         .unwrap();
         let scope = result.grant.fs_scope.as_ref().expect("scope stored");
-        assert_eq!(scope.read_roots, vec![std::path::PathBuf::from("/srv/data")]);
+        assert_eq!(
+            scope.read_roots,
+            vec![std::path::PathBuf::from(abs_root("/srv/data"))]
+        );
         assert_eq!(
             scope.write_roots,
-            vec![std::path::PathBuf::from("/srv/data/inbox")]
+            vec![std::path::PathBuf::from(abs_root("/srv/data/inbox"))]
         );
         let principal = AccessPrincipal {
             grant_id: Some(result.grant.id.clone()),
@@ -3803,7 +3816,7 @@ mod tests {
             UserClientGrantUpsertRequest {
                 kind: "browser_certificate".to_string(),
                 fingerprint: Some("CC:DD".to_string()),
-                fs_read_roots: vec!["/tmp/scoped".to_string()],
+                fs_read_roots: vec![abs_root("/tmp/scoped")],
                 ..Default::default()
             },
             &actor,
