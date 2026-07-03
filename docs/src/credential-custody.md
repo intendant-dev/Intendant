@@ -233,7 +233,9 @@ secrets, installs nothing on the user's device, and takes about ninety
 seconds from a phone:
 
 1. **Install**: `curl -fsSL https://intendant.dev/install.sh | sh -s --
-   --owner <client-key-fingerprint>` on the fresh box. The fingerprint
+   --owner <client-key-fingerprint>` on the fresh box (every rendezvous —
+   hosted or self-run — serves its own version-matched installer at
+   `/install.sh`). The fingerprint
    is public (shown in the Access drawer); the daemon boots with an
    owner grant pinned to that browser key — authority minted locally, as
    always. Nothing sensitive appears in the command or on the wire.

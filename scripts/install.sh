@@ -1,5 +1,6 @@
 #!/bin/sh
 # Intendant bootstrap installer (credential custody, rollout step 6).
+# Served by every Intendant Connect rendezvous at /install.sh.
 #
 #   curl -fsSL https://intendant.dev/install.sh | sh -s -- \
 #     --owner <client-key-fingerprint> [--connect <rendezvous-url>] [--no-run]
