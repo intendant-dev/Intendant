@@ -241,7 +241,7 @@ impl DashboardControlGrant {
         }
     }
 
-    fn filesystem(&self) -> Option<&crate::peer::access_policy::FilesystemAccessPolicy> {
+    pub(crate) fn filesystem(&self) -> Option<&crate::peer::access_policy::FilesystemAccessPolicy> {
         match self {
             // TrustedLocal is the owner's own dashboard; a root client key
             // is equivalent. Scoping applies to granted principals.
@@ -2952,24 +2952,28 @@ fn control_terminal_open_frame(
     let terminal_events_tx = terminal_events_tx.clone();
     // Attach needs only the terminal.view floor already enforced by the
     // frame table; creating a shell needs shell.spawn, decided at frame
-    // time so expiry mid-connection is honored.
+    // time so expiry mid-connection is honored. A grant-level fs scope
+    // makes the new shell a sandboxed one.
     let actor = runtime.grant.terminal_actor();
-    let may_spawn = runtime_operation_decision(
-        runtime,
-        crate::peer::access_policy::PeerOperation::ShellSpawn,
-    )
-    .allowed;
-    let shared = frame
-        .get("shared")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
+    let spawn_policy = crate::terminal::ShellSpawnPolicy {
+        may_spawn: runtime_operation_decision(
+            runtime,
+            crate::peer::access_policy::PeerOperation::ShellSpawn,
+        )
+        .allowed,
+        shared: frame
+            .get("shared")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        scope: runtime.grant.filesystem().cloned(),
+    };
     let handle = tokio::spawn(async move {
         let key = crate::terminal::TerminalKey {
             host_id: host_id.clone(),
             terminal_id: terminal_id.clone(),
         };
         match registry
-            .open_or_attach(key, cols, rows, &actor, may_spawn, shared)
+            .open_or_attach(key, cols, rows, &actor, spawn_policy)
             .await
         {
             Ok((session, _created)) => {

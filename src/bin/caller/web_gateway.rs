@@ -20808,22 +20808,28 @@ pub fn spawn_web_gateway(
                                             // floor already enforced; creating a
                                             // shell needs shell.spawn, decided at
                                             // frame time so expiry mid-connection
-                                            // is honored.
-                                            let may_spawn = dashboard_control_grant_inbound
-                                                .access_decision(
-                                                    crate::peer::access_policy::PeerOperation::ShellSpawn,
-                                                )
-                                                .allowed;
-                                            let shared =
-                                                json["shared"].as_bool().unwrap_or(false);
+                                            // is honored. A grant-level fs scope
+                                            // makes the new shell a sandboxed one.
+                                            let spawn_policy = crate::terminal::ShellSpawnPolicy {
+                                                may_spawn: dashboard_control_grant_inbound
+                                                    .access_decision(
+                                                        crate::peer::access_policy::PeerOperation::ShellSpawn,
+                                                    )
+                                                    .allowed,
+                                                shared: json["shared"]
+                                                    .as_bool()
+                                                    .unwrap_or(false),
+                                                scope: dashboard_control_grant_inbound
+                                                    .filesystem()
+                                                    .cloned(),
+                                            };
                                             match terminal_registry_inbound
                                                 .open_or_attach(
                                                     key.clone(),
                                                     cols,
                                                     rows,
                                                     &ws_terminal_actor,
-                                                    may_spawn,
-                                                    shared,
+                                                    spawn_policy,
                                                 )
                                                 .await
                                             {
