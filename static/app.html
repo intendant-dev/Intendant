@@ -1610,6 +1610,61 @@ body.access-page #tab-access {
 .acc-role-info .d { font-size: 10.5px; color: var(--subtext0); line-height: 1.5; }
 .acc-role-info .perms { font-size: 10px; color: var(--overlay1); line-height: 1.5; overflow-wrap: anywhere; }
 
+/* Credential vault (Advanced pane). */
+.vault-card {
+  border: 1px solid var(--glass-hairline);
+  border-radius: 8px;
+  background: rgba(24, 24, 37, 0.4);
+  padding: 12px 14px;
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.vault-status-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11.5px; color: var(--subtext1); }
+.vault-chip {
+  display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid var(--glass-hairline); font-size: 10px; color: var(--subtext0);
+}
+.vault-chip.ok { color: var(--green); border-color: color-mix(in srgb, var(--green) 45%, transparent); }
+.vault-chip.warn { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 45%, transparent); }
+.vault-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.vault-error { font-size: 11px; color: var(--red); line-height: 1.5; }
+.vault-warning {
+  font-size: 11px; color: var(--yellow); line-height: 1.5;
+  border: 1px solid color-mix(in srgb, var(--yellow) 40%, transparent);
+  border-radius: 6px; padding: 6px 9px;
+}
+.vault-note { font-size: 11px; color: var(--subtext0); line-height: 1.55; }
+.vault-words {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 6px;
+  padding: 10px; border: 1px dashed color-mix(in srgb, var(--yellow) 45%, transparent);
+  border-radius: 8px; background: rgba(17, 17, 27, 0.5);
+}
+.vault-words .w {
+  font-family: var(--mono, monospace); font-size: 12px; color: var(--text);
+  display: flex; gap: 6px; align-items: baseline;
+}
+.vault-words .n { color: var(--overlay1); font-size: 10px; min-width: 16px; text-align: right; }
+.vault-entry-list { display: grid; gap: 6px; }
+.vault-entry-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  border: 1px solid var(--glass-hairline); border-radius: 6px;
+  padding: 6px 9px; background: rgba(17, 17, 27, 0.35); font-size: 11.5px;
+}
+.vault-entry-row .lbl { color: var(--text); font-weight: 500; }
+.vault-entry-row .secret { font-family: var(--mono, monospace); font-size: 11px; color: var(--subtext0); overflow-wrap: anywhere; }
+.vault-entry-row .vault-entry-actions { margin-left: auto; display: flex; gap: 6px; }
+.vault-form-grid { display: grid; grid-template-columns: minmax(110px, 160px) 1fr; gap: 8px; align-items: center; }
+.vault-form-grid label { font-size: 11px; color: var(--subtext1); }
+.vault-form-grid input, .vault-form-grid select, .vault-phrase-input {
+  background: rgba(17, 17, 27, 0.6); color: var(--text);
+  border: 1px solid var(--glass-hairline); border-radius: 6px;
+  padding: 6px 8px; font-size: 12px; width: 100%;
+}
+.vault-phrase-input { font-family: var(--mono, monospace); }
+.vault-unlockers { display: grid; gap: 4px; font-size: 11px; color: var(--subtext0); }
+.vault-unlockers .u { display: flex; gap: 8px; align-items: baseline; }
+
 /* Status-bar route prefix. */
 #sb-dashboard-transport-prefix { color: var(--overlay1); }
 
@@ -12596,6 +12651,12 @@ body.display-fullscreen-open {
         <div class="subtab-pane" id="access-pane-advanced">
           <div class="access-pane-body">
             <div class="acc-section-head">
+              <div class="acc-section-title">Credential vault</div>
+              <div class="acc-section-sub">Provider credentials, end-to-end encrypted under your passkeys and a recovery phrase. The hosted store holds only ciphertext; daemons only ever borrow time-boxed leases.</div>
+            </div>
+            <div id="access-vault-section"></div>
+
+            <div class="acc-section-head">
               <div class="acc-section-title">Roles &amp; permissions</div>
               <div class="acc-section-sub">The exact permission matrix this daemon enforces. Roles bundle permissions; peer profiles live in the daemon-to-daemon domain.</div>
             </div>
@@ -14194,6 +14255,1025 @@ async function accessFleetRefreshProvenance() {
     }
   }
   if (changed) renderAccessAdminSummaries();
+}
+
+/* ── Credential vault (credential custody v1) ──
+   The user's provider credentials, end-to-end encrypted client-side and
+   synced blind through the hosted rendezvous (/api/vault). A random
+   256-bit master key encrypts the vault body; that key is stored only
+   wrapped, one envelope per enrolled unlocker: each account passkey (via
+   the WebAuthn PRF secret, HKDF salt 'intendant-vault-v1' — a domain
+   deliberately separate from fleet-sync) and a mandatory BIP39 recovery
+   phrase. Losing a passkey loses one envelope, not the vault. The store
+   can withhold or serve a stale revision — detectable via the local
+   high-water mark — and nothing else. Unsealing happens only here, in
+   memory, behind a passkey gesture or the phrase. */
+
+const VAULT_LOCAL_KEY = 'intendant_vault_local_v1';
+const VAULT_HKDF_SALT = 'intendant-vault-v1';
+/* The standard BIP39 English wordlist (2048 words). The phrase is
+   generated client-side — the server never sees it. */
+const VAULT_BIP39_WORDLIST = 'abandon ability able about above absent absorb abstract absurd abuse access accident account accuse achieve acid acoustic acquire across act action actor actress actual adapt add addict address adjust admit adult advance advice aerobic affair afford afraid again age agent agree ahead aim air airport aisle alarm album alcohol alert alien all alley allow almost alone alpha already also alter always amateur amazing among amount amused analyst anchor ancient anger angle angry animal ankle announce annual another answer antenna antique anxiety any apart apology appear apple approve april arch arctic area arena argue arm armed armor army around arrange arrest arrive arrow art artefact artist artwork ask aspect assault asset assist assume asthma athlete atom attack attend attitude attract auction audit august aunt author auto autumn average avocado avoid awake aware away awesome awful awkward axis baby bachelor bacon badge bag balance balcony ball bamboo banana banner bar barely bargain barrel base basic basket battle beach bean beauty because become beef before begin behave behind believe below belt bench benefit best betray better between beyond bicycle bid bike bind biology bird birth bitter black blade blame blanket blast bleak bless blind blood blossom blouse blue blur blush board boat body boil bomb bone bonus book boost border boring borrow boss bottom bounce box boy bracket brain brand brass brave bread breeze brick bridge brief bright bring brisk broccoli broken bronze broom brother brown brush bubble buddy budget buffalo build bulb bulk bullet bundle bunker burden burger burst bus business busy butter buyer buzz cabbage cabin cable cactus cage cake call calm camera camp can canal cancel candy cannon canoe canvas canyon capable capital captain car carbon card cargo carpet carry cart case cash casino castle casual cat catalog catch category cattle caught cause caution cave ceiling celery cement census century cereal certain chair chalk champion change chaos chapter charge chase chat cheap check cheese chef cherry chest chicken chief child chimney choice choose chronic chuckle chunk churn cigar cinnamon circle citizen city civil claim clap clarify claw clay clean clerk clever click client cliff climb clinic clip clock clog close cloth cloud clown club clump cluster clutch coach coast coconut code coffee coil coin collect color column combine come comfort comic common company concert conduct confirm congress connect consider control convince cook cool copper copy coral core corn correct cost cotton couch country couple course cousin cover coyote crack cradle craft cram crane crash crater crawl crazy cream credit creek crew cricket crime crisp critic crop cross crouch crowd crucial cruel cruise crumble crunch crush cry crystal cube culture cup cupboard curious current curtain curve cushion custom cute cycle dad damage damp dance danger daring dash daughter dawn day deal debate debris decade december decide decline decorate decrease deer defense define defy degree delay deliver demand demise denial dentist deny depart depend deposit depth deputy derive describe desert design desk despair destroy detail detect develop device devote diagram dial diamond diary dice diesel diet differ digital dignity dilemma dinner dinosaur direct dirt disagree discover disease dish dismiss disorder display distance divert divide divorce dizzy doctor document dog doll dolphin domain donate donkey donor door dose double dove draft dragon drama drastic draw dream dress drift drill drink drip drive drop drum dry duck dumb dune during dust dutch duty dwarf dynamic eager eagle early earn earth easily east easy echo ecology economy edge edit educate effort egg eight either elbow elder electric elegant element elephant elevator elite else embark embody embrace emerge emotion employ empower empty enable enact end endless endorse enemy energy enforce engage engine enhance enjoy enlist enough enrich enroll ensure enter entire entry envelope episode equal equip era erase erode erosion error erupt escape essay essence estate eternal ethics evidence evil evoke evolve exact example excess exchange excite exclude excuse execute exercise exhaust exhibit exile exist exit exotic expand expect expire explain expose express extend extra eye eyebrow fabric face faculty fade faint faith fall false fame family famous fan fancy fantasy farm fashion fat fatal father fatigue fault favorite feature february federal fee feed feel female fence festival fetch fever few fiber fiction field figure file film filter final find fine finger finish fire firm first fiscal fish fit fitness fix flag flame flash flat flavor flee flight flip float flock floor flower fluid flush fly foam focus fog foil fold follow food foot force forest forget fork fortune forum forward fossil foster found fox fragile frame frequent fresh friend fringe frog front frost frown frozen fruit fuel fun funny furnace fury future gadget gain galaxy gallery game gap garage garbage garden garlic garment gas gasp gate gather gauge gaze general genius genre gentle genuine gesture ghost giant gift giggle ginger giraffe girl give glad glance glare glass glide glimpse globe gloom glory glove glow glue goat goddess gold good goose gorilla gospel gossip govern gown grab grace grain grant grape grass gravity great green grid grief grit grocery group grow grunt guard guess guide guilt guitar gun gym habit hair half hammer hamster hand happy harbor hard harsh harvest hat have hawk hazard head health heart heavy hedgehog height hello helmet help hen hero hidden high hill hint hip hire history hobby hockey hold hole holiday hollow home honey hood hope horn horror horse hospital host hotel hour hover hub huge human humble humor hundred hungry hunt hurdle hurry hurt husband hybrid ice icon idea identify idle ignore ill illegal illness image imitate immense immune impact impose improve impulse inch include income increase index indicate indoor industry infant inflict inform inhale inherit initial inject injury inmate inner innocent input inquiry insane insect inside inspire install intact interest into invest invite involve iron island isolate issue item ivory jacket jaguar jar jazz jealous jeans jelly jewel job join joke journey joy judge juice jump jungle junior junk just kangaroo keen keep ketchup key kick kid kidney kind kingdom kiss kit kitchen kite kitten kiwi knee knife knock know lab label labor ladder lady lake lamp language laptop large later latin laugh laundry lava law lawn lawsuit layer lazy leader leaf learn leave lecture left leg legal legend leisure lemon lend length lens leopard lesson letter level liar liberty library license life lift light like limb limit link lion liquid list little live lizard load loan lobster local lock logic lonely long loop lottery loud lounge love loyal lucky luggage lumber lunar lunch luxury lyrics machine mad magic magnet maid mail main major make mammal man manage mandate mango mansion manual maple marble march margin marine market marriage mask mass master match material math matrix matter maximum maze meadow mean measure meat mechanic medal media melody melt member memory mention menu mercy merge merit merry mesh message metal method middle midnight milk million mimic mind minimum minor minute miracle mirror misery miss mistake mix mixed mixture mobile model modify mom moment monitor monkey monster month moon moral more morning mosquito mother motion motor mountain mouse move movie much muffin mule multiply muscle museum mushroom music must mutual myself mystery myth naive name napkin narrow nasty nation nature near neck need negative neglect neither nephew nerve nest net network neutral never news next nice night noble noise nominee noodle normal north nose notable note nothing notice novel now nuclear number nurse nut oak obey object oblige obscure observe obtain obvious occur ocean october odor off offer office often oil okay old olive olympic omit once one onion online only open opera opinion oppose option orange orbit orchard order ordinary organ orient original orphan ostrich other outdoor outer output outside oval oven over own owner oxygen oyster ozone pact paddle page pair palace palm panda panel panic panther paper parade parent park parrot party pass patch path patient patrol pattern pause pave payment peace peanut pear peasant pelican pen penalty pencil people pepper perfect permit person pet phone photo phrase physical piano picnic picture piece pig pigeon pill pilot pink pioneer pipe pistol pitch pizza place planet plastic plate play please pledge pluck plug plunge poem poet point polar pole police pond pony pool popular portion position possible post potato pottery poverty powder power practice praise predict prefer prepare present pretty prevent price pride primary print priority prison private prize problem process produce profit program project promote proof property prosper protect proud provide public pudding pull pulp pulse pumpkin punch pupil puppy purchase purity purpose purse push put puzzle pyramid quality quantum quarter question quick quit quiz quote rabbit raccoon race rack radar radio rail rain raise rally ramp ranch random range rapid rare rate rather raven raw razor ready real reason rebel rebuild recall receive recipe record recycle reduce reflect reform refuse region regret regular reject relax release relief rely remain remember remind remove render renew rent reopen repair repeat replace report require rescue resemble resist resource response result retire retreat return reunion reveal review reward rhythm rib ribbon rice rich ride ridge rifle right rigid ring riot ripple risk ritual rival river road roast robot robust rocket romance roof rookie room rose rotate rough round route royal rubber rude rug rule run runway rural sad saddle sadness safe sail salad salmon salon salt salute same sample sand satisfy satoshi sauce sausage save say scale scan scare scatter scene scheme school science scissors scorpion scout scrap screen script scrub sea search season seat second secret section security seed seek segment select sell seminar senior sense sentence series service session settle setup seven shadow shaft shallow share shed shell sheriff shield shift shine ship shiver shock shoe shoot shop short shoulder shove shrimp shrug shuffle shy sibling sick side siege sight sign silent silk silly silver similar simple since sing siren sister situate six size skate sketch ski skill skin skirt skull slab slam sleep slender slice slide slight slim slogan slot slow slush small smart smile smoke smooth snack snake snap sniff snow soap soccer social sock soda soft solar soldier solid solution solve someone song soon sorry sort soul sound soup source south space spare spatial spawn speak special speed spell spend sphere spice spider spike spin spirit split spoil sponsor spoon sport spot spray spread spring spy square squeeze squirrel stable stadium staff stage stairs stamp stand start state stay steak steel stem step stereo stick still sting stock stomach stone stool story stove strategy street strike strong struggle student stuff stumble style subject submit subway success such sudden suffer sugar suggest suit summer sun sunny sunset super supply supreme sure surface surge surprise surround survey suspect sustain swallow swamp swap swarm swear sweet swift swim swing switch sword symbol symptom syrup system table tackle tag tail talent talk tank tape target task taste tattoo taxi teach team tell ten tenant tennis tent term test text thank that theme then theory there they thing this thought three thrive throw thumb thunder ticket tide tiger tilt timber time tiny tip tired tissue title toast tobacco today toddler toe together toilet token tomato tomorrow tone tongue tonight tool tooth top topic topple torch tornado tortoise toss total tourist toward tower town toy track trade traffic tragic train transfer trap trash travel tray treat tree trend trial tribe trick trigger trim trip trophy trouble truck true truly trumpet trust truth try tube tuition tumble tuna tunnel turkey turn turtle twelve twenty twice twin twist two type typical ugly umbrella unable unaware uncle uncover under undo unfair unfold unhappy uniform unique unit universe unknown unlock until unusual unveil update upgrade uphold upon upper upset urban urge usage use used useful useless usual utility vacant vacuum vague valid valley valve van vanish vapor various vast vault vehicle velvet vendor venture venue verb verify version very vessel veteran viable vibrant vicious victory video view village vintage violin virtual virus visa visit visual vital vivid vocal voice void volcano volume vote voyage wage wagon wait walk wall walnut want warfare warm warrior wash wasp waste water wave way wealth weapon wear weasel weather web wedding weekend weird welcome west wet whale what wheat wheel when where whip whisper wide width wife wild will win window wine wing wink winner winter wire wisdom wise wish witness wolf woman wonder wood wool word work world worry worth wrap wreck wrestle wrist write wrong yard year yellow you young youth zebra zero zone zoo';
+let vaultBip39Words = null;
+
+function vaultWordlist() {
+  if (!vaultBip39Words) vaultBip39Words = VAULT_BIP39_WORDLIST.split(' ');
+  return vaultBip39Words;
+}
+
+const vaultState = {
+  status: 'unknown',   // unknown | unavailable | signed-out | none | locked | unlocked
+  revision: 0,         // revision of the blob this device considers current
+  highWater: 0,        // highest revision this device has ever seen (rollback detection)
+  blob: null,          // the full encrypted vault blob
+  entries: [],         // decrypted entries while unlocked
+  settings: {},        // decrypted vault-wide settings while unlocked
+  kBytes: null,        // raw master key while unlocked (zeroed on lock)
+  matchedEnvelopeId: null, // which prf envelope this session's passkey opened
+  rollbackWarning: '',
+  lastError: '',
+  migratedVoiceKeys: false,
+};
+let vaultCeremony = null;          // { phrase } while the create ceremony is on screen
+let vaultPublishChain = Promise.resolve(true);
+const vaultRevealedEntries = new Set();
+
+function vaultAvailable() {
+  return DASHBOARD_CONNECT_MODE && Boolean(crypto?.subtle);
+}
+
+/* ── Vault crypto ── */
+
+async function vaultHkdfAesKey(secretBytes, info) {
+  const hkdf = await crypto.subtle.importKey('raw', secretBytes, 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: new TextEncoder().encode(VAULT_HKDF_SALT),
+      info: new TextEncoder().encode(info),
+    },
+    hkdf,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function vaultPrfKek() {
+  const prfB64u = sessionStorage.getItem(FLEET_PRF_SESSION_KEY) || '';
+  if (!prfB64u) return null;
+  try {
+    return await vaultHkdfAesKey(dashboardBase64UrlToBytes(prfB64u), 'vault-kek');
+  } catch (err) {
+    console.warn('[vault] PRF key derivation failed:', err?.message || err);
+    return null;
+  }
+}
+
+/* Standard BIP39 seed stretch (PBKDF2-HMAC-SHA512, salt 'mnemonic',
+   2048 iterations — the 128-bit entropy does the security work), then
+   our own HKDF domain down to an AES-GCM key. */
+async function vaultPhraseKek(phrase) {
+  const password = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(phrase.normalize('NFKD')), 'PBKDF2', false, ['deriveBits']
+  );
+  const seed = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-512', salt: new TextEncoder().encode('mnemonic'), iterations: 2048 },
+    password,
+    512
+  );
+  return vaultHkdfAesKey(new Uint8Array(seed), 'vault-kek-phrase');
+}
+
+async function vaultGeneratePhrase() {
+  const words = vaultWordlist();
+  const entropy = crypto.getRandomValues(new Uint8Array(16));
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', entropy));
+  let bits = '';
+  for (const b of entropy) bits += b.toString(2).padStart(8, '0');
+  bits += hash[0].toString(2).padStart(8, '0').slice(0, 4);
+  const picked = [];
+  for (let i = 0; i < 12; i++) picked.push(words[parseInt(bits.slice(i * 11, (i + 1) * 11), 2)]);
+  return picked.join(' ');
+}
+
+/* Normalize + checksum-verify a typed phrase; null when it is not a
+   valid 12-word BIP39 mnemonic (catches typos before a doomed unwrap). */
+async function vaultNormalizePhrase(input) {
+  const words = String(input || '').toLowerCase().trim().split(/[\s,]+/).filter(Boolean);
+  if (words.length !== 12) return null;
+  const list = vaultWordlist();
+  let bits = '';
+  for (const word of words) {
+    const idx = list.indexOf(word);
+    if (idx < 0) return null;
+    bits += idx.toString(2).padStart(11, '0');
+  }
+  const entropy = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) entropy[i] = parseInt(bits.slice(i * 8, (i + 1) * 8), 2);
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', entropy));
+  if (bits.slice(128) !== hash[0].toString(2).padStart(8, '0').slice(0, 4)) return null;
+  return words.join(' ');
+}
+
+function vaultEnvelopeAad() {
+  return new TextEncoder().encode(`${VAULT_HKDF_SALT}|kek`);
+}
+
+/* The body AAD binds the revision into the ciphertext, so the store
+   cannot re-label an old body with a new revision number; replaying a
+   complete old blob (rollback) remains and is what highWater detects. */
+function vaultBodyAad(revision) {
+  return new TextEncoder().encode(`${VAULT_HKDF_SALT}|body|rev:${revision}`);
+}
+
+async function vaultWrapMasterKey(kek, kBytes) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const wrapped = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: vaultEnvelopeAad() },
+    kek,
+    kBytes
+  );
+  return {
+    iv: dashboardBytesToBase64Url(iv),
+    wrapped: dashboardBytesToBase64Url(new Uint8Array(wrapped)),
+  };
+}
+
+async function vaultUnwrapMasterKey(kek, envelope) {
+  try {
+    const kBytes = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: dashboardBase64UrlToBytes(String(envelope.iv || '')), additionalData: vaultEnvelopeAad() },
+      kek,
+      dashboardBase64UrlToBytes(String(envelope.wrapped || ''))
+    );
+    return new Uint8Array(kBytes);
+  } catch {
+    return null;
+  }
+}
+
+async function vaultMasterAesKey(kBytes) {
+  return crypto.subtle.importKey('raw', kBytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}
+
+async function vaultEncryptBody(kBytes, bodyObj, revision) {
+  const key = await vaultMasterAesKey(kBytes);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: vaultBodyAad(revision) },
+    key,
+    new TextEncoder().encode(JSON.stringify(bodyObj))
+  );
+  return {
+    iv: dashboardBytesToBase64Url(iv),
+    ct: dashboardBytesToBase64Url(new Uint8Array(ct)),
+  };
+}
+
+async function vaultDecryptBody(kBytes, blob) {
+  try {
+    const key = await vaultMasterAesKey(kBytes);
+    const plaintext = await crypto.subtle.decrypt(
+      {
+        name: 'AES-GCM',
+        iv: dashboardBase64UrlToBytes(String(blob?.body?.iv || '')),
+        additionalData: vaultBodyAad(Number(blob?.revision) || 0),
+      },
+      key,
+      dashboardBase64UrlToBytes(String(blob?.body?.ct || ''))
+    );
+    return JSON.parse(new TextDecoder().decode(plaintext));
+  } catch {
+    return null;
+  }
+}
+
+function vaultRandomId(prefix) {
+  return `${prefix}_${dashboardBytesToBase64Url(crypto.getRandomValues(new Uint8Array(9)))}`;
+}
+
+/* ── Local cache + hosted sync ── */
+
+function vaultReadLocal() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(VAULT_LOCAL_KEY) || 'null');
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function vaultWriteLocal() {
+  try {
+    localStorage.setItem(VAULT_LOCAL_KEY, JSON.stringify({
+      revision: vaultState.revision,
+      high_water: vaultState.highWater,
+      vault: vaultState.blob,
+      updated_unix_ms: Date.now(),
+    }));
+  } catch (err) {
+    console.warn('[vault] local cache write failed:', err?.message || err);
+  }
+}
+
+async function vaultServerFetch() {
+  const resp = await fetch(accessFleetHostedUrl('/api/vault'));
+  if (resp.status === 401) return { authenticated: false };
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok || body.ok === false) throw new Error(body.error || `HTTP ${resp.status}`);
+  return { authenticated: true, revision: Number(body.revision) || 0, vault: body.vault || null };
+}
+
+async function vaultServerPublish(blob) {
+  const headers = await accessFleetHostedHeaders();
+  if (!headers) throw new Error('sign in to the hosted account first');
+  const resp = await fetch(accessFleetHostedUrl('/api/vault'), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ revision: blob.revision, vault: blob }),
+  });
+  const body = await resp.json().catch(() => ({}));
+  if (resp.status === 409) {
+    const err = new Error(body.error || 'vault revision conflict');
+    err.vaultConflict = true;
+    throw err;
+  }
+  if (!resp.ok || body.ok === false) throw new Error(body.error || `HTTP ${resp.status}`);
+  return body;
+}
+
+/* Take a fetched blob as current if it is newer than what we hold; flag
+   rollback when the store serves older than this device has seen. */
+async function vaultAdoptBlob(blob, { fromServer = false } = {}) {
+  const revision = Number(blob?.revision) || 0;
+  if (!blob || !revision) return;
+  if (fromServer) {
+    vaultState.rollbackWarning = vaultState.highWater > revision
+      ? `The hosted store returned vault revision ${revision}, but this device has already seen revision ${vaultState.highWater}. The store cannot read or forge the vault, but it can withhold updates — treat its copy as stale.`
+      : '';
+  }
+  if (revision < vaultState.revision) return;
+  vaultState.blob = blob;
+  vaultState.revision = revision;
+  vaultState.highWater = Math.max(vaultState.highWater, revision);
+  if (vaultState.kBytes) {
+    const body = await vaultDecryptBody(vaultState.kBytes, blob);
+    if (body) {
+      vaultState.entries = Array.isArray(body.entries) ? body.entries : [];
+      vaultState.settings = body.settings && typeof body.settings === 'object' ? body.settings : {};
+      vaultSyncVoiceMirror();
+    } else {
+      vaultLock('The vault was re-keyed on another device — unlock it again.');
+    }
+  } else if (vaultState.status !== 'unlocked') {
+    vaultState.status = 'locked';
+  }
+  vaultWriteLocal();
+}
+
+let vaultInitPromise = null;
+function vaultInit() {
+  if (!vaultInitPromise) {
+    vaultInitPromise = vaultInitInner().catch(err => {
+      console.warn('[vault] init failed:', err?.message || err);
+    });
+  }
+  return vaultInitPromise;
+}
+
+async function vaultInitInner() {
+  if (!vaultAvailable()) {
+    vaultState.status = 'unavailable';
+    renderAccessVaultSection();
+    return;
+  }
+  const local = vaultReadLocal();
+  if (local?.vault) {
+    vaultState.highWater = Math.max(Number(local.high_water) || 0, Number(local.vault.revision) || 0);
+    await vaultAdoptBlob(local.vault);
+  }
+  vaultState.status = vaultState.blob ? 'locked' : 'none';
+  try {
+    const server = await vaultServerFetch();
+    if (server.authenticated === false) {
+      if (!vaultState.blob) vaultState.status = 'signed-out';
+    } else if (server.vault) {
+      await vaultAdoptBlob(server.vault, { fromServer: true });
+    }
+  } catch (err) {
+    console.warn('[vault] hosted fetch failed (working from the local cache):', err?.message || err);
+  }
+  if (vaultState.blob && vaultState.status !== 'unlocked') {
+    await vaultTryPrfUnlock({ silent: true });
+  }
+  renderAccessVaultSection();
+}
+
+/* ── Lock / unlock / create / enroll ── */
+
+function vaultLock(notice) {
+  if (vaultState.kBytes) vaultState.kBytes.fill(0);
+  vaultState.kBytes = null;
+  vaultState.entries = [];
+  vaultState.settings = {};
+  vaultState.matchedEnvelopeId = null;
+  vaultRevealedEntries.clear();
+  if (vaultState.blob) vaultState.status = 'locked';
+  vaultState.lastError = notice || '';
+  vaultSyncVoiceMirror();
+  renderAccessVaultSection();
+}
+
+async function vaultFinishUnlock(kBytes, envelopeId) {
+  const body = await vaultDecryptBody(kBytes, vaultState.blob);
+  if (!body) {
+    vaultState.lastError = 'The key envelope opened but the vault body did not decrypt — the blob may be corrupted.';
+    return false;
+  }
+  vaultState.kBytes = kBytes;
+  vaultState.entries = Array.isArray(body.entries) ? body.entries : [];
+  vaultState.settings = body.settings && typeof body.settings === 'object' ? body.settings : {};
+  vaultState.matchedEnvelopeId = envelopeId || null;
+  vaultState.status = 'unlocked';
+  vaultState.lastError = '';
+  vaultSyncVoiceMirror();
+  vaultMigrateVoiceKeys().catch(err => console.warn('[vault] voice key migration failed:', err?.message || err));
+  renderAccessVaultSection();
+  return true;
+}
+
+async function vaultTryPrfUnlock({ silent = false } = {}) {
+  if (!vaultState.blob) return false;
+  const kek = await vaultPrfKek();
+  if (!kek) {
+    if (!silent) vaultState.lastError = 'No passkey secret in this session — sign in with the account passkey, or use the recovery phrase.';
+    return false;
+  }
+  for (const envelope of vaultState.blob.envelopes || []) {
+    if (envelope.kind !== 'prf') continue;
+    const kBytes = await vaultUnwrapMasterKey(kek, envelope);
+    if (kBytes) return vaultFinishUnlock(kBytes, envelope.id);
+  }
+  if (!silent) vaultState.lastError = 'This passkey is not enrolled in the vault yet — unlock with the recovery phrase, then enroll it.';
+  return false;
+}
+
+/* A local WebAuthn assertion purely to (re-)evaluate the PRF extension —
+   no server round-trip; the fresh secret also re-arms fleet-sync. */
+async function vaultRequestPrfSecret() {
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const credential = await navigator.credentials.get({
+    publicKey: {
+      challenge,
+      userVerification: 'preferred',
+      extensions: { prf: { eval: { first: new TextEncoder().encode('intendant-fleet-sync-v1') } } },
+    },
+  });
+  const first = credential?.getClientExtensionResults?.()?.prf?.results?.first;
+  if (!first) return false;
+  sessionStorage.setItem(FLEET_PRF_SESSION_KEY, dashboardBytesToBase64Url(new Uint8Array(first)));
+  accessFleetAesKey = null;
+  return true;
+}
+
+async function vaultUnlockWithPasskey() {
+  vaultState.lastError = '';
+  try {
+    if (!(await vaultTryPrfUnlock({ silent: true }))) {
+      if (await vaultRequestPrfSecret()) {
+        await vaultTryPrfUnlock();
+      } else {
+        vaultState.lastError = 'This authenticator did not return a PRF secret — use the recovery phrase.';
+      }
+    }
+  } catch (err) {
+    vaultState.lastError = `Passkey unlock failed: ${err?.message || err}`;
+  }
+  renderAccessVaultSection();
+}
+
+async function vaultUnlockWithPhrase(input) {
+  vaultState.lastError = '';
+  const phrase = await vaultNormalizePhrase(input);
+  if (!phrase) {
+    vaultState.lastError = 'That is not a valid 12-word recovery phrase.';
+    renderAccessVaultSection();
+    return false;
+  }
+  const kek = await vaultPhraseKek(phrase);
+  for (const envelope of vaultState.blob?.envelopes || []) {
+    if (envelope.kind !== 'phrase') continue;
+    const kBytes = await vaultUnwrapMasterKey(kek, envelope);
+    if (kBytes) return vaultFinishUnlock(kBytes, envelope.id);
+  }
+  vaultState.lastError = 'The phrase is well-formed but does not open this vault.';
+  renderAccessVaultSection();
+  return false;
+}
+
+async function vaultCreate(phrase) {
+  if (!vaultAvailable()) throw new Error('the vault needs a hosted session');
+  const kBytes = crypto.getRandomValues(new Uint8Array(32));
+  const now = Date.now();
+  const envelopes = [];
+  envelopes.push({
+    kind: 'phrase',
+    id: vaultRandomId('env'),
+    label: 'Recovery phrase',
+    created_unix_ms: now,
+    ...(await vaultWrapMasterKey(await vaultPhraseKek(phrase), kBytes)),
+  });
+  let matched = null;
+  const prfKek = await vaultPrfKek();
+  if (prfKek) {
+    const envelope = {
+      kind: 'prf',
+      id: vaultRandomId('env'),
+      label: `Passkey enrolled ${new Date(now).toISOString().slice(0, 10)}`,
+      created_unix_ms: now,
+      ...(await vaultWrapMasterKey(prfKek, kBytes)),
+    };
+    envelopes.push(envelope);
+    matched = envelope.id;
+  }
+  const revision = Math.max(1, vaultState.highWater + 1);
+  const blob = {
+    v: 1,
+    kind: 'intendant-vault',
+    revision,
+    created_unix_ms: now,
+    updated_unix_ms: now,
+    envelopes,
+    body: await vaultEncryptBody(kBytes, { entries: [], settings: {} }, revision),
+  };
+  await vaultServerPublish(blob);
+  vaultState.blob = blob;
+  vaultState.revision = revision;
+  vaultState.highWater = Math.max(vaultState.highWater, revision);
+  vaultWriteLocal();
+  await vaultFinishUnlock(kBytes, matched);
+}
+
+/* Re-encrypt and publish the unlocked state as the next revision. On a
+   revision conflict: refetch, merge entries by (id, updated_unix_ms) —
+   a concurrent update wins over a concurrent delete, never silently
+   dropping a credential — and retry once. */
+async function vaultPersist() {
+  if (!vaultState.kBytes || !vaultState.blob) throw new Error('vault is locked');
+  const attempt = async () => {
+    const revision = Math.max(vaultState.revision, vaultState.highWater) + 1;
+    const blob = {
+      ...vaultState.blob,
+      revision,
+      updated_unix_ms: Date.now(),
+      body: await vaultEncryptBody(
+        vaultState.kBytes,
+        { entries: vaultState.entries, settings: vaultState.settings },
+        revision
+      ),
+    };
+    await vaultServerPublish(blob);
+    vaultState.blob = blob;
+    vaultState.revision = revision;
+    vaultState.highWater = Math.max(vaultState.highWater, revision);
+    vaultWriteLocal();
+  };
+  try {
+    await attempt();
+  } catch (err) {
+    if (!err?.vaultConflict) throw err;
+    const server = await vaultServerFetch();
+    if (server?.vault) {
+      const remoteBody = await vaultDecryptBody(vaultState.kBytes, server.vault);
+      if (!remoteBody) {
+        vaultLock('The vault was re-keyed on another device — unlock it again.');
+        throw err;
+      }
+      vaultState.blob = server.vault;
+      vaultState.revision = Number(server.vault.revision) || vaultState.revision;
+      vaultState.highWater = Math.max(vaultState.highWater, vaultState.revision);
+      vaultState.entries = vaultMergeEntries(
+        Array.isArray(remoteBody.entries) ? remoteBody.entries : [],
+        vaultState.entries
+      );
+      vaultState.settings = { ...(remoteBody.settings || {}), ...vaultState.settings };
+    }
+    await attempt();
+  }
+  vaultSyncVoiceMirror();
+  renderAccessVaultSection();
+}
+
+function vaultMergeEntries(remote, local) {
+  const byId = new Map();
+  for (const entry of remote) if (entry?.id) byId.set(entry.id, entry);
+  for (const entry of local) {
+    if (!entry?.id) continue;
+    const existing = byId.get(entry.id);
+    if (!existing || (Number(entry.updated_unix_ms) || 0) >= (Number(existing.updated_unix_ms) || 0)) {
+      byId.set(entry.id, entry);
+    }
+  }
+  return Array.from(byId.values());
+}
+
+/* Serialize publishes; resolves true on success, false after reporting. */
+function vaultQueuePersist() {
+  const result = vaultPublishChain
+    .then(async () => {
+      await vaultPersist();
+      return true;
+    })
+    .catch(err => {
+      vaultState.lastError = `Vault sync failed: ${err?.message || err}`;
+      renderAccessVaultSection();
+      return false;
+    });
+  vaultPublishChain = result;
+  return result;
+}
+
+function vaultUpsertEntry(entry) {
+  const now = Date.now();
+  const existing = entry.id ? vaultState.entries.find(e => e.id === entry.id) : null;
+  if (existing) {
+    Object.assign(existing, entry, { updated_unix_ms: now });
+  } else {
+    vaultState.entries.push({
+      ...entry,
+      id: entry.id || vaultRandomId('cred'),
+      created_unix_ms: now,
+      updated_unix_ms: now,
+    });
+  }
+  vaultSyncVoiceMirror();
+  return vaultQueuePersist();
+}
+
+function vaultRemoveEntry(id) {
+  vaultState.entries = vaultState.entries.filter(e => e.id !== id);
+  vaultRevealedEntries.delete(id);
+  vaultSyncVoiceMirror();
+  return vaultQueuePersist();
+}
+
+async function vaultEnrollThisPasskey() {
+  if (!vaultState.kBytes) return;
+  vaultState.lastError = '';
+  try {
+    let kek = await vaultPrfKek();
+    if (!kek) {
+      if (!(await vaultRequestPrfSecret())) throw new Error('this authenticator did not return a PRF secret');
+      kek = await vaultPrfKek();
+    }
+    if (!kek) throw new Error('no PRF secret available');
+    for (const envelope of vaultState.blob.envelopes || []) {
+      if (envelope.kind === 'prf' && (await vaultUnwrapMasterKey(kek, envelope))) {
+        vaultState.matchedEnvelopeId = envelope.id;
+        renderAccessVaultSection();
+        return;
+      }
+    }
+    const now = Date.now();
+    const envelope = {
+      kind: 'prf',
+      id: vaultRandomId('env'),
+      label: `Passkey enrolled ${new Date(now).toISOString().slice(0, 10)}`,
+      created_unix_ms: now,
+      ...(await vaultWrapMasterKey(kek, vaultState.kBytes)),
+    };
+    vaultState.blob = { ...vaultState.blob, envelopes: [...(vaultState.blob.envelopes || []), envelope] };
+    vaultState.matchedEnvelopeId = envelope.id;
+    await vaultQueuePersist();
+  } catch (err) {
+    vaultState.lastError = `Passkey enrollment failed: ${err?.message || err}`;
+    renderAccessVaultSection();
+  }
+}
+
+/* ── Voice keys: vault-first, localStorage fallback ── */
+
+const VAULT_VOICE_STORAGE_PROVIDERS = { gemini_api_key: 'gemini', openai_api_key: 'openai' };
+let vaultVoiceMirror = {};
+
+/* Synchronous mirror of the voice-relevant entries, so the existing
+   synchronous voice paths keep working without an unlock await. */
+function vaultSyncVoiceMirror() {
+  const mirror = {};
+  if (vaultState.status === 'unlocked' || vaultState.kBytes) {
+    for (const [storageKey, provider] of Object.entries(VAULT_VOICE_STORAGE_PROVIDERS)) {
+      const entry =
+        vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.voice && e.secret) ||
+        vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.secret);
+      if (entry) mirror[storageKey] = String(entry.secret);
+    }
+  }
+  vaultVoiceMirror = mirror;
+}
+
+function voiceApiKeyGet(storageKey = getStorageKey()) {
+  return vaultVoiceMirror[storageKey] || localStorage.getItem(storageKey) || '';
+}
+
+function voiceApiKeySet(key, storageKey = getStorageKey()) {
+  const value = String(key || '').trim();
+  if (!value) return;
+  const provider = VAULT_VOICE_STORAGE_PROVIDERS[storageKey];
+  if (provider && vaultState.status === 'unlocked') {
+    vaultVoiceMirror[storageKey] = value;
+    const existing = vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.voice);
+    vaultUpsertEntry(
+      existing
+        ? { ...existing, secret: value }
+        : {
+            kind: 'api_key',
+            provider,
+            voice: true,
+            label: `${provider === 'openai' ? 'OpenAI' : 'Gemini'} voice key`,
+            secret: value,
+          }
+    ).then(ok => {
+      // Keep the key reachable even if the publish failed.
+      if (ok) localStorage.removeItem(storageKey);
+      else localStorage.setItem(storageKey, value);
+    });
+    return;
+  }
+  localStorage.setItem(storageKey, value);
+}
+
+/* One-time migration: move today's per-origin localStorage voice keys
+   into the vault. The local copy is removed only after a successful
+   publish, so a failed sync can never lose a key. */
+async function vaultMigrateVoiceKeys() {
+  if (vaultState.status !== 'unlocked') return;
+  const migrated = [];
+  for (const [storageKey, provider] of Object.entries(VAULT_VOICE_STORAGE_PROVIDERS)) {
+    const value = String(localStorage.getItem(storageKey) || '').trim();
+    if (!value) continue;
+    const existing = vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.voice);
+    if (existing) {
+      // Same secret: the vault already owns it. Different: the vault
+      // copy wins; keep the local one for manual reconciliation.
+      if (existing.secret === value) localStorage.removeItem(storageKey);
+      continue;
+    }
+    const now = Date.now();
+    vaultState.entries.push({
+      id: vaultRandomId('cred'),
+      kind: 'api_key',
+      provider,
+      voice: true,
+      label: `${provider === 'openai' ? 'OpenAI' : 'Gemini'} voice key (migrated)`,
+      secret: value,
+      created_unix_ms: now,
+      updated_unix_ms: now,
+    });
+    migrated.push(storageKey);
+  }
+  if (!migrated.length) return;
+  vaultSyncVoiceMirror();
+  if (!(await vaultQueuePersist())) return;
+  for (const storageKey of migrated) localStorage.removeItem(storageKey);
+  vaultState.migratedVoiceKeys = true;
+  renderAccessVaultSection();
+}
+
+/* ── Vault UI (Access → Advanced) ── */
+
+function vaultProviderLabel(provider) {
+  if (provider === 'anthropic') return 'Anthropic';
+  if (provider === 'openai') return 'OpenAI';
+  if (provider === 'gemini') return 'Gemini';
+  if (provider === 'codex') return 'Codex (subscription)';
+  if (provider === 'claude-code') return 'Claude Code (subscription)';
+  return provider || 'custom';
+}
+
+function vaultButton(label, onClick, { primary = false, danger = false } = {}) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = `ui-btn${primary ? ' primary' : ''}${danger ? ' danger' : ''}`;
+  btn.textContent = label;
+  btn.addEventListener('click', onClick);
+  return btn;
+}
+
+function vaultRenderCeremony(card) {
+  const note = document.createElement('div');
+  note.className = 'vault-warning';
+  note.textContent =
+    'Write these 12 words down and keep them offline. The phrase is the only unlocker that survives losing every passkey, and it is shown exactly once.';
+  card.appendChild(note);
+
+  const grid = document.createElement('div');
+  grid.className = 'vault-words';
+  vaultCeremony.phrase.split(' ').forEach((word, i) => {
+    const w = document.createElement('span');
+    w.className = 'w';
+    const n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = String(i + 1);
+    w.append(n, document.createTextNode(word));
+    grid.appendChild(w);
+  });
+  card.appendChild(grid);
+
+  const actions = document.createElement('div');
+  actions.className = 'vault-actions';
+  actions.appendChild(
+    vaultButton('I saved the phrase — create the vault', async () => {
+      try {
+        await vaultCreate(vaultCeremony.phrase);
+        vaultCeremony = null;
+      } catch (err) {
+        vaultState.lastError = `Vault creation failed: ${err?.message || err}`;
+      }
+      renderAccessVaultSection();
+    }, { primary: true })
+  );
+  actions.appendChild(
+    vaultButton('Copy phrase', () => {
+      navigator.clipboard?.writeText(vaultCeremony.phrase).catch(() => {});
+    })
+  );
+  actions.appendChild(
+    vaultButton('Cancel', () => {
+      vaultCeremony = null;
+      renderAccessVaultSection();
+    })
+  );
+  card.appendChild(actions);
+}
+
+function vaultRenderLocked(card) {
+  const actions = document.createElement('div');
+  actions.className = 'vault-actions';
+  actions.appendChild(vaultButton('Unlock with passkey', () => vaultUnlockWithPasskey(), { primary: true }));
+  card.appendChild(actions);
+
+  const phraseRow = document.createElement('div');
+  phraseRow.className = 'vault-actions';
+  const phraseInput = document.createElement('input');
+  phraseInput.type = 'password';
+  phraseInput.className = 'vault-phrase-input';
+  phraseInput.placeholder = 'or type the 12-word recovery phrase';
+  phraseInput.autocomplete = 'off';
+  phraseInput.style.flex = '1';
+  const phraseBtn = vaultButton('Unlock with phrase', async () => {
+    await vaultUnlockWithPhrase(phraseInput.value);
+  });
+  phraseInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') phraseBtn.click();
+  });
+  phraseRow.append(phraseInput, phraseBtn);
+  card.appendChild(phraseRow);
+}
+
+function vaultRenderUnlockers(card) {
+  const list = document.createElement('div');
+  list.className = 'vault-unlockers';
+  for (const envelope of vaultState.blob?.envelopes || []) {
+    const row = document.createElement('div');
+    row.className = 'u';
+    const kind = envelope.kind === 'phrase' ? 'Recovery phrase' : 'Passkey';
+    const current = envelope.id && envelope.id === vaultState.matchedEnvelopeId ? ' — unlocked this session' : '';
+    row.textContent = `${kind}: ${envelope.label || envelope.id || ''}${current}`;
+    list.appendChild(row);
+  }
+  const fold = document.createElement('details');
+  fold.className = 'acc-fold';
+  const summary = document.createElement('summary');
+  summary.textContent = `Unlockers (${(vaultState.blob?.envelopes || []).length})`;
+  const body = document.createElement('div');
+  body.className = 'acc-fold-body';
+  body.appendChild(list);
+  fold.append(summary, body);
+  card.appendChild(fold);
+}
+
+function vaultRenderEntries(card) {
+  const list = document.createElement('div');
+  list.className = 'vault-entry-list';
+  if (!vaultState.entries.length) {
+    const empty = document.createElement('div');
+    empty.className = 'vault-note';
+    empty.textContent = 'No credentials stored yet. Anything added here syncs end-to-end encrypted across your devices and never reaches a server in the clear.';
+    list.appendChild(empty);
+  }
+  for (const entry of vaultState.entries) {
+    const row = document.createElement('div');
+    row.className = 'vault-entry-row';
+    const lbl = document.createElement('span');
+    lbl.className = 'lbl';
+    lbl.textContent = entry.label || vaultProviderLabel(entry.provider);
+    const chip = document.createElement('span');
+    chip.className = 'vault-chip';
+    chip.textContent = vaultProviderLabel(entry.provider);
+    const kindChip = document.createElement('span');
+    kindChip.className = 'vault-chip';
+    kindChip.textContent = entry.kind === 'oauth' ? 'OAuth' : 'API key';
+    const secret = document.createElement('span');
+    secret.className = 'secret';
+    const secretValue = String(entry.secret || '');
+    secret.textContent = vaultRevealedEntries.has(entry.id)
+      ? secretValue || '(token set)'
+      : secretValue
+        ? `••••${secretValue.slice(-4)}`
+        : '(token set)';
+    const actions = document.createElement('span');
+    actions.className = 'vault-entry-actions';
+    if (secretValue) {
+      actions.appendChild(
+        vaultButton(vaultRevealedEntries.has(entry.id) ? 'Hide' : 'Reveal', () => {
+          if (vaultRevealedEntries.has(entry.id)) vaultRevealedEntries.delete(entry.id);
+          else vaultRevealedEntries.add(entry.id);
+          renderAccessVaultSection();
+        })
+      );
+      actions.appendChild(
+        vaultButton('Copy', () => {
+          navigator.clipboard?.writeText(secretValue).catch(() => {});
+        })
+      );
+    }
+    actions.appendChild(
+      vaultButton('Remove', () => {
+        vaultRemoveEntry(entry.id);
+        renderAccessVaultSection();
+      }, { danger: true })
+    );
+    row.append(lbl, chip, kindChip, secret, actions);
+    list.appendChild(row);
+  }
+  card.appendChild(list);
+}
+
+function vaultRenderAddForm(card) {
+  const fold = document.createElement('details');
+  fold.className = 'acc-fold';
+  const summary = document.createElement('summary');
+  summary.textContent = 'Add a credential';
+  const body = document.createElement('div');
+  body.className = 'acc-fold-body';
+  const grid = document.createElement('div');
+  grid.className = 'vault-form-grid';
+
+  const providerLabel = document.createElement('label');
+  providerLabel.textContent = 'Provider';
+  const providerSelect = document.createElement('select');
+  for (const provider of ['anthropic', 'openai', 'gemini']) {
+    const option = document.createElement('option');
+    option.value = provider;
+    option.textContent = vaultProviderLabel(provider);
+    providerSelect.appendChild(option);
+  }
+  const labelLabel = document.createElement('label');
+  labelLabel.textContent = 'Label';
+  const labelInput = document.createElement('input');
+  labelInput.type = 'text';
+  labelInput.placeholder = 'e.g. Personal Anthropic';
+  labelInput.autocomplete = 'off';
+  const secretLabel = document.createElement('label');
+  secretLabel.textContent = 'API key';
+  const secretInput = document.createElement('input');
+  secretInput.type = 'password';
+  secretInput.placeholder = 'sk-…';
+  secretInput.autocomplete = 'off';
+  grid.append(providerLabel, providerSelect, labelLabel, labelInput, secretLabel, secretInput);
+  body.appendChild(grid);
+
+  const actions = document.createElement('div');
+  actions.className = 'vault-actions';
+  actions.style.marginTop = '8px';
+  actions.appendChild(
+    vaultButton('Add to vault', () => {
+      const secretValue = secretInput.value.trim();
+      if (!secretValue) return;
+      vaultUpsertEntry({
+        kind: 'api_key',
+        provider: providerSelect.value,
+        label: labelInput.value.trim() || `${vaultProviderLabel(providerSelect.value)} key`,
+        secret: secretValue,
+      });
+      secretInput.value = '';
+      labelInput.value = '';
+      fold.open = false;
+      renderAccessVaultSection();
+    }, { primary: true })
+  );
+  body.appendChild(actions);
+  fold.append(summary, body);
+  card.appendChild(fold);
+}
+
+function vaultRenderUnlocked(card) {
+  vaultRenderEntries(card);
+  vaultRenderAddForm(card);
+  vaultRenderUnlockers(card);
+
+  const actions = document.createElement('div');
+  actions.className = 'vault-actions';
+  if (!vaultState.matchedEnvelopeId) {
+    actions.appendChild(vaultButton('Enroll this passkey', () => vaultEnrollThisPasskey(), { primary: true }));
+    const hint = document.createElement('span');
+    hint.className = 'vault-note';
+    hint.textContent = 'The passkey from this session cannot open the vault yet — enrolling adds an envelope, nothing is re-encrypted.';
+    actions.appendChild(hint);
+  }
+  actions.appendChild(vaultButton('Lock vault', () => vaultLock()));
+  card.appendChild(actions);
+
+  if (vaultState.migratedVoiceKeys) {
+    const note = document.createElement('div');
+    note.className = 'vault-note';
+    note.textContent = 'Voice API keys moved into the vault; the old per-origin browser copies were removed.';
+    card.appendChild(note);
+  }
+}
+
+function renderAccessVaultSection() {
+  const mount = document.getElementById('access-vault-section');
+  if (!mount) return;
+  // Background renders must not clobber a phrase or key mid-typing.
+  if (mount.contains(document.activeElement) && document.activeElement.matches('input, textarea, select')) return;
+
+  const card = document.createElement('div');
+  card.className = 'vault-card';
+
+  const statusLine = document.createElement('div');
+  statusLine.className = 'vault-status-line';
+  const chip = document.createElement('span');
+  chip.className = 'vault-chip';
+  let statusText = '';
+  switch (vaultState.status) {
+    case 'unavailable':
+      chip.textContent = 'unavailable';
+      statusText = DASHBOARD_CONNECT_MODE
+        ? 'This browser lacks the WebCrypto features the vault needs.'
+        : 'The vault rides your hosted account — open this dashboard through Hosted Connect to use it.';
+      break;
+    case 'signed-out':
+      chip.textContent = 'signed out';
+      statusText = 'Sign in to the hosted account to reach your credential vault.';
+      break;
+    case 'none':
+      chip.textContent = 'not created';
+      statusText = 'No vault yet. Create one to keep provider credentials off every daemon disk — daemons will borrow time-boxed leases instead.';
+      break;
+    case 'locked':
+      chip.textContent = 'locked';
+      chip.classList.add('warn');
+      statusText = `Revision ${vaultState.revision}, ${(vaultState.blob?.envelopes || []).length} unlocker(s). Unseal it with a passkey or the recovery phrase.`;
+      break;
+    case 'unlocked':
+      chip.textContent = 'unlocked';
+      chip.classList.add('ok');
+      statusText = `Revision ${vaultState.revision}, ${vaultState.entries.length} credential(s). Unsealed in this tab's memory only.`;
+      break;
+    default:
+      chip.textContent = 'checking';
+      statusText = 'Looking for your vault…';
+  }
+  statusLine.append(chip, document.createTextNode(statusText));
+  card.appendChild(statusLine);
+
+  if (vaultState.rollbackWarning) {
+    const warning = document.createElement('div');
+    warning.className = 'vault-warning';
+    warning.textContent = vaultState.rollbackWarning;
+    card.appendChild(warning);
+  }
+  if (vaultState.lastError) {
+    const error = document.createElement('div');
+    error.className = 'vault-error';
+    error.textContent = vaultState.lastError;
+    card.appendChild(error);
+  }
+
+  if (vaultCeremony) {
+    vaultRenderCeremony(card);
+  } else if (vaultState.status === 'none') {
+    const actions = document.createElement('div');
+    actions.className = 'vault-actions';
+    actions.appendChild(
+      vaultButton('Create vault', async () => {
+        vaultCeremony = { phrase: await vaultGeneratePhrase() };
+        vaultState.lastError = '';
+        renderAccessVaultSection();
+      }, { primary: true })
+    );
+    card.appendChild(actions);
+  } else if (vaultState.status === 'locked') {
+    vaultRenderLocked(card);
+  } else if (vaultState.status === 'unlocked') {
+    vaultRenderUnlocked(card);
+  }
+
+  mount.innerHTML = '';
+  mount.appendChild(card);
 }
 
 /* Sign an offer. Absence is legacy-compatible (the daemon falls back to
@@ -21396,7 +22476,7 @@ function stopVideo() {
 function hasVoiceCredentials() {
   const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
   if (provider === 'openai') return true; // server mints token from OPENAI_API_KEY
-  return !!localStorage.getItem(getStorageKey());
+  return !!voiceApiKeyGet();
 }
 
 // ── Voice Connection ──
@@ -21423,8 +22503,8 @@ async function connectVoice() {
       return;
     }
   } else {
-    // Gemini: use API key from localStorage
-    token = localStorage.getItem(getStorageKey());
+    // Gemini: vault entry when unlocked, else the per-origin localStorage key
+    token = voiceApiKeyGet();
     if (!token) { showFirstRunDialog(); return; }
   }
 
@@ -21446,7 +22526,7 @@ function showFirstRunDialog() {
 function showSettingsDialog() {
   const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
   document.getElementById('apiKeyLabel').textContent = provider.charAt(0).toUpperCase() + provider.slice(1) + ' API Key';
-  document.getElementById('apiKeyInput').value = localStorage.getItem(getStorageKey()) || '';
+  document.getElementById('apiKeyInput').value = voiceApiKeyGet() || '';
   document.getElementById('passiveModeCheckbox').checked = localStorage.getItem('passive_mode') === 'true';
   document.getElementById('settingsDialog').classList.remove('hidden');
 }
@@ -21994,6 +23074,7 @@ async function main() {
       await waitForDashboardControlReady(30000);
       await hydrateDashboardFromControl();
       await accessFleetHydrateFromHosted();
+      vaultInit(); // fire-and-forget: the vault must never block dashboard bootstrap
       connectBootstrapReady = true;
       setConnectEventStatus('ok', 'Dashboard events are live through verified Hosted Connect');
     } catch (err) {
@@ -22040,6 +23121,10 @@ async function main() {
 
     maybeStartDashboardControlTransport();
   }
+
+  // Idempotent (no-op when the connect bootstrap above already ran it):
+  // outside hosted mode this just settles the vault UI to 'unavailable'.
+  vaultInit();
 
   // Initialize multi-host state now that self-label is resolved and the
   // WASM app is ready. Hydrates the peer list from the server-side
@@ -22145,7 +23230,7 @@ async function main() {
   document.getElementById('firstRunSave').addEventListener('click', () => {
     const key = document.getElementById('firstRunKeyInput').value.trim();
     if (key) {
-      localStorage.setItem(getStorageKey(), key);
+      voiceApiKeySet(key);
       document.getElementById('firstRunDialog').classList.add('hidden');
       connectVoice();
     }
@@ -22155,7 +23240,7 @@ async function main() {
   });
   document.getElementById('settingsSave').addEventListener('click', () => {
     const key = document.getElementById('apiKeyInput').value.trim();
-    if (key) localStorage.setItem(getStorageKey(), key);
+    if (key) voiceApiKeySet(key);
     const passive = document.getElementById('passiveModeCheckbox').checked;
     localStorage.setItem('passive_mode', passive);
     app.set_passive_mode(passive);
@@ -38767,6 +39852,7 @@ function renderAccessAdminSummaries() {
   renderAccessPeerSummary();
   accessRenderDetailCards('access-peer-details', accessPeerTrustDetailCards());
   accessRenderCards('access-diagnostics-overview', accessDiagnosticsCards());
+  renderAccessVaultSection();
   renderAccessRoleCatalog();
   renderAccessOrganizations();
   renderAccessPermissionMatrix();
