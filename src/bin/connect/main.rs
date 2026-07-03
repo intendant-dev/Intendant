@@ -95,6 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(healthz))
         .route("/install.sh", get(install_sh))
         .route("/favicon.png", get(favicon_png))
+        .route("/logo.svg", get(logo_svg))
         .route("/assets/landing/{name}", get(landing_asset))
         .route("/readyz", get(readyz))
         .route("/api/me", get(api_me))
@@ -932,10 +933,22 @@ async fn install_sh() -> impl IntoResponse {
     )
 }
 
-/// The canonical Intendant mark (macos-app/icon.png cropped full-bleed and
-/// downscaled — regenerate with `PIL: crop(alpha bbox) → resize`), embedded so
-/// every page this binary serves gets the real logo without a static root.
+/// The canonical Intendant mark, embedded so every page this binary serves
+/// gets the real logo without a static root. `static/logo.svg` is the
+/// macOS icon vector (macos-app/icon.svg) with the dock margin cropped in
+/// viewBox space; the PNG fallback is rendered from it (`rsvg-convert -w 128`).
+const LOGO_SVG: &str = include_str!("../../../static/logo.svg");
 const BRAND_ICON_PNG: &[u8] = include_bytes!("../../../static/icon-128.png");
+
+async fn logo_svg() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        LOGO_SVG,
+    )
+}
 
 async fn favicon_png() -> impl IntoResponse {
     (
@@ -4907,6 +4920,7 @@ fn trust_ui_html(origin: &str) -> String {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>How trust works — Intendant Connect</title>
+  <link rel="icon" type="image/svg+xml" href="/logo.svg">
   <link rel="icon" type="image/png" href="/favicon.png">
   <style>
     :root {{
@@ -4942,7 +4956,7 @@ fn trust_ui_html(origin: &str) -> String {
   </style>
 </head>
 <body>
-  <header><div class="topbar"><img class="brand-mark" src="/favicon.png" alt=""><a href="/connect">Intendant Connect</a></div></header>
+  <header><div class="topbar"><img class="brand-mark" src="/logo.svg" alt=""><a href="/connect">Intendant Connect</a></div></header>
   <main>
     <h1>How trust works here</h1>
     <p class="lede">The short version: this service makes introductions and carries ciphertext. Authority over your computers never lives here &mdash; not even when you sign in.</p>
@@ -5004,6 +5018,7 @@ fn landing_ui_html(origin: &str) -> String {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Intendant — an operating environment for autonomous AI agents</title>
   <meta name="description" content="Give an AI agent a full machine — shell, files, display, voice — under layered human oversight. Your keys stay yours.">
+  <link rel="icon" type="image/svg+xml" href="/logo.svg">
   <link rel="icon" type="image/png" href="/favicon.png">
   <style>
     :root {{
@@ -5177,7 +5192,7 @@ fn landing_ui_html(origin: &str) -> String {
 <body>
   <div class="wrap">
     <header>
-      <div class="mark"><img src="/favicon.png" alt="">intendant<span>.dev</span></div>
+      <div class="mark"><img src="/logo.svg" alt="">intendant<span>.dev</span></div>
       <nav>
         <a href="/trust">How trust works</a>
         <a href="{DOCS_URL}">Docs</a>
@@ -5392,6 +5407,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{product_title}</title>
+  <link rel="icon" type="image/svg+xml" href="/logo.svg">
   <link rel="icon" type="image/png" href="/favicon.png">
   <style>
     :root {{
@@ -5579,7 +5595,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
   <header>
     <div class="topbar">
       <div class="brand">
-        <img class="brand-mark" src="/favicon.png" alt="">
+        <img class="brand-mark" src="/logo.svg" alt="">
         <div>
         <h1>{product_title}</h1>
           <div class="brand-sub">{account_subtitle}</div>
@@ -5596,7 +5612,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     <!-- ── Signed out: landing ── -->
     <section id="auth">
       <div class="hero">
-        <img class="hero-mark" src="/favicon.png" alt="">
+        <img class="hero-mark" src="/logo.svg" alt="">
         <h2 class="hero-title">Your computers, anywhere.</h2>
         <p class="hero-sub">Sign in with a passkey and open any machine you own, from any browser. This service only makes the introduction &mdash; each computer verifies you itself and decides what you may do, end to end.</p>
       </div>
@@ -7159,24 +7175,31 @@ mod tests {
         }
         assert!(html.contains("alt=\"The Intendant dashboard's Activity feed"));
         // The canonical mark, not an ad-hoc monogram: favicon + header logo.
+        assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/logo.svg">"#));
         assert!(html.contains(r#"<link rel="icon" type="image/png" href="/favicon.png">"#));
-        assert!(html.contains(r#"<img src="/favicon.png""#));
+        assert!(html.contains(r#"<img src="/logo.svg""#));
         assert!(!html.contains("data:image/svg"));
     }
 
     #[test]
     fn every_page_serves_the_canonical_mark() {
-        // PNG magic on the embedded brand icon (kept in lockstep with
-        // static/icon-128.png by include_bytes!).
+        // The embedded mark is the real artwork: SVG vector + PNG fallback
+        // (kept in lockstep with static/ by include_str!/include_bytes!).
+        assert!(LOGO_SVG.starts_with("<svg"));
+        assert!(
+            LOGO_SVG.contains(r#"viewBox="16 16 480 480""#),
+            "logo.svg must stay the margin-cropped view of the macOS icon"
+        );
         assert_eq!(&BRAND_ICON_PNG[0..8], b"\x89PNG\r\n\x1a\n");
         assert!(BRAND_ICON_PNG.len() > 2_048, "brand icon suspiciously small");
-        let favicon_link = r#"<link rel="icon" type="image/png" href="/favicon.png">"#;
+        let svg_link = r#"<link rel="icon" type="image/svg+xml" href="/logo.svg">"#;
+        let png_link = r#"<link rel="icon" type="image/png" href="/favicon.png">"#;
         let connect = connect_ui_html("https://x.example", "Intendant Connect", "Rendezvous account");
-        assert!(connect.contains(favicon_link));
-        assert!(connect.contains(r#"class="brand-mark" src="/favicon.png""#));
+        assert!(connect.contains(svg_link) && connect.contains(png_link));
+        assert!(connect.contains(r#"class="brand-mark" src="/logo.svg""#));
         assert!(!connect.contains(">IC</div>"));
         let trust = trust_ui_html("https://x.example");
-        assert!(trust.contains(favicon_link));
+        assert!(trust.contains(svg_link) && trust.contains(png_link));
         assert!(!trust.contains(">IC</div>"));
     }
 
