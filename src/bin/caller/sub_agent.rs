@@ -45,6 +45,10 @@ pub struct SubAgentSpec {
     pub working_dir: PathBuf,
     pub result_file: PathBuf,
     pub progress_file: PathBuf,
+    /// Bespoke system prompt for this sub-agent. Travels as
+    /// INTENDANT_SYSTEM_PROMPT in the spawn env and replaces the child's
+    /// file-resolved role prompt wholesale (run_sub_agent_mode honors it;
+    /// the result/progress-file contracts are code-enforced either way).
     pub system_prompt: Option<String>,
     pub inherit_memory: bool,
 }

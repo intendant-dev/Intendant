@@ -8900,7 +8900,22 @@ fn resolve_persisted_start_target(
     let Some(source) = source else {
         return PersistedStartTarget::NonExternal;
     };
-    let Some(resume_id) = resume_id else {
+    // The scan above is target DISCOVERY; the supervisor's resolver is the
+    // authority on resume identity (canonical backend-id filtering plus the
+    // external-wrapper index). Canonicalize through it — this also rescues
+    // sessions whose session.jsonl carries no usable identity but whose
+    // wrapper index knows the backend session.
+    let canonical = crate::session_supervisor::effective_external_resume_token_in_home(
+        logs_home,
+        &source,
+        session_id,
+        resume_id.as_deref().unwrap_or(""),
+        false,
+    );
+    if !canonical.trim().is_empty() {
+        resume_id = Some(canonical);
+    }
+    let Some(resume_id) = resume_id.filter(|id| !id.trim().is_empty()) else {
         return PersistedStartTarget::ExternalMissingResume {
             source: Some(source),
         };

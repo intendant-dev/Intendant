@@ -152,7 +152,12 @@ const CODEX_SESSION_LIST_PREFIX_READ_LIMIT: u64 = 8 * 1024 * 1024;
 const CODEX_SESSION_LIST_PREFIX_LINE_LIMIT: usize = 64;
 // Exact fork baselines are a synchronous `/api/sessions` refinement. The scanner
 // below parses compact Codex token lines without materializing full JSON values.
-const CODEX_PARENT_BASELINE_MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+// Exact fork baselines come from scanning the parent's log (results
+// persist per file-state in the codex-parent-baseline namespace, so each
+// scan happens once). The per-file cap covers the largest observed
+// rollouts; parents past the per-build budget pick up their baseline on a
+// later list pass.
+const CODEX_PARENT_BASELINE_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const CODEX_PARENT_BASELINE_SCAN_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const WORKTREE_OBSERVED_SESSION_FILE_LIMIT: usize = 1_000;
 const WORKTREE_OBSERVED_HINT_LIMIT: usize = 1_000;
@@ -288,7 +293,13 @@ struct CodexSessionListSummary {
     lineage: SessionLineageMetadata,
     provider: Option<String>,
     usage: SessionUsage,
-    usage_events: Vec<CodexUsageEvent>,
+    // First usage event after the last in-file counter reset. For a forked
+    // session its cumulative reading still contains the parent's history;
+    // keeping just this event lets daily buckets be re-baselined without
+    // retaining the full per-request event history (which made the resident
+    // summary cache scale with transcript length, not session count).
+    #[serde(default)]
+    first_usage_event: Option<CodexUsageEvent>,
     daily_usage: BTreeMap<String, SessionUsage>,
     goal: Option<SessionGoal>,
     task: Option<String>,
@@ -318,17 +329,18 @@ struct CodexParentUsageBaselineCacheEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionDirFingerprint {
     path: String,
-    entries: Vec<SessionFileFingerprint>,
+    // SHA-256 over the sorted per-file stat records of the session dir
+    // (see `session_file_fingerprints_digest`). Only equality is ever
+    // needed for validation, and busy session dirs hold thousands of turn
+    // files — retaining the full record list made the resident row cache
+    // scale with turn count instead of session count.
+    digest: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug)]
 struct SessionFileFingerprint {
     rel: String,
-    // 128-bit timestamps ride as strings: serde_json's Number cannot hold
-    // them without the arbitrary_precision feature.
-    #[serde(with = "string_u128")]
     mtime_nanos: u128,
-    #[serde(with = "string_i128")]
     ctime_nanos: i128,
     len: u64,
     dev: u64,
@@ -2051,6 +2063,27 @@ struct FsWriteRequest {
     force: bool,
 }
 
+/// Body of `POST /api/fs/rename` — move/rename a file or directory. Both
+/// `from` and `to` must pass write-scope authorization (removing an entry is
+/// a write at the source; creating one is a write at the destination). A
+/// rename never replaces an existing destination — fail closed and let the
+/// client delete explicitly first.
+#[derive(Debug, Deserialize)]
+struct FsRenameRequest {
+    from: String,
+    to: String,
+}
+
+/// Body of `POST /api/fs/delete`. Files and symlinks (the link itself, never
+/// its target) delete unconditionally; directories must be empty unless the
+/// client states `recursive: true`.
+#[derive(Debug, Deserialize)]
+struct FsDeleteRequest {
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+}
+
 /// Debug state for the voice model, tracked server-side from WebSocket messages.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct VoiceDebugState {
@@ -3662,7 +3695,7 @@ fn session_agent_output_response_for_ids(
 ) -> String {
     let source = crate::session_names::normalize_source(source);
     if source == "intendant" {
-        let Some(session_dir) = resolve_session_dir_from_home(home, session_id) else {
+        let Some(session_dir) = resolve_bare_session_dir_from_home(home, session_id) else {
             return upload_error_response("404 Not Found", "session not found");
         };
         return current_agent_output_response_for_ids(ids, &session_dir);
@@ -3690,7 +3723,13 @@ pub(crate) fn session_agent_output_post_response(
     }
 }
 
-fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+/// The PASTE-FRIENDLY policy, used by replay only: accepts a bare session
+/// directory name (like everything else) or a full pasted log-dir path,
+/// which must canonicalize under `~/.intendant/logs` (anchored by
+/// `session_names::intendant_session_dir_from_slash_path`). Every other
+/// dashboard endpoint holds the bare-id line — see
+/// `session_lookup_id_is_safe` for the policy split.
+fn intendant_session_dir_from_id_or_path(home: &Path, session_id: &str) -> Option<PathBuf> {
     if crate::session_names::session_id_looks_like_path(session_id) {
         return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
     }
@@ -4082,7 +4121,7 @@ fn resume_session_activity_replay_from_home(
 
     let source_norm = source.trim().to_lowercase();
     if source_norm == "intendant" {
-        let log_dir = intendant_session_dir_from_home(home, session_id)?;
+        let log_dir = intendant_session_dir_from_id_or_path(home, session_id)?;
         return session_log_replay_payload_from_dir_with_limit(&log_dir, Some(limit))
             .map(|(payload, _)| payload);
     }
@@ -4091,7 +4130,7 @@ fn resume_session_activity_replay_from_home(
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .unwrap_or(session_id);
-    if let Some(log_dir) = intendant_session_dir_from_home(home, session_id) {
+    if let Some(log_dir) = intendant_session_dir_from_id_or_path(home, session_id) {
         if let Some((payload, external_id)) =
             session_log_replay_payload_from_dir_with_limit(&log_dir, Some(limit))
         {
@@ -4847,10 +4886,12 @@ mod host_header_tests {
     }
 }
 
-/// List session directories from `~/.intendant/logs/`, returning JSON metadata
-/// for each session (newest first, capped at 100).
-/// Return session detail: replayed log entries + metadata for a single session.
-/// Resolve a session directory by exact ID or prefix match.
+/// The BARE-ID policy: dashboard session APIs take a plain directory name
+/// (or id prefix) — anything path-shaped is invalid input, full stop.
+/// The one deliberate exception is replay's paste-friendly resolver,
+/// `intendant_session_dir_from_id_or_path`, which additionally accepts a
+/// full log-dir path anchored under `~/.intendant/logs`. Pick one policy
+/// per endpoint on purpose; never mix them in one lookup.
 pub(crate) fn session_lookup_id_is_safe(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id.trim() == session_id
@@ -4860,7 +4901,10 @@ pub(crate) fn session_lookup_id_is_safe(session_id: &str) -> bool {
         && !session_id.contains('\\')
 }
 
-fn resolve_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+/// Resolve a session directory under `~/.intendant/logs` from a bare id:
+/// exact directory, then id-prefix match, then the listed-external-row
+/// fallback. Enforces the bare-id policy (`session_lookup_id_is_safe`).
+fn resolve_bare_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
     if !session_lookup_id_is_safe(session_id) {
         return None;
     }
@@ -4911,7 +4955,7 @@ fn resolve_session_dir_from_listed_external_row(home: &Path, session_id: &str) -
 }
 
 pub(crate) fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
-    resolve_session_dir_from_home(&crate::platform::home_dir(), session_id)
+    resolve_bare_session_dir_from_home(&crate::platform::home_dir(), session_id)
 }
 
 fn deleted_external_sessions_path(home: &Path) -> PathBuf {
@@ -5247,7 +5291,7 @@ fn get_session_detail_from_home_with_page(
     limit: Option<usize>,
     before: Option<usize>,
 ) -> String {
-    let session_dir = match resolve_session_dir_from_home(home, session_id) {
+    let session_dir = match resolve_bare_session_dir_from_home(home, session_id) {
         Some(d) => d,
         None => return serde_json::json!({"error": "session not found"}).to_string(),
     };
@@ -5377,7 +5421,7 @@ fn context_snapshot_candidate_log_dirs(
         }
     };
 
-    if let Some(dir) = resolve_session_dir_from_home(home, session_id) {
+    if let Some(dir) = resolve_bare_session_dir_from_home(home, session_id) {
         push(&mut dirs, &mut seen, dir);
     }
     let source = crate::session_names::normalize_source(source);
@@ -5836,7 +5880,7 @@ fn session_log_search_file_path(
     }
 
     match source {
-        "intendant" => Some(resolve_session_dir_from_home(home, session_id)?.join("session.jsonl")),
+        "intendant" => Some(resolve_bare_session_dir_from_home(home, session_id)?.join("session.jsonl")),
         "codex" => find_codex_session_file(home, session_id),
         "claude-code" => find_claude_session_file(home, session_id),
         "gemini" => find_gemini_session_file(home, session_id),
@@ -6846,6 +6890,13 @@ fn session_list_cache_slot(key: &SessionListCacheKey) -> String {
 // race toward equivalent content, never corrupt an entry. External
 // stores (~/.codex, ~/.claude, ~/.gemini) are never written — the index
 // mirrors them under ~/.intendant/cache/session_index/.
+//
+// Entries carry a per-namespace schema stamp: when the value shape changes
+// in a way serde would accept silently (a removed or defaulted field),
+// bumping the namespace schema turns every old entry into a cache miss so
+// it is rebuilt in place under the same slot filename. Entries whose
+// source path no longer exists are pruned during the preload sweep —
+// deleted sessions otherwise accumulate dead index files forever.
 
 #[derive(Serialize, Deserialize)]
 struct PersistedSessionCacheKey {
@@ -6889,8 +6940,22 @@ impl PersistedSessionCacheKey {
 
 #[derive(Serialize, Deserialize)]
 struct PersistedSessionCacheEntry<T> {
+    #[serde(default)]
+    schema: u32,
     key: PersistedSessionCacheKey,
     value: T,
+}
+
+/// Schema stamp for a namespace's persisted entries. Old entries (schema 0
+/// predates the field) mismatch after a bump and read as cache misses.
+fn persisted_namespace_schema(namespace: &str) -> u32 {
+    match namespace {
+        // v1: summaries persist `first_usage_event` instead of the full
+        // `usage_events` history; pre-v1 entries would deserialize with a
+        // defaulted first event and mis-baseline forked sessions.
+        "codex" => 1,
+        _ => 0,
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -6943,6 +7008,9 @@ fn load_persisted_session_entry_in<T: serde::de::DeserializeOwned>(
     let path = session_index_entry_path_in(base, key.namespace, &session_list_cache_slot(key));
     let bytes = std::fs::read(path).ok()?;
     let entry: PersistedSessionCacheEntry<T> = serde_json::from_slice(&bytes).ok()?;
+    if entry.schema != persisted_namespace_schema(key.namespace) {
+        return None;
+    }
     entry.key.matches(key).then_some(entry.value)
 }
 
@@ -6958,6 +7026,7 @@ fn store_persisted_session_entry_in<T: Serialize>(
     value: &T,
 ) {
     let entry = PersistedSessionCacheEntry {
+        schema: persisted_namespace_schema(key.namespace),
         key: PersistedSessionCacheKey::of(key),
         value,
     };
@@ -7002,11 +7071,13 @@ fn remove_persisted_intendant_row(dir: &Path) {
 /// of that. Entries land exactly as `store_*` would have put them — the
 /// normal lookup path still validates every fingerprint against the live
 /// filesystem, so a stale preloaded entry can never be served.
+type PreloadApply = fn(&'static str, &[u8]) -> PreloadOutcome;
+
 fn preload_session_index() {
     static PRELOADED: std::sync::Once = std::sync::Once::new();
     PRELOADED.call_once(|| {
         let base = session_index_dir();
-        let namespaces: [(&'static str, fn(&'static str, &[u8])); 4] = [
+        let namespaces: [(&'static str, PreloadApply); 4] = [
             ("codex", preload_codex_entry),
             ("claude-code", preload_row_entry),
             ("gemini", preload_row_entry),
@@ -7025,15 +7096,47 @@ fn preload_session_index() {
     });
 }
 
-fn preload_namespace_dir(dir: &Path, namespace: &'static str, apply: fn(&'static str, &[u8])) {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PreloadOutcome {
+    /// Entry landed in the in-memory cache.
+    Loaded,
+    /// The session file/dir the entry indexes is gone — the entry is dead
+    /// weight and its index file should be deleted.
+    TargetMissing,
+    /// Not loadable by this build (schema mismatch, unreadable JSON). Keep
+    /// the file: an older or newer daemon sharing this HOME may still own
+    /// it, and refreshes overwrite the same slot anyway.
+    Skipped,
+}
+
+fn preload_namespace_dir(dir: &Path, namespace: &'static str, apply: PreloadApply) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("json"))
-        .collect();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".tmp.") {
+            // Writers rename these away within the same call; anything
+            // older than a minute is litter from a crashed daemon.
+            let aged = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|age| age > std::time::Duration::from_secs(60))
+                .unwrap_or(false);
+            if aged {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
     if paths.is_empty() {
         return;
     }
@@ -7045,7 +7148,9 @@ fn preload_namespace_dir(dir: &Path, namespace: &'static str, apply: fn(&'static
             scope.spawn(move || {
                 for path in slice {
                     if let Ok(bytes) = std::fs::read(path) {
-                        apply(namespace, &bytes);
+                        if apply(namespace, &bytes) == PreloadOutcome::TargetMissing {
+                            let _ = std::fs::remove_file(path);
+                        }
                     }
                 }
             });
@@ -7072,14 +7177,51 @@ fn runtime_session_cache_key(
     })
 }
 
-fn preload_row_entry(namespace: &'static str, bytes: &[u8]) {
+/// Lenient fallback for entries this build cannot parse (legacy or future
+/// shapes): both formats keep the indexed session's path under `key.path`
+/// (generic namespaces) or `fingerprint.path` (intendant rows), so a dead
+/// target is still detectable — and prunable — without understanding the
+/// rest of the entry. Anything else unreadable is left alone.
+fn preload_unparsed_entry_outcome(bytes: &[u8]) -> PreloadOutcome {
+    #[derive(Deserialize)]
+    struct ProbePath {
+        path: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Probe {
+        key: Option<ProbePath>,
+        fingerprint: Option<ProbePath>,
+    }
+    let Ok(probe) = serde_json::from_slice::<Probe>(bytes) else {
+        return PreloadOutcome::Skipped;
+    };
+    let path = probe
+        .key
+        .and_then(|key| key.path)
+        .or_else(|| probe.fingerprint.and_then(|fingerprint| fingerprint.path));
+    match path {
+        Some(path) if !path.is_empty() && !Path::new(&path).exists() => {
+            PreloadOutcome::TargetMissing
+        }
+        _ => PreloadOutcome::Skipped,
+    }
+}
+
+fn preload_row_entry(namespace: &'static str, bytes: &[u8]) -> PreloadOutcome {
     let Ok(entry) = serde_json::from_slice::<PersistedSessionCacheEntry<serde_json::Value>>(bytes)
     else {
-        return;
+        return preload_unparsed_entry_outcome(bytes);
     };
+    let schema_matches = entry.schema == persisted_namespace_schema(namespace);
     let Some(key) = runtime_session_cache_key(namespace, entry.key) else {
-        return;
+        return PreloadOutcome::Skipped;
     };
+    if !Path::new(&key.path).exists() {
+        return PreloadOutcome::TargetMissing;
+    }
+    if !schema_matches {
+        return PreloadOutcome::Skipped;
+    }
     let slot = session_list_cache_slot(&key);
     let mut cache = session_list_row_cache()
         .lock()
@@ -7088,17 +7230,25 @@ fn preload_row_entry(namespace: &'static str, bytes: &[u8]) {
         key,
         row: entry.value,
     });
+    PreloadOutcome::Loaded
 }
 
-fn preload_codex_entry(namespace: &'static str, bytes: &[u8]) {
+fn preload_codex_entry(namespace: &'static str, bytes: &[u8]) -> PreloadOutcome {
     let Ok(entry) =
         serde_json::from_slice::<PersistedSessionCacheEntry<CodexSessionListSummary>>(bytes)
     else {
-        return;
+        return preload_unparsed_entry_outcome(bytes);
     };
+    let schema_matches = entry.schema == persisted_namespace_schema(namespace);
     let Some(key) = runtime_session_cache_key(namespace, entry.key) else {
-        return;
+        return PreloadOutcome::Skipped;
     };
+    if !Path::new(&key.path).exists() {
+        return PreloadOutcome::TargetMissing;
+    }
+    if !schema_matches {
+        return PreloadOutcome::Skipped;
+    }
     let slot = session_list_cache_slot(&key);
     let mut cache = codex_session_list_cache()
         .lock()
@@ -7107,17 +7257,25 @@ fn preload_codex_entry(namespace: &'static str, bytes: &[u8]) {
         key,
         summary: entry.value,
     });
+    PreloadOutcome::Loaded
 }
 
-fn preload_baseline_entry(namespace: &'static str, bytes: &[u8]) {
+fn preload_baseline_entry(namespace: &'static str, bytes: &[u8]) -> PreloadOutcome {
     let Ok(entry) =
         serde_json::from_slice::<PersistedSessionCacheEntry<Option<SessionUsage>>>(bytes)
     else {
-        return;
+        return preload_unparsed_entry_outcome(bytes);
     };
+    let schema_matches = entry.schema == persisted_namespace_schema(namespace);
     let Some(key) = runtime_session_cache_key(namespace, entry.key) else {
-        return;
+        return PreloadOutcome::Skipped;
     };
+    if !Path::new(&key.path).exists() {
+        return PreloadOutcome::TargetMissing;
+    }
+    if !schema_matches {
+        return PreloadOutcome::Skipped;
+    }
     let slot = session_list_cache_slot(&key);
     let mut cache = codex_parent_usage_baseline_cache()
         .lock()
@@ -7128,12 +7286,16 @@ fn preload_baseline_entry(namespace: &'static str, bytes: &[u8]) {
             key,
             usage: entry.value,
         });
+    PreloadOutcome::Loaded
 }
 
-fn preload_intendant_entry(_namespace: &'static str, bytes: &[u8]) {
+fn preload_intendant_entry(_namespace: &'static str, bytes: &[u8]) -> PreloadOutcome {
     let Ok(entry) = serde_json::from_slice::<PersistedIntendantSessionEntry>(bytes) else {
-        return;
+        return preload_unparsed_entry_outcome(bytes);
     };
+    if !Path::new(&entry.fingerprint.path).exists() {
+        return PreloadOutcome::TargetMissing;
+    }
     let slot = entry.fingerprint.path.clone();
     let mut cache = intendant_session_list_cache()
         .lock()
@@ -7142,6 +7304,7 @@ fn preload_intendant_entry(_namespace: &'static str, bytes: &[u8]) {
         fingerprint: entry.fingerprint,
         row: entry.row,
     });
+    PreloadOutcome::Loaded
 }
 
 fn session_list_row_cache() -> &'static Mutex<HashMap<String, SessionListRowCacheEntry>> {
@@ -7940,29 +8103,6 @@ fn resolve_codex_inherited_model(
     None
 }
 
-fn codex_usage_at_or_before(
-    events: &[CodexUsageEvent],
-    timestamp: Option<&str>,
-) -> Option<SessionUsage> {
-    let cutoff = timestamp.map(timestamp_sort_secs).unwrap_or(0);
-    if cutoff <= 0 {
-        return None;
-    }
-
-    let mut selected = None;
-    for event in events {
-        let event_ts = event
-            .timestamp
-            .as_deref()
-            .map(timestamp_sort_secs)
-            .unwrap_or(0);
-        if event_ts > 0 && event_ts <= cutoff {
-            selected = Some(event.usage);
-        }
-    }
-    selected
-}
-
 fn json_compact_string_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let marker = format!("\"{key}\":\"");
     let start = line.find(&marker)? + marker.len();
@@ -8180,7 +8320,6 @@ fn codex_usage_baselines_from_file_uncached(
 
 fn codex_parent_baseline_for_summary(
     summary: &CodexSessionListSummary,
-    usage_events_by_id: &HashMap<String, Vec<CodexUsageEvent>>,
     exact_parent_baselines: &HashMap<(String, i64), Option<SessionUsage>>,
 ) -> Option<SessionUsage> {
     let parent_id = summary.lineage.parent_id.as_deref()?;
@@ -8197,26 +8336,30 @@ fn codex_parent_baseline_for_summary(
         }
     }
 
-    let parent_events = usage_events_by_id.get(parent_id)?;
-    codex_usage_at_or_before(parent_events, summary.created_at.as_deref())
+    None
 }
 
-fn codex_daily_usage_from_events(
+/// Daily usage for a forked session. The parse-time buckets counted the
+/// first usage event's cumulative reading from zero, but for a fork that
+/// reading still contains the parent's history — remove the parent
+/// baseline from the first event's day bucket.
+fn codex_daily_usage_with_baseline(
     summary: &CodexSessionListSummary,
     baseline: Option<SessionUsage>,
 ) -> BTreeMap<String, SessionUsage> {
-    let mut daily: BTreeMap<String, SessionUsage> = BTreeMap::new();
-    let mut previous = baseline.unwrap_or_default();
-    for event in &summary.usage_events {
-        let delta = event.usage.saturating_sub(previous);
-        previous = event.usage;
-        if delta.is_empty() {
-            continue;
-        }
-        let day = usage_day_from_timestamp(event.timestamp.as_deref())
-            .or_else(|| usage_day_from_timestamp(summary.file_updated_at.as_deref()));
-        if let Some(day) = day {
-            daily.entry(day).or_default().add(delta);
+    let mut daily = summary.daily_usage.clone();
+    if let (Some(first), Some(baseline)) = (summary.first_usage_event.as_ref(), baseline) {
+        if !baseline.is_empty() {
+            let day = usage_day_from_timestamp(first.timestamp.as_deref())
+                .or_else(|| usage_day_from_timestamp(summary.file_updated_at.as_deref()));
+            if let Some(day) = day {
+                if let Some(bucket) = daily.get_mut(&day) {
+                    *bucket = bucket.saturating_sub(baseline);
+                    if bucket.is_empty() {
+                        daily.remove(&day);
+                    }
+                }
+            }
         }
     }
     if daily.is_empty() && !summary.usage.is_empty() {
@@ -8245,7 +8388,11 @@ struct CodexSessionListAccumulator {
     lineage: SessionLineageMetadata,
     provider: Option<String>,
     usage: SessionUsage,
-    usage_events: Vec<CodexUsageEvent>,
+    first_usage_event: Option<CodexUsageEvent>,
+    // Deltas from events without a parseable timestamp; folded into the
+    // file-mtime day bucket at finish(), matching how the old
+    // event-replay path bucketed undated events.
+    undated_usage: SessionUsage,
     daily_usage: BTreeMap<String, SessionUsage>,
     goal: Option<SessionGoal>,
     task_started_turns: u64,
@@ -8365,7 +8512,8 @@ impl CodexSessionListAccumulator {
 
     fn clear_token_usage(&mut self) {
         self.usage = SessionUsage::default();
-        self.usage_events.clear();
+        self.first_usage_event = None;
+        self.undated_usage = SessionUsage::default();
         self.daily_usage.clear();
     }
 
@@ -8374,13 +8522,17 @@ impl CodexSessionListAccumulator {
         if !delta.is_empty() {
             if let Some(day) = usage_day_from_timestamp(timestamp.as_deref()) {
                 self.daily_usage.entry(day).or_default().add(delta);
+            } else {
+                self.undated_usage.add(delta);
             }
         }
         self.usage = parsed;
-        self.usage_events.push(CodexUsageEvent {
-            timestamp,
-            usage: parsed,
-        });
+        if self.first_usage_event.is_none() {
+            self.first_usage_event = Some(CodexUsageEvent {
+                timestamp,
+                usage: parsed,
+            });
+        }
     }
 
     fn finish(self, path: &Path) -> Option<CodexSessionListSummary> {
@@ -8403,6 +8555,13 @@ impl CodexSessionListAccumulator {
             .command_cwd
             .or(self.turn_cwd)
             .or_else(|| self.session_cwd.clone());
+        let file_updated_at = file_mtime_string(path);
+        let mut daily_usage = self.daily_usage;
+        if !self.undated_usage.is_empty() {
+            if let Some(day) = usage_day_from_timestamp(file_updated_at.as_deref()) {
+                daily_usage.entry(day).or_default().add(self.undated_usage);
+            }
+        }
         Some(CodexSessionListSummary {
             id,
             created_at: self.created_at,
@@ -8412,12 +8571,12 @@ impl CodexSessionListAccumulator {
             lineage: self.lineage,
             provider: self.provider,
             usage: self.usage,
-            usage_events: self.usage_events,
-            daily_usage: self.daily_usage,
+            first_usage_event: self.first_usage_event,
+            daily_usage,
             goal: self.goal,
             task,
             turns,
-            file_updated_at: file_mtime_string(path),
+            file_updated_at,
             bytes: file_size(path),
         })
     }
@@ -8593,7 +8752,6 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
     let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
     let mut model_by_id: HashMap<String, String> = HashMap::new();
     let mut parent_by_id: HashMap<String, String> = HashMap::new();
-    let mut usage_events_by_id: HashMap<String, Vec<CodexUsageEvent>> = HashMap::new();
     let mut path_by_id: HashMap<String, PathBuf> = HashMap::new();
     let index_path = codex.join("session_index.jsonl");
     if let Some(contents) = read_codex_session_index_for_list(&index_path) {
@@ -8647,9 +8805,8 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
             model_by_id.insert(id.clone(), model);
         }
         if let Some(parent_id) = summary.lineage.parent_id.clone() {
-            parent_by_id.insert(id.clone(), parent_id);
+            parent_by_id.insert(id, parent_id);
         }
-        usage_events_by_id.insert(id, summary.usage_events.clone());
         path_by_id.insert(summary.id.clone(), path.clone());
         summaries.push((path, summary));
     }
@@ -8659,10 +8816,7 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
         let Some(parent_id) = summary.lineage.parent_id.as_ref() else {
             continue;
         };
-        let Some(parent_path) = path_by_id.get(parent_id) else {
-            continue;
-        };
-        if file_size(parent_path) <= (EXTERNAL_SESSION_READ_LIMIT * 2) {
+        if !path_by_id.contains_key(parent_id) {
             continue;
         }
         let cutoff = summary
@@ -8746,17 +8900,14 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
             summary.bytes,
         );
         summary.lineage.apply_to_session_json(&mut session);
-        let parent_baseline = codex_parent_baseline_for_summary(
-            &summary,
-            &usage_events_by_id,
-            &exact_parent_baselines,
-        );
+        let parent_baseline =
+            codex_parent_baseline_for_summary(&summary, &exact_parent_baselines);
         let usage = parent_baseline
             .map(|baseline| summary.usage.saturating_sub(baseline))
             .unwrap_or(summary.usage);
         apply_session_usage(&mut session, usage, summary.model.as_deref());
         let daily_usage = if summary.lineage.parent_id.is_some() {
-            codex_daily_usage_from_events(&summary, parent_baseline)
+            codex_daily_usage_with_baseline(&summary, parent_baseline)
         } else {
             summary.daily_usage.clone()
         };
@@ -11699,8 +11850,32 @@ fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDirFingerprint
     entries.sort_by(|a, b| a.rel.cmp(&b.rel).then_with(|| a.is_dir.cmp(&b.is_dir)));
     Some(SessionDirFingerprint {
         path: session_list_path_key(dir),
-        entries,
+        digest: session_file_fingerprints_digest(&entries),
     })
+}
+
+/// Canonical digest over sorted per-file stat records. The byte layout is
+/// part of the persisted intendant-row format: changing it (or the record
+/// fields) invalidates every persisted row, which then rebuilds on the
+/// next list pass.
+fn session_file_fingerprints_digest(entries: &[SessionFileFingerprint]) -> String {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    for entry in entries {
+        ctx.update(entry.rel.as_bytes());
+        ctx.update(&[0]);
+        ctx.update(&entry.len.to_le_bytes());
+        ctx.update(&entry.mtime_nanos.to_le_bytes());
+        ctx.update(&entry.ctime_nanos.to_le_bytes());
+        ctx.update(&entry.dev.to_le_bytes());
+        ctx.update(&entry.ino.to_le_bytes());
+        ctx.update(&[entry.is_dir as u8]);
+    }
+    let digest = ctx.finish();
+    let mut out = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<serde_json::Value> {
@@ -16967,12 +17142,261 @@ pub(crate) fn dashboard_fs_write_response_parts(
         force: params.get("force").and_then(|v| v.as_bool()).unwrap_or(false),
     };
     let (status_line, body) = apply_dashboard_fs_write(&args, bytes);
-    let code = status_line
+    (status_line_u16(&status_line), body.to_string())
+}
+
+/// Rename/move half of the dashboard editor. Same contract as
+/// [`apply_dashboard_fs_write`]: the caller has already routed **both** paths
+/// through the write-scope gate — this function performs no IAM checks of its
+/// own.
+///
+/// The source must exist; the destination's parent must exist; the
+/// destination itself must not (`409` `code:"exists"` — a rename never
+/// replaces, even though the underlying syscall would). Cross-filesystem
+/// moves are refused rather than silently degraded to copy+delete.
+pub(crate) fn apply_dashboard_fs_rename(
+    raw_from: &str,
+    raw_to: &str,
+) -> (String, serde_json::Value) {
+    let from = match expand_dashboard_fs_path(raw_from) {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({ "error": e }),
+            )
+        }
+    };
+    let from = match std::fs::canonicalize(&from) {
+        Ok(canonical) => canonical,
+        Err(e) => {
+            return (
+                dashboard_fs_io_status(&e).to_string(),
+                serde_json::json!({
+                    "error": format!("{} is not accessible: {e}", from.display()),
+                    "code": "missing",
+                }),
+            )
+        }
+    };
+    let to = match expand_dashboard_fs_path(raw_to) {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({ "error": e }),
+            )
+        }
+    };
+    // Resolve the destination the same way a creating write does: canonical
+    // parent (which must exist) + final name, so `..` segments and symlinked
+    // parents cannot smuggle the target elsewhere after authorization.
+    let Some(name) = to.file_name().map(|n| n.to_os_string()) else {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!("{} has no file name", to.display())
+            }),
+        );
+    };
+    let Some(parent) = to.parent() else {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!("{} has no parent directory", to.display())
+            }),
+        );
+    };
+    let canonical_parent = match std::fs::canonicalize(parent) {
+        Ok(canonical) => canonical,
+        Err(_) => {
+            return (
+                "404 Not Found".to_string(),
+                serde_json::json!({
+                    "error": format!(
+                        "parent directory {} does not exist — create it first",
+                        parent.display()
+                    ),
+                    "code": "missing_parent",
+                }),
+            )
+        }
+    };
+    if !canonical_parent.is_dir() {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!("{} is not a directory", canonical_parent.display())
+            }),
+        );
+    }
+    let to = canonical_parent.join(name);
+    if to == from {
+        return (
+            "200 OK".to_string(),
+            serde_json::json!({
+                "ok": true,
+                "from": from.to_string_lossy().to_string(),
+                "path": to.to_string_lossy().to_string(),
+                "renamed": false,
+                "notice": "source and destination are the same path",
+            }),
+        );
+    }
+    if from.is_dir() && to.starts_with(&from) {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "cannot move {} into itself",
+                    from.display()
+                ),
+            }),
+        );
+    }
+    if to.symlink_metadata().is_ok() {
+        return (
+            "409 Conflict".to_string(),
+            serde_json::json!({
+                "error": format!("{} already exists", to.display()),
+                "code": "exists",
+            }),
+        );
+    }
+    match std::fs::rename(&from, &to) {
+        Ok(()) => (
+            "200 OK".to_string(),
+            serde_json::json!({
+                "ok": true,
+                "from": from.to_string_lossy().to_string(),
+                "path": to.to_string_lossy().to_string(),
+                "renamed": true,
+            }),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "{} and {} are on different filesystems — copy and delete instead",
+                    from.display(),
+                    to.display()
+                ),
+                "code": "cross_device",
+            }),
+        ),
+        Err(e) => (
+            dashboard_fs_io_status(&e).to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "could not rename {} to {}: {e}",
+                    from.display(),
+                    to.display()
+                ),
+            }),
+        ),
+    }
+}
+
+/// Delete half of the dashboard editor. Same contract as
+/// [`apply_dashboard_fs_write`]: the caller has already routed the path
+/// through the write-scope gate — this function performs no IAM checks of
+/// its own.
+///
+/// Symlinks are deleted as links (`symlink_metadata`, never following), so a
+/// link whose target sits outside the caller's scope removes only the link.
+/// Non-empty directories require an explicit `recursive` (`409`
+/// `code:"not_empty"` otherwise).
+pub(crate) fn apply_dashboard_fs_delete(
+    raw_path: &str,
+    recursive: bool,
+) -> (String, serde_json::Value) {
+    let path = match expand_dashboard_fs_path(raw_path) {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({ "error": e }),
+            )
+        }
+    };
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            return (
+                dashboard_fs_io_status(&e).to_string(),
+                serde_json::json!({
+                    "error": format!("{} is not accessible: {e}", path.display()),
+                    "code": "missing",
+                }),
+            )
+        }
+    };
+    let is_dir = metadata.is_dir();
+    let result = if is_dir {
+        if recursive {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_dir(&path)
+        }
+    } else {
+        std::fs::remove_file(&path)
+    };
+    match result {
+        Ok(()) => (
+            "200 OK".to_string(),
+            serde_json::json!({
+                "ok": true,
+                "path": path.to_string_lossy().to_string(),
+                "deleted": true,
+                "dir": is_dir,
+            }),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => (
+            "409 Conflict".to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "{} is not empty — pass recursive to delete its contents",
+                    path.display()
+                ),
+                "code": "not_empty",
+            }),
+        ),
+        Err(e) => (
+            dashboard_fs_io_status(&e).to_string(),
+            serde_json::json!({
+                "error": format!("could not delete {}: {e}", path.display()),
+            }),
+        ),
+    }
+}
+
+/// Tunnel-facing wrapper for [`apply_dashboard_fs_rename`]: request fields
+/// as JSON params, `(http-ish status code, body)` out for
+/// `http_body_response`.
+pub(crate) fn dashboard_fs_rename_response_parts(params: &serde_json::Value) -> (u16, String) {
+    let from = params.get("from").and_then(|v| v.as_str()).unwrap_or_default();
+    let to = params.get("to").and_then(|v| v.as_str()).unwrap_or_default();
+    let (status_line, body) = apply_dashboard_fs_rename(from, to);
+    (status_line_u16(&status_line), body.to_string())
+}
+
+/// Tunnel-facing wrapper for [`apply_dashboard_fs_delete`].
+pub(crate) fn dashboard_fs_delete_response_parts(params: &serde_json::Value) -> (u16, String) {
+    let path = params.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+    let recursive = params
+        .get("recursive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let (status_line, body) = apply_dashboard_fs_delete(path, recursive);
+    (status_line_u16(&status_line), body.to_string())
+}
+
+fn status_line_u16(status_line: &str) -> u16 {
+    status_line
         .split_whitespace()
         .next()
         .and_then(|c| c.parse::<u16>().ok())
-        .unwrap_or(500);
-    (code, body.to_string())
+        .unwrap_or(500)
 }
 
 /// Extract the `Content-Type` request header value, or a generic default.
@@ -17388,6 +17812,11 @@ pub struct SettingsPayload {
     pub cu_provider: Option<String>,
     pub cu_model: Option<String>,
     pub cu_backend: String,
+    /// Read-only: `[experimental] cu_first_routing` from intendant.toml.
+    /// The dashboard shows the CU provider/model rows only when the
+    /// vaulted routing is enabled; the flag itself is file-only.
+    #[serde(default)]
+    pub cu_first_routing: bool,
     // Presence
     pub presence_enabled: bool,
     pub presence_provider: Option<String>,
@@ -17519,6 +17948,7 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         cu_provider: config.computer_use.provider.clone(),
         cu_model: config.computer_use.model.clone(),
         cu_backend: config.computer_use.backend.clone(),
+        cu_first_routing: config.experimental.cu_first_routing,
         presence_enabled: config.presence.enabled,
         presence_provider: config.presence.provider.clone(),
         presence_model: config.presence.model.clone(),
@@ -18066,8 +18496,8 @@ fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
 
     match error.raw_os_error() {
         // The listener file descriptor/socket is invalid or no longer a
-        // listening socket. Retrying would spin forever without restoring
-        // reachability.
+        // listening socket (EBADF/EINVAL/ENOTSOCK). Retrying accept() on it
+        // would spin forever — the caller rebinds a fresh listener instead.
         Some(9 | 22 | 38) => false,
         // Process/system descriptor pressure and socket buffer pressure are
         // recoverable after current connections close. Keep the gateway alive
@@ -18078,6 +18508,33 @@ fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
         // listener while existing WebSocket tasks make the UI look alive.
         _ => true,
     }
+}
+
+/// Rebind the gateway listener on its original address after the previous
+/// socket became unusable — seen in the wild on macOS as `accept()`
+/// returning EINVAL a minute into an app-spawned daemon's life, which
+/// used to kill the listener task and leave the dashboard half-alive
+/// (established WebSockets kept flowing while every new connection —
+/// session details, files, uploads, Station assets — failed). Mirrors
+/// `bind_dual_stack_or_v4`: dual-stack for the IPv6 wildcard,
+/// `SO_REUSEADDR` so lingering TIME_WAIT sockets don't block the port.
+fn rebind_gateway_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() && addr.ip().is_unspecified() {
+        let _ = socket.set_only_v6(false);
+    }
+    let _ = socket.set_reuse_address(true);
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(std_listener)
 }
 
 /// CORS header segment for `/mcp` responses: echo the requesting origin
@@ -18926,7 +19383,9 @@ pub fn spawn_web_gateway(
     let tls_failure_log_state: TlsFailureLogState = Arc::new(Mutex::new(HashMap::new()));
 
     tokio::spawn(async move {
-        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        let mut listener = listener;
+        let bind_addr = listener.local_addr().ok();
+        let port = bind_addr.map(|a| a.port()).unwrap_or(0);
 
         if let Some(p) = tcp_advertised_port {
             eprintln!("[web_gateway] ICE-TCP candidates advertise port {p}");
@@ -18936,20 +19395,43 @@ pub fn spawn_web_gateway(
             let (stream, peer_addr) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    let should_continue = should_continue_after_accept_error(&e);
-                    eprintln!(
-                        "[web_gateway] accept failed on port {port}: {e}{}",
-                        if should_continue {
-                            " (continuing)"
-                        } else {
-                            " (listener task exiting)"
-                        }
-                    );
-                    if should_continue {
+                    if should_continue_after_accept_error(&e) {
+                        eprintln!("[web_gateway] accept failed on port {port}: {e} (continuing)");
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         continue;
                     }
-                    break;
+                    // The listening socket itself is dead. Exiting here
+                    // leaves the daemon half-alive (established WebSockets
+                    // keep the UI looking healthy while every new request
+                    // fails) — rebind the original address instead, backing
+                    // off up to 30s until the port comes back.
+                    let Some(addr) = bind_addr else {
+                        eprintln!(
+                            "[web_gateway] accept failed on port {port}: {e} (bind address unknown; listener task exiting)"
+                        );
+                        break;
+                    };
+                    eprintln!(
+                        "[web_gateway] accept failed on port {port}: {e} (rebinding listener)"
+                    );
+                    let mut delay = std::time::Duration::from_millis(250);
+                    listener = loop {
+                        tokio::time::sleep(delay).await;
+                        match rebind_gateway_listener(addr) {
+                            Ok(fresh) => {
+                                eprintln!("[web_gateway] listener rebound on port {port}");
+                                break fresh;
+                            }
+                            Err(err) => {
+                                delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                                eprintln!(
+                                    "[web_gateway] listener rebind on port {port} failed: {err} (retrying in {:.1}s)",
+                                    delay.as_secs_f32()
+                                );
+                            }
+                        }
+                    };
+                    continue;
                 }
             };
 
@@ -22058,9 +22540,9 @@ pub fn spawn_web_gateway(
                     // origins (and the write-side gate below enforces the same
                     // list on the actual requests, so a non-preflighted
                     // cross-site POST is refused too).
-                    if request_line.starts_with("OPTIONS") {
+                    if req_method == "OPTIONS" {
                         use tokio::io::AsyncWriteExt;
-                        let (_, opt_path, _) = parse_request_target(request_line);
+                        let opt_path = req_path;
                         let response = if (opt_path.starts_with("/api/")
                             && !is_fleet_cors_access_path(opt_path)
                             && !is_public_peer_access_request_path(request_line))
@@ -22640,6 +23122,87 @@ pub fn spawn_web_gateway(
                                     json_error("400 Bad Request", format!("invalid JSON: {e}"))
                                 }
                             }
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "POST" && req_path == "/api/fs/rename" {
+                        use tokio::io::AsyncWriteExt;
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let response = match serde_json::from_str::<FsRenameRequest>(&body_text) {
+                            // Removing the source entry and creating the
+                            // destination are both writes — each leg passes
+                            // the write-scope gate on its own path.
+                            Ok(req) => match authorize_http_filesystem_access(
+                                &http_access_context,
+                                peer_connection_identity.as_ref(),
+                                crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                crate::peer::access_policy::FilesystemAccessKind::Write,
+                                &req.from,
+                                &bus,
+                            )
+                            .and_then(|()| {
+                                authorize_http_filesystem_access(
+                                    &http_access_context,
+                                    peer_connection_identity.as_ref(),
+                                    crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                    crate::peer::access_policy::FilesystemAccessKind::Write,
+                                    &req.to,
+                                    &bus,
+                                )
+                            }) {
+                                Ok(()) => {
+                                    let (status, body) = tokio::task::spawn_blocking(move || {
+                                        apply_dashboard_fs_rename(&req.from, &req.to)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        (
+                                            "500 Internal Server Error".to_string(),
+                                            serde_json::json!({
+                                                "error": format!(
+                                                    "filesystem rename task failed: {e}"
+                                                )
+                                            }),
+                                        )
+                                    });
+                                    json_response(&status, body.to_string())
+                                }
+                                Err(message) => json_error("403 Forbidden", message),
+                            },
+                            Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "POST" && req_path == "/api/fs/delete" {
+                        use tokio::io::AsyncWriteExt;
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let response = match serde_json::from_str::<FsDeleteRequest>(&body_text) {
+                            Ok(req) => match authorize_http_filesystem_access(
+                                &http_access_context,
+                                peer_connection_identity.as_ref(),
+                                crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                crate::peer::access_policy::FilesystemAccessKind::Write,
+                                &req.path,
+                                &bus,
+                            ) {
+                                Ok(()) => {
+                                    let (status, body) = tokio::task::spawn_blocking(move || {
+                                        apply_dashboard_fs_delete(&req.path, req.recursive)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        (
+                                            "500 Internal Server Error".to_string(),
+                                            serde_json::json!({
+                                                "error": format!(
+                                                    "filesystem delete task failed: {e}"
+                                                )
+                                            }),
+                                        )
+                                    });
+                                    json_response(&status, body.to_string())
+                                }
+                                Err(message) => json_error("403 Forbidden", message),
+                            },
+                            Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/api/settings" {
@@ -23472,7 +24035,9 @@ pub fn spawn_web_gateway(
                             ),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/session/current/changes" {
+                    } else if req_method == "GET"
+                        && path_is_or_under(req_path, "/api/session/current/changes")
+                    {
                         // File change tracking endpoints:
                         //   GET /api/session/current/changes        — list all changed files
                         //   GET /api/session/current/changes/{path} — unified diff for one file
@@ -24076,7 +24641,7 @@ pub fn spawn_web_gateway(
                         let segments: Vec<&str> =
                             subpath.split('/').filter(|s| !s.is_empty()).collect();
                         let (status, body) =
-                            if segments.is_empty() && request_line.starts_with("POST") {
+                            if segments.is_empty() && req_method == "POST" {
                                 match read_request_body_capped(
                                     &mut stream,
                                     &header_text,
@@ -24095,7 +24660,7 @@ pub fn spawn_web_gateway(
                                     ),
                                     Err((status, body)) => (status, body),
                                 }
-                            } else if segments.len() == 1 && request_line.starts_with("GET") {
+                            } else if segments.len() == 1 && req_method == "GET" {
                                 peer_access_request_status(segments[0])
                             } else {
                                 (
@@ -24432,17 +24997,17 @@ pub fn spawn_web_gateway(
                             subpath.split('/').filter(|s| !s.is_empty()).collect();
 
                         let (status, body) = if segments == ["pairing", "invite"]
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_invite(&body_text)
                         } else if segments == ["pairing", "request-access"]
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_request_access(&body_text).await
                         } else if segments == ["pairing", "request-access", "poll"]
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_request_access_poll(
@@ -24452,22 +25017,22 @@ pub fn spawn_web_gateway(
                             )
                             .await
                         } else if segments == ["pairing", "requests"]
-                            && request_line.starts_with("GET")
+                            && req_method == "GET"
                         {
                             peers_pairing_requests_list()
                         } else if segments == ["pairing", "identities"]
-                            && request_line.starts_with("GET")
+                            && req_method == "GET"
                         {
                             peers_pairing_identities_list()
                         } else if segments == ["pairing", "identities", "revoke"]
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_identity_revoke(&body_text)
                         } else if segments.len() == 4
                             && segments[0] == "pairing"
                             && segments[1] == "requests"
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_request_decision(segments[2], segments[3], &body_text)
@@ -24481,18 +25046,18 @@ pub fn spawn_web_gateway(
                                     .to_string(),
                                 ),
                                 Some(registry)
-                                    if segments.is_empty() && request_line.starts_with("GET") =>
+                                    if segments.is_empty() && req_method == "GET" =>
                                 {
                                     (200, peers_list_response_body(registry))
                                 }
                                 Some(registry)
                                     if segments.is_empty()
-                                        && (request_line.starts_with("POST")
-                                            || request_line.starts_with("DELETE")) =>
+                                        && (req_method == "POST"
+                                            || req_method == "DELETE") =>
                                 {
                                     let body_text =
                                         read_request_body(&mut stream, &header_text).await;
-                                    if request_line.starts_with("POST") {
+                                    if req_method == "POST" {
                                         peers_add(registry, project_root.as_deref(), &body_text)
                                             .await
                                     } else {
@@ -24501,7 +25066,7 @@ pub fn spawn_web_gateway(
                                 }
                                 Some(registry)
                                     if segments == ["eligible"]
-                                        && request_line.starts_with("GET") =>
+                                        && req_method == "GET" =>
                                 {
                                     // GET /api/peers/eligible?capability=display
                                     // — list peers that satisfy all listed
@@ -24515,7 +25080,7 @@ pub fn spawn_web_gateway(
                                 }
                                 Some(registry)
                                     if segments == ["pairing", "join"]
-                                        && request_line.starts_with("POST") =>
+                                        && req_method == "POST" =>
                                 {
                                     let body_text =
                                         read_request_body(&mut stream, &header_text).await;
@@ -24527,7 +25092,7 @@ pub fn spawn_web_gateway(
                                     .await
                                 }
                                 Some(registry)
-                                    if segments.len() == 2 && request_line.starts_with("POST") =>
+                                    if segments.len() == 2 && req_method == "POST" =>
                                 {
                                     let id = url_path_decode(segments[0]);
                                     let op = segments[1];
@@ -24620,7 +25185,7 @@ pub fn spawn_web_gateway(
                                 })
                                 .to_string(),
                             ),
-                            Some(_) if !request_line.starts_with("POST") => (
+                            Some(_) if req_method != "POST" => (
                                 405,
                                 serde_json::json!({
                                     "error": "method not allowed"
@@ -29248,9 +29813,10 @@ fn dashboard_http_operation(
         ("GET", "/api/fs/stat") | ("GET", "/api/fs/list") | ("GET", "/api/fs/read") => {
             return Some(PeerOperation::FilesystemRead);
         }
-        ("POST", "/api/fs/mkdir") | ("POST", "/api/fs/write") => {
-            return Some(PeerOperation::FilesystemWrite)
-        }
+        ("POST", "/api/fs/mkdir")
+        | ("POST", "/api/fs/write")
+        | ("POST", "/api/fs/rename")
+        | ("POST", "/api/fs/delete") => return Some(PeerOperation::FilesystemWrite),
         ("POST", "/api/diagnostics/visual-freshness") => {
             return Some(PeerOperation::DisplayInput);
         }
@@ -29258,33 +29824,37 @@ fn dashboard_http_operation(
         _ => {}
     }
 
-    if req_path.starts_with("/api/managed-context/") {
+    // Boundary rule matches dispatch: exact path or a real `/` segment
+    // under it — a look-alike longer path (`/api/sessionsfoo`,
+    // `/api/worktrees/inspect-old`) is not a route there and must not be
+    // classified as one here.
+    if path_is_or_under(req_path, "/api/managed-context") {
         return Some(PeerOperation::SessionInspect);
     }
-    if req_path.starts_with("/api/session/current/") {
+    if path_is_or_under(req_path, "/api/session/current") {
         return Some(PeerOperation::SessionManage);
     }
-    if req_path.starts_with("/api/session/") {
+    if path_is_or_under(req_path, "/api/session") {
         return match req_method {
             "GET" => Some(PeerOperation::SessionInspect),
             "POST" | "DELETE" => Some(PeerOperation::SessionManage),
             _ => None,
         };
     }
-    if req_path.starts_with("/api/worktrees/inspect") {
+    // Worktree and session-list routes are exact in dispatch.
+    if req_path == "/api/worktrees/inspect" {
         return Some(PeerOperation::SessionInspect);
     }
-    if req_path.starts_with("/api/worktrees/scan") || req_path.starts_with("/api/worktrees/remove")
-    {
+    if req_path == "/api/worktrees/scan" || req_path == "/api/worktrees/remove" {
         return Some(PeerOperation::SessionManage);
     }
-    if req_path.starts_with("/api/worktrees") {
+    if req_path == "/api/worktrees" {
         return Some(PeerOperation::SessionInspect);
     }
-    if req_path.starts_with("/api/sessions") {
+    if req_path == "/api/sessions" {
         return Some(PeerOperation::SessionInspect);
     }
-    if req_path.starts_with("/api/peers") {
+    if path_is_or_under(req_path, "/api/peers") {
         return crate::peer::access_policy::federation_http_operation(req_method, req_path);
     }
 
@@ -36086,7 +36656,7 @@ mod tests {
             "",
         ] {
             assert!(
-                intendant_session_dir_from_home(home.path(), id).is_none(),
+                intendant_session_dir_from_id_or_path(home.path(), id).is_none(),
                 "path-shaped session id {id:?} must be refused"
             );
         }
@@ -38057,7 +38627,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            resolve_session_dir_from_home(home.path(), backend_id).as_deref(),
+            resolve_bare_session_dir_from_home(home.path(), backend_id).as_deref(),
             Some(wrapper_dir.as_path())
         );
     }
@@ -38077,14 +38647,14 @@ mod tests {
             " safe",
         ] {
             assert!(
-                resolve_session_dir_from_home(home.path(), session_id).is_none(),
+                resolve_bare_session_dir_from_home(home.path(), session_id).is_none(),
                 "unsafe session id resolved: {session_id:?}"
             );
         }
 
         let expected = home.path().join(".intendant/logs/safe-session");
         assert_eq!(
-            resolve_session_dir_from_home(home.path(), "safe").as_deref(),
+            resolve_bare_session_dir_from_home(home.path(), "safe").as_deref(),
             Some(expected.as_path())
         );
     }
@@ -41118,12 +41688,44 @@ mod tests {
             dashboard_http_operation("POST", "/api/fs/write"),
             Some(PeerOperation::FilesystemWrite)
         );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/fs/rename"),
+            Some(PeerOperation::FilesystemWrite)
+        );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/fs/delete"),
+            Some(PeerOperation::FilesystemWrite)
+        );
         // GET must not inherit the write classification, and look-alike
         // paths must not classify at all.
         assert_eq!(dashboard_http_operation("GET", "/api/fs/write"), None);
+        assert_eq!(dashboard_http_operation("GET", "/api/fs/rename"), None);
+        assert_eq!(dashboard_http_operation("GET", "/api/fs/delete"), None);
         assert_eq!(dashboard_http_operation("POST", "/api/fs/writeable"), None);
+        assert_eq!(dashboard_http_operation("POST", "/api/fs/deleted"), None);
         assert_eq!(dashboard_http_operation("POST", "/api/coordinator/route"), None);
         assert_eq!(dashboard_http_operation("GET", "/config"), None);
+        // The prefix families use the same boundary rule as dispatch:
+        // exact or a real `/` segment — dispatch's look-alike non-routes
+        // must be non-routes for the classifier too.
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/sessions"),
+            Some(PeerOperation::SessionInspect)
+        );
+        assert_eq!(dashboard_http_operation("GET", "/api/sessionsfoo"), None);
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/worktrees/inspect"),
+            Some(PeerOperation::SessionInspect)
+        );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/worktrees/inspect-old"),
+            None
+        );
+        assert_eq!(dashboard_http_operation("GET", "/api/peersfoo"), None);
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/session/current/changes/src/main.rs"),
+            Some(PeerOperation::SessionManage)
+        );
     }
 
     #[test]
@@ -41238,6 +41840,134 @@ mod tests {
         let (status, _) = write(&target, &huge, None, false, true);
         assert_eq!(status, "413 Payload Too Large");
         assert_eq!(std::fs::read(&target).unwrap(), b"v4");
+    }
+
+    #[test]
+    fn apply_dashboard_fs_rename_moves_and_never_replaces() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rename = |from: &std::path::Path, to: &std::path::Path| {
+            apply_dashboard_fs_rename(&from.to_string_lossy(), &to.to_string_lossy())
+        };
+
+        // A plain file rename moves the content.
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, b"payload").unwrap();
+        let (status, body) = rename(&a, &b);
+        assert_eq!(status, "200 OK", "{body}");
+        assert_eq!(body["renamed"], true);
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(&b).unwrap(), b"payload");
+
+        // A missing source is 404 code:"missing".
+        let (status, body) = rename(&a, &dir.path().join("c.txt"));
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body["code"], "missing");
+
+        // An existing destination is refused — renames never replace.
+        let c = dir.path().join("c.txt");
+        std::fs::write(&c, b"other").unwrap();
+        let (status, body) = rename(&b, &c);
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body["code"], "exists");
+        assert_eq!(std::fs::read(&b).unwrap(), b"payload");
+        assert_eq!(std::fs::read(&c).unwrap(), b"other");
+
+        // ... even when the destination is a dangling symlink.
+        #[cfg(unix)]
+        {
+            let dangling = dir.path().join("dangling");
+            std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+            let (status, body) = rename(&b, &dangling);
+            assert_eq!(status, "409 Conflict");
+            assert_eq!(body["code"], "exists");
+        }
+
+        // A missing destination parent is 404 code:"missing_parent".
+        let orphan = dir.path().join("no-such-dir").join("b.txt");
+        let (status, body) = rename(&b, &orphan);
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body["code"], "missing_parent");
+
+        // Directories move too — but never into themselves.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), b"x").unwrap();
+        let moved = dir.path().join("moved");
+        let (status, _) = rename(&sub, &moved);
+        assert_eq!(status, "200 OK");
+        assert_eq!(std::fs::read(moved.join("inner.txt")).unwrap(), b"x");
+        let inside = moved.join("nested");
+        let (status, body) = rename(&moved, &inside);
+        assert_eq!(status, "400 Bad Request");
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("into itself"));
+
+        // Renaming a path to itself is an explicit no-op.
+        let (status, body) = rename(&b, &b);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["renamed"], false);
+
+        // Relative paths are refused before touching the filesystem.
+        let (status, _) = apply_dashboard_fs_rename("relative/a", "relative/b");
+        assert_eq!(status, "400 Bad Request");
+    }
+
+    #[test]
+    fn apply_dashboard_fs_delete_scopes_directories_and_symlinks() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Files delete unconditionally.
+        let file = dir.path().join("gone.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let (status, body) = apply_dashboard_fs_delete(&file.to_string_lossy(), false);
+        assert_eq!(status, "200 OK", "{body}");
+        assert_eq!(body["dir"], false);
+        assert!(!file.exists());
+
+        // Deleting it again is 404 code:"missing".
+        let (status, body) = apply_dashboard_fs_delete(&file.to_string_lossy(), false);
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body["code"], "missing");
+
+        // Non-empty directories require an explicit recursive.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), b"x").unwrap();
+        let (status, body) = apply_dashboard_fs_delete(&sub.to_string_lossy(), false);
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body["code"], "not_empty");
+        assert!(sub.exists());
+        let (status, body) = apply_dashboard_fs_delete(&sub.to_string_lossy(), true);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["dir"], true);
+        assert!(!sub.exists());
+
+        // Empty directories delete without recursive.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let (status, _) = apply_dashboard_fs_delete(&empty.to_string_lossy(), false);
+        assert_eq!(status, "200 OK");
+        assert!(!empty.exists());
+
+        // A symlink deletes as a link: the target survives.
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("kept.txt");
+            std::fs::write(&target, b"keep me").unwrap();
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let (status, body) = apply_dashboard_fs_delete(&link.to_string_lossy(), false);
+            assert_eq!(status, "200 OK", "{body}");
+            assert!(link.symlink_metadata().is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+        }
+
+        // Relative paths are refused before touching the filesystem.
+        let (status, _) = apply_dashboard_fs_delete("relative/path", true);
+        assert_eq!(status, "400 Bad Request");
     }
 
     #[cfg(unix)]
@@ -42189,6 +42919,20 @@ mod tests {
             resp.contains("Content-Type: text/html"),
             "look-alike path must fall through, got: {}",
             &resp.chars().take(120).collect::<String>()
+        );
+
+        // Per-file diff subpaths ARE the route (regression: the parsed-path
+        // refactor briefly matched only the exact list endpoint, dropping
+        // /api/session/current/changes/{path}).
+        let resp = http_request(
+            port,
+            "GET /api/session/current/changes/src/main.rs HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(
+            !resp.contains("Content-Type: text/html"),
+            "per-file changes subpath must hit the changes handler, got: {}",
+            &resp.chars().take(200).collect::<String>()
         );
 
         handle.abort();
@@ -46102,5 +46846,301 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{not json").unwrap();
         assert!(load_persisted_session_entry_in::<serde_json::Value>(dir.path(), &key).is_none());
+    }
+
+    fn total_usage(total_tokens: u64) -> SessionUsage {
+        SessionUsage {
+            total_tokens,
+            ..Default::default()
+        }
+    }
+
+    /// Pre-schema "codex" entries carried the full usage_events history and
+    /// no schema stamp; they must read as misses (a defaulted
+    /// first_usage_event would mis-baseline forked sessions), while
+    /// current-schema entries round-trip.
+    #[test]
+    fn persisted_codex_entry_schema_mismatch_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut key = persisted_test_key("schema");
+        key.namespace = "codex";
+
+        let legacy = serde_json::json!({
+            "key": {
+                "namespace": key.namespace,
+                "path": key.path,
+                "len": key.len,
+                "mtime_nanos": key.mtime_nanos.to_string(),
+                "ctime_nanos": key.ctime_nanos.to_string(),
+                "dev": key.dev,
+                "ino": key.ino,
+                "extra": key.extra,
+            },
+            "value": {
+                "id": "codex-1",
+                "created_at": null,
+                "session_cwd": null,
+                "effective_cwd": null,
+                "model": null,
+                "lineage": {},
+                "provider": "Codex",
+                "usage": total_usage(10),
+                "usage_events": [{"timestamp": null, "usage": total_usage(10)}],
+                "daily_usage": {},
+                "goal": null,
+                "task": null,
+                "turns": 1,
+                "file_updated_at": null,
+                "bytes": 5,
+            },
+        });
+        let path =
+            session_index_entry_path_in(dir.path(), key.namespace, &session_list_cache_slot(&key));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(
+            load_persisted_session_entry_in::<CodexSessionListSummary>(dir.path(), &key).is_none()
+        );
+
+        // A freshly stored entry (current schema) round-trips.
+        let summary = CodexSessionListSummary {
+            id: "codex-1".to_string(),
+            created_at: None,
+            session_cwd: None,
+            effective_cwd: None,
+            model: None,
+            lineage: SessionLineageMetadata::default(),
+            provider: Some("Codex".to_string()),
+            usage: total_usage(10),
+            first_usage_event: Some(CodexUsageEvent {
+                timestamp: None,
+                usage: total_usage(10),
+            }),
+            daily_usage: BTreeMap::new(),
+            goal: None,
+            task: None,
+            turns: 1,
+            file_updated_at: None,
+            bytes: 5,
+        };
+        store_persisted_session_entry_in(dir.path(), &key, &summary);
+        let loaded = load_persisted_session_entry_in::<CodexSessionListSummary>(dir.path(), &key)
+            .expect("current-schema entry loads");
+        assert_eq!(loaded.id, "codex-1");
+        assert_eq!(
+            loaded.first_usage_event.map(|event| event.usage),
+            Some(total_usage(10))
+        );
+    }
+
+    #[test]
+    fn codex_accumulator_tracks_first_event_and_undated_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("rollout.jsonl");
+        std::fs::write(&log, b"{}\n").unwrap();
+
+        let mut acc = CodexSessionListAccumulator::new();
+        acc.id = Some("codex-acc".to_string());
+        acc.record_token_usage(Some("2026-07-01T09:00:00Z".to_string()), total_usage(100));
+        acc.record_token_usage(None, total_usage(130));
+        acc.record_token_usage(Some("2026-07-02T09:00:00Z".to_string()), total_usage(150));
+
+        let summary = acc.finish(&log).expect("summary");
+        assert_eq!(summary.usage, total_usage(150));
+        let first = summary.first_usage_event.as_ref().expect("first event");
+        assert_eq!(first.usage, total_usage(100));
+        assert_eq!(first.timestamp.as_deref(), Some("2026-07-01T09:00:00Z"));
+        // Dated deltas land on their own days; the undated delta folds into
+        // the file-mtime day.
+        assert_eq!(
+            summary.daily_usage.get("2026-07-01"),
+            Some(&total_usage(100))
+        );
+        let mtime_day = usage_day_from_timestamp(summary.file_updated_at.as_deref())
+            .expect("file mtime day");
+        let daily_total: u64 = summary
+            .daily_usage
+            .values()
+            .map(|usage| usage.total_tokens)
+            .sum();
+        assert_eq!(daily_total, 150);
+        assert!(summary.daily_usage.contains_key(&mtime_day));
+
+        // A counter reset discards prior history, including the first event.
+        let mut reset = CodexSessionListAccumulator::new();
+        reset.id = Some("codex-reset".to_string());
+        reset.record_token_usage(Some("2026-07-01T09:00:00Z".to_string()), total_usage(100));
+        reset.clear_token_usage();
+        reset.record_token_usage(Some("2026-07-03T09:00:00Z".to_string()), total_usage(40));
+        let summary = reset.finish(&log).expect("summary");
+        let first = summary.first_usage_event.as_ref().expect("first event");
+        assert_eq!(first.timestamp.as_deref(), Some("2026-07-03T09:00:00Z"));
+        assert_eq!(first.usage, total_usage(40));
+        assert_eq!(
+            summary.daily_usage.get("2026-07-03"),
+            Some(&total_usage(40))
+        );
+        assert!(!summary.daily_usage.contains_key("2026-07-01"));
+    }
+
+    #[test]
+    fn codex_daily_usage_with_baseline_rebaselines_first_day() {
+        let mut daily = BTreeMap::new();
+        daily.insert("2026-07-01".to_string(), total_usage(100));
+        daily.insert("2026-07-02".to_string(), total_usage(20));
+        let summary = CodexSessionListSummary {
+            id: "codex-fork".to_string(),
+            created_at: Some("2026-07-01T10:00:00Z".to_string()),
+            session_cwd: None,
+            effective_cwd: None,
+            model: None,
+            lineage: SessionLineageMetadata::default(),
+            provider: Some("Codex".to_string()),
+            usage: total_usage(120),
+            first_usage_event: Some(CodexUsageEvent {
+                timestamp: Some("2026-07-01T10:05:00Z".to_string()),
+                usage: total_usage(100),
+            }),
+            daily_usage: daily,
+            goal: None,
+            task: None,
+            turns: 2,
+            file_updated_at: Some("2026-07-02T09:30:00Z".to_string()),
+            bytes: 64,
+        };
+
+        // The fork baseline comes out of the first event's day only.
+        let rebased = codex_daily_usage_with_baseline(&summary, Some(total_usage(40)));
+        assert_eq!(rebased.get("2026-07-01"), Some(&total_usage(60)));
+        assert_eq!(rebased.get("2026-07-02"), Some(&total_usage(20)));
+
+        // A baseline covering the whole first day removes that bucket.
+        let rebased = codex_daily_usage_with_baseline(&summary, Some(total_usage(100)));
+        assert!(!rebased.contains_key("2026-07-01"));
+        assert_eq!(rebased.get("2026-07-02"), Some(&total_usage(20)));
+
+        // No baseline → parse-time buckets pass through untouched.
+        let rebased = codex_daily_usage_with_baseline(&summary, None);
+        assert_eq!(rebased.get("2026-07-01"), Some(&total_usage(100)));
+    }
+
+    #[test]
+    fn intendant_fingerprint_digest_tracks_dir_state() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("session.jsonl"), b"{\"a\":1}\n").unwrap();
+
+        let first = intendant_session_dir_fingerprint(dir.path()).expect("fingerprint");
+        assert_eq!(first.digest.len(), 64);
+        let second = intendant_session_dir_fingerprint(dir.path()).expect("fingerprint");
+        assert_eq!(first, second);
+
+        // Content growth (length change) must change the digest.
+        std::fs::write(dir.path().join("session.jsonl"), b"{\"a\":1,\"b\":2}\n").unwrap();
+        let third = intendant_session_dir_fingerprint(dir.path()).expect("fingerprint");
+        assert_eq!(first.path, third.path);
+        assert_ne!(first.digest, third.digest);
+    }
+
+    #[test]
+    fn preload_prunes_entries_for_deleted_targets() {
+        let base = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let live_target = target_dir.path().join("live.jsonl");
+        std::fs::write(&live_target, b"{}\n").unwrap();
+
+        let entry_for = |path: &Path, extra: &str| -> (PathBuf, Vec<u8>) {
+            let key = SessionListCacheKey {
+                namespace: "claude-code",
+                path: path.to_string_lossy().to_string(),
+                len: 2,
+                mtime_nanos: 1,
+                ctime_nanos: 1,
+                dev: 1,
+                ino: 1,
+                extra: extra.to_string(),
+            };
+            let entry = PersistedSessionCacheEntry {
+                schema: persisted_namespace_schema(key.namespace),
+                key: PersistedSessionCacheKey::of(&key),
+                value: serde_json::json!({"session_id": extra}),
+            };
+            let file = session_index_entry_path_in(
+                base.path(),
+                key.namespace,
+                &session_list_cache_slot(&key),
+            );
+            (file, serde_json::to_vec(&entry).unwrap())
+        };
+
+        let (live_file, live_bytes) = entry_for(&live_target, "live");
+        let missing_target = target_dir.path().join("deleted.jsonl");
+        let (dead_file, dead_bytes) = entry_for(&missing_target, "dead");
+        std::fs::create_dir_all(live_file.parent().unwrap()).unwrap();
+        std::fs::write(&live_file, &live_bytes).unwrap();
+        std::fs::write(&dead_file, &dead_bytes).unwrap();
+
+        preload_namespace_dir(
+            &base.path().join("claude-code"),
+            "claude-code",
+            preload_row_entry,
+        );
+
+        assert!(live_file.exists(), "entry for a live session is kept");
+        assert!(!dead_file.exists(), "entry for a deleted session is pruned");
+
+        // Outcome-level checks: schema drift is skipped (kept on disk for
+        // whichever daemon owns it), a missing target reports prunable.
+        assert_eq!(
+            preload_row_entry("claude-code", &dead_bytes),
+            PreloadOutcome::TargetMissing
+        );
+        let mut wrong_schema: serde_json::Value = serde_json::from_slice(&live_bytes).unwrap();
+        wrong_schema["schema"] = serde_json::json!(99);
+        assert_eq!(
+            preload_row_entry(
+                "claude-code",
+                &serde_json::to_vec(&wrong_schema).unwrap()
+            ),
+            PreloadOutcome::Skipped
+        );
+
+        // Legacy-shape entries no build of this daemon can parse are still
+        // prunable through the path probe once their session is gone, and
+        // kept while it is alive.
+        let legacy = |target: &Path| {
+            serde_json::to_vec(&serde_json::json!({
+                "fingerprint": {"path": target.to_string_lossy(), "entries": []},
+                "row": {"session_id": "legacy"},
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            preload_intendant_entry("intendant-row", &legacy(&missing_target)),
+            PreloadOutcome::TargetMissing
+        );
+        assert_eq!(
+            preload_intendant_entry("intendant-row", &legacy(&live_target)),
+            PreloadOutcome::Skipped
+        );
+    }
+
+    /// The gateway must be able to re-establish its listener on the exact
+    /// address a dead one occupied (accept() EINVAL/EBADF recovery path),
+    /// and the fresh listener must actually accept connections.
+    #[tokio::test]
+    async fn rebind_gateway_listener_restores_reachability() {
+        let original = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = original.local_addr().unwrap();
+        drop(original);
+
+        let rebound = rebind_gateway_listener(addr).expect("rebind on the freed address");
+        assert_eq!(rebound.local_addr().unwrap(), addr);
+
+        let (client, (server, _peer)) = tokio::join!(
+            tokio::net::TcpStream::connect(addr),
+            async { rebound.accept().await.unwrap() },
+        );
+        client.expect("client connects to rebound listener");
+        drop(server);
     }
 }

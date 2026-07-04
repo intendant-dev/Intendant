@@ -199,13 +199,25 @@ ffmpeg-based recording of agent displays (see
 ### `[computer_use]`
 
 Provider/model used for visual-grounding (computer-use) tasks. See
-[Computer Use & Live Audio](./computer-use-and-audio.md).
+[Computer Use & Live Audio](./computer-use-and-audio.md). The separate
+provider/model selection matters for frame-grounded CU dispatches and for
+the vaulted CU-first routing (below); the dashboard hides the selection
+rows while that routing is off.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `provider` | string | auto-detect | CU model provider |
 | `model` | string | auto-detect | CU model |
 | `backend` | string | `auto` | Input/screenshot backend: `x11`, `wayland`, `macos`, or `auto` |
+
+### `[experimental]`
+
+Vaulted features: kept runnable in the tree, all off by default, and
+production behavior must not depend on them.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `cu_first_routing` | bool | `false` | Intercept every non-direct task with a fast CU model that completes it on the display or escalates to the main agent (vaulted 2026-07-04: adds a model hop to every task and, under subscription-based external agents, an API-key model dependency) |
 
 ### `[agent]` and external backends
 

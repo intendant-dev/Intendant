@@ -22,11 +22,14 @@
         step('files tab + editor card');
 
         let snap = await ide._debugSetRoot(SMOKE);
-        assert(snap.root === SMOKE, 'tree rooted at smoke dir, got ' + snap.root);
+        // The daemon canonicalizes the root (macOS: /tmp -> /private/tmp);
+        // adopt its form for every path we send afterwards.
+        assert(snap.root === SMOKE || snap.root.endsWith(SMOKE), 'tree rooted at smoke dir, got ' + snap.root);
+        const ROOT = snap.root;
         assert(document.querySelectorAll('.files-ide-tree-row').length >= 3, 'tree rows rendered');
         step('tree lists smoke dir');
 
-        snap = await ide._debugOpen(SMOKE + '/hello.rs');
+        snap = await ide._debugOpen(ROOT + '/hello.rs');
         assert(window.CodeMirror, 'editor bundle lazy-loaded');
         assert(document.querySelector('.files-ide-editor-host .CodeMirror'), 'CodeMirror mounted');
         assert(snap.active && snap.active.path.endsWith('hello.rs'), 'hello.rs active');
@@ -47,7 +50,7 @@
         const forceResp = await fetch('/api/fs/write', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: SMOKE + '/hello.rs', content: external, force: true }),
+          body: JSON.stringify({ path: ROOT + '/hello.rs', content: external, force: true }),
         });
         assert(forceResp.ok, 'external force write ok');
         ide._debugSetText('fn main() {\n    println!("this save must conflict");\n}\n');
@@ -67,7 +70,7 @@
         assert(snap.saveStatus.startsWith('Saved'), 'post-reload save ok');
         step('post-reload save');
 
-        snap = await ide._debugOpen(SMOKE + '/created-in-ui.toml', { createNew: true });
+        snap = await ide._debugOpen(ROOT + '/created-in-ui.toml', { createNew: true });
         assert(snap.active.path.endsWith('created-in-ui.toml'), 'new buffer active');
         ide._debugSetText('[ui]\nmade = true\n');
         snap = await ide._debugSave();
@@ -80,6 +83,56 @@
         assert(/TOML/i.test(modeLine), 'language detected for toml, got ' + modeLine);
         assert(document.querySelectorAll('.files-ide-editor-host .cm-keyword, .files-ide-editor-host .cm-atom, .files-ide-editor-host .cm-property').length > 0, 'syntax highlighting active');
         step('language detection + highlighting');
+
+        // Rename the open buffer's file: the tab retargets, no data moves
+        // through the browser, and the old name is gone from the listing.
+        snap = await ide._debugRename(ROOT + '/created-in-ui.toml', 'renamed-in-ui.toml');
+        assert(snap.active.path.endsWith('renamed-in-ui.toml'), 'active buffer retargeted, got ' + snap.active.path);
+        assert(snap.openTabs.length === 2, 'still two tabs after rename');
+        const treeStatus = document.getElementById('files-ide-tree-status').textContent;
+        assert(!treeStatus, 'rename left no error, got ' + treeStatus);
+        const rowPaths = Array.from(document.querySelectorAll('.files-ide-tree-row')).map(r => r.dataset.path);
+        assert(rowPaths.some(p => p.endsWith('renamed-in-ui.toml')), 'renamed entry listed');
+        assert(!rowPaths.some(p => p.endsWith('created-in-ui.toml')), 'old name gone from listing');
+        step('rename retargets open tab');
+
+        // Row actions exist on tree rows (hover-revealed).
+        assert(document.querySelector('.files-ide-tree-row [data-act="rename"]'), 'rename row action present');
+        assert(document.querySelector('.files-ide-tree-row [data-act="delete"]'), 'delete row action present');
+        step('row actions rendered');
+
+        // Find-in-file: matches counted, stepping wraps.
+        await ide._debugOpen(ROOT + '/hello.rs');
+        const find = await ide._debugFind('println');
+        assert(find.open === true, 'find bar open');
+        assert(find.total >= 1, 'find counted matches, got ' + find.total);
+        assert(!document.getElementById('files-ide-find').classList.contains('hidden'), 'find bar visible');
+        assert(document.querySelectorAll('.files-ide-editor-host .files-ide-find-match').length >= 1, 'matches highlighted');
+        const stepped = ide._debugFindStep(1);
+        assert(stepped.index === (find.index + 1) % find.total || find.total === 1, 'find stepped');
+        window.filesIdeCloseFind();
+        assert(document.getElementById('files-ide-find').classList.contains('hidden'), 'find bar closed');
+        step('find in file');
+
+        // Delete a clean file: its tab closes and the row disappears.
+        const del = await ide._debugDelete(ROOT + '/renamed-in-ui.toml');
+        assert(del.openTabs.length === 1, 'deleted file tab closed, got ' + del.openTabs.length);
+        assert(!del.treeStatus, 'delete left no error, got ' + del.treeStatus);
+        const afterDelete = Array.from(document.querySelectorAll('.files-ide-tree-row')).map(r => r.dataset.path);
+        assert(!afterDelete.some(p => p.endsWith('renamed-in-ui.toml')), 'deleted entry gone from listing');
+        step('delete closes clean tab');
+
+        // Delete the still-open dirty buffer's file: the tab survives with
+        // the missing-file banner so unsaved work is not thrown away.
+        ide._debugSetText('fn main() {\n    println!("unsaved survivor");\n}\n');
+        const orphan = await ide._debugDelete(ROOT + '/hello.rs');
+        assert(orphan.openTabs.length === 1, 'dirty tab survives delete');
+        assert(orphan.openTabs[0].conflict === 'missing', 'dirty tab flagged missing, got ' + orphan.openTabs[0].conflict);
+        assert(orphan.banner.includes('no longer exists'), 'missing banner shown, got ' + orphan.banner);
+        await window.filesIdeOverwriteActive();
+        snap = ide._debugSnapshot();
+        assert(snap.active.dirty === false, 'overwrite recreated the file');
+        step('delete orphans dirty buffer; overwrite recreates');
 
         S.state = 'done';
       } catch (e) {

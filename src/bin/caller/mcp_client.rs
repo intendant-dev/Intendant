@@ -5,7 +5,6 @@ use rmcp::handler::client::ClientHandler;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo, Implementation};
 use rmcp::service::{Peer, RoleClient, RunningService, ServiceExt};
 use rmcp::transport::child_process::TokioChildProcess;
-use tokio::process::Command;
 
 /// A connected MCP server with its tools.
 struct ConnectedServer {
@@ -58,7 +57,10 @@ impl McpClientManager {
     }
 
     async fn connect_one(config: &McpServerConfig) -> Result<ConnectedServer, CallerError> {
-        let mut cmd = Command::new(&config.command);
+        // Resolve through the platform helper: configured MCP servers are
+        // bare command names (npx, uvx, …) that are .cmd/.bat shims on
+        // Windows and need the cmd.exe /C wrapping it provides.
+        let mut cmd = crate::platform::spawn_command(&config.command);
         cmd.args(&config.args);
         for (k, v) in &config.env {
             cmd.env(k, v);

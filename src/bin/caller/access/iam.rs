@@ -1777,7 +1777,7 @@ fn permission_summary(id: &str) -> &'static str {
             "Create, remove, and pair daemon peer routes (implies peer.use)."
         }
         "peer.use" => {
-            "Open tunnels to connected peers with this daemon's peer credentials; what a tunnel may do is decided by the peer's grants for this daemon, not by this grant."
+            "Act through connected peers with this daemon's peer credentials — open tunnels, send messages, delegate tasks, resolve approvals; what the peer allows is decided by the peer's grants for this daemon, not by this grant."
         }
         "session.inspect" => "Read session lists, logs, reports, recordings, and replay metadata.",
         "session.manage" => "Delete, rewind, prune, upload to, or otherwise mutate sessions.",

@@ -462,14 +462,28 @@ pub fn federation_http_operation(method: &str, path: &str) -> Option<PeerOperati
     if path.starts_with("/api/peers/pairing/") {
         return Some(PeerOperation::PeerManage);
     }
-    // Signaling relays to a connected peer (`/api/peers/{id}/<signal-op>`)
-    // are peer *use*, not peer administration: they open a tunnel that the
-    // receiving peer authorizes against its own grants for this daemon.
+    // Acting through a connected peer (`/api/peers/{id}/<op>`) is peer
+    // *use*, not peer administration. That covers the signaling relays
+    // (which open tunnels) and the quick controls (message / task /
+    // approval): every one of them delegates this daemon's peer identity,
+    // and the receiving peer authorizes the action against its own grants
+    // for this daemon. Keeping the quick controls on peer.manage would be a
+    // hollow boundary anyway — a peer.use principal can reach the same
+    // effects through the dashboard-control tunnel it may already open.
+    // Registry and pairing mutations stay peer.manage.
     if method == "POST" {
         let mut segments = path.strip_prefix("/api/peers/").into_iter().flat_map(|rest| rest.split('/'));
         if let (Some(id), Some(op), None) = (segments.next(), segments.next(), segments.next()) {
             if !id.is_empty()
-                && matches!(op, "webrtc" | "file-transfer-webrtc" | "dashboard-control-webrtc")
+                && matches!(
+                    op,
+                    "webrtc"
+                        | "file-transfer-webrtc"
+                        | "dashboard-control-webrtc"
+                        | "message"
+                        | "task"
+                        | "approval"
+                )
             {
                 return Some(PeerOperation::PeerUse);
             }
@@ -811,21 +825,26 @@ mod tests {
 
     #[test]
     fn peer_signal_relays_classify_as_peer_use() {
-        // The three signaling relays are peer use, not peer administration.
-        for op in ["webrtc", "file-transfer-webrtc", "dashboard-control-webrtc"] {
+        // Acting through a connected peer — the three signaling relays and
+        // the three quick controls — is peer use, not peer administration.
+        for op in [
+            "webrtc",
+            "file-transfer-webrtc",
+            "dashboard-control-webrtc",
+            "message",
+            "task",
+            "approval",
+        ] {
             assert_eq!(
                 federation_http_operation("POST", &format!("/api/peers/intendant:peer-b/{op}")),
                 Some(PeerOperation::PeerUse),
                 "{op}"
             );
         }
-        // Everything else under /api/peers keeps its class: mutations are
-        // manage, pairing arms win over the id/op shape, GETs are inspect,
-        // and deeper or look-alike op segments never classify as use.
-        assert_eq!(
-            federation_http_operation("POST", "/api/peers/intendant:peer-b/message"),
-            Some(PeerOperation::PeerManage)
-        );
+        // Everything else under /api/peers keeps its class: registry and
+        // pairing mutations are manage, pairing arms win over the id/op
+        // shape, GETs are inspect, and deeper or look-alike op segments
+        // never classify as use.
         assert_eq!(
             federation_http_operation("POST", "/api/peers/pairing/join"),
             Some(PeerOperation::PeerManage)
