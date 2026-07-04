@@ -103,6 +103,24 @@ pub fn spawn_connect_rendezvous_client(
     dashboard_control: Arc<DashboardControlRegistry>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.enabled {
+        // One line per gateway spawn: a daemon that silently never
+        // registers is indistinguishable from a broken rendezvous — say
+        // why. (This was the client's only silent path, found the hard
+        // way on the first fresh-VPS E2E.) The env-visibility clause
+        // distinguishes "not configured" from "configured but lost
+        // between the environment and this call".
+        eprintln!(
+            "[connect] rendezvous client disabled (enable via INTENDANT_CONNECT_RENDEZVOUS_URL \
+             or [connect] in intendant.toml; that env var {} visible to this process)",
+            if std::env::var("INTENDANT_CONNECT_RENDEZVOUS_URL")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+            {
+                "IS"
+            } else {
+                "is not"
+            }
+        );
         return None;
     }
     let Some(base_url) = config

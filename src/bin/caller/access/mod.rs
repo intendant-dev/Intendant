@@ -235,10 +235,19 @@ pub fn provision_virgin_access_certs() -> AccessResult<Option<PathBuf>> {
     if !certs::dir_is_virgin(&cert_dir) {
         return Ok(None);
     }
-    let primary_ip_text = be.detect_primary_ip()?;
-    let primary_ip = primary_ip_text
-        .parse()
-        .map_err(|_| AccessError(format!("detected primary IP '{primary_ip_text}' is not an IP address")))?;
+    let primary_ip = match be.detect_primary_ip() {
+        Ok(text) => text.parse().map_err(|_| {
+            AccessError(format!("detected primary IP '{text}' is not an IP address"))
+        })?,
+        // detect_primary_ip shells out (`route` / `ip`), which a service
+        // environment's minimal PATH may not carry. Interface enumeration
+        // still works — provision for what the box has rather than fail
+        // the whole first boot on knowing which address is primary.
+        Err(err) => match routable_local_addrs(false).into_iter().next() {
+            Some(addr) => addr,
+            None => return Err(err),
+        },
+    };
     let server_names = certs::ServerNames::new(primary_ip, routable_local_addrs(false), Vec::new())?;
     std::fs::create_dir_all(&cert_dir)
         .map_err(|e| AccessError(format!("create {}: {e}", cert_dir.display())))?;
