@@ -1,3 +1,4 @@
+use crate::types::truncate_str;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -2142,7 +2143,7 @@ impl SessionLog {
     /// Log a tool response sent back to the browser presence model.
     pub fn tool_response(&mut self, tool: &str, result: &str) {
         let preview = if result.len() > 200 {
-            &result[..200]
+            truncate_str(result, 200)
         } else {
             result
         };
@@ -3927,6 +3928,22 @@ mod tests {
             !body.starts_with('\n'),
             "unexpected leading newline: {:?}",
             body
+        );
+    }
+
+    #[test]
+    fn tool_response_preview_truncates_multibyte_on_char_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        let result = format!("{}{}tail", "a".repeat(199), "\u{00e9}");
+        log.tool_response("inspect", &result);
+
+        let body = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let event: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            event["message"].as_str().unwrap(),
+            format!("inspect \u{2192} {}", "a".repeat(199))
         );
     }
 

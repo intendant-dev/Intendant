@@ -247,7 +247,7 @@ preserve Codex's normal user configuration inheritance.
 |-----|------|---------|-------------|
 | `command` | string | `claude` | Path or command name |
 | `model` | string | unset | Model override |
-| `permission_mode` | string | `auto` | `default`, `acceptEdits`, `plan`, `auto`, `bypassPermissions` |
+| `permission_mode` | string | `default` | `default`, `acceptEdits`, `plan`, `bypassPermissions` (legacy `auto` = `default`) |
 | `allowed_tools` | array | `[]` (all) | Restrict the tool set |
 
 Unknown or empty values for `approval_policy`, `sandbox`, `reasoning_effort`,
@@ -762,7 +762,7 @@ writable_roots = []
 
 [agent.claude_code]
 command = "claude"
-permission_mode = "auto"
+permission_mode = "default"
 allowed_tools = []
 
 [live_audio]

@@ -495,6 +495,12 @@ pub struct App {
     pub session_completion_tokens: u64,
     pub session_cached_tokens: u64,
     pub context_window: u64,
+    /// Freshest main-model usage observed on the bus. External backends
+    /// (Codex, Claude Code) report usage through `AppEvent::UsageSnapshot`
+    /// rather than `ModelResponse.usage`, so the local counters above stay
+    /// zero for them; snapshots derived here must not overwrite the real
+    /// numbers with those zeros.
+    last_main_usage: Option<crate::frontend::ModelUsageSnapshot>,
 
     // Session metadata
     pub session_id: String,
@@ -617,6 +623,7 @@ impl App {
             session_completion_tokens: 0,
             session_cached_tokens: 0,
             context_window: 0,
+            last_main_usage: None,
             session_id: String::new(),
             task_description: String::new(),
             tick_count: 0,
@@ -671,6 +678,13 @@ impl App {
 
     /// Build a usage snapshot for the main model.
     fn main_usage_snapshot(&self) -> crate::frontend::ModelUsageSnapshot {
+        // Prefer the freshest snapshot observed on the bus: for external
+        // backends the local counters are always zero (their usage arrives
+        // via `AgentEvent::Usage` → `AppEvent::UsageSnapshot`), and a
+        // counter-derived snapshot would reset the dashboard meter.
+        if let Some(observed) = &self.last_main_usage {
+            return observed.clone();
+        }
         crate::frontend::ModelUsageSnapshot {
             provider: self.provider_name.clone(),
             model: self.model_name.clone(),
@@ -1365,6 +1379,39 @@ impl App {
                     format!("Rename session {} → {}", session_id, name),
                 );
             }
+            ControlMsg::SetClaudeModel { ref model } => {
+                let label = model
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("<default>");
+                self.log(
+                    LogLevel::Info,
+                    format!("Claude Code model → {} (applies on next task)", label),
+                );
+            }
+            ControlMsg::SetClaudePermissionMode { ref mode } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Claude Code permission mode → {} (applies on next task)",
+                        mode
+                    ),
+                );
+            }
+            ControlMsg::SetClaudeAllowedTools { ref tools } => {
+                self.log(
+                    LogLevel::Info,
+                    if tools.is_empty() {
+                        "Claude Code allowed tools cleared — all tools (applies on next task)"
+                            .to_string()
+                    } else {
+                        format!(
+                            "Claude Code allowed tools → {} (applies on next task)",
+                            tools.join(", ")
+                        )
+                    },
+                );
+            }
             ControlMsg::SetVerbosity { level } => {
                 let new_verbosity = match level.to_lowercase().as_str() {
                     "quiet" => Some(Verbosity::Quiet),
@@ -1842,16 +1889,30 @@ impl App {
                 ..
             } => {
                 self.turn = turn;
-                self.session_tokens += usage.total_tokens;
-                self.session_prompt_tokens += usage.prompt_tokens;
-                self.session_completion_tokens += usage.completion_tokens;
-                self.session_cached_tokens += usage.cached_tokens;
-                // Emit usage snapshot so external consumers (web UI) get updated
-                derived.push(AppEvent::UsageSnapshot {
-                    session_id: Some(self.session_id.clone()).filter(|s| !s.is_empty()),
-                    main: self.main_usage_snapshot(),
-                    presence: self.presence_usage_snapshot(),
-                });
+                // External backends attach no usage to ModelResponse (their
+                // usage flows through `AppEvent::UsageSnapshot` from the
+                // drain); deriving a snapshot from untouched counters here
+                // would rebroadcast zeros over the real numbers.
+                let has_usage = usage.total_tokens > 0
+                    || usage.prompt_tokens > 0
+                    || usage.completion_tokens > 0
+                    || usage.cached_tokens > 0;
+                if has_usage {
+                    self.session_tokens += usage.total_tokens;
+                    self.session_prompt_tokens += usage.prompt_tokens;
+                    self.session_completion_tokens += usage.completion_tokens;
+                    self.session_cached_tokens += usage.cached_tokens;
+                    // Locally accumulated counters are the authoritative
+                    // freshest data now — don't let an older observed
+                    // snapshot shadow them.
+                    self.last_main_usage = None;
+                    // Emit usage snapshot so external consumers (web UI) get updated
+                    derived.push(AppEvent::UsageSnapshot {
+                        session_id: Some(self.session_id.clone()).filter(|s| !s.is_empty()),
+                        main: self.main_usage_snapshot(),
+                        presence: self.presence_usage_snapshot(),
+                    });
+                }
                 self.streaming_buffer.clear();
                 // Local-only: OutboundEvent::ModelResponse already reaches
                 // external consumers, which synthesize their own log entry.
@@ -2449,8 +2510,24 @@ impl App {
             AppEvent::AutonomyChanged { autonomy } => {
                 self.autonomy_display = autonomy;
             }
+            AppEvent::UsageSnapshot {
+                session_id, main, ..
+            } => {
+                // Remember the freshest main-model usage seen on the bus
+                // (external backends report through this event, not through
+                // ModelResponse.usage) so snapshots derived here — e.g. on
+                // presence updates — carry the real numbers instead of
+                // zeroed local counters. Scope to this session when both
+                // sides carry an id.
+                let session_matches = match (session_id.as_deref(), self.session_id.as_str()) {
+                    (Some(event_id), own_id) if !own_id.is_empty() => event_id == own_id,
+                    _ => true,
+                };
+                if session_matches && main.tokens_used > 0 {
+                    self.last_main_usage = Some(main);
+                }
+            }
             AppEvent::ApprovalResolved { .. }
-            | AppEvent::UsageSnapshot { .. }
             | AppEvent::ContextSnapshot { .. }
             | AppEvent::StatusUpdate { .. }
             | AppEvent::LogEntry { .. }
@@ -2469,6 +2546,7 @@ impl App {
             | AppEvent::SessionRelationship { .. }
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::SessionAgentConfigResult { .. }
+            | AppEvent::ClaudeConfigChanged { .. }
             | AppEvent::SharedView { .. }
             | AppEvent::BrowserWorkspaceChanged { .. }
             | AppEvent::FileChanged { .. }

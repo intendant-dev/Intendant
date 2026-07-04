@@ -402,8 +402,15 @@ pub async fn read_screen_elements(target: DisplayTarget) -> Result<ScreenElement
     {
         // AT-SPI observes the session accessibility bus, which is
         // display-server-independent (X11 and Wayland alike) and
-        // session-scoped, so the display target does not select the tree.
-        let _ = target;
+        // session-scoped, so virtual display targets cannot select a different
+        // tree.
+        if !target.is_user_session() {
+            return Err(
+                "element trees are only available for the user session display on Linux \
+                 (virtual displays are Xvfb); use display_target=\"user_session\""
+                    .to_string(),
+            );
+        }
         crate::atspi_read::read_frontmost(ELEMENT_TREE_MAX_DEPTH, ELEMENT_TREE_MAX_NODES).await
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -2951,6 +2958,15 @@ mod tests {
     fn display_target_is_user_session() {
         assert!(!DisplayTarget::Virtual { id: 99 }.is_user_session());
         assert!(DisplayTarget::UserSession.is_user_session());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn read_screen_elements_rejects_virtual_target_on_linux() {
+        let err = read_screen_elements(DisplayTarget::Virtual { id: 99 })
+            .await
+            .unwrap_err();
+        assert!(err.contains("user_session"), "{err}");
     }
 
     #[test]

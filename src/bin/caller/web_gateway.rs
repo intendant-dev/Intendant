@@ -8721,7 +8721,17 @@ fn claude_session_list_row_from_file(path: &Path) -> Option<serde_json::Value> {
             if task.is_none() {
                 if let Some(msg) = obj.get("message") {
                     if let Some(content) = msg.get("content").and_then(message_content_text) {
-                        task = Some(compact_text(&content, 180));
+                        // Supervised sessions carry the Intendant bootstrap
+                        // addendum on their first prompt; keep it out of the
+                        // session title.
+                        let user_text = content
+                            .split(
+                                crate::external_agent::claude_code::CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER,
+                            )
+                            .next()
+                            .unwrap_or(&content)
+                            .trim_end();
+                        task = Some(compact_text(user_text, 180));
                     }
                 }
             }
@@ -13396,7 +13406,7 @@ async fn read_post_body<S: AsyncRead + Unpin>(header_text: &str, stream: &mut S)
         .unwrap_or(0);
     let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
     if peeked_body.len() >= content_length {
-        return peeked_body[..content_length].to_string();
+        return crate::types::truncate_str(peeked_body, content_length).to_string();
     }
     let mut full = peeked_body.to_string();
     let remaining = content_length.saturating_sub(peeked_body.len());
@@ -17021,6 +17031,14 @@ pub struct SettingsPayload {
     // command/path defaults.
     #[serde(default)]
     pub claude_command: Option<String>,
+    // Claude Code runtime config (persisted to `[agent.claude_code]`).
+    // Mirrors the Codex/Gemini fields for the Activity → Control sub-tab.
+    #[serde(default)]
+    pub claude_model: Option<String>,
+    #[serde(default)]
+    pub claude_permission_mode: Option<String>,
+    #[serde(default)]
+    pub claude_allowed_tools: Option<Vec<String>>,
     // Per-category approval rules (persisted to `[approval]`). Exposed here
     // for the dashboard's "Approval rules" controls to populate the selects.
     // Live edits flow through the `set_approval_rule` ControlMsg, not through
@@ -17127,6 +17145,11 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
             &config.agent.codex.context_archive,
         )),
         claude_command: Some(config.agent.claude_code.command.clone()),
+        claude_model: config.agent.claude_code.model.clone(),
+        claude_permission_mode: Some(crate::project::normalize_claude_permission_mode(
+            &config.agent.claude_code.permission_mode,
+        )),
+        claude_allowed_tools: Some(config.agent.claude_code.allowed_tools.clone()),
         approval_file_read: config.approval.file_read.as_str().to_string(),
         approval_file_write: config.approval.file_write.as_str().to_string(),
         approval_file_delete: config.approval.file_delete.as_str().to_string(),
@@ -17234,6 +17257,26 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
     if payload.claude_command.is_some() {
         config.agent.claude_code.command =
             normalize_settings_agent_command(payload.claude_command.as_deref(), "claude");
+    }
+    if payload.claude_model.is_some() {
+        // Empty clears the override (claude picks its configured default).
+        config.agent.claude_code.model = payload
+            .claude_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+    }
+    if let Some(mode) = payload.claude_permission_mode.as_deref() {
+        config.agent.claude_code.permission_mode =
+            crate::project::normalize_claude_permission_mode(mode);
+    }
+    if let Some(tools) = payload.claude_allowed_tools.as_ref() {
+        config.agent.claude_code.allowed_tools = tools
+            .iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
     }
 }
 
@@ -17353,6 +17396,14 @@ fn get_api_key_status_json() -> String {
 
 pub(crate) fn api_key_status_response_body() -> String {
     get_api_key_status_json()
+}
+
+/// Whether any provider credential is usable at all — the aggregate of
+/// [`get_api_key_status_json`], safe to expose at presence level.
+pub(crate) fn any_provider_credential_usable() -> bool {
+    ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+        .iter()
+        .any(|name| crate::credential_leases::provider_api_key(name).is_some())
 }
 
 pub(crate) fn project_root_response_body(project_root: Option<&Path>) -> String {
@@ -22082,7 +22133,7 @@ pub fn spawn_web_gateway(
                         let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
                         let body_owned;
                         let body_text = if peeked_body.len() >= content_length {
-                            &peeked_body[..content_length]
+                            crate::types::truncate_str(peeked_body, content_length)
                         } else {
                             let remaining = content_length.saturating_sub(peeked_body.len());
                             let mut full = peeked_body.to_string();
@@ -22215,7 +22266,7 @@ pub fn spawn_web_gateway(
                         let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
                         let body_owned;
                         let body_text = if peeked_body.len() >= content_length {
-                            &peeked_body[..content_length]
+                            crate::types::truncate_str(peeked_body, content_length)
                         } else {
                             let remaining = content_length.saturating_sub(peeked_body.len());
                             let mut full = peeked_body.to_string();
@@ -24380,7 +24431,7 @@ pub fn spawn_web_gateway(
                             let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
                             let body_owned;
                             let body_text = if peeked_body.len() >= content_length {
-                                &peeked_body[..content_length]
+                                crate::types::truncate_str(peeked_body, content_length)
                             } else {
                                 let remaining = content_length.saturating_sub(peeked_body.len());
                                 let mut full = peeked_body.to_string();
@@ -26900,7 +26951,7 @@ async fn read_request_body<S: AsyncRead + Unpin>(stream: &mut S, header_text: &s
     }
     let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
     if peeked_body.len() >= content_length {
-        return peeked_body[..content_length].to_string();
+        return crate::types::truncate_str(peeked_body, content_length).to_string();
     }
     let remaining = content_length.saturating_sub(peeked_body.len());
     let mut full = peeked_body.to_string();
@@ -26934,7 +26985,7 @@ async fn read_request_body_capped<S: AsyncRead + Unpin>(
     }
     let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
     if peeked_body.len() >= content_length {
-        return Ok(peeked_body[..content_length].to_string());
+        return Ok(crate::types::truncate_str(peeked_body, content_length).to_string());
     }
     let remaining = content_length.saturating_sub(peeked_body.len());
     let mut full = peeked_body.to_string();
@@ -29885,6 +29936,16 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn read_request_body_capped_truncates_peeked_body_on_char_boundary() {
+        let mut stream = tokio::io::empty();
+        let header_text = "POST /api/peers HTTP/1.1\r\nContent-Length: 1\r\n\r\n\u{00e9}";
+        let body = read_request_body_capped(&mut stream, header_text, 32)
+            .await
+            .unwrap();
+        assert_eq!(body, "");
+    }
 
     struct EnvVarGuard {
         key: &'static str,

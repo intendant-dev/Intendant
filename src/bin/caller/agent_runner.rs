@@ -1,6 +1,7 @@
 use crate::error::CallerError;
 use crate::sandbox::SandboxConfig;
 use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -28,6 +29,50 @@ fn has_ask_human(json_input: &str) -> bool {
                 .any(|cmd| cmd.get("function").and_then(|v| v.as_str()) == Some("askHuman"))
         })
         .unwrap_or(false)
+}
+
+fn has_parseable_runtime_output(stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout).lines().any(|line| {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            return false;
+        };
+        matches!(
+            parsed.get("type").and_then(|value| value.as_str()),
+            Some("status" | "result")
+        ) && parsed
+            .get("nonce")
+            .and_then(|value| value.as_u64())
+            .is_some()
+    })
+}
+
+fn output_with_exit_status(
+    stdout_buf: Vec<u8>,
+    stderr_buf: Vec<u8>,
+    status: ExitStatus,
+) -> Result<AgentOutput, CallerError> {
+    let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
+    let mut stderr = String::from_utf8_lossy(&stderr_buf).to_string();
+    if !status.success() {
+        if !has_parseable_runtime_output(&stdout_buf) {
+            let stderr_tail = stderr.trim();
+            let detail = if stderr_tail.is_empty() {
+                String::new()
+            } else {
+                format!("; stderr: {stderr_tail}")
+            };
+            return Err(CallerError::Agent(format!(
+                "sandboxed runtime exited with {status} before producing parseable output{detail}"
+            )));
+        }
+        if !stderr.ends_with('\n') && !stderr.is_empty() {
+            stderr.push('\n');
+        }
+        stderr.push_str(&format!(
+            "sandboxed runtime exited with {status} after producing output"
+        ));
+    }
+    Ok(AgentOutput { stdout, stderr })
 }
 
 pub async fn run_agent(
@@ -153,34 +198,32 @@ async fn run_agent_inner(
         let read_stdout = async {
             let mut buf = Vec::with_capacity(8192);
             if let Some(ref mut out) = stdout {
-                let _ = out
-                    .take(MAX_OUTPUT_BYTES as u64)
+                out.take(MAX_OUTPUT_BYTES as u64)
                     .read_to_end(&mut buf)
-                    .await;
+                    .await?;
             }
-            buf
+            Ok::<_, std::io::Error>(buf)
         };
         let read_stderr = async {
             let mut buf = Vec::with_capacity(8192);
             if let Some(ref mut err) = stderr {
-                let _ = err
-                    .take(MAX_OUTPUT_BYTES as u64)
+                err.take(MAX_OUTPUT_BYTES as u64)
                     .read_to_end(&mut buf)
-                    .await;
+                    .await?;
             }
-            buf
+            Ok::<_, std::io::Error>(buf)
         };
 
-        let (stdout_buf, stderr_buf, _) = tokio::join!(read_stdout, read_stderr, child.wait());
-        (stdout_buf, stderr_buf)
+        let (stdout_buf, stderr_buf, status) = tokio::join!(read_stdout, read_stderr, child.wait());
+        Ok::<_, CallerError>((stdout_buf?, stderr_buf?, status?))
     })
     .await;
 
     match result {
-        Ok((stdout_buf, stderr_buf)) => Ok(AgentOutput {
-            stdout: String::from_utf8_lossy(&stdout_buf).to_string(),
-            stderr: String::from_utf8_lossy(&stderr_buf).to_string(),
-        }),
+        Ok(Ok((stdout_buf, stderr_buf, status))) => {
+            output_with_exit_status(stdout_buf, stderr_buf, status)
+        }
+        Ok(Err(err)) => Err(err),
         Err(_) => {
             let _ = child.kill().await;
             Err(CallerError::Agent(format!(
@@ -218,5 +261,20 @@ mod tests {
         let json =
             r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"echo \"askHuman\""}]}"#;
         assert!(!has_ask_human(json));
+    }
+
+    #[test]
+    fn parseable_runtime_output_requires_nonce_result_or_status() {
+        assert!(has_parseable_runtime_output(
+            br#"{"type":"result","nonce":7,"data":"ok"}"#
+        ));
+        assert!(has_parseable_runtime_output(
+            br#"noise
+{"type":"status","nonce":7,"status":"E","exit_code":1}"#
+        ));
+        assert!(!has_parseable_runtime_output(
+            br#"{"type":"result","data":"missing nonce"}"#
+        ));
+        assert!(!has_parseable_runtime_output(b"panic before json"));
     }
 }

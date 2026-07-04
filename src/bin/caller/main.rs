@@ -947,6 +947,15 @@ fn codex_runtime_config_equal(
         && a.context_archive == b.context_archive
 }
 
+fn claude_runtime_config_equal(
+    a: &control_plane::ClaudeRuntimeConfig,
+    b: &control_plane::ClaudeRuntimeConfig,
+) -> bool {
+    a.model == b.model
+        && a.permission_mode == b.permission_mode
+        && a.allowed_tools == b.allowed_tools
+}
+
 fn normalize_diff_file_path(path: &str) -> Option<String> {
     let path = path.split('\t').next().unwrap_or(path).trim();
     if path == "/dev/null" {
@@ -6880,6 +6889,37 @@ fn emit_codex_session_capabilities_for_drain(
     });
 }
 
+/// Capabilities of a supervised Claude Code session: follow-up turns,
+/// native mid-turn steering (a user message written mid-turn is absorbed
+/// into the running turn), and native interrupts (stream-json
+/// `control_request`). The Codex-specific knobs stay unset so frontends
+/// keep those controls hidden.
+fn claude_code_external_session_capabilities() -> types::SessionCapabilities {
+    types::SessionCapabilities {
+        follow_up: true,
+        steer: true,
+        interrupt: true,
+        codex_thread_actions: Vec::new(),
+        codex_managed_context: None,
+        codex_sandbox: None,
+        codex_approval_policy: None,
+        codex_context_archive: None,
+        codex_command: None,
+        codex_fast_mode: None,
+        codex_service_tier: None,
+    }
+}
+
+fn emit_claude_code_session_capabilities(bus: &EventBus, session_id: Option<&str>) {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    bus.send(AppEvent::SessionCapabilities {
+        session_id: session_id.to_string(),
+        capabilities: claude_code_external_session_capabilities(),
+    });
+}
+
 fn side_session_prompt_from_params(params: &serde_json::Value) -> Option<String> {
     ["prompt", "message", "text", "task"]
         .iter()
@@ -9240,6 +9280,56 @@ fn emit_external_session_goal(
     }
 }
 
+/// A backend announced its native conversation id after thread start
+/// (Claude Code reveals it on the first stdout message of the first turn).
+/// Upgrade Intendant's identity and resume records from the placeholder
+/// thread id: frontends re-key via `AppEvent::SessionIdentity` and the
+/// external overlay makes `--continue`/resume find the native id.
+fn persist_native_backend_session_id(config: &DrainConfig<'_>, native_id: &str) {
+    let native_id = native_id.trim();
+    let Some(backend) = config
+        .agent_source
+        .as_deref()
+        .and_then(external_agent::AgentBackend::from_str_loose)
+    else {
+        return;
+    };
+    if !backend.thread_id_is_canonical(native_id) {
+        return;
+    }
+    emit_external_session_identity(
+        config.bus,
+        config
+            .session_id
+            .clone()
+            .or_else(|| config.alias_session_id.clone()),
+        backend.as_short_str(),
+        native_id,
+    );
+    if backend == external_agent::AgentBackend::ClaudeCode {
+        // Frontends may address the session by either id after the
+        // identity upgrade; advertise capabilities under the native id too.
+        emit_claude_code_session_capabilities(config.bus, Some(native_id));
+    }
+    let mut launch = crate::session_config::read_log_dir_config(config.log_dir).unwrap_or_default();
+    if launch.source.is_none() {
+        launch.source = Some(backend.as_short_str().to_string());
+    }
+    if let Err(e) = crate::session_config::write_external_overlay(
+        &platform::home_dir(),
+        backend.as_short_str(),
+        native_id,
+        &launch,
+    ) {
+        slog(config.session_log, |l| {
+            l.debug(&format!(
+                "Persist external overlay for native session id {} failed: {e}",
+                short_external_session_id(native_id)
+            ))
+        });
+    }
+}
+
 fn handle_idle_codex_subagent_event(
     config: &DrainConfig<'_>,
     stats: &mut LoopStats,
@@ -9248,6 +9338,10 @@ fn handle_idle_codex_subagent_event(
 ) {
     let session_id = Some(child_thread_id.clone());
     match event {
+        external_agent::AgentEvent::NativeSessionId { .. } => {
+            // Native-id announcements describe the primary conversation;
+            // a Codex subagent child never re-keys the session.
+        }
         external_agent::AgentEvent::MessageDelta { text } => {
             config
                 .bus
@@ -10338,6 +10432,11 @@ async fn drain_external_agent_events_with_prefetched(
         };
 
         match event {
+            external_agent::AgentEvent::NativeSessionId { session_id } => {
+                if event_is_primary {
+                    persist_native_backend_session_id(config, &session_id);
+                }
+            }
             external_agent::AgentEvent::MessageDelta { text } => {
                 mark_pending_runtime_steers_delivered_at_model_checkpoint(
                     config,
@@ -11075,9 +11174,14 @@ async fn drain_external_agent_events_with_prefetched(
                         id: 0,
                         action: "deny".to_string(),
                     });
-                    let _ = agent
+                    if let Err(e) = agent
                         .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
-                        .await;
+                        .await
+                    {
+                        slog(config.session_log, |l| {
+                            l.warn(&format!("Failed to resolve approval: {}", e))
+                        });
+                    }
                 } else if config.headless
                     && config.json_approval.is_none()
                     && config.web_port.is_none()
@@ -11090,9 +11194,14 @@ async fn drain_external_agent_events_with_prefetched(
                         id: 0,
                         action: "deny".to_string(),
                     });
-                    let _ = agent
+                    if let Err(e) = agent
                         .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
-                        .await;
+                        .await
+                    {
+                        slog(config.session_log, |l| {
+                            l.warn(&format!("Failed to resolve approval: {}", e))
+                        });
+                    }
                 } else {
                     let id = approval_counter.fetch_add(1, Ordering::Relaxed);
                     config.bus.send(AppEvent::ApprovalRequired {
@@ -11155,12 +11264,17 @@ async fn drain_external_agent_events_with_prefetched(
                             slog(config.session_log, |l| {
                                 l.warn("Approval channel closed, denying")
                             });
-                            let _ = agent
+                            if let Err(e) = agent
                                 .resolve_approval(
                                     &request_id,
                                     external_agent::ApprovalDecision::Decline,
                                 )
-                                .await;
+                                .await
+                            {
+                                slog(config.session_log, |l| {
+                                    l.warn(&format!("Failed to resolve approval: {}", e))
+                                });
+                            }
                         }
                     }
                 }
@@ -11198,9 +11312,14 @@ async fn drain_external_agent_events_with_prefetched(
                         id: 0,
                         action: "deny".to_string(),
                     });
-                    let _ = agent
+                    if let Err(e) = agent
                         .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
-                        .await;
+                        .await
+                    {
+                        slog(config.session_log, |l| {
+                            l.warn(&format!("Failed to resolve approval: {}", e))
+                        });
+                    }
                 } else if config.headless
                     && config.json_approval.is_none()
                     && config.web_port.is_none()
@@ -11213,9 +11332,14 @@ async fn drain_external_agent_events_with_prefetched(
                         id: 0,
                         action: "deny".to_string(),
                     });
-                    let _ = agent
+                    if let Err(e) = agent
                         .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
-                        .await;
+                        .await
+                    {
+                        slog(config.session_log, |l| {
+                            l.warn(&format!("Failed to resolve approval: {}", e))
+                        });
+                    }
                 } else {
                     let id = approval_counter.fetch_add(1, Ordering::Relaxed);
                     config.bus.send(AppEvent::ApprovalRequired {
@@ -11278,12 +11402,17 @@ async fn drain_external_agent_events_with_prefetched(
                             slog(config.session_log, |l| {
                                 l.warn("File approval channel closed, denying")
                             });
-                            let _ = agent
+                            if let Err(e) = agent
                                 .resolve_approval(
                                     &request_id,
                                     external_agent::ApprovalDecision::Decline,
                                 )
-                                .await;
+                                .await
+                            {
+                                slog(config.session_log, |l| {
+                                    l.warn(&format!("Failed to resolve approval: {}", e))
+                                });
+                            }
                         }
                     }
                 }
@@ -11622,6 +11751,19 @@ fn codex_subagent_parent_threads_from_log(log_dir: &std::path::Path) -> HashMap<
     parents
 }
 
+/// Build the control plane's live Claude Code runtime config from the
+/// project TOML. Mirrors the inline Codex/Gemini seeding blocks.
+fn shared_claude_config_from_project(project: &Project) -> control_plane::SharedClaudeConfig {
+    let cfg = &project.config.agent.claude_code;
+    Arc::new(tokio::sync::RwLock::new(
+        control_plane::ClaudeRuntimeConfig {
+            model: cfg.model.clone(),
+            permission_mode: project::normalize_claude_permission_mode(&cfg.permission_mode),
+            allowed_tools: cfg.allowed_tools.clone(),
+        },
+    ))
+}
+
 /// Configuration for `run_daemon_loop`.
 struct DaemonConfig {
     bus: EventBus,
@@ -11629,6 +11771,7 @@ struct DaemonConfig {
     autonomy: SharedAutonomy,
     shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     shared_codex_config: control_plane::SharedCodexConfig,
+    shared_claude_config: control_plane::SharedClaudeConfig,
     frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     session_registry: Option<display::SharedSessionRegistry>,
     web_port: Option<u16>,
@@ -11653,6 +11796,7 @@ async fn run_daemon_loop(config: DaemonConfig) {
         autonomy: config.autonomy,
         shared_external_agent: config.shared_external_agent,
         shared_codex_config: config.shared_codex_config,
+        shared_claude_config: config.shared_claude_config,
         frame_registry: config.frame_registry,
         session_registry: config.session_registry,
         web_port: config.web_port,
@@ -13149,10 +13293,11 @@ fn extract_brief_from_text(text: &str) -> String {
     }
     // Truncate if still too long
     if sentences.len() > 200 {
-        if let Some(pos) = sentences[..200].rfind(". ") {
+        let cut = char_boundary_at_or_before(&sentences, 200);
+        if let Some(pos) = sentences[..cut].rfind(". ") {
             sentences.truncate(pos + 1);
         } else {
-            sentences.truncate(200);
+            sentences.truncate(cut);
             sentences.push_str("...");
         }
     }
@@ -24858,7 +25003,7 @@ async fn run_agent_loop(
                             format!("double_click({},{})", x, y)
                         }
                         computer_use::CuAction::Type { text } => {
-                            format!("type(\"{}\")", &text[..text.len().min(30)])
+                            format!("type(\"{}\")", types::truncate_str(text, 30))
                         }
                         computer_use::CuAction::Key { key } => format!("key({})", key),
                         computer_use::CuAction::Scroll { x, y, .. } => {
@@ -26372,7 +26517,17 @@ All relative paths and commands execute from this directory.",
             artifacts: vec![],
             usage,
         };
-        let _ = sub_agent::write_result(std::path::Path::new(&result_path), &agent_result);
+        if let Err(e) = sub_agent::write_result(std::path::Path::new(&result_path), &agent_result) {
+            // The parent discovers sub-agent completion ONLY through this
+            // file; a swallowed failure strands it polling until timeout.
+            slog(&session_log_for_summary, |l| {
+                l.error(&format!(
+                    "Failed to write sub-agent result file {}: {}",
+                    result_path, e
+                ))
+            });
+            eprintln!("Failed to write sub-agent result file {}: {}", result_path, e);
+        }
     }
 
     result
@@ -26428,6 +26583,7 @@ async fn run_with_presence(
     agent_backend_override: Option<external_agent::AgentBackend>,
     shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     shared_codex_config: control_plane::SharedCodexConfig,
+    shared_claude_config: control_plane::SharedClaudeConfig,
     web_port: Option<u16>,
     resume_session: Option<String>,
     resume_session_config: Option<session_config::SessionAgentConfig>,
@@ -26643,6 +26799,7 @@ async fn run_with_presence(
     // `shared_codex_config` when a new task arrives, we tear the agent down
     // and build a fresh one. Only meaningful when the backend is Codex.
     let mut persistent_codex_config: Option<control_plane::CodexRuntimeConfig> = None;
+    let mut persistent_claude_config: Option<control_plane::ClaudeRuntimeConfig> = None;
 
     // Side channel for thread actions (Codex slash commands) dispatched from
     // the dashboard / MCP between tasks. We subscribe to the bus here (not
@@ -27444,6 +27601,7 @@ async fn run_with_presence(
                             persistent_thread = None;
                             persistent_event_rx = None;
                             persistent_codex_config = None;
+                            persistent_claude_config = None;
                             bus.send(AppEvent::ConversationRolledBack {
                                 round_id,
                                 turns_removed: turns_to_drop,
@@ -27542,7 +27700,7 @@ async fn run_with_presence(
             l.debug(&format!(
                 "CU-first routing: force_direct={}, task={}",
                 envelope.force_direct,
-                &envelope.task[..envelope.task.len().min(60)]
+                types::truncate_str(&envelope.task, 60)
             ))
         });
 
@@ -27584,11 +27742,14 @@ async fn run_with_presence(
                     slog(&session_log, |l| {
                         l.info(&format!(
                             "CU escalated to agent: {}",
-                            &task[..task.len().min(80)]
+                            types::truncate_str(&task, 80)
                         ))
                     });
                     bus.send(AppEvent::PresenceLog {
-                        message: format!("Escalating to agent: {}", &task[..task.len().min(80)]),
+                        message: format!(
+                            "Escalating to agent: {}",
+                            types::truncate_str(&task, 80)
+                        ),
                         level: None,
                         turn: None,
                     });
@@ -27618,6 +27779,7 @@ async fn run_with_presence(
         // per-session config at spawn/thread-start — a toggle in the UI takes
         // effect on the NEXT task by forcing an agent rebuild.
         let current_codex_config = shared_codex_config.read().await.clone();
+        let current_claude_config = shared_claude_config.read().await.clone();
 
         // Teardown conditions:
         //  - backend changed (any agent)
@@ -27627,19 +27789,32 @@ async fn run_with_presence(
                 && persistent_codex_config
                     .as_ref()
                     .is_some_and(|prev| !codex_runtime_config_equal(prev, &current_codex_config));
+        let claude_config_changed =
+            matches!(agent_backend, Some(external_agent::AgentBackend::ClaudeCode))
+                && persistent_claude_config
+                    .as_ref()
+                    .is_some_and(|prev| !claude_runtime_config_equal(prev, &current_claude_config));
 
         if persistent_agent.is_some()
-            && (agent_backend != persistent_agent_backend || codex_config_changed)
+            && (agent_backend != persistent_agent_backend
+                || codex_config_changed
+                || claude_config_changed)
         {
             if codex_config_changed {
                 slog(&session_log, |l| {
                     l.info("Codex config changed; rebuilding agent for next task")
                 });
             }
+            if claude_config_changed {
+                slog(&session_log, |l| {
+                    l.info("Claude Code config changed; rebuilding agent for next task")
+                });
+            }
             persistent_agent = None;
             persistent_thread = None;
             persistent_event_rx = None;
             persistent_codex_config = None;
+            persistent_claude_config = None;
             persistent_diff_tracker = ExternalDiffDeltaTracker::default();
             persistent_pending_runtime_steers.clear();
             persistent_handled_steer_ids.clear();
@@ -27686,6 +27861,12 @@ async fn run_with_presence(
                     cx.writable_roots = current_codex_config.writable_roots.clone();
                     cx.managed_context = current_codex_config.managed_context.clone();
                     cx.context_archive = current_codex_config.context_archive.clone();
+                }
+                if matches!(backend, external_agent::AgentBackend::ClaudeCode) {
+                    let cc = &mut proj.config.agent.claude_code;
+                    cc.model = current_claude_config.model.clone();
+                    cc.permission_mode = current_claude_config.permission_mode.clone();
+                    cc.allowed_tools = current_claude_config.allowed_tools.clone();
                 }
                 // The first agent build may be resuming a session from a
                 // startup `--resume`/`--continue`. That session's persisted
@@ -27745,6 +27926,12 @@ async fn run_with_presence(
                     backend.as_short_str(),
                     &thread.thread_id,
                 );
+                if *backend == external_agent::AgentBackend::ClaudeCode {
+                    emit_claude_code_session_capabilities(
+                        &bus,
+                        session_log_id(&session_log).as_deref(),
+                    );
+                }
                 persistent_agent = Some(agent);
                 persistent_thread = Some(thread);
                 persistent_event_rx = Some(event_rx);
@@ -27760,6 +27947,12 @@ async fn run_with_presence(
                 persistent_codex_config =
                     if matches!(agent_backend, Some(external_agent::AgentBackend::Codex)) {
                         Some(current_codex_config.clone())
+                    } else {
+                        None
+                    };
+                persistent_claude_config =
+                    if matches!(agent_backend, Some(external_agent::AgentBackend::ClaudeCode)) {
+                        Some(current_claude_config.clone())
                     } else {
                         None
                     };
@@ -29121,6 +29314,8 @@ async fn run_external_agent_mode(
             &project,
             effective_codex_service_tier.as_deref(),
         );
+    } else if backend == external_agent::AgentBackend::ClaudeCode {
+        emit_claude_code_session_capabilities(&bus, intendant_session_id.as_deref());
     }
     let (mut agent, thread, mut event_rx) = match create_external_agent(
         &backend,
@@ -29204,6 +29399,11 @@ async fn run_external_agent_mode(
                 &project,
                 service_tier.as_deref(),
             );
+        }
+    } else if backend == external_agent::AgentBackend::ClaudeCode {
+        emit_claude_code_session_capabilities(&bus, intendant_session_id.as_deref());
+        if live_session_id != intendant_session_id {
+            emit_claude_code_session_capabilities(&bus, live_session_id.as_deref());
         }
     }
     if emit_session_started_after_identity {
@@ -29355,6 +29555,12 @@ async fn run_external_agent_mode(
                                     continue;
                                 }
                                 match event {
+                                    external_agent::AgentEvent::NativeSessionId { session_id } => {
+                                        persist_native_backend_session_id(
+                                            &drain_config,
+                                            &session_id,
+                                        );
+                                    }
                                     external_agent::AgentEvent::GoalUpdated { goal } => {
                                         emit_external_session_goal(
                                             &drain_config,
@@ -32111,7 +32317,7 @@ async fn try_cu_first(
             "try_cu_first: ref_images={}, frame_images={}, task={}",
             reference_images.len(),
             frame_images.len(),
-            &task[..task.len().min(60)]
+            types::truncate_str(task, 60)
         ))
     });
 
@@ -32179,13 +32385,13 @@ async fn try_cu_first(
     slog(session_log, |l| {
         l.info(&format!(
             "CU-first: {} (provider: {}, model: {})",
-            &task[..task.len().min(80)],
+            types::truncate_str(task, 80),
             cu_provider.name(),
             cu_provider.model()
         ))
     });
     bus.send(event::AppEvent::PresenceLog {
-        message: format!("Trying CU: {}", &task[..task.len().min(80)]),
+        message: format!("Trying CU: {}", types::truncate_str(task, 80)),
         level: None,
         turn: None,
     });
@@ -32877,7 +33083,7 @@ async fn run_cu_task(
                 actions_desc.push(format!(
                     "{}({})",
                     tc.name,
-                    &tc.arguments[..tc.arguments.len().min(100)]
+                    types::truncate_str(&tc.arguments, 100)
                 ));
             }
             slog(session_log, |l| {
@@ -32897,7 +33103,7 @@ async fn run_cu_task(
                 l.info(&format!(
                     "CU turn {} text: {}",
                     turn,
-                    &response.content[..response.content.len().min(500)]
+                    types::truncate_str(&response.content, 500)
                 ))
             });
         }
@@ -32990,7 +33196,7 @@ async fn run_cu_task(
         }
 
         if is_done {
-            let summary = &response.content[..response.content.len().min(200)];
+            let summary = types::truncate_str(&response.content, 200);
             slog(session_log, |l| l.cu_task_complete(turn, true, summary));
             break;
         }
@@ -33264,7 +33470,7 @@ async fn execute_cu_calls(
                     format!("double_click({},{})", x, y)
                 }
                 computer_use::CuAction::Type { text } => {
-                    format!("type(\"{}\")", &text[..text.len().min(50)])
+                    format!("type(\"{}\")", types::truncate_str(text, 50))
                 }
                 computer_use::CuAction::Key { key } => format!("key({})", key),
                 computer_use::CuAction::Scroll {
@@ -33288,7 +33494,7 @@ async fn execute_cu_calls(
                 }
                 computer_use::CuAction::MouseUp { x, y, .. } => format!("mouse_up({},{})", x, y),
                 computer_use::CuAction::Paste { text } => {
-                    format!("paste(\"{}\")", &text[..text.len().min(50)])
+                    format!("paste(\"{}\")", types::truncate_str(text, 50))
                 }
                 computer_use::CuAction::HoldKey { key, ms } => {
                     format!("hold_key({},{}ms)", key, ms)
@@ -34013,22 +34219,24 @@ async fn main() -> Result<(), CallerError> {
             });
             Some(p)
         }
-        Err(ref e) if use_web || flags.mcp => {
-            // No API keys — start the dashboard anyway.
-            // Display control, session browsing, annotations, and clipping
-            // all work without inference.
+        Err(ref e) if use_web || flags.mcp || initial_agent_backend.is_some() => {
+            // No API keys — this is not an error. External backends bring
+            // their own authentication, and the dashboard's display control,
+            // session browsing, annotations, and clipping all work without
+            // inference. Keep the console note calm and free of error-shaped
+            // text ("No API key found…") — automation reading stderr kept
+            // mistaking that for a fatal startup failure. The full cause
+            // stays in the session log.
             if let Some(backend) = &initial_agent_backend {
                 eprintln!(
-                    "Warning: no native model provider: {}. Native-provider features are unavailable, \
-                     but the {} external agent can run with its own authentication.",
-                    e,
+                    "Note: running without a native model provider — {} authenticates on its own. \
+                     Native-model features (presence, sub-agents, voice) stay off until an API key is configured.",
                     backend
                 );
             } else {
                 eprintln!(
-                    "Warning: {} AI features will be unavailable. \
-                     The web dashboard is starting without a model provider.",
-                    e
+                    "Note: starting without a model provider — AI features stay off until an API key is configured. \
+                     The dashboard, display control, and session browsing still work.",
                 );
             }
             slog(&session_log, |l| {
@@ -34249,12 +34457,14 @@ async fn main() -> Result<(), CallerError> {
                 },
             ))
         };
+        let shared_claude_config = shared_claude_config_from_project(&project);
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
                 codex_config: shared_codex_config.clone(),
+                claude_config: shared_claude_config.clone(),
                 bus: bus.clone(),
                 project_root: Some(project.root.clone()),
             },
@@ -34266,6 +34476,7 @@ async fn main() -> Result<(), CallerError> {
             autonomy,
             shared_external_agent,
             shared_codex_config,
+            shared_claude_config,
             frame_registry,
             session_registry: Some(session_registry.clone()),
             web_port: web_port_for_agent,
@@ -35125,12 +35336,14 @@ async fn main() -> Result<(), CallerError> {
                 },
             ))
         };
+        let shared_claude_config = shared_claude_config_from_project(&project);
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
                 codex_config: shared_codex_config.clone(),
+                claude_config: shared_claude_config.clone(),
                 bus: bus.clone(),
                 project_root: Some(project.root.clone()),
             },
@@ -35144,6 +35357,7 @@ async fn main() -> Result<(), CallerError> {
                         autonomy: autonomy.clone(),
                         shared_external_agent: shared_external_agent.clone(),
                         shared_codex_config: shared_codex_config.clone(),
+                        shared_claude_config: shared_claude_config.clone(),
                         frame_registry: frame_registry.clone(),
                         session_registry: Some(session_registry.clone()),
                         web_port: web_port_for_agent,
@@ -35213,6 +35427,7 @@ async fn main() -> Result<(), CallerError> {
             let agent_backend_for_presence = agent_backend.clone();
             let shared_external_agent_for_presence = shared_external_agent.clone();
             let shared_codex_config_for_presence = shared_codex_config.clone();
+            let shared_claude_config_for_presence = shared_claude_config.clone();
             let session_registry_for_presence = session_registry.clone();
             tokio::spawn(async move {
                 let result = run_with_presence(
@@ -35237,6 +35452,7 @@ async fn main() -> Result<(), CallerError> {
                     agent_backend_for_presence,
                     shared_external_agent_for_presence,
                     shared_codex_config_for_presence,
+                    shared_claude_config_for_presence,
                     if use_web { Some(web_port) } else { None },
                     startup_external_resume_session.clone(),
                     startup_external_resume_overrides,
@@ -35433,6 +35649,7 @@ async fn main() -> Result<(), CallerError> {
                 autonomy: autonomy.clone(),
                 shared_external_agent: shared_external_agent.clone(),
                 shared_codex_config: shared_codex_config.clone(),
+                shared_claude_config: shared_claude_config.clone(),
                 frame_registry: frame_registry_for_events.clone(),
                 session_registry: Some(session_registry.clone()),
                 web_port: web_port_for_agent,
@@ -35668,9 +35885,17 @@ async fn main() -> Result<(), CallerError> {
                                     }
                                 }
                                 event::ControlMsg::Input { text } => {
-                                    // Write human_response file for askHuman IPC
+                                    // Write human_response file for askHuman IPC.
+                                    // The agent polls for this file; a swallowed
+                                    // failure leaves it waiting forever.
                                     let resp_path = log_dir_for_stdin.join("human_response");
-                                    let _ = std::fs::write(&resp_path, text.as_bytes());
+                                    if let Err(e) = std::fs::write(&resp_path, text.as_bytes()) {
+                                        eprintln!(
+                                            "Failed to write askHuman response {}: {}",
+                                            resp_path.display(),
+                                            e
+                                        );
+                                    }
                                 }
                                 event::ControlMsg::FollowUp {
                                     text, direct: _, ..
@@ -35749,12 +35974,14 @@ async fn main() -> Result<(), CallerError> {
                 },
             ))
         };
+        let shared_claude_config = shared_claude_config_from_project(&project);
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
                 codex_config: shared_codex_config.clone(),
+                claude_config: shared_claude_config.clone(),
                 bus: bus.clone(),
                 project_root: Some(project.root.clone()),
             },
@@ -35881,6 +36108,7 @@ async fn main() -> Result<(), CallerError> {
                 autonomy: autonomy_for_daemon.clone(),
                 shared_external_agent: shared_external_agent.clone(),
                 shared_codex_config: shared_codex_config.clone(),
+                shared_claude_config: shared_claude_config.clone(),
                 frame_registry: frame_registry.clone(),
                 session_registry: Some(session_registry.clone()),
                 web_port: web_port_for_agent,

@@ -4,6 +4,7 @@ use crate::event::{AppEvent, ControlMsg, EventBus};
 use crate::knowledge::{self, KnowledgeQuery};
 use crate::provider::ChatProvider;
 use crate::session_log;
+use crate::types::truncate_str;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -348,7 +349,7 @@ impl PresenceLayer {
                     .handle_presence_tool_call(&tc.name, &tc.arguments)
                     .await;
                 let result_preview = if result.len() > 200 {
-                    format!("{}...", &result[..200])
+                    format!("{}...", truncate_str(&result, 200))
                 } else {
                     result.clone()
                 };
@@ -369,10 +370,7 @@ impl PresenceLayer {
         let args: Value = serde_json::from_str(args_json).unwrap_or(json!({}));
         if name == "submit_task" {
             self.plog(
-                format!(
-                    "[debug] submit_task args: {}",
-                    &args_json[..args_json.len().min(500)]
-                ),
+                format!("[debug] submit_task args: {}", truncate_str(args_json, 500)),
                 None,
             );
         }
@@ -405,7 +403,7 @@ impl PresenceLayer {
                 self.plog(
                     format!(
                         "Rejected submit_task while agent is busy: {}",
-                        &envelope.task[..envelope.task.len().min(100)]
+                        truncate_str(&envelope.task, 100)
                     ),
                     None,
                 );
@@ -1056,6 +1054,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SessionGoal { .. }
         | AppEvent::SessionRenameResult { .. }
         | AppEvent::SessionAgentConfigResult { .. }
+        | AppEvent::ClaudeConfigChanged { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::Key(_)
         | AppEvent::Resize(_, _)
@@ -1322,6 +1321,12 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
 mod tests {
     use super::*;
     use crate::provider;
+
+    #[test]
+    fn presence_preview_truncation_stops_at_char_boundary() {
+        let text = format!("{}{}", "a".repeat(199), "\u{00e9}");
+        assert_eq!(truncate_str(&text, 200), "a".repeat(199));
+    }
 
     #[test]
     fn is_agent_idle_accepts_done_states() {

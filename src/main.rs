@@ -1,4 +1,4 @@
-use crate::agent::Agent;
+use crate::agent::{truncate_utf8_by_bytes, Agent};
 use crate::error::AgentError;
 use crate::models::AgentInput;
 use std::io::{self, Read, Write};
@@ -12,6 +12,7 @@ mod win_sandbox;
 
 /// Maximum bytes to read from stdin (64 MB).
 const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+const JSON_PARSE_INPUT_DIAGNOSTIC_BYTES: usize = 2048;
 
 #[cfg(target_os = "linux")]
 fn apply_sandbox_from_env() -> Result<(), AgentError> {
@@ -116,7 +117,18 @@ async fn main() -> Result<(), AgentError> {
         Ok(input) => input,
         Err(e) => {
             eprintln!("JSON parse error: {}", e);
-            eprintln!("Input was: {}", buffer);
+            let preview = truncate_utf8_by_bytes(&buffer, JSON_PARSE_INPUT_DIAGNOSTIC_BYTES);
+            let omitted = buffer.len().saturating_sub(preview.len());
+            if omitted > 0 {
+                eprintln!(
+                    "Input was (truncated to {} bytes; omitted {} bytes): {}",
+                    preview.len(),
+                    omitted,
+                    preview
+                );
+            } else {
+                eprintln!("Input was: {}", preview);
+            }
             return Err(AgentError::Json(e));
         }
     };

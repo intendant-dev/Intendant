@@ -406,6 +406,13 @@ pub enum AgentEvent {
         turn_id: Option<String>,
         event: Box<AgentEvent>,
     },
+    /// The backend revealed (or confirmed) its native conversation id after
+    /// thread start. Claude Code only stamps a session id on stdout messages
+    /// once the first turn begins, so `start_thread` returns a placeholder
+    /// and this event upgrades Intendant's identity and resume records to
+    /// the real id when it appears. Codex and Gemini return canonical ids
+    /// from `start_thread` and never emit this.
+    NativeSessionId { session_id: String },
     /// Incremental text from the agent's message.
     MessageDelta { text: String },
     /// Complete agent message.
