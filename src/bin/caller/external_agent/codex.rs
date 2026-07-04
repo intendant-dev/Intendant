@@ -3897,14 +3897,11 @@ async fn reader_task(
 
             let (thread_id, turn_id) = codex_event_scope(&params);
 
-            if method.contains("mcpServer")
-                || method.contains("elicit")
-                || method.contains("mcpTool")
-            {
+            if is_codex_mcp_approval_method(method) {
                 // Tool / MCP call approval (e.g. Codex invoking Intendant's
                 // own MCP server tools, or an MCP elicitation). Resolved with
                 // the `{"action": ...}` shape in `resolve_approval`, which uses
-                // the same substring test. Build a best-effort human-readable
+                // the same predicate. Build a best-effort human-readable
                 // label — never the bare "<unknown>" placeholder.
                 let label = params
                     .pointer("/params/message")
@@ -4157,6 +4154,16 @@ fn extract_turn_id(value: &serde_json::Value) -> Option<String> {
 
 fn codex_event_scope(params: &serde_json::Value) -> (Option<String>, Option<String>) {
     (extract_thread_id(params), extract_turn_id(params))
+}
+
+/// Single source of truth for "this Codex approval request is an MCP
+/// tool-call / elicitation" — used by BOTH the reader (to pick the
+/// approval category) and `resolve_approval` (to pick the response
+/// shape). The two sides once used different substring sets, so
+/// `mcpTool…` requests were classified as MCP but answered in the
+/// `{"decision"}` shape, which Codex ignores.
+fn is_codex_mcp_approval_method(method: &str) -> bool {
+    method.contains("mcpServer") || method.contains("elicit") || method.contains("mcpTool")
 }
 
 fn codex_permissions_approval_label(params: &serde_json::Value) -> String {
@@ -7008,10 +7015,14 @@ impl ExternalAgent for CodexAgent {
                 ))
             })?;
 
-        // MCP elicitation requests use {"action": "allow/deny"} format.
-        // Permissions requests use a granted-permissions response. Command/file
-        // approval requests use {"decision": "accept/decline"} format.
-        let result = if pending.method.contains("mcpServer") || pending.method.contains("elicit") {
+        // MCP tool-call / elicitation requests use the
+        // {"action": "accept"/"decline"} shape. Permissions requests use a
+        // granted-permissions response. Command/file approval requests use
+        // {"decision": "accept"/"decline"/…}. The MCP test MUST be the same
+        // predicate the reader classified with — a request classified as MCP
+        // but answered in the {"decision"} shape is silently ignored by
+        // Codex and the tool call hangs.
+        let result = if is_codex_mcp_approval_method(&pending.method) {
             let action = match decision {
                 ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => "accept",
                 ApprovalDecision::Decline | ApprovalDecision::Cancel => "decline",
@@ -7454,6 +7465,29 @@ impl Drop for CodexAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_approval_predicate_covers_every_mcp_shape() {
+        // Reader classification and resolve_approval response shape share
+        // this predicate; if any MCP-family method escapes it, the request
+        // gets a {"decision"} answer Codex ignores and the call hangs.
+        assert!(is_codex_mcp_approval_method(
+            "item/mcpToolCall/requestApproval"
+        ));
+        assert!(is_codex_mcp_approval_method(
+            "mcpServer/tool/requestApproval"
+        ));
+        assert!(is_codex_mcp_approval_method("elicitation/create"));
+        assert!(!is_codex_mcp_approval_method(
+            "item/commandExecution/requestApproval"
+        ));
+        assert!(!is_codex_mcp_approval_method(
+            "item/fileChange/requestApproval"
+        ));
+        assert!(!is_codex_mcp_approval_method(
+            "item/permissions/requestApproval"
+        ));
+    }
 
     #[test]
     fn context_snapshot_not_ready_suppresses_empty_trace_poll() {

@@ -318,8 +318,17 @@ impl WebTui {
                             if let Some(conn) = self.connections.get_mut(&id) {
                                 // Try view-only key handling first
                                 if !conn.view.handle_key(key, app) {
-                                    // Fall through to shared state
-                                    app.handle_key(key);
+                                    // Fall through to shared state via
+                                    // handle_event, like the native runner:
+                                    // it drains the derived events a key
+                                    // produces (follow-up submits, approval
+                                    // resolutions, control intents), which
+                                    // must reach the bus now — a bare
+                                    // handle_key leaves them queued until
+                                    // the next unrelated AppEvent.
+                                    for derived in app.handle_event(AppEvent::Key(key)) {
+                                        bus.send(derived);
+                                    }
                                 }
                             }
                         }

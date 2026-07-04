@@ -13939,6 +13939,16 @@ async fn start_external_display_recordings(
 /// access session-wide. Every approval surface (JSON stdin slot, TUI/MCP
 /// registry) must apply these identically, or an approval "succeeds" and
 /// the action still fails its grant check afterwards.
+/// Shared side effects for NATIVE runtime approvals, applied identically
+/// by every surface (TUI Enter, web, MCP): Approve records the command
+/// for dedup, ApproveAll raises global autonomy to Full, DisplayControl
+/// grants user display access.
+///
+/// External-agent approvals deliberately do NOT route here: their
+/// "Approve all" is Intendant-enforced per external session
+/// (`approve_all_session` in the agent event loop) instead of flipping
+/// global autonomy — a button on one Codex/Claude session must not
+/// escalate every other surface of the daemon.
 async fn apply_user_approval(
     response: event::ApprovalResponse,
     cat: autonomy::ActionCategory,
@@ -26618,10 +26628,21 @@ async fn run_sub_agent_mode(
     log_dir: PathBuf,
 ) -> Result<LoopStats, CallerError> {
     let project = Project::detect()?;
-    let system_prompt = if provider.use_tools() {
-        prompts::resolve_system_prompt_for_tools(&role, Some(&project.root))?
-    } else {
-        prompts::resolve_system_prompt(&role, Some(&project.root))?
+    // A spawner (SubAgentSpec.system_prompt → the INTENDANT_SYSTEM_PROMPT
+    // env var) may hand this sub-agent a bespoke system prompt; it
+    // replaces the file-resolved prompt wholesale — the result-file and
+    // progress contracts are enforced in code, not by prompt text. Absent
+    // that, prompts resolve from the SysPrompt files by role, with
+    // project-root overrides.
+    let custom_prompt = env::var("INTENDANT_SYSTEM_PROMPT")
+        .ok()
+        .filter(|p| !p.trim().is_empty());
+    let system_prompt = match custom_prompt {
+        Some(prompt) => prompt,
+        None if provider.use_tools() => {
+            prompts::resolve_system_prompt_for_tools(&role, Some(&project.root))?
+        }
+        None => prompts::resolve_system_prompt(&role, Some(&project.root))?,
     };
     let task = get_task()?;
 
@@ -28015,18 +28036,25 @@ async fn run_with_presence(
             });
         }
 
-        // ── CU-first routing: all tasks go to fast CU model first ──
+        // ── CU-first routing (VAULTED — [experimental] cu_first_routing) ──
+        // When enabled, every non-direct task is intercepted by a fast CU
+        // model that either completes it on the display or escalates.
+        // Off by default: the extra hop taxes every task with latency and,
+        // under subscription-based external agents, an API-key model the
+        // deployment otherwise doesn't need.
+        let cu_first_enabled = project.config.experimental.cu_first_routing;
         let task_for_agent: Option<String>;
 
         slog(&session_log, |l| {
             l.debug(&format!(
-                "CU-first routing: force_direct={}, task={}",
+                "CU-first routing: enabled={}, force_direct={}, task={}",
+                cu_first_enabled,
                 envelope.force_direct,
                 types::truncate_str(&envelope.task, 60)
             ))
         });
 
-        if !envelope.force_direct {
+        if cu_first_enabled && !envelope.force_direct {
             // Auto-attach latest display frame(s) if none were explicitly provided
             let mut reference_images =
                 resolve_frame_ids(&envelope.reference_frame_ids, &frame_registry).await;
@@ -34184,6 +34212,11 @@ async fn main() -> Result<(), CallerError> {
     // `install_default()` returns `Err(Arc<CryptoProvider>)` if a
     // provider is already installed (idempotent); we ignore that.
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Materialized OAuth credentials must never outlive the process:
+    // this guard revokes all leases on every normal return from main
+    // (the signal handler and the startup sweep cover the other exits).
+    let _lease_shutdown_guard = credential_leases::LeaseShutdownGuard::new();
 
     // Panic hook: handle broken pipe gracefully and persist panic info
     // to the active session's log directory for post-mortem auditing.
