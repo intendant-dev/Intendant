@@ -5,7 +5,8 @@
 //! `include_str!`, served from disk by intendant-connect). Its *source* lives
 //! as typed fragments (`.css` / `.js` / `.html`) under `static/app/`, in the
 //! order fixed by `static/app/manifest.txt`, and this crate concatenates them
-//! back into the tracked artifact. The transform is verbatim concatenation:
+//! back into the tracked artifact. The transform is concatenation plus a
+//! generated-file header and one banner comment per fragment — nothing else:
 //! all JS fragments share the single `<script type="module">` scope exactly
 //! as they did in the monolith (the open/close tags live in tiny wrapper
 //! fragments), so hoisting and TDZ order are untouched by construction.
@@ -28,6 +29,34 @@ pub const OUTPUT: &str = "static/app.html";
 /// (README.md, the manifest itself) is ignored by the completeness check;
 /// the manifest may only list these types.
 const FRAGMENT_EXTENSIONS: &[&str] = &["css", "js", "html"];
+
+/// First line of the generated artifact. A comment before `<!DOCTYPE>` is
+/// spec-legal and does not trigger quirks mode; nothing in the tree sniffs
+/// the artifact's first line (the validate-dashboard served-vs-disk identity
+/// check normalizes only cache-bust query strings, which appear in both).
+pub const GENERATED_HEADER: &str = "<!-- GENERATED from static/app/ — edit the fragments, \
+     not this file. Order: static/app/manifest.txt; any cargo build reassembles; \
+     CI enforces the match. -->\n";
+
+/// Banner emitted before a fragment so the assembled file stays navigable
+/// and a devtools line number maps back to its fragment via the nearest
+/// banner. `None` for the first fragment (the generated header marks it) and
+/// for the `*-open.html` / `*-close.html` wrappers: a wrapper's banner would
+/// land in the syntax context the wrapper is about to change (e.g. an HTML
+/// comment inside the still-open module script, before `</script>`), so the
+/// wrappers stay unmarked. With wrappers excluded, extension == context:
+/// `.css` banners sit inside `<style>`, `.js` banners inside the script
+/// scopes, `.html` banners in markup.
+fn fragment_banner(entry: &str, index: usize) -> Option<String> {
+    if index == 0 || entry.ends_with("-open.html") || entry.ends_with("-close.html") {
+        return None;
+    }
+    match Path::new(entry).extension().and_then(|e| e.to_str()) {
+        Some("css") | Some("js") => Some(format!("/* ── static/app/{entry} ── */\n")),
+        Some("html") => Some(format!("<!-- ── static/app/{entry} ── -->\n")),
+        _ => None,
+    }
+}
 
 /// What one assembly run did.
 #[derive(Debug, PartialEq, Eq)]
@@ -66,7 +95,11 @@ pub fn assemble(repo_root: &Path) -> Result<Outcome, String> {
     validate_completeness(&entries, &fragment_dir)?;
 
     let mut assembled: Vec<u8> = Vec::new();
-    for entry in &entries {
+    assembled.extend_from_slice(GENERATED_HEADER.as_bytes());
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(banner) = fragment_banner(entry, index) {
+            assembled.extend_from_slice(banner.as_bytes());
+        }
         let path = fragment_dir.join(entry);
         let bytes = fs::read(&path)
             .map_err(|e| format!("failed to read fragment {}: {e}", path.display()))?;
@@ -228,25 +261,63 @@ mod tests {
             "static/app/manifest.txt",
             "# order\n00-a.html\n\n20-c.js\n10-b.css\n",
         );
+        let expected = format!(
+            "{GENERATED_HEADER}A\n\
+             /* ── static/app/20-c.js ── */\nC\n\
+             /* ── static/app/10-b.css ── */\nB\n"
+        );
+        let bytes = expected.len();
         assert_eq!(
             assemble(dir.path()),
-            Ok(Outcome::Written { fragments: 3, bytes: 6 })
+            Ok(Outcome::Written { fragments: 3, bytes })
         );
-        assert_eq!(
-            fs::read_to_string(dir.path().join(OUTPUT)).unwrap(),
-            "A\nC\nB\n"
-        );
+        assert_eq!(fs::read_to_string(dir.path().join(OUTPUT)).unwrap(), expected);
         // Second run: byte-identical, no rewrite.
         assert_eq!(
             assemble(dir.path()),
-            Ok(Outcome::Unchanged { fragments: 3, bytes: 6 })
+            Ok(Outcome::Unchanged { fragments: 3, bytes })
         );
         // A hand-edit to the artifact is overwritten by fragment truth.
         write(dir.path(), OUTPUT, "hand edit");
         assert_eq!(
             assemble(dir.path()),
-            Ok(Outcome::Written { fragments: 3, bytes: 6 })
+            Ok(Outcome::Written { fragments: 3, bytes })
         );
+    }
+
+    #[test]
+    fn wrappers_and_first_fragment_get_no_banner() {
+        // The wrappers hold the <style> / <script type="module"> transitions;
+        // a banner on them would land in the syntax context they're closing.
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in [
+            ("00-head.html", "<!DOCTYPE html>\n"),
+            ("09-style-open.html", "<style>\n"),
+            ("10-x.css", ".x{}\n"),
+            ("19-style-close.html", "</style>\n"),
+            ("20-shell.html", "<body>\n"),
+            ("30-module-open.html", "<script type=\"module\">\n"),
+            ("31-a.js", "let a;\n"),
+            ("59-module-close.html", "</script>\n"),
+        ] {
+            write(dir.path(), &format!("static/app/{name}"), content);
+        }
+        write(
+            dir.path(),
+            "static/app/manifest.txt",
+            "00-head.html\n09-style-open.html\n10-x.css\n19-style-close.html\n\
+             20-shell.html\n30-module-open.html\n31-a.js\n59-module-close.html\n",
+        );
+        assemble(dir.path()).unwrap();
+        let out = fs::read_to_string(dir.path().join(OUTPUT)).unwrap();
+        let expected = format!(
+            "{GENERATED_HEADER}<!DOCTYPE html>\n<style>\n\
+             /* ── static/app/10-x.css ── */\n.x{{}}\n</style>\n\
+             <!-- ── static/app/20-shell.html ── -->\n<body>\n\
+             <script type=\"module\">\n\
+             /* ── static/app/31-a.js ── */\nlet a;\n</script>\n"
+        );
+        assert_eq!(out, expected);
     }
 
     #[test]

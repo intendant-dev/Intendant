@@ -8,5 +8,5 @@
 # a Windows checkout (autocrlf=true runners) reassembles to identical bytes.
 # `diff` forces text diffs for the NUL-carrying fragment, which would
 # otherwise show as "Binary files differ".
-static/app.html -text
+static/app.html -text linguist-generated=true
 static/app/** -text diff
