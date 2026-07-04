@@ -12802,9 +12802,20 @@ body.display-fullscreen-open {
                           <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
                         </div>
                       </div>
-                      <label class="sessions-new-session-field" for="new-session-claude-model">
+                      <label class="sessions-new-session-field" for="new-session-claude-model-select">
                         Claude model
-                        <input id="new-session-claude-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. haiku (empty = global setting)" disabled>
+                        <select id="new-session-claude-model-select" onchange="onNewSessionClaudeModelSelectChange()" disabled>
+                          <option value="">Global setting</option>
+                          <option value="fable">fable — latest Fable</option>
+                          <option value="opus">opus — latest Opus</option>
+                          <option value="sonnet">sonnet — latest Sonnet</option>
+                          <option value="haiku">haiku — latest Haiku</option>
+                          <option value="__custom__">Custom model id…</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field hidden" for="new-session-claude-model" id="new-session-claude-model-custom-row">
+                        Custom model id
+                        <input id="new-session-claude-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. claude-haiku-4-5-20251001" disabled>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-claude-permission-mode">
                         Permissions
@@ -12814,6 +12825,17 @@ body.display-fullscreen-open {
                           <option value="acceptEdits">acceptEdits</option>
                           <option value="plan">plan</option>
                           <option value="bypassPermissions">bypassPermissions</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-claude-effort">
+                        Effort
+                        <select id="new-session-claude-effort" disabled>
+                          <option value="">Global setting</option>
+                          <option value="low">low</option>
+                          <option value="medium">medium</option>
+                          <option value="high">high</option>
+                          <option value="xhigh">xhigh</option>
+                          <option value="max">max</option>
                         </select>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-codex-sandbox">
@@ -64984,6 +65006,21 @@ window.closeFsPicker = closeFsPicker;
 window.loadFsPickerPath = loadFsPickerPath;
 window.useFsPickerSelection = useFsPickerSelection;
 window.openAgentBinaryPicker = openAgentBinaryPicker;
+
+// The Claude model picker offers version-safe aliases (the CLI resolves
+// them to the latest model); the free-text id input only appears behind
+// the explicit "Custom model id…" choice.
+function updateNewSessionClaudeCustomModelRow() {
+  const select = document.getElementById('new-session-claude-model-select');
+  const row = document.getElementById('new-session-claude-model-custom-row');
+  if (!select || !row) return;
+  const custom = select.value === '__custom__' && !select.disabled;
+  row.classList.toggle('hidden', !custom);
+}
+function onNewSessionClaudeModelSelectChange() {
+  updateNewSessionClaudeCustomModelRow();
+}
+window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange;
 	window.openDownloadFilePicker = openDownloadFilePicker;
 	window.openFilesDownloadPicker = openFilesDownloadPicker;
 	window.onFilesDownloadHostChanged = onFilesDownloadHostChanged;
@@ -65545,20 +65582,27 @@ function renderNewSessionAgentControls(options = {}) {
   if (!hasExternalAgent || options.replaceCommand) {
     commandInput.value = '';
   }
+  const claudeModelSel = document.getElementById('new-session-claude-model-select');
   const claudeModelInp = document.getElementById('new-session-claude-model');
   const claudeModeSel = document.getElementById('new-session-claude-permission-mode');
+  const claudeEffortSel = document.getElementById('new-session-claude-effort');
+  const appliesToClaude = effectiveAgent === 'claude-code';
+  if (claudeModelSel) {
+    claudeModelSel.disabled = !appliesToClaude;
+    if (!appliesToClaude) claudeModelSel.value = '';
+  }
   if (claudeModelInp) {
-    const appliesToClaude = effectiveAgent === 'claude-code';
     claudeModelInp.disabled = !appliesToClaude;
     if (!appliesToClaude) claudeModelInp.value = '';
-    claudeModelInp.placeholder = appliesToClaude
-      ? 'e.g. haiku (empty = global setting)'
-      : 'Applies to Claude Code sessions';
   }
+  updateNewSessionClaudeCustomModelRow();
   if (claudeModeSel) {
-    const appliesToClaude = effectiveAgent === 'claude-code';
     claudeModeSel.disabled = !appliesToClaude;
     if (!appliesToClaude) claudeModeSel.value = '';
+  }
+  if (claudeEffortSel) {
+    claudeEffortSel.disabled = !appliesToClaude;
+    if (!appliesToClaude) claudeEffortSel.value = '';
   }
   if (managedContextSel) {
     const appliesToCodex = effectiveAgent === 'codex';
@@ -65825,10 +65869,15 @@ async function startNewSession() {
     if (agentCommand) msg.agent_command = agentCommand;
   }
   if (effectiveNewSessionAgentId() === 'claude-code') {
-    const model = document.getElementById('new-session-claude-model')?.value.trim() || '';
+    const modelChoice = document.getElementById('new-session-claude-model-select')?.value || '';
+    const model = modelChoice === '__custom__'
+      ? (document.getElementById('new-session-claude-model')?.value.trim() || '')
+      : modelChoice;
     if (model) msg.claude_model = model;
     const mode = document.getElementById('new-session-claude-permission-mode')?.value || '';
     if (mode) msg.claude_permission_mode = mode;
+    const effort = document.getElementById('new-session-claude-effort')?.value || '';
+    if (effort) msg.claude_effort = effort;
   }
   if (effectiveNewSessionAgentId() === 'codex') {
     if (newSessionCodexLaunchDefaultsLoaded) {
