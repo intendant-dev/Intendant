@@ -48,7 +48,10 @@ function assert(cond, why) { if (!cond) throw new Error('assert failed: ' + why)
     const rootSnap = await page.evaluate(async dir =>
       window.intendantDashboardFilesIde._debugSetRoot(dir), PEER_FILES);
     assert(rootSnap.host === PEER_ID, 'snapshot host is the peer, got ' + rootSnap.host);
-    assert(rootSnap.root === PEER_FILES, 'tree rooted at peer dir, got ' + rootSnap.root);
+    // B canonicalizes the root (macOS: /tmp -> /private/tmp); adopt its form
+    // for every path we send to it afterwards.
+    assert(rootSnap.root === PEER_FILES || rootSnap.root.endsWith(PEER_FILES), 'tree rooted at peer dir, got ' + rootSnap.root);
+    const ROOT = rootSnap.root;
     const treeNames = await page.evaluate(() =>
       Array.from(document.querySelectorAll('.files-ide-tree-row .files-ide-tree-name')).map(e => e.textContent));
     assert(treeNames.some(n => n.includes('peer-note.md')), 'peer-note.md listed, got ' + treeNames.join(','));
@@ -57,7 +60,7 @@ function assert(cond, why) { if (!cond) throw new Error('assert failed: ' + why)
 
     // Open, edit, save on the peer.
     let snap = await page.evaluate(async p =>
-      window.intendantDashboardFilesIde._debugOpen(p), PEER_FILES + '/peer-note.md');
+      window.intendantDashboardFilesIde._debugOpen(p), ROOT + '/peer-note.md');
     assert(snap.active && snap.active.host === PEER_ID, 'buffer bound to peer host');
     assert(snap.active.text.includes('Edited from another daemon soon'), 'peer file content loaded');
     assert(/^[0-9a-f]{64}$/.test(snap.active.baselineSha), 'sha baseline from peer read');
@@ -105,13 +108,47 @@ function assert(cond, why) { if (!cond) throw new Error('assert failed: ' + why)
     // Create a new file on the peer inside the grant.
     await page.evaluate(async dir => window.intendantDashboardFilesIde._debugSetRoot(dir), PEER_FILES);
     await page.evaluate(async p =>
-      window.intendantDashboardFilesIde._debugOpen(p, { createNew: true }), PEER_FILES + '/made-on-a.md');
+      window.intendantDashboardFilesIde._debugOpen(p, { createNew: true }), ROOT + '/made-on-a.md');
     await page.evaluate(() => window.intendantDashboardFilesIde._debugSetText('created on daemon B from daemon A\'s dashboard\n'));
     snap = await page.evaluate(async () => window.intendantDashboardFilesIde._debugSave());
     assert(snap.saveStatus.startsWith('Saved'), 'create-new on peer saved, got ' + snap.saveStatus);
     assert(fs.readFileSync(PEER_FILES + '/made-on-a.md', 'utf8').includes('created on daemon B'), 'new file on B disk');
     step('new file created on peer');
     await page.screenshot({ path: path.join(RIG, 'shot-4-final.png') });
+
+    // Rename on the peer (api_fs_rename over the tunnel): B's disk moves the
+    // file, the open tab retargets, and the browser never sees the bytes.
+    snap = await page.evaluate(async p =>
+      window.intendantDashboardFilesIde._debugRename(p, 'renamed-on-a.md'), ROOT + '/made-on-a.md');
+    assert(snap.active.path.endsWith('renamed-on-a.md'), 'peer rename retargeted tab, got ' + snap.active.path);
+    assert(!fs.existsSync(PEER_FILES + '/made-on-a.md'), 'old name gone on B');
+    assert(fs.readFileSync(PEER_FILES + '/renamed-on-a.md', 'utf8').includes('created on daemon B'), 'renamed file kept content on B');
+    step('rename executed on peer disk');
+
+    // Rename DENIAL: a destination outside write_roots must be refused by
+    // B. The inline rename UI can only target the same directory, so this
+    // exercises the raw tunnel RPC — the lane a hostile client would use.
+    // The denial surfaces as a non-ok envelope on the HTTP lane and as a
+    // thrown tunnel error on the peer lane — accept either shape.
+    const renameDenied = await page.evaluate(async ({ from, to }) =>
+      window.intendantDashboardFilesIde._debugRawRename(from, to)
+        .then(resp => ({ ok: resp.ok, detail: (resp.body && resp.body.error) || '' }))
+        .catch(e => ({ ok: false, detail: String((e && e.message) || e) })),
+      { from: ROOT + '/renamed-on-a.md', to: OUTSIDE + '/escape.md' });
+    assert(renameDenied.ok === false, 'cross-root rename refused, got ' + JSON.stringify(renameDenied));
+    assert(/outside|roots|denied|forbidden/i.test(renameDenied.detail), 'denial names the scope, got ' + renameDenied.detail);
+    assert(!fs.existsSync(OUTSIDE + '/escape.md'), 'no file escaped the write roots');
+    assert(fs.existsSync(PEER_FILES + '/renamed-on-a.md'), 'source untouched after denial');
+    step('rename outside write_roots denied by B');
+
+    // Delete on the peer: clean tab closes, file gone from B's disk.
+    snap = await page.evaluate(async p =>
+      window.intendantDashboardFilesIde._debugDelete(p), ROOT + '/renamed-on-a.md');
+    assert(!fs.existsSync(PEER_FILES + '/renamed-on-a.md'), 'deleted on B disk');
+    assert(!snap.openTabs.some(t => t.path.endsWith('renamed-on-a.md')), 'deleted file tab closed');
+    assert(!snap.treeStatus, 'delete left no error, got ' + snap.treeStatus);
+    step('delete executed on peer disk');
+    await page.screenshot({ path: path.join(RIG, 'shot-5-after-rename-delete.png') });
 
     console.log('PEER-IDE-SMOKE PASS:', steps.length, 'steps');
   } catch (e) {

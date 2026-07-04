@@ -2063,6 +2063,27 @@ struct FsWriteRequest {
     force: bool,
 }
 
+/// Body of `POST /api/fs/rename` — move/rename a file or directory. Both
+/// `from` and `to` must pass write-scope authorization (removing an entry is
+/// a write at the source; creating one is a write at the destination). A
+/// rename never replaces an existing destination — fail closed and let the
+/// client delete explicitly first.
+#[derive(Debug, Deserialize)]
+struct FsRenameRequest {
+    from: String,
+    to: String,
+}
+
+/// Body of `POST /api/fs/delete`. Files and symlinks (the link itself, never
+/// its target) delete unconditionally; directories must be empty unless the
+/// client states `recursive: true`.
+#[derive(Debug, Deserialize)]
+struct FsDeleteRequest {
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+}
+
 /// Debug state for the voice model, tracked server-side from WebSocket messages.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct VoiceDebugState {
@@ -17111,12 +17132,261 @@ pub(crate) fn dashboard_fs_write_response_parts(
             .unwrap_or(false),
     };
     let (status_line, body) = apply_dashboard_fs_write(&args, bytes);
-    let code = status_line
+    (status_line_u16(&status_line), body.to_string())
+}
+
+/// Rename/move half of the dashboard editor. Same contract as
+/// [`apply_dashboard_fs_write`]: the caller has already routed **both** paths
+/// through the write-scope gate — this function performs no IAM checks of its
+/// own.
+///
+/// The source must exist; the destination's parent must exist; the
+/// destination itself must not (`409` `code:"exists"` — a rename never
+/// replaces, even though the underlying syscall would). Cross-filesystem
+/// moves are refused rather than silently degraded to copy+delete.
+pub(crate) fn apply_dashboard_fs_rename(
+    raw_from: &str,
+    raw_to: &str,
+) -> (String, serde_json::Value) {
+    let from = match expand_dashboard_fs_path(raw_from) {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({ "error": e }),
+            )
+        }
+    };
+    let from = match std::fs::canonicalize(&from) {
+        Ok(canonical) => canonical,
+        Err(e) => {
+            return (
+                dashboard_fs_io_status(&e).to_string(),
+                serde_json::json!({
+                    "error": format!("{} is not accessible: {e}", from.display()),
+                    "code": "missing",
+                }),
+            )
+        }
+    };
+    let to = match expand_dashboard_fs_path(raw_to) {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({ "error": e }),
+            )
+        }
+    };
+    // Resolve the destination the same way a creating write does: canonical
+    // parent (which must exist) + final name, so `..` segments and symlinked
+    // parents cannot smuggle the target elsewhere after authorization.
+    let Some(name) = to.file_name().map(|n| n.to_os_string()) else {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!("{} has no file name", to.display())
+            }),
+        );
+    };
+    let Some(parent) = to.parent() else {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!("{} has no parent directory", to.display())
+            }),
+        );
+    };
+    let canonical_parent = match std::fs::canonicalize(parent) {
+        Ok(canonical) => canonical,
+        Err(_) => {
+            return (
+                "404 Not Found".to_string(),
+                serde_json::json!({
+                    "error": format!(
+                        "parent directory {} does not exist — create it first",
+                        parent.display()
+                    ),
+                    "code": "missing_parent",
+                }),
+            )
+        }
+    };
+    if !canonical_parent.is_dir() {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!("{} is not a directory", canonical_parent.display())
+            }),
+        );
+    }
+    let to = canonical_parent.join(name);
+    if to == from {
+        return (
+            "200 OK".to_string(),
+            serde_json::json!({
+                "ok": true,
+                "from": from.to_string_lossy().to_string(),
+                "path": to.to_string_lossy().to_string(),
+                "renamed": false,
+                "notice": "source and destination are the same path",
+            }),
+        );
+    }
+    if from.is_dir() && to.starts_with(&from) {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "cannot move {} into itself",
+                    from.display()
+                ),
+            }),
+        );
+    }
+    if to.symlink_metadata().is_ok() {
+        return (
+            "409 Conflict".to_string(),
+            serde_json::json!({
+                "error": format!("{} already exists", to.display()),
+                "code": "exists",
+            }),
+        );
+    }
+    match std::fs::rename(&from, &to) {
+        Ok(()) => (
+            "200 OK".to_string(),
+            serde_json::json!({
+                "ok": true,
+                "from": from.to_string_lossy().to_string(),
+                "path": to.to_string_lossy().to_string(),
+                "renamed": true,
+            }),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "{} and {} are on different filesystems — copy and delete instead",
+                    from.display(),
+                    to.display()
+                ),
+                "code": "cross_device",
+            }),
+        ),
+        Err(e) => (
+            dashboard_fs_io_status(&e).to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "could not rename {} to {}: {e}",
+                    from.display(),
+                    to.display()
+                ),
+            }),
+        ),
+    }
+}
+
+/// Delete half of the dashboard editor. Same contract as
+/// [`apply_dashboard_fs_write`]: the caller has already routed the path
+/// through the write-scope gate — this function performs no IAM checks of
+/// its own.
+///
+/// Symlinks are deleted as links (`symlink_metadata`, never following), so a
+/// link whose target sits outside the caller's scope removes only the link.
+/// Non-empty directories require an explicit `recursive` (`409`
+/// `code:"not_empty"` otherwise).
+pub(crate) fn apply_dashboard_fs_delete(
+    raw_path: &str,
+    recursive: bool,
+) -> (String, serde_json::Value) {
+    let path = match expand_dashboard_fs_path(raw_path) {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({ "error": e }),
+            )
+        }
+    };
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            return (
+                dashboard_fs_io_status(&e).to_string(),
+                serde_json::json!({
+                    "error": format!("{} is not accessible: {e}", path.display()),
+                    "code": "missing",
+                }),
+            )
+        }
+    };
+    let is_dir = metadata.is_dir();
+    let result = if is_dir {
+        if recursive {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_dir(&path)
+        }
+    } else {
+        std::fs::remove_file(&path)
+    };
+    match result {
+        Ok(()) => (
+            "200 OK".to_string(),
+            serde_json::json!({
+                "ok": true,
+                "path": path.to_string_lossy().to_string(),
+                "deleted": true,
+                "dir": is_dir,
+            }),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => (
+            "409 Conflict".to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "{} is not empty — pass recursive to delete its contents",
+                    path.display()
+                ),
+                "code": "not_empty",
+            }),
+        ),
+        Err(e) => (
+            dashboard_fs_io_status(&e).to_string(),
+            serde_json::json!({
+                "error": format!("could not delete {}: {e}", path.display()),
+            }),
+        ),
+    }
+}
+
+/// Tunnel-facing wrapper for [`apply_dashboard_fs_rename`]: request fields
+/// as JSON params, `(http-ish status code, body)` out for
+/// `http_body_response`.
+pub(crate) fn dashboard_fs_rename_response_parts(params: &serde_json::Value) -> (u16, String) {
+    let from = params.get("from").and_then(|v| v.as_str()).unwrap_or_default();
+    let to = params.get("to").and_then(|v| v.as_str()).unwrap_or_default();
+    let (status_line, body) = apply_dashboard_fs_rename(from, to);
+    (status_line_u16(&status_line), body.to_string())
+}
+
+/// Tunnel-facing wrapper for [`apply_dashboard_fs_delete`].
+pub(crate) fn dashboard_fs_delete_response_parts(params: &serde_json::Value) -> (u16, String) {
+    let path = params.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+    let recursive = params
+        .get("recursive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let (status_line, body) = apply_dashboard_fs_delete(path, recursive);
+    (status_line_u16(&status_line), body.to_string())
+}
+
+fn status_line_u16(status_line: &str) -> u16 {
+    status_line
         .split_whitespace()
         .next()
         .and_then(|c| c.parse::<u16>().ok())
-        .unwrap_or(500);
-    (code, body.to_string())
+        .unwrap_or(500)
 }
 
 /// Extract the `Content-Type` request header value, or a generic default.
@@ -18211,8 +18481,8 @@ fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
 
     match error.raw_os_error() {
         // The listener file descriptor/socket is invalid or no longer a
-        // listening socket. Retrying would spin forever without restoring
-        // reachability.
+        // listening socket (EBADF/EINVAL/ENOTSOCK). Retrying accept() on it
+        // would spin forever — the caller rebinds a fresh listener instead.
         Some(9 | 22 | 38) => false,
         // Process/system descriptor pressure and socket buffer pressure are
         // recoverable after current connections close. Keep the gateway alive
@@ -18223,6 +18493,33 @@ fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
         // listener while existing WebSocket tasks make the UI look alive.
         _ => true,
     }
+}
+
+/// Rebind the gateway listener on its original address after the previous
+/// socket became unusable — seen in the wild on macOS as `accept()`
+/// returning EINVAL a minute into an app-spawned daemon's life, which
+/// used to kill the listener task and leave the dashboard half-alive
+/// (established WebSockets kept flowing while every new connection —
+/// session details, files, uploads, Station assets — failed). Mirrors
+/// `bind_dual_stack_or_v4`: dual-stack for the IPv6 wildcard,
+/// `SO_REUSEADDR` so lingering TIME_WAIT sockets don't block the port.
+fn rebind_gateway_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() && addr.ip().is_unspecified() {
+        let _ = socket.set_only_v6(false);
+    }
+    let _ = socket.set_reuse_address(true);
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(std_listener)
 }
 
 /// CORS header segment for `/mcp` responses: echo the requesting origin
@@ -19071,7 +19368,9 @@ pub fn spawn_web_gateway(
     let tls_failure_log_state: TlsFailureLogState = Arc::new(Mutex::new(HashMap::new()));
 
     tokio::spawn(async move {
-        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        let mut listener = listener;
+        let bind_addr = listener.local_addr().ok();
+        let port = bind_addr.map(|a| a.port()).unwrap_or(0);
 
         if let Some(p) = tcp_advertised_port {
             eprintln!("[web_gateway] ICE-TCP candidates advertise port {p}");
@@ -19081,20 +19380,43 @@ pub fn spawn_web_gateway(
             let (stream, peer_addr) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    let should_continue = should_continue_after_accept_error(&e);
-                    eprintln!(
-                        "[web_gateway] accept failed on port {port}: {e}{}",
-                        if should_continue {
-                            " (continuing)"
-                        } else {
-                            " (listener task exiting)"
-                        }
-                    );
-                    if should_continue {
+                    if should_continue_after_accept_error(&e) {
+                        eprintln!("[web_gateway] accept failed on port {port}: {e} (continuing)");
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         continue;
                     }
-                    break;
+                    // The listening socket itself is dead. Exiting here
+                    // leaves the daemon half-alive (established WebSockets
+                    // keep the UI looking healthy while every new request
+                    // fails) — rebind the original address instead, backing
+                    // off up to 30s until the port comes back.
+                    let Some(addr) = bind_addr else {
+                        eprintln!(
+                            "[web_gateway] accept failed on port {port}: {e} (bind address unknown; listener task exiting)"
+                        );
+                        break;
+                    };
+                    eprintln!(
+                        "[web_gateway] accept failed on port {port}: {e} (rebinding listener)"
+                    );
+                    let mut delay = std::time::Duration::from_millis(250);
+                    listener = loop {
+                        tokio::time::sleep(delay).await;
+                        match rebind_gateway_listener(addr) {
+                            Ok(fresh) => {
+                                eprintln!("[web_gateway] listener rebound on port {port}");
+                                break fresh;
+                            }
+                            Err(err) => {
+                                delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                                eprintln!(
+                                    "[web_gateway] listener rebind on port {port} failed: {err} (retrying in {:.1}s)",
+                                    delay.as_secs_f32()
+                                );
+                            }
+                        }
+                    };
+                    continue;
                 }
             };
 
@@ -22783,6 +23105,87 @@ pub fn spawn_web_gateway(
                                     json_error("400 Bad Request", format!("invalid JSON: {e}"))
                                 }
                             }
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "POST" && req_path == "/api/fs/rename" {
+                        use tokio::io::AsyncWriteExt;
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let response = match serde_json::from_str::<FsRenameRequest>(&body_text) {
+                            // Removing the source entry and creating the
+                            // destination are both writes — each leg passes
+                            // the write-scope gate on its own path.
+                            Ok(req) => match authorize_http_filesystem_access(
+                                &http_access_context,
+                                peer_connection_identity.as_ref(),
+                                crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                crate::peer::access_policy::FilesystemAccessKind::Write,
+                                &req.from,
+                                &bus,
+                            )
+                            .and_then(|()| {
+                                authorize_http_filesystem_access(
+                                    &http_access_context,
+                                    peer_connection_identity.as_ref(),
+                                    crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                    crate::peer::access_policy::FilesystemAccessKind::Write,
+                                    &req.to,
+                                    &bus,
+                                )
+                            }) {
+                                Ok(()) => {
+                                    let (status, body) = tokio::task::spawn_blocking(move || {
+                                        apply_dashboard_fs_rename(&req.from, &req.to)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        (
+                                            "500 Internal Server Error".to_string(),
+                                            serde_json::json!({
+                                                "error": format!(
+                                                    "filesystem rename task failed: {e}"
+                                                )
+                                            }),
+                                        )
+                                    });
+                                    json_response(&status, body.to_string())
+                                }
+                                Err(message) => json_error("403 Forbidden", message),
+                            },
+                            Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "POST" && req_path == "/api/fs/delete" {
+                        use tokio::io::AsyncWriteExt;
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let response = match serde_json::from_str::<FsDeleteRequest>(&body_text) {
+                            Ok(req) => match authorize_http_filesystem_access(
+                                &http_access_context,
+                                peer_connection_identity.as_ref(),
+                                crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                crate::peer::access_policy::FilesystemAccessKind::Write,
+                                &req.path,
+                                &bus,
+                            ) {
+                                Ok(()) => {
+                                    let (status, body) = tokio::task::spawn_blocking(move || {
+                                        apply_dashboard_fs_delete(&req.path, req.recursive)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        (
+                                            "500 Internal Server Error".to_string(),
+                                            serde_json::json!({
+                                                "error": format!(
+                                                    "filesystem delete task failed: {e}"
+                                                )
+                                            }),
+                                        )
+                                    });
+                                    json_response(&status, body.to_string())
+                                }
+                                Err(message) => json_error("403 Forbidden", message),
+                            },
+                            Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/api/settings" {
@@ -29380,9 +29783,10 @@ fn dashboard_http_operation(
         ("GET", "/api/fs/stat") | ("GET", "/api/fs/list") | ("GET", "/api/fs/read") => {
             return Some(PeerOperation::FilesystemRead);
         }
-        ("POST", "/api/fs/mkdir") | ("POST", "/api/fs/write") => {
-            return Some(PeerOperation::FilesystemWrite)
-        }
+        ("POST", "/api/fs/mkdir")
+        | ("POST", "/api/fs/write")
+        | ("POST", "/api/fs/rename")
+        | ("POST", "/api/fs/delete") => return Some(PeerOperation::FilesystemWrite),
         ("POST", "/api/diagnostics/visual-freshness") => {
             return Some(PeerOperation::DisplayInput);
         }
@@ -41252,10 +41656,21 @@ mod tests {
             dashboard_http_operation("POST", "/api/fs/write"),
             Some(PeerOperation::FilesystemWrite)
         );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/fs/rename"),
+            Some(PeerOperation::FilesystemWrite)
+        );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/fs/delete"),
+            Some(PeerOperation::FilesystemWrite)
+        );
         // GET must not inherit the write classification, and look-alike
         // paths must not classify at all.
         assert_eq!(dashboard_http_operation("GET", "/api/fs/write"), None);
+        assert_eq!(dashboard_http_operation("GET", "/api/fs/rename"), None);
+        assert_eq!(dashboard_http_operation("GET", "/api/fs/delete"), None);
         assert_eq!(dashboard_http_operation("POST", "/api/fs/writeable"), None);
+        assert_eq!(dashboard_http_operation("POST", "/api/fs/deleted"), None);
         assert_eq!(
             dashboard_http_operation("POST", "/api/coordinator/route"),
             None
@@ -41396,6 +41811,134 @@ mod tests {
         let (status, _) = write(&target, &huge, None, false, true);
         assert_eq!(status, "413 Payload Too Large");
         assert_eq!(std::fs::read(&target).unwrap(), b"v4");
+    }
+
+    #[test]
+    fn apply_dashboard_fs_rename_moves_and_never_replaces() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rename = |from: &std::path::Path, to: &std::path::Path| {
+            apply_dashboard_fs_rename(&from.to_string_lossy(), &to.to_string_lossy())
+        };
+
+        // A plain file rename moves the content.
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, b"payload").unwrap();
+        let (status, body) = rename(&a, &b);
+        assert_eq!(status, "200 OK", "{body}");
+        assert_eq!(body["renamed"], true);
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(&b).unwrap(), b"payload");
+
+        // A missing source is 404 code:"missing".
+        let (status, body) = rename(&a, &dir.path().join("c.txt"));
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body["code"], "missing");
+
+        // An existing destination is refused — renames never replace.
+        let c = dir.path().join("c.txt");
+        std::fs::write(&c, b"other").unwrap();
+        let (status, body) = rename(&b, &c);
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body["code"], "exists");
+        assert_eq!(std::fs::read(&b).unwrap(), b"payload");
+        assert_eq!(std::fs::read(&c).unwrap(), b"other");
+
+        // ... even when the destination is a dangling symlink.
+        #[cfg(unix)]
+        {
+            let dangling = dir.path().join("dangling");
+            std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+            let (status, body) = rename(&b, &dangling);
+            assert_eq!(status, "409 Conflict");
+            assert_eq!(body["code"], "exists");
+        }
+
+        // A missing destination parent is 404 code:"missing_parent".
+        let orphan = dir.path().join("no-such-dir").join("b.txt");
+        let (status, body) = rename(&b, &orphan);
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body["code"], "missing_parent");
+
+        // Directories move too — but never into themselves.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), b"x").unwrap();
+        let moved = dir.path().join("moved");
+        let (status, _) = rename(&sub, &moved);
+        assert_eq!(status, "200 OK");
+        assert_eq!(std::fs::read(moved.join("inner.txt")).unwrap(), b"x");
+        let inside = moved.join("nested");
+        let (status, body) = rename(&moved, &inside);
+        assert_eq!(status, "400 Bad Request");
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("into itself"));
+
+        // Renaming a path to itself is an explicit no-op.
+        let (status, body) = rename(&b, &b);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["renamed"], false);
+
+        // Relative paths are refused before touching the filesystem.
+        let (status, _) = apply_dashboard_fs_rename("relative/a", "relative/b");
+        assert_eq!(status, "400 Bad Request");
+    }
+
+    #[test]
+    fn apply_dashboard_fs_delete_scopes_directories_and_symlinks() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Files delete unconditionally.
+        let file = dir.path().join("gone.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let (status, body) = apply_dashboard_fs_delete(&file.to_string_lossy(), false);
+        assert_eq!(status, "200 OK", "{body}");
+        assert_eq!(body["dir"], false);
+        assert!(!file.exists());
+
+        // Deleting it again is 404 code:"missing".
+        let (status, body) = apply_dashboard_fs_delete(&file.to_string_lossy(), false);
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body["code"], "missing");
+
+        // Non-empty directories require an explicit recursive.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), b"x").unwrap();
+        let (status, body) = apply_dashboard_fs_delete(&sub.to_string_lossy(), false);
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body["code"], "not_empty");
+        assert!(sub.exists());
+        let (status, body) = apply_dashboard_fs_delete(&sub.to_string_lossy(), true);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["dir"], true);
+        assert!(!sub.exists());
+
+        // Empty directories delete without recursive.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let (status, _) = apply_dashboard_fs_delete(&empty.to_string_lossy(), false);
+        assert_eq!(status, "200 OK");
+        assert!(!empty.exists());
+
+        // A symlink deletes as a link: the target survives.
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("kept.txt");
+            std::fs::write(&target, b"keep me").unwrap();
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let (status, body) = apply_dashboard_fs_delete(&link.to_string_lossy(), false);
+            assert_eq!(status, "200 OK", "{body}");
+            assert!(link.symlink_metadata().is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+        }
+
+        // Relative paths are refused before touching the filesystem.
+        let (status, _) = apply_dashboard_fs_delete("relative/path", true);
+        assert_eq!(status, "400 Bad Request");
     }
 
     #[cfg(unix)]
@@ -46558,5 +47101,25 @@ mod tests {
             preload_intendant_entry("intendant-row", &legacy(&live_target)),
             PreloadOutcome::Skipped
         );
+    }
+
+    /// The gateway must be able to re-establish its listener on the exact
+    /// address a dead one occupied (accept() EINVAL/EBADF recovery path),
+    /// and the fresh listener must actually accept connections.
+    #[tokio::test]
+    async fn rebind_gateway_listener_restores_reachability() {
+        let original = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = original.local_addr().unwrap();
+        drop(original);
+
+        let rebound = rebind_gateway_listener(addr).expect("rebind on the freed address");
+        assert_eq!(rebound.local_addr().unwrap(), addr);
+
+        let (client, (server, _peer)) = tokio::join!(
+            tokio::net::TcpStream::connect(addr),
+            async { rebound.accept().await.unwrap() },
+        );
+        client.expect("client connects to rebound listener");
+        drop(server);
     }
 }

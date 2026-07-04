@@ -361,20 +361,30 @@ available capabilities rather than as transport internals.
 The **Editor** sub-tab is a full-bleed workbench: a slim toolbar (target
 picker + one-line route summary + new file/folder), a lazy directory tree
 rail on the left (rooted at the project root locally, `~` on peers;
-hidden-file toggle), and a multi-tab CodeMirror editor filling the rest
-(vendored bundle, `static/codemirror-bundle.js`, lazy-loaded on first use;
-syntax highlighting by filename, dirty markers, hover-reveal close, a
-Reload-or-Overwrite conflict banner, Cmd/Ctrl-S). One accent answers "whose
-disk is this?": the active editor tab's underline, the tree selection, and
-the statusbar host chip render blue while editing this daemon and mauve on a
-peer (`--files-accent`). Reads and writes ride the same fs API family as
-everything else and are therefore IAM-scoped end to end:
+hidden-file toggle; hover-revealed per-row rename and delete — rename edits
+the name inline, delete is a two-click arm-then-confirm that escalates to an
+explicit "Delete all?" for non-empty folders), and a multi-tab CodeMirror
+editor filling the rest (vendored bundle, `static/codemirror-bundle.js`,
+lazy-loaded on first use; syntax highlighting by filename, dirty markers,
+hover-reveal close, a Reload-or-Overwrite conflict banner, Cmd/Ctrl-S, and a
+Cmd/Ctrl-F find bar with smart-case matching, live counts, and Enter /
+Shift-Enter stepping). Renaming a file whose buffer is open retargets the
+tab in place (same undo history); deleting one closes a clean tab and flips
+a dirty one to the missing-file banner so unsaved work survives. One accent
+answers "whose disk is this?": the active editor tab's underline, the tree
+selection, and the statusbar host chip render blue while editing this daemon
+and mauve on a peer (`--files-accent`). Reads and writes ride the same fs
+API family as everything else and are therefore IAM-scoped end to end:
 
-- Local targets use `GET /api/fs/stat|list|read` and `POST /api/fs/write`
-  (both classified `FilesystemWrite`→`write_roots` for mutation, and gated by
-  `authorize_http_filesystem_access` exactly like `mkdir`).
+- Local targets use `GET /api/fs/stat|list|read` and
+  `POST /api/fs/write|rename|delete` (all classified
+  `FilesystemWrite`→`write_roots` for mutation, and gated by
+  `authorize_http_filesystem_access` exactly like `mkdir` — a rename
+  authorizes both legs, since removing the source and creating the
+  destination are each writes).
 - Peer targets ride the peer's dashboard-control tunnel: `api_fs_stat/list`
-  requests, `api_fs_read` byte streams, and `api_fs_write` upload frames.
+  requests, `api_fs_read` byte streams, `api_fs_write` upload frames, and
+  `api_fs_rename`/`api_fs_delete` requests.
   Enforcement happens on the receiving daemon against its own peer profile
   (`file-operator` vs `file-reader`) and per-peer filesystem roots; the
   browser only picks where a request is sent, never whether it is allowed.
@@ -388,6 +398,10 @@ everything else and are therefore IAM-scoped end to end:
 - Guardrails: binary or non-UTF-8 and >2 MB files are refused with a pointer
   to the Downloads flow; per-request write payloads cap at the shared 100 MB
   upload limit; UTF-8 files keep their dominant line-ending style on save.
+  A rename never replaces an existing destination (`409 code:"exists"`) and
+  refuses cross-filesystem moves; deletes remove symlinks as links (never
+  following) and require an explicit `recursive` for non-empty directories
+  (`409 code:"not_empty"`).
 
 ### Access
 
@@ -461,10 +475,11 @@ and peer federation:
 - A **permission** is the operation gate the daemon enforces. Access
   administration now separates `access.inspect` from `access.manage`, and peer
   topology separates `peer.inspect`, `peer.manage`, and `peer.use`.
-  `peer.use` is the delegation gate: opening a tunnel to a connected peer
-  (dashboard-control, file-transfer, or display signaling) presents *this
-  daemon's* peer credentials, and the receiving peer authorizes everything
-  inside the tunnel against its own grants for this daemon — so relaying is
+  `peer.use` is the delegation gate: acting through a connected peer —
+  opening a tunnel (dashboard-control, file-transfer, or display signaling)
+  or sending it a message, task, or approval decision — presents *this
+  daemon's* peer credentials, and the receiving peer authorizes each action
+  against its own grants for this daemon — so relaying is
   never inferred from local capabilities, it is granted by name
   (`operator` and `peer-user` carry it; `peer.manage` implies it for
   compatibility). Owner/root dashboard sessions have all of these. Existing
@@ -1643,11 +1658,15 @@ unexpected transport.
 Pairing authorization follows the access/peer split: request and identity lists
 require `access.inspect`, invite/approve/revoke require `access.manage`, and
 join/request-access/poll remain peer-topology operations gated by `peer.manage`.
-The signaling relays that open tunnels to an already-connected peer
-(`api_peer_webrtc_signal`, `api_peer_file_transfer_signal`,
-`api_peer_dashboard_control_signal`, and their
-`POST /api/peers/{id}/…-webrtc` HTTP twins) are gated by `peer.use` instead —
-using a peer relationship is not administering it.
+Acting through an already-connected peer is gated by `peer.use` instead —
+using a peer relationship is not administering it. That covers the signaling
+relays that open tunnels (`api_peer_webrtc_signal`,
+`api_peer_file_transfer_signal`, `api_peer_dashboard_control_signal`, and
+their `POST /api/peers/{id}/…-webrtc` HTTP twins) and the quick controls
+(`api_peer_message`, `api_peer_task`, `api_peer_approval`, and their
+`POST /api/peers/{id}/message|task|approval` HTTP twins): each delegates this
+daemon's peer identity, and the receiving peer authorizes the action against
+its own grants for this daemon.
 General peer and coordinator controls are covered by the same rule. Peer add,
 remove, eligibility discovery, per-peer message/task/approval, peer-display
 signaling, and coordinator route calls use `api_peer_add`, `api_peer_remove`,

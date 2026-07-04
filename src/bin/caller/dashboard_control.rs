@@ -112,6 +112,8 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_fs_mkdir",
     "api_fs_read",
     "api_fs_write",
+    "api_fs_rename",
+    "api_fs_delete",
     "api_sessions_search",
     "api_settings",
     "api_settings_save",
@@ -2122,17 +2124,19 @@ fn dashboard_control_method_operation(
         }
         "api_peer_pairing_invite" => Some(PeerOperation::AccessManage),
         "api_peers" | "api_peer_eligible" => Some(PeerOperation::PeerInspect),
-        // Signaling relays open tunnels the receiving peer authorizes
-        // against its own grants for this daemon — peer use, not peer
-        // administration.
+        // Acting through a connected peer — signaling relays that open
+        // tunnels, and the message/task/approval quick controls — is peer
+        // use, not peer administration: the receiving peer authorizes each
+        // action against its own grants for this daemon. Mirrors the HTTP
+        // lane's `federation_http_operation`.
         "api_peer_webrtc_signal"
         | "api_peer_file_transfer_signal"
-        | "api_peer_dashboard_control_signal" => Some(PeerOperation::PeerUse),
-        "api_peer_add"
-        | "api_peer_remove"
+        | "api_peer_dashboard_control_signal"
         | "api_peer_message"
         | "api_peer_task"
-        | "api_peer_approval"
+        | "api_peer_approval" => Some(PeerOperation::PeerUse),
+        "api_peer_add"
+        | "api_peer_remove"
         | "api_peer_pairing_join"
         | "api_peer_pairing_request_access"
         | "api_peer_pairing_request_access_poll"
@@ -2171,7 +2175,9 @@ fn dashboard_control_method_operation(
         | "api_transfer_job_delete"
         | "api_transfer_upload_commit"
         | "api_fs_mkdir"
-        | "api_fs_write" => Some(PeerOperation::FilesystemWrite),
+        | "api_fs_write"
+        | "api_fs_rename"
+        | "api_fs_delete" => Some(PeerOperation::FilesystemWrite),
         "api_display_bootstrap" | "api_display_webrtc_signal" | "api_displays" => {
             Some(PeerOperation::DisplayView)
         }
@@ -2206,13 +2212,31 @@ fn dashboard_control_method_operation(
     }
 }
 
-fn dashboard_control_filesystem_path(params: Option<&serde_json::Value>) -> Option<String> {
-    let params = params?;
+/// Paths a filesystem method touches, for scope checks and the audit trail.
+/// Rename is the two-legged case: removing the source and creating the
+/// destination are both writes, so both paths must clear the grant's scope.
+fn dashboard_control_filesystem_paths(
+    method: &str,
+    params: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let Some(params) = params else {
+        return Vec::new();
+    };
+    if method == "api_fs_rename" {
+        return ["from", "to"]
+            .iter()
+            .filter_map(|key| params.get(*key).and_then(|v| v.as_str()))
+            .map(str::to_string)
+            .collect();
+    }
     optional_string_param(params, &["path", "source_path", "sourcePath", "source"])
+        .into_iter()
+        .collect()
 }
 
 fn authorize_dashboard_control_filesystem(
     runtime: &ControlRuntime,
+    method: &str,
     op: crate::peer::access_policy::PeerOperation,
     params: Option<&serde_json::Value>,
 ) -> Result<(), String> {
@@ -2225,10 +2249,17 @@ fn authorize_dashboard_control_filesystem(
     let Some(policy) = runtime.grant.filesystem() else {
         return Ok(());
     };
-    let raw_path = dashboard_control_filesystem_path(params)
-        .ok_or_else(|| "filesystem request missing path".to_string())?;
-    let path = crate::web_gateway::expand_dashboard_fs_path(&raw_path)?;
-    crate::peer::access_policy::filesystem_access_allowed(policy, kind, &path)
+    let raw_paths = dashboard_control_filesystem_paths(method, params);
+    // Fail closed on missing params: a rename that names only one leg must
+    // not slip past the scope check and let the handler report a plain 400.
+    if raw_paths.is_empty() || (method == "api_fs_rename" && raw_paths.len() != 2) {
+        return Err("filesystem request missing path".to_string());
+    }
+    for raw_path in &raw_paths {
+        let path = crate::web_gateway::expand_dashboard_fs_path(raw_path)?;
+        crate::peer::access_policy::filesystem_access_allowed(policy, kind, &path)?;
+    }
+    Ok(())
 }
 
 fn authorize_dashboard_control_method(
@@ -2242,8 +2273,8 @@ fn authorize_dashboard_control_method(
     let result = runtime_operation_decision(runtime, op)
         .ensure_allowed()
         .map_err(|reason| format!("dashboard-control method {method} is not allowed: {reason}"))
-        .and_then(|()| authorize_dashboard_control_filesystem(runtime, op, params));
-    audit_dashboard_control_filesystem(runtime, op, params, &result);
+        .and_then(|()| authorize_dashboard_control_filesystem(runtime, method, op, params));
+    audit_dashboard_control_filesystem(runtime, method, op, params, &result);
     result
 }
 
@@ -2253,6 +2284,7 @@ fn authorize_dashboard_control_method(
 /// same trail: peer grants log allow and deny, other grants log denials.
 fn audit_dashboard_control_filesystem(
     runtime: &ControlRuntime,
+    method: &str,
     op: crate::peer::access_policy::PeerOperation,
     params: Option<&serde_json::Value>,
     result: &Result<(), String>,
@@ -2264,7 +2296,7 @@ fn audit_dashboard_control_filesystem(
     ) {
         return;
     }
-    let path = dashboard_control_filesystem_path(params).unwrap_or_default();
+    let path = dashboard_control_filesystem_paths(method, params).join(" -> ");
     match &runtime.grant {
         DashboardControlGrant::Peer {
             fingerprint,
@@ -2909,6 +2941,8 @@ fn control_frame_response(
                 | "api_fs_stat"
                 | "api_fs_list"
                 | "api_fs_mkdir"
+                | "api_fs_rename"
+                | "api_fs_delete"
                 | "api_fs_read"
                 | "api_sessions_search"
                 | "api_settings"
@@ -4665,6 +4699,8 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_fs_mkdir_available", fs_write),
         ("api_fs_read_available", fs_read),
         ("api_fs_write_available", fs_write),
+        ("api_fs_rename_available", fs_write),
+        ("api_fs_delete_available", fs_write),
         ("api_sessions_search_available", session_inspect),
         ("api_settings_available", settings),
         (
@@ -4697,6 +4733,12 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         (
             "api_peer_mutations_available",
             peer_registry_available && peer_manage,
+        ),
+        // message/task/approval act *through* a peer rather than mutating
+        // the registry, so they ride peer.use like the signaling relays.
+        (
+            "api_peer_quick_controls_available",
+            peer_registry_available && peer_use,
         ),
         (
             "api_peer_webrtc_signal_available",
@@ -4940,6 +4982,8 @@ async fn control_request_response(
         "api_fs_stat" => api_fs_stat_response(id, params.as_ref()).await,
         "api_fs_list" => api_fs_list_response(id, params.as_ref()).await,
         "api_fs_mkdir" => api_fs_mkdir_response(id, params.as_ref()).await,
+        "api_fs_rename" => api_fs_rename_response(id, params.as_ref()).await,
+        "api_fs_delete" => api_fs_delete_response(id, params.as_ref()).await,
         "api_sessions_search" => api_sessions_search_response(id, params.as_ref(), cancel).await,
         "api_settings" => api_settings_response(id, &runtime).await,
         "api_settings_save" => api_settings_save_response(id, params.as_ref(), &runtime).await,
@@ -7392,6 +7436,46 @@ async fn api_fs_mkdir_response(
     let path = string_param(&params, &["path"]);
     let (status_line, body) = crate::web_gateway::dashboard_fs_mkdir_response_body(&path);
     http_body_response(id, status_line_code(&status_line), body, "filesystem mkdir")
+}
+
+async fn api_fs_rename_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let result = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::dashboard_fs_rename_response_parts(&params)
+    })
+    .await;
+    match result {
+        Ok((code, body)) => http_body_response(id, code, body, "filesystem rename"),
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("filesystem rename task failed: {e}"),
+        }),
+    }
+}
+
+async fn api_fs_delete_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let result = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::dashboard_fs_delete_response_parts(&params)
+    })
+    .await;
+    match result {
+        Ok((code, body)) => http_body_response(id, code, body, "filesystem delete"),
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("filesystem delete task failed: {e}"),
+        }),
+    }
 }
 
 /// Terminal leg of an `api_fs_write` upload: the file contents arrived via
@@ -11044,6 +11128,8 @@ mod tests {
         assert_eq!(status["result"]["api_fs_mkdir_available"], true);
         assert_eq!(status["result"]["api_fs_read_available"], true);
         assert_eq!(status["result"]["api_fs_write_available"], true);
+        assert_eq!(status["result"]["api_fs_rename_available"], true);
+        assert_eq!(status["result"]["api_fs_delete_available"], true);
         assert_eq!(status["result"]["api_sessions_search_available"], true);
         assert_eq!(status["result"]["api_settings_available"], true);
         assert_eq!(status["result"]["api_settings_save_available"], false);
@@ -13315,6 +13401,191 @@ mod tests {
         assert_eq!(response.frame["result"]["_httpStatus"], 200);
         assert_eq!(response.frame["result"]["created"], false);
         assert_eq!(std::fs::read(&target).unwrap(), b"key = 2\n");
+    }
+
+    #[tokio::test]
+    async fn fs_rename_and_delete_enforce_scope_on_both_legs() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let scoped_runtime = || {
+            let mut rt = runtime();
+            rt.grant = DashboardControlGrant::Peer {
+                fingerprint: "fp".into(),
+                label: "peer".into(),
+                profile: "file-operator".into(),
+                filesystem: crate::peer::access_policy::FilesystemAccessPolicy {
+                    read_roots: vec![],
+                    write_roots: vec![dir.path().to_path_buf()],
+                },
+            };
+            rt
+        };
+        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+        let request = |id: &str, method: &str, params: serde_json::Value| {
+            serde_json::json!({
+                "t": "request",
+                "id": id,
+                "method": method,
+                "params": params,
+            })
+            .to_string()
+        };
+
+        // A rename whose destination leaves the write roots is refused
+        // inline — before any disk IO — and the audit line names both legs.
+        let from = dir.path().join("a.txt");
+        std::fs::write(&from, b"payload").unwrap();
+        let escape = outside.path().join("stolen.txt");
+        let mut rt = scoped_runtime();
+        let mut events = rt.bus.subscribe();
+        let denied = test_control_frame_response(
+            &request(
+                "r1",
+                "api_fs_rename",
+                serde_json::json!({
+                    "from": from.to_string_lossy(),
+                    "to": escape.to_string_lossy(),
+                }),
+            ),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .expect("denied inline");
+        assert_eq!(denied["ok"], false);
+        assert!(from.exists());
+        assert!(!escape.exists());
+        let mut audited = false;
+        while let Ok(event) = events.try_recv() {
+            if let AppEvent::PresenceLog { message, .. } = event {
+                if message.contains("[peer-fs] denied") && message.contains(" -> ") {
+                    audited = true;
+                }
+            }
+        }
+        assert!(audited, "expected a [peer-fs] denied line naming both legs");
+
+        // ... and so is a rename whose *source* is outside (write-scope on
+        // the removal leg), and one that omits a leg entirely.
+        let foreign = outside.path().join("theirs.txt");
+        std::fs::write(&foreign, b"foreign").unwrap();
+        let denied = test_control_frame_response(
+            &request(
+                "r2",
+                "api_fs_rename",
+                serde_json::json!({
+                    "from": foreign.to_string_lossy(),
+                    "to": dir.path().join("mine.txt").to_string_lossy(),
+                }),
+            ),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .expect("denied inline");
+        assert_eq!(denied["ok"], false);
+        assert!(foreign.exists());
+        let denied = test_control_frame_response(
+            &request(
+                "r3",
+                "api_fs_rename",
+                serde_json::json!({ "from": from.to_string_lossy() }),
+            ),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .expect("denied inline");
+        assert_eq!(denied["ok"], false);
+        assert!(denied["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("missing path"));
+
+        // Both legs inside: the rename flows through the task path.
+        let to = dir.path().join("b.txt");
+        let queued = test_control_frame_response(
+            &request(
+                "r4",
+                "api_fs_rename",
+                serde_json::json!({
+                    "from": from.to_string_lossy(),
+                    "to": to.to_string_lossy(),
+                }),
+            ),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        );
+        assert!(queued.is_none());
+        let response = rx.recv().await.unwrap();
+        assert!(pending.remove(&response.id).is_some());
+        assert_eq!(response.frame["result"]["_httpStatus"], 200);
+        assert_eq!(response.frame["result"]["renamed"], true);
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"payload");
+
+        // Delete outside the write roots is refused; inside it lands, and a
+        // non-empty directory's 409 survives the tunnel envelope.
+        let denied = test_control_frame_response(
+            &request(
+                "d1",
+                "api_fs_delete",
+                serde_json::json!({ "path": foreign.to_string_lossy() }),
+            ),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .expect("denied inline");
+        assert_eq!(denied["ok"], false);
+        assert!(foreign.exists());
+
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), b"x").unwrap();
+        let queued = test_control_frame_response(
+            &request(
+                "d2",
+                "api_fs_delete",
+                serde_json::json!({ "path": sub.to_string_lossy() }),
+            ),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        );
+        assert!(queued.is_none());
+        let response = rx.recv().await.unwrap();
+        assert!(pending.remove(&response.id).is_some());
+        assert_eq!(response.frame["result"]["_httpStatus"], 409);
+        assert_eq!(response.frame["result"]["code"], "not_empty");
+        assert!(sub.exists());
+
+        let queued = test_control_frame_response(
+            &request(
+                "d3",
+                "api_fs_delete",
+                serde_json::json!({ "path": sub.to_string_lossy(), "recursive": true }),
+            ),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        );
+        assert!(queued.is_none());
+        let response = rx.recv().await.unwrap();
+        assert!(pending.remove(&response.id).is_some());
+        assert_eq!(response.frame["result"]["_httpStatus"], 200);
+        assert_eq!(response.frame["result"]["deleted"], true);
+        assert!(!sub.exists());
     }
 
     #[tokio::test]

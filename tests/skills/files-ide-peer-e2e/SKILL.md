@@ -82,7 +82,11 @@ All paths below live under a scratch `RIG` directory. Ports: A=18800
    ```bash
    NODE_PATH=<repo>/node_modules RIG=$RIG node tests/skills/files-ide-peer-e2e/peer-ide-smoke.cjs
    ```
-   Expect `PEER-IDE-SMOKE PASS: 9 steps` and screenshots under `$RIG/`.
+   Expect `PEER-IDE-SMOKE PASS: 12 steps` and screenshots under `$RIG/`.
+   (The three newest steps rename and delete on the peer through
+   `api_fs_rename`/`api_fs_delete`, including the cross-root rename denial
+   — B must refuse a destination outside `write_roots` even though the
+   source is inside.)
 7. **Audit trail** — B's session log must show the tunnel-lane trail:
    ```bash
    grep -rh 'peer-fs' $RIG/home-b/.intendant/logs/*/session.jsonl | tail
