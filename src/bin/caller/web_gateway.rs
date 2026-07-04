@@ -1910,6 +1910,10 @@ pub(crate) async fn mint_session_token(provider: &str, model: &str) -> Result<St
 const APP_HTML: &str = include_str!("../../../static/app.html");
 const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.js");
 const ICON_128_PNG: &[u8] = include_bytes!("../../../static/icon-128.png");
+const ICON_512_PNG: &[u8] = include_bytes!("../../../static/icon-512.png");
+const ICON_512_MASKABLE_PNG: &[u8] = include_bytes!("../../../static/icon-512-maskable.png");
+const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../../../static/apple-touch-icon.png");
+const MANIFEST_WEBMANIFEST: &str = include_str!("../../../static/manifest.webmanifest");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
 const WASM_STATION_JS: &str = include_str!("../../../static/wasm-station/station_web.js");
@@ -4163,6 +4167,15 @@ fn embedded_static_asset(path: &str) -> Option<&'static EmbeddedStaticAsset> {
         // PNG is already deflate-compressed; gzip would only add overhead.
         insert("/icon-128.png", "image/png", ICON_128_PNG, false);
         insert("/favicon.ico", "image/png", ICON_128_PNG, false);
+        insert("/icon-512.png", "image/png", ICON_512_PNG, false);
+        insert("/icon-512-maskable.png", "image/png", ICON_512_MASKABLE_PNG, false);
+        insert("/apple-touch-icon.png", "image/png", APPLE_TOUCH_ICON_PNG, false);
+        insert(
+            "/manifest.webmanifest",
+            "application/manifest+json",
+            MANIFEST_WEBMANIFEST.as_bytes(),
+            false,
+        );
         map
     });
     assets.get(path)
@@ -21936,9 +21949,18 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(&response).await;
-                    } else if let Some(asset) =
-                        static_asset_arm(req_method, req_path, &["/icon-128.png", "/favicon.ico"])
-                    {
+                    } else if let Some(asset) = static_asset_arm(
+                        req_method,
+                        req_path,
+                        &[
+                            "/icon-128.png",
+                            "/favicon.ico",
+                            "/icon-512.png",
+                            "/icon-512-maskable.png",
+                            "/apple-touch-icon.png",
+                            "/manifest.webmanifest",
+                        ],
+                    ) {
                         let response = build_static_asset_response(
                             req_method,
                             &header_text,
@@ -24550,6 +24572,12 @@ pub fn spawn_web_gateway(
                             "/wasm-station/station_web.js",
                             "/three.module.min.js",
                             "/audio-processor.js",
+                            "/icon-128.png",
+                            "/favicon.ico",
+                            "/icon-512.png",
+                            "/icon-512-maskable.png",
+                            "/apple-touch-icon.png",
+                            "/manifest.webmanifest",
                         ],
                     ) {
                         let response = build_static_asset_response(
@@ -36949,6 +36977,20 @@ mod tests {
             embedded_static_asset("/favicon.ico").unwrap().body,
             ICON_128_PNG
         );
+        // The PWA surface: manifest + install icons, embedded like the rest.
+        let manifest = embedded_static_asset("/manifest.webmanifest").unwrap();
+        assert_eq!(manifest.content_type, "application/manifest+json");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(manifest.body).expect("manifest must be valid JSON");
+        assert_eq!(parsed["display"], "standalone");
+        for icon in parsed["icons"].as_array().expect("manifest icons") {
+            let src = icon["src"].as_str().unwrap();
+            assert!(
+                embedded_static_asset(src).is_some(),
+                "manifest icon {src} must itself be embedded"
+            );
+        }
+        assert!(embedded_static_asset("/apple-touch-icon.png").is_some());
         // The gzip gate is size-based: tiny assets stay identity-only.
         let audio = embedded_static_asset("/audio-processor.js").unwrap();
         assert_eq!(audio.gzip.is_some(), audio.body.len() >= GZIP_MIN_BYTES);

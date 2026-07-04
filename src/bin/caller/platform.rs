@@ -1045,6 +1045,71 @@ pub fn home_dir() -> std::path::PathBuf {
     }
 }
 
+/// Effective-root check for paths that install system-wide artifacts
+/// (`intendant service install` picks the system vs user unit by this).
+/// Root is a Unix concept; on Windows elevation is probed differently.
+pub fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        (unsafe { libc::geteuid() }) == 0
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// The calling user's uid, for launchd's `gui/<uid>/…` service targets.
+#[cfg(unix)]
+pub fn unix_uid() -> u32 {
+    // SAFETY: getuid takes no arguments and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// Non-Unix twin so cross-platform callers compile (the launchd service
+/// backend that consumes this is only ever *detected* on macOS, but its
+/// match arm exists everywhere).
+#[cfg(not(unix))]
+pub fn unix_uid() -> u32 {
+    0
+}
+
+/// Prepare this process to run as the unattended service supervisor
+/// (`intendant service run`): ignore SIGHUP so the terminal or SSH
+/// session that spawned it can go away, and become our own process-group
+/// leader so `service uninstall` can stop supervisor + daemon with one
+/// group signal.
+#[cfg(unix)]
+pub fn detach_for_supervision() {
+    // SAFETY: setting a signal disposition to SIG_IGN and calling
+    // setpgid(0, 0) on ourselves have no preconditions; both are the
+    // standard daemon-detach idiom.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        let _ = libc::setpgid(0, 0);
+    }
+}
+
+#[cfg(not(unix))]
+pub fn detach_for_supervision() {}
+
+/// Terminate the whole process group led by `pid` (the supervisor and
+/// the daemon it spawned). Unix-only; the Windows path uses
+/// `taskkill /t` instead.
+#[cfg(unix)]
+pub fn kill_process_group(pid: u32) {
+    let pid = match libc::pid_t::try_from(pid) {
+        Ok(p) if p > 0 => p,
+        _ => return,
+    };
+    // SAFETY: kill with a negative pid signals the process group; the
+    // guard above keeps the value in range.
+    unsafe {
+        let _ = libc::kill(-pid, libc::SIGTERM);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
