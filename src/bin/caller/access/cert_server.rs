@@ -203,10 +203,48 @@ async fn accept_loop(
     https_port: u16,
     gate: Arc<EnrollmentGate>,
 ) {
+    let mut listener = listener;
+    let bind_addr = listener.local_addr().ok();
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                if crate::web_gateway::should_continue_after_accept_error(&e) {
+                    // Bare `continue` here would hot-spin at 100% CPU under
+                    // descriptor pressure; pause before the next accept.
+                    eprintln!("[access/cert-server] accept failed: {e} (continuing)");
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+                // The listening socket itself is dead: rebind so the
+                // enrollment page stays reachable mid-ceremony instead of
+                // spinning on a socket that can never accept again.
+                let Some(addr) = bind_addr else {
+                    eprintln!(
+                        "[access/cert-server] accept failed: {e} (bind address unknown; enrollment server exiting)"
+                    );
+                    return;
+                };
+                eprintln!("[access/cert-server] accept failed: {e} (rebinding listener)");
+                let mut delay = std::time::Duration::from_millis(250);
+                listener = loop {
+                    tokio::time::sleep(delay).await;
+                    match crate::web_gateway::rebind_dead_tcp_listener(addr) {
+                        Ok(fresh) => {
+                            eprintln!("[access/cert-server] listener rebound on {addr}");
+                            break fresh;
+                        }
+                        Err(err) => {
+                            delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                            eprintln!(
+                                "[access/cert-server] rebind on {addr} failed: {err} (retrying in {:.1}s)",
+                                delay.as_secs_f32()
+                            );
+                        }
+                    }
+                };
+                continue;
+            }
         };
         let acceptor = acceptor.clone();
         let cert_dir = cert_dir.clone();

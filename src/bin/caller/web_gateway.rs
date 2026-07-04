@@ -18474,7 +18474,7 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
+pub(crate) fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
     match error.kind() {
         std::io::ErrorKind::Interrupted
         | std::io::ErrorKind::WouldBlock
@@ -18504,7 +18504,7 @@ fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
     }
 }
 
-/// Rebind the gateway listener on its original address after the previous
+/// Rebind a TCP listener on its original address after the previous
 /// socket became unusable — seen in the wild on macOS as `accept()`
 /// returning EINVAL a minute into an app-spawned daemon's life, which
 /// used to kill the listener task and leave the dashboard half-alive
@@ -18512,7 +18512,10 @@ fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
 /// session details, files, uploads, Station assets — failed). Mirrors
 /// `bind_dual_stack_or_v4`: dual-stack for the IPv6 wildcard,
 /// `SO_REUSEADDR` so lingering TIME_WAIT sockets don't block the port.
-fn rebind_gateway_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+/// Shared by the dashboard gateway and the enrollment cert server.
+pub(crate) fn rebind_dead_tcp_listener(
+    addr: std::net::SocketAddr,
+) -> std::io::Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if addr.is_ipv6() {
         Domain::IPV6
@@ -19411,7 +19414,7 @@ pub fn spawn_web_gateway(
                     let mut delay = std::time::Duration::from_millis(250);
                     listener = loop {
                         tokio::time::sleep(delay).await;
-                        match rebind_gateway_listener(addr) {
+                        match rebind_dead_tcp_listener(addr) {
                             Ok(fresh) => {
                                 eprintln!("[web_gateway] listener rebound on port {port}");
                                 break fresh;
@@ -47122,12 +47125,12 @@ mod tests {
     /// address a dead one occupied (accept() EINVAL/EBADF recovery path),
     /// and the fresh listener must actually accept connections.
     #[tokio::test]
-    async fn rebind_gateway_listener_restores_reachability() {
+    async fn rebind_dead_tcp_listener_restores_reachability() {
         let original = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = original.local_addr().unwrap();
         drop(original);
 
-        let rebound = rebind_gateway_listener(addr).expect("rebind on the freed address");
+        let rebound = rebind_dead_tcp_listener(addr).expect("rebind on the freed address");
         assert_eq!(rebound.local_addr().unwrap(), addr);
 
         let (client, (server, _peer)) = tokio::join!(
