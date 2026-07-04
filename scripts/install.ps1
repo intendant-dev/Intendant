@@ -24,10 +24,15 @@
     Client-key fingerprint to pin root authority to from first boot.
 
 .PARAMETER Connect
-    Rendezvous URL to register with.
+    Rendezvous URL to register with. Defaults to the rendezvous this
+    script was fetched from (injected when served).
 
 .PARAMETER DaemonId
     Stable daemon id at the rendezvous.
+
+.PARAMETER Ref
+    Pin the fresh clone to a tag, branch, or commit instead of the
+    default branch head.
 
 .PARAMETER Service
     Keep the daemon running unattended: installs a Task Scheduler entry
@@ -49,6 +54,7 @@ param(
     [string]$Owner = "",
     [string]$Connect = "",
     [string]$DaemonId = "",
+    [string]$Ref = "",
     [switch]$Service,
     [switch]$NoRun,
     [string]$Repo = "https://github.com/lovon-spec/intendant",
@@ -74,11 +80,19 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 
 # -- Source --
 if (Test-Path (Join-Path $InstallDir ".git")) {
+    if ($Ref) { Fail "-Ref pins fresh clones only; $InstallDir already exists -- check out the ref there yourself." }
     Say "using existing checkout at $InstallDir (leaving it exactly as-is)"
 } else {
     Say "cloning $Repo -> $InstallDir"
     git clone --depth 1 $Repo $InstallDir
     if ($LASTEXITCODE -ne 0) { Fail "git clone failed" }
+    if ($Ref) {
+        Say "pinning checkout to $Ref"
+        git -C $InstallDir fetch --depth 1 origin $Ref
+        if ($LASTEXITCODE -ne 0) { Fail "git fetch $Ref failed" }
+        git -C $InstallDir checkout --detach FETCH_HEAD
+        if ($LASTEXITCODE -ne 0) { Fail "git checkout $Ref failed" }
+    }
 }
 Set-Location $InstallDir
 
@@ -98,8 +112,10 @@ if ($elevated -and (Test-Path $setup)) {
 }
 
 # -- Build --
+# --locked: build exactly the committed Cargo.lock -- a resolution that
+# differs from what CI tested is a failure, not a fallback.
 Say "building release binaries (this takes a few minutes on a fresh box)"
-cargo build --release
+cargo build --release --locked
 if ($LASTEXITCODE -ne 0) { Fail "cargo build failed" }
 $daemonExe = Join-Path $InstallDir "target\release\intendant.exe"
 

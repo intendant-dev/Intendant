@@ -177,6 +177,14 @@ struct ServiceConfig {
     /// Off by default so self-hosted instances stay zero-friction; the
     /// hosted instance turns it on. Existing accounts are unaffected.
     invite_required: bool,
+    /// Let daemons register and poll without the bearer token, even when
+    /// one is configured: registration is rate-limited, unclaimed records
+    /// expire after a day, and the gate moves to claim time (only
+    /// signed-in — on the hosted instance, invited — accounts can claim).
+    /// The token keeps guarding the admin surface regardless. This is
+    /// what makes the landing one-liner's claim story reachable by
+    /// someone who has never seen the operator token.
+    open_daemon_registration: bool,
 }
 
 impl ServiceConfig {
@@ -204,6 +212,10 @@ impl ServiceConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        let mut open_daemon_registration =
+            std::env::var("INTENDANT_CONNECT_OPEN_REGISTRATION")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+                .unwrap_or(false);
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -232,6 +244,9 @@ impl ServiceConfig {
                 }
                 "--invite-required" => {
                     invite_required = true;
+                }
+                "--open-registration" => {
+                    open_daemon_registration = true;
                 }
                 "--help" | "-h" => {
                     print_help();
@@ -262,6 +277,7 @@ impl ServiceConfig {
             data_file,
             daemon_token,
             invite_required,
+            open_daemon_registration,
             cookie_secure,
         })
     }
@@ -272,7 +288,8 @@ fn print_help() {
         "Usage: intendant-connect [--listen 127.0.0.1:9876] [--origin https://connect.intendant.dev] [--rp-id intendant.dev]\n\
          \n\
          Env: INTENDANT_CONNECT_LISTEN, INTENDANT_CONNECT_ORIGIN, INTENDANT_CONNECT_RP_ID,\n\
-              INTENDANT_CONNECT_STATIC_ROOT, INTENDANT_CONNECT_DATA_FILE, INTENDANT_CONNECT_TOKEN"
+              INTENDANT_CONNECT_STATIC_ROOT, INTENDANT_CONNECT_DATA_FILE, INTENDANT_CONNECT_TOKEN,\n\
+              INTENDANT_CONNECT_INVITE_REQUIRED, INTENDANT_CONNECT_OPEN_REGISTRATION"
     );
 }
 
@@ -921,29 +938,71 @@ async fn healthz() -> impl IntoResponse {
 /// at build time so the service — hosted or self-hosted — serves the
 /// installer that matches its own version:
 ///   curl -fsSL <origin>/install.sh | sh -s -- --owner <fingerprint>
+///
+/// Served with this rendezvous' public origin injected as the default
+/// `--connect` URL: fetching the installer from a rendezvous IS the opt-in,
+/// and a fresh VPS has no other way to learn where to register — without
+/// it the daemon comes up unregistered and hosted claiming dead-ends.
+/// (A compiled-in default in the daemon would instead make every install
+/// phone home to intendant.dev; serve-time injection keeps self-hosting
+/// exact.) Explicit `--connect` / `-Connect` still wins over the default.
 const INSTALL_SH: &str = include_str!("../../../scripts/install.sh");
+const INSTALL_SH_CONNECT_DEFAULT: &str = r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-}""#;
 
-async fn install_sh() -> impl IntoResponse {
+/// Only a plain URL charset may be spliced into the scripts — anything
+/// else (quotes, spaces, `$`) could change what the shell parses. A
+/// misconfigured origin falls back to serving the script verbatim.
+fn connect_default_injectable(origin: &str) -> bool {
+    !origin.is_empty()
+        && origin
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_'))
+}
+
+fn install_sh_body(public_origin: &str) -> String {
+    if !connect_default_injectable(public_origin) {
+        return INSTALL_SH.to_string();
+    }
+    INSTALL_SH.replacen(
+        INSTALL_SH_CONNECT_DEFAULT,
+        &format!(r#"CONNECT_URL="${{INTENDANT_CONNECT_RENDEZVOUS_URL:-{public_origin}}}""#),
+        1,
+    )
+}
+
+async fn install_sh(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        INSTALL_SH,
+        install_sh_body(&state.config.public_origin),
     )
 }
 
 /// The Windows counterpart, for PowerShell:
 ///   & ([scriptblock]::Create((irm <origin>/install.ps1))) -Owner <fingerprint>
 const INSTALL_PS1: &str = include_str!("../../../scripts/install.ps1");
+const INSTALL_PS1_CONNECT_DEFAULT: &str = "    [string]$Connect = \"\",";
 
-async fn install_ps1() -> impl IntoResponse {
+fn install_ps1_body(public_origin: &str) -> String {
+    if !connect_default_injectable(public_origin) {
+        return INSTALL_PS1.to_string();
+    }
+    INSTALL_PS1.replacen(
+        INSTALL_PS1_CONNECT_DEFAULT,
+        &format!("    [string]$Connect = \"{public_origin}\","),
+        1,
+    )
+}
+
+async fn install_ps1(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        INSTALL_PS1,
+        install_ps1_body(&state.config.public_origin),
     )
 }
 
@@ -2359,7 +2418,7 @@ fn require_admin_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
             "admin endpoints require the service to be started with --daemon-token",
         ));
     }
-    require_daemon_auth(state, headers)
+    require_bearer_token(state, headers)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2477,7 +2536,11 @@ async fn admin_invites_revoke(
     Ok(Json(json!({ "ok": true, "revoked": revoked })))
 }
 
-fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+/// Bearer check against the configured operator token. Admin endpoints
+/// verify through this directly (`require_admin_auth`) — never through
+/// `require_daemon_auth` — so opening daemon registration can never open
+/// the admin surface.
+fn require_bearer_token(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     let Some(token) = state.config.daemon_token.as_deref() else {
         return Ok(());
     };
@@ -2493,6 +2556,19 @@ fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
             "missing or invalid daemon bearer token",
         ))
     }
+}
+
+/// Gate for the daemon registration/polling endpoints. With
+/// `--open-registration` these are anonymous by design: registration is
+/// rate-limited, unclaimed records expire, and authorization moves to
+/// claim time (a signed-in — on the hosted instance, invited — account).
+/// Without it, the operator token (when configured) is required, which
+/// suits self-hosters who want a closed fleet.
+fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    if state.config.open_daemon_registration {
+        return Ok(());
+    }
+    require_bearer_token(state, headers)
 }
 
 fn header_string(headers: &HeaderMap, name: &'static str) -> Option<String> {
@@ -3679,7 +3755,8 @@ async fn api_status(
         "claim_code_expires_unix_ms": claim_code_expires_unix_ms,
         "queued": queued,
         "active_sessions": active_sessions,
-        "daemon_auth_required": state.config.daemon_token.is_some(),
+        "daemon_auth_required": state.config.daemon_token.is_some()
+            && !state.config.open_daemon_registration,
     }))
 }
 
@@ -3712,6 +3789,9 @@ async fn daemon_register(
         let mut claim_codes = state.claim_codes.lock().await;
         let mut store = state.store.lock().await;
         let now = now_unix_ms();
+        for stale_id in sweep_stale_unclaimed_daemons(&mut store, now) {
+            claim_codes.remove(&stale_id);
+        }
         let active_claim_hashes = active_claim_code_hashes(&store, &daemon_id, now);
         let claimed_now = if let Some(existing) =
             store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id)
@@ -3816,6 +3896,25 @@ fn generate_claim_code() -> ApiResult<String> {
     let mnemonic = Mnemonic::from_entropy(&entropy)
         .map_err(|e| ApiError::internal(format!("generate claim mnemonic: {e}")))?;
     Ok(mnemonic.to_string().replace(' ', "-"))
+}
+
+/// A day without polling: unclaimed records past this vanish on the next
+/// registration sweep, so open registration cannot grow the store without
+/// bound. Claimed daemons are never touched here — a returning unclaimed
+/// daemon simply re-registers and gets a fresh claim code.
+const UNCLAIMED_DAEMON_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+fn sweep_stale_unclaimed_daemons(store: &mut Store, now: u64) -> Vec<String> {
+    let mut removed = Vec::new();
+    store.daemons.retain(|daemon| {
+        let keep = daemon.owner_user_id.is_some()
+            || now.saturating_sub(daemon.last_seen_unix_ms) < UNCLAIMED_DAEMON_TTL_MS;
+        if !keep {
+            removed.push(daemon.daemon_id.clone());
+        }
+        keep
+    });
+    removed
 }
 
 fn active_claim_code_hashes(store: &Store, except_daemon_id: &str, now: u64) -> HashSet<String> {
@@ -6869,6 +6968,25 @@ mod tests {
     }
 
     #[test]
+    fn open_registration_sweep_expires_only_stale_unclaimed_daemons() {
+        let now = UNCLAIMED_DAEMON_TTL_MS * 10;
+        let mut store = Store::default();
+        let mut stale = daemon_record("stale-unclaimed", None, None, None);
+        stale.last_seen_unix_ms = now - UNCLAIMED_DAEMON_TTL_MS - 1;
+        // Claimed daemons are the owner's — staleness never sweeps them.
+        let mut claimed = daemon_record("stale-claimed", Some(Uuid::new_v4()), None, None);
+        claimed.last_seen_unix_ms = 0;
+        let mut fresh = daemon_record("fresh-unclaimed", None, None, None);
+        fresh.last_seen_unix_ms = now - 1;
+        store.daemons = vec![stale, claimed, fresh];
+
+        let removed = sweep_stale_unclaimed_daemons(&mut store, now);
+        assert_eq!(removed, vec!["stale-unclaimed".to_string()]);
+        let ids: Vec<&str> = store.daemons.iter().map(|d| d.daemon_id.as_str()).collect();
+        assert_eq!(ids, vec!["stale-claimed", "fresh-unclaimed"]);
+    }
+
+    #[test]
     fn account_handles_enforce_charset_length_and_reservations() {
         assert!(validate_account_name("lenny").is_ok());
         assert!(validate_account_name("a-b-1").is_ok());
@@ -7402,6 +7520,7 @@ mod tests {
             data_file: PathBuf::from("state.json"),
             daemon_token: None,
             invite_required: false,
+            open_daemon_registration: false,
             cookie_secure: true,
         };
 
@@ -7607,6 +7726,54 @@ mod tests {
         ] {
             assert!(INSTALL_PS1.contains(needle), "install.ps1 must contain {needle}");
         }
+    }
+
+    #[test]
+    fn served_installers_default_connect_to_the_serving_rendezvous() {
+        // The embedded scripts must keep the sentinel lines the handlers
+        // splice — if either drifts, injection silently stops and a fresh
+        // VPS comes up unregistered (hosted claiming dead-ends).
+        assert!(
+            INSTALL_SH.contains(INSTALL_SH_CONNECT_DEFAULT),
+            "install.sh connect-default sentinel drifted"
+        );
+        assert!(
+            INSTALL_PS1.contains(INSTALL_PS1_CONNECT_DEFAULT),
+            "install.ps1 connect-default sentinel drifted"
+        );
+
+        let sh = install_sh_body("https://rendezvous.example");
+        assert!(sh.contains(
+            r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-https://rendezvous.example}""#
+        ));
+        assert!(!sh.contains(INSTALL_SH_CONNECT_DEFAULT));
+
+        let ps1 = install_ps1_body("https://rendezvous.example");
+        assert!(ps1.contains(r#"[string]$Connect = "https://rendezvous.example","#));
+        assert!(!ps1.contains(INSTALL_PS1_CONNECT_DEFAULT));
+        // The ANSI-decode trap applies to the served body, not just the
+        // embedded file — the injected origin must not break the pin.
+        assert!(ps1.is_ascii(), "served install.ps1 must stay pure ASCII");
+
+        // Splice guard: only a plain URL charset reaches the scripts.
+        assert!(connect_default_injectable("https://intendant.dev"));
+        assert!(connect_default_injectable("http://localhost:9891"));
+        assert!(!connect_default_injectable(r#"https://x"; rm -rf ~"#));
+        assert!(!connect_default_injectable("https://x y"));
+        assert!(!connect_default_injectable(""));
+        let verbatim = install_sh_body(r#"https://x" y"#);
+        assert_eq!(verbatim, INSTALL_SH, "unsafe origin must serve verbatim");
+    }
+
+    /// Windows PowerShell 5.1 executes setup-windows.ps1 straight from the
+    /// fresh clone, so the BOM-less ANSI-decode trap pinned for install.ps1
+    /// above applies to it identically — a non-ASCII byte that lands in
+    /// code (not a comment) can decode into a cp1252 smart quote the parser
+    /// honors. Keep every PowerShell file a fresh box runs pure ASCII.
+    #[test]
+    fn setup_windows_ps1_is_pure_ascii() {
+        const SETUP_PS1: &str = include_str!("../../../scripts/setup-windows.ps1");
+        assert!(SETUP_PS1.is_ascii(), "setup-windows.ps1 must be pure ASCII");
     }
 
     /// Real parse coverage for the PowerShell installer, on the platform

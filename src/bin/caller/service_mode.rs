@@ -15,7 +15,7 @@
 //! is the contract the install scripts and the landing advisor lean on.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SYSTEMD_UNIT_NAME: &str = "intendant.service";
@@ -449,6 +449,10 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
             .map_err(|e| format!("create log directory {}: {e}", parent.display()))?;
     }
     let envs = carried_env(|key| std::env::var(key).ok());
+    // Captured before any backend starts the daemon, so the first-boot
+    // probe scans only log bytes this run produced (a reinstall over an
+    // old crash log must not false-positive).
+    let pre_log_len = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
 
     match backend {
         Backend::Systemd { system } => {
@@ -568,7 +572,135 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
             println!("claim phrase / logs: tail -f {log_str}");
         }
     }
+    if now {
+        first_boot_probe(&backend, &log, pre_log_len)?;
+    }
     Ok(())
+}
+
+/// How long after `--now` before requiring the started daemon to still be
+/// alive. Long enough for an instant crash to be visible (systemd flips to
+/// auto-restart immediately; the supervisor logs its restart line before
+/// its first 3s backoff), short enough not to stall the installer.
+const FIRST_BOOT_PROBE_DELAY_MS: u64 = 2500;
+
+/// `install --now` used to report success — and print where the claim
+/// phrase lands — while the daemon it had just started was crash-looping
+/// on a first-boot misconfiguration; the user then tails a log that never
+/// shows a claim phrase. After starting, wait briefly and fail loudly on
+/// positive evidence of death: a failed/auto-restarting unit, a pid-less
+/// LaunchAgent, or supervisor restart lines from this run. Absence of
+/// evidence (a slow start) stays green — this must never flake a healthy
+/// install.
+fn first_boot_probe(backend: &Backend, log: &Path, pre_log_len: u64) -> Result<(), String> {
+    std::thread::sleep(std::time::Duration::from_millis(FIRST_BOOT_PROBE_DELAY_MS));
+    let failure = match backend {
+        Backend::Systemd { system } => {
+            let scope: &[&str] = if *system { &[] } else { &["--user"] };
+            let show = run_capture(
+                "systemctl",
+                &[
+                    scope,
+                    &[
+                        "show",
+                        "-p",
+                        "ActiveState",
+                        "-p",
+                        "SubState",
+                        "-p",
+                        "NRestarts",
+                        "--value",
+                        "intendant",
+                    ],
+                ]
+                .concat(),
+            );
+            let mut lines = show.lines();
+            let active = lines.next().unwrap_or("").trim().to_string();
+            let sub = lines.next().unwrap_or("").trim().to_string();
+            let restarts: u32 = lines.next().unwrap_or("").trim().parse().unwrap_or(0);
+            if systemd_first_boot_failed(&active, &sub, restarts) {
+                let tail = run_capture(
+                    "journalctl",
+                    &[scope, &["-u", "intendant", "-n", "8", "--no-pager", "-o", "cat"]].concat(),
+                );
+                Some(format!(
+                    "unit is {active} ({sub}) after {restarts} restart(s); last log lines:\n{}",
+                    tail.trim_end()
+                ))
+            } else {
+                None
+            }
+        }
+        Backend::Launchd => {
+            let target = format!("gui/{}/{}", crate::platform::unix_uid(), LAUNCHD_LABEL);
+            let out = run_capture("launchctl", &["print", &target]);
+            if out.contains("pid = ") {
+                None
+            } else {
+                Some(format!(
+                    "LaunchAgent has no running pid; last log lines:\n{}",
+                    log_tail_since(log, pre_log_len)
+                ))
+            }
+        }
+        Backend::WindowsTask { .. } | Backend::CronReboot => {
+            let fresh = log_tail_since(log, pre_log_len);
+            if supervisor_first_boot_failed(&fresh) {
+                Some(format!(
+                    "the daemon exited on first boot; supervisor log:\n{fresh}"
+                ))
+            } else {
+                None
+            }
+        }
+    };
+    match failure {
+        Some(detail) => Err(format!(
+            "service installed, but the daemon did not stay up — {detail}\n\
+             The service stays installed: fix the cause and the supervisor restarts it \
+             (or rerun `intendant service install --now`)."
+        )),
+        None => {
+            println!("daemon is up (first-boot check passed)");
+            Ok(())
+        }
+    }
+}
+
+/// Positive-evidence verdict for the systemd backend. "activating" with a
+/// clean SubState and zero restarts is a slow start, not a failure; a
+/// currently-active unit is healthy even if it needed a restart to get
+/// there — the supervisor did its job.
+fn systemd_first_boot_failed(active: &str, sub: &str, restarts: u32) -> bool {
+    if active == "active" {
+        return false;
+    }
+    active == "failed" || sub == "auto-restart" || restarts > 0
+}
+
+/// The built-in supervisor's log is the only first-boot signal for the
+/// schtasks/cron backends; only lines from this run count (see
+/// `pre_log_len`). Matches the two lines `service run` writes when the
+/// child dies or cannot spawn.
+fn supervisor_first_boot_failed(fresh_log: &str) -> bool {
+    fresh_log.contains("restarting in") || fresh_log.contains("spawn failed")
+}
+
+/// Last few log lines written after `offset` (a size captured before the
+/// service started). Falls back to the whole file when it was rotated or
+/// truncated underneath the offset.
+fn log_tail_since(log: &Path, offset: u64) -> String {
+    let bytes = std::fs::read(log).unwrap_or_default();
+    let start = if (offset as usize) <= bytes.len() {
+        offset as usize
+    } else {
+        0
+    };
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    let lines: Vec<&str> = text.lines().collect();
+    let keep = lines.len().saturating_sub(10);
+    lines[keep..].join("\n")
 }
 
 fn windows_user_id() -> String {
@@ -592,6 +724,17 @@ fn write_private(path: &std::path::Path, content: &str) -> Result<(), String> {
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+/// Run a command and return its stdout (lossy) regardless of exit status —
+/// probes like `systemctl show` speak through stdout while exiting nonzero
+/// for non-active units.
+fn run_capture(program: &str, args: &[&str]) -> String {
+    Command::new(program)
+        .args(args)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 fn run_ok(program: &str, args: &[&str]) -> Result<(), String> {
@@ -966,6 +1109,57 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn systemd_first_boot_verdict_requires_positive_evidence() {
+        // Healthy steady state.
+        assert!(!systemd_first_boot_failed("active", "running", 0));
+        // Recovered after one crash: currently up — the supervisor did
+        // its job; the install must not be declared failed.
+        assert!(!systemd_first_boot_failed("active", "running", 1));
+        // Slow start: activating without any crash signal stays green.
+        assert!(!systemd_first_boot_failed("activating", "start", 0));
+        // The crash-loop shapes the probe exists for (the fresh-box mTLS
+        // boot loop showed exactly activating/auto-restart).
+        assert!(systemd_first_boot_failed("activating", "auto-restart", 0));
+        assert!(systemd_first_boot_failed("activating", "auto-restart", 3));
+        assert!(systemd_first_boot_failed("failed", "failed", 0));
+        assert!(systemd_first_boot_failed("inactive", "dead", 1));
+    }
+
+    #[test]
+    fn supervisor_first_boot_verdict_matches_run_loop_lines() {
+        // Shapes `cli_run` actually writes.
+        assert!(supervisor_first_boot_failed(
+            "[2026-07-04T10:10:10Z] daemon exited (status 1) after 0s — restarting in 3s"
+        ));
+        assert!(supervisor_first_boot_failed(
+            "[2026-07-04T10:10:10Z] spawn failed: No such file — retrying in 3s"
+        ));
+        assert!(!supervisor_first_boot_failed(
+            "[2026-07-04T10:10:10Z] daemon started (pid 4242)"
+        ));
+        assert!(!supervisor_first_boot_failed(""));
+    }
+
+    #[test]
+    fn log_tail_since_reads_only_this_run() {
+        let dir = std::env::temp_dir().join(format!("intendant-svc-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("svc.log");
+        std::fs::write(&log, "old crash — restarting in 3s\n").unwrap();
+        let pre = std::fs::metadata(&log).unwrap().len();
+        // Nothing new after the offset: an old crash log must not count.
+        assert_eq!(log_tail_since(&log, pre), "");
+        let mut all = std::fs::read(&log).unwrap();
+        all.extend_from_slice(b"daemon started (pid 7)\n");
+        std::fs::write(&log, &all).unwrap();
+        assert_eq!(log_tail_since(&log, pre), "daemon started (pid 7)");
+        // Rotated/truncated underneath the offset: fall back to the file.
+        std::fs::write(&log, b"fresh line\n").unwrap();
+        assert_eq!(log_tail_since(&log, pre), "fresh line");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

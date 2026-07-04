@@ -12538,9 +12538,41 @@ fn build_web_tls_acceptor(
         (None, None) => match installed_access_tls_cert_source()? {
             Some(source) => source,
             None if mtls_enabled => {
-                return Err(CallerError::Config(missing_default_mtls_cert_message(
-                    &installed_access_cert_dir(),
-                )));
+                // A service-managed first boot has no human at a prompt: on
+                // a machine whose access dir has never existed, provision
+                // the same durable material `intendant access setup` would
+                // create (CA + server pair + enrollable client identity)
+                // and continue. Anything short of virgin still gets the
+                // loud error — minting a new CA over one that browsers
+                // already enrolled against would silently strand them.
+                let provisioned = access::provision_virgin_access_certs().map_err(|e| {
+                    CallerError::Config(format!(
+                        "Dashboard mTLS is enabled by default and first-boot access \
+                         certificate provisioning failed: {e}. Run `intendant access \
+                         setup`, pass `--tls` for HTTPS without client certificate \
+                         authentication, or pass `--no-tls --bind 127.0.0.1` only for \
+                         explicit local/debug plaintext."
+                    ))
+                })?;
+                match provisioned {
+                    Some(cert_dir) => {
+                        eprintln!(
+                            "[access] first boot: generated dashboard access certificates \
+                             in {} — enroll a browser via the claim flow or `intendant access`",
+                            cert_dir.display()
+                        );
+                        installed_access_tls_cert_source()?.ok_or_else(|| {
+                            CallerError::Config(missing_default_mtls_cert_message(
+                                &installed_access_cert_dir(),
+                            ))
+                        })?
+                    }
+                    None => {
+                        return Err(CallerError::Config(missing_default_mtls_cert_message(
+                            &installed_access_cert_dir(),
+                        )));
+                    }
+                }
             }
             None => web_tls::TlsCertSource::SelfSigned {
                 bind_ip: bind_addr.map(|a| a.ip()),
@@ -12614,10 +12646,11 @@ fn web_default_mtls_enabled(flags: &CliFlags, server_cfg: &project::ServerTlsCon
 fn missing_default_mtls_cert_message(cert_dir: &Path) -> String {
     format!(
         "Dashboard mTLS is enabled by default, but no installed access server certificate was \
-         found in {cert_dir} (expected server.crt and server.key). Run `intendant access setup` \
-         to create/enroll dashboard access certificates, pass `--tls` for HTTPS without client \
-         certificate authentication, or pass `--no-tls --bind 127.0.0.1` only for explicit \
-         local/debug plaintext.",
+         found in {cert_dir} (expected server.crt and server.key). The directory holds other \
+         access material, so first-boot auto-provisioning stayed hands-off rather than touch an \
+         existing CA. Run `intendant access setup` to (re)generate what's missing, pass `--tls` \
+         for HTTPS without client certificate authentication, or pass `--no-tls --bind \
+         127.0.0.1` only for explicit local/debug plaintext.",
         cert_dir = cert_dir.display()
     )
 }
@@ -12932,7 +12965,22 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
             }
             "--owner" => {
                 if i + 1 < args.len() {
-                    flags.owner = Some(args[i + 1].clone());
+                    // Fail a typo at the flag, not after it's pinned: an
+                    // install whose owner fingerprint is garbage is an
+                    // unclaimable box that believes it's owned.
+                    let value = args[i + 1].trim().to_string();
+                    if !access::client_key::is_client_key_fingerprint(&value) {
+                        let shown: String = if value.chars().count() > 48 {
+                            value.chars().take(48).chain("…".chars()).collect()
+                        } else {
+                            value.clone()
+                        };
+                        return Err(CallerError::Config(format!(
+                            "--owner: '{shown}' is not a client-key fingerprint (expected 43 \
+                             base64url characters — copy it from the dashboard's Access drawer)"
+                        )));
+                    }
+                    flags.owner = Some(value);
                     i += 2;
                 } else {
                     return Err(CallerError::Config(
@@ -34356,7 +34404,18 @@ async fn main() -> Result<(), CallerError> {
             event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
+        {
+            // Fallback roots (no .git / intendant.toml — e.g. a service's
+            // $HOME WorkingDirectory) must never be baseline-scanned: it
+            // blocks boot for minutes and shadow-copies the whole tree.
+            eprintln!(
+                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+                 intendant.toml) — start intendant inside a project to enable rewind",
+                project.root.display()
+            );
+            (None, None, None)
+        } else {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
@@ -34581,7 +34640,18 @@ async fn main() -> Result<(), CallerError> {
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
+        {
+            // Fallback roots (no .git / intendant.toml — e.g. a service's
+            // $HOME WorkingDirectory) must never be baseline-scanned: it
+            // blocks boot for minutes and shadow-copies the whole tree.
+            eprintln!(
+                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+                 intendant.toml) — start intendant inside a project to enable rewind",
+                project.root.display()
+            );
+            (None, None, None)
+        } else {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
@@ -35055,7 +35125,18 @@ async fn main() -> Result<(), CallerError> {
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
+        {
+            // Fallback roots (no .git / intendant.toml — e.g. a service's
+            // $HOME WorkingDirectory) must never be baseline-scanned: it
+            // blocks boot for minutes and shadow-copies the whole tree.
+            eprintln!(
+                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+                 intendant.toml) — start intendant inside a project to enable rewind",
+                project.root.display()
+            );
+            (None, None, None)
+        } else {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
@@ -35721,7 +35802,18 @@ async fn main() -> Result<(), CallerError> {
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
+        {
+            // Fallback roots (no .git / intendant.toml — e.g. a service's
+            // $HOME WorkingDirectory) must never be baseline-scanned: it
+            // blocks boot for minutes and shadow-copies the whole tree.
+            eprintln!(
+                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+                 intendant.toml) — start intendant inside a project to enable rewind",
+                project.root.display()
+            );
+            (None, None, None)
+        } else {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
