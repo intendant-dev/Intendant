@@ -3,8 +3,9 @@ name: claude-code-e2e
 description: >
   Live end-to-end test of the Claude Code external-agent integration: spawn a
   supervised Claude Code session in a toy repo, exercise the approval protocol
-  (allow + deny), native session-id capture, mid-turn steering, interrupt, and
-  resume-by-native-id, driving everything through the Unix control socket.
+  (allow + deny), native session-id capture, mid-turn steering, interrupt,
+  thread actions (/compact, fork via --fork-session), and resume-by-native-id,
+  driving everything through the Unix control socket.
 compatibility: Requires the `claude` CLI (≥ 2.1.x) authenticated on this machine
   (subscription OAuth or API key) and a release build of intendant. Makes real
   model calls — haiku ONLY (enforced via [agent.claude_code] model); not for CI.
@@ -40,8 +41,18 @@ on **claude-haiku** — never a more expensive model.
   path would only deliver it at the next turn).
 - **Interrupt**: `interrupt` aborts a ~90s command well under its runtime,
   and the Claude Code process survives for follow-up turns.
-- **Resume**: a second `--continue` run binds to the *same* native session id
-  and recalls conversation context.
+- **Thread actions**: capabilities advertise the universal
+  `thread_actions: ["compact","fork"]`; `{"action":"thread_action",
+  "op":"compact"}` performs a real in-place compaction (the session still
+  recalls pre-compact facts); `op:"fork"` materializes a NEW wrapper session
+  that resumes the thread with `--fork-session` — its first prompt binds a
+  fresh native id, emits the `fork` session relationship, and recalls the
+  parent's pre-fork context while the parent stays untouched.
+- **Resume**: a second `--continue` run binds to the most recent session's
+  native id — after the fork phase that is the FORK child (resolution reads
+  the wrapper log's identity record, written directly by
+  `persist_native_backend_session_id` since the bus tee only reaches the
+  daemon-main log) — and recalls conversation context.
 
 ## Run
 
@@ -87,6 +98,16 @@ table and exits non-zero on any failure; the full event log lands in
 - `interrupt-aborts-turn` failing → the `control_request`/`interrupt`
   round-trip broke; `process-survives-interrupt` failing → the abort is
   killing the whole CLI process rather than the turn.
+- `compact-dispatched` failing → the `/compact` user-message trigger regressed
+  in the CLI (verify by hand: send `/compact` as a stream-json user message
+  and look for `status: compacting` → `compact_boundary`), or the
+  `thread_action` control alias / drain routing broke.
+- `fork-creates-wrapper-session` timeout → the drain's
+  `ForkHandling::RespawnResume` branch isn't emitting `ResumeSession
+  { fork: true }`, or no session supervisor is running (it requires `--web`).
+- `fork-child-has-own-native-id` failing → `--fork-session` missing from the
+  spawned argv (`fork_resume` derivation compares the resume id against the
+  persisted `forked_from`), or the child's placeholder identity leaked.
 - `resume-same-native-session` failing → the external overlay/identity
   records aren't being written (or `--resume` stopped keeping the session id
   stable in the CLI — verify with `claude --resume <id>` by hand).

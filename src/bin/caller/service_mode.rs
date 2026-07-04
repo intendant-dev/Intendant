@@ -715,14 +715,32 @@ fn write_private(path: &std::path::Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
-    // The definition may carry the connect token; keep it owner-only
-    // where the OS can express that.
+    // The definition may carry the connect token: create owner-only from the
+    // first byte (no write-then-chmod window) and treat a permissions failure
+    // as a failed install rather than silently leaving the token exposed.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("open {}: {e}", path.display()))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        // mode() only applies on creation; a pre-existing file keeps its old
+        // permissions, so tighten those too.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("restrict {}: {e}", path.display()))?;
     }
+    // On Windows there is no mode; the file inherits the profile directory's
+    // ACL, which is already scoped to the user (install paths live under
+    // %APPDATA%/%LOCALAPPDATA%).
+    #[cfg(not(unix))]
+    std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -1159,6 +1177,29 @@ mod tests {
         // Rotated/truncated underneath the offset: fall back to the file.
         std::fs::write(&log, b"fresh line\n").unwrap();
         assert_eq!(log_tail_since(&log, pre), "fresh line");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_private_is_owner_only_even_over_existing_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("intendant-svc-priv-{}", std::process::id()));
+        let path = dir.join("unit.service");
+        write_private(&path, "token=secret").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // A pre-existing lax file (from installs that predate the owner-only
+        // guarantee) must be tightened on rewrite, not inherited.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, "token=rotated").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "token=rotated");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

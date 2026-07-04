@@ -212,6 +212,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const isTurnEnd = (e) => e.event === 'task_complete' || e.event === 'round_complete';
 const isApproval = (e) => e.event === 'approval_required';
 
+// Session list over the plain-HTTP dashboard (run1 passes --bind/--no-tls).
+async function listSessions(port) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/sessions`);
+    if (!res.ok) return [];
+    const body = await res.json();
+    const rows = Array.isArray(body?.sessions) ? body.sessions : (Array.isArray(body) ? body : []);
+    return rows.map((row) => ({
+      id: String(row.id || row.session_id || ''),
+      source: String(row.backend_source || row.source || ''),
+    })).filter((row) => row.id);
+  } catch {
+    return [];
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Scenario
 // ---------------------------------------------------------------------------
@@ -252,11 +268,15 @@ async function main() {
     // No --log-file override: --continue resolves the prior session through
     // the default per-project log index, which a custom log dir would hide.
     '--web', String(PORT),
+    // Plain HTTP on loopback so the fork phase can poll /api/sessions.
+    '--bind', '127.0.0.1',
+    '--no-tls',
     '--control-socket',
     'Use a shell command to create a file named probe.txt containing exactly hello-from-cc. Then reply DONE.',
   ]);
 
   let backendSessionId = null;
+  let forkChildNativeId = null;
   try {
     await run.connect();
 
@@ -353,11 +373,101 @@ async function main() {
       120000,
     );
     check('process-survives-interrupt', Boolean(alive));
+
+    // Phase 6: the universal thread-action vocabulary is advertised.
+    const capsUniversal = run.events.find((e) => e.event === 'session_capabilities'
+      && Array.isArray((e.capabilities || {}).thread_actions));
+    check('thread-actions-advertised',
+      Boolean(capsUniversal && ['compact', 'fork'].every((op) => capsUniversal.capabilities.thread_actions.includes(op))),
+      capsUniversal ? JSON.stringify(capsUniversal.capabilities.thread_actions) : 'no thread_actions in any capabilities event');
+
+    // Phase 7: /compact via the universal thread_action channel. The CLI
+    // compacts in place (status: compacting → compact_boundary → a free
+    // result); the session must still recall pre-compact facts afterwards.
+    run.send({ action: 'thread_action', op: 'compact', session_id: backendSessionId });
+    const compactResult = await run.waitFor(
+      'compact result',
+      (e) => e.event === 'codex_thread_action_result' && e.action === 'compact',
+      120000,
+    );
+    check('compact-dispatched', compactResult.success === true, compactResult.message || '');
+    run.send({ action: 'follow_up', text: 'What was the name of the very first file you created this session? Reply with only the file name.' });
+    const postCompact = await run.waitFor(
+      'post-compact recall',
+      (e) => e.event === 'model_response' && /probe\.txt/.test(e.summary || ''),
+      180000,
+    );
+    check('compact-retains-context', Boolean(postCompact), (postCompact.summary || '').slice(0, 80));
+
+    // Phase 8: fork — a NEW wrapper session resumes this thread with
+    // --fork-session. The child announces its own native id on its first
+    // turn, which also emits the fork relationship.
+    const sessionsBefore = await listSessions(PORT);
+    run.send({ action: 'thread_action', op: 'fork', session_id: backendSessionId });
+    const forkResult = await run.waitFor(
+      'fork result',
+      (e) => e.event === 'codex_thread_action_result' && e.action === 'fork',
+      60000,
+    );
+    check('fork-dispatched', forkResult.success === true, forkResult.message || '');
+    let childWrapperId = null;
+    let lastRows = [];
+    for (let i = 0; i < 45 && !childWrapperId; i++) {
+      await sleep(1000);
+      lastRows = await listSessions(PORT);
+      const fresh = lastRows.filter((row) => /claude/.test(row.source)
+        && !sessionsBefore.some((old) => old.id === row.id)
+        && row.id !== backendSessionId);
+      if (fresh.length) childWrapperId = fresh[0].id;
+    }
+    if (!childWrapperId) {
+      log('fork-debug', `before=${JSON.stringify(sessionsBefore)} after=${JSON.stringify(lastRows)}`);
+    }
+    check('fork-creates-wrapper-session', Boolean(childWrapperId),
+      childWrapperId || 'no new claude-code session appeared in /api/sessions');
+
+    // The fork's first prompt binds its native id + relationship, and must
+    // recall the parent's pre-fork context.
+    run.send({
+      action: 'follow_up',
+      session_id: childWrapperId,
+      text: 'What was the name of the very first file you created this session? Reply with only the file name.',
+    });
+    const forkRel = await run.waitFor(
+      'fork relationship',
+      (e) => e.event === 'session_relationship' && e.relationship === 'fork'
+        && e.parent_session_id === backendSessionId,
+      180000,
+    );
+    const childNativeId = forkRel.child_session_id;
+    forkChildNativeId = childNativeId;
+    check('fork-child-has-own-native-id',
+      /^[0-9a-f-]{36}$/.test(childNativeId || '') && childNativeId !== backendSessionId,
+      `parent=${backendSessionId} child=${childNativeId}`);
+    const forkRecall = await run.waitFor(
+      'fork context recall',
+      (e) => e.event === 'model_response' && /probe\.txt/.test(e.summary || '')
+        && (e.session_id === childNativeId || e.session_id === childWrapperId),
+      180000,
+    );
+    check('fork-retains-context', Boolean(forkRecall), (forkRecall.summary || '').slice(0, 80));
+
+    // The parent thread must be untouched by the fork.
+    run.send({ action: 'follow_up', text: 'Reply with exactly: PARENTALIVE' });
+    const parentAlive = await run.waitFor(
+      'parent alive after fork',
+      (e) => e.event === 'model_response' && /PARENTALIVE/.test(e.summary || ''),
+      120000,
+    );
+    check('parent-survives-fork', Boolean(parentAlive));
   } finally {
     await run.stop();
   }
 
-  // ---- Run 2: resume by native session id --------------------------------
+  // ---- Run 2: resume the most recent session by native id ----------------
+  // The most recent session is now the FORK wrapper, so `--continue` must
+  // bind to the fork child's native id (resume resolution reads the
+  // wrapper log's identity record) and recall the forked context.
   const run2 = new IntendantRun('run2', [
     '--agent', 'claude-code',
     '--no-tui',
@@ -374,8 +484,8 @@ async function main() {
         && /^[0-9a-f-]{36}$/.test(e.backend_session_id || ''),
       120000,
     );
-    check('resume-same-native-session', identity2.backend_session_id === backendSessionId,
-      `run1=${backendSessionId} run2=${identity2.backend_session_id}`);
+    check('resume-binds-fork-native-session', identity2.backend_session_id === forkChildNativeId,
+      `fork-child=${forkChildNativeId} run2=${identity2.backend_session_id}`);
     const recall = await run2.waitFor(
       'context recall answer',
       (e) => e.event === 'model_response' && (e.summary || '').length > 0,

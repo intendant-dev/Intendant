@@ -5122,6 +5122,7 @@ mod tests {
                 follow_up: true,
                 steer: false,
                 interrupt: false,
+                thread_actions: Vec::new(),
                 codex_thread_actions: vec![],
                 codex_managed_context: Some("managed".to_string()),
                 codex_sandbox: Some("danger-full-access".to_string()),

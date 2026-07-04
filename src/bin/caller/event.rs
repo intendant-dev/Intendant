@@ -1097,6 +1097,17 @@ pub enum ControlMsg {
     ///
     /// The variant's field is named `op` (not `action`) because ControlMsg's
     /// serde tag is already `action`, and nested fields can't share the tag.
+    ///
+    /// Despite the legacy Codex-flavored name, this is the backend-neutral
+    /// per-session thread-action channel: the wire accepts the universal
+    /// `thread_action` tag (canonical for new frontends) as well as the
+    /// legacy `codex_thread_action`, and the owning drain dispatches through
+    /// `ExternalAgent::thread_action` / `ForkHandling` for whatever backend
+    /// runs the session. Claude Code advertises and accepts `compact` and
+    /// `fork`. Frontends should gate ops on
+    /// `SessionCapabilities.thread_actions` (with `codex_thread_actions` as
+    /// the legacy fallback), never on backend identity.
+    #[serde(alias = "thread_action")]
     CodexThreadAction {
         /// Target Codex thread/session. Kept optional on the wire for
         /// compatibility, but the control plane rejects missing values so an
@@ -1367,6 +1378,14 @@ pub enum ControlMsg {
         /// Frame/upload IDs attached to the first turn sent after resume.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<String>,
+        /// Fork the resumed backend thread into a NEW session instead of
+        /// attaching to it: the supervisor always creates a fresh wrapper
+        /// session (attach dedupe is skipped) and the backend is spawned
+        /// with its fork flag (Claude Code `--fork-session`), so the parent
+        /// thread is left untouched and the child announces its own native
+        /// id on the first turn.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        fork: bool,
         /// Per-session executable override. When omitted, the supervisor
         /// rehydrates the persisted session value before falling back to the
         /// global Settings value.
@@ -3114,6 +3133,39 @@ mod tests {
     }
 
     #[test]
+    fn control_msg_thread_action_accepts_universal_and_legacy_names() {
+        // `thread_action` is the canonical backend-neutral name; the
+        // Codex-flavored legacy tag must keep deserializing for old
+        // frontends and replayed control logs.
+        for action in ["thread_action", "codex_thread_action"] {
+            let json = format!(r#"{{"action":"{action}","op":"compact","session_id":"sess-1"}}"#);
+            let msg: ControlMsg = serde_json::from_str(&json).unwrap();
+            match msg {
+                ControlMsg::CodexThreadAction { session_id, op, .. } => {
+                    assert_eq!(session_id.as_deref(), Some("sess-1"));
+                    assert_eq!(op, "compact");
+                }
+                other => panic!("expected thread action for tag {action}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn control_msg_resume_session_fork_defaults_false() {
+        let json = r#"{"action":"resume_session","source":"claude-code","session_id":"abc"}"#;
+        match serde_json::from_str::<ControlMsg>(json).unwrap() {
+            ControlMsg::ResumeSession { fork, .. } => assert!(!fork),
+            other => panic!("expected ResumeSession, got {other:?}"),
+        }
+        let json =
+            r#"{"action":"resume_session","source":"claude-code","session_id":"abc","fork":true}"#;
+        match serde_json::from_str::<ControlMsg>(json).unwrap() {
+            ControlMsg::ResumeSession { fork, .. } => assert!(fork),
+            other => panic!("expected ResumeSession, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn control_msg_deny_deserialize() {
         let json = r#"{"action":"deny","id":7}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
@@ -3676,6 +3728,7 @@ mod tests {
                 task,
                 direct,
                 attachments,
+                fork,
                 agent_command,
                 codex_sandbox,
                 codex_approval_policy,
@@ -3683,6 +3736,7 @@ mod tests {
                 codex_context_archive,
             } => {
                 assert_eq!(source, "codex");
+                assert!(!fork);
                 assert_eq!(session_id, "thread-1");
                 assert_eq!(resume_id.as_deref(), Some("thread-1"));
                 assert_eq!(project_root.as_deref(), Some("/repo"));
@@ -4277,6 +4331,7 @@ mod tests {
                 follow_up: true,
                 steer: false,
                 interrupt: false,
+                thread_actions: Vec::new(),
                 codex_thread_actions: vec!["undo".to_string()],
                 codex_managed_context: Some("managed".to_string()),
                 codex_sandbox: Some("danger-full-access".to_string()),

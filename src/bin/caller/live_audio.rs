@@ -1441,27 +1441,20 @@ impl TranscriptLogger {
 // Full session orchestrator
 // ---------------------------------------------------------------------------
 
-/// Run a complete live audio session: connect, bridge audio, capture transcript,
-/// validate response, quarantine unexpected content.
-///
-/// This is the main entry point called from the agent loop when handling a
-/// `spawn_live_audio` tool call. It blocks until the call finishes or times out.
 /// Buffer inbound audio chunks from the capture tee, accumulate ~3 seconds,
 /// run silence detection, and send to Whisper for transcription.
 /// Results are appended to the transcript JSONL as "app" speaker entries.
+///
+/// The transcriber is constructed by `run_session` from the project's
+/// `[transcription]` config — this loop only ever runs when the project has
+/// explicitly opted in.
 async fn whisper_inbound_loop(
+    transcriber: crate::transcription::WhisperTranscriber,
     mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
     sample_rate: u32,
     transcript_path: &Path,
 ) {
-    use crate::transcription::{self, Transcriber, TranscriptionConfig};
-
-    // Try to create a Whisper transcriber — if OPENAI_API_KEY is not set, just skip
-    let transcriber = match transcription::WhisperTranscriber::new(&TranscriptionConfig::default())
-    {
-        Ok(t) => t,
-        Err(_) => return, // No API key or config issue — silently skip
-    };
+    use crate::transcription::{self, Transcriber};
 
     // Buffer ~3 seconds of audio before sending to Whisper
     let threshold = (sample_rate as usize) * 2 * 3; // 3 seconds of 16-bit mono
@@ -1525,12 +1518,18 @@ async fn whisper_inbound_loop(
     }
 }
 
+/// Run a complete live audio session: connect, bridge audio, capture transcript,
+/// validate response, quarantine unexpected content.
+///
+/// This is the main entry point called from the agent loop when handling a
+/// `spawn_live_audio` tool call. It blocks until the call finishes or times out.
 pub async fn run_session(
     spec: &LiveAudioSpec,
     api_key: &str,
     bridge: &AudioBridge,
     session_log_dir: &Path,
     event_bus: Option<&crate::event::EventBus>,
+    transcription: &crate::transcription::TranscriptionConfig,
 ) -> Result<LiveAudioResult, CallerError> {
     let start = Instant::now();
     let timeout = Duration::from_secs(spec.timeout_secs);
@@ -1578,13 +1577,39 @@ pub async fn run_session(
     // Channel for routing model audio output to the playback task
     let (audio_out_tx, audio_out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
+    // Set up the Whisper transcription tee for inbound audio — only when the
+    // project has explicitly opted in ([transcription] enabled = true).
+    // Fail-closed: by default no call audio leaves the box for transcription.
+    let (capture_tee_tx, whisper_handle) = if transcription.enabled {
+        match crate::transcription::WhisperTranscriber::new(transcription) {
+            Ok(transcriber) => {
+                let (tee_tx, tee_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let whisper_transcript_path = transcript.path().to_path_buf();
+                let handle = tokio::spawn(async move {
+                    whisper_inbound_loop(transcriber, tee_rx, 24000, &whisper_transcript_path)
+                        .await;
+                });
+                (Some(tee_tx), Some(handle))
+            }
+            Err(e) => {
+                if let Some(bus) = event_bus {
+                    bus.send(crate::event::AppEvent::PresenceLog {
+                        message: format!(
+                            "Live audio: transcription enabled but unavailable ({e}); \
+                             continuing without inbound transcription"
+                        ),
+                        level: None,
+                        turn: None,
+                    });
+                }
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     // Start the audio bridge
-    // Set up Whisper transcription tee for inbound audio
-    let (capture_tee_tx, capture_tee_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let whisper_transcript_path = transcript.path().to_path_buf();
-    let whisper_handle = tokio::spawn(async move {
-        whisper_inbound_loop(capture_tee_rx, 24000, &whisper_transcript_path).await;
-    });
 
     let audio_bridge = start_audio_bridge(
         session.ws_write.clone(),
@@ -1592,7 +1617,7 @@ pub async fn run_session(
         session.sample_rate,
         bridge,
         audio_out_rx,
-        Some(capture_tee_tx),
+        capture_tee_tx,
     )
     .await?;
 
@@ -1791,7 +1816,9 @@ pub async fn run_session(
 
     // Stop the audio bridge and whisper task
     audio_bridge.stop();
-    whisper_handle.abort();
+    if let Some(handle) = whisper_handle {
+        handle.abort();
+    }
 
     // Close the WebSocket
     session.close().await;
@@ -2683,7 +2710,14 @@ mod tests {
 
         let tmp_dir = tempfile::tempdir().expect("create temp dir");
 
-        let result = run_session(&spec, &api_key, &bridge, tmp_dir.path(), None)
+        let result = run_session(
+            &spec,
+            &api_key,
+            &bridge,
+            tmp_dir.path(),
+            None,
+            &crate::transcription::TranscriptionConfig::default(),
+        )
             .await
             .expect("run_session failed");
 
@@ -2802,7 +2836,14 @@ mod tests {
         eprintln!("  Session ID: {}", session_id);
         eprintln!("  Log dir: {}", tmp_dir.path().display());
 
-        let result = run_session(&spec, &api_key, &bridge, tmp_dir.path(), None)
+        let result = run_session(
+            &spec,
+            &api_key,
+            &bridge,
+            tmp_dir.path(),
+            None,
+            &crate::transcription::TranscriptionConfig::default(),
+        )
             .await
             .expect("run_session failed");
 

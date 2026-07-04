@@ -12637,6 +12637,7 @@ command = "asana-mcp"
             mcp_auth_token: None,
             mcp_session_id: Some("test-session".to_string()),
             resume_session: None,
+            fork_resume: false,
             codex_home: None,
         };
 

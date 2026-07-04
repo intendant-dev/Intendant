@@ -8662,6 +8662,7 @@ impl IntendantServer {
                                 project_root: target.project_root,
                                 task: Some(params.task),
                                 direct: params.orchestrate.map(|orchestrate| !orchestrate),
+                                fork: false,
                                 attachments: vec![],
                                 agent_command: target.agent_command,
                                 codex_sandbox: target.codex_sandbox,
@@ -10937,8 +10938,24 @@ impl IntendantServer {
             turn: None,
         });
 
-        let result =
-            live_audio::run_session(&spec, &api_key, &bridge, &log_dir, Some(&self.bus)).await;
+        // Live-call transcription follows the same project opt-in as every
+        // other transcription surface; unreachable config stays fail-closed
+        // (TranscriptionConfig::default() is disabled).
+        let transcription = project_root
+            .clone()
+            .and_then(|root| crate::project::Project::from_root(root).ok())
+            .map(|p| p.config.transcription)
+            .unwrap_or_default();
+
+        let result = live_audio::run_session(
+            &spec,
+            &api_key,
+            &bridge,
+            &log_dir,
+            Some(&self.bus),
+            &transcription,
+        )
+        .await;
 
         drop(bridge);
 
@@ -13617,6 +13634,7 @@ mod tests {
                     codex_context_archive: Some("summary".to_string()),
                     codex_service_tier: None,
                     codex_home: Some(home.path().join(".codex").to_string_lossy().to_string()),
+                    forked_from: None,
                 },
             )
             .unwrap();
@@ -13649,6 +13667,7 @@ mod tests {
                     source,
                     session_id,
                     resume_id,
+                    fork: _,
                     project_root: resumed_project_root,
                     task,
                     direct,
@@ -13729,6 +13748,7 @@ mod tests {
                     codex_context_archive: Some("summary".to_string()),
                     codex_service_tier: None,
                     codex_home: Some(home.path().join(".codex").to_string_lossy().to_string()),
+                    forked_from: None,
                 },
             )
             .unwrap();
@@ -13775,6 +13795,7 @@ mod tests {
                     source,
                     session_id,
                     resume_id,
+                    fork: _,
                     project_root: resumed_project_root,
                     task,
                     direct,
@@ -14315,6 +14336,7 @@ mod tests {
                     source,
                     session_id,
                     resume_id,
+                    fork: _,
                     task,
                     direct,
                     ..
@@ -15230,6 +15252,7 @@ mod tests {
                     follow_up: true,
                     steer: true,
                     interrupt: true,
+                    thread_actions: Vec::new(),
                     codex_thread_actions: vec!["rewind_context".to_string()],
                     codex_managed_context: Some("managed".to_string()),
                     codex_sandbox: Some("danger-full-access".to_string()),
@@ -15384,6 +15407,7 @@ mod tests {
                     follow_up: true,
                     steer: true,
                     interrupt: true,
+                    thread_actions: Vec::new(),
                     codex_thread_actions: vec!["rewind_context".to_string()],
                     codex_managed_context: Some("managed".to_string()),
                     codex_sandbox: Some("danger-full-access".to_string()),
@@ -15543,6 +15567,7 @@ mod tests {
                     follow_up: true,
                     steer: true,
                     interrupt: true,
+                    thread_actions: Vec::new(),
                     codex_thread_actions: vec!["undo".to_string()],
                     codex_managed_context: Some("managed".to_string()),
                     codex_sandbox: Some("danger-full-access".to_string()),
@@ -15759,6 +15784,7 @@ mod tests {
                             follow_up: true,
                             steer: true,
                             interrupt: true,
+                            thread_actions: Vec::new(),
                             codex_thread_actions: vec!["rewind_context".to_string()],
                             codex_managed_context: Some("managed".to_string()),
                             codex_sandbox: Some("danger-full-access".to_string()),
@@ -15841,6 +15867,7 @@ mod tests {
                             follow_up: true,
                             steer: true,
                             interrupt: true,
+                            thread_actions: Vec::new(),
                             codex_thread_actions: vec!["rewind_context".to_string()],
                             codex_managed_context: Some("managed".to_string()),
                             codex_sandbox: Some("danger-full-access".to_string()),
@@ -15936,6 +15963,7 @@ mod tests {
                             follow_up: true,
                             steer: true,
                             interrupt: true,
+                            thread_actions: Vec::new(),
                             codex_thread_actions: vec!["rewind_context".to_string()],
                             codex_managed_context: Some("managed".to_string()),
                             codex_sandbox: Some("danger-full-access".to_string()),
@@ -16002,6 +16030,7 @@ mod tests {
                             follow_up: true,
                             steer: true,
                             interrupt: true,
+                            thread_actions: Vec::new(),
                             codex_thread_actions: vec!["rewind_context".to_string()],
                             codex_managed_context: Some("managed".to_string()),
                             codex_sandbox: Some("danger-full-access".to_string()),
@@ -16100,6 +16129,7 @@ mod tests {
                 follow_up: true,
                 steer: true,
                 interrupt: true,
+                thread_actions: Vec::new(),
                 codex_thread_actions: vec!["rewind_context".to_string()],
                 codex_managed_context: Some("managed".to_string()),
                 codex_sandbox: Some("danger-full-access".to_string()),
