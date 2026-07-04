@@ -7467,6 +7467,11 @@ mod tests {
         assert!(!INSTALL_SH.contains("/etc/systemd/system"));
 
         assert!(INSTALL_PS1.starts_with("<#"), "ps1 installer must open with comment help");
+        // Windows PowerShell 5.1 decodes BOM-less files as ANSI, and a
+        // UTF-8 em-dash misdecodes into a cp1252 smart QUOTE — which the
+        // parser honors, unbalancing every string after it. The bootstrap
+        // script stays pure ASCII so no delivery path can corrupt it.
+        assert!(INSTALL_PS1.is_ascii(), "install.ps1 must be pure ASCII");
         for needle in [
             "param(",
             "$Owner",
