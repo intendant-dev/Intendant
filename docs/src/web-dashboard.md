@@ -453,10 +453,11 @@ and peer federation:
 - A **permission** is the operation gate the daemon enforces. Access
   administration now separates `access.inspect` from `access.manage`, and peer
   topology separates `peer.inspect`, `peer.manage`, and `peer.use`.
-  `peer.use` is the delegation gate: opening a tunnel to a connected peer
-  (dashboard-control, file-transfer, or display signaling) presents *this
-  daemon's* peer credentials, and the receiving peer authorizes everything
-  inside the tunnel against its own grants for this daemon — so relaying is
+  `peer.use` is the delegation gate: acting through a connected peer —
+  opening a tunnel (dashboard-control, file-transfer, or display signaling)
+  or sending it a message, task, or approval decision — presents *this
+  daemon's* peer credentials, and the receiving peer authorizes each action
+  against its own grants for this daemon — so relaying is
   never inferred from local capabilities, it is granted by name
   (`operator` and `peer-user` carry it; `peer.manage` implies it for
   compatibility). Owner/root dashboard sessions have all of these. Existing
@@ -1635,11 +1636,15 @@ unexpected transport.
 Pairing authorization follows the access/peer split: request and identity lists
 require `access.inspect`, invite/approve/revoke require `access.manage`, and
 join/request-access/poll remain peer-topology operations gated by `peer.manage`.
-The signaling relays that open tunnels to an already-connected peer
-(`api_peer_webrtc_signal`, `api_peer_file_transfer_signal`,
-`api_peer_dashboard_control_signal`, and their
-`POST /api/peers/{id}/…-webrtc` HTTP twins) are gated by `peer.use` instead —
-using a peer relationship is not administering it.
+Acting through an already-connected peer is gated by `peer.use` instead —
+using a peer relationship is not administering it. That covers the signaling
+relays that open tunnels (`api_peer_webrtc_signal`,
+`api_peer_file_transfer_signal`, `api_peer_dashboard_control_signal`, and
+their `POST /api/peers/{id}/…-webrtc` HTTP twins) and the quick controls
+(`api_peer_message`, `api_peer_task`, `api_peer_approval`, and their
+`POST /api/peers/{id}/message|task|approval` HTTP twins): each delegates this
+daemon's peer identity, and the receiving peer authorizes the action against
+its own grants for this daemon.
 General peer and coordinator controls are covered by the same rule. Peer add,
 remove, eligibility discovery, per-peer message/task/approval, peer-display
 signaling, and coordinator route calls use `api_peer_add`, `api_peer_remove`,
