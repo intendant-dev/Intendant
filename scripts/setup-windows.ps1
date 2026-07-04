@@ -72,7 +72,7 @@ $RepoRoot  = Split-Path -Parent $ScriptDir
 $script:NeedsManual = @()
 $script:PackageProvider = $null
 
-# ── Helpers ──────────────────────────────────────────────────────────────
+# -- Helpers --------------------------------------------------------------
 
 function Info($msg) { Write-Host ":: $msg" -ForegroundColor Cyan }
 function Warn($msg) { Write-Host "!! $msg" -ForegroundColor Yellow }
@@ -234,7 +234,7 @@ function Test-MediaFoundation {
     }
 }
 
-# ── Checks ─────────────────────────────────────────────────────────────────
+# -- Checks -----------------------------------------------------------------
 
 function Check-Core {
     $allOk = $true
@@ -319,7 +319,7 @@ function Check-Wasm {
         Ok "wasm-pack ($((wasm-pack --version) -replace '^wasm-pack\s+(\S+).*', '$1'))"
         return $true
     }
-    Miss "wasm-pack" "cargo install wasm-pack (optional -- build.rs degrades gracefully without it)"
+    Miss "wasm-pack" "cargo install wasm-pack --version 0.14.0 --locked (optional -- build.rs degrades gracefully without it)"
     return $false
 }
 
@@ -409,7 +409,7 @@ function Test-VbCable {
     }
 }
 
-# ── Install ──────────────────────────────────────────────────────────────
+# -- Install --------------------------------------------------------------
 
 function Install-Chocolatey {
     if (Test-Cmd choco) { return }
@@ -632,7 +632,9 @@ function Install-WasmPack {
         return
     }
     Info "installing wasm-pack (cargo install -- this may take a few minutes)..."
-    & cargo install wasm-pack
+    # Pinned to the version the committed wasm blobs were built with;
+    # cargo install resolves outside our Cargo.lock.
+    & cargo install wasm-pack --version 0.14.0 --locked
     if ($LASTEXITCODE -ne 0) {
         Warn "cargo install wasm-pack failed -- WASM rebuilds will be skipped."
         Warn "The dashboard still works from the pre-compiled static/wasm-web/ artifacts."
@@ -684,7 +686,7 @@ function Build-Intendant {
     Info "building intendant (release)..."
     Push-Location $RepoRoot
     try {
-        & cargo build --release --target x86_64-pc-windows-msvc
+        & cargo build --release --locked --target x86_64-pc-windows-msvc
         if ($LASTEXITCODE -ne 0) { Die "cargo build failed (exit $LASTEXITCODE)" }
     } finally {
         Pop-Location
@@ -776,7 +778,7 @@ function Show-CompletionSummary {
     if ($Built) {
         Ok "Build ready: $binDir\intendant.exe"
     } else {
-        Warn "   - Build skipped (-NoBuild); run cargo build --release --target x86_64-pc-windows-msvc when ready."
+        Warn "   - Build skipped (-NoBuild); run cargo build --release --locked --target x86_64-pc-windows-msvc when ready."
     }
     Ok "Web/display path: run from an interactive desktop session, then open the dashboard."
 
@@ -801,7 +803,7 @@ function Show-CompletionSummary {
     Write-Host ""
 }
 
-# ── Modes ──────────────────────────────────────────────────────────────────
+# -- Modes ------------------------------------------------------------------
 
 function Run-Check {
     Write-Host ""
@@ -925,7 +927,7 @@ function Run-Install {
     Show-CompletionSummary -Built $built
 }
 
-# ── Main ─────────────────────────────────────────────────────────────────
+# -- Main -----------------------------------------------------------------
 
 if (-not ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)) {
     Die "this script is for Windows"

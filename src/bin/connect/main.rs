@@ -177,6 +177,14 @@ struct ServiceConfig {
     /// Off by default so self-hosted instances stay zero-friction; the
     /// hosted instance turns it on. Existing accounts are unaffected.
     invite_required: bool,
+    /// Let daemons register and poll without the bearer token, even when
+    /// one is configured: registration is rate-limited, unclaimed records
+    /// expire after a day, and the gate moves to claim time (only
+    /// signed-in — on the hosted instance, invited — accounts can claim).
+    /// The token keeps guarding the admin surface regardless. This is
+    /// what makes the landing one-liner's claim story reachable by
+    /// someone who has never seen the operator token.
+    open_daemon_registration: bool,
 }
 
 impl ServiceConfig {
@@ -204,6 +212,10 @@ impl ServiceConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        let mut open_daemon_registration =
+            std::env::var("INTENDANT_CONNECT_OPEN_REGISTRATION")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+                .unwrap_or(false);
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -232,6 +244,9 @@ impl ServiceConfig {
                 }
                 "--invite-required" => {
                     invite_required = true;
+                }
+                "--open-registration" => {
+                    open_daemon_registration = true;
                 }
                 "--help" | "-h" => {
                     print_help();
@@ -262,6 +277,7 @@ impl ServiceConfig {
             data_file,
             daemon_token,
             invite_required,
+            open_daemon_registration,
             cookie_secure,
         })
     }
@@ -272,7 +288,8 @@ fn print_help() {
         "Usage: intendant-connect [--listen 127.0.0.1:9876] [--origin https://connect.intendant.dev] [--rp-id intendant.dev]\n\
          \n\
          Env: INTENDANT_CONNECT_LISTEN, INTENDANT_CONNECT_ORIGIN, INTENDANT_CONNECT_RP_ID,\n\
-              INTENDANT_CONNECT_STATIC_ROOT, INTENDANT_CONNECT_DATA_FILE, INTENDANT_CONNECT_TOKEN"
+              INTENDANT_CONNECT_STATIC_ROOT, INTENDANT_CONNECT_DATA_FILE, INTENDANT_CONNECT_TOKEN,\n\
+              INTENDANT_CONNECT_INVITE_REQUIRED, INTENDANT_CONNECT_OPEN_REGISTRATION"
     );
 }
 
@@ -921,29 +938,71 @@ async fn healthz() -> impl IntoResponse {
 /// at build time so the service — hosted or self-hosted — serves the
 /// installer that matches its own version:
 ///   curl -fsSL <origin>/install.sh | sh -s -- --owner <fingerprint>
+///
+/// Served with this rendezvous' public origin injected as the default
+/// `--connect` URL: fetching the installer from a rendezvous IS the opt-in,
+/// and a fresh VPS has no other way to learn where to register — without
+/// it the daemon comes up unregistered and hosted claiming dead-ends.
+/// (A compiled-in default in the daemon would instead make every install
+/// phone home to intendant.dev; serve-time injection keeps self-hosting
+/// exact.) Explicit `--connect` / `-Connect` still wins over the default.
 const INSTALL_SH: &str = include_str!("../../../scripts/install.sh");
+const INSTALL_SH_CONNECT_DEFAULT: &str = r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-}""#;
 
-async fn install_sh() -> impl IntoResponse {
+/// Only a plain URL charset may be spliced into the scripts — anything
+/// else (quotes, spaces, `$`) could change what the shell parses. A
+/// misconfigured origin falls back to serving the script verbatim.
+fn connect_default_injectable(origin: &str) -> bool {
+    !origin.is_empty()
+        && origin
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_'))
+}
+
+fn install_sh_body(public_origin: &str) -> String {
+    if !connect_default_injectable(public_origin) {
+        return INSTALL_SH.to_string();
+    }
+    INSTALL_SH.replacen(
+        INSTALL_SH_CONNECT_DEFAULT,
+        &format!(r#"CONNECT_URL="${{INTENDANT_CONNECT_RENDEZVOUS_URL:-{public_origin}}}""#),
+        1,
+    )
+}
+
+async fn install_sh(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        INSTALL_SH,
+        install_sh_body(&state.config.public_origin),
     )
 }
 
 /// The Windows counterpart, for PowerShell:
 ///   & ([scriptblock]::Create((irm <origin>/install.ps1))) -Owner <fingerprint>
 const INSTALL_PS1: &str = include_str!("../../../scripts/install.ps1");
+const INSTALL_PS1_CONNECT_DEFAULT: &str = "    [string]$Connect = \"\",";
 
-async fn install_ps1() -> impl IntoResponse {
+fn install_ps1_body(public_origin: &str) -> String {
+    if !connect_default_injectable(public_origin) {
+        return INSTALL_PS1.to_string();
+    }
+    INSTALL_PS1.replacen(
+        INSTALL_PS1_CONNECT_DEFAULT,
+        &format!("    [string]$Connect = \"{public_origin}\","),
+        1,
+    )
+}
+
+async fn install_ps1(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        INSTALL_PS1,
+        install_ps1_body(&state.config.public_origin),
     )
 }
 
@@ -2359,7 +2418,7 @@ fn require_admin_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
             "admin endpoints require the service to be started with --daemon-token",
         ));
     }
-    require_daemon_auth(state, headers)
+    require_bearer_token(state, headers)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2477,7 +2536,11 @@ async fn admin_invites_revoke(
     Ok(Json(json!({ "ok": true, "revoked": revoked })))
 }
 
-fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+/// Bearer check against the configured operator token. Admin endpoints
+/// verify through this directly (`require_admin_auth`) — never through
+/// `require_daemon_auth` — so opening daemon registration can never open
+/// the admin surface.
+fn require_bearer_token(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     let Some(token) = state.config.daemon_token.as_deref() else {
         return Ok(());
     };
@@ -2493,6 +2556,19 @@ fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
             "missing or invalid daemon bearer token",
         ))
     }
+}
+
+/// Gate for the daemon registration/polling endpoints. With
+/// `--open-registration` these are anonymous by design: registration is
+/// rate-limited, unclaimed records expire, and authorization moves to
+/// claim time (a signed-in — on the hosted instance, invited — account).
+/// Without it, the operator token (when configured) is required, which
+/// suits self-hosters who want a closed fleet.
+fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    if state.config.open_daemon_registration {
+        return Ok(());
+    }
+    require_bearer_token(state, headers)
 }
 
 fn header_string(headers: &HeaderMap, name: &'static str) -> Option<String> {
@@ -3679,7 +3755,8 @@ async fn api_status(
         "claim_code_expires_unix_ms": claim_code_expires_unix_ms,
         "queued": queued,
         "active_sessions": active_sessions,
-        "daemon_auth_required": state.config.daemon_token.is_some(),
+        "daemon_auth_required": state.config.daemon_token.is_some()
+            && !state.config.open_daemon_registration,
     }))
 }
 
@@ -3712,6 +3789,9 @@ async fn daemon_register(
         let mut claim_codes = state.claim_codes.lock().await;
         let mut store = state.store.lock().await;
         let now = now_unix_ms();
+        for stale_id in sweep_stale_unclaimed_daemons(&mut store, now) {
+            claim_codes.remove(&stale_id);
+        }
         let active_claim_hashes = active_claim_code_hashes(&store, &daemon_id, now);
         let claimed_now = if let Some(existing) =
             store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id)
@@ -3816,6 +3896,25 @@ fn generate_claim_code() -> ApiResult<String> {
     let mnemonic = Mnemonic::from_entropy(&entropy)
         .map_err(|e| ApiError::internal(format!("generate claim mnemonic: {e}")))?;
     Ok(mnemonic.to_string().replace(' ', "-"))
+}
+
+/// A day without polling: unclaimed records past this vanish on the next
+/// registration sweep, so open registration cannot grow the store without
+/// bound. Claimed daemons are never touched here — a returning unclaimed
+/// daemon simply re-registers and gets a fresh claim code.
+const UNCLAIMED_DAEMON_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+fn sweep_stale_unclaimed_daemons(store: &mut Store, now: u64) -> Vec<String> {
+    let mut removed = Vec::new();
+    store.daemons.retain(|daemon| {
+        let keep = daemon.owner_user_id.is_some()
+            || now.saturating_sub(daemon.last_seen_unix_ms) < UNCLAIMED_DAEMON_TTL_MS;
+        if !keep {
+            removed.push(daemon.daemon_id.clone());
+        }
+        keep
+    });
+    removed
 }
 
 fn active_claim_code_hashes(store: &Store, except_daemon_id: &str, now: u64) -> HashSet<String> {
@@ -5099,7 +5198,7 @@ const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advisor">
               var watched = pick.solo === 'no';
               if (pick.fuel !== 'sub') {
                 plan.push(watched
-                  ? '<b>Anthropic & Gemini: client egress.</b> Calls relay through this browser — the box never holds a key at all. OpenAI’s API refuses browser relay, so lease it with the offline window at “while connected only”.'
+                  ? '<b>Anthropic & Gemini: client egress.</b> The box never holds a key — its provider calls detour through this browser, and stop when it closes. OpenAI’s API refuses browser relay, so lease that one with the offline window at “while connected only”.'
                   : '<b>API keys: leases with a 24 h offline window.</b> Borrowed in memory only, never on disk, revocable from any signed-in device.');
               }
               if (pick.fuel !== 'api') {
@@ -5110,7 +5209,7 @@ const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advisor">
               }
             }
             document.getElementById('advplan').innerHTML = plan.map(function (item) { return '<li>' + item + '</li>'; }).join('');
-            var note = { vps: 'A disposable box should hold nothing durable: with egress or access-token leases, wiping it loses nothing and leaks nothing.',
+            var note = { vps: 'A disposable box should hold nothing durable. With client egress the key was never on it; with access-token leases what lands there dies in minutes. Wipe it — or lose it — and nothing leaks.',
                          server: 'Nothing rests on disk either way — leases only bound what a runtime compromise could spend before you revoke.',
                          laptop: 'Custody buys the least on the machine your browser already runs on.' }[pick.box];
             if (svc) {
@@ -5223,7 +5322,7 @@ fn landing_ui_html(origin: &str) -> String {
     .hero p {{ margin: 0 auto 28px; font-size: 17.5px; color: var(--muted); max-width: 680px; }}
     .cta {{ display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }}
     /* Framed product shots */
-    .heroshot {{ position: relative; margin: 50px 0 0; }}
+    .heroshot {{ position: relative; margin: 92px 0 0; }}
     .heroshot::before {{
       content: ""; position: absolute; inset: -60px 0 auto; height: 340px;
       background: radial-gradient(640px 260px at 50% 20%, rgba(137, 180, 250, .16), transparent 70%);
@@ -5268,6 +5367,19 @@ fn landing_ui_html(origin: &str) -> String {
       border-radius: 12px; box-shadow: var(--shadow); overflow: hidden;
     }}
     .shotnote {{ margin-top: 10px; font-size: 13px; color: var(--muted-2); }}
+    /* Custody: the two fueling modes, told by what travels */
+    .fuelmap {{ margin-top: 16px; display: grid; gap: 9px; }}
+    .fuelrow {{ display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }}
+    .fueltag {{
+      flex: 0 0 auto; min-width: 96px; text-align: center; padding: 2px 8px;
+      border: 1px solid var(--line-strong); border-radius: 6px;
+      font: 700 10.5px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: .08em; text-transform: uppercase; color: var(--accent);
+    }}
+    .fuelrow:last-child .fueltag {{ color: var(--ok); }}
+    .fuelflow {{ flex: 1; min-width: 230px; font-size: 13px; color: var(--muted-2); }}
+    .fuelflow em {{ font-style: normal; color: var(--muted); }}
+    .fuelflow .fx {{ opacity: .65; padding: 0 1px; }}
     /* The phone row: a bezel, not a browser frame */
     .phonepic {{ display: grid; justify-items: center; }}
     .phonepic .shotnote {{ text-align: center; }}
@@ -5288,7 +5400,9 @@ fn landing_ui_html(origin: &str) -> String {
     .card h3 {{ margin: 0 0 8px; font-size: 16px; }}
     .card p {{ margin: 0; font-size: 14px; color: var(--muted); }}
     /* Install */
-    .install-section {{ padding: 84px 0 0; }}
+    /* Sits directly under the hero: "how do I use it" is the first answer
+       the page gives, so it gets hero-adjacent spacing, not section spacing. */
+    .install-section {{ padding: 46px 0 0; }}
     .igrid {{ display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr); gap: 30px; align-items: start; }}
     .terminal {{
       background: var(--top); border: 1px solid var(--line-strong);
@@ -5319,6 +5433,9 @@ fn landing_ui_html(origin: &str) -> String {
     }}
     .step b {{ display: block; color: var(--text); margin-bottom: 4px; font-size: 14.5px; }}
     .step .n {{ color: var(--accent); font-weight: 700; margin-right: 6px; }}
+    .whyname {{ padding: 78px 0 0; }}
+    .whyname p {{ max-width: 65ch; margin: 0; font-size: 15.5px; color: var(--muted); line-height: 1.65; }}
+    .whyname p strong {{ color: var(--text); font-weight: 600; }}
     .trustrow {{ padding: 78px 0 20px; }}
     .trustrow .card {{ background: rgba(166, 227, 161, .05); border-color: rgba(166, 227, 161, .18); }}
     footer {{
@@ -5335,7 +5452,9 @@ fn landing_ui_html(origin: &str) -> String {
       .trow.rev .txt {{ order: 0; }}
       .tour {{ padding-top: 60px; }}
       .igrid {{ grid-template-columns: minmax(0, 1fr); }}
-      section.features, .install-section, .trustrow {{ padding-top: 56px; }}
+      section.features, .whyname, .trustrow {{ padding-top: 56px; }}
+      .install-section {{ padding-top: 36px; }}
+      .heroshot {{ margin-top: 64px; }}
     }}
   </style>
 </head>
@@ -5366,6 +5485,35 @@ fn landing_ui_html(origin: &str) -> String {
       <div class="cta">
         <a class="btn" href="/connect">Open your dashboard</a>
         <a class="btn ghost" href="#install">Install a daemon</a>
+      </div>
+    </section>
+
+    <section class="install-section" id="install">
+      <h2>Stand up a daemon in about ninety seconds</h2>
+      <p class="sectionlede">
+        Four answers about the machine the agent will live on, and the exact
+        command appears. That machine is the only one that installs anything
+        — you can be reading this from your phone.
+      </p>
+      <div class="igrid">
+        {advisor}
+        <div>
+          <div class="steps">
+            <div class="step"><b><span class="n">1</span>Install</b>
+              One command on a fresh box pins root authority to your browser's key. Nothing sensitive travels.</div>
+            <div class="step"><b><span class="n">2</span>Claim</b>
+              The daemon prints a twelve-word phrase; claim it from the browser you're already holding.</div>
+            <div class="step"><b><span class="n">3</span>Fuel</b>
+              Grant time-boxed credential leases from your encrypted vault — or relay calls through your browser and never hand over a key at all.</div>
+          </div>
+          <p class="installnote">
+            New here? <a href="/connect">Sign in</a> first — your key is in the
+            dashboard's Access drawer. Nothing sensitive travels in the command
+            or lands on the box: the daemon boots already owned by you, you claim
+            it with a twelve-word phrase, and it borrows credentials from your
+            vault only while you let it.
+          </p>
+        </div>
       </div>
     </section>
 
@@ -5427,10 +5575,19 @@ fn landing_ui_html(origin: &str) -> String {
           <div class="eyebrow">Credential custody</div>
           <h3>Fueling, not surrendering</h3>
           <p>Provider keys and subscription OAuth live end-to-end encrypted
-          behind your passkeys. Daemons borrow time-boxed leases that renew
-          from your browser and expire on their own — or relay calls through
-          the browser so a key never leaves it. Either way the machine's disk
-          holds nothing worth stealing, and revocation is immediate.</p>
+          behind your passkeys, and a machine gets fuel one of two ways. A
+          lease is borrowed authority — held in memory, renewed from your
+          browser, dead on expiry or the moment you revoke it. Client egress
+          goes further: the key never leaves your browser at all — the box's
+          provider calls detour through the tab you're signed in on. A
+          disposable VPS can be wiped, or seized, with nothing on it worth
+          taking.</p>
+          <div class="fuelmap">
+            <div class="fuelrow"><span class="fueltag">lease</span>
+              <span class="fuelflow">the key travels: vault <span class="fx">→</span> daemon memory <em>(expires on its own)</em> <span class="fx">→</span> provider calls from the box</span></div>
+            <div class="fuelrow"><span class="fueltag">client egress</span>
+              <span class="fuelflow">the calls travel: daemon <span class="fx">→</span> your browser <em>(the key stays here)</em> <span class="fx">→</span> provider</span></div>
+          </div>
         </div>
         <div class="pic">
           <div class="shot">
@@ -5512,33 +5669,15 @@ fn landing_ui_html(origin: &str) -> String {
       </div>
     </section>
 
-    <section class="install-section" id="install">
-      <h2>Stand up a daemon in about ninety seconds</h2>
-      <p class="sectionlede">
-        Four answers about the machine the agent will live on, and the exact
-        command appears. That machine is the only one that installs anything
-        — you can be reading this from your phone.
-      </p>
-      <div class="igrid">
-        {advisor}
-        <div>
-          <div class="steps">
-            <div class="step"><b><span class="n">1</span>Install</b>
-              One command on a fresh box pins root authority to your browser's key. Nothing sensitive travels.</div>
-            <div class="step"><b><span class="n">2</span>Claim</b>
-              The daemon prints a twelve-word phrase; claim it from the browser you're already holding.</div>
-            <div class="step"><b><span class="n">3</span>Fuel</b>
-              Grant time-boxed credential leases from your encrypted vault — or relay calls through your browser and never hand over a key at all.</div>
-          </div>
-          <p class="installnote">
-            New here? <a href="/connect">Sign in</a> first — your key is in the
-            dashboard's Access drawer. Nothing sensitive travels in the command
-            or lands on the box: the daemon boots already owned by you, you claim
-            it with a twelve-word phrase, and it borrows credentials from your
-            vault only while you let it.
-          </p>
-        </div>
-      </div>
+    <section class="whyname">
+      <h2>Why “Intendant”</h2>
+      <p>In a theater, performers play and conductors orchestrate — the
+      <strong>Intendant</strong> runs the house: who gets the stage, which
+      productions run, on whose authority, with the books open. Here agents
+      perform, orchestrators conduct (Codex and Claude Code as guest
+      conductors), and the Intendant runs the house and answers to you —
+      houses federate, companies tour on signed contracts, house rules always
+      win: a network of agentic networks.</p>
     </section>
 
     <section class="trustrow">
@@ -6829,6 +6968,25 @@ mod tests {
     }
 
     #[test]
+    fn open_registration_sweep_expires_only_stale_unclaimed_daemons() {
+        let now = UNCLAIMED_DAEMON_TTL_MS * 10;
+        let mut store = Store::default();
+        let mut stale = daemon_record("stale-unclaimed", None, None, None);
+        stale.last_seen_unix_ms = now - UNCLAIMED_DAEMON_TTL_MS - 1;
+        // Claimed daemons are the owner's — staleness never sweeps them.
+        let mut claimed = daemon_record("stale-claimed", Some(Uuid::new_v4()), None, None);
+        claimed.last_seen_unix_ms = 0;
+        let mut fresh = daemon_record("fresh-unclaimed", None, None, None);
+        fresh.last_seen_unix_ms = now - 1;
+        store.daemons = vec![stale, claimed, fresh];
+
+        let removed = sweep_stale_unclaimed_daemons(&mut store, now);
+        assert_eq!(removed, vec!["stale-unclaimed".to_string()]);
+        let ids: Vec<&str> = store.daemons.iter().map(|d| d.daemon_id.as_str()).collect();
+        assert_eq!(ids, vec!["stale-claimed", "fresh-unclaimed"]);
+    }
+
+    #[test]
     fn account_handles_enforce_charset_length_and_reservations() {
         assert!(validate_account_name("lenny").is_ok());
         assert!(validate_account_name("a-b-1").is_ok());
@@ -7362,6 +7520,7 @@ mod tests {
             data_file: PathBuf::from("state.json"),
             daemon_token: None,
             invite_required: false,
+            open_daemon_registration: false,
             cookie_secure: true,
         };
 
@@ -7425,6 +7584,23 @@ mod tests {
         // installs nothing, on any device — only the agent's machine does.
         assert!(html.contains("Nothing to install on your side"));
         assert!(html.contains("nothing to install on your side of the glass"));
+        // "How do I use it" is the page's first answer: the install
+        // questionnaire sits directly under the hero, before the shot tour.
+        let install_at = html.find(r#"<section class="install-section""#).unwrap();
+        let heroshot_at = html.find(r#"<section class="heroshot""#).unwrap();
+        let tour_at = html.find(r#"<section class="tour""#).unwrap();
+        assert!(
+            install_at < heroshot_at && heroshot_at < tour_at,
+            "install must lead, then the product tour"
+        );
+        // The name is the thesis, stated once, quietly, before the trust row.
+        assert!(html.contains("Why “Intendant”"));
+        assert!(html.contains("a network of agentic networks"));
+        // Custody names the two fueling modes by what travels: the key
+        // (lease) vs the calls (client egress — the disposable-box mode).
+        assert!(html.contains(r#"class="fuelmap""#));
+        assert!(html.contains("the key travels:"));
+        assert!(html.contains("the calls travel:"));
         // The canonical mark, not an ad-hoc monogram: favicon + header logo.
         assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/logo.svg">"#));
         assert!(html.contains(r#"<link rel="icon" type="image/png" href="/favicon.png">"#));
@@ -7550,6 +7726,54 @@ mod tests {
         ] {
             assert!(INSTALL_PS1.contains(needle), "install.ps1 must contain {needle}");
         }
+    }
+
+    #[test]
+    fn served_installers_default_connect_to_the_serving_rendezvous() {
+        // The embedded scripts must keep the sentinel lines the handlers
+        // splice — if either drifts, injection silently stops and a fresh
+        // VPS comes up unregistered (hosted claiming dead-ends).
+        assert!(
+            INSTALL_SH.contains(INSTALL_SH_CONNECT_DEFAULT),
+            "install.sh connect-default sentinel drifted"
+        );
+        assert!(
+            INSTALL_PS1.contains(INSTALL_PS1_CONNECT_DEFAULT),
+            "install.ps1 connect-default sentinel drifted"
+        );
+
+        let sh = install_sh_body("https://rendezvous.example");
+        assert!(sh.contains(
+            r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-https://rendezvous.example}""#
+        ));
+        assert!(!sh.contains(INSTALL_SH_CONNECT_DEFAULT));
+
+        let ps1 = install_ps1_body("https://rendezvous.example");
+        assert!(ps1.contains(r#"[string]$Connect = "https://rendezvous.example","#));
+        assert!(!ps1.contains(INSTALL_PS1_CONNECT_DEFAULT));
+        // The ANSI-decode trap applies to the served body, not just the
+        // embedded file — the injected origin must not break the pin.
+        assert!(ps1.is_ascii(), "served install.ps1 must stay pure ASCII");
+
+        // Splice guard: only a plain URL charset reaches the scripts.
+        assert!(connect_default_injectable("https://intendant.dev"));
+        assert!(connect_default_injectable("http://localhost:9891"));
+        assert!(!connect_default_injectable(r#"https://x"; rm -rf ~"#));
+        assert!(!connect_default_injectable("https://x y"));
+        assert!(!connect_default_injectable(""));
+        let verbatim = install_sh_body(r#"https://x" y"#);
+        assert_eq!(verbatim, INSTALL_SH, "unsafe origin must serve verbatim");
+    }
+
+    /// Windows PowerShell 5.1 executes setup-windows.ps1 straight from the
+    /// fresh clone, so the BOM-less ANSI-decode trap pinned for install.ps1
+    /// above applies to it identically — a non-ASCII byte that lands in
+    /// code (not a comment) can decode into a cp1252 smart quote the parser
+    /// honors. Keep every PowerShell file a fresh box runs pure ASCII.
+    #[test]
+    fn setup_windows_ps1_is_pure_ascii() {
+        const SETUP_PS1: &str = include_str!("../../../scripts/setup-windows.ps1");
+        assert!(SETUP_PS1.is_ascii(), "setup-windows.ps1 must be pure ASCII");
     }
 
     /// Real parse coverage for the PowerShell installer, on the platform

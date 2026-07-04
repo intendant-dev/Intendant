@@ -1,17 +1,19 @@
 # CLAUDE.md
 
-> **Living document — last verified 2026-07-03 against `main` @ `2800e1ce`.**
+> **Living document — last verified 2026-07-04 against `main` @ `3fb8eb30`.**
 > This is a *tight orientation* for working in the repo. The deep reference lives in
 > the mdBook under `docs/src/` (mapped below). **Both this file and those docs lag the
 > code** — Intendant moves fast (~500 commits/month) and the docs are *not* updated on
 > every change. When this file, the docs, and the source disagree, **trust the source**,
 > then fix the doc. See what changed since this was written with
-> `git log --oneline 2800e1ce..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
+> `git log --oneline 3fb8eb30..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
 > file — when you edit CLAUDE.md, run `cp CLAUDE.md AGENTS.md` in the same commit; CI enforces they match.)
 
 ## What Intendant Is
 
 Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. Beyond running its own agent loop, it **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines**. Provider-agnostic (OpenAI, Anthropic, Gemini); cross-platform (macOS, Linux, Windows — all first-class); every capability reachable from any interface (CLI, TUI, web dashboard, MCP, voice).
+
+Past the single box, the ambition is a **network of agentic networks** — fleets of daemons owned by people and organizations, where owners grant other people and other daemons scoped access to their machines, infrastructure, and resources. Three pillars carry it: the **trust architecture** (authority is only ever minted by the target daemon's local IAM; browser identity keys protected by passkeys; org root keys sign grant documents and revocation lists; the hosted rendezvous is zero-authority and self-hostable), **credential custody** (daemons borrow time-boxed leases from a passkey-sealed vault or relay calls through the owner's browser — a disposable box's disk holds no durable secrets), and the **zero-install client** (the entire client is a browser tab: claim a fresh daemon with a twelve-word phrase, watch every fleet display live, phone included). The name is the thesis: agents perform, orchestrators conduct, the Intendant runs the house — and answers to the owner.
 
 ## The Three Binaries (security boundary)
 
@@ -45,6 +47,7 @@ Read the relevant chapter before changing a subsystem:
 | Web dashboard (tabs, sessions, live voice) | `docs/src/web-dashboard.md` |
 | Station (rendered control canvas): architecture + roadmap to immersive 3D/XR | `docs/src/station.md` |
 | MCP server + client (trust model) | `docs/src/mcp-server.md` |
+| MCP client, external CLIs, audio stack, system tools, control socket, CI | `docs/src/integrations.md` |
 | Full `intendant.toml` + env reference | `docs/src/configuration.md` |
 | Session logging, replay, rehydration | `docs/src/session-logging.md` |
 | Windows backends and gotchas | `docs/src/windows-support.md` |
@@ -149,6 +152,35 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   (`check_core` or an appropriate check function) in the same commit. Silent
   missing deps break fresh-machine setups with cryptic `pkg-config` errors long
   after the crate was added.
+
+## Reconciling Contradictions
+
+This codebase is heavily AI-coding-agent built, at high velocity — contradictions
+between older and newer code, and between code and its comments/docs, are expected
+accumulated debt, not anomalies. Resolve them like amendments to a statute:
+**the latest deliberate change expresses the current intent and overrides what it
+contradicts** (*lex posterior*). Qualifiers, in order:
+
+1. **Invariants outrank recency.** The runtime/controller key boundary,
+   authority-minted-only-by-local-IAM, fail-closed defaults, and explicit user
+   decisions are not repealed by a newer commit that happens to conflict with them
+   — that's a bug in the newer commit.
+2. **Deliberate exceptions survive newer generalities** (*lex specialis*): a
+   documented platform carve-out or workaround is not steamrolled by a newer
+   general pattern. Deliberately parked seeds (unwired modules kept for a future
+   pass) are decisions, not stale losers — reconcile per-idea with the user,
+   never gut them wholesale.
+3. **Date the idea, not the line.** Use `git log -S`/`-L` on the semantic change;
+   mechanical sweeps (fmt, clippy, merge fixups, renames) re-touch lines without
+   carrying intent about them.
+4. **Age predicts craft.** Coding-agent capability rises quickly, so the older an
+   implementation, the weaker the model that likely wrote it. When two live
+   implementations of the same idea conflict, prefer the newer approach and port
+   what the older one still does better — but an old *decision* nothing has
+   revisited is not thereby wrong.
+5. **Codify the resolution.** Fix the losing side (comment, doc, or code) in the
+   same change, so the contradiction dies instead of being re-litigated by the
+   next agent.
 
 ## Platform Support
 

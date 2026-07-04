@@ -48,6 +48,19 @@ const CLIENT_CRT: &str = "client.crt";
 const CLIENT_P12: &str = "client.p12";
 const SERVER_NAMES: &str = "server_names";
 
+/// True when `cert_dir` holds none of the access material this module
+/// manages — no CA, no server pair, no client identity. This is the only
+/// state in which first-boot self-provisioning may act: anything partial
+/// means a human (or an older install) has been here, and regenerating a
+/// CA would strand every browser enrolled against it.
+pub fn dir_is_virgin(cert_dir: &Path) -> bool {
+    [
+        CA_KEY, CA_CRT, SERVER_KEY, SERVER_CRT, CLIENT_KEY, CLIENT_CRT, CLIENT_P12,
+    ]
+    .iter()
+    .all(|name| !cert_dir.join(name).exists())
+}
+
 /// Data returned from `ensure_certs` and used downstream by the cert
 /// distribution server.
 pub struct CertState {
@@ -588,6 +601,20 @@ mod tests {
     use super::*;
     use p12_keystore::KeyStore;
     use tempfile::TempDir;
+
+    #[test]
+    fn dir_is_virgin_only_without_any_access_material() {
+        let tmp = TempDir::new().unwrap();
+        assert!(dir_is_virgin(tmp.path()));
+        assert!(dir_is_virgin(&tmp.path().join("never-created")));
+        // A single stray file — even just half a server pair — must block
+        // self-provisioning: it means someone has been here before.
+        std::fs::write(tmp.path().join("server.crt"), "x").unwrap();
+        assert!(!dir_is_virgin(tmp.path()));
+        std::fs::remove_file(tmp.path().join("server.crt")).unwrap();
+        std::fs::write(tmp.path().join("ca.key"), "x").unwrap();
+        assert!(!dir_is_virgin(tmp.path()));
+    }
 
     fn names(ip: &str) -> ServerNames {
         ServerNames::new(

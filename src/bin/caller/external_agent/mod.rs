@@ -393,6 +393,88 @@ impl std::fmt::Display for AgentBackend {
     }
 }
 
+/// Availability of one external-agent backend on this daemon: whether the
+/// configured CLI resolves to an executable, and when this daemon last
+/// supervised a session with it. External agents authenticate with their
+/// own accounts, independent of provider fueling — the dashboard pairs
+/// this with the `fueled` flag so an unfueled daemon that can still run
+/// Codex or Claude Code doesn't read as dead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendAvailability {
+    pub backend: AgentBackend,
+    /// The command the daemon is configured to spawn for vanilla sessions.
+    pub command: String,
+    /// Whether the configured command (or, for Codex, the managed-capable
+    /// fork) resolves to an executable right now.
+    pub installed: bool,
+    /// Unix seconds of the most recent session this daemon recorded for
+    /// the backend — evidence it not only exists but has worked here.
+    pub last_used_secs: Option<u64>,
+}
+
+/// Probe every supported backend. Stat-based (never executes the CLIs),
+/// so it is cheap enough to answer a dashboard request directly. Reads
+/// the persisted project config only — a runtime `set_codex_command`
+/// override that hasn't been saved is not reflected.
+pub fn backend_availability(
+    agent_config: &crate::project::ExternalAgentConfig,
+    home: &Path,
+) -> Vec<BackendAvailability> {
+    [AgentBackend::Codex, AgentBackend::ClaudeCode]
+        .into_iter()
+        .map(|backend| {
+            let command = match backend {
+                AgentBackend::Codex => agent_config.codex.command.clone(),
+                AgentBackend::ClaudeCode => agent_config.claude_code.command.clone(),
+            };
+            let mut installed = crate::platform::resolve_command_path(&command).is_some();
+            if !installed && backend == AgentBackend::Codex {
+                // Managed sessions spawn the Intendant-aware fork instead
+                // of `command`; either binary makes the backend usable.
+                installed = agent_config
+                    .codex
+                    .managed_command
+                    .as_deref()
+                    .is_some_and(|cmd| crate::platform::resolve_command_path(cmd).is_some());
+            }
+            let last_used_secs =
+                crate::external_wrapper_index::wrappers_for_source(home, backend.as_short_str())
+                    .iter()
+                    .map(|record| record.updated_at_secs)
+                    .max()
+                    .filter(|secs| *secs > 0);
+            BackendAvailability {
+                backend,
+                command,
+                installed,
+                last_used_secs,
+            }
+        })
+        .collect()
+}
+
+/// The wire shape the dashboard consumes: `id` matches the new-session
+/// picker's `<option value>` attributes (`AgentBackend::as_short_str`).
+pub fn backend_availability_json(
+    agent_config: &crate::project::ExternalAgentConfig,
+    home: &Path,
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        backend_availability(agent_config, home)
+            .into_iter()
+            .map(|info| {
+                serde_json::json!({
+                    "id": info.backend.as_short_str(),
+                    "label": info.backend.to_string(),
+                    "command": info.command,
+                    "installed": info.installed,
+                    "last_used_secs": info.last_used_secs,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Events emitted by an external agent, normalized to Intendant concepts.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -1053,6 +1135,82 @@ mod tests {
             AgentBackend::from_str_loose("codex"),
             Some(AgentBackend::Codex)
         );
+    }
+
+    #[test]
+    fn backend_availability_reports_missing_installed_and_last_used() {
+        let home = tempfile::tempdir().unwrap();
+        let log_dir = tempfile::tempdir().unwrap();
+        let mut config = crate::project::ExternalAgentConfig::default();
+        config.codex.command = "intendant-test-absent-codex".to_string();
+        config.claude_code.command = "intendant-test-absent-claude".to_string();
+
+        // One recorded Codex session: its log-dir mtime becomes last_used.
+        crate::external_wrapper_index::upsert(
+            home.path(),
+            "codex",
+            "0198aa11-backend-thread",
+            "0198aa11-intendant-session",
+            log_dir.path(),
+            None,
+        )
+        .unwrap();
+
+        let availability = backend_availability(&config, home.path());
+        assert_eq!(availability.len(), 2);
+        assert_eq!(availability[0].backend, AgentBackend::Codex);
+        assert!(!availability[0].installed);
+        assert!(availability[0].last_used_secs.is_some());
+        assert_eq!(availability[1].backend, AgentBackend::ClaudeCode);
+        assert!(!availability[1].installed);
+        assert_eq!(availability[1].last_used_secs, None);
+    }
+
+    #[test]
+    fn backend_availability_counts_the_managed_codex_fork() {
+        let home = tempfile::tempdir().unwrap();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let fork = bin_dir.path().join(if cfg!(windows) {
+            "codex-fork.exe"
+        } else {
+            "codex-fork"
+        });
+        std::fs::write(&fork, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fork, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut config = crate::project::ExternalAgentConfig::default();
+        config.codex.command = "intendant-test-absent-codex".to_string();
+        config.codex.managed_command = Some(fork.to_string_lossy().to_string());
+        config.claude_code.command = "intendant-test-absent-claude".to_string();
+
+        let availability = backend_availability(&config, home.path());
+        assert!(
+            availability[0].installed,
+            "a resolvable managed fork must count as installed"
+        );
+        assert!(!availability[1].installed);
+    }
+
+    #[test]
+    fn backend_availability_json_uses_picker_ids() {
+        let home = tempfile::tempdir().unwrap();
+        let config = crate::project::ExternalAgentConfig::default();
+        let value = backend_availability_json(&config, home.path());
+        let entries = value.as_array().unwrap();
+        let ids: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.get("id").and_then(|id| id.as_str()).unwrap())
+            .collect();
+        assert_eq!(ids, vec!["codex", "claude-code"]);
+        for entry in entries {
+            assert!(entry.get("installed").is_some_and(serde_json::Value::is_boolean));
+            assert!(entry.get("command").is_some_and(serde_json::Value::is_string));
+            assert!(entry.get("label").is_some_and(serde_json::Value::is_string));
+        }
     }
 
     #[test]

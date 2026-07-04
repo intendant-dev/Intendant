@@ -71,7 +71,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # rustup ships preinstalled on the GitHub-hosted runners; just pin the
       # target this job type-checks against.
@@ -124,7 +124,7 @@ jobs:
       # saving them buys nothing — and the Windows tar/zstd save step is flaky
       # enough to fail an otherwise-green job. `save-if` keeps the speed-up on
       # restore while removing the unreliable post-run save from PR checks.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -136,5 +136,7 @@ jobs:
       # deliberately excludes the wasm workspace members (`presence-web`,
       # `station-web`), which have their own wasm-pack builds and don't build
       # against a native target.
+      # `--locked` makes lockfile drift a hard failure: CI must test exactly
+      # the dependency set main pins, never a silent re-resolution of it.
       - name: cargo test
-        run: cargo test -p intendant --bins --target ${{ matrix.target }}
+        run: cargo test -p intendant --bins --locked --target ${{ matrix.target }}

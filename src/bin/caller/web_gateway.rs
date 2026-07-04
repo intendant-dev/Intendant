@@ -17822,6 +17822,25 @@ pub(crate) fn project_root_response_body(project_root: Option<&Path>) -> String 
     .to_string()
 }
 
+/// Availability of the external-agent backends (Codex, Claude Code):
+/// the configured command, whether it resolves to an executable, and
+/// when this daemon last ran a session with it. Deliberately independent
+/// of provider fueling — external agents bring their own credentials, so
+/// the dashboard pairs this with the `fueled` flag instead of letting the
+/// first-run nudge claim an unfueled daemon can't do anything.
+pub(crate) fn external_agents_response_body(project_root: Option<&Path>) -> String {
+    let agent_config = project_root
+        .and_then(|root| crate::project::Project::from_root(root.to_path_buf()).ok())
+        .map(|project| project.config.agent)
+        .unwrap_or_default();
+    let home = crate::platform::home_dir();
+    serde_json::json!({
+        "external_agents":
+            crate::external_agent::backend_availability_json(&agent_config, &home),
+    })
+    .to_string()
+}
+
 pub(crate) async fn displays_response_body(
     session_registry: &Option<crate::display::SharedSessionRegistry>,
 ) -> String {
@@ -22783,6 +22802,21 @@ pub fn spawn_web_gateway(
                     } else if req_path == "/api/api-key-status" {
                         use tokio::io::AsyncWriteExt;
                         let body = api_key_status_response_body();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_path == "/api/external-agents" {
+                        use tokio::io::AsyncWriteExt;
+                        let body = external_agents_response_body(project_root.as_deref());
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -29197,6 +29231,7 @@ fn dashboard_http_operation(
         ("GET", "/api/settings") | ("GET", "/api/api-key-status") => {
             return Some(PeerOperation::Settings);
         }
+        ("GET", "/api/external-agents") => return Some(PeerOperation::SessionInspect),
         ("POST", "/api/settings") | ("POST", "/api/api-keys") => {
             return Some(PeerOperation::Settings);
         }

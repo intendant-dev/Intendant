@@ -344,16 +344,23 @@ the active compacted session is not mistaken for the target of the mutation.
 ### Files
 
 Edit, browse, download, and upload files on the local daemon or a configured
-peer target. The target summary uses the same access abstraction as Terminal:
-local/mTLS, hosted transports, and peer dashboard-control routes are shown as
-targets with their available capabilities rather than as transport internals.
+peer target. The tab is split into two sub-tabs: **Editor** (the default) and
+**Transfers** (the download/transfer-history/upload tooling). The target
+summary uses the same access abstraction as Terminal: local/mTLS, hosted
+transports, and peer dashboard-control routes are shown as targets with their
+available capabilities rather than as transport internals.
 
-The **Editor** card is a small IDE: a lazy directory tree on the left (rooted
-at the project root locally, `~` on peers; hidden-file toggle; new
-file/folder) and a multi-tab CodeMirror editor on the right (vendored bundle,
-`static/codemirror-bundle.js`, lazy-loaded on first use; syntax highlighting
-by filename, dirty markers, Cmd/Ctrl-S). Reads and writes ride the same fs
-API family as everything else and are therefore IAM-scoped end to end:
+The **Editor** sub-tab is a full-bleed workbench: a slim toolbar (target
+picker + one-line route summary + new file/folder), a lazy directory tree
+rail on the left (rooted at the project root locally, `~` on peers;
+hidden-file toggle), and a multi-tab CodeMirror editor filling the rest
+(vendored bundle, `static/codemirror-bundle.js`, lazy-loaded on first use;
+syntax highlighting by filename, dirty markers, hover-reveal close, a
+Reload-or-Overwrite conflict banner, Cmd/Ctrl-S). One accent answers "whose
+disk is this?": the active editor tab's underline, the tree selection, and
+the statusbar host chip render blue while editing this daemon and mauve on a
+peer (`--files-accent`). Reads and writes ride the same fs API family as
+everything else and are therefore IAM-scoped end to end:
 
 - Local targets use `GET /api/fs/stat|list|read` and `POST /api/fs/write`
   (both classified `FilesystemWrite`→`write_roots` for mutation, and gated by
@@ -1759,6 +1766,7 @@ family (sub-routes elided where the family is uniform):
 | `GET /recordings/*`, `GET /frames/*` | Current-session recording segments and captured frame assets |
 | `GET /api/fs/{stat,list,read}`, `POST /api/fs/mkdir` | Scoped filesystem browsing (fs scope enforced per grant) |
 | `GET/POST /api/settings`, `POST /api/api-keys`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key management |
+| `GET /api/external-agents` | External-agent backend availability (configured command, installed, last used) — drives the fueling nudge and new-session picker |
 | `GET /api/displays`, `POST /api/diagnostics/visual-freshness` | Display inventory; visual-freshness probe marker |
 | `GET /api/access/{overview,iam/state}`, `GET /api/dashboard/targets` | Trust-architecture snapshots (IAM state, fleet targets) |
 | `POST /api/access/...` | Trust mutations: enrollment decide, IAM grant upsert/update, org trust/revoke, org-grant issue/renew/revoke-member, issuer init/delegate/install, revocation-list apply |

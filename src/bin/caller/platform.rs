@@ -1045,6 +1045,71 @@ pub fn home_dir() -> std::path::PathBuf {
     }
 }
 
+/// Resolve a configured command string to an on-disk executable without
+/// running anything: values containing a path separator are checked
+/// directly, bare names are searched on `PATH`. A leading `~/` expands to
+/// the home directory, matching what users write in `intendant.toml`
+/// command fields. This is the probe half of `spawn_command`, for callers
+/// that want to report availability instead of failing at spawn time.
+pub fn resolve_command_path(command: &str) -> Option<std::path::PathBuf> {
+    resolve_command_path_in(command, std::env::var_os("PATH"))
+}
+
+/// `PATH` is injected so tests don't have to mutate process-global env
+/// (which races the parallel test runner).
+fn resolve_command_path_in(
+    command: &str,
+    path_var: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let expanded = if command == "~" || command.starts_with("~/") {
+        home_dir().join(command.trim_start_matches("~/").trim_start_matches('~'))
+    } else {
+        std::path::PathBuf::from(command)
+    };
+    if expanded.is_absolute() || expanded.components().count() > 1 {
+        return executable_candidate(&expanded);
+    }
+    for dir in std::env::split_paths(&path_var?) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if let Some(found) = executable_candidate(&dir.join(command)) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The candidate itself on Unix (a regular file with an execute bit); on
+/// Windows the candidate as-is when it already has an extension, else the
+/// usual `PATHEXT`-style suffixes.
+fn executable_candidate(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path).ok()?;
+        (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then(|| path.to_path_buf())
+    }
+    #[cfg(not(unix))]
+    {
+        let is_file = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.is_file());
+        if path.extension().is_some() {
+            return is_file(path).unwrap_or(false).then(|| path.to_path_buf());
+        }
+        for ext in ["exe", "cmd", "bat", "com"] {
+            let candidate = path.with_extension(ext);
+            if is_file(&candidate).unwrap_or(false) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
 /// Effective-root check for paths that install system-wide artifacts
 /// (`intendant service install` picks the system vs user unit by this).
 /// Root is a Unix concept; on Windows elevation is probed differently.
@@ -1117,6 +1182,72 @@ mod tests {
     #[test]
     fn home_dir_is_nonempty() {
         assert!(!home_dir().as_os_str().is_empty());
+    }
+
+    /// Drop an executable named `name` (plus the `.exe` suffix Windows
+    /// resolution probes for) into `dir` and return its path.
+    fn place_executable(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = if cfg!(windows) {
+            dir.join(format!("{name}.exe"))
+        } else {
+            dir.join(name)
+        };
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn resolve_command_path_finds_bare_names_on_the_given_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let placed = place_executable(dir.path(), "intendant-test-tool");
+        let path_var = Some(dir.path().as_os_str().to_os_string());
+
+        assert_eq!(
+            resolve_command_path_in("intendant-test-tool", path_var.clone()),
+            Some(placed)
+        );
+        assert_eq!(
+            resolve_command_path_in("intendant-test-absent", path_var),
+            None
+        );
+        // Bare names never resolve without a PATH to search.
+        assert_eq!(resolve_command_path_in("intendant-test-tool", None), None);
+    }
+
+    #[test]
+    fn resolve_command_path_checks_explicit_paths_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let placed = place_executable(dir.path(), "direct-tool");
+        // Query by the extensionless name; Windows resolution appends .exe.
+        let query = dir.path().join("direct-tool");
+
+        // An empty PATH must not matter for explicit paths.
+        let empty = Some(std::ffi::OsString::new());
+        assert_eq!(
+            resolve_command_path_in(&query.to_string_lossy(), empty.clone()),
+            Some(placed)
+        );
+        assert_eq!(
+            resolve_command_path_in(&dir.path().join("missing-tool").to_string_lossy(), empty),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_command_path_requires_the_execute_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("not-executable");
+        std::fs::write(&plain, b"data").unwrap();
+        assert_eq!(
+            resolve_command_path_in(&plain.to_string_lossy(), None),
+            None
+        );
     }
 
     #[cfg(unix)]

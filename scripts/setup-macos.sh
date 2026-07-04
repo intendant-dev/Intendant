@@ -250,9 +250,11 @@ check_wasm() {
     if has_cmd wasm-pack; then
         ok "wasm-pack"
     else
-        miss "wasm-pack" "cargo install wasm-pack"
+        miss "wasm-pack" "cargo install wasm-pack --version 0.14.0 --locked"
         info "installing wasm-pack..."
-        cargo install wasm-pack
+        # Pinned to the version the committed wasm blobs were built with;
+        # `cargo install` resolves outside our Cargo.lock.
+        cargo install wasm-pack --version 0.14.0 --locked
     fi
 }
 
@@ -419,7 +421,7 @@ build_intendant() {
     local repo_root="$script_dir/.."
 
     cd "$repo_root"
-    cargo build --release
+    cargo build --release --locked
 
     local bin_dir="$repo_root/target/release"
     echo ""

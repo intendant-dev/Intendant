@@ -29,9 +29,12 @@ Options:
                   where present, launchd on macOS, cron @reboot + the
                   built-in supervisor elsewhere) so it survives this SSH
                   session and restarts on failure.
-  --connect <url> Rendezvous to register with (defaults to the serving
-                  origin's INTENDANT_CONNECT_RENDEZVOUS_URL, if set).
+  --connect <url> Rendezvous to register with. Default: the environment's
+                  INTENDANT_CONNECT_RENDEZVOUS_URL, else the rendezvous
+                  this script was fetched from (injected when served).
   --daemon-id <id>Stable daemon id at the rendezvous.
+  --ref <ref>     Pin the fresh clone to a tag, branch, or commit instead
+                  of the default branch head.
   --no-run        Build and link only; print how to start it.
 
 Environment overrides:
@@ -45,6 +48,7 @@ INSTALL_DIR="${INTENDANT_INSTALL_DIR:-$HOME/intendant}"
 OWNER=""
 CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-}"
 DAEMON_ID="${INTENDANT_CONNECT_DAEMON_ID:-}"
+REF=""
 RUN=1
 SERVICE=0
 
@@ -62,6 +66,9 @@ while [ $# -gt 0 ]; do
     --daemon-id)
       [ $# -ge 2 ] || die "--daemon-id requires a value"
       DAEMON_ID="$2"; shift 2 ;;
+    --ref)
+      [ $# -ge 2 ] || die "--ref requires a git ref (tag, branch, or commit)"
+      REF="$2"; shift 2 ;;
     --service)
       SERVICE=1; shift ;;
     --no-run)
@@ -90,18 +97,23 @@ esac
 # detects the platform's supervisor itself (systemd / launchd / cron).
 
 # ── Toolchain ──
+# Only git is needed this early (for the clone). Rust may legitimately be
+# missing on a fresh box — scripts/setup-linux.sh installs it below, so
+# the hard requirement is enforced after dependency setup, not before it.
 command -v git >/dev/null 2>&1 || die "git is required (install it and re-run)"
-if ! command -v cargo >/dev/null 2>&1; then
-  die "Rust is required. Install via https://rustup.rs then re-run:
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-fi
 
 # ── Source ──
 if [ -d "$INSTALL_DIR/.git" ]; then
+  [ -z "$REF" ] || die "--ref pins fresh clones only; $INSTALL_DIR already exists — check out the ref there yourself"
   say "using existing checkout at $INSTALL_DIR (leaving it exactly as-is)"
 else
   say "cloning $REPO -> $INSTALL_DIR"
   git clone --depth 1 "$REPO" "$INSTALL_DIR"
+  if [ -n "$REF" ]; then
+    say "pinning checkout to $REF"
+    git -C "$INSTALL_DIR" fetch --depth 1 origin "$REF"
+    git -C "$INSTALL_DIR" checkout --detach FETCH_HEAD
+  fi
 fi
 cd "$INSTALL_DIR"
 
@@ -116,9 +128,19 @@ elif [ "$PLATFORM" = "Darwin" ] && [ -x scripts/setup-macos.sh ]; then
   ./scripts/setup-macos.sh || die "system dependency setup failed"
 fi
 
+# setup-linux.sh installs rustup when cargo is missing, but into its own
+# shell — pick the env up here before insisting.
+if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
+command -v cargo >/dev/null 2>&1 || die "Rust is required. Install via https://rustup.rs then re-run:
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+
 # ── Build ──
+# --locked: build exactly the committed Cargo.lock — a resolution that
+# differs from what CI tested is a failure, not a fallback.
 say "building release binaries (this takes a few minutes on a fresh box)"
-cargo build --release
+cargo build --release --locked
 
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"

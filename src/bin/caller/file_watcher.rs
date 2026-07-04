@@ -189,6 +189,32 @@ const IGNORED_EXTENSIONS: &[&str] = &[
     "svg", "webp", "zip", "tar", "gz", "bz2",
 ];
 
+/// Rewind snapshots baseline-copy and hash every file under the root —
+/// which is only sane inside an actual project. When project detection
+/// fell back to a bare cwd (no marker), the "root" is just wherever the
+/// daemon happened to start: a service's WorkingDirectory is `$HOME`,
+/// and baselining a home directory means minutes of boot-blocking I/O
+/// plus a shadow copy of everything the user owns under
+/// `file_snapshots/`. (Found live: a fresh-VPS service boot spent
+/// minutes reading `~/.rustup` before the dashboard and rendezvous
+/// client could spawn.)
+pub fn root_is_snapshot_worthy(root: &Path) -> bool {
+    // A git worktree's `.git` is a file, not a directory — exists()
+    // covers both shapes.
+    root.join(".git").exists() || root.join("intendant.toml").exists()
+}
+
+/// Tree-wide budget for the initial baseline scan. A root that blows
+/// past this is either not really a project or too large to shadow-copy;
+/// rewind degrades (the caller boots on without it) instead of stalling
+/// startup and duplicating gigabytes.
+pub(crate) const SNAPSHOT_MAX_TREE_FILES: usize = 100_000;
+pub(crate) const SNAPSHOT_MAX_TREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+fn tree_budget_exceeded(files_seen: usize, bytes_seen: u64) -> bool {
+    files_seen > SNAPSHOT_MAX_TREE_FILES || bytes_seen > SNAPSHOT_MAX_TREE_BYTES
+}
+
 pub(crate) fn should_ignore(rel_path: &Path) -> bool {
     for component in rel_path.components() {
         if let std::path::Component::Normal(name) = component {
@@ -442,6 +468,8 @@ impl FileWatcher {
         let mut baseline_manifest = BaselineManifest::new();
         let mut hashes = HashMap::new();
         let mut large_file_fingerprints = HashMap::new();
+        let mut files_seen: usize = 0;
+        let mut bytes_seen: u64 = 0;
 
         let mut stack = vec![project_root.clone()];
         while let Some(dir) = stack.pop() {
@@ -475,8 +503,19 @@ impl FileWatcher {
                     continue;
                 }
                 let rel_key = rel_path_key(&rel);
+                files_seen += 1;
+                if tree_budget_exceeded(files_seen, bytes_seen) {
+                    return Err(CallerError::Config(format!(
+                        "initial snapshot budget exceeded under {} ({files_seen} files / \
+                         {bytes_seen} bytes so far; caps {SNAPSHOT_MAX_TREE_FILES} files / \
+                         {SNAPSHOT_MAX_TREE_BYTES} bytes) — rewind snapshots stay off for \
+                         this run rather than shadow-copying a tree that large",
+                        project_root.display()
+                    )));
+                }
                 match inspect_file(&path) {
                     Ok(InspectedFile::Text(snapshot)) => {
+                        bytes_seen = bytes_seen.saturating_add(snapshot.size);
                         let baseline_path = baseline_dir.join(&rel);
                         if let Some(parent) = baseline_path.parent() {
                             std::fs::create_dir_all(parent).map_err(|e| {
@@ -507,6 +546,7 @@ impl FileWatcher {
                         );
                     }
                     Ok(InspectedFile::Unsupported(snapshot)) => {
+                        bytes_seen = bytes_seen.saturating_add(snapshot.size);
                         if snapshot.size > SNAPSHOT_MAX_FILE_BYTES {
                             if let Ok(meta) = std::fs::metadata(&path) {
                                 large_file_fingerprints
@@ -1320,6 +1360,32 @@ async fn run_watcher_loop(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn snapshot_worthiness_requires_a_project_marker() {
+        let tmp = TempDir::new().unwrap();
+        // A bare directory (the cwd-fallback root — e.g. a service's
+        // $HOME) is not a project and must never be baseline-scanned.
+        assert!(!root_is_snapshot_worthy(tmp.path()));
+        // A git worktree's .git is a FILE, not a directory.
+        std::fs::write(tmp.path().join(".git"), "gitdir: elsewhere").unwrap();
+        assert!(root_is_snapshot_worthy(tmp.path()));
+        std::fs::remove_file(tmp.path().join(".git")).unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        assert!(root_is_snapshot_worthy(tmp.path()));
+        std::fs::remove_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join("intendant.toml"), "").unwrap();
+        assert!(root_is_snapshot_worthy(tmp.path()));
+    }
+
+    #[test]
+    fn tree_budget_bounds_files_and_bytes() {
+        assert!(!tree_budget_exceeded(SNAPSHOT_MAX_TREE_FILES, 0));
+        assert!(tree_budget_exceeded(SNAPSHOT_MAX_TREE_FILES + 1, 0));
+        assert!(!tree_budget_exceeded(0, SNAPSHOT_MAX_TREE_BYTES));
+        assert!(tree_budget_exceeded(0, SNAPSHOT_MAX_TREE_BYTES + 1));
+        assert!(!tree_budget_exceeded(0, 0));
+    }
 
     fn make_watcher(root: &Path, snap: &Path) -> FileWatcher {
         let bus = EventBus::new();
