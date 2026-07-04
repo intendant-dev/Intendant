@@ -196,25 +196,64 @@ pub fn profile_fits_under(granted: &str, cap: &str) -> bool {
         .all(|op| !profile_allows_operation(granted, *op) || profile_allows_operation(cap, *op))
 }
 
+/// Canonical peer-profile vocabulary: every profile name a grant may carry,
+/// with the operation class it maps to. The dashboard's
+/// `PEER_PROFILE_OPTIONS` (static/app.html) mirrors the canonical names and
+/// `peerProfileMeta`'s alias map mirrors [`PROFILE_ALIASES`] — both pinned
+/// by parity tests below, so adding or renaming a profile here without
+/// updating the picker fails the suite instead of shipping drift.
+pub(crate) const PROFILES: &[(&str, ProfileClass)] = &[
+    ("presence-only", ProfileClass::PresenceOnly),
+    ("stats", ProfileClass::Stats),
+    ("session-reader", ProfileClass::SessionReader),
+    ("read-only-display", ProfileClass::ReadOnlyDisplay),
+    (
+        "shared-session-spectator",
+        ProfileClass::SharedSessionSpectator,
+    ),
+    ("file-reader", ProfileClass::FileReader),
+    ("file-operator", ProfileClass::FileOperator),
+    ("terminal-operator", ProfileClass::TerminalOperator),
+    ("task-runner", ProfileClass::TaskRunner),
+    ("peer-operator", ProfileClass::Operator),
+    ("peer-root", ProfileClass::AdminPeer),
+];
+
+/// Accepted alternate spellings, each canonicalizing to a [`PROFILES`] name.
+pub(crate) const PROFILE_ALIASES: &[(&str, &str)] = &[
+    ("presence", "presence-only"),
+    ("stats-only", "stats"),
+    ("sessions-read", "session-reader"),
+    ("session-inspect", "session-reader"),
+    ("logs-read", "session-reader"),
+    ("display-read-only", "read-only-display"),
+    ("spectator", "shared-session-spectator"),
+    ("files-read", "file-reader"),
+    ("filesystem-read-only", "file-reader"),
+    ("files", "file-operator"),
+    ("filesystem-operator", "file-operator"),
+    ("peer-terminal-operator", "terminal-operator"),
+    ("terminal", "terminal-operator"),
+    ("shell", "terminal-operator"),
+    ("operator", "peer-operator"),
+    ("admin-peer", "peer-root"),
+    ("admin", "peer-root"),
+    ("peer-daemon", "peer-root"),
+];
+
 pub fn profile_class(profile: &str) -> ProfileClass {
-    match profile.trim().to_ascii_lowercase().as_str() {
-        "presence-only" | "presence" => ProfileClass::PresenceOnly,
-        "stats" | "stats-only" => ProfileClass::Stats,
-        "session-reader" | "sessions-read" | "session-inspect" | "logs-read" => {
-            ProfileClass::SessionReader
-        }
-        "read-only-display" | "display-read-only" => ProfileClass::ReadOnlyDisplay,
-        "shared-session-spectator" | "spectator" => ProfileClass::SharedSessionSpectator,
-        "file-reader" | "files-read" | "filesystem-read-only" => ProfileClass::FileReader,
-        "file-operator" | "files" | "filesystem-operator" => ProfileClass::FileOperator,
-        "terminal-operator" | "peer-terminal-operator" | "terminal" | "shell" => {
-            ProfileClass::TerminalOperator
-        }
-        "task-runner" => ProfileClass::TaskRunner,
-        "operator" | "peer-operator" => ProfileClass::Operator,
-        "peer-root" | "admin-peer" | "admin" | "peer-daemon" => ProfileClass::AdminPeer,
-        _ => ProfileClass::PresenceOnly,
-    }
+    let normalized = profile.trim().to_ascii_lowercase();
+    let canonical = PROFILE_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == normalized)
+        .map(|(_, canonical)| *canonical)
+        .unwrap_or(normalized.as_str());
+    PROFILES
+        .iter()
+        .find(|(name, _)| *name == canonical)
+        .map(|(_, class)| *class)
+        // Unknown profiles degrade to the least-capable class.
+        .unwrap_or(ProfileClass::PresenceOnly)
 }
 
 pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
@@ -682,6 +721,64 @@ pub fn normalize_fingerprint(raw: &str) -> Result<String, CallerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dashboard's profile picker (`PEER_PROFILE_OPTIONS`) and alias
+    /// map (`peerProfileMeta`) are static mirrors of [`PROFILES`] /
+    /// [`PROFILE_ALIASES`] — they can't derive from this file, so this test
+    /// pins them: a profile added or renamed here without updating the
+    /// picker fails the suite instead of shipping drift.
+    #[test]
+    fn dashboard_profile_picker_mirrors_the_canonical_vocabulary() {
+        let app = include_str!("../../../../static/app.html");
+        let slice = |start: &str, end: &str| {
+            let from = app
+                .find(start)
+                .unwrap_or_else(|| panic!("marker {start:?} not found in app.html"))
+                + start.len();
+            let rest = &app[from..];
+            &rest[..rest
+                .find(end)
+                .unwrap_or_else(|| panic!("end marker {end:?} missing after {start:?}"))]
+        };
+
+        let options = slice("const PEER_PROFILE_OPTIONS = [", "\n];");
+        let picker: std::collections::BTreeSet<&str> = regex::Regex::new(r"profile: '([a-z-]+)'")
+            .unwrap()
+            .captures_iter(options)
+            .map(|caps| caps.get(1).unwrap().as_str())
+            .collect();
+        let canonical: std::collections::BTreeSet<&str> =
+            PROFILES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            picker, canonical,
+            "PEER_PROFILE_OPTIONS (static/app.html) drifted from PROFILES"
+        );
+
+        let alias_block = slice("function peerProfileMeta(", "const canonical");
+        let js_aliases: std::collections::BTreeSet<(&str, &str)> =
+            regex::Regex::new(r"(?m)^\s+'?([a-z][a-z-]*)'?: '([a-z-]+)',")
+                .unwrap()
+                .captures_iter(alias_block)
+                .map(|caps| {
+                    (
+                        caps.get(1).unwrap().as_str(),
+                        caps.get(2).unwrap().as_str(),
+                    )
+                })
+                .collect();
+        let rust_aliases: std::collections::BTreeSet<(&str, &str)> =
+            PROFILE_ALIASES.iter().copied().collect();
+        assert_eq!(
+            js_aliases, rust_aliases,
+            "peerProfileMeta aliases (static/app.html) drifted from PROFILE_ALIASES"
+        );
+
+        // Every alias lands on a canonical profile and classes agree.
+        for (alias, target) in PROFILE_ALIASES {
+            assert!(canonical.contains(target), "alias {alias} → unknown {target}");
+            assert_eq!(profile_class(alias), profile_class(target));
+        }
+    }
 
     #[test]
     fn profile_permissions_downgrade_task_runner() {
