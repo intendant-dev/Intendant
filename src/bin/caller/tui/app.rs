@@ -904,22 +904,24 @@ impl App {
                         true
                     }
                     KeyCode::Char('d') => {
-                        // Toggle user display access
+                        // Toggle user display access. Emit the intent to the
+                        // bus — the local handler's Grant/Revoke arms are
+                        // deliberate no-ops (control_plane owns this state),
+                        // so calling it directly would do nothing.
                         let granted = self
                             .autonomy
                             .try_read()
                             .map(|s| s.user_display_granted)
                             .unwrap_or(false);
-                        if granted {
-                            self.handle_control_command(ControlMsg::RevokeUserDisplay {
+                        let msg = if granted {
+                            ControlMsg::RevokeUserDisplay {
                                 display_id: None,
                                 note: None,
-                            });
+                            }
                         } else {
-                            self.handle_control_command(ControlMsg::GrantUserDisplay {
-                                display_id: None,
-                            });
-                        }
+                            ControlMsg::GrantUserDisplay { display_id: None }
+                        };
+                        self.pending_derived.push(AppEvent::ControlCommand(msg));
                         true
                     }
                     _ => false,
@@ -1105,24 +1107,26 @@ impl App {
     }
 
     fn cycle_autonomy_up(&mut self) {
-        let rt = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = rt {
-            let autonomy = self.autonomy.clone();
-            handle.spawn(async move {
-                let mut state = autonomy.write().await;
-                state.level = state.level.cycle_up();
-            });
+        // The control plane owns autonomy state: emit the intent instead of
+        // writing SharedAutonomy from the TUI (pre-control-plane residue).
+        // The AutonomyChanged event it broadcasts updates every surface.
+        if let Ok(state) = self.autonomy.try_read() {
+            let next = state.level.cycle_up();
+            self.pending_derived
+                .push(AppEvent::ControlCommand(ControlMsg::SetAutonomy {
+                    level: next.to_string(),
+                }));
         }
     }
 
     fn cycle_autonomy_down(&mut self) {
-        let rt = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = rt {
-            let autonomy = self.autonomy.clone();
-            handle.spawn(async move {
-                let mut state = autonomy.write().await;
-                state.level = state.level.cycle_down();
-            });
+        // See cycle_autonomy_up — same control-plane-owned path.
+        if let Ok(state) = self.autonomy.try_read() {
+            let next = state.level.cycle_down();
+            self.pending_derived
+                .push(AppEvent::ControlCommand(ControlMsg::SetAutonomy {
+                    level: next.to_string(),
+                }));
         }
     }
 

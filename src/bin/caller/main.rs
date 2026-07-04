@@ -13939,6 +13939,16 @@ async fn start_external_display_recordings(
 /// access session-wide. Every approval surface (JSON stdin slot, TUI/MCP
 /// registry) must apply these identically, or an approval "succeeds" and
 /// the action still fails its grant check afterwards.
+/// Shared side effects for NATIVE runtime approvals, applied identically
+/// by every surface (TUI Enter, web, MCP): Approve records the command
+/// for dedup, ApproveAll raises global autonomy to Full, DisplayControl
+/// grants user display access.
+///
+/// External-agent approvals deliberately do NOT route here: their
+/// "Approve all" is Intendant-enforced per external session
+/// (`approve_all_session` in the agent event loop) instead of flipping
+/// global autonomy — a button on one Codex/Claude session must not
+/// escalate every other surface of the daemon.
 async fn apply_user_approval(
     response: event::ApprovalResponse,
     cat: autonomy::ActionCategory,
@@ -34202,6 +34212,11 @@ async fn main() -> Result<(), CallerError> {
     // `install_default()` returns `Err(Arc<CryptoProvider>)` if a
     // provider is already installed (idempotent); we ignore that.
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Materialized OAuth credentials must never outlive the process:
+    // this guard revokes all leases on every normal return from main
+    // (the signal handler and the startup sweep cover the other exits).
+    let _lease_shutdown_guard = credential_leases::LeaseShutdownGuard::new();
 
     // Panic hook: handle broken pipe gracefully and persist panic info
     // to the active session's log directory for post-mortem auditing.

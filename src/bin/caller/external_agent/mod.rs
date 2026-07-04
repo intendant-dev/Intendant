@@ -378,10 +378,15 @@ fn human_bytes(n: u64) -> String {
 }
 
 /// Identifies which external agent backend is in use.
+///
+/// The serde wire form matches `as_short_str` — one canonical identifier
+/// (`"claude-code"`) everywhere; the old serde-derived `"claude_code"`
+/// stays accepted on deserialize so persisted state keeps parsing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum AgentBackend {
+    #[serde(rename = "codex")]
     Codex,
+    #[serde(rename = "claude-code", alias = "claude_code")]
     ClaudeCode,
 }
 
@@ -1459,11 +1464,16 @@ mod tests {
         let parsed: AgentBackend = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, AgentBackend::Codex);
 
+        // One canonical wire form (matches as_short_str)…
         let json = serde_json::to_string(&AgentBackend::ClaudeCode).unwrap();
-        assert_eq!(json, r#""claude_code""#);
+        assert_eq!(json, r#""claude-code""#);
 
         let parsed: AgentBackend = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, AgentBackend::ClaudeCode);
+
+        // …while state persisted by the old serde form keeps parsing.
+        let legacy: AgentBackend = serde_json::from_str(r#""claude_code""#).unwrap();
+        assert_eq!(legacy, AgentBackend::ClaudeCode);
     }
 
     /// Minimal backend that only implements the required trait methods, so

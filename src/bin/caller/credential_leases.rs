@@ -230,11 +230,14 @@ files, not from memory we control — the documented weakening in the
 custody chapter. An active oauth lease therefore materializes a
 private home directory (0700) holding exactly the leased auth file
 (0600); spawns point the agent at it (CODEX_HOME / CLAUDE_CONFIG_DIR)
-and it is deleted on lease expiry, revocation, and the startup
-recovery sweep. Non-secret configuration (config.toml /
-settings.json) is copied in so behavior is preserved; the user's own
-auth files never are. The directory lives under ~/.intendant, outside
-any project worktree, so the rewind/snapshot machinery never sees it. */
+and it is deleted on lease expiry, revocation, and daemon shutdown —
+normal exits via the `LeaseShutdownGuard` held by `main`, signal
+shutdown via the handler's explicit revoke — with the startup
+recovery sweep covering crashes where neither ran. Non-secret
+configuration (config.toml / settings.json) is copied in so behavior
+is preserved; the user's own auth files never are. The directory
+lives under ~/.intendant, outside any project worktree, so the
+rewind/snapshot machinery never sees it. */
 
 fn materialization_root() -> PathBuf {
     crate::platform::home_dir()
@@ -599,6 +602,31 @@ pub fn renew(lease_id: &str) -> Result<u64, String> {
         .ok_or_else(|| "no active lease with that id (expired or revoked)".to_string())?;
     lease.renewed_at_unix_ms = now;
     Ok(lease.expires_at_unix_ms())
+}
+
+/// Guard that revokes every lease when the process winds down. Held by
+/// `main` for the life of the process: `Drop` fires on every ordinary
+/// return path (task finished, daemon stopped, MCP stdin closed), the
+/// signal handler revokes explicitly before its `process::exit`, and the
+/// startup recovery sweep covers crashes where destructors never ran.
+/// Together these deliver the custody promise that materialized OAuth
+/// homes never outlive the daemon.
+#[derive(Default)]
+pub struct LeaseShutdownGuard(());
+
+impl LeaseShutdownGuard {
+    pub fn new() -> Self {
+        Self(())
+    }
+}
+
+impl Drop for LeaseShutdownGuard {
+    fn drop(&mut self) {
+        let dropped = revoke(None, "process exit");
+        if dropped > 0 {
+            eprintln!("Revoked {dropped} credential lease(s) at process exit");
+        }
+    }
 }
 
 /// Revoke by lease id, by kind, or everything (`None`). Returns how many

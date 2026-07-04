@@ -4563,7 +4563,15 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_access_org_issuer_delegate_available", access_manage),
         ("api_access_org_issuer_install_available", access_manage),
         ("api_access_org_orl_available", access_inspect),
-        ("api_access_org_orl_apply_available", access_inspect),
+        // Derived from the method gate, not hard-coded: orl_apply is
+        // deliberately courierable by any session (the root signature is
+        // the authority), so its availability must track that rule.
+        (
+            "api_access_org_orl_apply_available",
+            dashboard_control_method_operation("api_access_org_orl_apply")
+                .map(|op| runtime_allows_operation(runtime, op))
+                .unwrap_or(false),
+        ),
         ("api_access_org_renew_available", access_inspect),
         (
             "api_access_iam_upsert_user_client_grant_available",

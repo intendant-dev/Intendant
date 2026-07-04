@@ -1063,12 +1063,33 @@ mod wasm_impl {
         fn action_to_server_msg(&self, action: &PresenceAction) -> JsValue {
             let msg = match action {
                 PresenceAction::SubmitTask(envelope) => {
+                    // Carry the whole envelope onto the wire — the native and
+                    // gateway dispatch paths preserve reference frames,
+                    // display targets, and attachments, and dropping them
+                    // here silently unmoored voice tasks from what the user
+                    // was looking at. (context_hints stay presence-internal;
+                    // the wire StartTask has no field for them.)
                     let mut obj = serde_json::json!({
                         "action": "start_task",
                         "task": envelope.task,
                     });
                     if envelope.force_direct {
                         obj["orchestrate"] = serde_json::Value::Bool(false);
+                    }
+                    if !envelope.reference_frame_ids.is_empty() {
+                        obj["reference_frame_ids"] =
+                            serde_json::json!(envelope.reference_frame_ids);
+                    }
+                    if let Some(target) = envelope
+                        .display_target
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                    {
+                        obj["display_target"] = serde_json::json!(target);
+                    }
+                    if !envelope.attachment_frame_ids.is_empty() {
+                        obj["attachments"] = serde_json::json!(envelope.attachment_frame_ids);
                     }
                     Some(obj)
                 }
