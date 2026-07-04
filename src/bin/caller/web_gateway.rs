@@ -47203,6 +47203,9 @@ mod tests {
     /// drop the dead listener BEFORE entering their rebind loops — holding
     /// it made every attempt fail with EADDRINUSE forever while its
     /// backlog kept completing handshakes nothing would ever read.
+    /// Windows SO_REUSEADDR semantics differ (it can bind over an active
+    /// listener), so the still-bound assertion is Unix-only.
+    #[cfg(unix)]
     #[tokio::test]
     async fn rebind_fails_until_the_previous_listener_is_dropped() {
         let original = TcpListener::bind("127.0.0.1:0").await.unwrap();
