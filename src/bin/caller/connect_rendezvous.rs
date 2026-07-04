@@ -82,13 +82,6 @@ struct ErrorRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct AckRequest {
-    daemon_id: String,
-    request_id: String,
-    ok: bool,
-}
-
-#[derive(Debug, Serialize)]
 struct ClaimProofRequest {
     protocol: &'static str,
     daemon_id: String,
@@ -492,20 +485,21 @@ async fn handle_event(
             }
         }
         "ice" => {
-            let ok = match (event.session_id.as_deref(), event.candidate.as_ref()) {
+            let applied = match (event.session_id.as_deref(), event.candidate.as_ref()) {
                 (Some(session_id), Some(candidate)) => dashboard_control
                     .add_ice_candidate(session_id, candidate)
                     .await
                     .unwrap_or(false),
                 _ => false,
             };
-            let _ = post_ack(client, base_url, config, daemon_id, &event.id, ok).await;
+            if !applied {
+                eprintln!("[connect] dropped ICE candidate for event {}", event.id);
+            }
         }
         "close" => {
             if let Some(session_id) = event.session_id.as_deref() {
                 dashboard_control.close(session_id).await;
             }
-            let _ = post_ack(client, base_url, config, daemon_id, &event.id, true).await;
         }
         "claim_challenge" => {
             let Some(claim_id) = event.claim_id.as_deref().filter(|s| !s.trim().is_empty()) else {
@@ -748,29 +742,6 @@ async fn post_error(
         error: error.to_string(),
     };
     authenticated(config, client.post(join_url(base_url, "api/daemon/error")?))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-}
-
-async fn post_ack(
-    client: &Client,
-    base_url: &Url,
-    config: &ConnectConfig,
-    daemon_id: &str,
-    request_id: &str,
-    ok: bool,
-) -> Result<(), String> {
-    let body = AckRequest {
-        daemon_id: daemon_id.to_string(),
-        request_id: request_id.to_string(),
-        ok,
-    };
-    authenticated(config, client.post(join_url(base_url, "api/daemon/ack")?))
         .json(&body)
         .send()
         .await
