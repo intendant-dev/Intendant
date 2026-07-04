@@ -1,0 +1,12 @@
+# static/app.html is GENERATED from the static/app/ fragments (build.rs via
+# crates/app-html-assembler); edit the fragments, never the artifact.
+#
+# Byte-exactness pins: the artifact embeds one raw NUL byte (the
+# filesIdeBufferKey separator in 55-files-ide.js), so git's heuristics have
+# always treated the monolith as binary and never applied eol conversion to
+# it. Make that explicit for both the artifact and the fragments (-text), so
+# a Windows checkout (autocrlf=true runners) reassembles to identical bytes.
+# `diff` forces text diffs for the NUL-carrying fragment, which would
+# otherwise show as "Binary files differ".
+static/app.html -text
+static/app/** -text diff
