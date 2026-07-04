@@ -15,7 +15,7 @@
 //! is the contract the install scripts and the landing advisor lean on.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SYSTEMD_UNIT_NAME: &str = "intendant.service";
@@ -68,7 +68,6 @@ pub fn run_service_cli(args: &[String]) -> i32 {
 /* ── Backend detection ── */
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Clone, Copy)]
 enum Backend {
     /// system == true installs the machine-wide unit (root); false the
     /// `--user` unit with lingering.
