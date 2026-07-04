@@ -30001,6 +30001,94 @@ async fn run_external_agent_mode(
                                         stats.terminal_outcome = Some(reason);
                                         break 'outer;
                                     }
+                                    // Ambient diagnostics are not evidence of a
+                                    // backend-initiated turn. Recording them inline and
+                                    // staying idle matters: entering the observe drain on
+                                    // one of these deadlocks the session — with no real
+                                    // turn running the drain never sees a terminal event,
+                                    // so queued follow-ups are never picked up again
+                                    // (codex emits stderr `Log` lines right after a
+                                    // resume attach, e.g. failing MCP-server logins).
+                                    // Only turn-implying events (messages, reasoning,
+                                    // tools, plan/diff updates, turn completion) may fall
+                                    // through to the observe drain below.
+                                    external_agent::AgentEvent::Log { level, message } => {
+                                        slog(&session_log, |l| match level.as_str() {
+                                            "warn" => l.warn(&message),
+                                            "error" => l.error(&message),
+                                            _ => l.info(&message),
+                                        });
+                                        bus.send(AppEvent::LogEntry {
+                                            session_id: drain_config.session_id.clone(),
+                                            level,
+                                            source: drain_config
+                                                .agent_source
+                                                .clone()
+                                                .unwrap_or_else(|| "worker".to_string()),
+                                            content: message,
+                                            turn: None,
+                                        });
+                                    }
+                                    external_agent::AgentEvent::Usage { usage } => {
+                                        let main = frontend::ModelUsageSnapshot {
+                                            provider: usage.provider,
+                                            model: usage.model,
+                                            tokens_used: usage.tokens_used,
+                                            context_window: usage.context_window,
+                                            hard_context_window: usage.hard_context_window,
+                                            usage_pct: usage.usage_pct,
+                                            prompt_tokens: usage.prompt_tokens,
+                                            completion_tokens: usage.completion_tokens,
+                                            cached_tokens: usage.cached_tokens,
+                                        };
+                                        bus.send(AppEvent::UsageSnapshot {
+                                            session_id: drain_config.session_id.clone(),
+                                            main,
+                                            presence: None,
+                                        });
+                                    }
+                                    external_agent::AgentEvent::BackendError {
+                                        message,
+                                        code,
+                                        details,
+                                        will_retry,
+                                        ..
+                                    } => {
+                                        let mut content = if let Some(code) = code.as_deref() {
+                                            format!(
+                                                "{} backend error while idle ({code}): {message}",
+                                                agent.name()
+                                            )
+                                        } else {
+                                            format!(
+                                                "{} backend error while idle: {message}",
+                                                agent.name()
+                                            )
+                                        };
+                                        if let Some(details) =
+                                            details.as_deref().filter(|s| !s.trim().is_empty())
+                                        {
+                                            content.push('\n');
+                                            content.push_str(details.trim());
+                                        }
+                                        slog(&session_log, |l| {
+                                            if will_retry {
+                                                l.warn(&content)
+                                            } else {
+                                                l.error(&content)
+                                            }
+                                        });
+                                        bus.send(AppEvent::LogEntry {
+                                            session_id: drain_config.session_id.clone(),
+                                            level: if will_retry { "warn" } else { "error" }
+                                                .to_string(),
+                                            source: external_agent_log_source(
+                                                drain_config.agent_source.as_deref(),
+                                            ),
+                                            content,
+                                            turn: None,
+                                        });
+                                    }
                                     other => {
                                         let event_targets_primary = scoped_event_targets_config(
                                             &event_thread_id,
