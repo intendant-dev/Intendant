@@ -330,10 +330,36 @@ the active compacted session is not mistaken for the target of the mutation.
 
 ### Files
 
-Browse staged uploads and download files from the local daemon or a configured
+Edit, browse, download, and upload files on the local daemon or a configured
 peer target. The target summary uses the same access abstraction as Terminal:
 local/mTLS, hosted transports, and peer dashboard-control routes are shown as
 targets with their available capabilities rather than as transport internals.
+
+The **Editor** card is a small IDE: a lazy directory tree on the left (rooted
+at the project root locally, `~` on peers; hidden-file toggle; new
+file/folder) and a multi-tab CodeMirror editor on the right (vendored bundle,
+`static/codemirror-bundle.js`, lazy-loaded on first use; syntax highlighting
+by filename, dirty markers, Cmd/Ctrl-S). Reads and writes ride the same fs
+API family as everything else and are therefore IAM-scoped end to end:
+
+- Local targets use `GET /api/fs/stat|list|read` and `POST /api/fs/write`
+  (both classified `FilesystemWrite`→`write_roots` for mutation, and gated by
+  `authorize_http_filesystem_access` exactly like `mkdir`).
+- Peer targets ride the peer's dashboard-control tunnel: `api_fs_stat/list`
+  requests, `api_fs_read` byte streams, and `api_fs_write` upload frames.
+  Enforcement happens on the receiving daemon against its own peer profile
+  (`file-operator` vs `file-reader`) and per-peer filesystem roots; the
+  browser only picks where a request is sent, never whether it is allowed.
+- Saves are conflict-checked: full reads return the content's sha256
+  (`X-Content-Sha256` header on HTTP, `sha256` in the byte-stream result),
+  the editor sends it back as `expected_sha256`, and a mismatch returns
+  `409 {code:"conflict", current_sha256}`, which the UI surfaces as a
+  Reload-or-Overwrite banner instead of clobbering. New files save with
+  `create_new`; `force` is the explicit overwrite escape hatch. Writes land
+  atomically (same-directory tempfile, fsync, permission-preserving rename).
+- Guardrails: binary or non-UTF-8 and >2 MB files are refused with a pointer
+  to the Downloads flow; per-request write payloads cap at the shared 100 MB
+  upload limit; UTF-8 files keep their dominant line-ending style on save.
 
 ### Access
 
