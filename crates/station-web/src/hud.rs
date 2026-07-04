@@ -1836,7 +1836,6 @@ impl StationInner {
                 ("intendant", "internal"),
                 ("codex", "codex"),
                 ("claude", "claude-code"),
-                ("gemini", "gemini"),
             ]
             .into_iter()
             .map(|(label, id)| {
@@ -2470,7 +2469,6 @@ impl StationInner {
                 ("intendant", "internal"),
                 ("codex", "codex"),
                 ("claude", "claude-code"),
-                ("gemini", "gemini"),
             ] {
                 let cw = label.chars().count() as f32 * 5.8 + 16.0;
                 if cx + cw > x + sw - 86.0 {

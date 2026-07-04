@@ -43,6 +43,7 @@ Read the relevant chapter before changing a subsystem:
 | Presence layer (server text + browser voice) | `docs/src/presence.md` |
 | TUI + the autonomy/approval model | `docs/src/tui.md` |
 | Web dashboard (tabs, sessions, live voice) | `docs/src/web-dashboard.md` |
+| Station (rendered control canvas): architecture + roadmap to immersive 3D/XR | `docs/src/station.md` |
 | MCP server + client (trust model) | `docs/src/mcp-server.md` |
 | Full `intendant.toml` + env reference | `docs/src/configuration.md` |
 | Session logging, replay, rehydration | `docs/src/session-logging.md` |
