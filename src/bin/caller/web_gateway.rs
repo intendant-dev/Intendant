@@ -2063,6 +2063,27 @@ struct FsWriteRequest {
     force: bool,
 }
 
+/// Body of `POST /api/fs/rename` — move/rename a file or directory. Both
+/// `from` and `to` must pass write-scope authorization (removing an entry is
+/// a write at the source; creating one is a write at the destination). A
+/// rename never replaces an existing destination — fail closed and let the
+/// client delete explicitly first.
+#[derive(Debug, Deserialize)]
+struct FsRenameRequest {
+    from: String,
+    to: String,
+}
+
+/// Body of `POST /api/fs/delete`. Files and symlinks (the link itself, never
+/// its target) delete unconditionally; directories must be empty unless the
+/// client states `recursive: true`.
+#[derive(Debug, Deserialize)]
+struct FsDeleteRequest {
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+}
+
 /// Debug state for the voice model, tracked server-side from WebSocket messages.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct VoiceDebugState {
@@ -3674,7 +3695,7 @@ fn session_agent_output_response_for_ids(
 ) -> String {
     let source = crate::session_names::normalize_source(source);
     if source == "intendant" {
-        let Some(session_dir) = resolve_session_dir_from_home(home, session_id) else {
+        let Some(session_dir) = resolve_bare_session_dir_from_home(home, session_id) else {
             return upload_error_response("404 Not Found", "session not found");
         };
         return current_agent_output_response_for_ids(ids, &session_dir);
@@ -3702,7 +3723,13 @@ pub(crate) fn session_agent_output_post_response(
     }
 }
 
-fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+/// The PASTE-FRIENDLY policy, used by replay only: accepts a bare session
+/// directory name (like everything else) or a full pasted log-dir path,
+/// which must canonicalize under `~/.intendant/logs` (anchored by
+/// `session_names::intendant_session_dir_from_slash_path`). Every other
+/// dashboard endpoint holds the bare-id line — see
+/// `session_lookup_id_is_safe` for the policy split.
+fn intendant_session_dir_from_id_or_path(home: &Path, session_id: &str) -> Option<PathBuf> {
     if crate::session_names::session_id_looks_like_path(session_id) {
         return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
     }
@@ -4088,7 +4115,7 @@ fn resume_session_activity_replay_from_home(
 
     let source_norm = source.trim().to_lowercase();
     if source_norm == "intendant" {
-        let log_dir = intendant_session_dir_from_home(home, session_id)?;
+        let log_dir = intendant_session_dir_from_id_or_path(home, session_id)?;
         return session_log_replay_payload_from_dir_with_limit(&log_dir, Some(limit))
             .map(|(payload, _)| payload);
     }
@@ -4097,7 +4124,7 @@ fn resume_session_activity_replay_from_home(
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .unwrap_or(session_id);
-    if let Some(log_dir) = intendant_session_dir_from_home(home, session_id) {
+    if let Some(log_dir) = intendant_session_dir_from_id_or_path(home, session_id) {
         if let Some((payload, external_id)) =
             session_log_replay_payload_from_dir_with_limit(&log_dir, Some(limit))
         {
@@ -4853,10 +4880,12 @@ mod host_header_tests {
     }
 }
 
-/// List session directories from `~/.intendant/logs/`, returning JSON metadata
-/// for each session (newest first, capped at 100).
-/// Return session detail: replayed log entries + metadata for a single session.
-/// Resolve a session directory by exact ID or prefix match.
+/// The BARE-ID policy: dashboard session APIs take a plain directory name
+/// (or id prefix) — anything path-shaped is invalid input, full stop.
+/// The one deliberate exception is replay's paste-friendly resolver,
+/// `intendant_session_dir_from_id_or_path`, which additionally accepts a
+/// full log-dir path anchored under `~/.intendant/logs`. Pick one policy
+/// per endpoint on purpose; never mix them in one lookup.
 pub(crate) fn session_lookup_id_is_safe(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id.trim() == session_id
@@ -4866,7 +4895,10 @@ pub(crate) fn session_lookup_id_is_safe(session_id: &str) -> bool {
         && !session_id.contains('\\')
 }
 
-fn resolve_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+/// Resolve a session directory under `~/.intendant/logs` from a bare id:
+/// exact directory, then id-prefix match, then the listed-external-row
+/// fallback. Enforces the bare-id policy (`session_lookup_id_is_safe`).
+fn resolve_bare_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
     if !session_lookup_id_is_safe(session_id) {
         return None;
     }
@@ -4917,7 +4949,7 @@ fn resolve_session_dir_from_listed_external_row(home: &Path, session_id: &str) -
 }
 
 pub(crate) fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
-    resolve_session_dir_from_home(&crate::platform::home_dir(), session_id)
+    resolve_bare_session_dir_from_home(&crate::platform::home_dir(), session_id)
 }
 
 fn deleted_external_sessions_path(home: &Path) -> PathBuf {
@@ -5253,7 +5285,7 @@ fn get_session_detail_from_home_with_page(
     limit: Option<usize>,
     before: Option<usize>,
 ) -> String {
-    let session_dir = match resolve_session_dir_from_home(home, session_id) {
+    let session_dir = match resolve_bare_session_dir_from_home(home, session_id) {
         Some(d) => d,
         None => return serde_json::json!({"error": "session not found"}).to_string(),
     };
@@ -5383,7 +5415,7 @@ fn context_snapshot_candidate_log_dirs(
         }
     };
 
-    if let Some(dir) = resolve_session_dir_from_home(home, session_id) {
+    if let Some(dir) = resolve_bare_session_dir_from_home(home, session_id) {
         push(&mut dirs, &mut seen, dir);
     }
     let source = crate::session_names::normalize_source(source);
@@ -5842,7 +5874,7 @@ fn session_log_search_file_path(
     }
 
     match source {
-        "intendant" => Some(resolve_session_dir_from_home(home, session_id)?.join("session.jsonl")),
+        "intendant" => Some(resolve_bare_session_dir_from_home(home, session_id)?.join("session.jsonl")),
         "codex" => find_codex_session_file(home, session_id),
         "claude-code" => find_claude_session_file(home, session_id),
         "gemini" => find_gemini_session_file(home, session_id),
@@ -17104,12 +17136,261 @@ pub(crate) fn dashboard_fs_write_response_parts(
         force: params.get("force").and_then(|v| v.as_bool()).unwrap_or(false),
     };
     let (status_line, body) = apply_dashboard_fs_write(&args, bytes);
-    let code = status_line
+    (status_line_u16(&status_line), body.to_string())
+}
+
+/// Rename/move half of the dashboard editor. Same contract as
+/// [`apply_dashboard_fs_write`]: the caller has already routed **both** paths
+/// through the write-scope gate — this function performs no IAM checks of its
+/// own.
+///
+/// The source must exist; the destination's parent must exist; the
+/// destination itself must not (`409` `code:"exists"` — a rename never
+/// replaces, even though the underlying syscall would). Cross-filesystem
+/// moves are refused rather than silently degraded to copy+delete.
+pub(crate) fn apply_dashboard_fs_rename(
+    raw_from: &str,
+    raw_to: &str,
+) -> (String, serde_json::Value) {
+    let from = match expand_dashboard_fs_path(raw_from) {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({ "error": e }),
+            )
+        }
+    };
+    let from = match std::fs::canonicalize(&from) {
+        Ok(canonical) => canonical,
+        Err(e) => {
+            return (
+                dashboard_fs_io_status(&e).to_string(),
+                serde_json::json!({
+                    "error": format!("{} is not accessible: {e}", from.display()),
+                    "code": "missing",
+                }),
+            )
+        }
+    };
+    let to = match expand_dashboard_fs_path(raw_to) {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({ "error": e }),
+            )
+        }
+    };
+    // Resolve the destination the same way a creating write does: canonical
+    // parent (which must exist) + final name, so `..` segments and symlinked
+    // parents cannot smuggle the target elsewhere after authorization.
+    let Some(name) = to.file_name().map(|n| n.to_os_string()) else {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!("{} has no file name", to.display())
+            }),
+        );
+    };
+    let Some(parent) = to.parent() else {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!("{} has no parent directory", to.display())
+            }),
+        );
+    };
+    let canonical_parent = match std::fs::canonicalize(parent) {
+        Ok(canonical) => canonical,
+        Err(_) => {
+            return (
+                "404 Not Found".to_string(),
+                serde_json::json!({
+                    "error": format!(
+                        "parent directory {} does not exist — create it first",
+                        parent.display()
+                    ),
+                    "code": "missing_parent",
+                }),
+            )
+        }
+    };
+    if !canonical_parent.is_dir() {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!("{} is not a directory", canonical_parent.display())
+            }),
+        );
+    }
+    let to = canonical_parent.join(name);
+    if to == from {
+        return (
+            "200 OK".to_string(),
+            serde_json::json!({
+                "ok": true,
+                "from": from.to_string_lossy().to_string(),
+                "path": to.to_string_lossy().to_string(),
+                "renamed": false,
+                "notice": "source and destination are the same path",
+            }),
+        );
+    }
+    if from.is_dir() && to.starts_with(&from) {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "cannot move {} into itself",
+                    from.display()
+                ),
+            }),
+        );
+    }
+    if to.symlink_metadata().is_ok() {
+        return (
+            "409 Conflict".to_string(),
+            serde_json::json!({
+                "error": format!("{} already exists", to.display()),
+                "code": "exists",
+            }),
+        );
+    }
+    match std::fs::rename(&from, &to) {
+        Ok(()) => (
+            "200 OK".to_string(),
+            serde_json::json!({
+                "ok": true,
+                "from": from.to_string_lossy().to_string(),
+                "path": to.to_string_lossy().to_string(),
+                "renamed": true,
+            }),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "{} and {} are on different filesystems — copy and delete instead",
+                    from.display(),
+                    to.display()
+                ),
+                "code": "cross_device",
+            }),
+        ),
+        Err(e) => (
+            dashboard_fs_io_status(&e).to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "could not rename {} to {}: {e}",
+                    from.display(),
+                    to.display()
+                ),
+            }),
+        ),
+    }
+}
+
+/// Delete half of the dashboard editor. Same contract as
+/// [`apply_dashboard_fs_write`]: the caller has already routed the path
+/// through the write-scope gate — this function performs no IAM checks of
+/// its own.
+///
+/// Symlinks are deleted as links (`symlink_metadata`, never following), so a
+/// link whose target sits outside the caller's scope removes only the link.
+/// Non-empty directories require an explicit `recursive` (`409`
+/// `code:"not_empty"` otherwise).
+pub(crate) fn apply_dashboard_fs_delete(
+    raw_path: &str,
+    recursive: bool,
+) -> (String, serde_json::Value) {
+    let path = match expand_dashboard_fs_path(raw_path) {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({ "error": e }),
+            )
+        }
+    };
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            return (
+                dashboard_fs_io_status(&e).to_string(),
+                serde_json::json!({
+                    "error": format!("{} is not accessible: {e}", path.display()),
+                    "code": "missing",
+                }),
+            )
+        }
+    };
+    let is_dir = metadata.is_dir();
+    let result = if is_dir {
+        if recursive {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_dir(&path)
+        }
+    } else {
+        std::fs::remove_file(&path)
+    };
+    match result {
+        Ok(()) => (
+            "200 OK".to_string(),
+            serde_json::json!({
+                "ok": true,
+                "path": path.to_string_lossy().to_string(),
+                "deleted": true,
+                "dir": is_dir,
+            }),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => (
+            "409 Conflict".to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "{} is not empty — pass recursive to delete its contents",
+                    path.display()
+                ),
+                "code": "not_empty",
+            }),
+        ),
+        Err(e) => (
+            dashboard_fs_io_status(&e).to_string(),
+            serde_json::json!({
+                "error": format!("could not delete {}: {e}", path.display()),
+            }),
+        ),
+    }
+}
+
+/// Tunnel-facing wrapper for [`apply_dashboard_fs_rename`]: request fields
+/// as JSON params, `(http-ish status code, body)` out for
+/// `http_body_response`.
+pub(crate) fn dashboard_fs_rename_response_parts(params: &serde_json::Value) -> (u16, String) {
+    let from = params.get("from").and_then(|v| v.as_str()).unwrap_or_default();
+    let to = params.get("to").and_then(|v| v.as_str()).unwrap_or_default();
+    let (status_line, body) = apply_dashboard_fs_rename(from, to);
+    (status_line_u16(&status_line), body.to_string())
+}
+
+/// Tunnel-facing wrapper for [`apply_dashboard_fs_delete`].
+pub(crate) fn dashboard_fs_delete_response_parts(params: &serde_json::Value) -> (u16, String) {
+    let path = params.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+    let recursive = params
+        .get("recursive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let (status_line, body) = apply_dashboard_fs_delete(path, recursive);
+    (status_line_u16(&status_line), body.to_string())
+}
+
+fn status_line_u16(status_line: &str) -> u16 {
+    status_line
         .split_whitespace()
         .next()
         .and_then(|c| c.parse::<u16>().ok())
-        .unwrap_or(500);
-    (code, body.to_string())
+        .unwrap_or(500)
 }
 
 /// Extract the `Content-Type` request header value, or a generic default.
@@ -17525,6 +17806,11 @@ pub struct SettingsPayload {
     pub cu_provider: Option<String>,
     pub cu_model: Option<String>,
     pub cu_backend: String,
+    /// Read-only: `[experimental] cu_first_routing` from intendant.toml.
+    /// The dashboard shows the CU provider/model rows only when the
+    /// vaulted routing is enabled; the flag itself is file-only.
+    #[serde(default)]
+    pub cu_first_routing: bool,
     // Presence
     pub presence_enabled: bool,
     pub presence_provider: Option<String>,
@@ -17656,6 +17942,7 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         cu_provider: config.computer_use.provider.clone(),
         cu_model: config.computer_use.model.clone(),
         cu_backend: config.computer_use.backend.clone(),
+        cu_first_routing: config.experimental.cu_first_routing,
         presence_enabled: config.presence.enabled,
         presence_provider: config.presence.provider.clone(),
         presence_model: config.presence.model.clone(),
@@ -22247,9 +22534,9 @@ pub fn spawn_web_gateway(
                     // origins (and the write-side gate below enforces the same
                     // list on the actual requests, so a non-preflighted
                     // cross-site POST is refused too).
-                    if request_line.starts_with("OPTIONS") {
+                    if req_method == "OPTIONS" {
                         use tokio::io::AsyncWriteExt;
-                        let (_, opt_path, _) = parse_request_target(request_line);
+                        let opt_path = req_path;
                         let response = if (opt_path.starts_with("/api/")
                             && !is_fleet_cors_access_path(opt_path)
                             && !is_public_peer_access_request_path(request_line))
@@ -22829,6 +23116,87 @@ pub fn spawn_web_gateway(
                                     json_error("400 Bad Request", format!("invalid JSON: {e}"))
                                 }
                             }
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "POST" && req_path == "/api/fs/rename" {
+                        use tokio::io::AsyncWriteExt;
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let response = match serde_json::from_str::<FsRenameRequest>(&body_text) {
+                            // Removing the source entry and creating the
+                            // destination are both writes — each leg passes
+                            // the write-scope gate on its own path.
+                            Ok(req) => match authorize_http_filesystem_access(
+                                &http_access_context,
+                                peer_connection_identity.as_ref(),
+                                crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                crate::peer::access_policy::FilesystemAccessKind::Write,
+                                &req.from,
+                                &bus,
+                            )
+                            .and_then(|()| {
+                                authorize_http_filesystem_access(
+                                    &http_access_context,
+                                    peer_connection_identity.as_ref(),
+                                    crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                    crate::peer::access_policy::FilesystemAccessKind::Write,
+                                    &req.to,
+                                    &bus,
+                                )
+                            }) {
+                                Ok(()) => {
+                                    let (status, body) = tokio::task::spawn_blocking(move || {
+                                        apply_dashboard_fs_rename(&req.from, &req.to)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        (
+                                            "500 Internal Server Error".to_string(),
+                                            serde_json::json!({
+                                                "error": format!(
+                                                    "filesystem rename task failed: {e}"
+                                                )
+                                            }),
+                                        )
+                                    });
+                                    json_response(&status, body.to_string())
+                                }
+                                Err(message) => json_error("403 Forbidden", message),
+                            },
+                            Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "POST" && req_path == "/api/fs/delete" {
+                        use tokio::io::AsyncWriteExt;
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let response = match serde_json::from_str::<FsDeleteRequest>(&body_text) {
+                            Ok(req) => match authorize_http_filesystem_access(
+                                &http_access_context,
+                                peer_connection_identity.as_ref(),
+                                crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                crate::peer::access_policy::FilesystemAccessKind::Write,
+                                &req.path,
+                                &bus,
+                            ) {
+                                Ok(()) => {
+                                    let (status, body) = tokio::task::spawn_blocking(move || {
+                                        apply_dashboard_fs_delete(&req.path, req.recursive)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        (
+                                            "500 Internal Server Error".to_string(),
+                                            serde_json::json!({
+                                                "error": format!(
+                                                    "filesystem delete task failed: {e}"
+                                                )
+                                            }),
+                                        )
+                                    });
+                                    json_response(&status, body.to_string())
+                                }
+                                Err(message) => json_error("403 Forbidden", message),
+                            },
+                            Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/api/settings" {
@@ -23661,7 +24029,9 @@ pub fn spawn_web_gateway(
                             ),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/session/current/changes" {
+                    } else if req_method == "GET"
+                        && path_is_or_under(req_path, "/api/session/current/changes")
+                    {
                         // File change tracking endpoints:
                         //   GET /api/session/current/changes        — list all changed files
                         //   GET /api/session/current/changes/{path} — unified diff for one file
@@ -24265,7 +24635,7 @@ pub fn spawn_web_gateway(
                         let segments: Vec<&str> =
                             subpath.split('/').filter(|s| !s.is_empty()).collect();
                         let (status, body) =
-                            if segments.is_empty() && request_line.starts_with("POST") {
+                            if segments.is_empty() && req_method == "POST" {
                                 match read_request_body_capped(
                                     &mut stream,
                                     &header_text,
@@ -24284,7 +24654,7 @@ pub fn spawn_web_gateway(
                                     ),
                                     Err((status, body)) => (status, body),
                                 }
-                            } else if segments.len() == 1 && request_line.starts_with("GET") {
+                            } else if segments.len() == 1 && req_method == "GET" {
                                 peer_access_request_status(segments[0])
                             } else {
                                 (
@@ -24621,17 +24991,17 @@ pub fn spawn_web_gateway(
                             subpath.split('/').filter(|s| !s.is_empty()).collect();
 
                         let (status, body) = if segments == ["pairing", "invite"]
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_invite(&body_text)
                         } else if segments == ["pairing", "request-access"]
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_request_access(&body_text).await
                         } else if segments == ["pairing", "request-access", "poll"]
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_request_access_poll(
@@ -24641,22 +25011,22 @@ pub fn spawn_web_gateway(
                             )
                             .await
                         } else if segments == ["pairing", "requests"]
-                            && request_line.starts_with("GET")
+                            && req_method == "GET"
                         {
                             peers_pairing_requests_list()
                         } else if segments == ["pairing", "identities"]
-                            && request_line.starts_with("GET")
+                            && req_method == "GET"
                         {
                             peers_pairing_identities_list()
                         } else if segments == ["pairing", "identities", "revoke"]
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_identity_revoke(&body_text)
                         } else if segments.len() == 4
                             && segments[0] == "pairing"
                             && segments[1] == "requests"
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_request_decision(segments[2], segments[3], &body_text)
@@ -24670,18 +25040,18 @@ pub fn spawn_web_gateway(
                                     .to_string(),
                                 ),
                                 Some(registry)
-                                    if segments.is_empty() && request_line.starts_with("GET") =>
+                                    if segments.is_empty() && req_method == "GET" =>
                                 {
                                     (200, peers_list_response_body(registry))
                                 }
                                 Some(registry)
                                     if segments.is_empty()
-                                        && (request_line.starts_with("POST")
-                                            || request_line.starts_with("DELETE")) =>
+                                        && (req_method == "POST"
+                                            || req_method == "DELETE") =>
                                 {
                                     let body_text =
                                         read_request_body(&mut stream, &header_text).await;
-                                    if request_line.starts_with("POST") {
+                                    if req_method == "POST" {
                                         peers_add(registry, project_root.as_deref(), &body_text)
                                             .await
                                     } else {
@@ -24690,7 +25060,7 @@ pub fn spawn_web_gateway(
                                 }
                                 Some(registry)
                                     if segments == ["eligible"]
-                                        && request_line.starts_with("GET") =>
+                                        && req_method == "GET" =>
                                 {
                                     // GET /api/peers/eligible?capability=display
                                     // — list peers that satisfy all listed
@@ -24704,7 +25074,7 @@ pub fn spawn_web_gateway(
                                 }
                                 Some(registry)
                                     if segments == ["pairing", "join"]
-                                        && request_line.starts_with("POST") =>
+                                        && req_method == "POST" =>
                                 {
                                     let body_text =
                                         read_request_body(&mut stream, &header_text).await;
@@ -24716,7 +25086,7 @@ pub fn spawn_web_gateway(
                                     .await
                                 }
                                 Some(registry)
-                                    if segments.len() == 2 && request_line.starts_with("POST") =>
+                                    if segments.len() == 2 && req_method == "POST" =>
                                 {
                                     let id = url_path_decode(segments[0]);
                                     let op = segments[1];
@@ -24809,7 +25179,7 @@ pub fn spawn_web_gateway(
                                 })
                                 .to_string(),
                             ),
-                            Some(_) if !request_line.starts_with("POST") => (
+                            Some(_) if req_method != "POST" => (
                                 405,
                                 serde_json::json!({
                                     "error": "method not allowed"
@@ -29437,9 +29807,10 @@ fn dashboard_http_operation(
         ("GET", "/api/fs/stat") | ("GET", "/api/fs/list") | ("GET", "/api/fs/read") => {
             return Some(PeerOperation::FilesystemRead);
         }
-        ("POST", "/api/fs/mkdir") | ("POST", "/api/fs/write") => {
-            return Some(PeerOperation::FilesystemWrite)
-        }
+        ("POST", "/api/fs/mkdir")
+        | ("POST", "/api/fs/write")
+        | ("POST", "/api/fs/rename")
+        | ("POST", "/api/fs/delete") => return Some(PeerOperation::FilesystemWrite),
         ("POST", "/api/diagnostics/visual-freshness") => {
             return Some(PeerOperation::DisplayInput);
         }
@@ -29447,33 +29818,37 @@ fn dashboard_http_operation(
         _ => {}
     }
 
-    if req_path.starts_with("/api/managed-context/") {
+    // Boundary rule matches dispatch: exact path or a real `/` segment
+    // under it — a look-alike longer path (`/api/sessionsfoo`,
+    // `/api/worktrees/inspect-old`) is not a route there and must not be
+    // classified as one here.
+    if path_is_or_under(req_path, "/api/managed-context") {
         return Some(PeerOperation::SessionInspect);
     }
-    if req_path.starts_with("/api/session/current/") {
+    if path_is_or_under(req_path, "/api/session/current") {
         return Some(PeerOperation::SessionManage);
     }
-    if req_path.starts_with("/api/session/") {
+    if path_is_or_under(req_path, "/api/session") {
         return match req_method {
             "GET" => Some(PeerOperation::SessionInspect),
             "POST" | "DELETE" => Some(PeerOperation::SessionManage),
             _ => None,
         };
     }
-    if req_path.starts_with("/api/worktrees/inspect") {
+    // Worktree and session-list routes are exact in dispatch.
+    if req_path == "/api/worktrees/inspect" {
         return Some(PeerOperation::SessionInspect);
     }
-    if req_path.starts_with("/api/worktrees/scan") || req_path.starts_with("/api/worktrees/remove")
-    {
+    if req_path == "/api/worktrees/scan" || req_path == "/api/worktrees/remove" {
         return Some(PeerOperation::SessionManage);
     }
-    if req_path.starts_with("/api/worktrees") {
+    if req_path == "/api/worktrees" {
         return Some(PeerOperation::SessionInspect);
     }
-    if req_path.starts_with("/api/sessions") {
+    if req_path == "/api/sessions" {
         return Some(PeerOperation::SessionInspect);
     }
-    if req_path.starts_with("/api/peers") {
+    if path_is_or_under(req_path, "/api/peers") {
         return crate::peer::access_policy::federation_http_operation(req_method, req_path);
     }
 
@@ -36275,7 +36650,7 @@ mod tests {
             "",
         ] {
             assert!(
-                intendant_session_dir_from_home(home.path(), id).is_none(),
+                intendant_session_dir_from_id_or_path(home.path(), id).is_none(),
                 "path-shaped session id {id:?} must be refused"
             );
         }
@@ -38246,7 +38621,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            resolve_session_dir_from_home(home.path(), backend_id).as_deref(),
+            resolve_bare_session_dir_from_home(home.path(), backend_id).as_deref(),
             Some(wrapper_dir.as_path())
         );
     }
@@ -38266,14 +38641,14 @@ mod tests {
             " safe",
         ] {
             assert!(
-                resolve_session_dir_from_home(home.path(), session_id).is_none(),
+                resolve_bare_session_dir_from_home(home.path(), session_id).is_none(),
                 "unsafe session id resolved: {session_id:?}"
             );
         }
 
         let expected = home.path().join(".intendant/logs/safe-session");
         assert_eq!(
-            resolve_session_dir_from_home(home.path(), "safe").as_deref(),
+            resolve_bare_session_dir_from_home(home.path(), "safe").as_deref(),
             Some(expected.as_path())
         );
     }
@@ -41307,12 +41682,44 @@ mod tests {
             dashboard_http_operation("POST", "/api/fs/write"),
             Some(PeerOperation::FilesystemWrite)
         );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/fs/rename"),
+            Some(PeerOperation::FilesystemWrite)
+        );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/fs/delete"),
+            Some(PeerOperation::FilesystemWrite)
+        );
         // GET must not inherit the write classification, and look-alike
         // paths must not classify at all.
         assert_eq!(dashboard_http_operation("GET", "/api/fs/write"), None);
+        assert_eq!(dashboard_http_operation("GET", "/api/fs/rename"), None);
+        assert_eq!(dashboard_http_operation("GET", "/api/fs/delete"), None);
         assert_eq!(dashboard_http_operation("POST", "/api/fs/writeable"), None);
+        assert_eq!(dashboard_http_operation("POST", "/api/fs/deleted"), None);
         assert_eq!(dashboard_http_operation("POST", "/api/coordinator/route"), None);
         assert_eq!(dashboard_http_operation("GET", "/config"), None);
+        // The prefix families use the same boundary rule as dispatch:
+        // exact or a real `/` segment — dispatch's look-alike non-routes
+        // must be non-routes for the classifier too.
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/sessions"),
+            Some(PeerOperation::SessionInspect)
+        );
+        assert_eq!(dashboard_http_operation("GET", "/api/sessionsfoo"), None);
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/worktrees/inspect"),
+            Some(PeerOperation::SessionInspect)
+        );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/worktrees/inspect-old"),
+            None
+        );
+        assert_eq!(dashboard_http_operation("GET", "/api/peersfoo"), None);
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/session/current/changes/src/main.rs"),
+            Some(PeerOperation::SessionManage)
+        );
     }
 
     #[test]
@@ -41427,6 +41834,134 @@ mod tests {
         let (status, _) = write(&target, &huge, None, false, true);
         assert_eq!(status, "413 Payload Too Large");
         assert_eq!(std::fs::read(&target).unwrap(), b"v4");
+    }
+
+    #[test]
+    fn apply_dashboard_fs_rename_moves_and_never_replaces() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rename = |from: &std::path::Path, to: &std::path::Path| {
+            apply_dashboard_fs_rename(&from.to_string_lossy(), &to.to_string_lossy())
+        };
+
+        // A plain file rename moves the content.
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, b"payload").unwrap();
+        let (status, body) = rename(&a, &b);
+        assert_eq!(status, "200 OK", "{body}");
+        assert_eq!(body["renamed"], true);
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(&b).unwrap(), b"payload");
+
+        // A missing source is 404 code:"missing".
+        let (status, body) = rename(&a, &dir.path().join("c.txt"));
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body["code"], "missing");
+
+        // An existing destination is refused — renames never replace.
+        let c = dir.path().join("c.txt");
+        std::fs::write(&c, b"other").unwrap();
+        let (status, body) = rename(&b, &c);
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body["code"], "exists");
+        assert_eq!(std::fs::read(&b).unwrap(), b"payload");
+        assert_eq!(std::fs::read(&c).unwrap(), b"other");
+
+        // ... even when the destination is a dangling symlink.
+        #[cfg(unix)]
+        {
+            let dangling = dir.path().join("dangling");
+            std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+            let (status, body) = rename(&b, &dangling);
+            assert_eq!(status, "409 Conflict");
+            assert_eq!(body["code"], "exists");
+        }
+
+        // A missing destination parent is 404 code:"missing_parent".
+        let orphan = dir.path().join("no-such-dir").join("b.txt");
+        let (status, body) = rename(&b, &orphan);
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body["code"], "missing_parent");
+
+        // Directories move too — but never into themselves.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), b"x").unwrap();
+        let moved = dir.path().join("moved");
+        let (status, _) = rename(&sub, &moved);
+        assert_eq!(status, "200 OK");
+        assert_eq!(std::fs::read(moved.join("inner.txt")).unwrap(), b"x");
+        let inside = moved.join("nested");
+        let (status, body) = rename(&moved, &inside);
+        assert_eq!(status, "400 Bad Request");
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("into itself"));
+
+        // Renaming a path to itself is an explicit no-op.
+        let (status, body) = rename(&b, &b);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["renamed"], false);
+
+        // Relative paths are refused before touching the filesystem.
+        let (status, _) = apply_dashboard_fs_rename("relative/a", "relative/b");
+        assert_eq!(status, "400 Bad Request");
+    }
+
+    #[test]
+    fn apply_dashboard_fs_delete_scopes_directories_and_symlinks() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Files delete unconditionally.
+        let file = dir.path().join("gone.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let (status, body) = apply_dashboard_fs_delete(&file.to_string_lossy(), false);
+        assert_eq!(status, "200 OK", "{body}");
+        assert_eq!(body["dir"], false);
+        assert!(!file.exists());
+
+        // Deleting it again is 404 code:"missing".
+        let (status, body) = apply_dashboard_fs_delete(&file.to_string_lossy(), false);
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body["code"], "missing");
+
+        // Non-empty directories require an explicit recursive.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), b"x").unwrap();
+        let (status, body) = apply_dashboard_fs_delete(&sub.to_string_lossy(), false);
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body["code"], "not_empty");
+        assert!(sub.exists());
+        let (status, body) = apply_dashboard_fs_delete(&sub.to_string_lossy(), true);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["dir"], true);
+        assert!(!sub.exists());
+
+        // Empty directories delete without recursive.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let (status, _) = apply_dashboard_fs_delete(&empty.to_string_lossy(), false);
+        assert_eq!(status, "200 OK");
+        assert!(!empty.exists());
+
+        // A symlink deletes as a link: the target survives.
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("kept.txt");
+            std::fs::write(&target, b"keep me").unwrap();
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let (status, body) = apply_dashboard_fs_delete(&link.to_string_lossy(), false);
+            assert_eq!(status, "200 OK", "{body}");
+            assert!(link.symlink_metadata().is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+        }
+
+        // Relative paths are refused before touching the filesystem.
+        let (status, _) = apply_dashboard_fs_delete("relative/path", true);
+        assert_eq!(status, "400 Bad Request");
     }
 
     #[cfg(unix)]
@@ -42378,6 +42913,20 @@ mod tests {
             resp.contains("Content-Type: text/html"),
             "look-alike path must fall through, got: {}",
             &resp.chars().take(120).collect::<String>()
+        );
+
+        // Per-file diff subpaths ARE the route (regression: the parsed-path
+        // refactor briefly matched only the exact list endpoint, dropping
+        // /api/session/current/changes/{path}).
+        let resp = http_request(
+            port,
+            "GET /api/session/current/changes/src/main.rs HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(
+            !resp.contains("Content-Type: text/html"),
+            "per-file changes subpath must hit the changes handler, got: {}",
+            &resp.chars().take(200).collect::<String>()
         );
 
         handle.abort();

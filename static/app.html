@@ -2247,6 +2247,63 @@ body.access-page #tab-access {
 .files-ide-create-row input:focus {
   outline: none;
 }
+.files-ide-tree-row {
+  user-select: none;
+}
+.files-ide-tree-row .files-ide-tree-name {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.files-ide-tree-row .files-ide-row-acts {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  flex: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.files-ide-tree-row:hover .files-ide-row-acts,
+.files-ide-tree-row:focus-within .files-ide-row-acts,
+.files-ide-tree-row.arming .files-ide-row-acts {
+  opacity: 1;
+}
+@media (hover: none) {
+  .files-ide-tree-row .files-ide-row-acts {
+    opacity: 1;
+  }
+}
+.files-ide-row-act {
+  flex: none;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--overlay1);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 5px;
+  cursor: pointer;
+  transition: color 0.12s ease, background-color 0.12s ease;
+}
+.files-ide-row-act:hover {
+  color: var(--text);
+  background: var(--surface1);
+}
+.files-ide-row-act:focus-visible {
+  outline: 2px solid var(--files-accent);
+  outline-offset: -1px;
+}
+.files-ide-row-act.delete:hover {
+  color: var(--red);
+}
+.files-ide-row-act.delete.armed {
+  color: var(--base);
+  background: var(--red);
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
 .files-ide-editor-pane {
   display: flex;
   flex-direction: column;
@@ -2379,6 +2436,57 @@ body.access-page #tab-access {
   font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code', Menlo, Monaco, Consolas, monospace;
   font-size: 12.5px;
   line-height: 1.5;
+}
+.files-ide-find {
+  position: absolute;
+  top: 8px;
+  right: 16px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 7px;
+  background: var(--mantle);
+  border: 1px solid var(--surface1);
+  border-radius: 7px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+.files-ide-find.hidden {
+  display: none;
+}
+.files-ide-find input {
+  width: 200px;
+  padding: 3px 7px;
+  border: 1px solid var(--surface1);
+  border-radius: 5px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+}
+.files-ide-find input:focus {
+  outline: none;
+  border-color: var(--files-accent);
+}
+.files-ide-find .ui-btn {
+  min-height: 22px;
+  padding: 2px 7px;
+  font-size: 11px;
+}
+.files-ide-find-count {
+  min-width: 52px;
+  text-align: right;
+  color: var(--overlay1);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.files-ide-find-count.none {
+  color: var(--red);
+}
+.files-ide-editor-host .files-ide-find-match {
+  background: color-mix(in srgb, var(--files-accent) 26%, transparent);
+  border-radius: 2px;
 }
 .files-ide-empty {
   position: absolute;
@@ -12927,6 +13035,15 @@ body.display-fullscreen-open {
               <div id="files-ide-tabs" class="files-ide-tabs" role="tablist"></div>
               <div id="files-ide-banner" class="files-ide-banner hidden" aria-live="polite"></div>
               <div id="files-ide-editor-host" class="files-ide-editor-host">
+                <div id="files-ide-find" class="files-ide-find hidden" role="search" aria-label="Find in file">
+                  <input id="files-ide-find-input" type="text" autocomplete="off" spellcheck="false" placeholder="Find in file"
+                         oninput="filesIdeFindOnInput()"
+                         onkeydown="if (event.key === 'Enter') { event.preventDefault(); filesIdeFindStep(event.shiftKey ? -1 : 1); } else if (event.key === 'Escape') { filesIdeCloseFind(); }">
+                  <span id="files-ide-find-count" class="files-ide-find-count" aria-live="polite"></span>
+                  <button type="button" class="ui-btn" title="Previous match (Shift+Enter)" aria-label="Previous match" onclick="filesIdeFindStep(-1)">&#8593;</button>
+                  <button type="button" class="ui-btn" title="Next match (Enter)" aria-label="Next match" onclick="filesIdeFindStep(1)">&#8595;</button>
+                  <button type="button" class="ui-btn" title="Close (Esc)" aria-label="Close find" onclick="filesIdeCloseFind()">&#10005;</button>
+                </div>
                 <div id="files-ide-empty" class="files-ide-empty">
                   <div class="ui-empty-title">No file open</div>
                   <div class="ui-empty-sub">Choose a file from the browser on the left, or create one with New file. Every write is checked against this target's filesystem grants.</div>
@@ -13438,10 +13555,16 @@ body.display-fullscreen-open {
                 <h3 class="ui-section-title" id="settings-cu-heading">Computer Use</h3>
                 <div class="ui-section-sub">The model and display backend that drive screen control.</div>
               </div>
+              <!-- CU-first routing is vaulted ([experimental] cu_first_routing
+                   in intendant.toml); the separate provider/model selection
+                   only applies when it is on, so the rows stay hidden
+                   otherwise. Elements remain in the DOM — Station and the
+                   settings save path read them either way. -->
+              <div id="cu-routing-rows" style="display:none">
               <div class="settings-row">
                 <label>Provider</label>
                 <select id="set-cu-provider">
-                  <option value="">Auto (gemini-3-flash-preview)</option>
+                  <option value="">Auto</option>
                   <option value="gemini">Gemini</option>
                   <option value="openai">OpenAI</option>
                   <option value="anthropic">Anthropic</option>
@@ -13466,6 +13589,7 @@ body.display-fullscreen-open {
                     <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
                   </optgroup>
                 </select>
+              </div>
               </div>
               <div class="settings-row">
                 <label>Backend</label>
@@ -17603,6 +17727,12 @@ let filesIdeCm = null;
 let filesIdeLibPromise = null;
 let filesIdeInitialized = false;
 let activeFilesSubtab = 'editor';
+// Find-in-file state (single bar over the active buffer).
+let filesIdeFindOpen = false;
+let filesIdeFindMatches = []; // [{from, to}]
+let filesIdeFindMarks = []; // CodeMirror TextMarker handles
+let filesIdeFindIndex = -1;
+let filesIdeFindTimer = 0;
 
 // Shell key bar state: sticky modifiers (Ctrl, Alt) that transform the
 // next character typed on the soft keyboard. Cleared after one use.
@@ -59320,6 +59450,9 @@ async function loadSettings() {
     document.getElementById('set-cu-provider').value = d.cu_provider || '';
     document.getElementById('set-cu-model').value = d.cu_model || '';
     document.getElementById('set-cu-backend').value = d.cu_backend || 'auto';
+    // Separate CU provider/model selection only means something while the
+    // vaulted CU-first routing is enabled (file-only experimental flag).
+    document.getElementById('cu-routing-rows').style.display = d.cu_first_routing ? '' : 'none';
     document.getElementById('set-presence-enabled').checked = d.presence_enabled;
     document.getElementById('set-presence-provider').value = d.presence_provider || '';
     document.getElementById('set-presence-model').value = d.presence_model || '';
@@ -63764,6 +63897,8 @@ function filesIdeTreeState(hostId) {
       showHidden: false,
       contextDir: '',
       creating: null, // {kind: 'file'|'folder', dir}
+      renaming: null, // {path, dir, name, isDir}
+      deleteArming: null, // {path, recursive, timer}
     };
     filesIdeTreeStates.set(key, state);
   }
@@ -63845,6 +63980,27 @@ function filesIdeMkdir(hostId, path) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path }),
+    })
+  );
+}
+
+function filesIdeRename(hostId, from, to) {
+  return filesIdeRpc(hostId, 'api_fs_rename', { from, to }, () =>
+    authedFetch('/api/fs/rename', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to }),
+    })
+  );
+}
+
+function filesIdeDeleteRpc(hostId, path, recursive) {
+  const params = recursive ? { path, recursive: true } : { path };
+  return filesIdeRpc(hostId, 'api_fs_delete', params, () =>
+    authedFetch('/api/fs/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
     })
   );
 }
@@ -64077,30 +64233,63 @@ function renderFilesIdeTree() {
     }
     const entry = row.entry;
     const isDir = Boolean(entry.is_dir);
+    if (state.renaming && state.renaming.path === entry.path) {
+      html.push(
+        `<div class="files-ide-create-row" style="padding-left:${pad}px">` +
+        `<span class="files-ide-tree-caret">${isDir ? '▸' : ''}</span>` +
+        `<input id="files-ide-rename-input" type="text" autocomplete="off" spellcheck="false" value="${escapeHtml(state.renaming.name)}">` +
+        `</div>`
+      );
+      continue;
+    }
     const expanded = isDir && state.expanded.has(entry.path);
     const caret = isDir ? (expanded ? '▾' : '▸') : '';
+    const arming = state.deleteArming && state.deleteArming.path === entry.path
+      ? state.deleteArming
+      : null;
     const classes = ['files-ide-tree-row', isDir ? 'dir' : 'file'];
     if (entry.hidden) classes.push('hidden-entry');
     if (!isDir && filesIdeBufferKey(hostId, entry.path) === filesIdeActiveKey) classes.push('active');
     if (isDir && state.contextDir === entry.path) classes.push('active');
+    if (arming) classes.push('arming');
     const name = escapeHtml(entry.name || '');
     const pathAttr = escapeHtml(entry.path || '');
     const suffix = entry.is_symlink ? ' ⇢' : '';
+    const deleteLabel = arming
+      ? (arming.recursive ? 'Delete all?' : 'Delete?')
+      : '✕';
+    const deleteClass = arming ? 'files-ide-row-act delete armed' : 'files-ide-row-act delete';
+    const deleteTitle = arming
+      ? (arming.recursive ? 'Folder is not empty — click again to delete everything inside' : 'Click again to delete')
+      : `Delete ${escapeHtml(entry.name || '')}`;
     html.push(
-      `<button type="button" class="${classes.join(' ')}" data-path="${pathAttr}" data-dir="${isDir ? '1' : '0'}" style="padding-left:${pad}px" title="${pathAttr}">` +
+      `<div class="${classes.join(' ')}" role="button" tabindex="0" data-path="${pathAttr}" data-dir="${isDir ? '1' : '0'}" style="padding-left:${pad}px" title="${pathAttr}">` +
       `<span class="files-ide-tree-caret">${caret}</span>` +
       `<span class="files-ide-tree-name">${name}${suffix}</span>` +
-      `</button>`
+      `<span class="files-ide-row-acts">` +
+      `<button type="button" class="files-ide-row-act" data-act="rename" title="Rename ${name}" aria-label="Rename ${name}">✎</button>` +
+      `<button type="button" class="${deleteClass}" data-act="delete" title="${deleteTitle}" aria-label="Delete ${name}">${deleteLabel}</button>` +
+      `</span>` +
+      `</div>`
     );
   }
   container.innerHTML = html.join('') || '<div class="files-ide-tree-notice">Empty directory</div>';
-  container.querySelectorAll('.files-ide-tree-row').forEach(btn => {
-    const path = btn.dataset.path || '';
-    if (btn.dataset.dir === '1') {
-      btn.addEventListener('click', () => filesIdeToggleDir(path));
-    } else {
-      btn.addEventListener('click', () => filesIdeOpenFile(filesIdeSelectedHostId(), path));
-    }
+  container.querySelectorAll('.files-ide-tree-row').forEach(rowEl => {
+    const path = rowEl.dataset.path || '';
+    const isDir = rowEl.dataset.dir === '1';
+    const open = () => (isDir ? filesIdeToggleDir(path) : filesIdeOpenFile(filesIdeSelectedHostId(), path));
+    rowEl.addEventListener('click', ev => {
+      if (ev.target.closest('.files-ide-row-act')) return;
+      open();
+    });
+    rowEl.addEventListener('keydown', ev => {
+      if ((ev.key === 'Enter' || ev.key === ' ') && !ev.target.closest('.files-ide-row-act')) {
+        ev.preventDefault();
+        open();
+      }
+    });
+    rowEl.querySelector('[data-act="rename"]')?.addEventListener('click', () => filesIdeBeginRename(path, isDir));
+    rowEl.querySelector('[data-act="delete"]')?.addEventListener('click', () => filesIdeDeleteRequested(path, isDir));
   });
   const createInput = document.getElementById('files-ide-create-input');
   if (createInput) {
@@ -64114,6 +64303,23 @@ function renderFilesIdeTree() {
       setTimeout(() => {
         const state = filesIdeTreeState(filesIdeSelectedHostId());
         if (state.creating) filesIdeCancelCreate();
+      }, 150);
+    });
+  }
+  const renameInput = document.getElementById('files-ide-rename-input');
+  if (renameInput) {
+    renameInput.focus();
+    // Preselect the stem so typing replaces the name but keeps the extension.
+    const stem = renameInput.value.lastIndexOf('.');
+    renameInput.setSelectionRange(0, stem > 0 ? stem : renameInput.value.length);
+    renameInput.addEventListener('keydown', ev => {
+      if (ev.key === 'Enter') filesIdeCommitRename(renameInput.value);
+      if (ev.key === 'Escape') filesIdeCancelRename();
+    });
+    renameInput.addEventListener('blur', () => {
+      setTimeout(() => {
+        const state = filesIdeTreeState(filesIdeSelectedHostId());
+        if (state.renaming) filesIdeCancelRename();
       }, 150);
     });
   }
@@ -64173,6 +64379,189 @@ async function filesIdeCommitCreate(rawName) {
   }
   renderFilesIdeTree();
   filesIdeOpenFile(hostId, path, { createNew: true });
+}
+
+function filesIdeParentDir(path) {
+  const trimmed = String(path || '').replace(/\/+$/, '');
+  const idx = trimmed.lastIndexOf('/');
+  return idx > 0 ? trimmed.slice(0, idx) : '/';
+}
+
+function filesIdeBeginRename(path, isDir) {
+  const state = filesIdeTreeState(filesIdeSelectedHostId());
+  state.creating = null;
+  if (state.deleteArming) {
+    clearTimeout(state.deleteArming.timer);
+    state.deleteArming = null;
+  }
+  state.renaming = {
+    path,
+    dir: filesIdeParentDir(path),
+    name: String(path).split(/[\\/]/).filter(Boolean).pop() || path,
+    isDir: Boolean(isDir),
+  };
+  renderFilesIdeTree();
+}
+
+function filesIdeCancelRename() {
+  const state = filesIdeTreeState(filesIdeSelectedHostId());
+  state.renaming = null;
+  renderFilesIdeTree();
+}
+
+async function filesIdeCommitRename(rawName) {
+  const hostId = filesIdeSelectedHostId();
+  const state = filesIdeTreeState(hostId);
+  const renaming = state.renaming;
+  const name = String(rawName || '').trim();
+  state.renaming = null;
+  if (!renaming || !name || name === renaming.name) {
+    renderFilesIdeTree();
+    return;
+  }
+  if (name.includes('/') || name.includes('\\')) {
+    filesIdeSetTreeStatus('error', 'Name must not contain path separators');
+    renderFilesIdeTree();
+    return;
+  }
+  const from = renaming.path;
+  const to = renaming.dir.replace(/\/+$/, '') + '/' + name;
+  try {
+    const resp = await filesIdeRename(hostId, from, to);
+    if (!resp.ok) throw new Error(resp.body.error || `Rename failed (${resp.status})`);
+    const finalPath = typeof resp.body.path === 'string' && resp.body.path ? resp.body.path : to;
+    filesIdeRetargetBuffers(hostId, from, finalPath, renaming.isDir);
+    if (renaming.isDir) filesIdeDropSubtreeState(state, from);
+    if (state.contextDir === from || (renaming.isDir && state.contextDir.startsWith(from + '/'))) {
+      state.contextDir = renaming.dir;
+    }
+    state.listings.delete(renaming.dir);
+    await filesIdeLoadListing(hostId, renaming.dir);
+    filesIdeSetTreeStatus('', '');
+  } catch (e) {
+    filesIdeSetTreeStatus('error', e.message || 'Rename failed');
+  }
+  renderFilesIdeTree();
+  filesIdeRenderTabs();
+  filesIdeRenderChrome();
+}
+
+/// Two-step delete, no page-blocking confirm: first click arms the row's
+/// button ("Delete?"), a second click within the window executes. A 409
+/// not_empty re-arms as "Delete all?" so recursive removal is always its
+/// own explicit click.
+function filesIdeDeleteRequested(path, isDir) {
+  const state = filesIdeTreeState(filesIdeSelectedHostId());
+  const arming = state.deleteArming;
+  if (arming && arming.path === path) {
+    clearTimeout(arming.timer);
+    state.deleteArming = null;
+    filesIdeExecuteDelete(path, isDir, arming.recursive);
+    return;
+  }
+  filesIdeArmDelete(state, path, false);
+}
+
+function filesIdeArmDelete(state, path, recursive) {
+  if (state.deleteArming) clearTimeout(state.deleteArming.timer);
+  const arming = { path, recursive, timer: 0 };
+  arming.timer = setTimeout(() => {
+    if (state.deleteArming === arming) {
+      state.deleteArming = null;
+      renderFilesIdeTree();
+    }
+  }, 3500);
+  state.deleteArming = arming;
+  renderFilesIdeTree();
+}
+
+async function filesIdeExecuteDelete(path, isDir, recursive) {
+  const hostId = filesIdeSelectedHostId();
+  const state = filesIdeTreeState(hostId);
+  const dir = filesIdeParentDir(path);
+  filesIdeSetTreeStatus('', 'Deleting…');
+  try {
+    const resp = await filesIdeDeleteRpc(hostId, path, recursive);
+    if (!resp.ok) {
+      if (resp.status === 409 && resp.body.code === 'not_empty') {
+        filesIdeSetTreeStatus('error', 'Folder is not empty — Delete all? removes everything inside');
+        filesIdeArmDelete(state, path, true);
+        return;
+      }
+      throw new Error(resp.body.error || `Delete failed (${resp.status})`);
+    }
+    filesIdeOrphanOrCloseBuffers(hostId, path, isDir);
+    if (isDir) filesIdeDropSubtreeState(state, path);
+    if (state.contextDir === path || (isDir && state.contextDir.startsWith(path + '/'))) {
+      state.contextDir = dir;
+    }
+    state.listings.delete(dir);
+    await filesIdeLoadListing(hostId, dir);
+    filesIdeSetTreeStatus('', '');
+  } catch (e) {
+    filesIdeSetTreeStatus('error', e.message || 'Delete failed');
+  }
+  renderFilesIdeTree();
+}
+
+/// Rewire open buffers after a rename: same buffer, same undo history, new
+/// key/path/name. Directory renames retarget every buffer underneath.
+function filesIdeRetargetBuffers(hostId, oldPath, newPath, isDir) {
+  const host = hostId || '';
+  const prefix = oldPath.replace(/\/+$/, '') + '/';
+  const newBase = newPath.replace(/\/+$/, '');
+  for (const buffer of Array.from(filesIdeBuffers.values())) {
+    if ((buffer.host || '') !== host) continue;
+    if (buffer.path === oldPath) {
+      filesIdeRekeyBuffer(buffer, newPath);
+    } else if (isDir && buffer.path.startsWith(prefix)) {
+      filesIdeRekeyBuffer(buffer, newBase + '/' + buffer.path.slice(prefix.length));
+    }
+  }
+}
+
+function filesIdeRekeyBuffer(buffer, newPath) {
+  const oldKey = buffer.key;
+  const newKey = filesIdeBufferKey(buffer.host, newPath);
+  buffer.key = newKey;
+  buffer.path = newPath;
+  buffer.name = String(newPath).split(/[\\/]/).filter(Boolean).pop() || newPath;
+  // Rebuild the map with the new key in place, keeping tab order stable.
+  const entries = Array.from(filesIdeBuffers.entries());
+  filesIdeBuffers.clear();
+  for (const [key, value] of entries) {
+    filesIdeBuffers.set(key === oldKey ? newKey : key, value);
+  }
+  if (filesIdeActiveKey === oldKey) filesIdeActiveKey = newKey;
+  // Re-highlight for the new extension: live when active, on next
+  // activation otherwise (a swapped-out doc keeps its mode until then).
+  const spec = filesIdeModeSpecFor(buffer.name);
+  if (filesIdeActiveKey === newKey && filesIdeCm) {
+    filesIdeCm.setOption('mode', spec);
+  } else {
+    buffer.pendingMode = { spec };
+  }
+}
+
+/// After a delete, a clean buffer just closes; a dirty one stays open and
+/// flips to the missing-file banner so unsaved work survives — Overwrite
+/// recreates the file from the buffer.
+function filesIdeOrphanOrCloseBuffers(hostId, path, isDir) {
+  const host = hostId || '';
+  const prefix = path.replace(/\/+$/, '') + '/';
+  for (const buffer of Array.from(filesIdeBuffers.values())) {
+    if ((buffer.host || '') !== host) continue;
+    const hit = buffer.path === path || (isDir && buffer.path.startsWith(prefix));
+    if (!hit) continue;
+    if (filesIdeBufferDirty(buffer)) {
+      buffer.conflict = { code: 'missing' };
+      buffer.baselineSha = '';
+    } else {
+      filesIdeCloseTab(buffer.key, true);
+    }
+  }
+  filesIdeRenderTabs();
+  filesIdeRenderChrome();
 }
 
 // -- buffers, tabs, editor
@@ -64257,6 +64646,7 @@ async function filesIdeOpenFile(hostId, path, options = {}) {
       if (buffer.key === filesIdeActiveKey) {
         const saveBtn = document.getElementById('files-ide-save-btn');
         if (saveBtn && !buffer.saving) saveBtn.disabled = !dirty && !buffer.conflict;
+        filesIdeFindOnDocChange();
       }
     });
     filesIdeSetSaveStatus('', '');
@@ -64276,6 +64666,7 @@ function filesIdeBufferDirty(buffer) {
 function filesIdeActivate(key) {
   const buffer = filesIdeBuffers.get(key);
   if (!buffer) return;
+  if (filesIdeFindOpen && key !== filesIdeActiveKey) filesIdeCloseFind(false);
   filesIdeActiveKey = key;
   const host = document.getElementById('files-ide-editor-host');
   const empty = document.getElementById('files-ide-empty');
@@ -64296,12 +64687,29 @@ function filesIdeActivate(key) {
         'Ctrl-S': () => filesIdeSaveActive(),
         'Cmd-/': 'toggleComment',
         'Ctrl-/': 'toggleComment',
+        'Cmd-F': () => filesIdeOpenFind(),
+        'Ctrl-F': () => filesIdeOpenFind(),
+        'Cmd-G': () => filesIdeFindStep(1),
+        'Ctrl-G': () => filesIdeFindStep(1),
+        'Shift-Cmd-G': () => filesIdeFindStep(-1),
+        'Shift-Ctrl-G': () => filesIdeFindStep(-1),
+        'F3': () => filesIdeFindStep(1),
+        'Shift-F3': () => filesIdeFindStep(-1),
+        Esc: () => {
+          if (!filesIdeFindOpen) return window.CodeMirror.Pass;
+          filesIdeCloseFind();
+          return undefined;
+        },
       },
     });
   }
   if (empty) empty.classList.add('hidden');
   if (filesIdeCm) {
     filesIdeCm.swapDoc(buffer.doc);
+    if (buffer.pendingMode) {
+      filesIdeCm.setOption('mode', buffer.pendingMode.spec);
+      buffer.pendingMode = null;
+    }
     requestAnimationFrame(() => {
       filesIdeCm.refresh();
       filesIdeCm.focus();
@@ -64336,6 +64744,7 @@ function filesIdeCloseTab(key, confirmed) {
       filesIdeActivate(next.value);
       return;
     }
+    if (filesIdeFindOpen) filesIdeCloseFind(false);
     if (filesIdeCm && window.CodeMirror) filesIdeCm.swapDoc(window.CodeMirror.Doc('', null));
     const empty = document.getElementById('files-ide-empty');
     if (empty) empty.classList.remove('hidden');
@@ -64536,9 +64945,9 @@ async function filesIdeReloadActive() {
 
 function filesIdeOverwriteActive() {
   const buffer = filesIdeActiveBuffer();
-  if (!buffer) return;
+  if (!buffer) return Promise.resolve();
   buffer.conflict = null;
-  filesIdeSaveActive({ force: true });
+  return filesIdeSaveActive({ force: true });
 }
 
 // -- host wiring + tab lifecycle
@@ -64578,6 +64987,129 @@ function onFilesIdeHostChanged() {
     filesIdeSetRoot('');
   }
   filesIdeRenderChrome();
+}
+
+// -- find in file (vendored searchcursor addon; smart case, live count)
+
+const FILES_IDE_FIND_MARK_CAP = 300;
+
+function filesIdeFindInput() {
+  return document.getElementById('files-ide-find-input');
+}
+
+function filesIdeOpenFind() {
+  if (!filesIdeCm || !filesIdeActiveBuffer()) return;
+  const bar = document.getElementById('files-ide-find');
+  const input = filesIdeFindInput();
+  if (!bar || !input) return;
+  bar.classList.remove('hidden');
+  filesIdeFindOpen = true;
+  const selected = filesIdeCm.getSelection();
+  if (selected && !selected.includes('\n')) input.value = selected;
+  input.focus();
+  input.select();
+  filesIdeFindRecompute({ jump: true });
+}
+
+function filesIdeCloseFind(focusEditor = true) {
+  const bar = document.getElementById('files-ide-find');
+  if (bar) bar.classList.add('hidden');
+  filesIdeFindOpen = false;
+  filesIdeFindClearMarks();
+  filesIdeFindMatches = [];
+  filesIdeFindIndex = -1;
+  filesIdeFindSetCount();
+  if (focusEditor && filesIdeCm && filesIdeActiveBuffer()) filesIdeCm.focus();
+}
+
+function filesIdeFindClearMarks() {
+  for (const mark of filesIdeFindMarks) {
+    try { mark.clear(); } catch (_) { /* detached doc */ }
+  }
+  filesIdeFindMarks = [];
+}
+
+function filesIdeFindSetCount() {
+  const el = document.getElementById('files-ide-find-count');
+  if (!el) return;
+  const query = filesIdeFindInput()?.value || '';
+  if (!filesIdeFindOpen || !query) {
+    el.textContent = '';
+    el.classList.remove('none');
+    return;
+  }
+  el.textContent = filesIdeFindMatches.length
+    ? `${filesIdeFindIndex + 1} / ${filesIdeFindMatches.length}`
+    : 'No matches';
+  el.classList.toggle('none', !filesIdeFindMatches.length);
+}
+
+function filesIdeFindRecompute(options = {}) {
+  if (!filesIdeCm || !filesIdeFindOpen) return;
+  filesIdeFindClearMarks();
+  filesIdeFindMatches = [];
+  filesIdeFindIndex = -1;
+  const query = filesIdeFindInput()?.value || '';
+  if (!query) {
+    filesIdeFindSetCount();
+    return;
+  }
+  const CM = window.CodeMirror;
+  // Smart case: an all-lowercase query matches case-insensitively.
+  const caseFold = !/[A-Z]/.test(query);
+  const cursor = filesIdeCm.getSearchCursor(query, CM.Pos(0, 0), { caseFold });
+  while (cursor.findNext()) {
+    filesIdeFindMatches.push({ from: cursor.from(), to: cursor.to() });
+    if (filesIdeFindMatches.length >= 10000) break;
+  }
+  const markCount = Math.min(filesIdeFindMatches.length, FILES_IDE_FIND_MARK_CAP);
+  for (let i = 0; i < markCount; i++) {
+    const match = filesIdeFindMatches[i];
+    filesIdeFindMarks.push(
+      filesIdeCm.markText(match.from, match.to, { className: 'files-ide-find-match' })
+    );
+  }
+  if (!filesIdeFindMatches.length) {
+    filesIdeFindSetCount();
+    return;
+  }
+  // Land on the first match at or after the editor cursor.
+  const at = filesIdeCm.getCursor();
+  let index = filesIdeFindMatches.findIndex(
+    m => m.from.line > at.line || (m.from.line === at.line && m.from.ch >= at.ch)
+  );
+  if (index < 0) index = 0;
+  filesIdeFindSelect(index, { scroll: options.jump !== false });
+}
+
+function filesIdeFindSelect(index, options = {}) {
+  if (!filesIdeCm || !filesIdeFindMatches.length) return;
+  const total = filesIdeFindMatches.length;
+  filesIdeFindIndex = ((index % total) + total) % total;
+  const match = filesIdeFindMatches[filesIdeFindIndex];
+  filesIdeCm.setSelection(match.from, match.to);
+  if (options.scroll !== false) filesIdeCm.scrollIntoView({ from: match.from, to: match.to }, 80);
+  filesIdeFindSetCount();
+}
+
+function filesIdeFindStep(dir) {
+  if (!filesIdeFindOpen) return;
+  if (!filesIdeFindMatches.length) {
+    filesIdeFindRecompute({ jump: true });
+    return;
+  }
+  filesIdeFindSelect(filesIdeFindIndex + (dir < 0 ? -1 : 1));
+}
+
+function filesIdeFindOnInput() {
+  clearTimeout(filesIdeFindTimer);
+  filesIdeFindTimer = setTimeout(() => filesIdeFindRecompute({ jump: true }), 120);
+}
+
+function filesIdeFindOnDocChange() {
+  if (!filesIdeFindOpen) return;
+  clearTimeout(filesIdeFindTimer);
+  filesIdeFindTimer = setTimeout(() => filesIdeFindRecompute({ jump: false }), 200);
 }
 
 function filesIdeOnTabShown() {
@@ -65049,6 +65581,9 @@ window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange
 	window.filesIdeSaveActive = filesIdeSaveActive;
 	window.filesIdeReloadActive = filesIdeReloadActive;
 	window.filesIdeOverwriteActive = filesIdeOverwriteActive;
+	window.filesIdeFindOnInput = filesIdeFindOnInput;
+	window.filesIdeFindStep = filesIdeFindStep;
+	window.filesIdeCloseFind = filesIdeCloseFind;
 	window.intendantDashboardFilesIde = {
 	  _debugSnapshot() {
 	    const buffer = filesIdeActiveBuffer();
@@ -65093,6 +65628,42 @@ window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange
 	  async _debugSetRoot(path) {
 	    await filesIdeSetRoot(path);
 	    return this._debugSnapshot();
+	  },
+	  async _debugRename(path, newName, isDir = false) {
+	    filesIdeBeginRename(path, isDir);
+	    await filesIdeCommitRename(newName);
+	    return this._debugSnapshot();
+	  },
+	  // Raw rename RPC (no UI): the inline rename can only ever target the
+	  // same directory, so cross-root denial tests need the direct lane.
+	  _debugRawRename(from, to) {
+	    return filesIdeRename(filesIdeSelectedHostId(), from, to);
+	  },
+	  async _debugDelete(path, options = {}) {
+	    await filesIdeExecuteDelete(path, Boolean(options.isDir), Boolean(options.recursive));
+	    return {
+	      ...this._debugSnapshot(),
+	      treeStatus: document.getElementById('files-ide-tree-status')?.textContent || '',
+	      deleteArming: filesIdeTreeState(filesIdeSelectedHostId()).deleteArming
+	        ? { ...filesIdeTreeState(filesIdeSelectedHostId()).deleteArming, timer: null }
+	        : null,
+	    };
+	  },
+	  async _debugFind(query) {
+	    filesIdeOpenFind();
+	    const input = filesIdeFindInput();
+	    if (input) input.value = String(query ?? '');
+	    filesIdeFindRecompute({ jump: true });
+	    return {
+	      open: filesIdeFindOpen,
+	      total: filesIdeFindMatches.length,
+	      index: filesIdeFindIndex,
+	      count: document.getElementById('files-ide-find-count')?.textContent || '',
+	    };
+	  },
+	  _debugFindStep(dir) {
+	    filesIdeFindStep(dir);
+	    return { total: filesIdeFindMatches.length, index: filesIdeFindIndex };
 	  },
 	};
 	window.intendantDashboardFiles = {
