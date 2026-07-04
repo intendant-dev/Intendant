@@ -1701,8 +1701,11 @@ pub enum ControlMsg {
 
 /// The event bus sender. Cloneable for use in multiple tasks.
 ///
-/// Backed by a `broadcast::channel` so multiple consumers can subscribe
-/// independently. Each subscriber gets its own copy of every event.
+/// Backed by a bounded `broadcast::channel` so multiple consumers can
+/// subscribe independently. Normal subscribers receive best-effort future
+/// events and must tolerate `RecvError::Lagged`;
+/// [`EventBus::subscribe_session_log`] is the lossless path for the
+/// low-volume event subset persisted to `session.jsonl`.
 #[derive(Clone)]
 pub struct EventBus {
     tx: tokio::sync::broadcast::Sender<AppEvent>,
@@ -1727,7 +1730,10 @@ impl EventBus {
         let _ = self.tx.send(event);
     }
 
-    /// Create a new subscriber that receives all future events.
+    /// Create a new best-effort subscriber for future events.
+    ///
+    /// This receiver is backed by the bounded broadcast channel. Slow
+    /// consumers can observe `RecvError::Lagged` and skip dropped events.
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AppEvent> {
         self.tx.subscribe()
     }

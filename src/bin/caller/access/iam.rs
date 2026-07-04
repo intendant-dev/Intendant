@@ -2677,11 +2677,28 @@ mod tests {
                 .clone()
         };
         assert!(permissions_allow(&permissions("role:operator"), "peer.use"));
-        assert!(!permissions_allow(&permissions("role:operator"), "peer.manage"));
-        assert!(permissions_allow(&permissions("role:peer-user"), "peer.use"));
-        assert!(permissions_allow(&permissions("role:peer-user"), "peer.inspect"));
-        assert!(!permissions_allow(&permissions("role:peer-user"), "filesystem.read"));
-        for role in ["role:files-write", "role:files-read", "role:terminal", "role:observer"] {
+        assert!(!permissions_allow(
+            &permissions("role:operator"),
+            "peer.manage"
+        ));
+        assert!(permissions_allow(
+            &permissions("role:peer-user"),
+            "peer.use"
+        ));
+        assert!(permissions_allow(
+            &permissions("role:peer-user"),
+            "peer.inspect"
+        ));
+        assert!(!permissions_allow(
+            &permissions("role:peer-user"),
+            "filesystem.read"
+        ));
+        for role in [
+            "role:files-write",
+            "role:files-read",
+            "role:terminal",
+            "role:observer",
+        ] {
             assert!(
                 !permissions_allow(&permissions(role), "peer.use"),
                 "{role} must not reach peer tunnels by default"

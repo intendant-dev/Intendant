@@ -57,9 +57,9 @@ end of `src/bin/caller/main.rs`):
 ## User Mode and the Orchestrator
 
 When a complex task is submitted without `--direct`, Intendant enters **User
-Mode**. The user layer (`SysPrompt_user.md`) is a clean, conversational interface
-that does **not** execute commands itself. Its sole job is to spawn an
-orchestrator sub-agent and relay its progress.
+Mode**. The user-mode layer is Rust control code that does **not** execute
+commands itself. It starts the orchestrator subprocess, monitors it, and relays
+its progress.
 
 The orchestrator (`SysPrompt_orchestrator.md`) is itself a sub-agent — it is
 spawned with `INTENDANT_ROLE=orchestrator`. It decomposes the task, spawns
@@ -70,7 +70,7 @@ the result.
 User (TUI / Web / MCP / CLI)
     │
     ▼
-[User layer]  — SysPrompt_user.md, monitors only, spawns the orchestrator
+[User Mode monitor]  — Rust subprocess handoff; monitors only
     │
     ▼
 [Orchestrator]  — SysPrompt_orchestrator.md, INTENDANT_ROLE=orchestrator
@@ -270,11 +270,11 @@ using `store_memory` on the `project_state` channel (key `project_state`, tag
 `checkpoint`). The checkpoint captures completed tasks, active tasks,
 architectural decisions, and discovered constraints.
 
-`write_project_state()` (`sub_agent.rs`) also persists the checkpoint to disk in
-the orchestrator's directory as both `project_state.json` (machine-readable) and
-`project_state.md` (human-readable). On a context restart the orchestrator's
-prompt directs it to `recall_memory` the latest `project_state` first, restoring
-awareness of what is done and what remains.
+On a context restart the orchestrator's prompt directs it to `recall_memory` the
+latest `project_state` first, restoring awareness of what is done and what
+remains. The disk helper `write_project_state()` (`sub_agent.rs`) is PARKED and
+unwired: it can write `project_state.json` and `project_state.md`, but the live
+checkpoint path is the knowledge store.
 
 > The orchestrator prompt instructs checkpointing *before context reaches ~60%
 > usage*. (Earlier docs cited ~90%; the shipped `SysPrompt_orchestrator.md`

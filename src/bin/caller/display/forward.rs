@@ -1,89 +1,15 @@
-//! Per-peer forwarder: translates encoder output into one peer's
-//! WebRTC RTP stream, with per-peer codec / simulcast-layer selection.
+//! Legacy helper vocabulary for display forwarding.
 //!
-//! Implementation note: the codebase uses the `rtc` crate (rtc-rs,
-//! version 0.9). API names below refer to rtc-rs unless explicitly
-//! noted as external prior art.
+//! Runtime forwarding lives in [`crate::display::webrtc::WebRtcPeer`]: each peer
+//! driver subscribes to the shared encoder pool, requests keyframes from that
+//! pool on PLI/FIR, checks each frame's payload spec against the negotiated
+//! sender codec, and writes RTP through its own `RTCPeerConnection`.
 //!
-//! ## Why this exists
-//!
-//! The peer pool (see [`crate::display::encode::pool`]) produces
-//! encoded frames per `(codec, rid)`. Each WebRTC peer needs those
-//! frames rewritten into its own RTP track with:
-//!
-//! - **Its own negotiated payload type (PT)**. Different peers can
-//!   land on different PTs for the same codec depending on each peer's
-//!   offer SDP, so a frame produced by the encoder pool with one PT
-//!   must be rewritten to whatever PT each subscriber peer negotiated
-//!   for the same codec.
-//! - **Its own SSRC + sequence numbers + RTP timestamps**, managed by
-//!   rtc-rs per `RTCPeerConnection`.
-//! - **Its own simulcast layer choice**, which may shift as
-//!   bandwidth-estimate feedback (TWCC) changes. Today this is static
-//!   (`Rid::full`); phase 4 wires TWCC events into layer selection.
-//!
-//! ## Pattern: SFU forwarding (modeled on str0m's chat.rs example)
-//!
-//! str0m's chat.rs SFU example is the canonical reference for this
-//! pattern (str0m is a separate Rust WebRTC crate from rtc-rs but
-//! the SFU shape is the same). Key elements, expressed in our
-//! rtc-rs vocabulary:
-//!
-//! 1. **One `RTCPeerConnection` per peer.** rtc-rs's
-//!    `RTCPeerConnection` negotiates a single codec set per instance,
-//!    so each peer gets its own — there is no per-peer-codec
-//!    selection inside one connection.
-//! 2. **Receive encoded frames from the publisher, enqueue onto a
-//!    shared channel.** Our publisher is the encoder pool producing
-//!    `EncodedFrame` directly (not another `RTCPeerConnection`),
-//!    but the fan-out channel is the same shape.
-//! 3. **For each subscriber `RTCPeerConnection`, translate the
-//!    encoder's PT to the peer-negotiated PT and write the codec-
-//!    specific sample.** This is the core of the forwarder loop.
-//! 4. **For simulcast sources, the subscriber filters by RID.** The
-//!    str0m example hard-codes to one RID; we pick per-peer based on
-//!    TWCC bandwidth.
-//!
-//! ## Keyframe-first guard
-//!
-//! A peer that joins mid-stream MUST receive a keyframe before any
-//! P-frame or the decoder produces garbage (browser shows black or
-//! corruption until the next natural keyframe, often 2-5 seconds
-//! later on static content).
-//!
-//! Every forwarder starts with `keyframe_seen: false`. Until set, it
-//! drops non-keyframe frames and requests a keyframe from the pool
-//! via [`crate::display::encode::pool::EncoderPool::request_keyframe`].
-//! The pool's keyframe coalescer ensures N late-joiners produce one
-//! keyframe, not N.
-//!
-//! Once the forwarder sees its first keyframe, it sets the flag and
-//! forwards all subsequent frames (keyframe and P).
-//!
-//! ## Layer selection
-//!
-//! Simulcast lets one peer pick the layer it can sustain over its
-//! link:
-//!
-//! - Full-resolution peer on LAN: RID `f`.
-//! - Browser behind a 2 Mbps shared WiFi: RID `h` (or `q` under load).
-//! - Browser on a mobile hotspot: RID `q`.
-//!
-//! The per-peer [`LayerSelector`] holds the currently-active RID and
-//! accepts feedback from the WebRTC bandwidth-estimate signal (TWCC,
-//! phase 4). In this design stub, selection is static (`RID_FULL`
-//! default).
-//!
-//! ## What this module is NOT doing yet
-//!
-//! - Spawning the forward loop task (phase 4).
-//! - Wiring keyframe-request feedback (PLI / FIR) → pool (phase 4).
-//! - Wiring bandwidth-estimate feedback → layer selector (phase 4).
-//! - Per-peer RTP timestamp anchoring beyond what rtc-rs does
-//!   internally (phase 4).
-//!
-//! This stub captures the types, the forwarder state machine, and the
-//! per-peer contract the pool depends on. Phase 4 fills in the runtime.
+//! This module keeps the pieces that are still shared by that path:
+//! [`LayerSelector`] for the active RID, [`ForwarderError`] for offer/payload
+//! mismatch vocabulary, [`codec_preferences_from_offer`] for exact codec
+//! gating, and [`inject_recv_simulcast_into_video_offer`] for the SDP helper
+//! mirrored by the browser.
 
 use crate::display::encode::pool::{CodecKind, PeerCodecPreferences, SimulcastRid};
 use std::fmt;
@@ -154,11 +80,9 @@ impl std::error::Error for ForwarderError {}
 /// the forwarder reads it on each frame to decide whether to forward
 /// or drop.
 ///
-/// Layer changes come from WebRTC bandwidth-estimate feedback (TWCC,
-/// phase 4). For now: static default `RID_FULL`, updates via
-/// [`LayerSelector::prefer`] which is called from the forwarder's
-/// keyframe-request path (a new layer needs a fresh keyframe to be
-/// decodable, so layer-switch and keyframe-request are paired).
+/// Layer changes are driven by the WebRTC peer path. The selector defaults to
+/// `RID_FULL`; callers may switch it with [`LayerSelector::prefer`] when the
+/// negotiated/demanded layer changes.
 #[allow(dead_code)]
 pub struct LayerSelector {
     active: RwLock<SimulcastRid>,
@@ -247,11 +171,8 @@ impl Default for LayerSelector {
 /// produces Constrained Baseline / mode 1 — a silent-black-screen
 /// class of bug that the whole 3c.0 contract exists to prevent.
 ///
-/// The guard is [`crate::display::encode::has_compatible_h264_offer`],
-/// which checks for a Baseline-family (profile_idc 0x42) variant
-/// with packetization-mode 0 or 1 — the intersection of what our
-/// VideoToolbox / VAAPI / libx264 backends produce and what rtc-rs
-/// will actually negotiate against the encoder's cached
+/// The guard is [`crate::display::encode::offer_has_poolable_h264_variant`],
+/// which requires a variant that exactly matches the encoder pool's cached
 /// [`crate::display::encode::PayloadSpec::h264_constrained_baseline`].
 ///
 /// VP9 / AV1 don't need the guard today (no backend; pool excludes

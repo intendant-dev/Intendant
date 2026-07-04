@@ -162,7 +162,7 @@ pub fn presence_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "set_autonomy".to_string(),
-            description: "Set the autonomy level: low (ask for everything), medium (ask for writes/deletes), high (ask for destructive only), full (no approval needed).".to_string(),
+            description: "Set the autonomy level: low asks for every category except file reads unless a Deny rule gates it; medium applies category rules and by default asks for writes, deletes, and destructive actions while network is auto; high auto-approves ordinary Ask/Auto categories but still gates Deny rules, first user-display access, human input, and live audio; full asks only for human input and live audio.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

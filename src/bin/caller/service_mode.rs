@@ -622,7 +622,11 @@ fn first_boot_probe(backend: &Backend, log: &Path, pre_log_len: u64) -> Result<(
             if systemd_first_boot_failed(&active, &sub, restarts) {
                 let tail = run_capture(
                     "journalctl",
-                    &[scope, &["-u", "intendant", "-n", "8", "--no-pager", "-o", "cat"]].concat(),
+                    &[
+                        scope,
+                        &["-u", "intendant", "-n", "8", "--no-pager", "-o", "cat"],
+                    ]
+                    .concat(),
                 );
                 Some(format!(
                     "unit is {active} ({sub}) after {restarts} restart(s); last log lines:\n{}",

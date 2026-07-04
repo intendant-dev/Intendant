@@ -3,11 +3,14 @@
 > Status: **shipped 2026-07-03, all six rollout steps + access-token
 > OAuth mode.** The four sign-off decisions were resolved as recommended:
 > offline-lease default **24h**; full-credential OAuth leases **built but
-> off by default**; recovery phrase **mandatory** at vault creation;
+> off by default in the browser UX**; recovery phrase **mandatory** at
+> vault creation;
 > scoping ships as the **single default rule** with per-entry overrides
 > deferred. The v1 deviation (OAuth fueling = full-credential opt-in
 > only) is resolved: access-token leases (browser-side token refresh,
-> `mode: "access_token"`) are now the OAuth default. Reach caveat:
+> explicit `mode: "access_token"`) are now the browser OAuth default.
+> Raw dashboard-control callers must send that mode explicitly; omitted
+> OAuth mode remains the legacy full-credential grant. Reach caveat:
 > OpenAI's token endpoint serves any browser origin, so Codex works
 > out of the box; Anthropic's origin-allowlists browsers away, so Claude
 > Code still needs the full-credential opt-in until that changes.
@@ -120,15 +123,16 @@ verifies), the browser unseals the needed entries and grants the daemon a
 **lease**: the credential material, delivered over the tunnel, held by
 the controller **in memory only**, tagged with an expiry.
 
-**Frames** (dashboard-control, mirroring existing RPC conventions):
+**Dashboard-control request methods** (mirroring existing RPC conventions;
+raw frame names are reserved for the `egress_*` relay path):
 
-| Frame | Direction | Meaning |
+| Method | Request | Response result |
 |---|---|---|
-| `credential_lease_grant` | browser → daemon | credential material + lease id + TTL + scope (+ `mode` for oauth kinds: `access_token` / `full_credential`) |
-| `credential_lease_renew` | browser → daemon | extend a lease (sent automatically while connected) |
-| `credential_lease_revoke` | browser → daemon | kill a lease now; daemon wipes the material |
-| `credential_lease_status` | daemon → browser | active leases, expiries, usage counters (for the UI and the audit trail) |
-| `credential_custody_trail` | daemon → browser | the daemon's own custody record — lease grants/expiries/revocations, relay changes, restart resets; metadata only, never material. Kept at `~/.intendant/custody-audit.jsonl` (0600, bounded), rendered in Access → Advanced → Custody trail |
+| `api_credential_lease_grant` | browser → daemon request with `kind`, `label`, credential `material` (or legacy `secret`), optional OAuth `mode` (`access_token` / `full_credential`), `ttl_ms`, and `offline_ms` | daemon-generated `lease_id`, `kind`, `expires_at_unix_ms`, `replaced` |
+| `api_credential_lease_renew` | browser → daemon request with `lease_id` (or legacy `leaseId`) | `lease_id`, new `expires_at_unix_ms` |
+| `api_credential_lease_revoke` | browser → daemon request with optional `lease_id` / `leaseId` / `kind`; omitted revokes every lease on the daemon | `revoked` count |
+| `api_credential_lease_status` | browser → daemon request with no params | active `leases` (`lease_id`, `kind`, `label`, `mode`, grant/renew/expiry timestamps, `ttl_ms`, `offline_ms`, `use_count`), active `egress` relays, and `expired_note` |
+| `api_credential_custody_trail` | browser → daemon request with no params | recent custody events (`at_unix_ms`, `event`, `kind`, `label`, `actor`, `detail`) from the daemon's own record — lease grants/expiries/revocations, relay changes, restart resets; metadata only, never material. Kept at `~/.intendant/custody-audit.jsonl` (0600, bounded), rendered in Access → Advanced → Custody trail |
 
 Leases ride the same per-frame IAM checks as every other tunnel
 operation; granting requires a session whose principal holds a new
@@ -155,12 +159,15 @@ lane) telling the user which daemon went dry.
 suited to leasing than raw keys, because the protocol already separates
 durable from ephemeral authority:
 
-- **Access-token lease (the default):** the browser keeps the **refresh
+- **Access-token lease (the browser UX default):** the browser keeps the **refresh
   token** in the vault and never leases it. It performs token refresh
   itself against the provider's token endpoint (rotated refresh tokens
   are written back into the vault — both providers rotate) and leases
   only short-lived **access tokens** over the tunnel, as material with
   every durable field blanked and `mode: "access_token"` on the grant.
+  Raw dashboard-control callers must send `mode: "access_token"` for
+  this path; omitting `mode` on an OAuth grant is the compatibility path
+  for a legacy full-credential lease.
   The daemon re-verifies the material is refresh-free before accepting —
   fail-closed against custodian bugs — and re-materializes on every
   re-grant; the granting tab's renewal tick re-grants freshly refreshed
@@ -184,14 +191,16 @@ durable from ephemeral authority:
 **External-agent materialization (a documented weakening).** Codex and
 Claude Code are child processes that read credentials from files, not
 from process memory we control. A lease for them therefore materializes
-a **session-scoped auth file** (0600, inside the session directory, e.g.
-a synthesized `CODEX_HOME/auth.json` — the injection point already
-exists) that is deleted on lease expiry, revocation, and daemon
-shutdown. During an active lease those bytes are on disk; the ledger
-says so plainly. Mitigations: the file exists only while leased, the
-directory is excluded from the rewind/snapshot machinery, and crash
-recovery deletes stale materializations at startup. On macOS, Claude
-Code's keychain path is preferred over a file where it works.
+a daemon-private temporary home under `~/.intendant/leased-auth`, outside
+any project worktree: `codex-home/auth.json` for Codex and
+`claude-home/.credentials.json` for Claude Code. The directories are
+0700, the auth files are 0600, and spawns point the child process at
+them with `CODEX_HOME` or `CLAUDE_CONFIG_DIR`. The materialization is
+deleted on lease expiry, revocation, and daemon shutdown. During an
+active lease those bytes are on disk; the ledger says so plainly.
+Mitigations: the materialization root is outside worktrees and is never
+seen by rewind/snapshot machinery, the file exists only while leased,
+and crash recovery deletes stale materializations at startup.
 
 **Fallback.** `.env` keeps working untouched (`custody = "local"`, the
 implicit default), so nothing breaks for existing daemons and CI. A
@@ -298,15 +307,19 @@ enforced by the daemon's own IAM from first boot.
    gate (operator holds it; peer lane excluded) + lease-first provider
    plumbing. `.env` fallback untouched; distinct "unfueled" error.
 3. ✅ OAuth materialization for Codex (`CODEX_HOME`) and Claude Code
-   (`CLAUDE_CONFIG_DIR`): private 0700/0600 files, deleted on expiry,
-   revocation, shutdown, and a startup recovery sweep; full-credential
-   opt-in per daemon (OFF by default). Access-token mode shipped as the
+   (`CLAUDE_CONFIG_DIR`): private temporary homes under
+   `~/.intendant/leased-auth/{codex-home,claude-home}`, outside
+   worktrees and snapshots, deleted on expiry, revocation, shutdown, and
+   a startup recovery sweep; full-credential opt-in per daemon (OFF by
+   default in the browser UX). Access-token mode shipped as the browser
    OAuth default (browser refresh + rotation write-back; daemon-verified
-   refresh-free material; Codex live, Claude Code pending provider CORS).
+   refresh-free material; raw RPC callers must send
+   `mode: "access_token"` explicitly; Codex live, Claude Code pending
+   provider CORS).
 4. ✅ Offline-lease knob, fueling panel (per-daemon status, revocation,
    usage audit fields), dry-daemon Web Push. Custody trail shipped: the
    daemon records every grant/expiry/revocation/relay change (+ restart
-   resets) locally and serves them over `credential_custody_trail`.
+   resets) locally and serves them over `api_credential_custody_trail`.
 5. ✅ Client-egress mode for Anthropic/Gemini (host-allowlisted browser
    relay, credit-windowed streaming, probe); per-session path indicator
    in the fueling panel and lease status.

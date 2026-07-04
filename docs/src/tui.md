@@ -136,7 +136,7 @@ Set with `--autonomy` (or cycled in the TUI with `+`/`-`). `AutonomyLevel`:
 | Low | Ask before every category except `FileRead` |
 | Medium (default) | Ask for writes, deletes, destructive, and network |
 | High | Don't ask for the above (only the always-ask categories below) |
-| Full | Never ask, except `HumanInput` |
+| Full | Ask only for the always-ask categories: `HumanInput` and `LiveAudioSpawn` |
 
 ### Layer 2 — per-category rules
 
@@ -156,8 +156,7 @@ same choices ([MCP Server](./mcp-server.md)).
 The precise logic (`Autonomy::needs_approval`) has nuances worth knowing:
 
 - **Always ask, regardless of level:** `HumanInput` and `LiveAudioSpawn` — these
-  always require a human even at Full. (`HumanInput` is the only thing Full still
-  asks for; `LiveAudioSpawn` is treated the same way.)
+  always require a human even at Full.
 - **`DisplayControl`** — asks on *first* use, then the session grant takes over
   (`return !user_display_granted`).
 - **Full** — auto-approves everything else.
@@ -182,12 +181,16 @@ Commands are classified into categories by inspecting the command JSON
 | HumanInput | `askHuman` |
 | LiveAudioSpawn | `spawn_live_audio` (voice sessions, phone calls) |
 | DisplayControl | user-session display access (session-grant via `d`) |
+| ToolCall | external-agent MCP/tool approval category |
 
 For shell commands (`execAsAgent`/`execPty`), the command string is further
 inspected for destructive patterns, network tools, and file writes (redirects,
 `tee`, `mv`, `cp`). A `sudo` prefix is flagged Destructive *and* the command
 after `sudo` is classified too. When multiple categories apply, the highest-
 severity one drives the prompt label.
+
+`ToolCall` is not produced by ordinary runtime `classify_command`; it is used by
+external-agent approval routing through `external_approval_decision`.
 
 ### DisplayControl session grant
 

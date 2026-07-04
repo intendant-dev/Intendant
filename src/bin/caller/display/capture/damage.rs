@@ -18,11 +18,9 @@
 //!   anywhere. Dirty fraction is approximate (false negatives possible
 //!   under hash collisions, false positives possible under animations
 //!   that happen to land identically).
-//! - [`DamageCapability::None`] — no damage information available. The
-//!   consumer must treat every tick as "everything dirty" (forces
-//!   fallback to full-frame video per the [`tile policy`](super::super::tile)
-//!   in D-4). Reported explicitly so the operator sees why tile mode
-//!   isn't engaging instead of silently doing nothing.
+//! - [`DamageCapability::None`] — no OS damage metadata available. The
+//!   bridge may still use the frame-diff fallback to produce dirty regions
+//!   while reporting explicitly that no platform damage source is active.
 //!
 //! D-1 ships only the X11 `OsLevel` backend; Wayland and macOS slot in
 //! later as additional implementations behind the same trait.
@@ -76,9 +74,8 @@ pub enum DamageCapability {
     /// false negatives possible under hash collisions.
     #[allow(dead_code)]
     FrameDiff,
-    /// No damage info. Caller should assume every tick = everything dirty
-    /// and force the fallback video path. Used for non-X11 platforms in
-    /// D-1, frame-diff backend supersedes this in D-4 where applicable.
+    /// No OS damage metadata. The bridge may use frame-diff fallback for
+    /// dirty regions while reporting that no platform damage source is active.
     None,
 }
 
@@ -91,7 +88,7 @@ pub enum DamageError {
     Connect(String),
     /// Required extension not available (e.g. XDamage missing on the
     /// X server). The caller should fall back to a different backend
-    /// or report `DamageCapability::None` and route through video.
+    /// or report `DamageCapability::None` and use frame diff.
     #[allow(dead_code)]
     ExtensionMissing(&'static str),
     /// Setup failed after extension was confirmed available
@@ -153,11 +150,9 @@ pub trait DamageBackend: Send {
 }
 
 /// Always-empty backend reporting [`DamageCapability::None`]. Used as
-/// the explicit fallback when no real backend is available, so the
-/// consumer's degradation path is the same shape ("ask for damage,
-/// got nothing, go to video") regardless of platform. Returning a real
-/// backend here would mask the absence; returning Result::Err would
-/// force every consumer to write its own fallback.
+/// the explicit fallback when no OS damage backend is available, so the
+/// bridge can run its frame-diff fallback through the same polling shape
+/// while keeping the absence of platform metadata visible.
 pub struct NullDamageBackend {
     #[allow(dead_code)]
     geometry: (u32, u32),

@@ -2078,14 +2078,14 @@ impl AppState {
                     .get("permission_mode")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let allowed_tools = msg
-                    .get("allowed_tools")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    });
+                let allowed_tools =
+                    msg.get("allowed_tools")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        });
                 cmds.push(UiCommand::ClaudeConfigChanged {
                     model,
                     model_cleared,
@@ -3335,9 +3335,7 @@ pub fn render_peer_event(host_id: &str, payload: &serde_json::Value) -> Vec<UiCo
                     ts: now,
                     level: "warn".to_string(),
                     source: "peer-dashboard-control".to_string(),
-                    content: format!(
-                        "Peer dashboard-control signal missing session_id: {payload}"
-                    ),
+                    content: format!("Peer dashboard-control signal missing session_id: {payload}"),
                 }];
             }
             vec![UiCommand::PeerDashboardControlSignal {
@@ -4074,9 +4072,6 @@ mod tests {
         });
         assert!(matched, "expected UploadDeleted, got {:?}", cmds);
     }
-
-
-
 
     #[test]
     fn handle_event_agent_output() {
@@ -5695,10 +5690,7 @@ mod tests {
             signal: json!({"kind": "answer", "sdp": "", "binding": {"ok": true}}),
         };
         let v = serde_json::to_value(&cmd).expect("serialize");
-        assert_eq!(
-            v["cmd"].as_str(),
-            Some("peer_dashboard_control_signal")
-        );
+        assert_eq!(v["cmd"].as_str(), Some("peer_dashboard_control_signal"));
     }
 
     /// `webrtc_signal` without a session_id can't route to any
@@ -5833,6 +5825,9 @@ mod tests {
             UiCommand::ClaudeConfigChanged { model: Some(m), permission_mode: Some(pm), allowed_tools: Some(t), .. }
                 if m == "claude-haiku-4-5-20251001" && pm == "acceptEdits" && t.len() == 2
         ));
-        assert!(found, "expected ClaudeConfigChanged UiCommand, got {cmds:?}");
+        assert!(
+            found,
+            "expected ClaudeConfigChanged UiCommand, got {cmds:?}"
+        );
     }
 }

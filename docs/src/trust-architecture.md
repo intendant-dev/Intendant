@@ -90,7 +90,9 @@ user controls — the **anchor**:
 
 A companion chapter, [Credential Custody](./credential-custody.md),
 applies the same discipline to the *other* secret class — the model
-provider credentials a daemon spends (proposed, not yet built).
+provider credentials a daemon spends. Credential custody has shipped; the
+custody chapter is the source for the current vault, lease, relay, and
+caveat details.
 
 The hosted service keeps exactly four jobs, all zero-authority:
 introductions (signaling for endpoints that authenticate each other
@@ -154,14 +156,14 @@ and first contact, honest about what it is.
 
 ## Phase 6 design: organization grants in detail
 
-> Status: **implemented** (v1: steps 1-5 of the rollout below). Grant
+> Status: **implemented** (v1: steps 1-6 of the rollout below). Grant
 > expiry, org root keys, signed grant documents, per-daemon trust with a
 > local cap, materialization, the presentation/issue/trust/revoke
 > endpoints, the offer ride-along (documents attached to dashboard-control
-> offers), and signed revocation lists + renewal are live;
-> peer-subject/issuer-key delegation (step 6) and revocation-list gossip
-> over peer links remain. This section is the spec the code follows; the
-> earlier "two lanes" section is the product narrative it serves.
+> offers), signed revocation lists + renewal, peer-subject documents, and
+> issuer-key delegation are live. Revocation-list gossip over peer links
+> remains. This section is the spec the code follows; the earlier "two
+> lanes" section is the product narrative it serves.
 
 ### Objects
 
@@ -170,9 +172,9 @@ The root key lives on an org-designated daemon
 (`intendant org init <handle>` →
 `~/.intendant/access-certs/org/<handle>/root.pk8`, 0600), following the
 existing daemon-identity custody pattern; it is exportable for offline
-custody. The format reserves a delegation chain so day-to-day signing can
-later move to issuer keys certified by the root — v1 signs with the root
-directly.
+custody. Day-to-day signing can move to delegated issuer keys certified by
+the root; root-signed documents carry no chain, and delegated documents
+carry the issuer certificate beside the signature it explains.
 
 **Org grant document.** A self-contained, signed statement a member presents
 to any daemon that trusts the org key:
@@ -183,15 +185,16 @@ to any daemon that trusts the org key:
   "kind": "org-grant",
   "org": { "handle": "acme", "root_key": "<ed25519 b64u>" },
   "subject": {
-    "client_key_fingerprint": "…", "label": "…"
-  },                                      // client keys ONLY in v1 (see below);
-                                          // peer_fingerprint subjects: v1.1
-  "role_id": "role:session-reader",
+    "client_key_fingerprint": "…",       // or "peer_fingerprint": "…";
+    "label": "…"                         // exactly one subject fingerprint
+  },
+  "role_id": "role:session-reader",      // or "peer:<profile>" for peer subjects
   "targets": ["*"],                       // or explicit daemon ids
   "grant_id": "<uuid>",                   // stable id, used by revocation
   "issued_at_unix_ms": 0,
   "expires_at_unix_ms": 0,                // REQUIRED; hard cap 90d, default 30d
-  "sig": "<ed25519 over the canonical payload>"
+  "chain": [{ "…": "issuer cert object" }], // present when an issuer key signed
+  "sig": "<ed25519 over the newline payload>"
 }
 ```
 
@@ -200,17 +203,21 @@ used by claim proofs and client-key offers), not canonical JSON. The
 document is *authorization*, not authentication: only the bound subject can
 use it, because sessions still authenticate the subject itself — a stolen
 document is useless to anyone else, and third-party replay just
-re-materializes the same grant.
+re-materializes the same grant. `chain` is omitted or empty when the root
+signed the document and present with one issuer certificate when a
+delegated issuer signed.
 
-Subjects are **client keys only in v1**, deliberately: a Connect-account
-subject would make the org-grant path only as trustworthy as the
-rendezvous's account assertion — a compromised hosted service could claim
-to be a granted member and collect the org's authority on every daemon
-that trusts it. Client keys authenticate cryptographically end-to-end, and
-a member without a daemon still joins fine: any page mints a key, the org
-grants that key, and hosted-origin keys remain ceiling-capped. Account
-subjects can be added later as an explicit, documented weakening if a real
-need appears.
+Subjects are exactly one of two cryptographic fingerprints: a browser
+client key for the human lane, or a peer daemon certificate fingerprint
+for the peer lane. Connect-account subjects are deliberately absent: they
+would make the org-grant path only as trustworthy as the rendezvous's
+account assertion — a compromised hosted service could claim to be a
+granted member and collect the org's authority on every daemon that trusts
+it. Client keys and peer certificates authenticate cryptographically
+end-to-end. A member without a daemon still joins fine: any page mints a
+key, the org grants that key, and hosted-origin keys remain ceiling-capped.
+Account subjects can be added later as an explicit, documented weakening
+if a real need appears.
 
 **Daemon-side org trust.** `iam.json` gains
 `trusted_orgs: [{handle, root_key, max_role, status, added_at}]`. Trusting
@@ -228,13 +235,15 @@ than silently downgraded, so issuers learn the cap immediately.
 ### Verification and materialization
 
 On presentation, the daemon verifies: signature against a *trusted* org
-root key → expiry → `targets` contains this daemon (or `*`) → role exists,
-is enforced, is not a peer profile for a human subject, and fits under the
-org's `max_role`. It then **materializes an ordinary local IAM grant**
-(`source: "org:acme"`, the document's `grant_id`, expiry recorded) rather
-than evaluating documents per-request — auditability and the existing
-evaluator come for free, and the local owner can revoke or re-role the
-materialized grant like any other; local IAM always wins.
+root or delegated issuer key → expiry → `targets` contains this daemon
+(or `*`) → subject kind and role/profile namespace match → the document
+fits under the trusted-org cap for its lane. A human-subject document
+**materializes an ordinary local IAM grant** (`source: "org:acme"`, the
+document's `grant_id`, expiry recorded) rather than evaluating documents
+per-request; a peer-subject document materializes into the peer identity
+store. Auditability and the existing evaluators come for free, and the
+local owner can revoke or re-role the materialized authority like any
+other; local IAM and local peer identity state always win.
 
 Prerequisite schema work, valuable on its own: `IamGrant` gains
 `expires_at_unix_ms: Option<u64>`, and enforcement treats an expired grant
@@ -279,9 +288,10 @@ Layered, with the failure mode stated honestly:
 1. **Short expiries + renewal** are the primary mechanism. Documents are
    cheap to re-issue; the org daemon serves renewals to still-valid members.
 2. **Org revocation list**: the root signs
-   `{org, seq, revoked_grant_ids[], revoked_subjects[]}`; org daemons serve
-   it publicly and gossip it over peer links; daemons enforce monotonic
-   `seq` and apply it by revoking materialized grants.
+   `{org, seq, revoked_grant_ids[], revoked_subjects[], revoked_issuer_keys[]}`;
+   org daemons serve it publicly, browsers carry it today, and peer-link
+   gossip remains later plumbing; daemons enforce monotonic `seq` and
+   apply it by revoking materialized grants and peer identities.
 3. **Local override** always works: any daemon root can revoke an
    org-materialized grant locally, ORL or not.
 
@@ -297,14 +307,16 @@ window — hence the 90-day hard cap and the 30-day default.
   "org": { "handle": "acme", "root_key": "<ed25519 b64u>" },
   "seq": 4,                          // monotonic; consumers refuse stale
   "revoked_grant_ids": ["…"],        // document grant_ids, not local grant ids
-  "revoked_subjects": ["…"],         // client key fingerprints — "member is out"
+  "revoked_subjects": ["…"],         // subject fingerprints — "member is out"
+  "revoked_issuer_keys": ["…"],      // delegated issuer keys revoked wholesale
   "issued_at_unix_ms": 0,
   "sig": "<ed25519 over the newline payload>"
 }
 ```
 
-The signing payload is newline-joined like every other protocol here. The
-org daemon persists the current list next to the root key
+The signing payload is newline-joined like every other protocol here and
+includes the grant-id list, subject-fingerprint list, issuer-key list, and
+issue time. The org daemon persists the current list next to the root key
 (`org/<handle>/orl.json`), bumps `seq` on every change, and serves it at
 `GET /api/access/orgs/<handle>/revocations` (public — it is org-public
 data; an empty seq-0 list is signed lazily on first read).
@@ -326,12 +338,12 @@ already reach any daemon a member still talks to.
 against its *trusted* key for that handle, requires `seq` strictly greater
 than the last applied (equal is an idempotent no-op), then persists the
 lists and the new `seq` on its `trusted_orgs` entry and revokes every
-materialized grant whose document `grant_id` or subject fingerprint is
-listed. Persisting matters beyond the sweep: **materialization and
-renewal both check the stored lists**, so a revoked grant_id or subject
-is refused *future* presentation too — combined with the no-resurrection
-rule above, an ORL revocation sticks even against a member who still
-holds a validly signed document.
+materialized grant whose document `grant_id`, subject fingerprint, or
+issuer key is listed. Persisting matters beyond the sweep:
+**materialization and renewal both check the stored lists**, so a revoked
+grant_id, subject, or issuer key is refused *future* presentation too —
+combined with the no-resurrection rule above, an ORL revocation sticks
+even against a member who still holds a validly signed document.
 
 **Renewal.** A member (or anyone carrying the document) presents a
 still-valid document to the *org daemon* —
@@ -390,8 +402,8 @@ be present), and the signing payload's subject-kind line — the literal
 `client_key` today, deliberately baked into every existing signature —
 becomes `peer_daemon`, so a signature can never be replayed across
 subject kinds. `role_id` uses a `peer:<profile>` namespace (e.g.
-`peer:session-reader`, the `profile_class` ladder) so a peer document
-cannot be confused with a human-role document even outside the payload.
+`peer:session-reader`) so a peer document cannot be confused with a
+human-role document even outside the payload.
 
 Materialization upserts an approved `PeerIdentityRecord` bound to the
 fingerprint. Two prerequisite schema steps, each valuable alone (the
@@ -400,13 +412,16 @@ same pattern as grant expiry in step 1): the record gains
 expired record as revoked) and `source` (`org:<handle>` provenance, so
 org revocation can sweep records it created and the UI can say where an
 identity came from). The org's cap for the peer lane is a separate
-`max_peer_profile` on the trusted-org entry — profile classes are a
-ladder, not a permission set, so the human `max_role` cannot express it —
-defaulting to `session-reader`; over-cap documents are rejected, not
-downgraded, like the human lane. Local rules carry over verbatim:
-locally revoked records are never resurrected, re-presentation is
-idempotent-quiet, and ORL `revoked_subjects` matches peer fingerprints
-exactly as it matches client keys.
+`max_peer_profile` on the trusted-org entry. It is empty by default, so
+trusting an org grants no peer authority until the owner sets a peer cap.
+The cap relation is operation-set containment, not a strict ladder:
+file-oriented and session-oriented profiles can be siblings, and a
+document fits only when its profile allows no operation outside the cap.
+Over-cap documents are rejected, not downgraded, like the human lane.
+Local rules carry over verbatim: locally revoked records are never
+resurrected, re-presentation is idempotent-quiet, and ORL
+`revoked_subjects` matches peer fingerprints exactly as it matches client
+keys.
 
 **Issuer-key delegation.** Day-to-day signing moves off the root: the
 root signs a delegation certificate
@@ -418,7 +433,7 @@ root signs a delegation certificate
   "issuer_key": "<ed25519 b64u>", "label": "…",
   "issued_at_unix_ms": 0,
   "expires_at_unix_ms": 0,          // REQUIRED; suggested cap 365d
-  "max_role": "role:operator",      // optional scope; also caps peer:<profile>
+  "max_role": "role:operator",      // optional role:* or peer:* scope; "" allows both
   "sig": "<root, newline payload>"
 }
 ```
@@ -426,10 +441,16 @@ root signs a delegation certificate
 and a document may then carry `chain: [<issuer-cert>]` (the array
 reserved since v1) with its own `sig` made by the issuer key.
 Verification walks outside-in: the *trusted* root key validates the
-cert, the cert must be unexpired and its `max_role` (when present) must
-contain the document's role, then the issuer key validates the document;
-everything else — org cap, targets, expiry, ORL — applies unchanged.
-One level only: an issuer cannot mint issuers.
+cert, the cert must be unexpired, then the issuer key validates the
+document. `max_role` is a scoped string despite the historic field name:
+`role:*` scopes sign only human-subject documents, `peer:*` scopes sign
+only peer-subject documents, and an empty scope allows both lanes. A
+`peer:*` scope is enforced during verification by operation-set
+containment; a `role:*` scope refuses peer documents during verification
+and enforces human role permission containment during materialization,
+where the receiving daemon's local IAM catalog exists. Everything else —
+org cap, targets, expiry, ORL — applies unchanged. One level only: an
+issuer cannot mint issuers.
 
 Revoking an issuer revokes everything it signed going forward: the ORL
 gains a `revoked_issuer_keys` list, which adds a line to the ORL signing
@@ -455,8 +476,9 @@ The pieces that implement the model, mapped to the codebase:
 
 - **Daemon-local IAM** (`~/.intendant/access-certs/iam.json`): principals
   (browser certificate, client key, Connect account, human user, peer
-  daemon), grants (principal → role on this daemon), roles over an 18-gate
-  permission catalog. Implemented; the source of all authority.
+  daemon), grants (principal → role on this daemon), roles over the daemon
+  permission catalog defined in `access/iam.rs`. Implemented; the source
+  of all authority.
 - **End-to-end tunnel binding**: dashboard-control offers are answered with a
   daemon-signed binding over (daemon public key, session grant, client
   nonce); the browser verifies before trusting the channel. Implemented —

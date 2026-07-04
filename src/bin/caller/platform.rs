@@ -80,7 +80,7 @@ pub fn process_alive(pid: u32) -> bool {
         Ok(p) if p > 0 => p,
         _ => return false,
     };
-    // Safety: kill with signal 0 is a standard POSIX existence check.
+    // SAFETY: kill with signal 0 is a standard POSIX existence check.
     let ret = unsafe { libc::kill(pid, 0) };
     if ret == 0 {
         return true;
@@ -88,6 +88,82 @@ pub fn process_alive(pid: u32) -> bool {
     // EPERM means the process exists but we can't signal it — still alive
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
+
+/// Return the main display's pixel dimensions on macOS.
+///
+/// Other platforms return `None`; callers should use their normal fallback.
+#[cfg(target_os = "macos")]
+pub fn main_display_pixel_size() -> Option<(u32, u32)> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayPixelsWide(display: u32) -> usize;
+        fn CGDisplayPixelsHigh(display: u32) -> usize;
+    }
+
+    // SAFETY: these CoreGraphics query functions take no borrowed pointers.
+    // CGMainDisplayID returns a display id accepted by the pixel-size queries.
+    let (w, h) = unsafe {
+        let display = CGMainDisplayID();
+        (
+            CGDisplayPixelsWide(display) as u32,
+            CGDisplayPixelsHigh(display) as u32,
+        )
+    };
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn main_display_pixel_size() -> Option<(u32, u32)> {
+    None
+}
+
+/// Probe for the Vortex Audio POSIX shared-memory segment.
+#[cfg(unix)]
+pub fn vortex_audio_shm_available() -> bool {
+    const VORTEX_SHM_NAME: &[u8] = b"/vortex-audio\0";
+
+    // SAFETY: VORTEX_SHM_NAME is a static NUL-terminated POSIX shm name.
+    // O_RDONLY opens the object for probing only and passes no pointers.
+    let fd = unsafe {
+        libc::shm_open(
+            VORTEX_SHM_NAME.as_ptr() as *const libc::c_char,
+            libc::O_RDONLY,
+            0,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+
+    // SAFETY: fd was returned by shm_open above and is not used after close.
+    unsafe {
+        libc::close(fd);
+    }
+    true
+}
+
+#[cfg(not(unix))]
+pub fn vortex_audio_shm_available() -> bool {
+    false
+}
+
+/// Ask a process to interrupt gracefully.
+#[cfg(unix)]
+pub fn interrupt_process(pid: u32) {
+    let pid = match libc::pid_t::try_from(pid) {
+        Ok(pid) if pid > 0 => pid,
+        _ => return,
+    };
+    // SAFETY: `pid` is a positive pid_t converted from u32 and SIGINT is a
+    // standard POSIX signal value.
+    unsafe {
+        let _ = libc::kill(pid, libc::SIGINT);
+    }
+}
+
+#[cfg(not(unix))]
+pub fn interrupt_process(_pid: u32) {}
 
 /// Check whether a process with the given PID is currently running.
 ///
@@ -108,7 +184,7 @@ pub fn process_alive(pid: u32) -> bool {
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
-    // Safety: OpenProcess with a query-only access right is a read-only
+    // SAFETY: OpenProcess with a query-only access right is a read-only
     // probe; we always close the handle if one was returned.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -356,6 +432,8 @@ pub fn terminate_unprotected_descendants_now(root_pid: u32, protected: &HashSet<
 /// hard-killed daemon can still orphan agents.
 pub fn die_with_parent(command: &mut tokio::process::Command) {
     #[cfg(target_os = "linux")]
+    // SAFETY: pre_exec installs a closure that runs after fork and before exec.
+    // The closure below uses only async-signal-safe syscalls.
     unsafe {
         command.pre_exec(|| {
             // SAFETY: runs post-fork/pre-exec where only async-signal-safe
@@ -451,8 +529,9 @@ pub async fn terminate_unprotected_descendants(
 pub fn process_cmdline(pid: u32) -> Option<String> {
     let mut mib: [libc::c_int; 3] = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
 
-    // First call: get buffer size
     let mut size: libc::size_t = 0;
+    // SAFETY: mib points to a fixed KERN_PROCARGS2 query; oldp is null for the
+    // size probe and oldlenp points to initialized local storage.
     let ret = unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
@@ -467,8 +546,9 @@ pub fn process_cmdline(pid: u32) -> Option<String> {
         return None;
     }
 
-    // Second call: read the data
     let mut buf: Vec<u8> = vec![0u8; size];
+    // SAFETY: buf is allocated with the size returned by the first sysctl call;
+    // oldlenp points to `size`, allowing sysctl to report the bytes written.
     let ret = unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
@@ -549,7 +629,7 @@ pub fn process_cmdline(pid: u32) -> Option<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
-    // Safety: every raw pointer below is into a buffer we own and size
+    // SAFETY: every raw pointer below is into a buffer we own and size
     // ourselves; the handle is always closed before returning.
     unsafe {
         let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -671,6 +751,7 @@ unsafe fn query_image_path(handle: windows_sys::Win32::Foundation::HANDLE) -> Op
 /// Get the UID of the current process. POSIX `getuid()`.
 #[cfg(unix)]
 pub fn current_uid() -> u32 {
+    // SAFETY: getuid takes no arguments and cannot fail.
     unsafe { libc::getuid() }
 }
 

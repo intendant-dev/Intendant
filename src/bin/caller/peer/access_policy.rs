@@ -466,10 +466,16 @@ pub fn federation_http_operation(method: &str, path: &str) -> Option<PeerOperati
     // are peer *use*, not peer administration: they open a tunnel that the
     // receiving peer authorizes against its own grants for this daemon.
     if method == "POST" {
-        let mut segments = path.strip_prefix("/api/peers/").into_iter().flat_map(|rest| rest.split('/'));
+        let mut segments = path
+            .strip_prefix("/api/peers/")
+            .into_iter()
+            .flat_map(|rest| rest.split('/'));
         if let (Some(id), Some(op), None) = (segments.next(), segments.next(), segments.next()) {
             if !id.is_empty()
-                && matches!(op, "webrtc" | "file-transfer-webrtc" | "dashboard-control-webrtc")
+                && matches!(
+                    op,
+                    "webrtc" | "file-transfer-webrtc" | "dashboard-control-webrtc"
+                )
             {
                 return Some(PeerOperation::PeerUse);
             }
@@ -831,7 +837,10 @@ mod tests {
             Some(PeerOperation::PeerManage)
         );
         assert_eq!(
-            federation_http_operation("GET", "/api/peers/intendant:peer-b/dashboard-control-webrtc"),
+            federation_http_operation(
+                "GET",
+                "/api/peers/intendant:peer-b/dashboard-control-webrtc"
+            ),
             Some(PeerOperation::PeerInspect)
         );
         assert_eq!(
@@ -839,9 +848,18 @@ mod tests {
             Some(PeerOperation::PeerManage)
         );
         // Only the admin peer profile may use relays transitively.
-        assert!(profile_allows_operation("peer-root", PeerOperation::PeerUse));
-        assert!(!profile_allows_operation("file-operator", PeerOperation::PeerUse));
-        assert!(!profile_allows_operation("peer-operator", PeerOperation::PeerUse));
+        assert!(profile_allows_operation(
+            "peer-root",
+            PeerOperation::PeerUse
+        ));
+        assert!(!profile_allows_operation(
+            "file-operator",
+            PeerOperation::PeerUse
+        ));
+        assert!(!profile_allows_operation(
+            "peer-operator",
+            PeerOperation::PeerUse
+        ));
     }
 
     #[test]

@@ -434,16 +434,13 @@ pub fn offer_has_poolable_h264_variant(sdp: &str) -> bool {
 ///
 /// Parses the browser's SDP offer to determine which codecs it advertises,
 /// then intersects with locally available encoders.  Tries H264 first (if
-/// the browser offered it with a compatible profile *and* a local encoder
+/// the browser offered a poolable payload variant *and* a local encoder
 /// is available), falls back to VP8 (universally supported by all WebRTC
 /// browsers).
 ///
-/// H264 compatibility is determined by parsing `a=fmtp:` lines for
-/// `profile-level-id` and `packetization-mode`, then checking that at least
-/// one offered H264 variant matches our encoder's Baseline profile
-/// (profile_idc 0x42) with packetization-mode 0 or 1.  If no `a=fmtp:`
-/// line exists for an H264 payload type, it is accepted per RFC 6184
-/// defaults.
+/// This is a parked pre-pool helper. It intentionally uses the same strict
+/// H.264 gate as the live encoder pool so reviving it cannot accept a payload
+/// rtc-rs would negotiate but our encoder frames could not match.
 #[allow(dead_code)]
 pub fn select_codec(
     offer_sdp: &str,
@@ -451,7 +448,7 @@ pub fn select_codec(
     height: u32,
     bitrate_kbps: u32,
 ) -> (Box<dyn Encoder>, CodecChoice) {
-    if has_compatible_h264_offer(offer_sdp) {
+    if offer_has_poolable_h264_variant(offer_sdp) {
         match create_h264_encoder(width, height, bitrate_kbps) {
             Ok(pair) => return pair,
             Err(reason) => {

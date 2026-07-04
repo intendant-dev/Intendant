@@ -264,8 +264,8 @@ readable, only the listed paths writable — with its native primitive:
 
 - **Linux** — a Landlock ruleset applied in-process **before running any
   command** (`apply_sandbox_from_env` in `src/main.rs`, ABI v5). Nonexistent
-  paths are skipped. If the kernel doesn't enforce Landlock, a warning is
-  printed and execution continues.
+  paths are skipped. If the kernel does not enforce Landlock, the runtime fails
+  closed and refuses to run the requested sandbox unconfined.
 - **macOS** — the controller wraps the runtime child in `sandbox-exec` with a
   generated Seatbelt profile (write-restriction composed with the always-on
   secret-directory denial; see `sandbox.rs`).
@@ -285,20 +285,24 @@ though it runs with the user's privileges.
 
 ## Knowledge System
 
-Project knowledge persists as tagged entries across sessions in
-`<project>/.intendant/memory.json`. The runtime supports both the **legacy
-key-value format** (entries as an object) and the **tagged format** (entries as an
-array with `tags`/`channel`/`source`/cursors), auto-detecting which is on disk and
-migrating on write when knowledge fields are supplied.
+Project knowledge persists across sessions in `<project>/.intendant/memory.json`.
+The runtime supports both the **legacy key-value format** (entries as an object)
+and the **tagged format** (entries as an array with
+`tags`/`channel`/`source`/cursors), auto-detecting which is on disk. Existing
+legacy files stay in the legacy format on write, even when knowledge fields are
+supplied; a new file selects the tagged format only when a tag/channel/source
+field is supplied.
 
-- **`storeMemory`** creates or updates an entry by `(key, source)`. Tags come from
-  a comma-separated `memory_tags`; `memory_channel` defaults to `default`;
-  `memory_source` defaults to `agent`. Supplying any tag/channel/source field on a
-  new file selects the tagged format.
+- **`storeMemory`** creates or updates an entry by `(key, source)` in tagged
+  files. Tags come from a comma-separated `memory_tags`; `memory_channel`
+  defaults to `default`; `memory_source` defaults to `agent`. In legacy files it
+  stores only `summary`, `created_at`, and `updated_at` under the key.
 - **`recallMemory`** keyword-searches `key`+`summary`, ranks by match count, and
-  applies optional filters: `memory_tags` (any-match), `memory_channel`,
-  `memory_source`, and `memory_since` (Unix-seconds lower bound). A filter-only
-  query with no keywords returns all matching entries.
+  applies optional filters in tagged files: `memory_tags` (any-match),
+  `memory_channel`, `memory_source`, and `memory_since` (Unix-seconds lower
+  bound). A filter-only query with no keywords returns all matching tagged
+  entries. Legacy-file recall ignores those filters and returns only entries
+  with at least one keyword match.
 
 These pub/sub channels and cursors are what the orchestrator uses to route
 findings between sub-agents — see

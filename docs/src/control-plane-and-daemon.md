@@ -51,6 +51,7 @@ state:
 | `autonomy` | `SharedAutonomy` | Global autonomy level + the user-display grant flag |
 | `external_agent` | `Arc<RwLock<Option<AgentBackend>>>` | Active backend: Codex / Claude Code, or `None` (internal) |
 | `codex_config` | `SharedCodexConfig` | Runtime Codex config (command, sandbox, approval policy, model, reasoning effort, web search, network access, writable roots) |
+| `claude_config` | `SharedClaudeConfig` | Runtime Claude Code config (model, permission mode, allowed tools) |
 | `project_root` | `Option<PathBuf>` | When set, state changes also persist to `intendant.toml` |
 
 It is spawned once, early in `main.rs`, from its own bus subscription:
@@ -58,21 +59,25 @@ It is spawned once, early in `main.rs`, from its own bus subscription:
 ```rust
 let _control_plane_handle = control_plane::spawn(
     bus.subscribe(),
-    control_plane::ControlPlaneState { autonomy, external_agent, codex_config, bus, project_root },
+    control_plane::ControlPlaneState {
+        autonomy, external_agent, codex_config, claude_config, bus, project_root
+    },
 );
 ```
 
 ### The "applies on the NEXT task" rule
 
-A subtlety worth internalizing: most Codex settings **latch at process spawn**.
-Codex locks its sandbox / approval / model / tool configuration at
-`thread/start`. So when a frontend flips, say, the Codex sandbox mode, the
-control plane updates the shared config and persists it, but an already-running
-Codex thread keeps its old values for the rest of its life. The change takes
-effect on the **next** task — the daemon loop re-reads the shared config at the
-start of each task and, for changes that cannot be applied mid-session, tears
-down the persistent agent so the next launch picks them up. Each
-`ControlMsg::SetCodex*` variant documents this in its doc comment.
+A subtlety worth internalizing: external-agent launch settings **latch at process
+spawn**. Codex locks its sandbox / approval / model / tool configuration at
+`thread/start`; Claude Code likewise latches model, permission mode, and allowed
+tools when the CLI process is launched. So when a frontend flips, say, the Codex
+sandbox mode or the Claude Code permission mode, the control plane updates the
+shared config and persists it, but an already-running external-agent thread keeps
+its old values for the rest of its life. The change takes effect on the **next**
+task — the daemon loop re-reads the shared config at the start of each task and,
+for changes that cannot be applied mid-session, tears down the persistent agent
+so the next launch picks them up. Each `ControlMsg::SetCodex*` and
+`ControlMsg::SetClaude*` variant documents this in its doc comment.
 
 Two exceptions apply *immediately* rather than next-task, because the backend
 accepts them as live RPCs: `CodexThreadAction` (the `/new`, `/compact`, `/fast`, `/fork`,
@@ -221,13 +226,16 @@ restart, `history.json` is reloaded so history survives the restart.
 
 ## Headless Daemon Mode (idle `--web`)
 
-A bare `--web` launch with no task is special. `should_start_idle_web_daemon`
-returns true when `--web` is set, it is not an MCP-stdio run, and no task was
-supplied:
+A bare `--web` launch with no task and no `--task-file` is special.
+`should_start_idle_web_daemon` returns true when `--web` is set, it is not an
+MCP-stdio run, no `--task-file` was supplied, and no inline task was supplied:
 
 ```rust
 fn should_start_idle_web_daemon(use_web: bool, flags: &CliFlags) -> bool {
-    use_web && !flags.mcp && flags.task.as_ref().map(|t| t.trim().is_empty()).unwrap_or(true)
+    use_web
+        && !flags.mcp
+        && flags.task_file.is_none()
+        && flags.task.as_ref().map(|t| t.trim().is_empty()).unwrap_or(true)
 }
 ```
 

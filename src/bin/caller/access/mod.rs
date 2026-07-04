@@ -47,7 +47,7 @@ pub fn resolve_host_label() -> String {
     choose_host_label(candidates, hostname().ok().as_deref())
 }
 
-/// Read the system hostname via the POSIX `gethostname` call.
+/// Read the system hostname by shelling out to the platform `hostname` command.
 fn hostname() -> Result<String, std::io::Error> {
     let output = std::process::Command::new("hostname").output()?;
     let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -248,7 +248,8 @@ pub fn provision_virgin_access_certs() -> AccessResult<Option<PathBuf>> {
             None => return Err(err),
         },
     };
-    let server_names = certs::ServerNames::new(primary_ip, routable_local_addrs(false), Vec::new())?;
+    let server_names =
+        certs::ServerNames::new(primary_ip, routable_local_addrs(false), Vec::new())?;
     std::fs::create_dir_all(&cert_dir)
         .map_err(|e| AccessError(format!("create {}: {e}", cert_dir.display())))?;
     certs::ensure_certs(&cert_dir, &server_names, &resolve_host_label(), false)?;

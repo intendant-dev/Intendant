@@ -201,7 +201,8 @@ impl Drop for XvfbGuard {
 // ── Display launch (Linux / X11) ────────────────────────────────────────────
 
 /// Launch Xvfb on the given display with the given resolution.
-/// The config's target must be `DisplayTarget::Virtual`; panics otherwise.
+/// The config's target must be `DisplayTarget::Virtual`; returns
+/// `CallerError::Config` otherwise.
 /// Returns a guard that kills the process on drop.
 #[cfg(target_os = "linux")]
 pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerError> {
@@ -280,7 +281,7 @@ pub fn is_display_accessible() -> bool {
 /// First checks `DISPLAY` env var. If unset, probes `/tmp/.X11-unix/` for
 /// sockets (handles tty/ssh sessions where env vars aren't inherited from
 /// the graphical session). If a socket is found, sets `DISPLAY` so
-/// downstream code (xdotool, ImageMagick, etc.) can use it.
+/// downstream X11 capture/input code can use it.
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub fn is_display_accessible() -> bool {
     let display = match std::env::var("DISPLAY") {
@@ -308,7 +309,7 @@ pub fn is_display_accessible() -> bool {
 
 /// Windows has no X11 display server, so there's nothing to probe.
 /// Tier-1 will report accessibility based on a DXGI/desktop backend; for
-/// now report inaccessible so the X11/xdotool code paths stay dormant.
+/// now report inaccessible so the X11 capture/input paths stay dormant.
 #[cfg(target_os = "windows")]
 pub fn is_display_accessible() -> bool {
     false

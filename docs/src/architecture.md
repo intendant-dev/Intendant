@@ -2,13 +2,14 @@
 
 ## Overview
 
-Intendant is a two-binary system: a sandboxed **runtime** that executes
-commands, and a **controller** that drives it via AI model APIs. That split is
-the original security boundary and it is unchanged. What has grown is the
-controller: it is no longer a single agent loop with a TUI bolted on. It is a
-multi-session, multi-backend orchestration host built around a shared
-**EventBus**, a single-writer **control plane**, and a long-lived **session
-supervisor** that owns the lifecycle of every session launched at runtime.
+Intendant ships three binaries: a sandboxed **runtime** that executes commands,
+a **controller** that drives it via AI model APIs, and **intendant-connect**, the
+hosted/self-hostable rendezvous service. The runtime/controller split remains
+the security boundary. What has grown is the controller: it is no longer a
+single agent loop with a TUI bolted on. It is a multi-session, multi-backend
+orchestration host built around a shared **EventBus**, a single-writer **control
+plane**, and a long-lived **session supervisor** that owns the lifecycle of
+every session launched at runtime.
 
 ```
                               ┌──────────────────────────────────────────────┐
@@ -63,7 +64,7 @@ Two facts about this diagram drive everything below:
 
 ## Security Model
 
-The two-binary split is a deliberate security boundary:
+The runtime/controller split is a deliberate security boundary:
 
 - **intendant-runtime** executes arbitrary shell commands but runs under
   OS filesystem restrictions (Landlock on Linux, Seatbelt on macOS, restricted
@@ -73,6 +74,9 @@ The two-binary split is a deliberate security boundary:
 - **intendant** (the controller) holds API keys and manages model conversations
   but **never executes user-requested shell commands directly** — it pipes them
   to the runtime subprocess.
+- **intendant-connect** is the hosted rendezvous/account metadata service. It is
+  outside the runtime/controller command-execution boundary and holds no daemon
+  API keys or runtime authority.
 
 A compromised model conversation therefore cannot reach API keys, and the
 runtime process cannot exfiltrate data through a model API. See
@@ -217,7 +221,8 @@ delegate it. Verified against `main.rs`:
     surface an approval request and wait; headless mode denies (no implicit
     auto-approve).
 16. Pipes the JSON to `intendant-runtime` and waits with a hard timeout (120s
-    default; 600s for `askHuman`).
+    default). `askHuman` batches disable that normal timeout because the runtime
+    polls indefinitely for the response file.
 17. Feeds output back as the next user message (text path) or as individual tool
     results (tool-call path), appending a token-budget summary.
 18. Repeats until done, no JSON / no commands, the budget is exhausted, or the
@@ -226,23 +231,19 @@ delegate it. Verified against `main.rs`:
     prompt ("continue with explicit assumptions") instead of blocking on the
     human-input timeout.
 
-## Frontend Parity (corrected)
+## Frontend Vocabulary
 
-Older docs claimed a single `UserAction` enum was the contract across *all* four
-frontends. That is not accurate. There are **two** parity contracts:
+`ControlMsg` and `AppEvent` are the shared vocabulary across frontends. The TUI,
+web dashboard, MCP server, and control socket render `AppEvent` state and send
+`ControlMsg` intents through the EventBus; the control plane and session
+supervisor are the state writers. The MCP surface additionally maps its
+approval/input tools to `UserAction` and serializes some resource snapshots via
+`StateResult`, but the TUI does not use `UserAction` or `StateQuery`.
 
-- **`UserAction` (in `frontend.rs`)** is the compile-time contract shared by the
-  **TUI and the MCP server**. Adding a variant forces both the TUI key handler
-  and the MCP tool handler to produce it, and the shared action handler to
-  process it — no `_ =>` wildcards allowed.
-- **`ControlMsg` (in `event.rs`)** is the intent contract used by the **web
-  dashboard and the control socket** (and how MCP/TUI ultimately reach the
-  control plane and session supervisor). The control socket parses `ControlMsg`
-  JSON and republishes it as `AppEvent::ControlCommand`; the web gateway emits
-  `ControlMsg` directly.
-
-The two meet on the EventBus. The practical guarantee is the same — capabilities
-reach every interface — but it is enforced by *two* exhaustive enums, not one.
+There is no single compile-time exhaustiveness guarantee across all frontends.
+Rust exhaustive matching protects each local handler, and cross-frontend parity
+is maintained by routing new capabilities through the `ControlMsg`/`AppEvent`
+surface.
 
 ## askHuman Behavior
 
@@ -252,8 +253,9 @@ reach every interface — but it is enforced by *two* exhaustive enums, not one.
 - In **headless mode** (`--no-tui` or non-interactive stdin), `askHuman` cannot
   be answered interactively, so the loop tells the model to continue with
   explicit assumptions rather than wait.
-- The runtime-level timeout for an unanswered `askHuman` is 5 minutes (600s at
-  the controller's per-command timeout).
+- In interactive paths, `askHuman` has no effective timeout: the controller
+  disables the normal command timeout and the runtime polls indefinitely for the
+  response file.
 
 ## Streaming
 
@@ -291,8 +293,8 @@ When context usage reaches 90% (`usage_fraction() >= 0.90`),
 
 - **Keeps**: the system message, the first 2 context messages (working directory
   + ack), and the last 4 messages.
-- **Summarizes**: the oldest half of the remaining middle messages via
-  `summarize_turns()`.
+- **Summarizes**: all messages between the system/context prefix and the last
+  four messages via `summarize_turns()`.
 - Emits a `ContextManagement` event to the frontends.
 
 Sub-agents and orchestrators additionally checkpoint structured state to the

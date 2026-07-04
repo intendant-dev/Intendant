@@ -52,7 +52,7 @@ authenticate*:
 
 ```json
 {
-  "id": { "kind": "intendant", "label": "nicks-mac" },
+  "id": "intendant:nicks-mac",
   "label": "nicks-mac",
   "version": "0.x.y",
   "git_sha": "abc1234",
@@ -103,9 +103,11 @@ intendant --web --advertise-url wss://192.168.1.42:8765/ws \
 ```
 
 `--advertise-url` is repeatable; each occurrence appends one URL in preference
-order. When non-empty, the CLI list replaces both the `[server.advertise]` config
-value and the auto-detected URL (operator wins). The same list also seeds the
-**primary-relay TCP fallback** for cross-machine display (see below).
+order. When non-empty, the CLI list replaces the `[server.advertise]` config
+list at config-merge time. The Agent Card then prepends those operator URLs
+ahead of auto-detected URLs; auto-detected entries are always appended as
+fallbacks. The merged list also seeds the **primary-relay TCP fallback** for
+cross-machine display (see below).
 
 ## The Peer Actor / Registry / Coordinator Model
 
@@ -137,8 +139,12 @@ value and the auto-detected URL (operator wins). The same list also seeds the
   events as they arrive off the wire — there's no "take the stream once"
   awkwardness. Outbound work is a transport-neutral `PeerOp` envelope
   (`SendMessage`, `DelegateTask`, `CancelTask`, `QueryTaskStatus`,
-  `InvokeCapability`, `ResolveApproval`, `WebRtcSignal`); a `TransportFeatures`
-  struct declares which verbs a transport class supports.
+  `InvokeCapability`, `ResolveApproval`, `WebRtcSignal`,
+  `PeerFileTransferSignal`, `PeerDashboardControlSignal`); a
+  `TransportFeatures` struct declares which verbs a transport class supports.
+  The WebRTC, file-transfer, and dashboard-control signaling relays are
+  authorized as `peer.use`, separate from peer inspection and management; the
+  receiving peer applies its own grants to the tunnel contents.
 - **The per-peer actor** (`peer/actor.rs`) owns the transport by value and runs a
   `connect → main-loop → reconnect` state machine with **indefinite exponential
   backoff** (500 ms initial, 30 s cap, jitter, reset on every successful connect).

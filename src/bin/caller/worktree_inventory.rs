@@ -394,6 +394,10 @@ fn scan_worktrees_with_size_budget(
     }
 }
 
+/// Dashboard cleanup path: remove only the registered checkout after safety
+/// checks. The branch ref is intentionally left in place and returned in the
+/// response; fission-owned cleanup that also deletes the branch uses
+/// `worktree::remove_worktree_and_branch`.
 pub fn remove_worktree_if_safe(
     request: WorktreeRemoveRequest,
     session_hints: &[WorktreeSessionHint],
@@ -1728,7 +1732,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_safe_worktree_deletes_clean_merged_worktree() {
+    fn remove_safe_worktree_removes_checkout_and_keeps_branch() {
         let tmp = init_repo();
         let repo = repo_path(&tmp);
         let wt = tmp.path().join("remove-worktree");
@@ -1762,6 +1766,12 @@ mod tests {
             canonical_child_path(&wt)
         );
         assert!(!wt.exists());
+        assert!(Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "refs/heads/remove-me"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
         let scan = scan_worktrees(tmp.path(), Some(&repo), &[]);
         assert!(!scan
             .worktrees

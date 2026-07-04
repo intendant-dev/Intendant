@@ -135,16 +135,13 @@
 //! requests per `(codec, rid)` within a small window
 //! ([`KEYFRAME_COALESCE_WINDOW`]).
 //!
-//! ## Out of scope for this stub
+//! ## Current lifecycle
 //!
-//! - Encoder spawning (the actual `tokio::task::spawn_blocking` wiring).
-//!   Phase 3.
-//! - Layer width/height selection logic. Phase 4.
-//! - Bitrate-aware layer downgrade based on TWCC. Phase 4.
-//! - Hardware encoder slot tracking (VAAPI session counter). Phase 3.
-//!
-//! This module currently establishes the type vocabulary and
-//! orchestration contract; subsequent phases fill in the bodies.
+//! Pool construction spawns the platform baseline encoder bank immediately.
+//! Subscriptions refcount on-demand codecs, spawning the first matching encoder
+//! when a peer needs it and tearing it down when the last lease drops. Resize
+//! rebuilds the always-on bank from the layer factory, and demand/capacity
+//! state decides which spawned layers actually encode frames.
 
 use crate::display::{visual_marker, EncodedFrame};
 use std::collections::HashMap;
@@ -1046,19 +1043,10 @@ impl Default for KeyframeCoalescer {
 
 /// The orchestrator. One pool per [`crate::display::DisplaySession`].
 ///
-/// Phase 3a (this commit) implements the always-on encoder spawn path —
-/// `new` actually spawns encoder threads for each always-on layer, the
-/// bridge feeds I420 frames via [`Self::push_i420_frame`], and
-/// [`Self::request_keyframe`] propagates through the coalescer to the
-/// matching encoder thread's atomic flag.
-///
-/// Phase 3b will fill in on-demand encoder spawn (refcount-driven, one
-/// per non-always-on codec subscriber) so a peer offering only H.264
-/// triggers an H.264 encoder spawn; the slot is torn down when the
-/// last H.264 peer disconnects.
-///
-/// Phase 3c wires this pool into [`crate::display::DisplaySession`],
-/// replacing the single-encoder code path in `start_encoder_pipeline`.
+/// The pool owns the always-on baseline encoder bank, on-demand codec
+/// slots, subscription refcounts, resize rebuilds, and keyframe coalescing.
+/// The capture bridge feeds I420 frames via [`Self::push_i420_frame`], and
+/// peer driver tasks consume [`EncoderSubscription`] receivers.
 ///
 /// The pool is `Clone` (Arc-backed) — one reference goes to the bridge
 /// (feeds I420), one to each peer's forwarder (subscribes / releases),
@@ -1070,9 +1058,9 @@ pub struct EncoderPool {
 
 struct EncoderPoolInner {
     /// Always-on encoders (constructed at pool creation, torn down and
-    /// respawned atomically on resize). Today: a single VP8 layer at
-    /// the source resolution. Phase 4 expands this into VP8 simulcast
-    /// (multiple layers).
+    /// respawned atomically on resize). The bank uses the platform
+    /// [`BASELINE_CODEC`]: VP8 simulcast on macOS/Linux, and a single
+    /// full-resolution H.264 layer on Windows.
     ///
     /// Behind `StdRwLock` because [`EncoderPool::on_resize`] mutates
     /// the vec (swapping every handle for a fresh one at new
@@ -1269,12 +1257,11 @@ impl EncoderPool {
     ///   `move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)]`
     ///   (single full-source layer that tracks resize).
     ///
-    /// Always-on codec is always VP8 — it has the broadest browser
-    /// support and no codec-licensing complications, so it's the safe
-    /// default the pool guarantees is producing frames the instant any
-    /// peer subscribes. H.264 is spawned on-demand by
-    /// [`Self::subscribe`] when a peer needs it; VP9 / AV1 are not yet
-    /// wired to a backend (phase 4+).
+    /// The always-on codec is the platform [`BASELINE_CODEC`]: VP8 on
+    /// macOS/Linux for broad browser compatibility, and H.264 on Windows
+    /// because the VP8 backend is gated off there. Other codecs are spawned
+    /// on demand by [`Self::subscribe`] when a matching backend exists and a
+    /// peer needs them.
     ///
     /// Returns a pool with all always-on encoder threads already
     /// running. The pool's I420 broadcast is empty until the caller

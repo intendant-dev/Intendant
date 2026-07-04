@@ -45,11 +45,13 @@ pub struct FissionBranch {
     /// (legacy/observed values such as `ended`, `interrupted`, and `unknown`
     /// also occur — see [`normalize_branch_status`]). Kept as a free string
     /// for wire/back compat with ledgers written before the vocabulary
-    /// existed. `detached` and `cancelled` are *sticky*: only an explicit API
-    /// (the detach functions, a future cancel/reattach API) may change them.
-    /// [`record_fission_observation`] never does, so a stray completion event
-    /// from a still-running child of a detached anchor cannot resurrect the
-    /// branch. See [`branch_status_is_terminal`] / [`branch_status_is_sticky`].
+    /// existed. `detached` and `cancelled` are *sticky* once written:
+    /// detach functions write `detached`, and the lifecycle watcher writes
+    /// `cancelled` when it observes `AppEvent::Interrupted`. After either
+    /// status exists, [`record_fission_observation`] refuses to overwrite it,
+    /// so a stray completion event from a still-running child of a detached
+    /// anchor cannot resurrect the branch. See [`branch_status_is_terminal`] /
+    /// [`branch_status_is_sticky`].
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -1386,14 +1388,14 @@ pub fn branch_status_is_terminal(status: &str) -> bool {
 }
 
 /// True for the *sticky* statuses — exactly `detached` or `cancelled`, raw
-/// value. Sticky statuses are written only by explicit supervisor APIs (the
-/// detach functions, a future cancel/reattach API) and no passive observation
-/// may overwrite them, not even with another terminal status: a detached
-/// branch's child process may still be running and will eventually emit stray
+/// value. Sticky statuses are written by the detach paths or by lifecycle
+/// observation of an `Interrupted` event, and no later observation may
+/// overwrite them, not even with another terminal status: a detached branch's
+/// child process may still be running and will eventually emit stray
 /// completion events that must not resurrect or "complete" the branch behind
-/// the supervisor's back. Matches the raw value rather than the normalized
-/// one on purpose — the observation-recorded legacy `interrupted` normalizes
-/// to `cancelled` for display but keeps its pre-vocabulary upgradeability.
+/// the supervisor's back. Matches the raw value rather than the normalized one
+/// on purpose — the observation-recorded legacy `interrupted` normalizes to
+/// `cancelled` for display but keeps its pre-vocabulary upgradeability.
 /// Called by [`record_fission_observation`], [`register_spawned_branch`], and
 /// [`claim_canonical_checked`].
 pub fn branch_status_is_sticky(status: &str) -> bool {

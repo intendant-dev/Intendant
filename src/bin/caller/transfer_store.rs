@@ -138,14 +138,28 @@ fn artifacts_dir(project_root: &Path) -> PathBuf {
     transfer_root(project_root).join("artifacts")
 }
 
-fn job_path(project_root: &Path, id: &str) -> PathBuf {
-    jobs_dir(project_root).join(format!("{}.json", safe_id(id)))
+fn is_generated_transfer_key(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(idx, byte)| match idx {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'),
+        })
 }
 
-fn safe_id(id: &str) -> String {
-    id.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .collect::<String>()
+fn job_path(project_root: &Path, id: &str) -> Result<PathBuf, TransferStoreError> {
+    if !is_generated_transfer_key(id) {
+        return Err(TransferStoreError::new(
+            500,
+            "transfer job id is not a generated UUID",
+        ));
+    }
+    Ok(jobs_dir(project_root).join(format!("{id}.json")))
+}
+
+fn lookup_job_path(project_root: &Path, id_or_token: &str) -> Option<PathBuf> {
+    is_generated_transfer_key(id_or_token)
+        .then(|| jobs_dir(project_root).join(format!("{id_or_token}.json")))
 }
 
 fn now_unix() -> u64 {
@@ -182,13 +196,28 @@ fn content_type_for_path(path: &Path) -> String {
     .to_string()
 }
 
+fn cleanup_created_file_after_save_failure(path: &Path, label: &str) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            eprintln!(
+                "[transfer-store] failed to remove {label} {} after metadata save failed: {}",
+                path.display(),
+                err
+            );
+        }
+    }
+}
+
 fn save_job(project_root: &Path, job: &TransferJob) -> Result<(), TransferStoreError> {
     crate::upload_store::ensure_project_uploads_ignored(project_root).map_err(|e| {
         TransferStoreError::new(500, format!("ensure transfer metadata ignored: {e}"))
     })?;
     let bytes = serde_json::to_vec_pretty(job)
         .map_err(|e| TransferStoreError::new(500, format!("serialize transfer job: {e}")))?;
-    crate::file_watcher::atomic_write(&job_path(project_root, &job.id), &bytes)
+    let path = job_path(project_root, &job.id)?;
+    crate::file_watcher::atomic_write(&path, &bytes)
         .map_err(|e| TransferStoreError::new(500, format!("write transfer job: {e}")))
 }
 
@@ -222,8 +251,10 @@ pub fn find_job(project_root: &Path, id_or_token: &str) -> Option<TransferJob> {
     if needle.is_empty() {
         return None;
     }
-    let direct = job_path(project_root, needle);
-    if direct.is_file() {
+    if !is_generated_transfer_key(needle) {
+        return None;
+    }
+    if let Some(direct) = lookup_job_path(project_root, needle).filter(|path| path.is_file()) {
         if let Ok(content) = fs::read_to_string(direct) {
             if let Ok(job) = serde_json::from_str::<TransferJob>(&content) {
                 return Some(job);
@@ -350,7 +381,7 @@ pub fn create_download_job_from_bytes(
         status: TransferStatus::Queued,
         created_at: now,
         updated_at: now,
-        source_path: Some(artifact_path),
+        source_path: Some(artifact_path.clone()),
         source_kind: Some(source_kind.into()),
         source_label,
         artifact,
@@ -366,7 +397,10 @@ pub fn create_download_job_from_bytes(
         error: None,
         conflict_policy: TransferConflictPolicy::Fail,
     };
-    save_job(project_root, &job)?;
+    if let Err(err) = save_job(project_root, &job) {
+        cleanup_created_file_after_save_failure(&artifact_path, "transfer artifact");
+        return Err(err);
+    }
     Ok(job)
 }
 
@@ -496,7 +530,7 @@ pub fn create_upload_job(
         managed_source: false,
         destination_path: Some(final_path.clone()),
         final_path: None,
-        temp_path: Some(temp_path),
+        temp_path: Some(temp_path.clone()),
         original_name: Some(original_name.to_string()),
         filename: Some(filename),
         mime: Some(if mime.trim().is_empty() {
@@ -509,7 +543,10 @@ pub fn create_upload_job(
         error: None,
         conflict_policy,
     };
-    save_job(project_root, &job)?;
+    if let Err(err) = save_job(project_root, &job) {
+        cleanup_created_file_after_save_failure(&temp_path, "upload partial");
+        return Err(err);
+    }
     Ok(job)
 }
 
@@ -739,7 +776,7 @@ pub fn delete_job(project_root: &Path, id_or_token: &str) -> Result<bool, Transf
     job.status = TransferStatus::Cancelled;
     job.updated_at = now_unix();
     let _ = save_job(project_root, &job);
-    let path = job_path(project_root, &job.id);
+    let path = job_path(project_root, &job.id)?;
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -759,6 +796,12 @@ mod tests {
         tmp.write_all(bytes).unwrap();
         tmp.flush().unwrap();
         tmp
+    }
+
+    fn block_jobs_dir(project: &Path) {
+        let transfers = transfer_root(project);
+        fs::create_dir_all(&transfers).unwrap();
+        fs::write(transfers.join("jobs"), b"not a directory").unwrap();
     }
 
     #[test]
@@ -784,6 +827,22 @@ mod tests {
         assert_eq!(end, 14);
         assert_eq!(updated.status, TransferStatus::Completed);
         assert_eq!(updated.completed_bytes, 14);
+    }
+
+    #[test]
+    fn transfer_lookup_rejects_malformed_uuid_strings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let source = tmp.path().join("fixture.txt");
+        fs::write(&source, b"hello transfer").unwrap();
+
+        let job = create_download_job(&project, source.to_str().unwrap()).unwrap();
+        assert!(find_job(&project, &job.id).is_some());
+        assert!(find_job(&project, &job.resume_token).is_some());
+        assert!(find_job(&project, &format!("../{}", job.id)).is_none());
+        assert!(find_job(&project, &format!("{}!!", job.id)).is_none());
+        assert!(find_job(&project, &job.id.to_uppercase()).is_none());
     }
 
     #[test]
@@ -820,6 +879,30 @@ mod tests {
 
         assert!(delete_job(&project, &job.id).unwrap());
         assert!(!source_path.exists());
+    }
+
+    #[test]
+    fn generated_download_artifact_is_removed_when_metadata_save_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        block_jobs_dir(&project);
+
+        let err = create_download_job_from_bytes(
+            &project,
+            b"generated report bytes".to_vec(),
+            "report.zip",
+            "application/zip",
+            "session_report",
+            Some("Session report".to_string()),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.status, 500);
+
+        let artifacts = artifacts_dir(&project);
+        assert!(artifacts.exists());
+        assert!(fs::read_dir(artifacts).unwrap().next().is_none());
     }
 
     #[test]
@@ -897,6 +980,38 @@ mod tests {
         let committed = commit_upload_job(&project, &job.id).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"existing");
         assert_eq!(fs::read(committed.final_path.unwrap()).unwrap(), b"new");
+    }
+
+    #[test]
+    fn upload_partial_is_removed_when_metadata_save_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let dest_dir = tmp.path().join("dest");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+        block_jobs_dir(&project);
+
+        let err = create_upload_job(
+            &project,
+            dest_dir.join("out.txt").to_str().unwrap(),
+            "out.txt",
+            "text/plain",
+            Some(3),
+            TransferConflictPolicy::Fail,
+        )
+        .unwrap_err();
+        assert_eq!(err.status, 500);
+        let partials = fs::read_dir(&dest_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".intendant-upload-")
+            })
+            .count();
+        assert_eq!(partials, 0);
     }
 
     #[test]
