@@ -18203,8 +18203,8 @@ fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
 
     match error.raw_os_error() {
         // The listener file descriptor/socket is invalid or no longer a
-        // listening socket. Retrying would spin forever without restoring
-        // reachability.
+        // listening socket (EBADF/EINVAL/ENOTSOCK). Retrying accept() on it
+        // would spin forever — the caller rebinds a fresh listener instead.
         Some(9 | 22 | 38) => false,
         // Process/system descriptor pressure and socket buffer pressure are
         // recoverable after current connections close. Keep the gateway alive
@@ -18215,6 +18215,33 @@ fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
         // listener while existing WebSocket tasks make the UI look alive.
         _ => true,
     }
+}
+
+/// Rebind the gateway listener on its original address after the previous
+/// socket became unusable — seen in the wild on macOS as `accept()`
+/// returning EINVAL a minute into an app-spawned daemon's life, which
+/// used to kill the listener task and leave the dashboard half-alive
+/// (established WebSockets kept flowing while every new connection —
+/// session details, files, uploads, Station assets — failed). Mirrors
+/// `bind_dual_stack_or_v4`: dual-stack for the IPv6 wildcard,
+/// `SO_REUSEADDR` so lingering TIME_WAIT sockets don't block the port.
+fn rebind_gateway_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() && addr.ip().is_unspecified() {
+        let _ = socket.set_only_v6(false);
+    }
+    let _ = socket.set_reuse_address(true);
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(std_listener)
 }
 
 /// CORS header segment for `/mcp` responses: echo the requesting origin
@@ -19063,7 +19090,9 @@ pub fn spawn_web_gateway(
     let tls_failure_log_state: TlsFailureLogState = Arc::new(Mutex::new(HashMap::new()));
 
     tokio::spawn(async move {
-        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        let mut listener = listener;
+        let bind_addr = listener.local_addr().ok();
+        let port = bind_addr.map(|a| a.port()).unwrap_or(0);
 
         if let Some(p) = tcp_advertised_port {
             eprintln!("[web_gateway] ICE-TCP candidates advertise port {p}");
@@ -19073,20 +19102,43 @@ pub fn spawn_web_gateway(
             let (stream, peer_addr) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    let should_continue = should_continue_after_accept_error(&e);
-                    eprintln!(
-                        "[web_gateway] accept failed on port {port}: {e}{}",
-                        if should_continue {
-                            " (continuing)"
-                        } else {
-                            " (listener task exiting)"
-                        }
-                    );
-                    if should_continue {
+                    if should_continue_after_accept_error(&e) {
+                        eprintln!("[web_gateway] accept failed on port {port}: {e} (continuing)");
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         continue;
                     }
-                    break;
+                    // The listening socket itself is dead. Exiting here
+                    // leaves the daemon half-alive (established WebSockets
+                    // keep the UI looking healthy while every new request
+                    // fails) — rebind the original address instead, backing
+                    // off up to 30s until the port comes back.
+                    let Some(addr) = bind_addr else {
+                        eprintln!(
+                            "[web_gateway] accept failed on port {port}: {e} (bind address unknown; listener task exiting)"
+                        );
+                        break;
+                    };
+                    eprintln!(
+                        "[web_gateway] accept failed on port {port}: {e} (rebinding listener)"
+                    );
+                    let mut delay = std::time::Duration::from_millis(250);
+                    listener = loop {
+                        tokio::time::sleep(delay).await;
+                        match rebind_gateway_listener(addr) {
+                            Ok(fresh) => {
+                                eprintln!("[web_gateway] listener rebound on port {port}");
+                                break fresh;
+                            }
+                            Err(err) => {
+                                delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                                eprintln!(
+                                    "[web_gateway] listener rebind on port {port} failed: {err} (retrying in {:.1}s)",
+                                    delay.as_secs_f32()
+                                );
+                            }
+                        }
+                    };
+                    continue;
                 }
             };
 
@@ -46515,5 +46567,25 @@ mod tests {
             preload_intendant_entry("intendant-row", &legacy(&live_target)),
             PreloadOutcome::Skipped
         );
+    }
+
+    /// The gateway must be able to re-establish its listener on the exact
+    /// address a dead one occupied (accept() EINVAL/EBADF recovery path),
+    /// and the fresh listener must actually accept connections.
+    #[tokio::test]
+    async fn rebind_gateway_listener_restores_reachability() {
+        let original = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = original.local_addr().unwrap();
+        drop(original);
+
+        let rebound = rebind_gateway_listener(addr).expect("rebind on the freed address");
+        assert_eq!(rebound.local_addr().unwrap(), addr);
+
+        let (client, (server, _peer)) = tokio::join!(
+            tokio::net::TcpStream::connect(addr),
+            async { rebound.accept().await.unwrap() },
+        );
+        client.expect("client connects to rebound listener");
+        drop(server);
     }
 }
