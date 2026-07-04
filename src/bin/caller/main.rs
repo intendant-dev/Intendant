@@ -53,6 +53,7 @@ mod sandbox;
 mod schema_validator;
 mod service_mode;
 mod session_config;
+mod session_identity;
 mod session_log;
 mod session_names;
 mod session_supervisor;
