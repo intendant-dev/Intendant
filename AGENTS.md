@@ -127,6 +127,16 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
 - tokio (full features), `Arc<RwLock/Mutex<T>>` for shared state, `mpsc` for channels
 - TLS/cert code is **pure-Rust `ring`/`rcgen`/`rustls`** (`web_tls.rs`, `access/certs.rs`) — no OpenSSL; prefer that path when touching crypto/cert code
 - Tests live in inline `#[cfg(test)]` modules only
+- **File size budget:** keep a source file under ~3k lines (4k absolute ceiling;
+  the remaining god-files are legacy being carved down, not precedents). When a
+  file outgrows its seams, split along domain boundaries as **pure-move
+  commits**: relocate code *and its tests* verbatim into a new module, add
+  `mod new_module; pub(crate) use new_module::*;` at the old location so every
+  existing reference keeps compiling, and widen moved items to `pub(crate)` as
+  needed — that widening is the only permitted non-move edit. No renames,
+  reformatting, or logic changes ride in a move commit; review with
+  `git diff --color-moved=dimmed-zebra`, where any non-dimmed red/green is a
+  violation.
 - WASM boundary: `serde_wasm_bindgen` with `serialize_maps_as_objects(true)`
 - Pure-safe Rust by default. The Unix (macOS / Linux) code paths keep `unsafe`
   confined to documented islands: small platform probes/signals and display or
