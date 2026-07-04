@@ -52,6 +52,17 @@ pub fn client_key_fingerprint(raw_point: &[u8]) -> String {
     b64u(ring::digest::digest(&ring::digest::SHA256, raw_point).as_ref())
 }
 
+/// Shape check for a value claiming to be a [`client_key_fingerprint`]:
+/// unpadded base64url of a SHA-256 digest — exactly 43 characters of the
+/// base64url alphabet. Lets CLI boundaries reject typos and placeholders
+/// before they get pinned as root authority.
+pub fn is_client_key_fingerprint(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// The exact byte string a client signs for an offer.
 pub fn client_key_offer_payload(
     daemon_id: &str,
@@ -172,6 +183,19 @@ pub fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_shape_matches_the_generator() {
+        let fp = client_key_fingerprint(b"any raw point bytes");
+        assert!(is_client_key_fingerprint(&fp));
+        // The exact failure that motivated the check: a placeholder (or a
+        // typo'd paste) must not be pinnable as root.
+        assert!(!is_client_key_fingerprint("OWNERKEY-PLACEHOLDER"));
+        assert!(!is_client_key_fingerprint(""));
+        assert!(!is_client_key_fingerprint(&fp[..42]));
+        assert!(!is_client_key_fingerprint(&format!("{fp}=")));
+        assert!(!is_client_key_fingerprint(&format!("{}+", &fp[..42])));
+    }
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 
     struct TestKey {
