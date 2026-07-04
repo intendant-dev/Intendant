@@ -267,8 +267,25 @@ final class ConsoleBridge: NSObject, WKScriptMessageHandler {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDelegate {
+/// Routes the placeholder/crash pages' buttons back into the app.
+/// Held strongly by WKUserContentController, so the delegate link is weak.
+final class AppMessageBridge: NSObject, WKScriptMessageHandler {
+    weak var appDelegate: AppDelegate?
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        switch message.name {
+        case "activate": appDelegate?.activateDashboard()
+        case "restart": appDelegate?.restartBackend()
+        default: break
+        }
+    }
+}
+
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelegate,
+    WKNavigationDelegate
+{
     let consoleBridge = ConsoleBridge()
+    let messageBridge = AppMessageBridge()
     var window: NSWindow!
     var webView: WKWebView!
     var backendProcess: Process?
@@ -279,6 +296,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     var launchPlan: BackendLaunchPlan!
     var backendSession: URLSession!
     var backendTrustDelegate: BackendTrustDelegate?
+
+    /// Whether the WKWebView currently hosts the dashboard SPA (as opposed
+    /// to the placeholder / boot / crash pages). The SPA is the expensive
+    /// part — a long streaming session grows the web-content process past
+    /// a gigabyte — so it only loads on explicit request and is torn down
+    /// with the window.
+    var dashboardActive = false
+    /// Last moment the window was actually on screen (occlusion-visible).
+    var lastWindowVisibleAt = Date()
+    /// Unload the SPA back to the placeholder after the window has been
+    /// continuously hidden this long. 0 or negative disables. The default
+    /// catches "left it open behind other windows for days" without ever
+    /// firing on a dashboard someone is glancing at.
+    let idleUnloadSeconds: TimeInterval = {
+        if let raw = ProcessInfo.processInfo.environment["INTENDANT_DASHBOARD_IDLE_UNLOAD_SECS"],
+           let value = Double(raw) {
+            return value
+        }
+        return 3 * 3600
+    }()
+    /// Load the SPA immediately instead of the placeholder. INTENDANT_DIAG
+    /// smoke runs depend on the dashboard coming up unattended, and users
+    /// who prefer the old behavior can set INTENDANT_AUTO_DASHBOARD=1.
+    let autoActivateDashboard: Bool = {
+        let env = ProcessInfo.processInfo.environment
+        return env["INTENDANT_DIAG"] == "1" || env["INTENDANT_AUTO_DASHBOARD"] == "1"
+    }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let preferredPort = port
@@ -299,9 +343,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         )
         configureBackendSession()
         checkPermissions()
+        installMainMenu()
         startBackend()
         createWindow()
         pollUntilReady()
+    }
+
+    /// The app historically had no menu bar because closing the window
+    /// quit it. Now that the window is closable without stopping the
+    /// daemon, Quit (Cmd+Q) and Close (Cmd+W) need menu items to exist.
+    func installMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appItem = NSMenuItem()
+        mainMenu.addItem(appItem)
+        let appMenu = NSMenu()
+        appItem.submenu = appMenu
+        appMenu.addItem(
+            withTitle: "Quit Intendant (stops the daemon)",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+
+        let windowItem = NSMenuItem()
+        mainMenu.addItem(windowItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowItem.submenu = windowMenu
+        windowMenu.addItem(
+            withTitle: "Close Window (daemon keeps running)",
+            action: #selector(NSWindow.performClose(_:)),
+            keyEquivalent: "w"
+        )
+        windowMenu.addItem(
+            withTitle: "Minimize",
+            action: #selector(NSWindow.performMiniaturize(_:)),
+            keyEquivalent: "m"
+        )
+        NSApp.mainMenu = mainMenu
     }
 
     func configureBackendSession() {
@@ -412,8 +490,104 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         return nil
     }
 
+    // Closing the window frees the WKWebView but keeps the daemon (and the
+    // app) alive — the whole point of running this Mac as a remote daemon.
+    // Quitting the app is the explicit "stop everything" gesture.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        return true
+        return false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication,
+                                       hasVisibleWindows flag: Bool) -> Bool {
+        if window == nil {
+            createWindow()
+            showPlaceholder(paused: false)
+        } else {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+        }
+        return false
+    }
+
+    // MARK: - NSWindowDelegate
+
+    func windowWillClose(_ notification: Notification) {
+        NSLog("Dashboard window closed — daemon keeps running (quit via Cmd+Q or the Dock menu)")
+        teardownWebView()
+        window = nil
+    }
+
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        if window?.occlusionState.contains(.visible) == true {
+            lastWindowVisibleAt = Date()
+        }
+    }
+
+    // MARK: - Dashboard lifecycle
+
+    /// Destroy the WKWebView outright. Dropping the last reference exits
+    /// the WebKit content/GPU helper processes — actual zero cost, unlike
+    /// an occluded page that merely throttles.
+    func teardownWebView() {
+        guard webView != nil else { return }
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        webView.removeFromSuperview()
+        webView = nil
+        dashboardActive = false
+    }
+
+    /// The cheap resting state: a static page with daemon status and an
+    /// Activate button. A web-content process hosting this is ~20 MB; the
+    /// SPA it defers is hundreds of MB and grows with session length.
+    func showPlaceholder(paused: Bool) {
+        guard webView != nil else { return }
+        dashboardActive = false
+        let title = paused ? "Dashboard paused" : "Intendant daemon is running"
+        let detail = paused
+            ? "The dashboard was unloaded after staying hidden, to give its memory back. The daemon never stopped."
+            : "Remote clients can connect right away — load the dashboard here only when you need it."
+        webView.loadHTMLString("""
+            <html>
+            <body style="background:#1e1e2e;color:#cdd6f4;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+            <div style="text-align:center;max-width:480px;padding:0 24px">
+                <div style="font-size:24px;margin-bottom:10px">\(title)</div>
+                <div style="font-size:14px;color:#6c7086;line-height:1.5">Serving on port \(port). \(detail)</div>
+                <button onclick="window.webkit.messageHandlers.activate.postMessage(null)"
+                        style="margin-top:18px;padding:10px 28px;border:1px solid #89b4fa;border-radius:6px;background:transparent;color:#89b4fa;font-size:15px;cursor:pointer">
+                    Activate Dashboard
+                </button>
+                <div style="font-size:12px;color:#6c7086;margin-top:16px">Closing this window keeps the daemon running. Quit from the Dock or with Cmd+Q to stop it.</div>
+            </div>
+            </body>
+            </html>
+            """, baseURL: nil)
+        NSLog(paused
+            ? "Dashboard unloaded to placeholder (hidden \(Int(idleUnloadSeconds))s)"
+            : "Showing dashboard placeholder — activate to load the SPA")
+    }
+
+    func activateDashboard() {
+        if window == nil { createWindow() }
+        guard !dashboardActive, webView != nil else { return }
+        dashboardActive = true
+        lastWindowVisibleAt = Date()
+        NSLog("Activating dashboard")
+        webView.load(URLRequest(url: intendantBackendURL()))
+    }
+
+    /// Crash-screen Restart button: relaunch the backend and re-enter the
+    /// readiness poll (which lands on the placeholder / auto-activation).
+    func restartBackend() {
+        NSLog("Backend restart requested")
+        healthTimer?.invalidate()
+        healthProbeFailures = 0
+        if let proc = backendProcess, proc.isRunning {
+            proc.terminate()
+        }
+        startBackend()
+        pollUntilReady()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -472,9 +646,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     // MARK: - WKNavigationDelegate
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        // macOS killed the web process (memory pressure). Reload the dashboard.
-        NSLog("Web content process terminated — reloading")
-        webView.load(URLRequest(url: intendantBackendURL()))
+        // macOS killed the web process (memory pressure). Restore what was
+        // actually showing — reloading the SPA when only the placeholder
+        // was up would defeat the point of deferring it.
+        NSLog("Web content process terminated — \(dashboardActive ? "reloading dashboard" : "restoring placeholder")")
+        if dashboardActive {
+            webView.load(URLRequest(url: intendantBackendURL()))
+        } else {
+            showPlaceholder(paused: false)
+        }
     }
 
     // Navigation outcomes are otherwise invisible from outside the app;
@@ -642,6 +822,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         // terminal launches can see what the dashboard is doing — the
         // WKWebView inspector is rarely attached when it matters.
         config.userContentController.add(consoleBridge, name: "log")
+
+        // Placeholder "Activate Dashboard" + crash-screen "Restart".
+        messageBridge.appDelegate = self
+        config.userContentController.add(messageBridge, name: "activate")
+        config.userContentController.add(messageBridge, name: "restart")
         let consoleScript = WKUserScript(
             source: """
             (() => {
@@ -697,6 +882,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         window.title = port == 8765 ? "Intendant" : "Intendant (port \(port))"
         window.contentView = webView
         window.minSize = NSSize(width: 600, height: 400)
+        // ARC owns the window through `self.window`; the default
+        // release-when-closed would over-release it on the first close.
+        window.isReleasedWhenClosed = false
+        window.delegate = self
         window.makeKeyAndOrderFront(nil)
 
         // Dark title bar to match Catppuccin Mocha theme
@@ -708,7 +897,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     // MARK: - Polling
 
     func pollUntilReady() {
-        webView.loadHTMLString("""
+        webView?.loadHTMLString("""
             <html>
             <body style="background:#1e1e2e;color:#cdd6f4;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
             <div style="text-align:center">
@@ -724,7 +913,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
 
     func poll(attempts: Int) {
         if attempts > 30 {
-            webView.loadHTMLString("""
+            // The window may have been closed while the backend booted;
+            // the poll keeps running regardless, only painting is skipped.
+            webView?.loadHTMLString("""
                 <html>
                 <body style="background:#1e1e2e;color:#f38ba8;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
                 <div>Failed to connect to backend on port \(port)</div>
@@ -742,8 +933,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         backendSession.dataTask(with: request) { _, response, error in
             if let http = response as? HTTPURLResponse, http.statusCode == 200 {
                 DispatchQueue.main.async {
-                    // Load via custom scheme for secure context
-                    self.webView.load(URLRequest(url: intendantBackendURL()))
+                    // Backend is up. The SPA is deferred behind the
+                    // placeholder unless a harness/user asked for it.
+                    if self.autoActivateDashboard {
+                        self.activateDashboard()
+                    } else {
+                        self.showPlaceholder(paused: false)
+                    }
                     self.startHealthCheck()
                 }
             } else {
@@ -763,6 +959,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     // MARK: - Health Check
 
     func startHealthCheck() {
+        healthTimer?.invalidate()
         healthTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             // Check if the backend process is still alive
@@ -770,6 +967,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
                 self.healthTimer?.invalidate()
                 self.showBackendCrash()
                 return
+            }
+            // Idle unload: an SPA nobody has seen for hours is pure cost —
+            // its web-content process grows with every streamed session.
+            if self.dashboardActive,
+               self.idleUnloadSeconds > 0,
+               let win = self.window,
+               !win.occlusionState.contains(.visible),
+               Date().timeIntervalSince(self.lastWindowVisibleAt) > self.idleUnloadSeconds {
+                self.showPlaceholder(paused: true)
             }
             // Also ping the HTTP endpoint. Probe failures are logged, never
             // fatal: the process-liveness check above is the only thing
@@ -805,6 +1011,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
 
     func showBackendCrash() {
         NSLog("Backend process is no longer running")
+        // A dead daemon is worth a window even if the user had closed it —
+        // remotely this machine just went dark.
+        if window == nil { createWindow() }
+        dashboardActive = false
+        guard webView != nil else { return }
         webView.loadHTMLString("""
             <html>
             <body style="background:#1e1e2e;color:#cdd6f4;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
