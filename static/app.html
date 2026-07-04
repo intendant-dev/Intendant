@@ -16367,7 +16367,17 @@ function vaultLeaseTransportReady() {
   if (!DASHBOARD_CONNECT_MODE) return false;
   try {
     const status = window.intendantDashboardControl?.status?.();
-    return Boolean(status?.connected && status?.verifiedBinding?.ok);
+    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
+    // Leases need the credential RPC family. A daemon that advertises its
+    // control surface but not these methods is too old — report
+    // unsupported instead of firing calls that fail one by one. An empty
+    // list means the hello_ack hasn't landed yet: fall through and let
+    // the RPCs answer.
+    const features = status.controlFeatures;
+    if (Array.isArray(features) && features.length) {
+      return features.includes('api_credential_lease_status');
+    }
+    return true;
   } catch {
     return false;
   }
@@ -38864,7 +38874,7 @@ function accessIamEnforcementReason(iam) {
 }
 
 function accessFallbackIamRoles() {
-  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'];
+  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'credentials.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'];
   return [{
     id: 'role:root',
     label: 'Root',
@@ -38922,11 +38932,18 @@ function accessFallbackIamRoles() {
     permissions: ['presence.read', 'stats.read', 'access.inspect', 'filesystem.read', 'filesystem.write'],
     source: 'builtin',
   }, {
+    id: 'role:peer-user',
+    label: 'Peer user',
+    status: 'enforced',
+    summary: "Reach connected peers through this daemon (peer files, terminal, display tunnels); what each tunnel may do is decided by that peer's grants for this daemon. Combine with local roles as needed.",
+    permissions: ['presence.read', 'stats.read', 'access.inspect', 'peer.inspect', 'peer.use'],
+    source: 'builtin',
+  }, {
     id: 'role:operator',
     label: 'Operator',
     status: 'enforced',
-    summary: 'Operate sessions, display, shell, files, and approvals without access/settings administration.',
-    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'filesystem.read', 'filesystem.write'],
+    summary: 'Operate sessions, display, shell, files, peers, and approvals without access/settings administration.',
+    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'credentials.manage', 'filesystem.read', 'filesystem.write'],
     source: 'builtin',
   }];
 }
@@ -38941,6 +38958,7 @@ function accessFallbackPolicyIdForRole(roleId) {
     'role:terminal': 'policy:terminal',
     'role:files-read': 'policy:files-read',
     'role:files-write': 'policy:files-write',
+    'role:peer-user': 'policy:peer-user',
     'role:operator': 'policy:operator',
   }[roleId] || `policy:${String(roleId || 'role').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase()}`;
 }
@@ -38978,7 +38996,8 @@ function accessFallbackPermissions() {
     'access.inspect': ['Access inspect', 'access', 'Read targets, principals, grants, policies, transports, and access architecture notes.'],
     'access.manage': ['Access manage', 'access', 'Approve, revoke, or change access grants.'],
     'peer.inspect': ['Peer inspect', 'peer', 'Read configured peer routes and peer eligibility.'],
-    'peer.manage': ['Peer manage', 'peer', 'Create, remove, pair, and use daemon peer routes.'],
+    'peer.manage': ['Peer manage', 'peer', 'Administer peer relationships: create, remove, and pair daemon peer routes.'],
+    'peer.use': ['Peer use', 'peer', "Act through connected peers (files, terminal, display tunnels, quick controls); the receiving peer's own grants bound each tunnel."],
     'session.inspect': ['Session inspect', 'session', 'Read session lists, logs, reports, recordings, and replay metadata.'],
     'session.manage': ['Session manage', 'session', 'Delete, rewind, prune, upload to, or otherwise mutate sessions.'],
     'terminal.use': ['Terminal (legacy)', 'terminal', 'Legacy aggregate: implies terminal.view, terminal.write, and shell.spawn.'],
@@ -38986,6 +39005,7 @@ function accessFallbackPermissions() {
     'terminal.write': ['Terminal write', 'terminal', 'Type into, resize, and close shell sessions you can see.'],
     'shell.spawn': ['Shell spawn', 'terminal', 'Create new shell sessions on this daemon.'],
     'settings.manage': ['Settings manage', 'settings', 'Read or write daemon settings and API keys.'],
+    'credentials.manage': ['Credentials manage', 'credentials', 'Grant, renew, revoke, and inspect credential leases; register client egress.'],
     'runtime.control': ['Runtime control', 'runtime', 'Use runtime-control surfaces such as TUI, media, and recording controls.'],
     'filesystem.read': ['Filesystem read', 'filesystem', 'Stat, list, and read files through dashboard APIs.'],
     'filesystem.write': ['Filesystem write', 'filesystem', 'Create directories or write uploaded file content.'],
@@ -39747,7 +39767,7 @@ const ACCESS_GRANT_KIND_CHOICES = [{
 
 const ACCESS_ROLE_PICKER_ORDER = [
   'role:scoped-human', 'role:observer', 'role:session-reader', 'role:files-read',
-  'role:files-write', 'role:terminal', 'role:operator', 'role:root',
+  'role:files-write', 'role:terminal', 'role:peer-user', 'role:operator', 'role:root',
 ];
 
 /* Grant fanout: the daemons this page can apply a grant to, each with the
@@ -40498,6 +40518,7 @@ const ACCESS_ROLE_META = {
   'role:files-write': { cls: 'role-files', short: 'Browse, download, and upload files.' },
   'role:files-read': { cls: 'role-files', short: 'Browse and download files, read-only.' },
   'role:session-reader': { cls: 'role-sessions', short: 'Read sessions, logs, and status.' },
+  'role:peer-user': { cls: 'role-peer', short: 'Act through connected peers; each peer\'s own grants bound the reach.' },
   'role:observer': { cls: 'role-observer', short: 'Watch read-only, including live displays.' },
   'role:scoped-human': { cls: 'role-scoped', short: 'Inspect the access model only. A safe first grant.' },
   'role:peer-profile': { cls: 'role-peer', short: 'Daemon-to-daemon authority bounded by the peer profile.' },
@@ -52643,6 +52664,10 @@ class DashboardControlTransport {
   handleFrame(msg) {
     if (msg.t === 'hello_ack') {
       console.info('[dashboard-control] hello_ack', msg.session_id || '');
+      // The daemon advertises its control-RPC surface here; readiness
+      // checks (vault leases, egress) consult it to distinguish
+      // "daemon too old to support this" from "denied for this session".
+      this.controlFeatures = Array.isArray(msg.features) ? msg.features : [];
       return;
     }
     if (msg.t === 'egress_request' || msg.t === 'egress_request_chunk' ||
@@ -53502,6 +53527,7 @@ class DashboardControlTransport {
       connected,
       pcState: this.pc?.connectionState || '',
       channelState: this.channel?.readyState || '',
+      controlFeatures: this.controlFeatures || [],
       sessionId: this.sessionId,
       verifiedBinding: this.verifiedBinding,
       claimedDaemonPublicKey: this.claimedDaemonPublicKey,
@@ -58709,6 +58735,26 @@ const PEER_PROFILE_OPTIONS = [
     summary: 'Presence, stats, messages, and task delegation.',
   },
   {
+    profile: 'session-reader',
+    label: 'Session reader',
+    summary: 'Presence, stats, and session inspection (lists, logs, reports). Read-only.',
+  },
+  {
+    profile: 'file-reader',
+    label: 'File reader',
+    summary: 'Presence, stats, and read-only filesystem access.',
+  },
+  {
+    profile: 'file-operator',
+    label: 'File operator',
+    summary: 'Presence, stats, and filesystem read/write.',
+  },
+  {
+    profile: 'terminal-operator',
+    label: 'Terminal operator',
+    summary: 'Presence, stats, session inspection, and shared shells (view, type, spawn).',
+  },
+  {
     profile: 'stats',
     label: 'Stats',
     summary: 'Presence and usage statistics only.',
@@ -58732,6 +58778,16 @@ function peerProfileMeta(profile) {
     'stats-only': 'stats',
     'display-read-only': 'read-only-display',
     spectator: 'shared-session-spectator',
+    'sessions-read': 'session-reader',
+    'session-inspect': 'session-reader',
+    'logs-read': 'session-reader',
+    'files-read': 'file-reader',
+    'filesystem-read-only': 'file-reader',
+    files: 'file-operator',
+    'filesystem-operator': 'file-operator',
+    'peer-terminal-operator': 'terminal-operator',
+    terminal: 'terminal-operator',
+    shell: 'terminal-operator',
     operator: 'peer-operator',
     admin: 'peer-root',
     'admin-peer': 'peer-root',
