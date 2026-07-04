@@ -115,7 +115,12 @@ cannot reach bindings by name).
 
 ### Activity
 
-The default tab. Five subtabs:
+The default tab, and the classic DOM control surface. It remains fully
+supported as the legacy fallback (the accessibility floor, the low-GPU path,
+and the surface most automation drives today), but [Station](./station.md)
+is the designated canonical control surface going forward.
+
+Five subtabs:
 
 - **Log** — a scrollable, color-coded event stream of everything in the system,
   grouped by turn with visual separators, with a verbosity selector
@@ -273,6 +278,14 @@ classic tabs, so anything triggered from Station behaves exactly like its
 canonical dashboard equivalent. View settings shape the scene: layout
 (`orbital` / `constellation`), mood (`calm` / `cockpit`), and fov, motion, ar,
 and density tuning.
+
+Station is the designated successor to the classic Activity surface as the
+canonical way to operate agents; the DOM Logs view remains the legacy
+fallback. Today the scene is a 3D constellation backdrop with the working UI
+painted as screen-space HUD panels; the destination is action panes living
+*in* the scene, and eventually WebXR spatial computing. The dedicated
+[Station](./station.md) chapter carries the architecture, an honest
+current-state inventory, and the roadmap.
 
 ### Sessions
 
