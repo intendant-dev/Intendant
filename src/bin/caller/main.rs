@@ -11211,6 +11211,19 @@ async fn drain_external_agent_events_with_prefetched(
                         command_preview: command.clone(),
                         category: cat,
                     });
+                    // Authoritative phase for frontends: the session window
+                    // badge must read "waiting", not whatever the last turn
+                    // left behind, for as long as this approval blocks.
+                    let approval_status_preview: String = command.chars().take(80).collect();
+                    emit_external_turn_status(
+                        config.bus,
+                        &config.autonomy,
+                        config.session_id.as_deref(),
+                        stats.turns,
+                        "waiting_approval",
+                        format!("Awaiting approval: {}", approval_status_preview),
+                    )
+                    .await;
 
                     let rx = if let Some(ref slot) = config.json_approval {
                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -11278,6 +11291,17 @@ async fn drain_external_agent_events_with_prefetched(
                             }
                         }
                     }
+                    // The block is over — hand the badge back to "running"
+                    // (the turn continues inside the backend either way).
+                    emit_external_turn_status(
+                        config.bus,
+                        &config.autonomy,
+                        config.session_id.as_deref(),
+                        stats.turns,
+                        "running",
+                        "Approval resolved — continuing".to_string(),
+                    )
+                    .await;
                 }
             }
             external_agent::AgentEvent::FileApprovalRequest {
@@ -27921,12 +27945,19 @@ async fn run_with_presence(
                         backend, thread.thread_id
                     ))
                 });
-                emit_external_session_identity(
-                    &bus,
-                    session_log_id(&session_log),
-                    backend.as_short_str(),
-                    &thread.thread_id,
-                );
+                // A non-canonical thread id (Claude Code's placeholder until
+                // the stream announces the real session id) must not be
+                // recorded as a backend alias: frontends would retarget
+                // status/phase updates at a window that never exists. The
+                // real id arrives via AgentEvent::NativeSessionId.
+                if backend.thread_id_is_canonical(&thread.thread_id) {
+                    emit_external_session_identity(
+                        &bus,
+                        session_log_id(&session_log),
+                        backend.as_short_str(),
+                        &thread.thread_id,
+                    );
+                }
                 if *backend == external_agent::AgentBackend::ClaudeCode {
                     emit_claude_code_session_capabilities(
                         &bus,
@@ -29377,14 +29408,20 @@ async fn run_external_agent_mode(
     } else {
         intendant_session_id.clone()
     };
-    emit_external_session_identity(
-        &bus,
-        intendant_session_id
-            .clone()
-            .or_else(|| session_log_id(&session_log)),
-        backend.as_short_str(),
-        &backend_session_id,
-    );
+    // Placeholder thread ids (see thread_id_is_canonical) are withheld from
+    // the identity stream: the real backend id is announced later via
+    // AgentEvent::NativeSessionId and recording the placeholder would point
+    // frontends' status routing at a never-materialized window.
+    if backend.thread_id_is_canonical(&backend_session_id) {
+        emit_external_session_identity(
+            &bus,
+            intendant_session_id
+                .clone()
+                .or_else(|| session_log_id(&session_log)),
+            backend.as_short_str(),
+            &backend_session_id,
+        );
+    }
     if backend == external_agent::AgentBackend::Codex {
         let service_tier = agent.service_tier().map(str::to_string);
         emit_codex_session_capabilities_for_project(

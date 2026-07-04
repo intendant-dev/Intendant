@@ -330,6 +330,18 @@ pub enum UiCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         context_archive: Option<String>,
     },
+    /// Claude Code runtime config changed. Mirror of `CodexConfigChanged`
+    /// for the Activity → Control sub-tab.
+    ClaudeConfigChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        model_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_tools: Option<Vec<String>>,
+    },
     /// Session history changed (snapshot_created / rolled_back / redone /
     /// history_pruned). The JS layer re-fetches `/api/session/current/history`
     /// and re-renders the Timeline UI in the Changes sub-tab.
@@ -1013,6 +1025,14 @@ pub struct AppState {
     /// a `ts` field; cleared before `handle_event` returns.
     replay_ts: Option<String>,
     event_session_id: Option<String>,
+    /// Undirected identity links from `session_identity` events: the
+    /// Intendant session id and the backend-native id name the SAME
+    /// conversation. External sessions (Claude Code) re-key mid-run —
+    /// `session_attached` switches `session_id` to the native id while
+    /// usage/status events keep the Intendant id — so "is this event for
+    /// the selected session" must match across the link group or the HUD
+    /// freezes at the moment of the re-key.
+    session_identity_links: std::collections::HashMap<String, std::collections::HashSet<String>>,
 
     // Usage
     main_usage: Option<UsageSnapshot>,
@@ -1059,6 +1079,7 @@ impl AppState {
             verbosity: "normal".to_string(),
             replay_ts: None,
             event_session_id: None,
+            session_identity_links: std::collections::HashMap::new(),
             main_usage: None,
             session_main_usage: std::collections::HashMap::new(),
             usage_log_bands: std::collections::HashMap::new(),
@@ -2047,11 +2068,44 @@ impl AppState {
                 });
             }
 
+            "claude_config_changed" => {
+                let model = msg.get("model").and_then(|v| v.as_str()).map(String::from);
+                let model_cleared = msg
+                    .get("model_cleared")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let permission_mode = msg
+                    .get("permission_mode")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let allowed_tools = msg
+                    .get("allowed_tools")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    });
+                cmds.push(UiCommand::ClaudeConfigChanged {
+                    model,
+                    model_cleared,
+                    permission_mode,
+                    allowed_tools,
+                });
+            }
+
             "usage" | "usage_update" => {
                 if let Some(main) = msg.get("main") {
                     if let Ok(u) = serde_json::from_value::<UsageSnapshot>(main.clone()) {
                         if let Some(sid) = self.event_session_id.clone() {
                             self.session_main_usage.insert(sid, u.clone());
+                        }
+                        // Mirror under the selected id when the event rides a
+                        // linked identity, so per-session lookups keyed by
+                        // either id see the freshest numbers.
+                        if current_session_event && !self.session_id.is_empty() {
+                            self.session_main_usage
+                                .insert(self.session_id.clone(), u.clone());
                         }
                         cmds.extend(self.add_usage_log_if_milestone(&u));
                         if current_session_event {
@@ -2191,9 +2245,26 @@ impl AppState {
             }
 
             "session_identity" => {
-                // Browser JS keeps the richer wrapper ↔ backend-native id map.
-                // The Rust dashboard reducer intentionally treats this as
-                // metadata so it does not create activity noise.
+                // Browser JS keeps the richer wrapper ↔ backend-native id
+                // map for its own views; the reducer records the link so
+                // current-session matching survives external re-keys. No
+                // activity noise is emitted.
+                let session_id = msg["session_id"].as_str().unwrap_or("").trim().to_string();
+                let backend_id = msg["backend_session_id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !session_id.is_empty() && !backend_id.is_empty() && session_id != backend_id {
+                    self.session_identity_links
+                        .entry(session_id.clone())
+                        .or_default()
+                        .insert(backend_id.clone());
+                    self.session_identity_links
+                        .entry(backend_id)
+                        .or_default()
+                        .insert(session_id);
+                }
             }
 
             "session_attached" => {
@@ -2655,9 +2726,39 @@ impl AppState {
 
     fn current_event_matches_selected_session(&self) -> bool {
         match self.event_session_id.as_deref() {
-            Some(sid) if !self.session_id.is_empty() => sid == self.session_id,
+            Some(sid) if !self.session_id.is_empty() => {
+                sid == self.session_id || self.same_identity_group(sid, &self.session_id)
+            }
             _ => true,
         }
+    }
+
+    /// True when two session ids name the same conversation through
+    /// `session_identity` links (Intendant id ↔ backend-native id, possibly
+    /// via a shared intermediate). Small breadth-first walk — groups hold a
+    /// handful of ids at most.
+    fn same_identity_group(&self, a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut queue: Vec<&str> = vec![a];
+        while let Some(id) = queue.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(linked) = self.session_identity_links.get(id) {
+                for next in linked {
+                    if next == b {
+                        return true;
+                    }
+                    if !seen.contains(next.as_str()) {
+                        queue.push(next);
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Add a log entry, respecting verbosity. Returns AddLogEntry command if visible.
@@ -5639,5 +5740,99 @@ mod tests {
             content.contains("session_id"),
             "warn log should mention session_id: {content}"
         );
+    }
+
+    #[test]
+    fn identity_links_keep_hud_updates_flowing_after_rekey() {
+        // External sessions re-key: session_attached switches the selected
+        // id to the backend-native id while usage/status events keep the
+        // Intendant id. The identity link must bridge them.
+        let mut st = AppState::new();
+        st.handle_event(&json!({
+            "event": "session_identity",
+            "session_id": "intendant-log-id",
+            "source": "claude-code",
+            "backend_session_id": "cc-native-uuid",
+        }));
+        st.handle_event(&json!({
+            "event": "session_attached",
+            "session_id": "cc-native-uuid",
+            "source": "claude-code",
+        }));
+        assert_eq!(st.session_id, "cc-native-uuid");
+
+        // Usage arrives keyed to the Intendant id — it must still update
+        // the selected session's HUD state.
+        let cmds = st.handle_event(&json!({
+            "event": "usage_update",
+            "session_id": "intendant-log-id",
+            "main": {
+                "provider": "anthropic",
+                "model": "claude-haiku-4-5-20251001",
+                "tokens_used": 25083u64,
+                "context_window": 200000u64,
+                "usage_pct": 12.5,
+                "prompt_tokens": 25038u64,
+                "completion_tokens": 45u64,
+                "cached_tokens": 17209u64,
+            },
+        }));
+        assert!(
+            st.main_usage.is_some(),
+            "usage riding the linked Intendant id must reach the selected HUD"
+        );
+        assert_eq!(st.main_usage.as_ref().unwrap().tokens_used, 25083);
+        // Mirrored under the selected native id for per-session lookups.
+        assert!(st.session_main_usage.contains_key("cc-native-uuid"));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::UpdateStatusBar { budget_pct: Some(p), .. } if (*p - 12.5).abs() < 1e-9
+        )));
+    }
+
+    #[test]
+    fn unrelated_session_usage_does_not_touch_selected_hud() {
+        let mut st = AppState::new();
+        st.handle_event(&json!({
+            "event": "session_attached",
+            "session_id": "selected-session",
+            "source": "claude-code",
+        }));
+        st.handle_event(&json!({
+            "event": "usage_update",
+            "session_id": "some-other-session",
+            "main": {
+                "provider": "anthropic",
+                "model": "claude-haiku-4-5-20251001",
+                "tokens_used": 999u64,
+                "context_window": 200000u64,
+                "usage_pct": 0.5,
+                "prompt_tokens": 999u64,
+                "completion_tokens": 0u64,
+                "cached_tokens": 0u64,
+            },
+        }));
+        assert!(
+            st.main_usage.is_none(),
+            "an unrelated session's usage must not overwrite the selected HUD"
+        );
+        assert!(!st.session_main_usage.contains_key("selected-session"));
+    }
+
+    #[test]
+    fn claude_config_changed_translates_to_ui_command() {
+        let mut st = AppState::new();
+        let cmds = st.handle_event(&json!({
+            "event": "claude_config_changed",
+            "model": "claude-haiku-4-5-20251001",
+            "permission_mode": "acceptEdits",
+            "allowed_tools": ["Read", "Bash"],
+        }));
+        let found = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::ClaudeConfigChanged { model: Some(m), permission_mode: Some(pm), allowed_tools: Some(t), .. }
+                if m == "claude-haiku-4-5-20251001" && pm == "acceptEdits" && t.len() == 2
+        ));
+        assert!(found, "expected ClaudeConfigChanged UiCommand, got {cmds:?}");
     }
 }

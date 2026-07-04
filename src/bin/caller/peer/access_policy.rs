@@ -383,46 +383,58 @@ pub fn filesystem_access_allowed(
 }
 
 pub fn profile_allows_federation_http(profile: &str, request_line: &str) -> bool {
-    let Some(op) = federation_http_operation(request_line) else {
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    let path = target.split('?').next().unwrap_or("");
+    let Some(op) = federation_http_operation(method, path) else {
         return true;
     };
     profile_allows_operation(profile, op)
 }
 
-pub fn federation_http_operation(request_line: &str) -> Option<PeerOperation> {
-    if request_line.contains(" /api/access/overview")
-        || request_line.contains(" /api/access/iam/state")
-        || request_line.contains(" /api/dashboard/targets")
+/// Map a federation API request to the operation it needs. `path` must be
+/// the parsed request path with the query string stripped — matching is on
+/// exact routes and their `/`-nested sub-routes, never on substrings, so a
+/// query parameter or a longer look-alike path cannot change the class.
+pub fn federation_http_operation(method: &str, path: &str) -> Option<PeerOperation> {
+    let under = |base: &str| {
+        path == base
+            || path
+                .strip_prefix(base)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    if path == "/api/access/overview"
+        || path == "/api/access/iam/state"
+        || path == "/api/dashboard/targets"
     {
         return Some(PeerOperation::AccessInspect);
     }
-    if request_line.contains(" /api/peers/pairing/requests")
-        || request_line.contains(" /api/peers/pairing/identities")
-    {
-        if request_line.starts_with("GET") {
+    if under("/api/peers/pairing/requests") || under("/api/peers/pairing/identities") {
+        if method == "GET" {
             return Some(PeerOperation::AccessInspect);
         }
         return Some(PeerOperation::AccessManage);
     }
-    if request_line.contains(" /api/peers/pairing/invite") {
+    if under("/api/peers/pairing/invite") {
         return Some(PeerOperation::AccessManage);
     }
-    if request_line.contains(" /api/peers/pairing/") {
+    if path.starts_with("/api/peers/pairing/") {
         return Some(PeerOperation::PeerManage);
     }
-    if request_line.contains(" /api/peers") {
-        if request_line.starts_with("GET") {
+    if under("/api/peers") {
+        if method == "GET" {
             return Some(PeerOperation::PeerInspect);
         }
         return Some(PeerOperation::PeerManage);
     }
-    if request_line.contains(" /api/coordinator/") {
+    if path.starts_with("/api/coordinator/") {
         return Some(PeerOperation::Task);
     }
-    if request_line.contains(" /api/sessions") {
+    if under("/api/sessions") {
         return Some(PeerOperation::SessionInspect);
     }
-    if request_line.contains(" /api/worktrees") {
+    if under("/api/worktrees") {
         return Some(PeerOperation::SessionInspect);
     }
     None
@@ -679,22 +691,29 @@ mod tests {
             "GET /api/access/iam/state HTTP/1.1"
         ));
         assert_eq!(
-            federation_http_operation("GET /api/access/iam/state HTTP/1.1"),
+            federation_http_operation("GET", "/api/access/iam/state"),
             Some(PeerOperation::AccessInspect)
         );
         assert_eq!(
-            federation_http_operation("POST /api/peers/pairing/invite HTTP/1.1"),
+            federation_http_operation("POST", "/api/peers/pairing/invite"),
             Some(PeerOperation::AccessManage)
         );
         assert_eq!(
-            federation_http_operation("GET /api/peers HTTP/1.1"),
+            federation_http_operation("GET", "/api/peers"),
             Some(PeerOperation::PeerInspect)
         );
         assert_eq!(
-            federation_http_operation("POST /api/peers HTTP/1.1"),
+            federation_http_operation("POST", "/api/peers"),
             Some(PeerOperation::PeerManage)
         );
-        assert_eq!(federation_http_operation("GET /config HTTP/1.1"), None);
+        assert_eq!(federation_http_operation("GET", "/config"), None);
+        // Matching is on parsed routes, never substrings: look-alike paths
+        // and query strings that mention a route do not classify as it.
+        assert_eq!(federation_http_operation("GET", "/api/peersonal"), None);
+        assert_eq!(
+            federation_http_operation("GET", "/api/peers/pairing/requests/r-1"),
+            Some(PeerOperation::AccessInspect)
+        );
         assert!(!profile_allows_federation_http(
             "peer-operator",
             "GET /api/access/iam/state HTTP/1.1"
