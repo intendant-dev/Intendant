@@ -574,7 +574,11 @@ pub fn grant(
             ttl_ms / 60_000,
             offline_ms / 3_600_000,
             mode.as_str(),
-            if replaced { " · replaced previous" } else { "" },
+            if replaced {
+                " · replaced previous"
+            } else {
+                ""
+            },
         ),
     );
     Ok(GrantOutcome {

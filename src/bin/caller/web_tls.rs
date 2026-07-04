@@ -151,6 +151,7 @@ pub enum ClientAuth {
     /// then decide which paths are allowed to proceed unauthenticated.
     OptionalCa { ca_path: std::path::PathBuf },
     /// Require a client certificate chaining to the supplied CA bundle.
+    #[allow(dead_code)]
     RequireCa { ca_path: std::path::PathBuf },
 }
 

@@ -694,6 +694,7 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
 
 /// Normalize a list of names (extension IDs, MCP server names, etc.): trim
 /// whitespace, drop empty entries, dedupe while preserving order.
+#[allow(dead_code)]
 fn normalize_name_list(raw: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(raw.len());
     for entry in raw {
@@ -825,7 +826,6 @@ fn claude_config_changed_event(delta: ClaudeConfigDelta) -> AppEvent {
     }
 }
 
-
 /// Re-read intendant.toml, update `[agent] default_backend`, and save
 /// it back. Re-reading (instead of caching a mutable ProjectConfig) is
 /// the simplest way to avoid races with other writers to the TOML.
@@ -873,7 +873,6 @@ mod tests {
             context_archive: "summary".to_string(),
         }))
     }
-
 
     fn test_claude_config() -> SharedClaudeConfig {
         Arc::new(RwLock::new(ClaudeRuntimeConfig {

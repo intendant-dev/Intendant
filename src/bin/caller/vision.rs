@@ -102,14 +102,17 @@ pub(crate) fn remove_stale_lock(id: u32) {
 
 // Non-Linux stubs — these are called from debug.rs and XvfbGuard::Drop.
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub(crate) fn is_lock_stale(_lock_path: &str) -> bool {
     false
 }
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub(crate) fn is_our_xvfb(_lock_path: &str, _display_id: u32) -> bool {
     false
 }
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub(crate) fn kill_and_reclaim(_lock_path: &str, _display_id: u32) {}
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn remove_stale_lock(_id: u32) {}

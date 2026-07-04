@@ -16,8 +16,10 @@ const MAX_LOG_ENTRIES: usize = 10_000;
 pub enum AppMode {
     Normal,
     AskHuman,
+    #[allow(dead_code)]
     Help,
     Approval,
+    #[allow(dead_code)]
     Inspect,
     FollowUp,
 }
@@ -98,6 +100,7 @@ pub struct ViewState {
     pub inspect_scroll: u16,
     pub log_tab: LogTab,
     pub expanded_turns: HashSet<usize>,
+    #[allow(dead_code)]
     pub focused_line: Option<usize>,
     /// Per-connection overlays on top of the shared `App::mode`.
     pub show_help: bool,

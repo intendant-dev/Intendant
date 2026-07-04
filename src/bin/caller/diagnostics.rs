@@ -15,7 +15,7 @@
 //! one helper trio + boundary tests.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Sanitize a session id from query-string input down to a filesystem-
 /// safe slug. Accepts ASCII alphanumerics, `-`, and `_`; everything else

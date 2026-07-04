@@ -61,11 +61,11 @@
 //!     - an opt-in multi-RID viewer (offer carries
 //!       `a=simulcast:recv f;h;q`) demands all three — the experimental
 //!       adaptive-bandwidth path that fans out f / h / q simultaneously.
-//!   "Always-on" thus means the encoder *threads* are spawned eagerly
-//!   so any browser can subscribe instantly without waiting for spin-up;
-//!   it does NOT mean every layer is producing frames. Idle cost per
-//!   spawned-but-paused VP8 encoder is negligible (~5 % of a core for
-//!   the active layer; paused threads block in `blocking_recv`).
+//!       "Always-on" thus means the encoder *threads* are spawned eagerly
+//!       so any browser can subscribe instantly without waiting for spin-up;
+//!       it does NOT mean every layer is producing frames. Idle cost per
+//!       spawned-but-paused VP8 encoder is negligible (~5 % of a core for
+//!       the active layer; paused threads block in `blocking_recv`).
 //! - **On-demand** (spawned when first matching peer joins, torn down
 //!   when last leaves): H.264, AV1, VP9. These exist for browsers that
 //!   prefer or only support a non-VP8 codec — Safari shipped H.264 long
@@ -632,10 +632,10 @@ pub struct EncoderHandle {
     /// thread drains its `i420_rx` broadcast subscription as usual
     /// (so the channel doesn't lag) but skips the downscale + encode
     /// + broadcast step entirely. Used by the layer-selection policy
-    /// (4d.2) to throttle layers no peer is consuming under current
-    /// bandwidth conditions, without tearing down the encoder slot
-    /// itself — resume is just a flag flip and the next captured frame
-    /// gets encoded.
+    ///   (4d.2) to throttle layers no peer is consuming under current
+    ///   bandwidth conditions, without tearing down the encoder slot
+    ///   itself — resume is just a flag flip and the next captured frame
+    ///   gets encoded.
     ///
     /// Behavior preserved across pause:
     /// - `force_keyframe`: NOT consumed while paused, so a keyframe

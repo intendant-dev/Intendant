@@ -14,13 +14,16 @@ use std::path::PathBuf;
 use tokio::process::Child;
 
 /// Preferred debug display range (50-59). Intendant reserves 99+ for agent displays.
+#[allow(dead_code)]
 const DEBUG_DISPLAY_MIN: u32 = 50;
+#[allow(dead_code)]
 const DEBUG_DISPLAY_MAX: u32 = 59;
 
 /// RAII guard for the debug screen.
 /// On Linux: Xvfb + Firefox. On macOS: just a browser window.
 /// Kills the browser on drop; XvfbGuard (if present) handles Xvfb.
 pub struct DebugScreen {
+    #[allow(dead_code)]
     pub xvfb_guard: Option<vision::XvfbGuard>,
     pub firefox: Child,
     pub display_id: u32,
@@ -35,6 +38,7 @@ impl Drop for DebugScreen {
 /// Find a free display in the 50-59 range for debug use.
 /// On non-Linux platforms the X lock file helpers are stubs, so this
 /// returns the first display in range immediately.
+#[allow(dead_code)]
 pub fn find_free_debug_display() -> u32 {
     for id in DEBUG_DISPLAY_MIN..=DEBUG_DISPLAY_MAX {
         let lock = format!("/tmp/.X{}-lock", id);

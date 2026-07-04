@@ -1156,6 +1156,7 @@ impl McpAppState {
         })
     }
 
+    #[allow(dead_code)]
     fn context_pressure_snapshot(&self) -> serde_json::Value {
         self.context_pressure_snapshot_for(None, None)
     }
@@ -1264,6 +1265,7 @@ impl McpAppState {
         !include_non_recovery
     }
 
+    #[allow(dead_code)]
     fn rewind_only_gate_message(&self, tool_name: &str) -> Option<String> {
         self.rewind_only_gate_message_for(tool_name, None, None)
     }
@@ -1480,10 +1482,16 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
     use crate::peer::access_policy::PeerOperation;
     match name {
         // Daemon/agent status summaries.
-        "get_status" | "get_restart_status" | "get_controller_loop_status"
-        | "browser_workspace_providers" | "list_browser_workspaces" => PeerOperation::StatsRead,
+        "get_status"
+        | "get_restart_status"
+        | "get_controller_loop_status"
+        | "browser_workspace_providers"
+        | "list_browser_workspaces" => PeerOperation::StatsRead,
         // Session observation: logs, pending prompts, managed-context anchors.
-        "get_logs" | "get_pending_approval" | "get_pending_input" | "list_rewind_anchors"
+        "get_logs"
+        | "get_pending_approval"
+        | "get_pending_input"
+        | "list_rewind_anchors"
         | "inspect_rewind_anchor" => PeerOperation::SessionInspect,
         // Resolving supervised approvals.
         "approve" | "deny" | "skip" | "approve_all" => PeerOperation::Approval,
@@ -1492,16 +1500,29 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         // Starting or delegating agent work.
         "start_task" => PeerOperation::Task,
         // Mutating the supervised session's context/lineage.
-        "rewind_context" | "rewind_backout" | "claim_fission_canonical" | "fission_spawn"
+        "rewind_context"
+        | "rewind_backout"
+        | "claim_fission_canonical"
+        | "fission_spawn"
         | "fission_control" => PeerOperation::SessionManage,
         // Viewing displays, frames, and shared-view surfaces.
-        "list_displays" | "take_screenshot" | "read_screen" | "list_frames" | "read_frame"
-        | "capture_shared_view_frame" | "show_shared_view" | "hide_shared_view"
+        "list_displays"
+        | "take_screenshot"
+        | "read_screen"
+        | "list_frames"
+        | "read_frame"
+        | "capture_shared_view_frame"
+        | "show_shared_view"
+        | "hide_shared_view"
         | "focus_shared_view" => PeerOperation::DisplayView,
         // Controlling displays and injecting input — including granting the
         // agent access to the user's real session.
-        "take_display" | "release_display" | "grant_user_display" | "revoke_user_display"
-        | "request_shared_view_input" | "execute_cu_actions" => PeerOperation::DisplayInput,
+        "take_display"
+        | "release_display"
+        | "grant_user_display"
+        | "revoke_user_display"
+        | "request_shared_view_input"
+        | "execute_cu_actions" => PeerOperation::DisplayInput,
         // Browser workspaces, live audio, autonomy/verbosity, lifecycle, and
         // controller-restart orchestration are runtime-control surfaces.
         "create_browser_workspace"
@@ -2386,13 +2407,13 @@ fn mcp_state_session_source_for_id(s: &McpAppState, session_id: &str) -> Option<
                 .then(|| s.active_session_source.clone())
                 .flatten()
         })
-        .or_else(
-            || match resolve_persisted_start_target(&mcp_state_session_logs_home(s), session_id) {
+        .or_else(|| {
+            match resolve_persisted_start_target(&mcp_state_session_logs_home(s), session_id) {
                 PersistedStartTarget::External(target) => Some(target.source),
                 PersistedStartTarget::ExternalMissingResume { source } => source,
                 PersistedStartTarget::NotFound | PersistedStartTarget::NonExternal => None,
-            },
-        )
+            }
+        })
 }
 
 fn mcp_state_controller_loop_dir(s: &McpAppState) -> std::path::PathBuf {
@@ -2668,6 +2689,7 @@ fn controller_loop_active_wrapper_is_idle_external_app_server(wrapper: &serde_js
         })
 }
 
+#[allow(dead_code)]
 fn active_external_wrappers_from_index(
     loop_dir: &std::path::Path,
     live_codex_pids: &[u32],
@@ -2693,6 +2715,7 @@ fn active_external_wrappers_from_index_for_processes(
     )
 }
 
+#[allow(dead_code)]
 fn active_external_wrappers_from_index_homes<'a, I>(
     candidate_homes: I,
     live_codex_pids: &[u32],
@@ -2704,6 +2727,7 @@ where
     active_external_wrappers_from_index_homes_for_processes(candidate_homes, &live_codex_processes)
 }
 
+#[allow(dead_code)]
 fn active_external_wrappers_from_index_homes_with_probe<'a, I, F>(
     candidate_homes: I,
     live_codex_pids: &[u32],
@@ -2752,6 +2776,7 @@ where
     )
 }
 
+#[allow(dead_code)]
 fn active_external_wrappers_from_index_homes_with_probe_and_cwd<'a, I, F, G>(
     candidate_homes: I,
     live_codex_pids: &[u32],
@@ -2884,6 +2909,7 @@ fn live_codex_process_matches_wrapper_record(
     session_id == record.intendant_session_id || session_id == record.backend_session_id
 }
 
+#[allow(dead_code)]
 fn live_codex_processes_from_pids(live_codex_pids: &[u32]) -> Vec<LiveCodexAppServerProcess> {
     live_codex_pids
         .iter()
@@ -2918,6 +2944,7 @@ fn live_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     }
 }
 
+#[allow(dead_code)]
 fn controller_loop_latest_status(
     latest_status_file: serde_json::Value,
     wrappers: &[serde_json::Value],
@@ -3058,6 +3085,7 @@ async fn collect_controller_loop_status_with_state(
     collect_controller_loop_status_for_mcp_state(loop_dir, &s)
 }
 
+#[allow(dead_code)]
 fn enrich_controller_loop_status_with_mcp_state_at(
     status: &mut serde_json::Value,
     state: &McpAppState,
@@ -3496,6 +3524,7 @@ fn live_codex_app_server_pids(root_pid: u32, known_codex_pids: &HashSet<u32>) ->
         .collect()
 }
 
+#[allow(dead_code)]
 fn live_codex_app_server_pids_from_descendants<I, F>(
     descendant_pids: I,
     known_codex_pids: &HashSet<u32>,
@@ -7559,6 +7588,7 @@ impl IntendantServer {
     /// Return MCP tool definitions as JSON for the HTTP transport.
     /// Schemas are flattened (all `$ref`/`$defs` inlined) for compatibility
     /// with clients that don't resolve JSON Schema references (e.g. Codex).
+    #[allow(dead_code)]
     pub async fn list_tools_json(&self) -> serde_json::Value {
         self.list_tools_json_for_session(None, None, None).await
     }
@@ -7596,6 +7626,7 @@ impl IntendantServer {
     }
 
     /// Dispatch a tool call by name for the HTTP transport.
+    #[allow(dead_code)]
     pub async fn call_tool_by_name(
         &self,
         name: &str,
@@ -8666,7 +8697,7 @@ impl IntendantServer {
                 return format!(
                     "Cannot start task: session {} is not active (phase {}); use restart/resume before sending a follow-up",
                     session_id,
-                    phase_to_str(&phase)
+                    phase_to_str(phase)
                 );
             }
             self.bus
@@ -8858,7 +8889,8 @@ fn resolve_persisted_start_target(
         }
     }
 
-    let identity = exact_identity.or_else(|| (identity_count == 1).then(|| any_identity).flatten());
+    let identity =
+        exact_identity.or_else(|| (identity_count == 1).then_some(any_identity).flatten());
     if let Some(identity) = identity {
         source = Some(identity.source);
         resume_id = Some(identity.resume_id);

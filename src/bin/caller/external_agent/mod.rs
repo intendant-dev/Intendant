@@ -372,6 +372,7 @@ impl AgentBackend {
         matches!(self, AgentBackend::Codex)
     }
 
+    #[allow(dead_code)]
     pub fn supports_item_anchor_rewind(&self) -> bool {
         matches!(self, AgentBackend::Codex)
     }
@@ -700,6 +701,7 @@ pub struct AutonomousGoalPauseResult {
     /// True when the backend successfully reported that no visible goal exists.
     pub goal_absent: bool,
     /// True when this call changed an active goal into a passive state.
+    #[allow(dead_code)]
     pub paused: bool,
 }
 

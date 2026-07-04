@@ -85,15 +85,9 @@
 //! This stub captures the types, the forwarder state machine, and the
 //! per-peer contract the pool depends on. Phase 4 fills in the runtime.
 
-use crate::display::encode::pool::{
-    CodecKind, EncoderSubscription, PeerCodecPreferences, SimulcastRid,
-};
-use crate::display::EncodedFrame;
-use crate::display::PeerId;
+use crate::display::encode::pool::{CodecKind, PeerCodecPreferences, SimulcastRid};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::RwLock;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -102,6 +96,7 @@ use tokio::sync::{broadcast, RwLock};
 /// Forwarder-layer errors. These are in-process errors; wire-layer
 /// WebRTC errors stay in [`crate::display::webrtc`].
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum ForwarderError {
     /// Peer advertised codecs but the pool returned no subscriptions —
     /// the peer's codec set doesn't overlap with any encoder the pool
@@ -164,17 +159,20 @@ impl std::error::Error for ForwarderError {}
 /// [`LayerSelector::prefer`] which is called from the forwarder's
 /// keyframe-request path (a new layer needs a fresh keyframe to be
 /// decodable, so layer-switch and keyframe-request are paired).
+#[allow(dead_code)]
 pub struct LayerSelector {
     active: RwLock<SimulcastRid>,
 }
 
 impl LayerSelector {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             active: RwLock::new(SimulcastRid::full()),
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_initial(rid: SimulcastRid) -> Self {
         Self {
             active: RwLock::new(rid),
@@ -182,6 +180,7 @@ impl LayerSelector {
     }
 
     /// Currently-active RID. Cheap (read lock on a small value).
+    #[allow(dead_code)]
     pub async fn active(&self) -> SimulcastRid {
         self.active.read().await.clone()
     }
@@ -189,6 +188,7 @@ impl LayerSelector {
     /// Switch to a new layer. The caller should also request a
     /// keyframe — P-frames against the new layer's keyframe chain
     /// don't decode against the old layer's keyframe.
+    #[allow(dead_code)]
     pub async fn prefer(&self, rid: SimulcastRid) {
         *self.active.write().await = rid;
     }
@@ -332,6 +332,7 @@ pub fn codec_preferences_from_offer(sdp: &str) -> PeerCodecPreferences {
 /// - `rids` empty → return sdp unchanged.
 /// - No `m=video` section → return sdp unchanged.
 /// - `m=video` already has `a=simulcast:` → return sdp unchanged.
+#[allow(dead_code)]
 pub fn inject_recv_simulcast_into_video_offer(sdp: &str, rids: &[&str]) -> String {
     if rids.is_empty() {
         return sdp.to_string();
@@ -406,6 +407,7 @@ pub fn inject_recv_simulcast_into_video_offer(sdp: &str, rids: &[&str]) -> Strin
 /// Rust function exists for unit-test coverage of the corner cases the
 /// JS version must also handle (empty username, empty credential,
 /// multiple servers, default-empty config).
+#[allow(dead_code)]
 pub fn ice_servers_to_rtc_peer_connection_config(
     servers: &[crate::display::IceServer],
 ) -> Vec<crate::display::IceServer> {
@@ -427,8 +429,10 @@ pub fn ice_servers_to_rtc_peer_connection_config(
 mod tests {
     use super::*;
     use crate::display::encode::pool::{EncoderId, EncoderSubscription, LayerSpec, SimulcastRid};
+    use crate::display::PeerId;
     use tokio::sync::broadcast;
 
+    #[allow(dead_code)]
     fn make_subscription(codec: CodecKind, rid: SimulcastRid) -> EncoderSubscription {
         let (_tx, rx) = broadcast::channel(16);
         EncoderSubscription {
@@ -438,6 +442,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn peer_id(n: u64) -> PeerId {
         n
     }

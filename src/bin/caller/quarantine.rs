@@ -95,6 +95,7 @@ pub fn store_payload(
 
 /// List all quarantined payload references for a live audio session.
 /// Returns references only (no content).
+#[allow(dead_code)]
 pub fn list_payloads(live_audio_id: &str) -> Result<Vec<QuarantinePayload>, CallerError> {
     let dir = quarantine_dir(live_audio_id)?;
     if !dir.exists() {
@@ -127,6 +128,7 @@ pub fn list_payloads(live_audio_id: &str) -> Result<Vec<QuarantinePayload>, Call
 ///
 /// This function intentionally returns the raw content string. It must NEVER
 /// be called from code that feeds the result back to an agent.
+#[allow(dead_code)]
 pub fn read_payload(live_audio_id: &str, payload_id: &str) -> Result<String, CallerError> {
     validate_quarantine_id("payload_id", payload_id)?;
     let file_path = quarantine_dir(live_audio_id)?.join(format!("{}.json", payload_id));
@@ -136,6 +138,7 @@ pub fn read_payload(live_audio_id: &str, payload_id: &str) -> Result<String, Cal
 }
 
 /// Remove all quarantine data for a live audio session.
+#[allow(dead_code)]
 pub fn cleanup_quarantine(live_audio_id: &str) -> Result<(), CallerError> {
     let dir = quarantine_dir(live_audio_id)?;
     if dir.exists() {

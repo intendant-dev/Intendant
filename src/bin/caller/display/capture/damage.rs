@@ -70,9 +70,11 @@ impl fmt::Display for Rect {
 pub enum DamageCapability {
     /// OS reports damage events directly (X11 XDamage, etc.). Dirty
     /// fraction reported per poll is trustworthy.
+    #[allow(dead_code)]
     OsLevel,
     /// Damage computed from frame-diff (tile hashing). Approximate;
     /// false negatives possible under hash collisions.
+    #[allow(dead_code)]
     FrameDiff,
     /// No damage info. Caller should assume every tick = everything dirty
     /// and force the fallback video path. Used for non-X11 platforms in
@@ -85,15 +87,19 @@ pub enum DamageCapability {
 #[derive(Debug)]
 pub enum DamageError {
     /// Failed to connect to the display server.
+    #[allow(dead_code)]
     Connect(String),
     /// Required extension not available (e.g. XDamage missing on the
     /// X server). The caller should fall back to a different backend
     /// or report `DamageCapability::None` and route through video.
+    #[allow(dead_code)]
     ExtensionMissing(&'static str),
     /// Setup failed after extension was confirmed available
     /// (e.g. damage_create call failed). Backend should be dropped.
+    #[allow(dead_code)]
     Setup(String),
     /// Polling failed transiently. Caller may retry or drop.
+    #[allow(dead_code)]
     Poll(String),
 }
 
@@ -132,6 +138,7 @@ pub trait DamageBackend: Send {
     /// `(width_px, height_px)`. Used by the grid partitioner to size
     /// the tile grid; may go stale on resize, in which case the
     /// caller should rebuild the backend (D-4 wires resize handling).
+    #[allow(dead_code)]
     fn screen_geometry(&self) -> (u32, u32);
 
     /// Best-effort cursor position in screen coordinates.
@@ -152,6 +159,7 @@ pub trait DamageBackend: Send {
 /// backend here would mask the absence; returning Result::Err would
 /// force every consumer to write its own fallback.
 pub struct NullDamageBackend {
+    #[allow(dead_code)]
     geometry: (u32, u32),
 }
 
