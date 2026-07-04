@@ -113,7 +113,7 @@ loop.
 | Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) |
 | Reasoning trace | Yes | Yes (`thinking` blocks) |
 | Rollback turns | Yes (`thread/rollback`) | No → session reset |
-| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | No |
+| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | No — catch-up planned through the universal rails, see [Dashboard and Station parity](#dashboard-and-station-parity-codex-vs-claude-code) |
 
 Both spawn through `crate::platform::spawn_command(&cfg.command)` with the
 working dir set to the project root and stdin/stdout/stderr piped; stderr is
@@ -542,6 +542,45 @@ bootstrap addendum naming the MCP bootstrap tools
 `ctl --help` discovery flow, and the dashboard-validation helper.
 `--permission-mode` (normalized — the legacy Intendant value `auto` maps to
 the CLI default) and `--allowedTools` are added from config when set.
+
+## Dashboard and Station parity: Codex vs Claude Code
+
+The per-session dashboard features (Activity → Logs agent windows and the
+[Station](./station.md) canvas) were built against Codex first. An audit
+(2026-07-04 @ `d590ad94`) found that the *rails* are almost all
+backend-neutral already — what is Codex-only is the *producers*. The
+standing rule for closing the gap: **wire Claude Code (and native sessions)
+into the universal rails; do not clone `codex_*`-shaped UI paths.** The
+rails that already exist end-to-end and are backend-agnostic:
+`SessionCapabilities` (universal `follow_up` / `steer` / `interrupt`
+booleans plus backend-specific knobs), `AgentEvent::GoalUpdated/GoalCleared`
+→ the `session_goal` event and its log replay, `session_relationship` plus
+the lineage/fission ledgers and their `/api` serving, the
+capability-gated affordances in `app.html`, and `external_wrapper_index`.
+
+| Feature | Universal rail (exists today) | Codex producer | Claude Code today → plan |
+|---|---|---|---|
+| Steer / interrupt / stop affordances | `SessionCapabilities.{follow_up,steer,interrupt}`; the UI gates on capabilities, not backend type | emits all three | **Parity** (emits all three) |
+| Usage / context meter | `AgentEvent::Usage` → `UsageSnapshot` / `ContextSnapshot` | `token_count` notifications | **Parity** (`message_delta` + `result` usage) |
+| Goal chip in the agent-window header (`/goal`) | `SessionGoal` type; `AgentEvent::GoalUpdated/GoalCleared`; `session_goal` outbound + log replay; the window chip renderer is backend-neutral | native `thread/goal/*` RPCs | **Missing.** Plan: a supervisor-side goal engine in the wrapper (objective / budget / status tracked in the drain loop, steering text injected on set/edit, budget fed from usage events) emitting the same events — works for every backend including native sessions; Codex keeps its native path |
+| Per-window action menu (fork / compact / goals / …) | `codex_thread_action` ControlMsg → `ExternalAgent::thread_action`; `SESSION_WINDOW_CODEX_ACTIONS` + the `sessionWindowIsCodex` predicate in `app.html` | full op set | **Missing.** Plan: generalize to a capability-listed `thread_actions` op vocabulary (one universal capability field + one WS action; `codex_thread_actions` stays as a compat alias) so the kebab renders from the advertised op list. Claude ops that map cleanly: `compact`, `fork` (`--fork-session` on resume). No Claude analog: side / fast / review / memory-reset |
+| Relationship wiring (parent/sub/fork header chips + SVG wires; Station edges) | `session_relationship` event + lineage ledger + `/api` serving + both renderers — all backend-neutral | side / subagent / fork / fission / rewind emitters | **Missing producers.** Plan: emit `fork` on `--fork-session` resumes; surface in-band Task sub-agents (`parent_tool_use_id` on stream messages) via `SubAgentToolCall` / relationship events |
+| Per-session persisted launch overlay | `SessionAgentConfig` + `ConfigureSessionAgent` / `Resume` / `Restart` (universal `agent_command` + backend fields) | all `codex_*` fields | **`agent_command` only** (plus one-shot `CreateSession.claude_model` / `claude_permission_mode`). Plan: add `claude_model` / `claude_permission_mode` / `claude_allowed_tools` overlay fields + Launch-config modal rows; probe CC `control_request` `set_permission_mode` / `set_model` for live apply, falling back to restart-with-saved-config |
+| Global runtime config pane | `Set*` ControlMsgs + `*ConfigChanged` broadcast + Settings/Control panes | 12 knobs | **3 knobs** (model / permission mode / allowed tools) — by design; grows only when CC grows equivalent concepts |
+| Station controls-panel runtime block | the controls panel renders per-backend blocks | approval policy / managed-context / fork-binary warning | **Missing.** Plan: a Claude block (model + permission mode) riding the existing `ClaudeRuntimeConfig` + `set_claude_*` messages, gated on backend selection exactly like the Codex block |
+| Plan / todo display | `AgentEvent::PlanUpdate` exists | emits plan updates | **Missing.** Plan: translate `TodoWrite` tool inputs into `PlanUpdate` |
+| Managed context / fission / rewind family | managed-context tools + ledgers | patched managed fork only | **Out of scope for parity** — Codex-fork-specific by design; Claude Code manages its own context (`/compact`, auto-compaction) |
+
+Catch-up order (each step unlocks UI in both surfaces at once):
+
+1. universal `thread_actions` capability + a Claude `thread_action`
+   implementation (`compact`, `fork`) — turns on the window kebab and the
+   Station session actions;
+2. the wrapper-level goal engine → goal chips everywhere (plus Station goal
+   rendering, which is plumbed but unrendered today);
+3. relationship producers → header chips, SVG wires, Station edges;
+4. per-session Claude overlay fields + Launch-config modal rows;
+5. the Station controls Claude block.
 
 ## Approval Routing
 

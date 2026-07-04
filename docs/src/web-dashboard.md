@@ -115,7 +115,12 @@ cannot reach bindings by name).
 
 ### Activity
 
-The default tab. Five subtabs:
+The default tab, and the classic DOM control surface. It remains fully
+supported as the legacy fallback (the accessibility floor, the low-GPU path,
+and the surface most automation drives today), but [Station](./station.md)
+is the designated canonical control surface going forward.
+
+Five subtabs:
 
 - **Log** — a scrollable, color-coded event stream of everything in the system,
   grouped by turn with visual separators, with a verbosity selector
@@ -274,6 +279,14 @@ canonical dashboard equivalent. View settings shape the scene: layout
 (`orbital` / `constellation`), mood (`calm` / `cockpit`), and fov, motion, ar,
 and density tuning.
 
+Station is the designated successor to the classic Activity surface as the
+canonical way to operate agents; the DOM Logs view remains the legacy
+fallback. Today the scene is a 3D constellation backdrop with the working UI
+painted as screen-space HUD panels; the destination is action panes living
+*in* the scene, and eventually WebXR spatial computing. The dedicated
+[Station](./station.md) chapter carries the architecture, an honest
+current-state inventory, and the roadmap.
+
 ### Sessions
 
 A browser of past and current sessions. Four subtabs:
@@ -331,16 +344,23 @@ the active compacted session is not mistaken for the target of the mutation.
 ### Files
 
 Edit, browse, download, and upload files on the local daemon or a configured
-peer target. The target summary uses the same access abstraction as Terminal:
-local/mTLS, hosted transports, and peer dashboard-control routes are shown as
-targets with their available capabilities rather than as transport internals.
+peer target. The tab is split into two sub-tabs: **Editor** (the default) and
+**Transfers** (the download/transfer-history/upload tooling). The target
+summary uses the same access abstraction as Terminal: local/mTLS, hosted
+transports, and peer dashboard-control routes are shown as targets with their
+available capabilities rather than as transport internals.
 
-The **Editor** card is a small IDE: a lazy directory tree on the left (rooted
-at the project root locally, `~` on peers; hidden-file toggle; new
-file/folder) and a multi-tab CodeMirror editor on the right (vendored bundle,
-`static/codemirror-bundle.js`, lazy-loaded on first use; syntax highlighting
-by filename, dirty markers, Cmd/Ctrl-S). Reads and writes ride the same fs
-API family as everything else and are therefore IAM-scoped end to end:
+The **Editor** sub-tab is a full-bleed workbench: a slim toolbar (target
+picker + one-line route summary + new file/folder), a lazy directory tree
+rail on the left (rooted at the project root locally, `~` on peers;
+hidden-file toggle), and a multi-tab CodeMirror editor filling the rest
+(vendored bundle, `static/codemirror-bundle.js`, lazy-loaded on first use;
+syntax highlighting by filename, dirty markers, hover-reveal close, a
+Reload-or-Overwrite conflict banner, Cmd/Ctrl-S). One accent answers "whose
+disk is this?": the active editor tab's underline, the tree selection, and
+the statusbar host chip render blue while editing this daemon and mauve on a
+peer (`--files-accent`). Reads and writes ride the same fs API family as
+everything else and are therefore IAM-scoped end to end:
 
 - Local targets use `GET /api/fs/stat|list|read` and `POST /api/fs/write`
   (both classified `FilesystemWrite`→`write_roots` for mutation, and gated by
@@ -427,15 +447,22 @@ and peer federation:
   `root` is user/client authority and `peer-profile` is daemon-to-daemon
   authority. Local user/client bindings can also use enforced scoped roles:
   `scoped-human` (access model inspection only), `observer`, `session-reader`,
-  `terminal`, `files-read`, `files-write`, and `operator`. Directory-scoped file
-  access, public shares, organization groups, and external identity policy are
-  design targets, not hidden enforcement.
+  `terminal`, `files-read`, `files-write`, `peer-user`, and `operator`.
+  Directory-scoped file access, public shares, organization groups, and
+  external identity policy are design targets, not hidden enforcement.
 - A **permission** is the operation gate the daemon enforces. Access
   administration now separates `access.inspect` from `access.manage`, and peer
-  topology separates `peer.inspect` from `peer.manage`. Owner/root dashboard
-  sessions have all four. Existing peer profiles are mapped conservatively:
-  `peer-root` can inspect access and inspect/manage peer topology, but
-  `access.manage` remains reserved for trusted root user/client sessions.
+  topology separates `peer.inspect`, `peer.manage`, and `peer.use`.
+  `peer.use` is the delegation gate: opening a tunnel to a connected peer
+  (dashboard-control, file-transfer, or display signaling) presents *this
+  daemon's* peer credentials, and the receiving peer authorizes everything
+  inside the tunnel against its own grants for this daemon — so relaying is
+  never inferred from local capabilities, it is granted by name
+  (`operator` and `peer-user` carry it; `peer.manage` implies it for
+  compatibility). Owner/root dashboard sessions have all of these. Existing
+  peer profiles are mapped conservatively: `peer-root` can inspect access and
+  inspect/manage/use peer topology, but `access.manage` remains reserved for
+  trusted root user/client sessions.
 - A **transport** is only how the route is carried: browser mTLS, hosted
   Connect/WebRTC tunnel, local/debug HTTP, or daemon-to-daemon peer mTLS. The
   product UI should not make Connect a separate access system.
@@ -1608,6 +1635,11 @@ unexpected transport.
 Pairing authorization follows the access/peer split: request and identity lists
 require `access.inspect`, invite/approve/revoke require `access.manage`, and
 join/request-access/poll remain peer-topology operations gated by `peer.manage`.
+The signaling relays that open tunnels to an already-connected peer
+(`api_peer_webrtc_signal`, `api_peer_file_transfer_signal`,
+`api_peer_dashboard_control_signal`, and their
+`POST /api/peers/{id}/…-webrtc` HTTP twins) are gated by `peer.use` instead —
+using a peer relationship is not administering it.
 General peer and coordinator controls are covered by the same rule. Peer add,
 remove, eligibility discovery, per-peer message/task/approval, peer-display
 signaling, and coordinator route calls use `api_peer_add`, `api_peer_remove`,
