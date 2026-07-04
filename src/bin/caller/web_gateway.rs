@@ -4243,6 +4243,19 @@ fn is_mcp_request_path(request_line: &str) -> bool {
     path == "/mcp"
 }
 
+/// True when `path` is exactly `base` or nested beneath it (`base` + `/`).
+/// The parsed-path twin of the retired `request_line.contains(...)` routing:
+/// a query string that merely mentions `base`, or a longer path that shares
+/// its prefix (`/api/peersonal`), no longer matches — only the route itself
+/// and its sub-routes do. `path` must come from `parse_request_target`, so
+/// the query is already stripped.
+fn path_is_or_under(path: &str, base: &str) -> bool {
+    path == base
+        || path
+            .strip_prefix(base)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 static LOOPBACK_MCP_AUTH_TOKEN: OnceLock<String> = OnceLock::new();
 
 pub(crate) fn loopback_mcp_auth_token() -> &'static str {
@@ -21799,7 +21812,9 @@ pub fn spawn_web_gateway(
                     // for the design rationale.
                     if is_federation_path(request_line) {
                         if let Some(op) =
-                            crate::peer::access_policy::federation_http_operation(request_line)
+                            crate::peer::access_policy::federation_http_operation(
+                                req_method, req_path,
+                            )
                         {
                             let decision = http_access_context.decision(op);
                             if !decision.allowed {
@@ -21990,7 +22005,7 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(&response).await;
-                    } else if request_line.contains(" /frames/") {
+                    } else if req_path.starts_with("/frames/") {
                         // Serve HQ frame images from the frame registry.
                         // URL format: /frames/<frame_id> (not /api/session/*/frames/*)
                         use tokio::io::AsyncWriteExt;
@@ -22031,7 +22046,7 @@ pub fn spawn_web_gateway(
                             );
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
-                    } else if request_line.contains("/api/project-root") {
+                    } else if req_path == "/api/project-root" {
                         use tokio::io::AsyncWriteExt;
                         let body = project_root_response_body(project_root.as_deref());
                         let response = format!(
@@ -22046,8 +22061,7 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET")
-                        && request_line.contains(" /api/fs/stat")
+                    } else if req_method == "GET" && req_path == "/api/fs/stat"
                     {
                         use tokio::io::AsyncWriteExt;
                         let path = query_param(&request_line, "path").unwrap_or_default();
@@ -22059,8 +22073,7 @@ pub fn spawn_web_gateway(
                             Err(e) => json_error("400 Bad Request", e),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET")
-                        && request_line.contains(" /api/fs/list")
+                    } else if req_method == "GET" && req_path == "/api/fs/list"
                     {
                         use tokio::io::AsyncWriteExt;
                         let path = query_param(&request_line, "path").unwrap_or_default();
@@ -22069,8 +22082,7 @@ pub fn spawn_web_gateway(
                             Err(e) => json_error("400 Bad Request", e),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET")
-                        && request_line.contains(" /api/fs/read")
+                    } else if req_method == "GET" && req_path == "/api/fs/read"
                     {
                         use tokio::io::AsyncWriteExt;
                         let path = query_param(&request_line, "path").unwrap_or_default();
@@ -22138,8 +22150,7 @@ pub fn spawn_web_gateway(
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
                         }
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains(" /api/fs/mkdir")
+                    } else if req_method == "POST" && req_path == "/api/fs/mkdir"
                     {
                         use tokio::io::AsyncWriteExt;
                         let body_text = read_post_body(&header_text, &mut stream).await;
@@ -22161,8 +22172,7 @@ pub fn spawn_web_gateway(
                             Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains("/api/settings")
+                    } else if req_method == "POST" && req_path == "/api/settings"
                     {
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         // Read POST body — may be partially or fully outside the peek buffer
@@ -22192,8 +22202,7 @@ pub fn spawn_web_gateway(
                             settings_post_result(body_text, project_root.as_deref(), &bus);
                         let response = json_response(status, result);
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains("/api/diagnostics/visual-freshness")
+                    } else if req_method == "POST" && req_path == "/api/diagnostics/visual-freshness"
                     {
                         // **Phase 0 visual-freshness transcript sink** (task #83).
                         // Body is browser-emitted NDJSON (one JSON record per
@@ -22278,7 +22287,7 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains("/api/settings") {
+                    } else if req_path == "/api/settings" {
                         use tokio::io::AsyncWriteExt;
                         let body =
                             settings_get_response_body(project_root.as_deref(), &runtime_settings)
@@ -22295,8 +22304,7 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains("/api/api-keys")
+                    } else if req_method == "POST" && req_path == "/api/api-keys"
                     {
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         let content_length: usize = header_text
@@ -22334,7 +22342,7 @@ pub fn spawn_web_gateway(
                             result
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains("/api/api-key-status") {
+                    } else if req_path == "/api/api-key-status" {
                         use tokio::io::AsyncWriteExt;
                         let body = api_key_status_response_body();
                         let response = format!(
@@ -22349,10 +22357,7 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains(" /session")
-                        && !request_line.contains("/api/session/")
-                    {
+                    } else if req_method == "POST" && req_path == "/session" {
                         let result = mint_session_token(&session_provider, &session_model).await;
                         let (status, body) = match result {
                             Ok(json) => ("200 OK", json),
@@ -22374,9 +22379,7 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains("/recordings/")
-                        && !request_line.contains("/api/session/")
-                    {
+                    } else if req_path.starts_with("/recordings/") {
                         // Serve recording data: segment files and metadata.
                         use tokio::io::AsyncWriteExt;
                         let path_part = request_line
@@ -22552,9 +22555,7 @@ pub fn spawn_web_gateway(
                             use tokio::io::AsyncWriteExt;
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
-                    } else if request_line.contains("/recordings")
-                        && !request_line.contains("/api/session/")
-                    {
+                    } else if req_path == "/recordings" {
                         // GET /recordings — list all streams (session + daemon-scoped)
                         use tokio::io::AsyncWriteExt;
 
@@ -22571,10 +22572,9 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if (request_line.starts_with("DELETE")
-                        || request_line.starts_with("POST"))
-                        && request_line.contains("/api/session/")
-                        && request_line.contains("/delete")
+                    } else if (req_method == "DELETE" || req_method == "POST")
+                        && req_path.starts_with("/api/session/")
+                        && req_path.ends_with("/delete")
                     {
                         // DELETE /api/session/{id}[/{target}]  (native DELETE)
                         // POST  /api/session/{id}/delete[/{target}]  (WKWebView fallback)
@@ -22604,8 +22604,7 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("DELETE")
-                        && request_line.contains("/api/session/")
+                    } else if req_method == "DELETE" && req_path.starts_with("/api/session/")
                     {
                         // Plain DELETE without /delete in path (curl, regular browser)
                         use tokio::io::AsyncWriteExt;
@@ -22632,8 +22631,7 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains(" /api/session/current/agent-output")
+                    } else if req_method == "POST" && req_path == "/api/session/current/agent-output"
                     {
                         use tokio::io::AsyncWriteExt;
                         let log_dir =
@@ -22644,9 +22642,9 @@ pub fn spawn_web_gateway(
                             None => upload_error_response("404 Not Found", "no active session log"),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains(" /api/session/")
-                        && request_line.contains("/agent-output")
+                    } else if req_method == "POST"
+                        && req_path.starts_with("/api/session/")
+                        && req_path.ends_with("/agent-output")
                     {
                         use tokio::io::AsyncWriteExt;
                         let rest = request_line
@@ -22669,9 +22667,7 @@ pub fn spawn_web_gateway(
                             upload_error_response("404 Not Found", "unknown session output route")
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains(" /api/session/current/uploads")
-                    {
+                    } else if req_method == "POST" && req_path == "/api/session/current/uploads" {
                         // POST /api/session/current/uploads?name=<fn>&destination=task|workspace
                         //   Content-Type: <mime>
                         //   <raw bytes>
@@ -22793,8 +22789,8 @@ pub fn spawn_web_gateway(
                             }
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET")
-                        && request_line.contains(" /api/session/current/uploads")
+                    } else if req_method == "GET"
+                        && path_is_or_under(req_path, "/api/session/current/uploads")
                     {
                         // GET /api/session/current/uploads           — list uploads for the current session
                         // GET /api/session/current/uploads/<id>/raw  — stream bytes of one upload
@@ -22882,8 +22878,8 @@ pub fn spawn_web_gateway(
                         if !response.is_empty() {
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
-                    } else if request_line.starts_with("DELETE")
-                        && request_line.contains(" /api/session/current/uploads/")
+                    } else if req_method == "DELETE"
+                        && req_path.starts_with("/api/session/current/uploads/")
                     {
                         // DELETE /api/session/current/uploads/<id> — remove the file + sidecar.
                         use tokio::io::AsyncWriteExt;
@@ -22922,8 +22918,7 @@ pub fn spawn_web_gateway(
                             }
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET")
-                        && request_line.contains(" /api/managed-context/anchors")
+                    } else if req_method == "GET" && req_path == "/api/managed-context/anchors"
                     {
                         use tokio::io::AsyncWriteExt;
                         let response = match session_log.as_ref() {
@@ -22948,8 +22943,7 @@ pub fn spawn_web_gateway(
                             ),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET")
-                        && request_line.contains(" /api/managed-context/records")
+                    } else if req_method == "GET" && req_path == "/api/managed-context/records"
                     {
                         use tokio::io::AsyncWriteExt;
                         let response = match session_log.as_ref() {
@@ -22974,8 +22968,7 @@ pub fn spawn_web_gateway(
                             ),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET")
-                        && request_line.contains(" /api/managed-context/fission")
+                    } else if req_method == "GET" && req_path == "/api/managed-context/fission"
                     {
                         use tokio::io::AsyncWriteExt;
                         let response = match session_log.as_ref() {
@@ -23000,8 +22993,7 @@ pub fn spawn_web_gateway(
                             ),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET")
-                        && request_line.contains("/api/session/current/changes")
+                    } else if req_method == "GET" && req_path == "/api/session/current/changes"
                     {
                         // File change tracking endpoints:
                         //   GET /api/session/current/changes        — list all changed files
@@ -23027,8 +23019,7 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET")
-                        && request_line.contains("/api/session/current/history")
+                    } else if req_method == "GET" && req_path == "/api/session/current/history"
                     {
                         // GET /api/session/current/history — serialized History.
                         use tokio::io::AsyncWriteExt;
@@ -23047,8 +23038,7 @@ pub fn spawn_web_gateway(
                             body,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains("/api/session/current/rollback")
+                    } else if req_method == "POST" && req_path == "/api/session/current/rollback"
                     {
                         // POST /api/session/current/rollback body:
                         //   {"round_id": N,
@@ -23078,8 +23068,7 @@ pub fn spawn_web_gateway(
                             body,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains("/api/session/current/redo")
+                    } else if req_method == "POST" && req_path == "/api/session/current/redo"
                     {
                         // POST /api/session/current/redo — no body required.
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
@@ -23101,8 +23090,7 @@ pub fn spawn_web_gateway(
                             body,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains("/api/session/current/prune")
+                    } else if req_method == "POST" && req_path == "/api/session/current/prune"
                     {
                         // POST /api/session/current/prune — no body required.
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
@@ -23122,7 +23110,7 @@ pub fn spawn_web_gateway(
                             body,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains("/api/session/") {
+                    } else if req_path.starts_with("/api/session/") {
                         use tokio::io::AsyncWriteExt;
                         // Extract the rest after /api/session/ and split into parts
                         let rest = request_line
@@ -23586,7 +23574,7 @@ pub fn spawn_web_gateway(
                             );
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
-                    } else if request_line.contains("/api/displays") {
+                    } else if req_path == "/api/displays" {
                         // Display enumeration endpoint
                         use tokio::io::AsyncWriteExt;
                         let body = displays_response_body(&session_registry).await;
@@ -23891,7 +23879,7 @@ pub fn spawn_web_gateway(
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
                         }
-                    } else if request_line.contains(" /api/access/enrollment-requests") {
+                    } else if req_path == "/api/access/enrollment-requests" {
                         use tokio::io::AsyncWriteExt;
                         let body = access_enrollment_requests_response_body();
                         let response = with_fleet_cors(
@@ -23899,7 +23887,7 @@ pub fn spawn_web_gateway(
                             fleet_cors_origin.as_deref(),
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains(" /api/access/iam/state") {
+                    } else if req_path == "/api/access/iam/state" {
                         use tokio::io::AsyncWriteExt;
                         let body = access_iam_state_response_body();
                         let response = with_fleet_cors(
@@ -23907,7 +23895,7 @@ pub fn spawn_web_gateway(
                             fleet_cors_origin.as_deref(),
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains(" /api/access/overview") {
+                    } else if req_path == "/api/access/overview" {
                         use tokio::io::AsyncWriteExt;
                         let body = access_overview_response_body_for_principal(
                             &agent_card_value_for_targets,
@@ -23919,7 +23907,7 @@ pub fn spawn_web_gateway(
                             fleet_cors_origin.as_deref(),
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains(" /api/dashboard/targets") {
+                    } else if req_path == "/api/dashboard/targets" {
                         use tokio::io::AsyncWriteExt;
                         let body = dashboard_targets_response_body(
                             &agent_card_value_for_targets,
@@ -23927,7 +23915,7 @@ pub fn spawn_web_gateway(
                         );
                         let response = json_response("200 OK", body);
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains(" /api/peers") {
+                    } else if path_is_or_under(req_path, "/api/peers") {
                         // Peer registry endpoints. Dispatch:
                         //   GET    /api/peers                  → list
                         //   POST   /api/peers                  → add
@@ -24140,7 +24128,7 @@ pub fn spawn_web_gateway(
                             body.len(),
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains(" /api/coordinator/route") {
+                    } else if req_path == "/api/coordinator/route" {
                         // POST /api/coordinator/route — capability-based
                         // task routing through the Coordinator primitive.
                         // Body shape: {"required_capabilities": ["display",
@@ -24193,8 +24181,7 @@ pub fn spawn_web_gateway(
                             body.len(),
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains(" /api/worktrees/inspect")
+                    } else if req_method == "POST" && req_path == "/api/worktrees/inspect"
                     {
                         let body_text = read_request_body(&mut stream, &header_text).await;
                         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -24216,8 +24203,7 @@ pub fn spawn_web_gateway(
                         let response = json_response(status, body);
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains(" /api/worktrees/remove")
+                    } else if req_method == "POST" && req_path == "/api/worktrees/remove"
                     {
                         let body_text = read_request_body(&mut stream, &header_text).await;
                         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -24246,8 +24232,7 @@ pub fn spawn_web_gateway(
                         let response = json_response(status, body);
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST")
-                        && request_line.contains(" /api/worktrees/scan")
+                    } else if req_method == "POST" && req_path == "/api/worktrees/scan"
                     {
                         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
                         let project_root = project_root.clone();
@@ -24271,8 +24256,7 @@ pub fn spawn_web_gateway(
                         let response = json_response("200 OK", body);
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET")
-                        && request_line.contains(" /api/worktrees")
+                    } else if req_method == "GET" && req_path == "/api/worktrees"
                     {
                         let body = worktree_inventory_cache
                             .lock()
@@ -24282,7 +24266,7 @@ pub fn spawn_web_gateway(
                         let response = json_response("200 OK", body);
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains("/api/sessions/stream") {
+                    } else if req_path == "/api/sessions/stream" {
                         let request_line_for_stream = request_line.to_string();
                         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
                         let stream_task = tokio::task::spawn_blocking(move || {
@@ -24303,7 +24287,7 @@ pub fn spawn_web_gateway(
                             }
                         }
                         let _ = stream_task.await;
-                    } else if request_line.contains("/api/sessions/search") {
+                    } else if req_path == "/api/sessions/search" {
                         let query = query_param(request_line, "q").unwrap_or_default();
                         let source_filter = query_param(request_line, "source")
                             .unwrap_or_else(|| "all".to_string());
@@ -24330,7 +24314,7 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains("/api/sessions") {
+                    } else if req_path == "/api/sessions" {
                         // Session listing endpoint. CORS `*` so the
                         // multi-host Stats tab can fetch sibling
                         // daemons' session lists to populate its "All
@@ -24375,7 +24359,7 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains("/debug") {
+                    } else if req_path == "/debug" {
                         // Debug endpoint: returns agent state + voice connection info
                         let state = query_ctx.as_ref().map(|ctx| {
                             ctx.agent_state
@@ -24410,7 +24394,7 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST") && request_line.contains(" /mcp") {
+                    } else if req_method == "POST" && req_path == "/mcp" {
                         // MCP Streamable HTTP endpoint.
                         //
                         // rmcp expects:
@@ -24532,9 +24516,7 @@ pub fn spawn_web_gateway(
                             );
                             let _ = stream.write_all(http.as_bytes()).await;
                         }
-                    } else if (request_line.starts_with("GET")
-                        || request_line.starts_with("DELETE"))
-                        && request_line.contains(" /mcp")
+                    } else if (req_method == "GET" || req_method == "DELETE") && req_path == "/mcp"
                     {
                         // MCP Streamable HTTP: GET (SSE stream) and DELETE (session cleanup)
                         // are not supported by our stateless endpoint.  Return 405 so rmcp
@@ -24609,10 +24591,8 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(&response).await;
-                    } else if request_line.contains("/.well-known/agent-card.json")
-                        || request_line.contains("/config")
-                    {
-                        let body = if request_line.contains("/.well-known/agent-card.json") {
+                    } else if req_path == "/.well-known/agent-card.json" || req_path == "/config" {
+                        let body = if req_path == "/.well-known/agent-card.json" {
                             // Canonical peer identity + capability surface.
                             // Served alongside /config so the browser and
                             // federated peers can discover who this daemon
@@ -28720,10 +28700,11 @@ pub(crate) async fn coordinator_route(
 /// `/`, `/static/*`), and `/ws` are exempt — see
 /// `spawn_web_gateway::inbound_bearer_token` docs for why.
 fn is_federation_path(request_line: &str) -> bool {
-    request_line.contains(" /api/peers")
-        || request_line.contains(" /api/coordinator/")
-        || request_line.contains(" /api/sessions")
-        || request_line.contains(" /api/worktrees")
+    let (_, path, _) = parse_request_target(request_line);
+    path_is_or_under(path, "/api/peers")
+        || path.starts_with("/api/coordinator/")
+        || path_is_or_under(path, "/api/sessions")
+        || path_is_or_under(path, "/api/worktrees")
 }
 
 fn peer_filesystem_query_request(
@@ -28814,8 +28795,7 @@ fn dashboard_http_operation(
         return Some(PeerOperation::SessionInspect);
     }
     if req_path.starts_with("/api/peers") {
-        let request_line = format!("{req_method} {req_path} HTTP/1.1");
-        return crate::peer::access_policy::federation_http_operation(&request_line);
+        return crate::peer::access_policy::federation_http_operation(req_method, req_path);
     }
 
     None
@@ -36989,6 +36969,30 @@ mod tests {
     }
 
     #[test]
+    fn path_is_or_under_matches_routes_not_substrings() {
+        assert!(path_is_or_under("/api/peers", "/api/peers"));
+        assert!(path_is_or_under("/api/peers/p-1/message", "/api/peers"));
+        assert!(!path_is_or_under("/api/peersonal", "/api/peers"));
+        assert!(!path_is_or_under("/api", "/api/peers"));
+        // Callers pass the parse_request_target path, so a query string
+        // mentioning a route never reaches this predicate as path text.
+        let (_, path, _) = parse_request_target("GET /api/fs/stat?path=/api/peers HTTP/1.1");
+        assert!(!path_is_or_under(path, "/api/peers"));
+    }
+
+    #[test]
+    fn is_federation_path_uses_parsed_routes() {
+        assert!(is_federation_path("GET /api/peers HTTP/1.1"));
+        assert!(is_federation_path("POST /api/peers/p-1/task HTTP/1.1"));
+        assert!(is_federation_path("GET /api/sessions?limit=5 HTTP/1.1"));
+        // Look-alike paths and query mentions are not federation routes.
+        assert!(!is_federation_path("GET /api/peersonal HTTP/1.1"));
+        assert!(!is_federation_path(
+            "GET /api/fs/stat?path=/api/sessions HTTP/1.1"
+        ));
+    }
+
+    #[test]
     fn embedded_static_assets_precompress_large_assets() {
         for path in [
             "/wasm-web/presence_web_bg.wasm",
@@ -41268,6 +41272,68 @@ mod tests {
             body.contains("</html>"),
             "TLS body must include the closing </html> (not cut off mid-record)"
         );
+        handle.abort();
+    }
+
+    /// The dispatch chain routes on parsed `(method, path)`, matching the
+    /// IAM/Origin gates. The old `request_line.contains(...)` dispatch let
+    /// a request whose path merely EMBEDDED an API route reach its handler
+    /// while the gates — which classify by parsed path — never saw it as
+    /// that route (`POST /x/api/api-keys` reached the API-key writer).
+    #[tokio::test]
+    async fn dispatch_routes_on_parsed_paths_not_substrings() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, None).await;
+
+        // Path embedding /api/api-keys must NOT reach the API-key writer;
+        // it falls through to the SPA shell like any unknown route.
+        let resp = http_request(
+            port,
+            "POST /x/api/api-keys HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        assert!(
+            resp.contains("Content-Type: text/html"),
+            "off-path api-keys request must fall through, got: {}",
+            &resp.chars().take(120).collect::<String>()
+        );
+
+        // The exact route still reaches the writer (a JSON responder).
+        let resp = http_request(
+            port,
+            "POST /api/api-keys HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        assert!(
+            resp.contains("Content-Type: application/json"),
+            "exact api-keys route must reach the writer, got: {}",
+            &resp.chars().take(120).collect::<String>()
+        );
+
+        // A query string mentioning another route must not shadow the
+        // requested one. /api/project-root dispatches well before /debug,
+        // so under substring routing this query would have answered as
+        // project-root; parsed routing serves the /debug state object.
+        // (Both are cheap and machine-independent, unlike the session
+        // list, which scans the real home directory.)
+        let resp = http_request(
+            port,
+            "GET /debug?note=/api/project-root HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.contains("\"agent_state\"") && !resp.contains("\"project_root\""),
+            "query mention must not shadow the routed path, got: {}",
+            &resp.chars().take(200).collect::<String>()
+        );
+
+        // Look-alike longer paths are not the route.
+        let resp = http_request(port, "GET /api/sessionsfoo HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            resp.contains("Content-Type: text/html"),
+            "look-alike path must fall through, got: {}",
+            &resp.chars().take(120).collect::<String>()
+        );
+
         handle.abort();
     }
 
