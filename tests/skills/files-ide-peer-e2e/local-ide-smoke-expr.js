@@ -1,5 +1,9 @@
 (() => {
-  const SMOKE = '/private/tmp/claude-501/-Users-vm-projects-intendant/ec37805b-701f-43e2-afe2-250377035668/scratchpad/ide-smoke';
+  // In-page expression for scripts/validate-dashboard.cjs --wait-for-function.
+  // SMOKE is the fixture directory on the daemon host; seed it with hello.rs
+  // (containing "hello from the files tab") before running, or inject another
+  // path first via --wait-for-function "window.__IDE_SMOKE_DIR='...'||true".
+  const SMOKE = window.__IDE_SMOKE_DIR || '/tmp/files-ide-smoke';
   const ide = window.intendantDashboardFilesIde;
   if (!ide || !document.querySelector('.tab-btn[data-tab="files"]')) return false;
   if (!window.__ideSmoke) {
