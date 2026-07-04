@@ -17,10 +17,10 @@
 //! reset on every successful connect. No command buffering while
 //! disconnected — commands pulled off the queue during reconnecting
 //! states would be ambiguous (is the user expecting them to apply to
-//! the old connection or the new one?). The actor only processes
-//! commands while in `Connected`; any that arrive during the
-//! reconnect window wait in the bounded command channel and are
-//! delivered once the connection comes back up.
+//! the old connection or the new one?). During reconnect the actor drains
+//! the command channel only to let `Disconnect` short-circuit the backoff;
+//! `Send` commands fail fast with `NotConnected` so callers choose their
+//! own retry policy.
 
 use crate::peer::card::AgentCard;
 use crate::peer::event::{PeerEvent, PeerStatus, TaggedPeerEvent};

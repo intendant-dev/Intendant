@@ -16,7 +16,7 @@ As the orchestrator, you:
 
 ### Spawning Sub-Agents
 
-Spawn sub-agents using `exec_agent` with the caller binary and environment variables:
+Spawn sub-agents with the shell command tool: use `exec_command` in native-tool mode, or `execAsAgent` in legacy JSON mode, with the caller binary and environment variables:
 
 ```
 INTENDANT_ROLE=research INTENDANT_ID=research-1 \
@@ -33,7 +33,7 @@ INTENDANT_PROGRESS_FILE=.intendant/subagents/research-1/progress.json \
 
 ### Monitoring Progress
 
-Check sub-agent progress files periodically using `inspect_path`.
+Check sub-agent progress files periodically with the path-inspection tool (`inspect_path` in native-tool mode, `inspectPath` in legacy JSON mode).
 
 ### Implementation Isolation
 

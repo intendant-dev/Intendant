@@ -1702,7 +1702,7 @@ fn append_manual_http_tool_definitions(
         "read_screen",
         manual_http_tool_definition!(
             "read_screen",
-            "Read the frontmost application's UI element tree (roles, labels, values, and logical-point frames) from the platform accessibility API. Cheap textual grounding for computer use: click the center of a reported frame. Fall back to take_screenshot for visual verification or apps with poor accessibility support. Currently macOS user-session only.",
+            "Read the frontmost application's UI element tree (roles, labels, values, and logical-point frames) from the platform accessibility API. Cheap textual grounding for computer use: click the center of a reported frame. Fall back to take_screenshot for visual verification or apps with poor accessibility support. User-session only on all supported platforms: macOS AX, Linux AT-SPI, and Windows UIA.",
             ReadScreenParams
         ),
     );
@@ -8633,7 +8633,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Start a new task for the Intendant agent to execute. The agent will begin working on the task immediately. Only one task can run at a time — check get_status to see if a task is already running."
+        description = "Start work through Intendant. Without session_id, starts a new agent task when the launcher is available. With session_id, routes the text to that managed session as a follow-up or resumes a persisted external-agent wrapper when possible. With reference_frame_ids or display_target, routes to the computer-use task runner."
     )]
     async fn start_task(&self, Parameters(params): Parameters<StartTaskParams>) -> String {
         let session_id = params
@@ -10622,7 +10622,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Read the frontmost application's UI element tree (roles, labels, values, and logical-point frames) from the platform accessibility API. Cheap textual grounding for computer use: click the center of a reported frame. Fall back to take_screenshot for visual verification or apps with poor accessibility support. Currently macOS user-session only."
+        description = "Read the frontmost application's UI element tree (roles, labels, values, and logical-point frames) from the platform accessibility API. Cheap textual grounding for computer use: click the center of a reported frame. Fall back to take_screenshot for visual verification or apps with poor accessibility support. User-session only on all supported platforms: macOS AX, Linux AT-SPI, and Windows UIA."
     )]
     async fn read_screen(
         &self,
@@ -10907,35 +10907,17 @@ impl IntendantServer {
             Err(_) => return format!("Error: {} not set", api_key_var),
         };
 
-        // Create audio bridge
-        // Vortex shared-memory probe is POSIX-only (`shm_open`). On
-        // Windows the Vortex bridge isn't available, so the probe is
-        // compiled out and we fall through to the regular audio bridge.
-        #[cfg(unix)]
-        let vortex_shm_available = unsafe {
-            let fd = libc::shm_open(
-                b"/vortex-audio\0".as_ptr() as *const libc::c_char,
-                libc::O_RDONLY,
-                0,
-            );
-            if fd >= 0 {
-                libc::close(fd);
-                true
-            } else {
-                false
-            }
-        };
-        #[cfg(not(unix))]
-        let vortex_shm_available = false;
-        let mut bridge = if vortex_shm_available {
-            audio_routing::create_vortex_bridge("shm")
+        // Create audio bridge. The platform helper probes Vortex shm where
+        // supported; otherwise we fall through to the regular bridge.
+        let mut bridge = if crate::platform::vortex_audio_shm_available() {
+            audio_routing::create_vortex_bridge()
         } else {
             match audio_routing::create_bridge(&spec.id).await {
                 Ok(b) => b,
                 Err(e) => return format!("Error creating audio bridge: {}", e),
             }
         };
-        if bridge.vortex_socket_path().is_none() {
+        if !bridge.uses_vortex_shm() {
             let _ = audio_routing::set_as_default(&mut bridge).await;
         }
 

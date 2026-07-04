@@ -376,13 +376,11 @@ impl PeerRegistry {
     /// the card's `auth.transport = PinnedMutualTls` for use by the
     /// custom rustls verifier on subsequent TLS connects.
     ///
-    /// Pinning fingerprints come *from the card* (TOFU-style) — the
-    /// initial card fetch in `fetch_card` happens with default trust,
-    /// and once we have the card we use its declared fingerprints
-    /// for every subsequent connect. The card itself is the trust
-    /// assertion. Operator-side override (out-of-band fingerprint
-    /// supplied via `[[peer]]` config) is a follow-up that goes
-    /// through this same path.
+    /// This low-level path consumes the already-prepared card and parses
+    /// whatever `auth.transport` it contains. Higher-level config entry
+    /// points apply operator-side `[[peer]].pinned_fingerprints` overrides
+    /// before calling here, replacing the card's declared pins when an
+    /// out-of-band fingerprint is configured.
     pub async fn add_peer_with_card_and_auth(
         &self,
         card: AgentCard,

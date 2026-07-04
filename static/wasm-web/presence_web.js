@@ -177,12 +177,13 @@ export class PresenceWeb {
     /**
      * Handle a voice model tool call end-to-end.
      *
-     * ALL tools respond instantly — no server roundtrip blocks the voice model.
+     * Local-result and action tools respond immediately; IO tools defer
+     * their tool response until the server returns `async_query_result`.
      *
      * - `TextResult` (check_status): answered from cached state, immediate response
      * - Action tools (approve, deny, submit_task, etc.): immediate "ok", fire-and-forget to server
-     * - `NeedsIO` (query_detail, recall_memory): immediate "querying..." response,
-     *   async query to server, result injected as text when it arrives
+     * - `NeedsIO` (query_detail, recall_memory): async query to server,
+     *   original tool call resolved with the real result when it arrives
      * @param {any} call
      * @returns {any}
      */

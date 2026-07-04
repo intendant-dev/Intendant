@@ -1,22 +1,26 @@
 //! WebRTC-based display transport.
 //!
 //! A `DisplaySession` connects a platform-native capture backend to one or more
-//! WebRTC peers via a shared VP8 encoder.  The pipeline is:
+//! WebRTC peers through a shared multi-codec, multi-layer encoder pool. The
+//! pipeline is:
 //!
 //! ```text
-//! [CaptureBackend] --mpsc(4)--> [capture bridge] --broadcast(16)--> [encoder]
-//!                                     |                                |
-//!                              latest_frame (RwLock)            per-peer mpsc(8)
-//!                                                                      |
-//!                                                              [WebRtcPeer sender]
-//!                                                                      |
-//!                                                               track.write_sample()
+//! [CaptureBackend] --mpsc(4)--> [capture bridge] --I420 feed--> [EncoderPool]
+//!                                     |                              |
+//!                              latest_frame (RwLock)          per-codec/RID
+//!                                                             subscriptions
+//!                                                            /      |      \
+//!                                                   [WebRtcPeer] [WebRtcPeer] ...
+//!                                                        |
+//!                                                 track.write_sample()
 //! ```
 //!
 //! Backpressure rules:
 //! - PipeWire -> tokio: bounded `mpsc(4)`, frames dropped via `try_send`.
-//! - Broadcast to encoder subscribers: `broadcast(16)`, lagging receivers skip.
-//! - Per-peer encoded frame queue: `mpsc(8)`, encoder drops via `try_send`.
+//! - Capture bridge -> encoder pool: latest-wins I420 feed.
+//! - Encoder pool subscriptions: `broadcast(16)`, lagging peer forwarders skip.
+//! - Per-peer forwarders run inside `WebRtcPeer` and write only negotiated
+//!   codec/RID frames.
 //! - `latest_frame`: always overwritten, latest-wins.
 
 use std::collections::{HashMap, HashSet};
@@ -1936,9 +1940,9 @@ impl DisplaySession {
         // `PeerDisplayConnection`-over-TURN signature) so the pool spawns
         // the loss-resilient quarter-resolution / capped-bitrate on-demand
         // H.264 layer instead of the full-resolution one. Local
-        // `DisplaySlot` offers inject `a=simulcast:recv f;h;q` and stay
-        // non-federated. The same discriminator drives the single-RID vs
-        // multi-RID answer path in `WebRtcPeer::new`.
+        // `DisplaySlot` offers inject recv-simulcast (default `f`, opt-in
+        // `f;h;q`) and stay non-federated. The same discriminator drives
+        // the single-RID vs multi-RID answer path in `WebRtcPeer::new`.
         prefs.federated = self::webrtc::offer_is_federated(sdp);
 
         let (subs, lease) = pool.subscribe(&prefs).map_err(|e| {

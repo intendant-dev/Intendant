@@ -240,42 +240,6 @@ pub(crate) fn ensure_project_uploads_ignored(project_root: &Path) -> io::Result<
     append_intendant_ignore_rule(&project_gitignore)
 }
 
-/// Persist a tempfile at `dest_path`: rename when the tempfile lives on the
-/// same filesystem (atomic), otherwise re-stage next to the destination and
-/// rename from there. Shared by the upload store and the dashboard fs-write
-/// endpoint.
-pub(crate) fn persist_tempfile(temp_file: tempfile::NamedTempFile, dest_path: &Path) -> io::Result<()> {
-    match temp_file.persist(dest_path) {
-        Ok(_) => Ok(()),
-        Err(err) if err.error.kind() == io::ErrorKind::CrossesDevices => {
-            copy_upload_tempfile_across_filesystems(err.file, dest_path)
-        }
-        Err(err) => Err(err.error),
-    }
-}
-
-fn copy_upload_tempfile_across_filesystems(
-    temp_file: tempfile::NamedTempFile,
-    dest_path: &Path,
-) -> io::Result<()> {
-    let dest_dir = dest_path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "upload destination has no parent",
-        )
-    })?;
-    let mut source = temp_file.reopen()?;
-    let mut dest_temp = tempfile::Builder::new()
-        .prefix(".intendant-upload-")
-        .suffix(".tmp")
-        .tempfile_in(dest_dir)?;
-    io::copy(&mut source, &mut dest_temp)?;
-    dest_temp.flush()?;
-    dest_temp.as_file_mut().sync_all()?;
-    dest_temp.persist(dest_path).map_err(|err| err.error)?;
-    Ok(())
-}
-
 /// Commit a pending temp file into the upload store as a new descriptor.
 ///
 /// The caller is responsible for having streamed the bytes into a tempfile
@@ -311,7 +275,7 @@ pub fn commit_upload(
     // Prefer rename (atomic on the same filesystem); fall back to copy if
     // the tempdir lives elsewhere (common on Linux when TMPDIR is tmpfs
     // and the session dir is on a regular disk).
-    persist_tempfile(temp_file, &dest_path)?;
+    crate::file_watcher::persist_tempfile(temp_file, &dest_path)?;
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

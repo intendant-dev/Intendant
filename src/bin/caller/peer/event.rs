@@ -4,8 +4,8 @@
 //! (Intendant, OpenClaw, A2A, MCP), so this enum is the convex hull of
 //! what every transport can map into. It deliberately does NOT carry
 //! Intendant-specific concepts like [`crate::event::AppEvent`] — the
-//! native Intendant transport upcasts `AppEvent` into these variants in
-//! `transport/intendant.rs` (via `crate::event::app_event_to_peer_event`).
+//! native Intendant transport maps wire-format [`crate::types::OutboundEvent`]
+//! values into these variants with [`crate::peer::upcast::WireEventUpcaster`].
 //!
 //! Variants are organized into categories that map to the dashboard UI:
 //! lifecycle, activity stream, conversation, task delegation, approval,

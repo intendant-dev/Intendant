@@ -704,21 +704,8 @@ pub fn logical_display_size() -> (u32, u32) {
     use std::sync::OnceLock;
     static SIZE: OnceLock<(u32, u32)> = OnceLock::new();
     *SIZE.get_or_init(|| {
-        #[cfg(target_os = "macos")]
-        {
-            #[link(name = "CoreGraphics", kind = "framework")]
-            extern "C" {
-                fn CGMainDisplayID() -> u32;
-                fn CGDisplayPixelsWide(display: u32) -> usize;
-                fn CGDisplayPixelsHigh(display: u32) -> usize;
-            }
-            let (w, h) = unsafe {
-                let d = CGMainDisplayID();
-                (CGDisplayPixelsWide(d) as u32, CGDisplayPixelsHigh(d) as u32)
-            };
-            if w > 0 && h > 0 {
-                return (w, h);
-            }
+        if let Some(size) = crate::platform::main_display_pixel_size() {
+            return size;
         }
         // Fallback: assume 1:1 mapping
         (1024, 768)

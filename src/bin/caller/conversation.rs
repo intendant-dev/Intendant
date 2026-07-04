@@ -24,9 +24,9 @@ pub struct ImageData {
 /// Reference to a tool call, stored on assistant messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRef {
-    /// Item ID (fc_-prefixed for Responses API).
+    /// Provider item identity when available.
     pub id: String,
-    /// Correlation key (call_-prefixed). Used for function_call_output.
+    /// Local correlation key used to pair calls with tool results.
     #[serde(default)]
     pub call_id: String,
     pub name: String,
@@ -49,8 +49,9 @@ pub struct Message {
     /// Base64-encoded images attached to this message (e.g. from captureScreen).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<ImageData>>,
-    /// Raw output items from the API response (for verbatim echo-back).
-    /// Used by OpenAI Responses API to echo reasoning + function_call items together.
+    /// Opaque provider transcript items for verbatim echo-back. Used by
+    /// providers that require exact replay of response parts, including
+    /// OpenAI Responses items and Gemini `thoughtSignature` parts.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub raw_output: Option<Vec<serde_json::Value>>,
     /// True when this tool result is from a native computer-use call.
@@ -511,12 +512,12 @@ impl Conversation {
         }
     }
 
-    /// Truncate the conversation so that it retains exactly
-    /// `target_len` messages at the front. Used by the conversation
-    /// rollback flow: the file-snapshot history records
-    /// `native_message_count` at each `RoundComplete`, and rolling
-    /// back to that round drops every message appended after that
-    /// point.
+    /// Truncate the conversation to the requested prefix, then append any
+    /// synthetic tool results needed to keep provider APIs from rejecting
+    /// dangling tool calls at the new tail. Used by the conversation rollback
+    /// flow: the file-snapshot history records `native_message_count` at each
+    /// `RoundComplete`, and rolling back to that round drops every message
+    /// appended after that point before the pairing repair runs.
     ///
     /// Returns the number of messages removed. Caps `target_len` at
     /// the current length (oversized requests are treated as no-op
@@ -1594,9 +1595,9 @@ mod tests {
         assert_eq!(next.role, "tool");
         assert_eq!(next.tool_call_id.as_deref(), Some("call_1"));
         assert!(next.content.contains("[dropped]"));
-        assert!(messages
-            .iter()
-            .any(|m| m.content.contains("[Context Summary] earlier work summarized")));
+        assert!(messages.iter().any(|m| m
+            .content
+            .contains("[Context Summary] earlier work summarized")));
     }
 
     #[test]

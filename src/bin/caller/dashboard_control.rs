@@ -4568,10 +4568,8 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         runtime,
         crate::peer::access_policy::PeerOperation::PeerManage,
     );
-    let peer_use = runtime_allows_operation(
-        runtime,
-        crate::peer::access_policy::PeerOperation::PeerUse,
-    );
+    let peer_use =
+        runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::PeerUse);
     let message =
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Message);
     let capabilities = [

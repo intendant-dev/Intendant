@@ -1059,8 +1059,7 @@ impl SessionSupervisor {
                 );
                 return;
             };
-            if let Err(e) = apply_session_claude_effort(&mut project, backend, effort.to_string())
-            {
+            if let Err(e) = apply_session_claude_effort(&mut project, backend, effort.to_string()) {
                 self.loop_error(format!("Session create failed: {}", e));
                 return;
             }

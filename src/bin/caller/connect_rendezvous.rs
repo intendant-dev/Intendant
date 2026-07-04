@@ -1,9 +1,11 @@
 //! Outbound Intendant Connect rendezvous client for dashboard-control signaling.
 //!
-//! This module intentionally implements only signaling plus opaque session-grant
-//! binding. It does not authorize a browser or replace mTLS dashboard access. A
-//! production Connect service must wrap this with account/passkey/device policy;
-//! this client is the daemon-side transport substrate and local E2E hook.
+//! Connect is the hosted transport and identity-metadata relay for
+//! dashboard-control signaling. Authorization stays daemon-local: before
+//! answering an offer, this client verifies any browser client key / account
+//! metadata against local IAM and creates a dashboard-control session only when
+//! that local grant exists. Direct mTLS/local-root dashboard access remains the
+//! bootstrap path for managing those grants.
 
 use crate::daemon_identity::DaemonIdentity;
 use crate::dashboard_control::DashboardControlRegistry;
@@ -311,9 +313,7 @@ async fn register(
     };
     authenticated(
         config,
-        client.post(
-            join_url(base_url, "api/daemon/register").map_err(RegisterError::Transient)?,
-        ),
+        client.post(join_url(base_url, "api/daemon/register").map_err(RegisterError::Transient)?),
     )
     .json(&request)
     .send()

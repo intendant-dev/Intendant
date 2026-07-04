@@ -38,7 +38,7 @@ example.
 
 | Backend | Screenshot capture                          | Input injection            | Platform        |
 |---------|---------------------------------------------|----------------------------|-----------------|
-| X11     | live session frame, else ImageMagick `import` | `xdotool`                | Linux (X11)     |
+| X11     | live session frame, else in-process root-window capture via `x11rb` | `x11rb`/XTest | Linux (X11) |
 | Wayland | live session frame (PipeWire portal)        | portal `InputEvent`s       | Linux (Wayland) |
 | MacOS   | live session frame, else `screencapture`    | in-process CGEvents        | macOS           |
 | Windows | live session frame (DXGI)                   | `SendInput` via session    | Windows         |
@@ -46,11 +46,12 @@ example.
 Wayland and Windows are **session-only** backends: both capture and input run
 through the live `DisplaySession` (WebRTC pipeline); without an active session
 the executor returns an actionable error naming the recovery path. X11 and
-macOS inject input directly — macOS posts CoreGraphics `CGEvent`s in-process
-(no `cliclick`/`osascript` subprocesses; key chords use ANSI-US virtual
-keycodes, unicode typing is layout-independent) — and prefer the in-memory
-frame of a live capture session for screenshots, falling back to the
-subprocess tools when no session exists.
+macOS inject input directly — X11 uses a persistent `x11rb`/XTest connection
+with in-process root-window capture and clipboard support; macOS posts
+CoreGraphics `CGEvent`s in-process (no `cliclick`/`osascript` subprocesses; key
+chords use ANSI-US virtual keycodes, unicode typing is layout-independent) —
+and prefer the in-memory frame of a live capture session for screenshots,
+falling back to their platform capture paths when no session exists.
 
 **Post-action freshness:** capture backends are damage-driven, so a screenshot
 taken right after an input action waits (bounded, 300 ms) for a frame captured
@@ -73,11 +74,12 @@ typically a few hundred tokens versus ~1.5k for a screenshot. Clicks ground
 deterministically: click the center of a reported frame. Depth/node caps are
 always announced in the output, never silent.
 
-Currently macOS-only (`src/bin/caller/ax.rs`, raw `accessibility-sys` bindings
-— the documented Unix `unsafe` exception; Windows UIA / Linux AT-SPI are
-future work), user-session display only, and it requires the same
-Accessibility (TCC) permission input injection already needs. Exposed as an
-MCP tool (in the `core` bootstrap profile) and as
+Implemented for the user session on all supported platforms: macOS AX
+(`src/bin/caller/ax.rs`, raw `accessibility-sys` bindings — the documented Unix
+`unsafe` exception), Linux AT-SPI (`src/bin/caller/atspi_read.rs`), and Windows
+UIA (`src/bin/caller/windows_uia.rs`). It inspects the user's session, not
+virtual display pixels, and requires the platform accessibility path to be
+available. Exposed as an MCP tool (in the `core` bootstrap profile) and as
 `intendant ctl cu elements [--format json]`. Pixels remain the fallback for
 visual verification and for apps with sparse accessibility trees (web views
 notably).
@@ -243,12 +245,6 @@ segment isn't present, it falls back to the per-OS device bridge:
 | Linux fallback        | PulseAudio null sinks via `pactl` (virtual mic/speaker, set as default for the session, restored on drop). |
 | macOS fallback        | BlackHole virtual device + `SwitchAudioSource` (legacy). |
 
-> **Doc-vs-code note:** the `spawn_live_audio` *tool description* in `tools.rs`
-> still says audio routes through "PulseAudio on Linux, BlackHole on macOS". The
-> macOS reality is the Vortex HAL plugin over the POSIX shm bridge; BlackHole is
-> only the legacy fallback. There is also a TCP "bh-bridge" network bridge for
-> routing audio to a host outside the VM.
-
 Audio routing is only needed for the app-to-model bridge. Browser voice
 interaction through the [dashboard](./web-dashboard.md) (Gemini Live / OpenAI
 Realtime) needs none of this.
@@ -274,7 +270,7 @@ conversation with a voice model. **macOS only**; requires the Vortex Audio HAL
 plugin, `pjsua`, and a GUI session with TCC mic permission.
 
 ```
-voice model ──shm──▶ Vortex Audio (default in/out) ──▶ pjsua (SIP/SRTP) ──▶ phone
+voice model ──shm──▶ Vortex Audio device ──▶ pjsua (SIP/SRTP) ──▶ phone
    │                                                                          │
    │◀────────────────────────────────────────────────────────────────────────│
 ```

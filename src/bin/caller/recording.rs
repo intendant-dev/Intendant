@@ -1,8 +1,9 @@
 //! Continuous video recording for display and camera streams.
 //!
-//! Uses ffmpeg to record displays (x11grab on Linux, avfoundation on macOS)
-//! and browser camera frames (image2pipe) into segmented MP4 files stored in
-//! the session directory. Follows the same RAII guard pattern as `vision::XvfbGuard`.
+//! Uses ffmpeg to record displays (x11grab on Linux, screencapture feeding
+//! image2pipe on macOS) and browser camera frames (image2pipe) into segmented
+//! MP4 files stored in the session directory. Follows the same RAII guard
+//! pattern as `vision::XvfbGuard`.
 
 use crate::event::{AppEvent, EventBus};
 use crate::project::RecordingConfig;
@@ -72,9 +73,7 @@ impl Drop for RecordingGuard {
         #[cfg(unix)]
         {
             if let Some(id) = self.child.id() {
-                unsafe {
-                    libc::kill(id as i32, libc::SIGINT);
-                }
+                crate::platform::interrupt_process(id);
                 // Wait for ffmpeg to exit and finalize (up to 5 seconds)
                 for _ in 0..50 {
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -171,7 +170,7 @@ async fn verify_ffmpeg_started(
 }
 
 /// Start recording a display via ffmpeg.
-/// Uses x11grab on Linux, avfoundation on macOS.
+/// Uses x11grab on Linux and a screencapture/image2pipe feeder on macOS.
 pub async fn start_display_recording(
     display_id: u32,
     width: u32,
@@ -192,7 +191,7 @@ pub async fn start_display_recording(
     let segment_list = segments_dir.join("segments.csv");
 
     let source = if cfg!(target_os = "macos") {
-        "avfoundation"
+        "screencapture_image2pipe"
     } else {
         "x11grab"
     };
@@ -297,7 +296,8 @@ pub async fn start_display_recording(
     })?;
 
     // Guard against fail-fast errors: x11grab on a Wayland-only session, or
-    // avfoundation without Screen Recording permission, exits within ~50ms.
+    // the screencapture feeder without Screen Recording permission, exits
+    // within ~50ms.
     verify_ffmpeg_started(
         &mut child,
         &segments_dir.join("ffmpeg.log"),
@@ -875,7 +875,8 @@ fn spawn_frame_bridge(
 
 /// Start a display recording, preferring the frame-fed path when a
 /// `DisplaySession` exists for the display.  Falls back to the legacy
-/// x11grab/avfoundation path otherwise.  This is the single entry point used
+/// x11grab/screencapture-image2pipe path otherwise.  This is the single entry
+/// point used
 /// by both the DisplayReady auto-start path and the manual `StartRecording`
 /// ControlMsg path — so manual recording on Wayland sessions goes through
 /// PipeWire (via the session's frame broadcast) instead of trying `x11grab`,
@@ -921,7 +922,7 @@ async fn start_display_auto(
 /// When a `DisplaySession` exists for the display (WebRTC pipeline), recording
 /// uses the frame-fed path: frames are subscribed from the session's broadcast
 /// channel, JPEG-encoded, and piped into ffmpeg via `image2pipe`.  Otherwise,
-/// the legacy path (x11grab / avfoundation) is used.
+/// the legacy path (x11grab / screencapture-image2pipe) is used.
 pub fn spawn_recording_listener(
     mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
     registry: std::sync::Arc<tokio::sync::RwLock<RecordingRegistry>>,

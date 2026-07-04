@@ -56,9 +56,10 @@ pub struct WebRtcConfig {
     /// Whether the federated (peer-to-peer) display path may negotiate
     /// H.264. Default false ⇒ federation pins VP8 in the browser (the safe
     /// default for lossy TURN-relayed paths). Set true to let federation
-    /// negotiate the peer's intra-refresh H.264 (libx264 / NVENC). Threaded
-    /// into the `/config` payload alongside `ice_servers`; the local
-    /// (same-machine) display path is unaffected.
+    /// prefer the peer's loss-resilient H.264 layer: quarter resolution,
+    /// capped bitrate, periodic IDRs, same-SSRC NACK, and small slices.
+    /// Threaded into the `/config` payload alongside `ice_servers`; the
+    /// local (same-machine) display path is unaffected.
     #[serde(default)]
     pub federation_allow_h264: bool,
 }
@@ -160,7 +161,7 @@ pub struct CodexConfig {
     /// Model to use (e.g. "o4-mini", "codex-mini-latest").
     #[serde(default)]
     pub model: Option<String>,
-    /// Approval policy: "never", "on-request", "on-failure", "untrusted", "granular".
+    /// Approval policy: "untrusted", "on-request", or "never".
     #[serde(default = "default_codex_approval_policy")]
     pub approval_policy: String,
     /// Sandbox mode within Codex.

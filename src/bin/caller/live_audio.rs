@@ -750,7 +750,7 @@ pub async fn start_audio_bridge(
     audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
 ) -> Result<AudioStreamBridge, CallerError> {
-    if bridge.vortex_socket_path().is_some() {
+    if bridge.uses_vortex_shm() {
         // The Vortex shared-memory bridge is POSIX-only (shm_open/mmap).
         // On Windows `create_vortex_bridge` is never selected, so this
         // branch is unreachable in practice; gate it so the Unix-only
@@ -838,6 +838,8 @@ async fn start_vortex_shm_bridge(
     capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
 ) -> Result<AudioStreamBridge, CallerError> {
     // Open and mmap the shared memory
+    // SAFETY: VORTEX_SHM_NAME is a static NUL-terminated POSIX shm name.
+    // O_RDWR opens the Vortex HAL-owned object for shared ring access.
     let fd = unsafe {
         libc::shm_open(
             VORTEX_SHM_NAME.as_ptr() as *const libc::c_char,
@@ -853,6 +855,8 @@ async fn start_vortex_shm_bridge(
     }
 
     let shm_size = OFF_IN_BUFFER + VORTEX_RING_SAMPLES * 4;
+    // SAFETY: fd is a live descriptor from shm_open; shm_size covers the
+    // VortexSharedAudioState header and both f32 ring buffers.
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -863,6 +867,7 @@ async fn start_vortex_shm_bridge(
             0,
         )
     };
+    // SAFETY: fd was returned by shm_open above and is not used after close.
     unsafe { libc::close(fd) };
     if ptr == libc::MAP_FAILED {
         return Err(CallerError::Agent("vortex mmap failed".into()));
@@ -870,6 +875,8 @@ async fn start_vortex_shm_bridge(
     let base = ptr as *mut u8;
 
     // Verify magic
+    // SAFETY: base points to a mapped VortexSharedAudioState; OFF_MAGIC is the
+    // first u32 field and remains valid for the mapping's process lifetime.
     let magic = unsafe {
         (base.add(OFF_MAGIC) as *const std::sync::atomic::AtomicU32)
             .as_ref()
@@ -892,15 +899,23 @@ async fn start_vortex_shm_bridge(
 
     // Helper: read/write atomics via raw address (Send-safe)
     fn atomic_load_u64(base: usize, offset: usize, order: std::sync::atomic::Ordering) -> u64 {
+        // SAFETY: callers pass offsets for aligned AtomicU64 fields inside the
+        // mapped VortexSharedAudioState, whose lifetime outlives the bridge tasks.
         unsafe { &*((base + offset) as *const std::sync::atomic::AtomicU64) }.load(order)
     }
     fn atomic_store_u64(base: usize, offset: usize, val: u64, order: std::sync::atomic::Ordering) {
+        // SAFETY: same invariant as atomic_load_u64; the selected field is an
+        // aligned AtomicU64 owned by the shared Vortex state.
         unsafe { &*((base + offset) as *const std::sync::atomic::AtomicU64) }.store(val, order);
     }
     fn read_f32(base: usize, buf_offset: usize, idx: usize) -> f32 {
+        // SAFETY: idx is masked by VORTEX_RING_MASK before each call, so the
+        // access stays within the selected f32 ring buffer.
         unsafe { *((base + buf_offset) as *const f32).add(idx) }
     }
     fn write_f32(base: usize, buf_offset: usize, idx: usize, val: f32) {
+        // SAFETY: idx is masked by VORTEX_RING_MASK before each call, so the
+        // write stays within the selected f32 ring buffer.
         unsafe { *((base + buf_offset) as *mut f32).add(idx) = val };
     }
 
@@ -1008,9 +1023,10 @@ async fn start_vortex_shm_bridge(
     })
 }
 
-/// Vortex audio bridge: listens on a Unix socket for the Vortex guest daemon,
-/// speaks the Vortex wire protocol, and converts between Float32 stereo 48kHz
-/// (daemon) and PCM16 mono 24kHz (model).
+/// Legacy Vortex daemon-socket bridge. The active dispatcher uses
+/// [`start_vortex_shm_bridge`] instead; this parked path listens on a Unix
+/// socket for the Vortex guest daemon, speaks the Vortex wire protocol, and
+/// converts between Float32 stereo 48kHz (daemon) and PCM16 mono 24kHz (model).
 ///
 /// Unix-only: binds a `UnixListener`. Gated off Windows for Tier-0.
 #[cfg(unix)]
@@ -1236,8 +1252,8 @@ async fn start_network_audio_bridge(
     })
 }
 
-/// Local audio bridge: spawns sox processes for capture/playback via platform
-/// audio devices (PulseAudio on Linux, BlackHole on macOS).
+/// Local fallback audio bridge: spawns capture/playback subprocesses via
+/// platform virtual devices (PulseAudio null sinks or BlackHole).
 async fn start_local_audio_bridge(
     session_write: Arc<Mutex<WsSink>>,
     provider: LiveAudioProvider,
@@ -2532,13 +2548,12 @@ mod tests {
     /// IMPORTANT: This test requires a GUI login session. macOS gates audio
     /// input behind the WindowServer session — processes from SSH get silence.
     /// Run this test from Terminal.app inside the VM's display, or install
-    /// pjsua as a LaunchAgent. The Vortex daemon and intendant can run from
-    /// any context; only pjsua (the app opening mic input) needs GUI session.
+    /// pjsua as a LaunchAgent. Intendant can run from any context; only pjsua
+    /// (the app opening mic input) needs GUI session.
     ///
     /// Prerequisites:
-    ///   - Vortex guest tools installed (VortexAudioPlugin + VortexAudioDaemon)
-    ///   - "Vortex Audio" set as default input AND output in System Settings
-    ///   - VortexAudioDaemon running with --socket /tmp/intendant-audio.sock
+    ///   - Vortex guest tools installed (VortexAudioPlugin)
+    ///   - Vortex POSIX shared-memory segment available at /vortex-audio
     ///   - ~/bin/pjsua built from pjsip source
     ///   - ~/lin containing the SIP password
     ///   - OPENAI_API_KEY in environment
@@ -2553,7 +2568,6 @@ mod tests {
             None => return,
         };
 
-        let vortex_socket = "/tmp/intendant-audio.sock";
         let session_id = format!(
             "call-{}",
             std::time::SystemTime::now()
@@ -2562,7 +2576,7 @@ mod tests {
                 .as_millis()
         );
 
-        let bridge = crate::audio_routing::create_vortex_bridge(vortex_socket);
+        let bridge = crate::audio_routing::create_vortex_bridge();
 
         // Discover Vortex Audio's pjsua device index dynamically.
         let pjsua_bin = dirs::home_dir().unwrap().join("bin/pjsua");
@@ -2614,8 +2628,8 @@ mod tests {
         };
 
         // Launch pjsua AFTER the bridge connects (spawned with delay).
-        // pjsua opening Vortex Audio triggers a flood of PCM_OUTPUT from
-        // the daemon. The bridge's drain task must be running first.
+        // pjsua opening Vortex Audio writes to the shared-memory rings. The
+        // bridge's poll tasks must be running first.
         // NOTE: pjsua must run in the GUI login session for mic input.
         let pjsua_bin_clone = pjsua_bin.clone();
         let pjsua_handle = tokio::spawn(async move {
@@ -2718,8 +2732,8 @@ mod tests {
             None,
             &crate::transcription::TranscriptionConfig::default(),
         )
-            .await
-            .expect("run_session failed");
+        .await
+        .expect("run_session failed");
 
         // Stop pjsua
         if let Ok(mut pjsua) = pjsua_handle.await {
@@ -2768,7 +2782,7 @@ mod tests {
     }
 
     /// Layer 3: Full run_session pipeline with audio bridge + schema validation.
-    /// Skips if virtual audio routing is not available (no BlackHole / PulseAudio).
+    /// Skips if virtual audio routing is not available (no Vortex / PulseAudio / BlackHole).
     #[tokio::test]
     #[ignore]
     async fn test_live_audio_openai_full_session() {
@@ -2844,8 +2858,8 @@ mod tests {
             None,
             &crate::transcription::TranscriptionConfig::default(),
         )
-            .await
-            .expect("run_session failed");
+        .await
+        .expect("run_session failed");
 
         drop(bridge);
 
