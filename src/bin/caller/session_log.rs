@@ -427,32 +427,26 @@ impl SessionLog {
     /// Find a session by its ID (UUID prefix or full UUID).
     /// Checks `~/.intendant/logs/{id}/` directly, then scans for prefix matches.
     pub fn find_session_by_id(session_id: &str) -> Option<PathBuf> {
-        let logs_dir = crate::platform::home_dir().join(".intendant").join("logs");
+        Self::find_session_by_id_in_home(&crate::platform::home_dir(), session_id)
+    }
+
+    pub fn find_session_by_id_in_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+        // Path-form ids ("resume by path": absolute, or containing a
+        // separator) resolve through the anchored helper — the path must
+        // land inside the logs root, so a pasted log-dir path keeps
+        // working without turning session lookup into an
+        // arbitrary-directory read. This runs FIRST because
+        // `logs_dir.join(absolute_path)` would silently replace the base.
+        if crate::session_names::session_id_looks_like_path(session_id) {
+            return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
+        }
+
+        let logs_dir = home.join(".intendant").join("logs");
 
         // Direct match (dir name == session_id)
         let direct = logs_dir.join(session_id);
         if direct.is_dir() && direct.join("session_meta.json").exists() {
             return Some(direct);
-        }
-
-        // Backward compat: if session_id looks like a path (absolute, or
-        // containing any path separator on this platform), treat it as a
-        // direct path. A bare UUID prefix has no separators and is not
-        // absolute, so it falls through to the prefix scan below. Checking
-        // for both '/' and the platform separator keeps Windows absolute
-        // paths (`C:\...`, which use '\\') from being misclassified.
-        let looks_like_path = {
-            let p = Path::new(session_id);
-            p.is_absolute()
-                || session_id.contains('/')
-                || session_id.contains(std::path::MAIN_SEPARATOR)
-        };
-        if looks_like_path {
-            let dir = PathBuf::from(session_id);
-            if dir.is_dir() {
-                return Some(dir);
-            }
-            return None;
         }
 
         // Scan for prefix match or meta match
@@ -4269,13 +4263,27 @@ mod tests {
     }
 
     #[test]
-    fn find_session_by_id_direct_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let session_dir = dir.path().join("my-session");
+    fn find_session_by_id_path_form_is_anchored_to_logs_root() {
+        let home = tempfile::tempdir().unwrap();
+        let logs = home.path().join(".intendant").join("logs");
+        let session_dir = logs.join("my-session");
         fs::create_dir_all(&session_dir).unwrap();
-        // Without session_meta.json, the direct path check still works
-        let result = SessionLog::find_session_by_id(session_dir.to_str().unwrap());
-        assert_eq!(result, Some(session_dir));
+
+        // A pasted log-dir path resolves (no session_meta.json needed) —
+        // compare canonicalized because the resolver canonicalizes.
+        let result =
+            SessionLog::find_session_by_id_in_home(home.path(), session_dir.to_str().unwrap());
+        assert_eq!(result, Some(fs::canonicalize(&session_dir).unwrap()));
+
+        // A directory outside the logs root is not a session, even though
+        // it exists: path-form lookup must not read arbitrary directories.
+        let outside = tempfile::tempdir().unwrap();
+        let escape = outside.path().join("my-session");
+        fs::create_dir_all(&escape).unwrap();
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), escape.to_str().unwrap()),
+            None
+        );
     }
 
     #[test]
