@@ -4,6 +4,7 @@ use std::sync::Mutex;
 
 /// Extra tool definitions registered at runtime (e.g. from MCP servers).
 static EXTRA_TOOLS: Mutex<Vec<ToolDefinition>> = Mutex::new(Vec::new());
+const BUILT_IN_TOOL_COUNT: usize = 14;
 
 /// Provider-agnostic tool definition.
 #[derive(Debug, Clone, Serialize)]
@@ -59,9 +60,9 @@ pub fn tool_name_to_function(tool_name: &str) -> Option<&'static str> {
     }
 }
 
-/// Returns all 14 tool definitions.
+/// Returns all built-in tool definitions plus any runtime-registered extras.
 pub fn all_tools() -> Vec<ToolDefinition> {
-    let mut tools = Vec::with_capacity(12);
+    let mut tools = Vec::with_capacity(BUILT_IN_TOOL_COUNT);
 
     // 1. exec_command → execAsAgent
     {
@@ -72,13 +73,13 @@ pub fn all_tools() -> Vec<ToolDefinition> {
             },
             "command": {
                 "type": "string",
-                "description": "The Bash command to run."
+                "description": "The command to run through the platform shell."
             }
         });
 
         tools.push(ToolDefinition {
             name: "exec_command".to_string(),
-            description: "Execute a Bash command and wait for completion. Returns exit code, stdout tail (last 10KB), and stderr tail directly. DISPLAY and XAUTHORITY are set automatically. Reference a previous command's PID with $NONCE[id]. For daemons, background in bash (`cmd &`) — the shell exits and the tool returns while the daemon keeps running. Optional fields (omit unless needed): `display` (integer) — X11 display number for GUI commands, use 0 for the user's session display (requires approval); `wait_for_port` (integer) — TCP port to wait for before executing.".to_string(),
+            description: "Execute a command through the platform shell and wait for completion. Returns exit code, stdout tail (last 10KB), and stderr tail directly. On Unix the shell is bash; on Windows it is cmd.exe. Reference a previous command's PID with $NONCE[id]. For daemons, background with the active shell syntax (`cmd &` on Unix shells) so the shell exits while the daemon keeps running. DISPLAY/XAUTHORITY are set automatically on X11-backed displays. Optional fields (omit unless needed): `display` (integer) — display/session number for GUI commands, use 0 for the user's session display (requires approval); `wait_for_port` (integer) — TCP port to wait for before executing.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
@@ -99,7 +100,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
 
         tools.push(ToolDefinition {
             name: "capture_screen".to_string(),
-            description: "Capture a screenshot of an X11 display. The screenshot image is sent back to you for visual inspection. Screenshots are also saved to the log directory. The runtime auto-discovers active virtual displays by default. Use `display: 0` for the user's session display (requires one-time approval). Chain after UI interactions to verify success. Optional: `display` (integer) — display number, 0 for user session (requires approval), omit for auto-discover.".to_string(),
+            description: "Capture a screenshot using the runtime display capture backend. The screenshot image is sent back to you for visual inspection. Screenshots are also saved to the log directory. The runtime auto-discovers active virtual displays where numbered displays are supported. Use `display: 0` for the user's session display (requires one-time approval). Chain after UI interactions to verify success. Optional: `display` (integer) — display/session number, 0 for user session (requires approval), omit for auto-discover.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
@@ -124,7 +125,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
 
         tools.push(ToolDefinition {
             name: "inspect_path".to_string(),
-            description: "Inspect a filesystem path and return metadata (exists, type, size, permissions, timestamps).".to_string(),
+            description: "Inspect a filesystem path and return available metadata (exists, type, size, timestamps; Unix also includes permissions, uid, and gid).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
@@ -408,7 +409,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     // 14. spawn_live_audio (caller-handled, untrusted live audio sub-agent)
     tools.push(ToolDefinition {
         name: "spawn_live_audio".to_string(),
-        description: "Spawn an untrusted live audio sub-agent to conduct a voice conversation through an app on the display. Connects to a live audio model (Gemini Live or OpenAI Realtime) and routes audio through virtual devices (PulseAudio on Linux, Vortex Audio on macOS). Requires virtual audio driver to be installed. The sub-agent has zero tools and zero file access. Returns structured data matching the response_schema, or quarantine references for unexpected content.".to_string(),
+        description: "Spawn an untrusted live audio sub-agent to conduct a voice conversation through an app on the display. Connects to a live audio model (Gemini Live or OpenAI Realtime) and routes audio through virtual devices. Vortex Audio direct shared memory is preferred on Unix when available; Linux falls back to PulseAudio null sinks and macOS falls back to BlackHole. Requires a supported virtual audio driver to be installed. The sub-agent has zero tools and zero file access. Returns structured data matching the response_schema, or quarantine references for unexpected content.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -439,7 +440,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 },
                 "display_id": {
                     "type": "integer",
-                    "description": "X11 display number where the target app is running."
+                    "description": "Display/session id where the target app is running; on Linux/X11 this is the X display number."
                 },
                 "initial_message": {
                     "type": "string",
@@ -500,10 +501,33 @@ pub fn clear_extra_tools() {
 mod tests {
     use super::*;
 
+    const BUILT_IN_TOOL_NAMES: [&str; BUILT_IN_TOOL_COUNT] = [
+        "exec_command",
+        "capture_screen",
+        "inspect_path",
+        "edit_file",
+        "browse_url",
+        "ask_human",
+        "exec_pty",
+        "store_memory",
+        "recall_memory",
+        "manage_context",
+        "signal_done",
+        "invoke_skill",
+        "shared_view",
+        "spawn_live_audio",
+    ];
+
     #[test]
-    fn all_tools_has_14_definitions() {
+    fn all_tools_includes_built_in_definitions() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 14);
+        assert!(tools.len() >= BUILT_IN_TOOL_COUNT);
+        for name in BUILT_IN_TOOL_NAMES {
+            assert!(
+                tools.iter().any(|tool| tool.name == name),
+                "missing built-in tool {name}"
+            );
+        }
     }
 
     #[test]
@@ -650,19 +674,19 @@ mod tests {
         let tools = all_tools();
 
         let oai_tools: Vec<Value> = tools.iter().map(|t| t.to_openai()).collect();
-        assert_eq!(oai_tools.len(), 14);
+        assert_eq!(oai_tools.len(), tools.len());
         for t in &oai_tools {
             assert_eq!(t["type"].as_str(), Some("function"));
         }
 
         let ant_tools: Vec<Value> = tools.iter().map(|t| t.to_anthropic()).collect();
-        assert_eq!(ant_tools.len(), 14);
+        assert_eq!(ant_tools.len(), tools.len());
         for t in &ant_tools {
             assert!(t["input_schema"].is_object());
         }
 
         let gem_tools: Vec<Value> = tools.iter().map(|t| t.to_gemini()).collect();
-        assert_eq!(gem_tools.len(), 14);
+        assert_eq!(gem_tools.len(), tools.len());
         for t in &gem_tools {
             assert!(t["parameters"].is_object());
         }

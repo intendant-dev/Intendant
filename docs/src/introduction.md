@@ -14,7 +14,7 @@ The name is the thesis. In a theater, performers play and conductors orchestrate
 
 Intendant is built around a few core ideas:
 
-**Security through process isolation.** Two separate binaries form a trust boundary. The *runtime* that executes arbitrary commands runs under OS filesystem restrictions (Landlock on Linux, Seatbelt on macOS, restricted tokens on Windows) and never holds API keys. The *controller* that manages model conversations never executes user-requested shell commands directly. See [Architecture](./architecture.md).
+**Security through process isolation.** The runtime and controller form the command-execution trust boundary. The *runtime* that executes arbitrary commands runs under OS filesystem restrictions (Landlock on Linux, Seatbelt on macOS, restricted tokens on Windows) and never holds API keys. The *controller* that manages model conversations never executes user-requested shell commands directly. See [Architecture](./architecture.md).
 
 **Authority is always local.** Every session's authority — human or agent, browser or peer daemon — is minted by the *target daemon's own IAM*. Hosted services carry introductions, ciphertext, and signatures, nothing else; organizations are root keys whose signed grant documents materialize into local IAM under each owner's ceilings, never a central directory that could mint access. See [Trust Architecture](./trust-architecture.md).
 
@@ -26,7 +26,7 @@ Intendant is built around a few core ideas:
 
 **A single-writer control plane.** Shared mutable state (autonomy level, the active agent backend, runtime config) has exactly one writer: the control plane. Frontends are *display-only* — they render state and emit intents, but never mutate state directly. See [Control Plane & Daemon](./control-plane-and-daemon.md).
 
-**Compile-time frontend contracts.** Interfaces cannot silently diverge: the TUI and MCP server share the `UserAction`/`StateQuery` enums, while the web dashboard and control socket share the `ControlMsg` vocabulary — both enforced by Rust's exhaustive matching. See [Architecture](./architecture.md) and [TUI & Autonomy](./tui.md).
+**Shared frontend vocabulary.** Frontends exchange state and intents through `AppEvent` and `ControlMsg`: the TUI, web dashboard, MCP server, and control socket render events and submit control messages to the single-writer control plane. The MCP surface also maps approval/input tools to `UserAction`; there is no single compile-time exhaustiveness guarantee across every frontend. See [Architecture](./architecture.md) and [TUI & Autonomy](./tui.md).
 
 **Presence as a separate AI.** Rather than a chat wrapper, the presence layer is an independent (usually fast) model with its own conversation, tools, and state awareness. It mediates between the user and the working agent, turning intent into tasks and narrating progress back. See [Presence Layer](./presence.md).
 

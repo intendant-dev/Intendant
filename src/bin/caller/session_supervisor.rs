@@ -620,11 +620,14 @@ impl SessionSupervisor {
                     direct,
                     attachments,
                     fork,
-                    agent_command,
-                    codex_sandbox,
-                    codex_approval_policy,
-                    codex_managed_context,
-                    codex_context_archive,
+                    LaunchOverrides {
+                        agent_command,
+                        codex_sandbox,
+                        codex_approval_policy,
+                        codex_managed_context,
+                        codex_context_archive,
+                        ..Default::default()
+                    },
                     false,
                 )
                 .await;
@@ -646,6 +649,10 @@ impl SessionSupervisor {
                 codex_approval_policy,
                 codex_managed_context,
                 codex_context_archive,
+                claude_model,
+                claude_permission_mode,
+                claude_allowed_tools,
+                claude_effort,
             } => {
                 self.restart_session(
                     source,
@@ -655,11 +662,17 @@ impl SessionSupervisor {
                     task,
                     direct,
                     attachments,
-                    agent_command,
-                    codex_sandbox,
-                    codex_approval_policy,
-                    codex_managed_context,
-                    codex_context_archive,
+                    LaunchOverrides {
+                        agent_command,
+                        codex_sandbox,
+                        codex_approval_policy,
+                        codex_managed_context,
+                        codex_context_archive,
+                        claude_model,
+                        claude_permission_mode,
+                        claude_allowed_tools,
+                        claude_effort,
+                    },
                 )
                 .await;
             }
@@ -766,17 +779,27 @@ impl SessionSupervisor {
                 codex_approval_policy,
                 codex_managed_context,
                 codex_context_archive,
+                claude_model,
+                claude_permission_mode,
+                claude_allowed_tools,
+                claude_effort,
             } => {
                 self.configure_session_agent(
                     session_id,
                     source,
                     backend_session_id,
                     intendant_session_id,
-                    agent_command,
-                    codex_sandbox,
-                    codex_approval_policy,
-                    codex_managed_context,
-                    codex_context_archive,
+                    LaunchOverrides {
+                        agent_command,
+                        codex_sandbox,
+                        codex_approval_policy,
+                        codex_managed_context,
+                        codex_context_archive,
+                        claude_model,
+                        claude_permission_mode,
+                        claude_allowed_tools,
+                        claude_effort,
+                    },
                 )
                 .await;
             }
@@ -1036,8 +1059,7 @@ impl SessionSupervisor {
                 );
                 return;
             };
-            if let Err(e) = apply_session_claude_effort(&mut project, backend, effort.to_string())
-            {
+            if let Err(e) = apply_session_claude_effort(&mut project, backend, effort.to_string()) {
                 self.loop_error(format!("Session create failed: {}", e));
                 return;
             }
@@ -1188,11 +1210,7 @@ impl SessionSupervisor {
         direct: Option<bool>,
         attachments: Vec<String>,
         fork: bool,
-        agent_command: Option<String>,
-        codex_sandbox: Option<String>,
-        codex_approval_policy: Option<String>,
-        codex_managed_context: Option<String>,
-        codex_context_archive: Option<String>,
+        overrides: LaunchOverrides,
         force_new: bool,
     ) {
         // A fork never attaches to (or dedupes against) the thread it forks
@@ -1237,14 +1255,8 @@ impl SessionSupervisor {
             Vec::new()
         };
         let mut session_agent_config = external_backend.as_ref().map(|backend| {
-            let mut config = crate::session_config::from_wire(
-                Some(backend.as_short_str()),
-                agent_command.as_deref(),
-                codex_sandbox.as_deref(),
-                codex_approval_policy.as_deref(),
-                codex_managed_context.as_deref(),
-                codex_context_archive.as_deref(),
-                None,
+            let mut config = crate::session_config::from_wire_fields(
+                overrides.as_wire_fields(backend.as_short_str()),
             );
             if let Some(persisted) = crate::session_config::load_for_resume(
                 &crate::platform::home_dir(),
@@ -2102,11 +2114,7 @@ impl SessionSupervisor {
                     Some(attach.direct.unwrap_or(true)),
                     Vec::new(),
                     false,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    LaunchOverrides::default(),
                     false,
                 )
                 .await;
@@ -2560,11 +2568,7 @@ impl SessionSupervisor {
         task: Option<String>,
         direct: Option<bool>,
         attachments: Vec<String>,
-        agent_command: Option<String>,
-        codex_sandbox: Option<String>,
-        codex_approval_policy: Option<String>,
-        codex_managed_context: Option<String>,
-        codex_context_archive: Option<String>,
+        overrides: LaunchOverrides,
     ) {
         let source_norm = source.trim().to_lowercase();
         if source_norm == "intendant" {
@@ -2608,11 +2612,7 @@ impl SessionSupervisor {
             direct,
             attachments,
             false,
-            agent_command,
-            codex_sandbox,
-            codex_approval_policy,
-            codex_managed_context,
-            codex_context_archive,
+            overrides,
             true,
         )
         .await;
@@ -2956,11 +2956,7 @@ impl SessionSupervisor {
         source: Option<String>,
         backend_session_id: Option<String>,
         intendant_session_id: Option<String>,
-        agent_command: Option<String>,
-        codex_sandbox: Option<String>,
-        codex_approval_policy: Option<String>,
-        codex_managed_context: Option<String>,
-        codex_context_archive: Option<String>,
+        overrides: LaunchOverrides,
     ) {
         let managed = {
             let state = self.state.lock().await;
@@ -2996,27 +2992,35 @@ impl SessionSupervisor {
             self.loop_error(message);
             return;
         };
-        let clear_codex_sandbox = matches!(backend, external_agent::AgentBackend::Codex)
-            && session_config_clear_value(codex_sandbox.as_deref());
-        let clear_codex_approval_policy = matches!(backend, external_agent::AgentBackend::Codex)
-            && session_config_clear_value(codex_approval_policy.as_deref());
+        let is_codex = matches!(backend, external_agent::AgentBackend::Codex);
+        let is_claude = matches!(backend, external_agent::AgentBackend::ClaudeCode);
+        let clear_codex_sandbox =
+            is_codex && session_config_clear_value(overrides.codex_sandbox.as_deref());
+        let clear_codex_approval_policy =
+            is_codex && session_config_clear_value(overrides.codex_approval_policy.as_deref());
         // The clear sentinel must be checked on the RAW wire value, before
         // from_wire's normalization, and re-applied after the merge passes
         // below re-fill cleared fields from the persisted configs — same
         // dance as sandbox/approval. Otherwise "inherit" would either pin
         // the default into the overlay or be resurrected by the merge.
-        let clear_codex_managed_context = matches!(backend, external_agent::AgentBackend::Codex)
-            && session_config_clear_value(codex_managed_context.as_deref());
-        let clear_codex_context_archive = matches!(backend, external_agent::AgentBackend::Codex)
-            && session_config_clear_value(codex_context_archive.as_deref());
-        let mut config = crate::session_config::from_wire(
-            Some(backend.as_short_str()),
-            agent_command.as_deref(),
-            codex_sandbox.as_deref(),
-            codex_approval_policy.as_deref(),
-            codex_managed_context.as_deref(),
-            codex_context_archive.as_deref(),
-            None,
+        let clear_codex_managed_context =
+            is_codex && session_config_clear_value(overrides.codex_managed_context.as_deref());
+        let clear_codex_context_archive =
+            is_codex && session_config_clear_value(overrides.codex_context_archive.as_deref());
+        let clear_claude_model =
+            is_claude && session_config_clear_value(overrides.claude_model.as_deref());
+        // "default" is a REAL permission mode (pinnable under a stricter
+        // global); only inherit/global/empty clear it.
+        let clear_claude_permission_mode = is_claude
+            && session_config_clear_value_keeping_default(
+                overrides.claude_permission_mode.as_deref(),
+            );
+        let clear_claude_allowed_tools =
+            is_claude && session_config_clear_value(overrides.claude_allowed_tools.as_deref());
+        let clear_claude_effort =
+            is_claude && session_config_clear_value(overrides.claude_effort.as_deref());
+        let mut config = crate::session_config::from_wire_fields(
+            overrides.as_wire_fields(backend.as_short_str()),
         );
         let home = crate::platform::home_dir();
         if let Some(existing) = crate::session_config::load_for_resume(
@@ -3054,6 +3058,18 @@ impl SessionSupervisor {
         }
         if clear_codex_context_archive {
             config.codex_context_archive = None;
+        }
+        if clear_claude_model {
+            config.claude_model = None;
+        }
+        if clear_claude_permission_mode {
+            config.claude_permission_mode = None;
+        }
+        if clear_claude_allowed_tools {
+            config.claude_allowed_tools = None;
+        }
+        if clear_claude_effort {
+            config.claude_effort = None;
         }
         if config.is_empty() {
             let message = "Session config failed: no launch settings supplied".to_string();
@@ -3800,10 +3816,57 @@ fn normalize_session_codex_managed_context(mode: Option<&str>) -> Option<String>
     crate::session_config::normalize_codex_managed_context(mode)
 }
 
+/// One-shot per-session launch overrides carried by a configure, resume, or
+/// restart request. Raw wire values (clear sentinels intact) — backend
+/// gating and normalization happen in `session_config::from_wire_fields`.
+#[derive(Debug, Default)]
+struct LaunchOverrides {
+    agent_command: Option<String>,
+    codex_sandbox: Option<String>,
+    codex_approval_policy: Option<String>,
+    codex_managed_context: Option<String>,
+    codex_context_archive: Option<String>,
+    claude_model: Option<String>,
+    claude_permission_mode: Option<String>,
+    claude_allowed_tools: Option<String>,
+    claude_effort: Option<String>,
+}
+
+impl LaunchOverrides {
+    /// The matching normalizer input for `session_config::from_wire_fields`.
+    fn as_wire_fields<'a>(
+        &'a self,
+        source: &'a str,
+    ) -> crate::session_config::WireSessionAgentFields<'a> {
+        crate::session_config::WireSessionAgentFields {
+            source: Some(source),
+            agent_command: self.agent_command.as_deref(),
+            codex_sandbox: self.codex_sandbox.as_deref(),
+            codex_approval_policy: self.codex_approval_policy.as_deref(),
+            codex_managed_context: self.codex_managed_context.as_deref(),
+            codex_context_archive: self.codex_context_archive.as_deref(),
+            codex_service_tier: None,
+            claude_model: self.claude_model.as_deref(),
+            claude_permission_mode: self.claude_permission_mode.as_deref(),
+            claude_allowed_tools: self.claude_allowed_tools.as_deref(),
+            claude_effort: self.claude_effort.as_deref(),
+        }
+    }
+}
+
 fn session_config_clear_value(value: Option<&str>) -> bool {
     value
         .map(str::trim)
         .map(|value| value.is_empty() || matches!(value, "inherit" | "default" | "global"))
+        .unwrap_or(false)
+}
+
+/// Clear sentinel for the Claude permission-mode field, where "default" is a
+/// real pinnable mode (unlike every other launch field).
+fn session_config_clear_value_keeping_default(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .map(|value| value.is_empty() || matches!(value, "inherit" | "global"))
         .unwrap_or(false)
 }
 
@@ -5236,11 +5299,7 @@ mod tests {
                 Some(true),
                 Vec::new(),
                 false,
-                None,
-                None,
-                None,
-                None,
-                None,
+                LaunchOverrides::default(),
                 false,
             )
             .await;
@@ -5291,11 +5350,7 @@ mod tests {
                 Some(true),
                 Vec::new(),
                 false,
-                None,
-                None,
-                None,
-                None,
-                None,
+                LaunchOverrides::default(),
                 false,
             )
             .await;
@@ -5475,11 +5530,7 @@ mod tests {
                 Some(true),
                 Vec::new(),
                 false,
-                None,
-                None,
-                None,
-                None,
-                None,
+                LaunchOverrides::default(),
                 false,
             ),
         )
@@ -5569,11 +5620,7 @@ mod tests {
                 Some(true),
                 vec![format!("upload:{}", upload.id)],
                 false,
-                None,
-                None,
-                None,
-                None,
-                None,
+                LaunchOverrides::default(),
                 false,
             )
             .await;
@@ -6193,6 +6240,47 @@ mod tests {
         assert!(!session_config_clear_value(Some("managed")));
         assert!(!session_config_clear_value(Some("vanilla")));
         assert!(!session_config_clear_value(None));
+        // The Claude permission-mode variant keeps "default" pinnable.
+        assert!(session_config_clear_value_keeping_default(Some("inherit")));
+        assert!(session_config_clear_value_keeping_default(Some("global")));
+        assert!(session_config_clear_value_keeping_default(Some("")));
+        assert!(!session_config_clear_value_keeping_default(Some("default")));
+        assert!(!session_config_clear_value_keeping_default(Some(
+            "acceptEdits"
+        )));
+        assert!(!session_config_clear_value_keeping_default(None));
+    }
+
+    #[test]
+    fn launch_overrides_map_to_wire_fields_and_gate_by_source() {
+        let overrides = LaunchOverrides {
+            agent_command: Some("/tmp/claude".to_string()),
+            claude_model: Some("sonnet".to_string()),
+            claude_permission_mode: Some("plan".to_string()),
+            claude_allowed_tools: Some("Read, Bash(cargo test *)".to_string()),
+            claude_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        // The claude configure path: fields normalize into pins.
+        let config = crate::session_config::from_wire_fields(
+            overrides.as_wire_fields("claude-code"),
+        );
+        assert_eq!(config.agent_command.as_deref(), Some("/tmp/claude"));
+        assert_eq!(config.claude_model.as_deref(), Some("sonnet"));
+        assert_eq!(config.claude_permission_mode.as_deref(), Some("plan"));
+        assert_eq!(
+            config.claude_allowed_tools.as_deref(),
+            Some(&["Read".to_string(), "Bash(cargo test *)".into()][..])
+        );
+        assert_eq!(config.claude_effort.as_deref(), Some("high"));
+        // The same overrides against a codex session never leak claude pins.
+        let cross = crate::session_config::from_wire_fields(
+            overrides.as_wire_fields("codex"),
+        );
+        assert!(cross.claude_model.is_none());
+        assert!(cross.claude_permission_mode.is_none());
+        assert!(cross.claude_allowed_tools.is_none());
+        assert!(cross.claude_effort.is_none());
     }
 
     #[test]

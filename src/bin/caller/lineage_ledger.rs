@@ -220,12 +220,17 @@ pub fn lineage_ledger_from_jsonl(contents: &str, source_session_id: &str) -> Opt
             "session_ended" => {
                 let session_id = json_string(data, "session_id");
                 if !session_id.is_empty() {
+                    let reason = json_string(data, "reason");
                     // A generic teardown must not downgrade a completed task or
                     // clobber a model-authored summary with a terse reason.
                     if facts.statuses.get(&session_id).map(String::as_str) != Some("completed") {
-                        facts.statuses.insert(session_id.clone(), "ended".into());
+                        let status = if session_ended_reason_is_failure(&reason) {
+                            "failed"
+                        } else {
+                            "ended"
+                        };
+                        facts.statuses.insert(session_id.clone(), status.into());
                     }
-                    let reason = json_string(data, "reason");
                     if !reason.is_empty() && !facts.summaries.contains_key(&session_id) {
                         facts.summaries.insert(session_id, trim_summary(&reason));
                     }
@@ -404,6 +409,13 @@ fn trim_summary(value: &str) -> String {
     out
 }
 
+/// True for `session_ended` reasons that describe a failed branch, matching
+/// the fission lifecycle watcher's status split.
+fn session_ended_reason_is_failure(reason: &str) -> bool {
+    let reason = reason.trim().to_ascii_lowercase();
+    reason.starts_with("error") || reason.contains("errored") || reason.contains("failed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +447,21 @@ mod tests {
         assert_eq!(branch.status, "completed");
         assert_eq!(branch.task.as_deref(), Some("check the parser"));
         assert_eq!(branch.summary.as_deref(), Some("parser is fine"));
+    }
+
+    #[test]
+    fn lineage_ledger_session_ended_maps_failure_reasons() {
+        let jsonl = concat!(
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-branch","ephemeral":false}}"#,
+            "\n",
+            r#"{"event":"session_ended","data":{"session_id":"branch","reason":"error: model call failed"}}"#,
+            "\n",
+        );
+
+        let ledger = lineage_ledger_from_jsonl(jsonl, "parent").expect("ledger");
+        let branch = &ledger.groups[0].branches[0];
+        assert_eq!(branch.status, "failed");
+        assert_eq!(branch.summary.as_deref(), Some("error: model call failed"));
     }
 
     #[test]

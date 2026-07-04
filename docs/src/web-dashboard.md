@@ -335,6 +335,16 @@ immediately to that external backend. These settings are stored with the
 Intendant wrapper session and, for canonical backend session IDs, in an
 external-session overlay. They are used on the next attach/resume so a daemon
 restart or page refresh does not fall back to the current global Settings pane.
+Claude Code sessions get four pinnable rows: model (the same version-safe
+aliases as New Session, plus a Custom-id escape), permission mode, allowed
+tools (comma-separated rules; `all` pins the explicitly-unrestricted empty
+list so a session can escape a restrictive global list), and reasoning
+effort. Every field saves as a pin or the explicit `inherit` clear — and
+"default" is a *real* permission mode that pins, unlike the other fields'
+clear sentinels. On a live session, **Save** additionally applies the model
+and permission pins immediately (native `set_model` / `set_permission_mode`
+control requests); tools and effort take effect at the next launch or via
+**Save & restart**.
 The separate **Restart with saved config** action is a power-user shortcut for
 reapplying settings that were already persisted elsewhere.
 The Managed activity view exposes rewind anchors, saved records, restore, and
@@ -1786,18 +1796,21 @@ family (sub-routes elided where the family is uniform):
 | `POST /mcp` | Streamable-HTTP MCP server (per-tool IAM; see [MCP server](./mcp-server.md)) |
 | `WS /` or `WS /ws` | Main WebSocket: events, TUI terminal and fallback Shell terminal I/O, presence protocol, WebRTC signaling |
 | `GET /api/sessions` | List past sessions (`/stream` NDJSON variant, `/search` full-text) |
-| `GET /api/session/{id}/*` | Per-session detail, report, agent output, log replay, recordings, frame assets; `POST .../delete` |
-| `POST /api/session/current/*` | Current-session ops: `history`, `rollback`, `redo`, `prune`, `changes`, `agent-output`, `control-msg` |
-| `GET/POST /api/session/current/uploads[/*]` | Task attachment store (list, upload, raw fetch, delete) |
+| `GET /api/session/{id}/*` | Per-session detail, report, log replay, context snapshots, recordings, frame assets |
+| `POST /api/session/{id}/agent-output` | Append agent output for a historical/session-scoped backend transcript |
+| `DELETE /api/session/{id}[/{target}]`, `POST /api/session/{id}/delete[/{target}]` | Delete archived session data (native DELETE plus WKWebView fallback) |
+| `GET /api/session/current/history`, `GET /api/session/current/changes[/*]` | Current-session reads: serialized history and file-change list/detail |
+| `POST /api/session/current/{rollback,redo,prune,agent-output}` | Current-session mutations: history rollback/redo/prune and active-session agent-output append |
+| `GET /api/session/current/uploads[/*]`, `POST /api/session/current/uploads`, `DELETE /api/session/current/uploads/{id}` | Task attachment store: list, upload, raw fetch, delete |
 | `GET /api/managed-context/{records,anchors,fission}` | Managed-context state: rewind records, anchors, fission groups |
 | `GET /recordings/*`, `GET /frames/*` | Current-session recording segments and captured frame assets |
-| `GET /api/fs/{stat,list,read}`, `POST /api/fs/mkdir` | Scoped filesystem browsing (fs scope enforced per grant) |
+| `GET /api/fs/{stat,list,read}`, `POST /api/fs/{mkdir,write}` | Scoped filesystem browsing and editor writes (fs scope enforced per grant) |
 | `GET/POST /api/settings`, `POST /api/api-keys`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key management |
 | `GET /api/external-agents` | External-agent backend availability (configured command, installed, auth posture: active oauth lease / local login, last used) — drives the fueling nudge and new-session picker |
 | `GET /api/displays`, `POST /api/diagnostics/visual-freshness` | Display inventory; visual-freshness probe marker |
 | `GET /api/access/{overview,iam/state}`, `GET /api/dashboard/targets` | Trust-architecture snapshots (IAM state, fleet targets) |
 | `POST /api/access/...` | Trust mutations: enrollment decide, IAM grant upsert/update, org trust/revoke, org-grant issue/renew/revoke-member, issuer init/delegate/install, revocation-list apply |
-| `GET/POST /api/peers[/*]` | Peer federation: registry reads (GET), pairing + management (POST) |
+| `GET /api/peers[/*]`, `POST /api/peers[/*]`, `DELETE /api/peers` | Peer federation: registry reads (GET), pairing + management/signaling (POST), registry removal (DELETE) |
 | `POST /api/coordinator/route` | Multi-agent coordinator task routing (peer lane) |
 | `GET /api/worktrees`, `POST /api/worktrees/{inspect,scan,remove}` | Agent worktree inventory and lifecycle |
 | `GET /connect/{bootstrap,status}`, `POST /connect/dashboard/{offer,ice,close}` | Intendant Connect tunnel: bootstrap metadata and dashboard-control WebRTC signaling |
@@ -1805,3 +1818,5 @@ family (sub-routes elided where the family is uniform):
 The full WebSocket message protocol (inbound key/resize/presence/WebRTC frames,
 outbound term/state/log-replay/tool-response frames) and the gateway's internal
 layering are documented in [Integrations → Web Gateway](./integrations.md#web-gateway).
+Dashboard session-control actions use the `api_session_control_msg`
+dashboard-control RPC; there is no HTTP `control-msg` route.

@@ -6932,7 +6932,9 @@ fn emit_codex_session_capabilities_for_drain(
 /// `fork` respawns a resumed process with `--fork-session` via the drain's
 /// `ForkHandling::RespawnResume` path; the `goal*` family runs the
 /// wrapper-level goal engine (adapter-owned state riding the universal
-/// `GoalUpdated`/`GoalCleared` rails).
+/// `GoalUpdated`/`GoalCleared` rails); `model` / `permission-mode`
+/// reconfigure the RUNNING process live via `set_model` /
+/// `set_permission_mode` control requests (verified on CC 2.1.201).
 fn claude_code_thread_action_capabilities() -> Vec<String> {
     [
         "compact",
@@ -6946,6 +6948,8 @@ fn claude_code_thread_action_capabilities() -> Vec<String> {
         "goal-resume",
         "goal-complete",
         "goal-budget-limited",
+        "model",
+        "permission-mode",
     ]
     .into_iter()
     .map(str::to_string)
@@ -7798,7 +7802,7 @@ async fn spawn_single_fission_branch(
     };
     let cleanup_worktree = |wt: &Option<worktree::Worktree>| -> String {
         if let Some(wt) = wt {
-            if let Err(err) = worktree::remove(config.project_root, wt) {
+            if let Err(err) = worktree::remove_worktree_and_branch(config.project_root, wt) {
                 return format!(
                     "; cleanup of worktree {} also failed: {err}",
                     wt.path.display()
@@ -12382,7 +12386,7 @@ struct CliFlags {
     #[allow(dead_code)]
     sandbox: bool,
     /// --direct: Force single-agent mode (skip orchestrator/sub-agent delegation).
-    /// Does NOT disable the TUI — use --no-tui for headless output.
+    /// Does NOT disable the UI — use --no-web --no-tui for headless output.
     direct: bool,
     /// --no-presence: Disable the presence layer (direct agent interaction).
     no_presence: bool,
@@ -12453,7 +12457,7 @@ fn print_help() {
     println!("    --log-file <DIR>      Override session log directory (default: ~/.intendant/logs/<uuid>/)");
     println!("    --continue, -c        Resume the most recent session for this project");
     println!("    --resume, -r [ID]     Resume a specific session by ID, prefix, or path");
-    println!("    --no-tui              Disable TUI, run headless");
+    println!("    --no-tui              Disable terminal TUI; combine with --no-web for headless");
     println!("    --mcp                 Run as MCP server on stdio (replaces TUI)");
     println!("    --verbose, -v         Enable verbose output");
     println!("    --control-socket      Enable Unix control socket");
@@ -12495,12 +12499,14 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("    ctl                   Control a running Intendant daemon over MCP");
     println!("    access                Configure dashboard TLS/mTLS access certificates");
+    println!("    org                   Create or print a local org root key");
     println!("    peer                  Pair and configure federated Intendant peers");
+    println!("    service               Install, remove, inspect, or run the boot service");
     println!("    setup                 Install or verify host-level Intendant dependencies");
     println!();
     println!("SESSION LOGS:");
     println!(
-        "    Logs are always written to ~/.intendant/logs/<timestamp>/ (override with --log-file)."
+        "    Logs are always written to ~/.intendant/logs/<uuid>/ (override with --log-file)."
     );
     println!("    The log directory contains:");
     println!("      session.jsonl           Structured JSONL event log (one JSON object per line)");
@@ -13771,7 +13777,8 @@ async fn maybe_auto_launch_xvfb(
     // If a display is already accessible (e.g. DISPLAY was set before launch,
     // or on macOS where the native display is always available), skip Xvfb.
     // Don't emit DisplayReady — no DisplaySession exists, so the web dashboard
-    // can't connect via WebRTC. Recording uses x11grab/avfoundation directly.
+    // can't connect via WebRTC. Recording uses the legacy platform ffmpeg path
+    // directly (x11grab on Linux, screencapture/image2pipe on macOS).
     if vision::is_display_accessible() {
         let default_display = if cfg!(target_os = "macos") { 0 } else { 99 };
         let display_id = std::env::var("DISPLAY")
@@ -14186,9 +14193,21 @@ mod tests {
         // fast toggle heuristics) never lights up on Claude sessions.
         assert!(caps.codex_thread_actions.is_empty());
         // Claude's ops must exist in the dashboard's action registry
-        // (today the codex vocabulary) or the kebab could not render them.
+        // (today the codex vocabulary) or the kebab could not render them —
+        // EXCEPT ops the dashboard deliberately drives from the Launch-config
+        // modal instead of the kebab (live apply on save).
+        let modal_driven = ["model", "permission-mode"];
+        for op in modal_driven {
+            assert!(
+                caps.thread_actions.iter().any(|candidate| candidate == op),
+                "missing advertised modal-driven Claude thread action: {op}"
+            );
+        }
         let registry = codex_thread_action_capabilities();
         for op in &caps.thread_actions {
+            if modal_driven.contains(&op.as_str()) {
+                continue;
+            }
             assert!(
                 registry.contains(op),
                 "op {op} missing from the dashboard action registry"
@@ -20748,6 +20767,20 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
+    fn mcp_task_file_is_initial_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let task_path = dir.path().join("task.txt");
+        std::fs::write(&task_path, "serve this task over mcp\n").unwrap();
+
+        let mut flags = cli_flags_for_tests();
+        flags.mcp = true;
+        flags.task_file = Some(task_path.to_string_lossy().into_owned());
+
+        let task = resolve_initial_task_for_startup(&flags, false, false).unwrap();
+        assert_eq!(task.as_deref(), Some("serve this task over mcp"));
+    }
+
+    #[test]
     fn web_task_file_is_initial_task_even_when_tui_mode_is_available() {
         let dir = tempfile::tempdir().unwrap();
         let task_path = dir.path().join("task.txt");
@@ -25491,28 +25524,8 @@ async fn run_agent_loop(
                             }
                         };
 
-                        // Vortex shared-memory probe is POSIX-only
-                        // (`shm_open`). On Windows the Vortex bridge isn't
-                        // available, so the probe is compiled out and the
-                        // code falls through to the regular audio bridge.
-                        #[cfg(unix)]
-                        let vortex_shm_available = unsafe {
-                            let fd = libc::shm_open(
-                                b"/vortex-audio\0".as_ptr() as *const libc::c_char,
-                                libc::O_RDONLY,
-                                0,
-                            );
-                            if fd >= 0 {
-                                libc::close(fd);
-                                true
-                            } else {
-                                false
-                            }
-                        };
-                        #[cfg(not(unix))]
-                        let vortex_shm_available = false;
-                        let mut bridge = if vortex_shm_available {
-                            audio_routing::create_vortex_bridge("shm")
+                        let mut bridge = if platform::vortex_audio_shm_available() {
+                            audio_routing::create_vortex_bridge()
                         } else {
                             match audio_routing::create_bridge(session_id).await {
                                 Ok(b) => b,
@@ -25527,7 +25540,7 @@ async fn run_agent_loop(
                             }
                         };
 
-                        if bridge.vortex_socket_path().is_none() {
+                        if !bridge.uses_vortex_shm() {
                             if let Err(e) = audio_routing::set_as_default(&mut bridge).await {
                                 slog(&session_log, |l| {
                                     l.warn(&format!("Could not set audio bridge as default: {}", e))
@@ -26585,15 +26598,15 @@ fn resolve_initial_task_for_startup(
     if web_daemon_requested {
         return Ok(None);
     }
-    if flags.mcp {
-        return Ok(flags.task.clone().filter(|t| !t.is_empty()));
-    }
     if flags.task_file.is_some() {
         let task = get_task_from_flags_or_env(flags)?;
         if task.is_empty() {
             return Err(CallerError::Config("No task provided".to_string()));
         }
         return Ok(Some(task));
+    }
+    if flags.mcp {
+        return Ok(flags.task.clone().filter(|t| !t.is_empty()));
     }
     if use_tui {
         return Ok(flags.task.clone().filter(|t| !t.is_empty()));
@@ -33173,7 +33186,7 @@ async fn activate_user_display(
     {
         let has_x11 = std::env::var("DISPLAY").is_ok() || vision::detect_x11_display().is_some();
         if has_x11 {
-            // Ensure DISPLAY is set for downstream tools (xdotool, import, etc.)
+            // Ensure DISPLAY is set for downstream X11 capture/input paths.
             if std::env::var("DISPLAY").is_err() {
                 if let Some(d) = vision::detect_x11_display() {
                     std::env::set_var("DISPLAY", &d);
@@ -33817,7 +33830,7 @@ async fn run_cu_task(
     Ok(CuTaskResult::Completed(stats))
 }
 
-/// Execute native computer-use tool calls via the xdotool executor
+/// Execute native computer-use tool calls via the platform-native executor
 /// and add results (with screenshots) to the conversation.
 /// Handle native `shared_view` tool calls: dashboard visibility into
 /// agent-owned displays (sandboxes, VMs, virtual displays). Sharing the
@@ -34505,25 +34518,47 @@ async fn main() -> Result<(), CallerError> {
     }
 
     // Create or resume session log.
-    let _is_resume = flags.continue_last || flags.resume_id.is_some();
+    //
+    // Under the default-web daemon, --continue/--resume are owned by the
+    // SUPERVISOR: the daemon starts on a fresh base log and resumes the
+    // target session through ResumeSession at startup. (These flags used to
+    // be silently swallowed — the daemon adopted the old session's log dir
+    // and then idled.) The predicate mirrors use_web/web_daemon_requested
+    // computed below; the flags it reads are not mutated in between.
+    let daemon_owns_resume =
+        should_start_idle_web_daemon(!flags.no_web && !flags.mcp && !flags.json_output, &flags)
+            && (flags.continue_last || flags.resume_id.is_some());
+    let mut daemon_startup_resume_dir: Option<PathBuf> = None;
     let log_dir = if let Some(ref session_id) = flags.resume_id {
         // --resume <id>: find a specific session by ID or path
-        session_log::SessionLog::find_session_by_id(session_id).ok_or_else(|| {
+        let dir = session_log::SessionLog::find_session_by_id(session_id).ok_or_else(|| {
             CallerError::Config(format!(
                 "Resume requested, but session '{}' was not found",
                 session_id
             ))
-        })?
+        })?;
+        if daemon_owns_resume {
+            daemon_startup_resume_dir = Some(dir);
+            session_log::SessionLog::resolve_path(None)
+        } else {
+            dir
+        }
     } else if flags.continue_last {
         // --continue: find the most recent session for this project
-        session_log::SessionLog::find_latest_session(&project.root)
+        let dir = session_log::SessionLog::find_latest_session(&project.root)
             .map(|(_, dir)| dir)
             .ok_or_else(|| {
                 CallerError::Config(
                     "Continue requested, but no existing session was found for this project"
                         .to_string(),
                 )
-            })?
+            })?;
+        if daemon_owns_resume {
+            daemon_startup_resume_dir = Some(dir);
+            session_log::SessionLog::resolve_path(None)
+        } else {
+            dir
+        }
     } else {
         session_log::SessionLog::resolve_path(flags.log_file.as_deref())
     };
@@ -34837,8 +34872,9 @@ async fn main() -> Result<(), CallerError> {
                 && io::stdout().is_terminal()));
 
     // Task resolution: MCP and TUI modes allow starting without a task.
-    // MCP mode must NOT call get_task_from_flags_or_env() because it would
-    // print to stdout and read from stdin, both reserved for JSON-RPC.
+    // MCP mode honors an explicit --task-file but must not otherwise call
+    // get_task_from_flags_or_env() because it would print to stdout and read
+    // from stdin, both reserved for JSON-RPC.
     // TUI mode can accept a task later via the follow-up input panel.
     // Headless mode still requires a task upfront.
     let task = resolve_initial_task_for_startup(&flags, web_daemon_requested, use_tui)?;
@@ -34892,30 +34928,34 @@ async fn main() -> Result<(), CallerError> {
             event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
-        {
-            // Fallback roots (no .git / intendant.toml — e.g. a service's
-            // $HOME WorkingDirectory) must never be baseline-scanned: it
-            // blocks boot for minutes and shadow-copies the whole tree.
-            eprintln!(
-                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) =
+            if !file_watcher::root_is_snapshot_worthy(&project.root) {
+                // Fallback roots (no .git / intendant.toml — e.g. a service's
+                // $HOME WorkingDirectory) must never be baseline-scanned: it
+                // blocks boot for minutes and shadow-copies the whole tree.
+                eprintln!(
+                    "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
                  intendant.toml) — start intendant inside a project to enable rewind",
-                project.root.display()
-            );
-            (None, None, None)
-        } else {
-            let snapshot_dir = log_dir.join("file_snapshots");
-            match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
-                Ok(watcher) => {
-                    let (fw, wh, rh) = watcher.start_shared();
-                    (Some(fw), Some(wh), Some(rh))
+                    project.root.display()
+                );
+                (None, None, None)
+            } else {
+                let snapshot_dir = log_dir.join("file_snapshots");
+                match file_watcher::FileWatcher::new(
+                    project.root.clone(),
+                    snapshot_dir,
+                    bus.clone(),
+                ) {
+                    Ok(watcher) => {
+                        let (fw, wh, rh) = watcher.start_shared();
+                        (Some(fw), Some(wh), Some(rh))
+                    }
+                    Err(e) => {
+                        eprintln!("[file_watcher] Failed to start: {}", e);
+                        (None, None, None)
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[file_watcher] Failed to start: {}", e);
-                    (None, None, None)
-                }
-            }
-        };
+            };
 
         let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
             if project.config.transcription.enabled {
@@ -35039,21 +35079,52 @@ async fn main() -> Result<(), CallerError> {
             },
         );
 
-        session_supervisor::SessionSupervisor::new(session_supervisor::SessionSupervisorConfig {
-            bus,
-            project_root: project.root.clone(),
-            autonomy,
-            shared_external_agent,
-            shared_codex_config,
-            shared_claude_config,
-            frame_registry,
-            session_registry: Some(session_registry.clone()),
-            web_port: web_port_for_agent,
-            flags_direct: flags.direct,
-            shared_session: Some(shared_session),
-        })
-        .run()
-        .await;
+        let startup_bus = bus.clone();
+        let supervisor_handle = session_supervisor::SessionSupervisor::new(
+            session_supervisor::SessionSupervisorConfig {
+                bus,
+                project_root: project.root.clone(),
+                autonomy,
+                shared_external_agent,
+                shared_codex_config,
+                shared_claude_config,
+                frame_registry,
+                session_registry: Some(session_registry.clone()),
+                web_port: web_port_for_agent,
+                flags_direct: flags.direct,
+                shared_session: Some(shared_session),
+            },
+        )
+        .spawn();
+        // --continue/--resume under the daemon: the supervisor (subscribed
+        // above, before this send) resumes the target session — attach only,
+        // no task; follow-ups come from the dashboard/TUI like any session.
+        if let Some(resume_dir) = daemon_startup_resume_dir {
+            let session_id = resume_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let source = crate::session_config::read_log_dir_config(&resume_dir)
+                .and_then(|config| config.source)
+                .unwrap_or_else(|| "intendant".to_string());
+            eprintln!("Resuming session {session_id} ({source}) in the daemon");
+            startup_bus.send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+                source,
+                session_id,
+                resume_id: None,
+                project_root: None,
+                task: None,
+                direct: None,
+                attachments: Vec::new(),
+                fork: false,
+                agent_command: None,
+                codex_sandbox: None,
+                codex_approval_policy: None,
+                codex_managed_context: None,
+                codex_context_archive: None,
+            }));
+        }
+        let _ = supervisor_handle.await;
         return Ok(());
     }
 
@@ -35128,30 +35199,34 @@ async fn main() -> Result<(), CallerError> {
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
-        {
-            // Fallback roots (no .git / intendant.toml — e.g. a service's
-            // $HOME WorkingDirectory) must never be baseline-scanned: it
-            // blocks boot for minutes and shadow-copies the whole tree.
-            eprintln!(
-                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) =
+            if !file_watcher::root_is_snapshot_worthy(&project.root) {
+                // Fallback roots (no .git / intendant.toml — e.g. a service's
+                // $HOME WorkingDirectory) must never be baseline-scanned: it
+                // blocks boot for minutes and shadow-copies the whole tree.
+                eprintln!(
+                    "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
                  intendant.toml) — start intendant inside a project to enable rewind",
-                project.root.display()
-            );
-            (None, None, None)
-        } else {
-            let snapshot_dir = log_dir.join("file_snapshots");
-            match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
-                Ok(watcher) => {
-                    let (fw, wh, rh) = watcher.start_shared();
-                    (Some(fw), Some(wh), Some(rh))
+                    project.root.display()
+                );
+                (None, None, None)
+            } else {
+                let snapshot_dir = log_dir.join("file_snapshots");
+                match file_watcher::FileWatcher::new(
+                    project.root.clone(),
+                    snapshot_dir,
+                    bus.clone(),
+                ) {
+                    Ok(watcher) => {
+                        let (fw, wh, rh) = watcher.start_shared();
+                        (Some(fw), Some(wh), Some(rh))
+                    }
+                    Err(e) => {
+                        eprintln!("[file_watcher] Failed to start: {}", e);
+                        (None, None, None)
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[file_watcher] Failed to start: {}", e);
-                    (None, None, None)
-                }
-            }
-        };
+            };
 
         // Web gateway (WebSocket)
         let _web_handle = if use_web {
@@ -35613,30 +35688,34 @@ async fn main() -> Result<(), CallerError> {
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
-        {
-            // Fallback roots (no .git / intendant.toml — e.g. a service's
-            // $HOME WorkingDirectory) must never be baseline-scanned: it
-            // blocks boot for minutes and shadow-copies the whole tree.
-            eprintln!(
-                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) =
+            if !file_watcher::root_is_snapshot_worthy(&project.root) {
+                // Fallback roots (no .git / intendant.toml — e.g. a service's
+                // $HOME WorkingDirectory) must never be baseline-scanned: it
+                // blocks boot for minutes and shadow-copies the whole tree.
+                eprintln!(
+                    "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
                  intendant.toml) — start intendant inside a project to enable rewind",
-                project.root.display()
-            );
-            (None, None, None)
-        } else {
-            let snapshot_dir = log_dir.join("file_snapshots");
-            match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
-                Ok(watcher) => {
-                    let (fw, wh, rh) = watcher.start_shared();
-                    (Some(fw), Some(wh), Some(rh))
+                    project.root.display()
+                );
+                (None, None, None)
+            } else {
+                let snapshot_dir = log_dir.join("file_snapshots");
+                match file_watcher::FileWatcher::new(
+                    project.root.clone(),
+                    snapshot_dir,
+                    bus.clone(),
+                ) {
+                    Ok(watcher) => {
+                        let (fw, wh, rh) = watcher.start_shared();
+                        (Some(fw), Some(wh), Some(rh))
+                    }
+                    Err(e) => {
+                        eprintln!("[file_watcher] Failed to start: {}", e);
+                        (None, None, None)
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[file_watcher] Failed to start: {}", e);
-                    (None, None, None)
-                }
-            }
-        };
+            };
 
         if let Some(ref t) = task {
             app.log(types::LogLevel::Info, format!("Task: {}", t));
@@ -36251,7 +36330,7 @@ async fn main() -> Result<(), CallerError> {
         // Headless mode always has a task (enforced above).
         let task = task.unwrap();
 
-        // Headless mode (--no-tui or non-TTY)
+        // Headless mode: no WebTui or terminal TUI is active.
         let bus = EventBus::new();
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(),
@@ -36290,30 +36369,34 @@ async fn main() -> Result<(), CallerError> {
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
-        {
-            // Fallback roots (no .git / intendant.toml — e.g. a service's
-            // $HOME WorkingDirectory) must never be baseline-scanned: it
-            // blocks boot for minutes and shadow-copies the whole tree.
-            eprintln!(
-                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) =
+            if !file_watcher::root_is_snapshot_worthy(&project.root) {
+                // Fallback roots (no .git / intendant.toml — e.g. a service's
+                // $HOME WorkingDirectory) must never be baseline-scanned: it
+                // blocks boot for minutes and shadow-copies the whole tree.
+                eprintln!(
+                    "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
                  intendant.toml) — start intendant inside a project to enable rewind",
-                project.root.display()
-            );
-            (None, None, None)
-        } else {
-            let snapshot_dir = log_dir.join("file_snapshots");
-            match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
-                Ok(watcher) => {
-                    let (fw, wh, rh) = watcher.start_shared();
-                    (Some(fw), Some(wh), Some(rh))
+                    project.root.display()
+                );
+                (None, None, None)
+            } else {
+                let snapshot_dir = log_dir.join("file_snapshots");
+                match file_watcher::FileWatcher::new(
+                    project.root.clone(),
+                    snapshot_dir,
+                    bus.clone(),
+                ) {
+                    Ok(watcher) => {
+                        let (fw, wh, rh) = watcher.start_shared();
+                        (Some(fw), Some(wh), Some(rh))
+                    }
+                    Err(e) => {
+                        eprintln!("[file_watcher] Failed to start: {}", e);
+                        (None, None, None)
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[file_watcher] Failed to start: {}", e);
-                    (None, None, None)
-                }
-            }
-        };
+            };
 
         // JSON stdout subscriber: prints OutboundEvents as JSONL to stdout
         if flags.json_output {

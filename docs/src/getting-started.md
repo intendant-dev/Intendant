@@ -107,6 +107,10 @@ cargo check               # type-check only (fast)
 ./target/release/intendant setup browsers  # managed Chrome for Testing for browser workspaces
 ```
 
+Managed browser setup accepts `--check`, `--force`,
+`--channel stable|beta|dev|canary`, `--json`, and `--print-path`; run
+`intendant setup browsers --help` for exact usage.
+
 A release build produces two binaries:
 
 - `target/release/intendant-runtime` — the sandboxed command executor. Reads
@@ -328,8 +332,9 @@ value is missing.
 |------|----------|-------------|
 | `--provider` | `<name>` | Force provider: `openai`, `anthropic`, or `gemini` (sets `PROVIDER`) |
 | `--model` | `<name>` | Override the model (sets `MODEL_NAME`) |
+| `--task-file` | `<path>` | Read the initial task from a file instead of argv |
 | `--autonomy` | `<level>` | Autonomy level: `low`, `medium`, `high`, `full` (loose parse; unknown → `medium`) |
-| `--log-file` | `<dir>` | Override the session log directory (default `~/.intendant/logs/<timestamp>/`) |
+| `--log-file` | `<dir>` | Override the session log directory (default `~/.intendant/logs/<uuid>/`) |
 | `--continue`, `-c` | — | Resume the most recent session for this project |
 | `--resume`, `-r` | `[id]` | Resume a session by id, prefix, or path; with no id behaves like `--continue` |
 | `--no-tui` | — | Disable the terminal TUI; run headless |
@@ -343,6 +348,7 @@ value is missing.
 | `--web` | `[port]` | Start the web dashboard. **On by default**; optional numeric port (default 8765) |
 | `--no-web` | — | Disable the web dashboard; use the terminal TUI when interactive |
 | `--bind` | `<addr>` | IP address for the web dashboard listener. Use `127.0.0.1` for local/plaintext automation |
+| `--owner` | `<fingerprint>` | Pin root authority to a browser client key at startup for the install bootstrap; authority is minted locally and no secrets go on the wire |
 | `--no-tls` | — | Serve the dashboard over plain HTTP. Explicit local/debug escape; wildcard bind refuses startup when a public interface exists |
 | `--allow-public-plaintext` | — | Override the `--no-tls` public-interface guard for intentional public plaintext exposure |
 | `--tls` | — | Serve HTTPS/WSS without requiring browser client certificates; uses installed access certs when present, otherwise falls back to an auto self-signed cert |

@@ -17,7 +17,12 @@ pub struct ContextRewindRecord {
     pub discard: Vec<String>,
     pub artifacts: Vec<String>,
     pub next_steps: Vec<String>,
+    /// Live rollout path captured from the backend before the rewind mutates
+    /// the thread.
     pub source_rollout_path: Option<PathBuf>,
+    /// Archived pre-rewind rollout copy used for inspect/fork/backout/restore.
+    /// Older records store this under a `-source-rollout.jsonl` filename; the
+    /// field name describes how callers use the copy, not the legacy suffix.
     pub recovery_rollout_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fission_snapshot: Option<FissionSnapshot>,
@@ -98,6 +103,11 @@ pub fn record_path(log_dir: &Path, record_id: &str) -> io::Result<PathBuf> {
     Ok(records_dir(log_dir).join(format!("{record_id}.json")))
 }
 
+/// Path for the archived pre-rewind rollout copy used by recovery actions.
+///
+/// The `-source-rollout.jsonl` suffix is the established on-disk name for
+/// backward compatibility; it contains the recovery copy made before the live
+/// rollout is mutated.
 pub fn recovery_rollout_path(log_dir: &Path, record_id: &str) -> io::Result<PathBuf> {
     validate_record_id(record_id)?;
     Ok(records_dir(log_dir).join(format!("{record_id}-source-rollout.jsonl")))
@@ -161,6 +171,8 @@ pub fn list_records(log_dir: &Path) -> io::Result<Vec<ContextRewindRecord>> {
     Ok(records)
 }
 
+/// Copy the live pre-rewind rollout into the recovery archive before the
+/// backend thread is rolled back.
 pub fn copy_recovery_rollout(
     log_dir: &Path,
     record_id: &str,

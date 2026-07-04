@@ -1,50 +1,49 @@
-//! Shared frontend contract for TUI and MCP interfaces.
+//! MCP action and snapshot helpers.
 //!
-//! This module defines the canonical set of **actions** a user or external agent
-//! can perform, and the canonical set of **observations** they can make. Both the
-//! TUI and MCP server implement these enums — adding a new variant forces both
-//! sides to handle it (via Rust's exhaustive match).
+//! The cross-frontend vocabulary is [`ControlMsg`](crate::event::ControlMsg) and
+//! [`AppEvent`](crate::event::AppEvent). The TUI, web dashboard, MCP server, and
+//! control socket all meet on that EventBus surface.
 //!
-//! **Rule**: never use `_ =>` wildcards when matching on these types.
+//! `UserAction` and `StateResult` are MCP-oriented helpers used for
+//! approval/input tools and resource serialization. They do not provide a
+//! compile-time exhaustiveness contract across all frontends.
 
 use crate::autonomy::AutonomyLevel;
 use crate::types::{LogLevel, Verbosity};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Actions (what the user / external agent can do)
+// MCP approval/input actions
 // ---------------------------------------------------------------------------
 
-/// Every action a user or external agent can take.
+/// Approval/input actions exposed by the MCP surface.
 ///
-/// Adding a variant here is a **compile-time contract**: both the TUI key
-/// handler and the MCP tool handler must produce it, and the shared
-/// [`process_action`] function must handle it.
+/// Adding a variant here requires updating MCP action mapping and handling.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UserAction {
-    /// Approve a pending command (TUI: `y`, MCP: `approve` tool).
+    /// Approve a pending command (`approve` tool).
     Approve { id: u64 },
-    /// Deny a pending command (TUI: `n`, MCP: `deny` tool).
+    /// Deny a pending command (`deny` tool).
     Deny { id: u64 },
-    /// Skip a pending command (TUI: `s`, MCP: `skip` tool).
+    /// Skip a pending command (`skip` tool).
     Skip { id: u64 },
-    /// Approve all future commands (TUI: `a`, MCP: `approve_all` tool).
+    /// Approve all future commands (`approve_all` tool).
     ApproveAll { id: u64 },
-    /// Respond to an askHuman question (TUI: textarea, MCP: `respond` tool).
+    /// Respond to an askHuman question (`respond` tool).
     RespondHuman { text: String },
-    /// Change the autonomy level (TUI: `+`/`-`, MCP: `set_autonomy` tool).
+    /// Change the autonomy level (`set_autonomy` tool).
     SetAutonomy { level: AutonomyLevel },
-    /// Cycle verbosity (TUI: `v`, MCP: `set_verbosity` tool).
+    /// Set verbosity (`set_verbosity` tool).
     SetVerbosity { level: Verbosity },
-    /// Submit a follow-up message after a round completes (TUI: textarea, MCP: `start_task` when waiting).
+    /// Submit a follow-up message after a round completes.
     #[allow(dead_code)]
     SubmitFollowUp { text: String },
-    /// Shut down the agent (TUI: `q`/Ctrl-C, MCP: `quit` tool).
+    /// Shut down the agent (`quit` tool).
     Quit,
 }
 
 // ---------------------------------------------------------------------------
-// Observations (what the user / external agent can see)
+// MCP snapshots
 // ---------------------------------------------------------------------------
 
 /// A snapshot of the current status bar.
@@ -118,10 +117,7 @@ pub struct HumanQuestionSnapshot {
     pub question: String,
 }
 
-/// Every piece of observable state an interface can query.
-///
-/// Adding a variant here forces both the TUI rendering and MCP resource
-/// handler to provide the data.
+/// Snapshot queries used by MCP-style resource handling.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateQuery {

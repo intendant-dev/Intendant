@@ -113,12 +113,6 @@ APT_PACKAGES=(
     # Rust build dep for vpx-encode (ffi-generate needs libclang)
     libclang-dev
 
-    # Rust build dep for openssl-sys (pkg-config finds libssl + headers)
-    libssl-dev
-
-    # PNG encoding/decoding (libpng)
-    libpng-dev
-
     # VP8 encoding (libvpx)
     libvpx-dev
 
@@ -129,9 +123,6 @@ APT_PACKAGES=(
     libxcb1-dev
     libxcb-shm0-dev
     libxcb-randr0-dev
-
-    # X11 input injection
-    xdotool
 
     # Display detection (xdpyinfo)
     x11-utils
@@ -357,13 +348,13 @@ detect_display() {
         ok "display backend: Wayland (portal + PipeWire capture)"
     elif [[ -n "$x_display" ]]; then
         ok "X11 session detected (DISPLAY=$x_display)"
-        ok "display backend: X11 (XShm capture + xdotool input)"
+        ok "display backend: X11 (XShm capture + x11rb/XTest input)"
     elif [[ "$session_type" == "wayland" ]]; then
         ok "Wayland session type detected (XDG_SESSION_TYPE=$session_type)"
         ok "display backend: Wayland (portal + PipeWire capture)"
     elif [[ "$session_type" == "x11" ]]; then
         ok "X11 session type detected (XDG_SESSION_TYPE=$session_type)"
-        ok "display backend: X11 (XShm capture + xdotool input)"
+        ok "display backend: X11 (XShm capture + x11rb/XTest input)"
     else
         warn "no display session detected (headless)"
         warn "intendant will auto-launch Xvfb for virtual displays"
