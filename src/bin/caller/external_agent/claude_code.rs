@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
@@ -13,7 +13,7 @@ use crate::error::CallerError;
 
 use super::{
     AgentConfig, AgentEvent, AgentThread, AgentUsageSnapshot, ApprovalCategory, ApprovalDecision,
-    ExternalAgent, ToolCompletionStatus,
+    ExternalAgent, SubAgentState, ToolCompletionStatus,
 };
 
 /// Appended to the first user message when an Intendant web port is
@@ -433,6 +433,72 @@ impl CcLineOutcome {
     }
 }
 
+/// One in-band Task/Agent sub-agent (the 2.1.x `Agent` tool; async by
+/// default — the tool_result returns launch metadata immediately and the
+/// child keeps streaming tagged envelopes, potentially past the parent
+/// turn's `result`, until a `system:task_notification` reports the end).
+struct CcTaskChild {
+    /// Synthetic session id the child's activity is scoped to. Frontends
+    /// see it as an ephemeral child session wired to the parent via a
+    /// `session_relationship` — it is not resumable or addressable.
+    child_id: String,
+    /// A terminal state was already emitted; late envelopes (e.g. the main
+    /// agent continuing the child via SendMessage) still scope to the
+    /// child window, but no second terminal event fires.
+    terminal: bool,
+}
+
+/// Synthetic child session id for an in-band sub-agent. Derived from the
+/// spawning tool_use id (the correlation key Claude Code stamps on child
+/// envelopes as `parent_tool_use_id`), with the constant `toolu_01` prefix
+/// stripped so 8-char short forms stay distinctive.
+fn task_tool_child_id(tool_use_id: &str) -> String {
+    let suffix = tool_use_id
+        .strip_prefix("toolu_")
+        .unwrap_or(tool_use_id)
+        .strip_prefix("01")
+        .filter(|rest| rest.len() >= 8)
+        .unwrap_or(tool_use_id.strip_prefix("toolu_").unwrap_or(tool_use_id));
+    let safe: String = suffix
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("task-{safe}")
+}
+
+/// The in-band sub-agent spawn tool: `Agent` since Claude Code 2.1.x,
+/// `Task` in earlier releases.
+fn is_task_tool(name: &str) -> bool {
+    name == "Agent" || name == "Task"
+}
+
+/// Terminal summaries ride log lines; keep them one line and short.
+fn task_summary_snippet(text: &str) -> Option<String> {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() > 240 {
+        Some(format!(
+            "{}…",
+            trimmed.chars().take(240).collect::<String>()
+        ))
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Spawn details for a task child, from the Agent tool_use input or the
+/// `system:task_started` event.
+#[derive(Default)]
+struct CcTaskSpawn {
+    tool_name: Option<String>,
+    description: Option<String>,
+    prompt: Option<String>,
+    model: Option<String>,
+}
+
 /// Line-by-line interpreter for Claude Code's stream-json stdout. Pure with
 /// respect to I/O — `process_line` returns the events to emit and any
 /// auto-responses to write — so the protocol mapping is unit-testable
@@ -444,10 +510,19 @@ struct CcReader {
     /// unhealthy `intendant` entry in the init message warrants a warning.
     expect_intendant_mcp: bool,
     approval_counter: u64,
-    /// tool_use ids started but not yet completed. Force-closed as
-    /// cancelled at turn end: an interrupted turn never reports results
-    /// for its in-flight tools.
-    open_tools: HashSet<String>,
+    /// tool_use ids started but not yet completed, mapped to the synthetic
+    /// child session that owns them (None = the main thread). Main-thread
+    /// tools are force-closed as cancelled at turn end (an interrupted turn
+    /// never reports results for its in-flight tools); child-owned tools
+    /// survive turn end — async sub-agents legitimately outlive the turn —
+    /// and close with their child instead.
+    open_tools: HashMap<String, Option<String>>,
+    /// In-band sub-agents by spawning tool_use id (the value child
+    /// envelopes carry as `parent_tool_use_id`).
+    task_children: HashMap<String, CcTaskChild>,
+    /// `task_id` (the key `system:task_*` events use) → spawning
+    /// tool_use id.
+    task_ids: HashMap<String, String>,
     /// Most recent model name seen (init message / message_start).
     model: String,
     context_window: u64,
@@ -467,7 +542,9 @@ impl CcReader {
             pending_approvals,
             expect_intendant_mcp,
             approval_counter: 0,
-            open_tools: HashSet::new(),
+            open_tools: HashMap::new(),
+            task_children: HashMap::new(),
+            task_ids: HashMap::new(),
             model: "claude".to_string(),
             context_window: DEFAULT_CONTEXT_WINDOW,
             last_intendant_mcp_status: None,
@@ -482,10 +559,36 @@ impl CcReader {
             return out;
         };
         self.capture_session_id(&msg, &mut out);
-        match msg.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        // In-band sub-agent activity: assistant/user envelopes carry the
+        // spawning tool_use id as top-level `parent_tool_use_id`. Route the
+        // whole envelope to the child's synthetic session. (Only complete
+        // envelopes are tagged — stream_events are always main-thread.)
+        if matches!(msg_type, "assistant" | "user") {
+            if let Some(child_id) = self.task_scope_for(&msg, &mut out) {
+                let mut child_out = CcLineOutcome::default();
+                match msg_type {
+                    "assistant" => {
+                        self.handle_assistant(&msg, &mut child_out, Some(child_id.as_str()))
+                    }
+                    _ => self.handle_user(&msg, &mut child_out, Some(child_id.as_str())),
+                }
+                out.events.extend(child_out.events.into_iter().map(|ev| match ev {
+                    // Already-scoped events (a nested task's terminal state
+                    // targets the grandchild) keep their own scope.
+                    ev @ AgentEvent::Scoped { .. } => ev,
+                    ev => AgentEvent::scoped(Some(child_id.clone()), None, ev),
+                }));
+                out.outbound.extend(child_out.outbound);
+                return out;
+            }
+        }
+
+        match msg_type {
             "system" => self.handle_system(&msg, &mut out),
-            "assistant" => self.handle_assistant(&msg, &mut out),
-            "user" => self.handle_user(&msg, &mut out),
+            "assistant" => self.handle_assistant(&msg, &mut out, None),
+            "user" => self.handle_user(&msg, &mut out, None),
             "stream_event" => self.handle_stream_event(&msg, &mut out),
             "result" => self.handle_result(&msg, &mut out),
             "control_request" => self.handle_control_request(&msg, &mut out),
@@ -494,6 +597,153 @@ impl CcReader {
             _ => {}
         }
         out
+    }
+
+    /// Resolve which child session a tagged envelope belongs to,
+    /// materializing the child if the spawn wasn't observed (resumed
+    /// transcript replay, or a spawn that predates this supervisor). The
+    /// registration event this may push must stay unscoped: the drain
+    /// learns the child→parent route from it.
+    fn task_scope_for(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) -> Option<String> {
+        let ptid = msg
+            .get("parent_tool_use_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?
+            .to_string();
+        if !self.task_children.contains_key(&ptid) {
+            let spawn = CcTaskSpawn {
+                description: msg
+                    .get("task_description")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                ..Default::default()
+            };
+            self.register_task_child(&ptid, None, spawn, out);
+        }
+        self.task_children
+            .get(&ptid)
+            .map(|child| child.child_id.clone())
+    }
+
+    /// Register an in-band sub-agent and announce it as a synthetic child
+    /// session (`SubAgentToolCall` status `inProgress` → the drain wires
+    /// the relationship, creates the child window, and shows the spawn as
+    /// the turn's work item — which is why the Agent tool_use deliberately
+    /// does NOT also emit `ToolStarted`).
+    fn register_task_child(
+        &mut self,
+        tool_use_id: &str,
+        sender_scope: Option<&str>,
+        spawn: CcTaskSpawn,
+        out: &mut CcLineOutcome,
+    ) {
+        let tool_use_id = tool_use_id.trim();
+        if tool_use_id.is_empty() || self.task_children.contains_key(tool_use_id) {
+            return;
+        }
+        let child_id = task_tool_child_id(tool_use_id);
+        self.task_children.insert(
+            tool_use_id.to_string(),
+            CcTaskChild {
+                child_id: child_id.clone(),
+                terminal: false,
+            },
+        );
+        let sender_thread_id = sender_scope
+            .map(str::to_string)
+            .or_else(|| self.announced_session_id.clone())
+            .unwrap_or_default();
+        out.events.push(AgentEvent::SubAgentToolCall {
+            item_id: tool_use_id.to_string(),
+            tool: spawn.tool_name.unwrap_or_else(|| "Agent".to_string()),
+            status: "inProgress".to_string(),
+            sender_thread_id,
+            receiver_thread_ids: vec![child_id.clone()],
+            prompt: spawn
+                .prompt
+                .as_deref()
+                .or(spawn.description.as_deref())
+                .and_then(task_summary_snippet),
+            model: spawn.model,
+            reasoning_effort: None,
+            agents: vec![SubAgentState {
+                thread_id: child_id,
+                status: "running".to_string(),
+                message: spawn.description,
+            }],
+        });
+    }
+
+    /// Emit the child's terminal state exactly once: a scoped
+    /// `SubAgentToolCall` whose agent state ends the child session in
+    /// frontends, preceded by scoped cancellations for any of the child's
+    /// still-open tools.
+    fn emit_task_terminal(
+        &mut self,
+        tool_use_id: &str,
+        outer_status: &str,
+        state_status: &str,
+        message: Option<String>,
+        out: &mut CcLineOutcome,
+    ) {
+        let child_id = match self.task_children.get_mut(tool_use_id) {
+            Some(child) if !child.terminal => {
+                child.terminal = true;
+                child.child_id.clone()
+            }
+            _ => return,
+        };
+        let owned: Vec<String> = self
+            .open_tools
+            .iter()
+            .filter(|(_, owner)| owner.as_deref() == Some(child_id.as_str()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for tool_id in owned {
+            self.open_tools.remove(&tool_id);
+            out.events.push(AgentEvent::scoped(
+                Some(child_id.clone()),
+                None,
+                AgentEvent::ToolCompleted {
+                    item_id: tool_id,
+                    status: ToolCompletionStatus::Cancelled,
+                },
+            ));
+        }
+        out.events.push(AgentEvent::scoped(
+            Some(child_id.clone()),
+            None,
+            AgentEvent::SubAgentToolCall {
+                item_id: tool_use_id.to_string(),
+                tool: "Agent".to_string(),
+                status: outer_status.to_string(),
+                sender_thread_id: self.announced_session_id.clone().unwrap_or_default(),
+                receiver_thread_ids: vec![child_id.clone()],
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents: vec![SubAgentState {
+                    thread_id: child_id,
+                    status: state_status.to_string(),
+                    message,
+                }],
+            },
+        ));
+    }
+
+    /// The process is going away; close every child that never reported a
+    /// terminal state so frontends don't show sub-agents running forever.
+    fn close_open_task_children(&mut self, out: &mut CcLineOutcome) {
+        let open: Vec<String> = self
+            .task_children
+            .iter()
+            .filter(|(_, child)| !child.terminal)
+            .map(|(tool_use_id, _)| tool_use_id.clone())
+            .collect();
+        for tool_use_id in open {
+            self.emit_task_terminal(&tool_use_id, "interrupted", "shutdown", None, out);
+        }
     }
 
     /// Claude Code stamps the native session id on every stdout message
@@ -551,6 +801,19 @@ impl CcReader {
                 );
                 return;
             }
+            // Async sub-agent lifecycle (2.1.x `Agent` tool).
+            Some("task_started") => {
+                self.handle_task_started(msg, out);
+                return;
+            }
+            Some("task_notification") => {
+                self.handle_task_notification(msg, out);
+                return;
+            }
+            // task_progress duplicates what the child's scoped tool events
+            // already show live; task_updated's terminal patch is followed
+            // by the authoritative task_notification.
+            Some("task_progress") | Some("task_updated") => return,
             _ => return,
         }
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
@@ -613,7 +876,86 @@ impl CcReader {
         }
     }
 
-    fn handle_assistant(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+    /// `system:task_started`: the spawn signal for an async sub-agent.
+    /// Usually the Agent tool_use block already registered the child; this
+    /// event contributes the `task_id` correlation key (and is the
+    /// registration fallback if the tool_use was never seen).
+    fn handle_task_started(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        let tool_use_id = msg
+            .get("tool_use_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let Some(tool_use_id) = tool_use_id else {
+            return;
+        };
+        if let Some(task_id) = msg
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.task_ids
+                .insert(task_id.to_string(), tool_use_id.to_string());
+        }
+        if !self.task_children.contains_key(tool_use_id) {
+            let spawn = CcTaskSpawn {
+                description: msg
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                prompt: msg
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                ..Default::default()
+            };
+            self.register_task_child(tool_use_id, None, spawn, out);
+        }
+    }
+
+    /// `system:task_notification`: the async sub-agent's authoritative end
+    /// (status + final summary).
+    fn handle_task_notification(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        let tool_use_id = msg
+            .get("tool_use_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                msg.get("task_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|task_id| self.task_ids.get(task_id.trim()).cloned())
+            });
+        let Some(tool_use_id) = tool_use_id else {
+            return;
+        };
+        let status = msg
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("completed");
+        let (outer_status, state_status) = match status {
+            "completed" | "success" => ("completed", "completed"),
+            "failed" | "error" | "errored" => ("failed", "errored"),
+            "killed" | "stopped" | "cancelled" | "interrupted" => ("interrupted", "interrupted"),
+            other => (other, other),
+        };
+        let summary = msg
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .and_then(task_summary_snippet);
+        self.emit_task_terminal(&tool_use_id, outer_status, state_status, summary, out);
+    }
+
+    fn handle_assistant(
+        &mut self,
+        msg: &serde_json::Value,
+        out: &mut CcLineOutcome,
+        child_scope: Option<&str>,
+    ) {
         let Some(content) = msg
             .get("message")
             .and_then(|m| m.get("content"))
@@ -651,8 +993,32 @@ impl CcReader {
                         .unwrap_or("unknown")
                         .to_string();
                     let input = block.get("input").cloned().unwrap_or_default();
+                    if is_task_tool(&tool_name) && !tool_id.is_empty() {
+                        // Spawns a sub-agent: announce the synthetic child
+                        // session instead of a plain tool call. (Nested
+                        // spawns pass the enclosing child as the sender, so
+                        // the relationship edge nests correctly.)
+                        let spawn = CcTaskSpawn {
+                            tool_name: Some(tool_name),
+                            description: input
+                                .get("description")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                            prompt: input
+                                .get("prompt")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                            model: input
+                                .get("model")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                        };
+                        self.register_task_child(&tool_id, child_scope, spawn, out);
+                        continue;
+                    }
                     if !tool_id.is_empty() {
-                        self.open_tools.insert(tool_id.clone());
+                        self.open_tools
+                            .insert(tool_id.clone(), child_scope.map(str::to_string));
                     }
                     out.events.push(AgentEvent::ToolStarted {
                         item_id: tool_id,
@@ -660,7 +1026,7 @@ impl CcReader {
                         preview: tool_input_preview(&input),
                     });
                 }
-                "tool_result" => self.tool_result_events(block, out),
+                "tool_result" => self.tool_result_events(block, out, false),
                 _ => {}
             }
         }
@@ -670,7 +1036,23 @@ impl CcReader {
     /// content blocks (not on assistant messages). Synthetic text markers
     /// like "[Request interrupted by user]" also ride user messages and are
     /// intentionally dropped — the `result` message carries the outcome.
-    fn handle_user(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+    fn handle_user(
+        &mut self,
+        msg: &serde_json::Value,
+        out: &mut CcLineOutcome,
+        _child_scope: Option<&str>,
+    ) {
+        // An async Agent spawn acknowledges immediately with internal launch
+        // metadata (envelope-level `tool_use_result.status =
+        // "async_launched"`); the child's real end arrives later as
+        // `system:task_notification`.
+        let async_launch = msg
+            .get("tool_use_result")
+            .map(|r| {
+                r.get("status").and_then(|s| s.as_str()) == Some("async_launched")
+                    || r.get("isAsync").and_then(|b| b.as_bool()) == Some(true)
+            })
+            .unwrap_or(false);
         let Some(content) = msg
             .get("message")
             .and_then(|m| m.get("content"))
@@ -680,12 +1062,17 @@ impl CcReader {
         };
         for block in content {
             if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-                self.tool_result_events(block, out);
+                self.tool_result_events(block, out, async_launch);
             }
         }
     }
 
-    fn tool_result_events(&mut self, block: &serde_json::Value, out: &mut CcLineOutcome) {
+    fn tool_result_events(
+        &mut self,
+        block: &serde_json::Value,
+        out: &mut CcLineOutcome,
+        async_launch: bool,
+    ) {
         let tool_id = block
             .get("tool_use_id")
             .and_then(|v| v.as_str())
@@ -712,6 +1099,28 @@ impl CcReader {
                 }
             })
             .unwrap_or_default();
+
+        if self.task_children.contains_key(&tool_id) {
+            // The Agent tool's own result. Async launch: internal metadata,
+            // never surfaced (the spawn was already announced and the child
+            // ends via task_notification). Otherwise — a synchronous run or
+            // a launch failure — the result IS the child's terminal state.
+            if !async_launch {
+                let (outer, state) = if is_error {
+                    ("failed", "errored")
+                } else {
+                    ("completed", "completed")
+                };
+                self.emit_task_terminal(
+                    &tool_id,
+                    outer,
+                    state,
+                    task_summary_snippet(&content_text),
+                    out,
+                );
+            }
+            return;
+        }
 
         if !content_text.is_empty() {
             out.events.push(AgentEvent::ToolOutputDelta {
@@ -828,9 +1237,18 @@ impl CcReader {
             out.events.push(AgentEvent::GoalUpdated { goal });
         }
 
-        // An aborted turn never reports results for in-flight tools; close
-        // them so frontends don't show tools running forever.
-        for tool_id in std::mem::take(&mut self.open_tools) {
+        // An aborted turn never reports results for its in-flight tools;
+        // close them so frontends don't show tools running forever. Only
+        // main-thread tools: async sub-agents (and their tools) legitimately
+        // outlive the turn and close with their own terminal event.
+        let unowned: Vec<String> = self
+            .open_tools
+            .iter()
+            .filter(|(_, owner)| owner.is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for tool_id in unowned {
+            self.open_tools.remove(&tool_id);
             out.events.push(AgentEvent::ToolCompleted {
                 item_id: tool_id,
                 status: ToolCompletionStatus::Cancelled,
@@ -997,6 +1415,11 @@ async fn reader_task(
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
             Ok(None) => {
+                let mut cleanup = CcLineOutcome::default();
+                reader_state.close_open_task_children(&mut cleanup);
+                for event in cleanup.events {
+                    let _ = event_tx.send(event);
+                }
                 let _ = event_tx.send(AgentEvent::Terminated {
                     reason: "Claude Code process closed stdout".into(),
                     exit_code: None,
@@ -1004,6 +1427,11 @@ async fn reader_task(
                 break;
             }
             Err(e) => {
+                let mut cleanup = CcLineOutcome::default();
+                reader_state.close_open_task_children(&mut cleanup);
+                for event in cleanup.events {
+                    let _ = event_tx.send(event);
+                }
                 let _ = event_tx.send(AgentEvent::Terminated {
                     reason: format!("IO error reading Claude Code stdout: {}", e),
                     exit_code: None,
@@ -2058,7 +2486,7 @@ mod tests {
             AgentEvent::ToolStarted { item_id, tool_name, preview }
                 if item_id == "t1" && tool_name == "Bash" && preview == "ls"
         )));
-        assert!(reader.open_tools.contains("t1"));
+        assert!(reader.open_tools.contains_key("t1"));
     }
 
     #[test]
@@ -2279,7 +2707,7 @@ mod tests {
         reader.process_line(
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t5","name":"Bash","input":{"command":"sleep 30"}}]},"session_id":"s1"}"#,
         );
-        assert!(reader.open_tools.contains("t5"));
+        assert!(reader.open_tools.contains_key("t5"));
         let out = reader.process_line(
             r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s1"}"#,
         );
@@ -2289,6 +2717,332 @@ mod tests {
                 if item_id == "t5"
         )));
         assert!(reader.open_tools.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // In-band Task/Agent sub-agents
+    // ---------------------------------------------------------------
+
+    /// The child session id every task test expects for tool_use id
+    /// `toolu_01AAABBBCCCDDDEEE`.
+    const TASK_CHILD: &str = "task-AAABBBCCCDDDEEE";
+
+    fn spawn_task(reader: &mut CcReader) -> CcLineOutcome {
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01AAABBBCCCDDDEEE","name":"Agent","input":{"subagent_type":"general-purpose","description":"probe echo","prompt":"Run echo and report."}}]},"parent_tool_use_id":null,"session_id":"s1"}"#,
+        )
+    }
+
+    #[test]
+    fn task_child_ids_are_distinctive() {
+        assert_eq!(
+            task_tool_child_id("toolu_01AAABBBCCCDDDEEE"),
+            "task-AAABBBCCCDDDEEE"
+        );
+        // Degenerate ids stay unique and safe.
+        assert_eq!(task_tool_child_id("weird:id"), "task-weird-id");
+    }
+
+    #[test]
+    fn agent_tool_use_announces_subagent_instead_of_tool() {
+        let mut reader = test_reader();
+        let out = spawn_task(&mut reader);
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolStarted { .. })),
+            "Agent spawn must not double-render as a plain tool"
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SubAgentToolCall { item_id, tool, status, sender_thread_id, receiver_thread_ids, prompt, agents, .. }
+                if item_id == "toolu_01AAABBBCCCDDDEEE"
+                    && tool == "Agent"
+                    && status == "inProgress"
+                    && sender_thread_id == "s1"
+                    && receiver_thread_ids == &vec![TASK_CHILD.to_string()]
+                    && prompt.as_deref() == Some("Run echo and report.")
+                    && agents.len() == 1
+                    && agents[0].thread_id == TASK_CHILD
+                    && agents[0].status == "running"
+        )));
+        assert!(reader.open_tools.is_empty());
+    }
+
+    #[test]
+    fn tagged_envelopes_scope_to_the_child() {
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"child plans"},{"type":"tool_use","id":"tb1","name":"Bash","input":{"command":"echo hi"}}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1","subagent_type":"general-purpose","task_description":"probe echo"}"#,
+        );
+        let mut saw_reasoning = false;
+        let mut saw_tool = false;
+        for event in &out.events {
+            let AgentEvent::Scoped {
+                thread_id, event, ..
+            } = event
+            else {
+                panic!("child activity must be scoped, got {event:?}");
+            };
+            assert_eq!(thread_id.as_deref(), Some(TASK_CHILD));
+            match event.as_ref() {
+                AgentEvent::Reasoning { text } => {
+                    saw_reasoning = true;
+                    assert_eq!(text, "child plans");
+                }
+                AgentEvent::ToolStarted { item_id, .. } => {
+                    saw_tool = true;
+                    assert_eq!(item_id, "tb1");
+                }
+                other => panic!("unexpected child event {other:?}"),
+            }
+        }
+        assert!(saw_reasoning && saw_tool);
+        assert_eq!(
+            reader.open_tools.get("tb1"),
+            Some(&Some(TASK_CHILD.to_string()))
+        );
+
+        // The child's tool result scopes too.
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tb1","content":"hi","is_error":false}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(event.as_ref(), AgentEvent::ToolCompleted { item_id, .. } if item_id == "tb1")
+        )));
+        assert!(!reader.open_tools.contains_key("tb1"));
+    }
+
+    #[test]
+    fn async_launch_tool_result_is_suppressed() {
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01AAABBBCCCDDDEEE","content":[{"type":"text","text":"Async agent launched successfully. internal metadata"}]}]},"parent_tool_use_id":null,"session_id":"s1","tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"aa338"}}"#,
+        );
+        assert!(
+            out.events.is_empty(),
+            "launch metadata must not surface: {:?}",
+            out.events
+        );
+        // The child is still open — its end arrives via task_notification.
+        assert!(!reader.task_children["toolu_01AAABBBCCCDDDEEE"].terminal);
+    }
+
+    #[test]
+    fn task_notification_ends_the_child_once() {
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"aa338","tool_use_id":"toolu_01AAABBBCCCDDDEEE","description":"probe echo","subagent_type":"general-purpose","session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"aa338","tool_use_id":"toolu_01AAABBBCCCDDDEEE","status":"completed","summary":"did the thing","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::SubAgentToolCall { status, agents, .. }
+                            if status == "completed"
+                                && agents.len() == 1
+                                && agents[0].status == "completed"
+                                && agents[0].message.as_deref() == Some("did the thing")
+                    )
+        )));
+        // A duplicate notification stays silent.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"aa338","status":"completed","summary":"did the thing","session_id":"s1"}"#,
+        );
+        assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn task_notification_correlates_via_task_id() {
+        // A notification without tool_use_id resolves through the
+        // task_started mapping.
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"aa338","tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"aa338","status":"failed","summary":"boom","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    AgentEvent::SubAgentToolCall { status, agents, .. }
+                        if status == "failed" && agents[0].status == "errored"
+                )
+        )));
+    }
+
+    #[test]
+    fn task_notification_closes_the_childs_open_tools() {
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tb2","name":"Bash","input":{"command":"sleep 99"}}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","tool_use_id":"toolu_01AAABBBCCCDDDEEE","status":"completed","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::ToolCompleted { item_id, status: ToolCompletionStatus::Cancelled }
+                            if item_id == "tb2"
+                    )
+        )));
+        assert!(!reader.open_tools.contains_key("tb2"));
+    }
+
+    #[test]
+    fn sync_task_tool_result_is_terminal() {
+        // No async marker on the envelope: the result is the child's final
+        // report (synchronous run or launch failure).
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01AAABBBCCCDDDEEE","content":"final report","is_error":false}]},"parent_tool_use_id":null,"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::SubAgentToolCall { status, agents, .. }
+                            if status == "completed"
+                                && agents[0].message.as_deref() == Some("final report")
+                    )
+        )));
+        // No plain tool events leak for the Agent call.
+        assert!(!out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCompleted { .. } | AgentEvent::ToolOutputDelta { .. }
+        )));
+    }
+
+    #[test]
+    fn unseen_parent_tool_use_id_materializes_the_child() {
+        // Resume replay: the spawn was never observed, only tagged activity.
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"child says hi"}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1","subagent_type":"general-purpose","task_description":"replayed task"}"#,
+        );
+        let registration = out
+            .events
+            .iter()
+            .find(|e| !matches!(e, AgentEvent::NativeSessionId { .. }))
+            .expect("registration event");
+        assert!(matches!(
+            registration,
+            AgentEvent::SubAgentToolCall { status, receiver_thread_ids, prompt, .. }
+                if status == "inProgress"
+                    && receiver_thread_ids == &vec![TASK_CHILD.to_string()]
+                    && prompt.as_deref() == Some("replayed task")
+        ));
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(event.as_ref(), AgentEvent::Message { text } if text == "child says hi")
+        )));
+    }
+
+    #[test]
+    fn turn_end_spares_child_owned_tools() {
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        // One main-thread tool, one child tool.
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"main1","name":"Bash","input":{"command":"ls"}}]},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"child1","name":"Bash","input":{"command":"sleep 99"}}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","result":"launched","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCompleted { item_id, status: ToolCompletionStatus::Cancelled }
+                if item_id == "main1"
+        )));
+        assert!(
+            reader.open_tools.contains_key("child1"),
+            "async child tools survive the parent turn"
+        );
+    }
+
+    #[test]
+    fn eof_shuts_down_open_children() {
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        let mut out = CcLineOutcome::default();
+        reader.close_open_task_children(&mut out);
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::SubAgentToolCall { status, agents, .. }
+                            if status == "interrupted" && agents[0].status == "shutdown"
+                    )
+        )));
+        // Terminal children stay quiet.
+        let mut again = CcLineOutcome::default();
+        reader.close_open_task_children(&mut again);
+        assert!(again.events.is_empty());
+    }
+
+    #[test]
+    fn nested_task_spawn_uses_child_as_sender() {
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        // The child spawns a grandchild: the registration must name the
+        // child as the sender so the relationship edge nests.
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01FFFGGGHHHIIIJJJ","name":"Agent","input":{"description":"nested","prompt":"go deeper"}}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::SubAgentToolCall { status, sender_thread_id, receiver_thread_ids, .. }
+                            if status == "inProgress"
+                                && sender_thread_id == TASK_CHILD
+                                && receiver_thread_ids == &vec!["task-FFFGGGHHHIIIJJJ".to_string()]
+                    )
+        )));
+    }
+
+    #[test]
+    fn task_summary_snippets_are_single_line_and_bounded() {
+        assert_eq!(
+            task_summary_snippet("a\nb\n\n  c").as_deref(),
+            Some("a b c")
+        );
+        assert_eq!(task_summary_snippet("   "), None);
+        let long = "x".repeat(500);
+        let snippet = task_summary_snippet(&long).unwrap();
+        assert!(snippet.chars().count() <= 241 && snippet.ends_with('…'));
     }
 
     #[test]

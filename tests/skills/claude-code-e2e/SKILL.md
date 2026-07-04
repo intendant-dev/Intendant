@@ -4,8 +4,9 @@ description: >
   Live end-to-end test of the Claude Code external-agent integration: spawn a
   supervised Claude Code session in a toy repo, exercise the approval protocol
   (allow + deny), native session-id capture, mid-turn steering, interrupt,
-  thread actions (/compact, fork via --fork-session), and resume-by-native-id,
-  driving everything through the Unix control socket.
+  thread actions (/compact, fork via --fork-session), the async Agent-tool
+  sub-agent surfacing (ephemeral task-* child sessions), and
+  resume-by-native-id, driving everything through the Unix control socket.
 compatibility: Requires the `claude` CLI (≥ 2.1.x) authenticated on this machine
   (subscription OAuth or API key) and a release build of intendant. Makes real
   model calls — haiku ONLY (enforced via [agent.claude_code] model); not for CI.
@@ -48,11 +49,19 @@ on **claude-haiku** — never a more expensive model.
   that resumes the thread with `--fork-session` — its first prompt binds a
   fresh native id, emits the `fork` session relationship, and recalls the
   parent's pre-fork context while the parent stays untouched.
+- **In-band sub-agents**: an `Agent` tool spawn (async on 2.1.201) surfaces
+  as an ephemeral `task-*` child session — `session_relationship
+  "subagent"` from the parent, the child's own Bash rendered under the
+  child id (scoped transcript), a "subagent completed" log on
+  `task_notification`, the spontaneous notification turn completing as a
+  clean idle round, and the internal "Async agent launched" metadata
+  suppressed everywhere.
 - **Resume**: a second `--continue` run binds to the most recent session's
   native id — after the fork phase that is the FORK child (resolution reads
   the wrapper log's identity record, written directly by
   `persist_native_backend_session_id` since the bus tee only reaches the
-  daemon-main log) — and recalls conversation context.
+  daemon-main log) — and recalls conversation context. Task children never
+  create wrapper sessions, so the fork wrapper stays the resume target.
 
 ## Run
 
@@ -108,6 +117,16 @@ table and exits non-zero on any failure; the full event log lands in
 - `fork-child-has-own-native-id` failing → `--fork-session` missing from the
   spawned argv (`fork_resume` derivation compares the resume id against the
   persisted `forked_from`), or the child's placeholder identity leaked.
+- `task-subagent-relationship` timeout → haiku ran Bash directly instead of
+  the Agent tool (check the prompt), the tool got renamed again
+  (`is_task_tool` in `claude_code.rs` knows `Agent` + `Task`), or the
+  `SubAgentToolCall` → `register_external_subagent_children` chain broke.
+- `task-child-scoped-activity` timeout → `parent_tool_use_id` scoping
+  regressed (tagged envelopes no longer wrap in `AgentEvent::scoped`) or
+  the drain's `codex_subagent_parent_threads` routing lost the child.
+- `task-notification-turn-reports` timeout → the spontaneous notification
+  turn desynced (idle prefetch path), or `system:task_notification` parsing
+  broke.
 - `resume-same-native-session` failing → the external overlay/identity
   records aren't being written (or `--resume` stopped keeping the session id
   stable in the CLI — verify with `claude --resume <id>` by hand).

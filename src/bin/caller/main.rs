@@ -8761,7 +8761,21 @@ fn emit_side_session_started(
     );
 }
 
-fn emit_codex_subagent_started(
+/// Which external backend this drain supervises, from its display source
+/// ("Codex", "Claude Code"). None for unknown/legacy sources.
+fn external_backend_of_config(config: &DrainConfig<'_>) -> Option<external_agent::AgentBackend> {
+    config
+        .agent_source
+        .as_deref()
+        .and_then(external_agent::AgentBackend::from_str_loose)
+}
+
+/// Announce a backend-native sub-agent as a synthetic child session:
+/// identity, parent relationship, capability ceiling, and the started log
+/// line. Backend-neutral — the universal sub-agent rail. Codex collab
+/// children accept follow-ups (injected via collab tools); Claude Code's
+/// in-band tasks are fire-and-forget, so their windows expose none.
+fn emit_external_subagent_started(
     config: &DrainConfig<'_>,
     parent_thread_id: &str,
     child_thread_id: &str,
@@ -8783,9 +8797,14 @@ fn emit_codex_subagent_started(
         return;
     }
 
+    let backend = external_backend_of_config(config);
+    let source_label = external_agent_log_source(config.agent_source.as_deref());
     config.bus.send(AppEvent::SessionIdentity {
         session_id: child_thread_id.to_string(),
-        source: "codex".to_string(),
+        source: backend
+            .as_ref()
+            .map(|b| b.as_short_str().to_string())
+            .unwrap_or_else(|| "codex".to_string()),
         backend_session_id: child_thread_id.to_string(),
     });
     emit_session_relationship(
@@ -8798,7 +8817,7 @@ fn emit_codex_subagent_started(
     config.bus.send(AppEvent::SessionCapabilities {
         session_id: child_thread_id.to_string(),
         capabilities: types::SessionCapabilities {
-            follow_up: true,
+            follow_up: !matches!(backend, Some(external_agent::AgentBackend::ClaudeCode)),
             steer: false,
             interrupt: false,
             thread_actions: Vec::new(),
@@ -8818,8 +8837,8 @@ fn emit_codex_subagent_started(
             prompt
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .unwrap_or("Codex subagent")
-                .to_string(),
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{source_label} subagent")),
         ),
     });
 
@@ -8838,22 +8857,65 @@ fn emit_codex_subagent_started(
     let content = prompt
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|prompt| format!("Codex subagent started{suffix}: {prompt}"))
-        .unwrap_or_else(|| format!("Codex subagent started{suffix}"));
+        .map(|prompt| format!("{source_label} subagent started{suffix}: {prompt}"))
+        .unwrap_or_else(|| format!("{source_label} subagent started{suffix}"));
     config.bus.send(AppEvent::LogEntry {
         session_id: Some(child_thread_id.to_string()),
         level: "agent".to_string(),
-        source: "Codex".to_string(),
+        source: source_label,
         content,
         turn: None,
     });
 }
 
-fn emit_codex_subagent_state(config: &DrainConfig<'_>, state: &external_agent::SubAgentState) {
+/// Register a `SubAgentToolCall`'s children in the routing tables and
+/// announce the new ones. Shared by the active drain and the idle listener
+/// so children spawned in either state get windows and scoped-event
+/// routing.
+fn register_external_subagent_children(
+    config: &DrainConfig<'_>,
+    stats: &mut LoopStats,
+    sender_thread_id: &str,
+    subagent_thread_ids: &[String],
+    prompt: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+) {
+    for child_thread_id in subagent_thread_ids {
+        let child_thread_id = child_thread_id.trim();
+        if child_thread_id.is_empty() || child_thread_id == sender_thread_id.trim() {
+            continue;
+        }
+        let sender_thread_id = sender_thread_id.trim();
+        if !sender_thread_id.is_empty() {
+            stats
+                .codex_subagent_parent_threads
+                .entry(child_thread_id.to_string())
+                .or_insert_with(|| sender_thread_id.to_string());
+        }
+        if stats
+            .codex_subagent_sessions
+            .insert(child_thread_id.to_string())
+        {
+            emit_external_subagent_started(
+                config,
+                sender_thread_id,
+                child_thread_id,
+                prompt,
+                model,
+                reasoning_effort,
+            );
+        }
+        emit_codex_subagent_transcript_updates(config, stats, child_thread_id);
+    }
+}
+
+fn emit_external_subagent_state(config: &DrainConfig<'_>, state: &external_agent::SubAgentState) {
     let thread_id = state.thread_id.trim();
     if thread_id.is_empty() {
         return;
     }
+    let label = external_agent_log_source(config.agent_source.as_deref());
     let status = state.status.trim();
     let message = state
         .message
@@ -8864,51 +8926,54 @@ fn emit_codex_subagent_state(config: &DrainConfig<'_>, state: &external_agent::S
         "completed" => (
             "info",
             message
-                .map(|message| format!("Task complete: Codex subagent completed: {message}"))
-                .unwrap_or_else(|| "Task complete: Codex subagent completed".to_string()),
+                .map(|message| format!("Task complete: {label} subagent completed: {message}"))
+                .unwrap_or_else(|| format!("Task complete: {label} subagent completed")),
         ),
         "interrupted" => (
             "warn",
             message
-                .map(|message| format!("Agent interrupted: Codex subagent interrupted: {message}"))
-                .unwrap_or_else(|| "Agent interrupted: Codex subagent interrupted".to_string()),
+                .map(|message| format!("Agent interrupted: {label} subagent interrupted: {message}"))
+                .unwrap_or_else(|| format!("Agent interrupted: {label} subagent interrupted")),
         ),
         "errored" => (
             "warn",
             message
-                .map(|message| format!("Session ended: Codex subagent errored: {message}"))
-                .unwrap_or_else(|| "Session ended: Codex subagent errored".to_string()),
+                .map(|message| format!("Session ended: {label} subagent errored: {message}"))
+                .unwrap_or_else(|| format!("Session ended: {label} subagent errored")),
         ),
         "shutdown" => (
             "info",
             message
-                .map(|message| format!("Session ended: Codex subagent shut down: {message}"))
-                .unwrap_or_else(|| "Session ended: Codex subagent shut down".to_string()),
+                .map(|message| format!("Session ended: {label} subagent shut down: {message}"))
+                .unwrap_or_else(|| format!("Session ended: {label} subagent shut down")),
         ),
         "notFound" => (
             "warn",
             message
-                .map(|message| format!("Session ended: Codex subagent not found: {message}"))
-                .unwrap_or_else(|| "Session ended: Codex subagent not found".to_string()),
+                .map(|message| format!("Session ended: {label} subagent not found: {message}"))
+                .unwrap_or_else(|| format!("Session ended: {label} subagent not found")),
         ),
         "pendingInit" | "running" => return,
         other => (
             "info",
             message
-                .map(|message| format!("Codex subagent {other}: {message}"))
-                .unwrap_or_else(|| format!("Codex subagent {other}")),
+                .map(|message| format!("{label} subagent {other}: {message}"))
+                .unwrap_or_else(|| format!("{label} subagent {other}")),
         ),
     };
     config.bus.send(AppEvent::LogEntry {
         session_id: Some(thread_id.to_string()),
         level: level.to_string(),
-        source: "Codex".to_string(),
+        source: label,
         content,
         turn: None,
     });
 }
 
-fn codex_subagent_terminal_reason(state: &external_agent::SubAgentState) -> Option<String> {
+fn external_subagent_terminal_reason(
+    label: &str,
+    state: &external_agent::SubAgentState,
+) -> Option<String> {
     let status = state.status.trim();
     let message = state
         .message
@@ -8918,29 +8983,29 @@ fn codex_subagent_terminal_reason(state: &external_agent::SubAgentState) -> Opti
     match status {
         "interrupted" => Some(
             message
-                .map(|message| format!("Codex subagent interrupted: {message}"))
-                .unwrap_or_else(|| "Codex subagent interrupted".to_string()),
+                .map(|message| format!("{label} subagent interrupted: {message}"))
+                .unwrap_or_else(|| format!("{label} subagent interrupted")),
         ),
         "errored" => Some(
             message
-                .map(|message| format!("Codex subagent errored: {message}"))
-                .unwrap_or_else(|| "Codex subagent errored".to_string()),
+                .map(|message| format!("{label} subagent errored: {message}"))
+                .unwrap_or_else(|| format!("{label} subagent errored")),
         ),
         "shutdown" => Some(
             message
-                .map(|message| format!("Codex subagent shut down: {message}"))
-                .unwrap_or_else(|| "Codex subagent shut down".to_string()),
+                .map(|message| format!("{label} subagent shut down: {message}"))
+                .unwrap_or_else(|| format!("{label} subagent shut down")),
         ),
         "notFound" => Some(
             message
-                .map(|message| format!("Codex subagent not found: {message}"))
-                .unwrap_or_else(|| "Codex subagent not found".to_string()),
+                .map(|message| format!("{label} subagent not found: {message}"))
+                .unwrap_or_else(|| format!("{label} subagent not found")),
         ),
         _ => None,
     }
 }
 
-fn emit_codex_subagent_terminal(
+fn emit_external_subagent_terminal(
     config: &DrainConfig<'_>,
     stats: &mut LoopStats,
     state: &external_agent::SubAgentState,
@@ -8949,7 +9014,8 @@ fn emit_codex_subagent_terminal(
     if thread_id.is_empty() {
         return;
     }
-    let Some(reason) = codex_subagent_terminal_reason(state) else {
+    let label = external_agent_log_source(config.agent_source.as_deref());
+    let Some(reason) = external_subagent_terminal_reason(&label, state) else {
         return;
     };
     if !stats
@@ -9028,6 +9094,14 @@ fn emit_codex_subagent_transcript_updates(
     stats: &mut LoopStats,
     child_thread_id: &str,
 ) {
+    // Reads Codex's on-disk session transcripts; other backends' children
+    // stream their transcript in-band as scoped events.
+    if !matches!(
+        external_backend_of_config(config),
+        None | Some(external_agent::AgentBackend::Codex)
+    ) {
+        return;
+    }
     let child_thread_id = child_thread_id.trim();
     if child_thread_id.is_empty() {
         return;
@@ -9087,6 +9161,14 @@ fn record_codex_fission_observation(
     config: &DrainConfig<'_>,
     input: CodexFissionObservationInput<'_>,
 ) {
+    // Fission is a Codex managed-context concept; other backends' in-band
+    // sub-agents are relationships, not fission branches.
+    if !matches!(
+        external_backend_of_config(config),
+        None | Some(external_agent::AgentBackend::Codex)
+    ) {
+        return;
+    }
     let parent_session_id = {
         let sender_thread_id = input.sender_thread_id.trim();
         if sender_thread_id.is_empty() {
@@ -9570,10 +9652,11 @@ fn handle_idle_codex_subagent_event(
             recovery_hint,
             ..
         } => {
+            let label = external_agent_log_source(config.agent_source.as_deref());
             let mut content = if let Some(code) = code {
-                format!("Codex subagent backend error ({code}): {message}")
+                format!("{label} subagent backend error ({code}): {message}")
             } else {
-                format!("Codex subagent backend error: {message}")
+                format!("{label} subagent backend error: {message}")
             };
             if let Some(details) = details.filter(|s| !s.trim().is_empty()) {
                 content.push('\n');
@@ -9683,9 +9766,18 @@ fn handle_idle_codex_subagent_event(
                     agents: &agents,
                 },
             );
+            register_external_subagent_children(
+                config,
+                stats,
+                &sender_thread_id,
+                &subagent_thread_ids,
+                prompt.as_deref(),
+                model.as_deref(),
+                reasoning_effort.as_deref(),
+            );
             for state in &agents {
-                emit_codex_subagent_state(config, state);
-                emit_codex_subagent_terminal(config, stats, state);
+                emit_external_subagent_state(config, state);
+                emit_external_subagent_terminal(config, stats, state);
             }
         }
         external_agent::AgentEvent::Usage { usage } => {
@@ -10983,33 +11075,15 @@ async fn drain_external_agent_events_with_prefetched(
                     }
                 }
 
-                for child_thread_id in &subagent_thread_ids {
-                    let child_thread_id = child_thread_id.trim();
-                    if child_thread_id.is_empty() || child_thread_id == sender_thread_id.trim() {
-                        continue;
-                    }
-                    let sender_thread_id = sender_thread_id.trim();
-                    if !sender_thread_id.is_empty() {
-                        stats
-                            .codex_subagent_parent_threads
-                            .entry(child_thread_id.to_string())
-                            .or_insert_with(|| sender_thread_id.to_string());
-                    }
-                    if stats
-                        .codex_subagent_sessions
-                        .insert(child_thread_id.to_string())
-                    {
-                        emit_codex_subagent_started(
-                            config,
-                            sender_thread_id,
-                            child_thread_id,
-                            prompt_ref,
-                            model.as_deref(),
-                            reasoning_effort.as_deref(),
-                        );
-                    }
-                    emit_codex_subagent_transcript_updates(config, stats, child_thread_id);
-                }
+                register_external_subagent_children(
+                    config,
+                    stats,
+                    &sender_thread_id,
+                    &subagent_thread_ids,
+                    prompt_ref,
+                    model.as_deref(),
+                    reasoning_effort.as_deref(),
+                );
 
                 if status == "failed" {
                     let item_id = item_id.trim();
@@ -11019,7 +11093,8 @@ async fn drain_external_agent_events_with_prefetched(
                         format!(" ({item_id})")
                     };
                     let content = format!(
-                        "Codex subagent tool {}{} failed{}",
+                        "{} subagent tool {}{} failed{}",
+                        external_agent_log_source(config.agent_source.as_deref()),
                         tool,
                         item_suffix,
                         prompt_ref
@@ -11039,8 +11114,8 @@ async fn drain_external_agent_events_with_prefetched(
                 }
 
                 for state in &agents {
-                    emit_codex_subagent_state(config, state);
-                    emit_codex_subagent_terminal(config, stats, state);
+                    emit_external_subagent_state(config, state);
+                    emit_external_subagent_terminal(config, stats, state);
                 }
 
                 emit_external_context_snapshot_if_changed(
@@ -14316,14 +14391,14 @@ mod tests {
             status: "completed".to_string(),
             message: Some("done".to_string()),
         };
-        assert!(codex_subagent_terminal_reason(&state).is_none());
+        assert!(external_subagent_terminal_reason("Codex", &state).is_none());
 
         let running = external_agent::SubAgentState {
             thread_id: "child".to_string(),
             status: "running".to_string(),
             message: None,
         };
-        assert!(codex_subagent_terminal_reason(&running).is_none());
+        assert!(external_subagent_terminal_reason("Codex", &running).is_none());
     }
 
     #[test]
@@ -16699,6 +16774,130 @@ mod tests {
                 );
             }
             other => panic!("expected child completion LogEntry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn claude_task_subagent_registration_is_claude_flavored() {
+        // The universal sub-agent rail, driven by a Claude Code drain:
+        // identity carries the claude-code source, the child advertises no
+        // follow-up (in-band tasks are fire-and-forget), labels say
+        // "Claude Code", and no fission observation is recorded (fission is
+        // Codex managed-context).
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("cc-parent".to_string()),
+            alias_session_id: None,
+            backend_thread_id: None,
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Claude Code".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+        let mut stats = LoopStats::default();
+
+        let children = vec!["task-ABC123".to_string()];
+        record_codex_fission_observation(
+            &config,
+            CodexFissionObservationInput {
+                item_id: "toolu_01x",
+                tool: "Agent",
+                status: "inProgress",
+                sender_thread_id: "cc-parent",
+                subagent_thread_ids: &children,
+                prompt: Some("probe"),
+                model: None,
+                reasoning_effort: None,
+                agents: &[],
+            },
+        );
+        assert!(
+            !fission_ledger::ledger_path(&log_dir).exists(),
+            "Claude Code sub-agents must not record fission observations"
+        );
+
+        register_external_subagent_children(
+            &config,
+            &mut stats,
+            "cc-parent",
+            &children,
+            Some("probe echo"),
+            None,
+            None,
+        );
+        assert_eq!(
+            stats.codex_subagent_parent_threads.get("task-ABC123"),
+            Some(&"cc-parent".to_string())
+        );
+
+        match rx.try_recv().expect("identity") {
+            AppEvent::SessionIdentity {
+                session_id, source, ..
+            } => {
+                assert_eq!(session_id, "task-ABC123");
+                assert_eq!(source, "claude-code");
+            }
+            other => panic!("expected SessionIdentity, got {other:?}"),
+        }
+        match rx.try_recv().expect("relationship") {
+            AppEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ephemeral,
+            } => {
+                assert_eq!(parent_session_id, "cc-parent");
+                assert_eq!(child_session_id, "task-ABC123");
+                assert_eq!(relationship, "subagent");
+                assert!(!ephemeral);
+            }
+            other => panic!("expected SessionRelationship, got {other:?}"),
+        }
+        match rx.try_recv().expect("capabilities") {
+            AppEvent::SessionCapabilities { capabilities, .. } => {
+                assert!(
+                    !capabilities.follow_up,
+                    "in-band Claude Code tasks accept no follow-ups"
+                );
+            }
+            other => panic!("expected SessionCapabilities, got {other:?}"),
+        }
+        match rx.try_recv().expect("started") {
+            AppEvent::SessionStarted { session_id, task } => {
+                assert_eq!(session_id, "task-ABC123");
+                assert_eq!(task.as_deref(), Some("probe echo"));
+            }
+            other => panic!("expected SessionStarted, got {other:?}"),
+        }
+        match rx.try_recv().expect("log line") {
+            AppEvent::LogEntry {
+                source, content, ..
+            } => {
+                assert_eq!(source, "Claude Code");
+                assert!(
+                    content.starts_with("Claude Code subagent started"),
+                    "{content}"
+                );
+            }
+            other => panic!("expected LogEntry, got {other:?}"),
         }
     }
 
@@ -27122,6 +27321,11 @@ async fn run_with_presence(
             target_native_message_count: Option<u32>,
             turns_to_drop: u32,
         },
+        /// The persistent external agent produced an event while no task
+        /// was being drained: an async sub-agent streaming between turns,
+        /// or the backend starting a spontaneous turn (e.g. Claude Code's
+        /// task-notification round after an async Agent-tool child ends).
+        IdleAgentEvent(Box<external_agent::AgentEvent>),
         Done,
     }
 
@@ -27195,6 +27399,25 @@ async fn run_with_presence(
                 // Closed also fall through — task_rx close is the
                 // authoritative "we're done" signal.
                 _ => continue,
+            },
+            // Agent events while idle: without this arm they would buffer
+            // until the next task's drain and complete it prematurely
+            // (async Claude Code sub-agents finish — and the CLI starts its
+            // notification turn — while the loop sits here).
+            maybe_event = async {
+                persistent_event_rx
+                    .as_mut()
+                    .expect("branch guarded by is_some")
+                    .recv()
+                    .await
+            }, if persistent_event_rx.is_some() => match maybe_event {
+                Some(event) => OuterSignal::IdleAgentEvent(Box::new(event)),
+                None => {
+                    // Reader task ended (agent process gone); disable the
+                    // arm — the next task recreates the agent.
+                    persistent_event_rx = None;
+                    continue;
+                }
             },
         };
         let envelope = match signal {
@@ -27912,6 +28135,248 @@ async fn run_with_presence(
                     }
                 }
                 turn_bus_rx = bus.subscribe();
+                continue;
+            }
+            OuterSignal::IdleAgentEvent(event) => {
+                // Inline mirror of run_external_agent_mode's idle listener
+                // (the drain loops there and here must stay in sync): route
+                // sub-agent-scoped events to their child windows, absorb
+                // identity/goal/termination housekeeping, and treat any
+                // other primary event as the start of a spontaneous backend
+                // round drained to completion.
+                let (event_thread_id, event_turn_id, event) = event.into_scope();
+                let persistent_thread_id = persistent_thread
+                    .as_ref()
+                    .map(|thread| thread.thread_id.clone());
+                let idle_drain_config = DrainConfig {
+                    bus: &bus,
+                    web_port,
+                    session_id: session_log_id(&session_log),
+                    alias_session_id: persistent_thread_id.clone(),
+                    backend_thread_id: persistent_thread_id.clone(),
+                    autonomy: autonomy.clone(),
+                    session_log: &session_log,
+                    project_root: &project.root,
+                    log_dir: &log_dir,
+                    approval_registry: &approval_registry,
+                    json_approval: None,
+                    agent_source: Some(
+                        persistent_agent_backend
+                            .as_ref()
+                            .map(|backend| backend.to_string())
+                            .unwrap_or_else(|| "Codex".to_string()),
+                    ),
+                    suppress_agent_started: true,
+                    persist_model_responses_inline: false,
+                    headless: false,
+                    context_injection: &context_injection,
+                };
+                if let Some(child_thread_id) =
+                    scoped_event_codex_subagent_thread_id(&event_thread_id, &cumulative_stats)
+                {
+                    handle_idle_codex_subagent_event(
+                        &idle_drain_config,
+                        &mut cumulative_stats,
+                        child_thread_id,
+                        event,
+                    );
+                    continue;
+                }
+                match event {
+                    external_agent::AgentEvent::NativeSessionId { session_id } => {
+                        persist_native_backend_session_id(&idle_drain_config, &session_id);
+                        let is_canonical = persistent_agent_backend
+                            .as_ref()
+                            .is_some_and(|backend| backend.thread_id_is_canonical(&session_id));
+                        if is_canonical {
+                            if let Some(thread) = persistent_thread.as_mut() {
+                                thread.thread_id = session_id;
+                            }
+                        }
+                    }
+                    external_agent::AgentEvent::GoalUpdated { goal } => {
+                        emit_external_session_goal(
+                            &idle_drain_config,
+                            event_thread_id,
+                            Some(goal),
+                        );
+                    }
+                    external_agent::AgentEvent::GoalCleared => {
+                        emit_external_session_goal(&idle_drain_config, event_thread_id, None);
+                    }
+                    external_agent::AgentEvent::Terminated { reason, exit_code } => {
+                        slog(&session_log, |l| {
+                            l.warn(&format!(
+                                "External agent terminated while idle: {} (exit code: {:?})",
+                                reason, exit_code
+                            ))
+                        });
+                        bus.send(AppEvent::PresenceLog {
+                            message: format!("External agent terminated while idle: {reason}"),
+                            level: Some(types::LogLevel::Warn),
+                            turn: None,
+                        });
+                        persistent_agent = None;
+                        persistent_thread = None;
+                        persistent_event_rx = None;
+                    }
+                    other => {
+                        let targets_primary = scoped_event_targets_config(
+                            &event_thread_id,
+                            &local_session_id,
+                            &persistent_thread_id,
+                        );
+                        let targets_side = event_thread_id
+                            .as_deref()
+                            .is_some_and(|id| persistent_open_side_threads.contains_key(id));
+                        if !targets_primary && !targets_side {
+                            continue;
+                        }
+                        if let (Some(agent), Some(event_rx)) =
+                            (persistent_agent.as_mut(), persistent_event_rx.as_mut())
+                        {
+                            let round = cumulative_stats.rounds.saturating_add(1);
+                            emit_external_turn_status(
+                                &bus,
+                                &autonomy,
+                                session_log_id(&session_log).as_deref(),
+                                round,
+                                "running",
+                                format!(
+                                    "{} backend turn {} observed while idle",
+                                    agent.name(),
+                                    round
+                                ),
+                            )
+                            .await;
+                            let mut prefetched_events = std::collections::VecDeque::new();
+                            prefetched_events.push_back(external_agent::AgentEvent::scoped(
+                                event_thread_id,
+                                event_turn_id,
+                                other,
+                            ));
+                            let mut side_session_state = ExternalSideSessionState {
+                                open_side_threads: &mut persistent_open_side_threads,
+                                side_rounds: &mut persistent_side_rounds,
+                                side_turn_revisions: &mut persistent_side_turn_revisions,
+                            };
+                            let outcome = drain_external_agent_events_with_prefetched(
+                                agent,
+                                event_rx,
+                                &mut turn_bus_rx,
+                                &idle_drain_config,
+                                &mut cumulative_stats,
+                                &mut persistent_diff_tracker,
+                                &mut persistent_pending_runtime_steers,
+                                &mut persistent_handled_steer_ids,
+                                &mut persistent_cancelled_follow_ups,
+                                &mut codex_thread_action_dedupe,
+                                &mut prefetched_events,
+                                Some(&mut side_session_state),
+                                false,
+                                false,
+                                false,
+                            )
+                            .await;
+                            if let Some(native) =
+                                cumulative_stats.announced_native_session_id.take()
+                            {
+                                let is_canonical =
+                                    persistent_agent_backend.as_ref().is_some_and(|backend| {
+                                        backend.thread_id_is_canonical(&native)
+                                    });
+                                if is_canonical {
+                                    if let Some(thread) = persistent_thread.as_mut() {
+                                        if thread.thread_id != native {
+                                            thread.thread_id = native;
+                                        }
+                                    }
+                                }
+                            }
+                            match outcome {
+                                DrainOutcome::TurnCompleted {
+                                    message,
+                                    turns_in_round,
+                                } => {
+                                    cumulative_stats.turns += 1;
+                                    cumulative_stats.rounds = round;
+                                    bus.send(AppEvent::DoneSignal {
+                                        session_id: session_log_id(&session_log),
+                                        message: message.clone(),
+                                    });
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: session_log_id(&session_log),
+                                        round,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
+                                }
+                                DrainOutcome::Interrupted { .. } => {
+                                    cumulative_stats.rounds = round;
+                                }
+                                DrainOutcome::RecoveryRequired {
+                                    message,
+                                    turns_in_round,
+                                    ..
+                                } => {
+                                    cumulative_stats.rounds = round;
+                                    slog(&session_log, |l| {
+                                        l.warn(&format!(
+                                            "Spontaneous external round ended in recovery state: {message}"
+                                        ))
+                                    });
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: session_log_id(&session_log),
+                                        round,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
+                                }
+                                DrainOutcome::ContextRewindRequested {
+                                    message,
+                                    turns_in_round,
+                                    ..
+                                } => {
+                                    // Rewinds are requested by managed Codex
+                                    // turns; a spontaneous round has no task
+                                    // to resume into, so complete the round
+                                    // and drop the request.
+                                    cumulative_stats.rounds = round;
+                                    slog(&session_log, |l| {
+                                        l.warn(
+                                            "Dropping context-rewind request from a spontaneous external round",
+                                        )
+                                    });
+                                    bus.send(AppEvent::DoneSignal {
+                                        session_id: session_log_id(&session_log),
+                                        message: message.clone(),
+                                    });
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: session_log_id(&session_log),
+                                        round,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
+                                }
+                                DrainOutcome::Terminated { reason, .. } => {
+                                    slog(&session_log, |l| {
+                                        l.warn(&format!(
+                                            "External agent terminated during spontaneous round: {reason}"
+                                        ))
+                                    });
+                                    persistent_agent = None;
+                                    persistent_thread = None;
+                                    persistent_event_rx = None;
+                                }
+                                DrainOutcome::ChannelClosed => {
+                                    persistent_agent = None;
+                                    persistent_thread = None;
+                                    persistent_event_rx = None;
+                                }
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             OuterSignal::ConversationRollback {

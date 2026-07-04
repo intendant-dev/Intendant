@@ -334,7 +334,7 @@ async function main() {
     run.autoApprove = true;
     run.send({
       action: 'follow_up',
-      text: 'Run exactly this bash command: for i in $(seq 1 20); do sleep 1; done; echo waited. Then reply WAITED.',
+      text: 'Run exactly this bash command yourself with your Bash tool (do NOT delegate to the Agent tool): for i in $(seq 1 20); do sleep 1; done; echo waited. Then reply WAITED.',
     });
     // Give the model time to start the ~20s loop (safe commands may run
     // without an approval prompt depending on host settings — don't gate
@@ -352,7 +352,7 @@ async function main() {
     // Phase 4: interrupt a long-running turn; the process must survive.
     run.send({
       action: 'follow_up',
-      text: 'Run exactly this bash command: for i in $(seq 1 90); do sleep 1; done; echo done90. Then reply LONGDONE.',
+      text: 'Run exactly this bash command yourself with your Bash tool (do NOT delegate to the Agent tool): for i in $(seq 1 90); do sleep 1; done; echo done90. Then reply LONGDONE.',
     });
     // Let the 90s loop start (approval, if any, is auto-approved).
     await sleep(8000);
@@ -503,6 +503,76 @@ async function main() {
       120000,
     );
     check('parent-survives-fork', Boolean(parentAlive));
+
+    // ---- Phase 9: in-band Task sub-agent (async Agent tool) --------------
+    // The spawn becomes an ephemeral task-* child session (subagent
+    // relationship + scoped transcript), the launch metadata never leaks
+    // into the transcript, the child ends via task_notification ("Task
+    // complete" log — completed children are deliberately not
+    // session_ended, matching Codex), and the CLI's spontaneous
+    // notification turn completes cleanly while the parent is idle.
+    const turnEndsBefore = run.events.filter(isTurnEnd).length;
+    // Earlier phases may have delegated organically — key everything to
+    // relationships created AFTER this phase starts.
+    const isSubagentRel = (e) => e.event === 'session_relationship'
+      && e.relationship === 'subagent' && /^task-/.test(e.child_session_id || '');
+    const subRelsBefore = run.events.filter(isSubagentRel).length;
+    run.send({
+      action: 'follow_up',
+      text: 'Use the Agent tool exactly once with subagent_type general-purpose, description "e2e echo", and this prompt: Run the shell command `echo task-e2e-hello` with your Bash tool, then reply with only its output. Do nothing else after launching it.',
+    });
+    const subRel = await run.waitFor(
+      'subagent relationship',
+      isSubagentRel,
+      180000,
+      { skip: subRelsBefore },
+    );
+    const taskChildId = subRel.child_session_id;
+    check('task-subagent-relationship', subRel.parent_session_id === backendSessionId,
+      `parent=${subRel.parent_session_id} child=${taskChildId}`);
+
+    // The child's own Bash output renders in the child window, not the
+    // parent's (presence mode suppresses agent_started, so the streamed
+    // tool output is the scoped-activity signal).
+    const childOutput = await run.waitFor(
+      'child scoped output',
+      (e) => e.event === 'agent_output' && e.session_id === taskChildId
+        && /task-e2e-hello/.test(e.stdout || ''),
+      180000,
+    );
+    check('task-child-scoped-activity', Boolean(childOutput),
+      (childOutput.stdout || '').slice(0, 60));
+
+    // task_notification → the child's terminal "Task complete" log line.
+    const childDone = await run.waitFor(
+      'child completion log',
+      (e) => e.event === 'log_entry' && e.session_id === taskChildId
+        && /subagent completed/i.test(e.content || ''),
+      240000,
+    );
+    check('task-child-completes', Boolean(childDone), (childDone.content || '').slice(0, 100));
+
+    // The spontaneous notification turn (fresh init → outcome report →
+    // result) must complete as a normal round: launch turn + notification
+    // turn = two turn-ends past the phase baseline.
+    await run.waitFor('launch turn end', isTurnEnd, 180000, { skip: turnEndsBefore });
+    await run.waitFor('notification turn end', isTurnEnd, 240000, { skip: turnEndsBefore + 1 });
+    const outcomeReport = await run.waitFor(
+      'subagent outcome report on the parent',
+      (e) => e.event === 'model_response' && /task-e2e-hello/.test(e.summary || '')
+        && e.session_id !== taskChildId,
+      240000,
+    );
+    check('task-notification-turn-reports', Boolean(outcomeReport),
+      (outcomeReport.summary || '').slice(0, 100));
+
+    // The async-launch tool_result is internal metadata and must never
+    // surface in any transcript or log.
+    const metadataLeak = run.events.find(
+      (e) => /Async agent launched successfully/.test(e.summary || e.content || e.stdout || ''),
+    );
+    check('task-launch-metadata-suppressed', !metadataLeak,
+      metadataLeak ? `${metadataLeak.event}: ${(metadataLeak.summary || metadataLeak.content || metadataLeak.stdout || '').slice(0, 80)}` : '');
   } finally {
     await run.stop();
   }
