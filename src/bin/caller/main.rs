@@ -9735,6 +9735,26 @@ fn provider_request_item_count(raw: &serde_json::Value) -> Option<usize> {
 /// This is the unified event loop shared by both the presence path
 /// (`run_with_presence`) and the non-presence path (`run_external_agent_mode`).
 ///
+/// Upper bound on a single `interrupt_turn()` RPC awaited from inside the
+/// drain's select arms. An unbounded await there freezes event and control
+/// processing — including the interrupt-again escape hatch — whenever the
+/// backend stops responding.
+const EXTERNAL_INTERRUPT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Time-bounded `interrupt_turn()`. Every call inside the drain must go
+/// through this so an unresponsive backend can't wedge the drain loop itself.
+async fn interrupt_turn_bounded(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+) -> Result<(), CallerError> {
+    match tokio::time::timeout(EXTERNAL_INTERRUPT_RPC_TIMEOUT, agent.interrupt_turn()).await {
+        Ok(result) => result,
+        Err(_) => Err(CallerError::ExternalAgent(format!(
+            "interrupt RPC timed out after {}s",
+            EXTERNAL_INTERRUPT_RPC_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
 /// Also subscribes to the event bus for `AppEvent::InterruptRequested` and
 /// forwards it to the external agent via `ExternalAgent::interrupt_turn()`.
 /// Backends that don't support interruption return a typed error we log and
@@ -9938,6 +9958,25 @@ async fn drain_external_agent_events_with_prefetched(
                             &alias_session_id,
                         ) =>
                     {
+                        if interrupt_pending {
+                            // Escalation: a second interrupt arrived and the
+                            // backend still hasn't produced a turn-terminal
+                            // event — either no turn is actually running
+                            // (a phantom observe drain) or the backend is
+                            // unresponsive. Waiting longer wedges the session
+                            // with no user-side recovery; return to the idle
+                            // loop so queued follow-ups flow again.
+                            slog(config.session_log, |l| {
+                                l.warn(&format!(
+                                    "Second interrupt with no turn-terminal event from {}; abandoning the turn drain",
+                                    agent.name()
+                                ))
+                            });
+                            return DrainOutcome::Interrupted {
+                                reason: "user requested (backend reported no turn end)"
+                                    .to_string(),
+                            };
+                        }
                         interrupt_pending = true;
                         interrupt_reason = "user requested".to_string();
                         // Approval registry is drained by the background
@@ -9946,17 +9985,23 @@ async fn drain_external_agent_events_with_prefetched(
                         // only need to forward the interrupt to the backend.
                         // For backends that don't support mid-turn cancel
                         // (Claude Code) we log a warning and keep waiting —
-                        // the next interrupt could escalate to shutdown, but
-                        // that's a caller policy decision.
-                        match agent.interrupt_turn().await {
-                            Ok(()) => {
+                        // a second interrupt escalates to abandoning the
+                        // drain above. The RPC itself is time-bounded so an
+                        // unresponsive backend can't wedge this select arm.
+                        match tokio::time::timeout(
+                            EXTERNAL_INTERRUPT_RPC_TIMEOUT,
+                            agent.interrupt_turn(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
                                 config.bus.send(AppEvent::PresenceLog {
                                     message: format!("Interrupt sent to {}", agent.name()),
                                     level: None,
                                     turn: None,
                                 });
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 config.bus.send(AppEvent::PresenceLog {
                                     message: format!(
                                         "Interrupt not supported or failed for {}: {}",
@@ -9968,6 +10013,15 @@ async fn drain_external_agent_events_with_prefetched(
                                 slog(config.session_log, |l| {
                                     l.warn(&format!(
                                         "Interrupt failed for {}: {}", agent.name(), e
+                                    ))
+                                });
+                            }
+                            Err(_) => {
+                                slog(config.session_log, |l| {
+                                    l.warn(&format!(
+                                        "Interrupt RPC to {} timed out after {}s; interrupt again to abandon the drain",
+                                        agent.name(),
+                                        EXTERNAL_INTERRUPT_RPC_TIMEOUT.as_secs()
                                     ))
                                 });
                             }
@@ -10396,7 +10450,7 @@ async fn drain_external_agent_events_with_prefetched(
                                             );
                                         }
                                         if should_stop_turn {
-                                            match agent.interrupt_turn().await {
+                                            match interrupt_turn_bounded(agent).await {
                                                 Ok(()) => {
                                                     pending_context_rewind_turn_stop
                                                         .request_stop(&active_tool_ids);
@@ -10720,7 +10774,7 @@ async fn drain_external_agent_events_with_prefetched(
                                 content,
                                 turn: None,
                             });
-                            if let Err(e) = agent.interrupt_turn().await {
+                            if let Err(e) = interrupt_turn_bounded(agent).await {
                                 let content =
                                     format!("Managed-context pressure interrupt failed: {}", e);
                                 slog(config.session_log, |l| l.warn(&content));
@@ -11089,7 +11143,7 @@ async fn drain_external_agent_events_with_prefetched(
                     });
                     if !managed_dashboard_command_interrupt_sent {
                         managed_dashboard_command_interrupt_sent = true;
-                        if let Err(e) = agent.interrupt_turn().await {
+                        if let Err(e) = interrupt_turn_bounded(agent).await {
                             let content =
                                 format!("Managed Codex dashboard command interrupt failed: {}", e);
                             slog(config.session_log, |l| l.warn(&content));
@@ -11135,7 +11189,7 @@ async fn drain_external_agent_events_with_prefetched(
                             });
                             if !managed_context_pressure_interrupt_sent {
                                 managed_context_pressure_interrupt_sent = true;
-                                if let Err(e) = agent.interrupt_turn().await {
+                                if let Err(e) = interrupt_turn_bounded(agent).await {
                                     let content = format!(
                                         "Managed-context tool-gate interrupt failed: {}",
                                         e
@@ -11182,7 +11236,7 @@ async fn drain_external_agent_events_with_prefetched(
                         interrupt_pending = true;
                         interrupt_reason =
                             MANAGED_CONTEXT_DENSITY_BLOCK_INTERRUPT_REASON.to_string();
-                        if let Err(e) = agent.interrupt_turn().await {
+                        if let Err(e) = interrupt_turn_bounded(agent).await {
                             let content = format!(
                                 "Managed-context density tool-gate interrupt failed: {}",
                                 e
@@ -31608,6 +31662,14 @@ async fn run_external_agent_mode(
             "delivered",
             None,
         );
+        if let Some(id) = follow_up_id.as_deref() {
+            // Pairs with the supervisor's "FollowUp … queued" daemon-log
+            // line; queued without delivered means the queue stopped
+            // draining.
+            slog(&session_log, |l| {
+                l.debug(&format!("Follow-up {} delivered to {}", id, agent.name()))
+            });
+        }
         if let Some(id) = steer_id {
             bus.send(AppEvent::SteerDelivered {
                 session_id: live_session_id.clone(),
