@@ -44,16 +44,14 @@ impl FrameRegistry {
         fs::write(&hq_path, hq_data)?;
 
         // Append metadata to frames.jsonl manifest
-        if let Ok(json_line) = serde_json::to_string(&meta) {
-            let manifest = self.frames_dir.join("frames.jsonl");
-            if let Ok(mut f) = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&manifest)
-            {
-                let _ = writeln!(f, "{}", json_line);
-            }
-        }
+        let json_line = serde_json::to_string(&meta)
+            .map_err(|err| std::io::Error::other(format!("serialize frame meta: {err}")))?;
+        let manifest = self.frames_dir.join("frames.jsonl");
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&manifest)?;
+        writeln!(f, "{}", json_line)?;
 
         let frame_id = meta.frame_id.clone();
         let stream = meta.stream.clone();

@@ -596,19 +596,41 @@ impl PlatformBridge {
     }
 
     fn set_default_source(&self, name: &str) {
-        let _ = std::process::Command::new("SwitchAudioSource")
+        match std::process::Command::new("SwitchAudioSource")
             .args(["-s", name, "-t", "input"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!(
+                "[audio-routing] WARN: failed to restore default input device to {:?}: SwitchAudioSource exited with {}",
+                name, status
+            ),
+            Err(err) => eprintln!(
+                "[audio-routing] WARN: failed to restore default input device to {:?}: {}",
+                name, err
+            ),
+        }
     }
 
     fn set_default_sink(&self, name: &str) {
-        let _ = std::process::Command::new("SwitchAudioSource")
+        match std::process::Command::new("SwitchAudioSource")
             .args(["-s", name, "-t", "output"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!(
+                "[audio-routing] WARN: failed to restore default output device to {:?}: SwitchAudioSource exited with {}",
+                name, status
+            ),
+            Err(err) => eprintln!(
+                "[audio-routing] WARN: failed to restore default output device to {:?}: {}",
+                name, err
+            ),
+        }
     }
 
     async fn route_app(&self, _app_name: &str) -> Result<(), CallerError> {

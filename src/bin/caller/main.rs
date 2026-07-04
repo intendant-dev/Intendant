@@ -11173,9 +11173,14 @@ async fn drain_external_agent_events_with_prefetched(
                         id: 0,
                         action: "deny".to_string(),
                     });
-                    let _ = agent
+                    if let Err(e) = agent
                         .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
-                        .await;
+                        .await
+                    {
+                        slog(config.session_log, |l| {
+                            l.warn(&format!("Failed to resolve approval: {}", e))
+                        });
+                    }
                 } else if config.headless
                     && config.json_approval.is_none()
                     && config.web_port.is_none()
@@ -11188,9 +11193,14 @@ async fn drain_external_agent_events_with_prefetched(
                         id: 0,
                         action: "deny".to_string(),
                     });
-                    let _ = agent
+                    if let Err(e) = agent
                         .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
-                        .await;
+                        .await
+                    {
+                        slog(config.session_log, |l| {
+                            l.warn(&format!("Failed to resolve approval: {}", e))
+                        });
+                    }
                 } else {
                     let id = approval_counter.fetch_add(1, Ordering::Relaxed);
                     config.bus.send(AppEvent::ApprovalRequired {
@@ -11266,12 +11276,17 @@ async fn drain_external_agent_events_with_prefetched(
                             slog(config.session_log, |l| {
                                 l.warn("Approval channel closed, denying")
                             });
-                            let _ = agent
+                            if let Err(e) = agent
                                 .resolve_approval(
                                     &request_id,
                                     external_agent::ApprovalDecision::Decline,
                                 )
-                                .await;
+                                .await
+                            {
+                                slog(config.session_log, |l| {
+                                    l.warn(&format!("Failed to resolve approval: {}", e))
+                                });
+                            }
                         }
                     }
                     // The block is over — hand the badge back to "running"
@@ -11320,9 +11335,14 @@ async fn drain_external_agent_events_with_prefetched(
                         id: 0,
                         action: "deny".to_string(),
                     });
-                    let _ = agent
+                    if let Err(e) = agent
                         .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
-                        .await;
+                        .await
+                    {
+                        slog(config.session_log, |l| {
+                            l.warn(&format!("Failed to resolve approval: {}", e))
+                        });
+                    }
                 } else if config.headless
                     && config.json_approval.is_none()
                     && config.web_port.is_none()
@@ -11335,9 +11355,14 @@ async fn drain_external_agent_events_with_prefetched(
                         id: 0,
                         action: "deny".to_string(),
                     });
-                    let _ = agent
+                    if let Err(e) = agent
                         .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
-                        .await;
+                        .await
+                    {
+                        slog(config.session_log, |l| {
+                            l.warn(&format!("Failed to resolve approval: {}", e))
+                        });
+                    }
                 } else {
                     let id = approval_counter.fetch_add(1, Ordering::Relaxed);
                     config.bus.send(AppEvent::ApprovalRequired {
@@ -11400,12 +11425,17 @@ async fn drain_external_agent_events_with_prefetched(
                             slog(config.session_log, |l| {
                                 l.warn("File approval channel closed, denying")
                             });
-                            let _ = agent
+                            if let Err(e) = agent
                                 .resolve_approval(
                                     &request_id,
                                     external_agent::ApprovalDecision::Decline,
                                 )
-                                .await;
+                                .await
+                            {
+                                slog(config.session_log, |l| {
+                                    l.warn(&format!("Failed to resolve approval: {}", e))
+                                });
+                            }
                         }
                     }
                 }
@@ -13286,10 +13316,11 @@ fn extract_brief_from_text(text: &str) -> String {
     }
     // Truncate if still too long
     if sentences.len() > 200 {
-        if let Some(pos) = sentences[..200].rfind(". ") {
+        let cut = char_boundary_at_or_before(&sentences, 200);
+        if let Some(pos) = sentences[..cut].rfind(". ") {
             sentences.truncate(pos + 1);
         } else {
-            sentences.truncate(200);
+            sentences.truncate(cut);
             sentences.push_str("...");
         }
     }
@@ -24995,7 +25026,7 @@ async fn run_agent_loop(
                             format!("double_click({},{})", x, y)
                         }
                         computer_use::CuAction::Type { text } => {
-                            format!("type(\"{}\")", &text[..text.len().min(30)])
+                            format!("type(\"{}\")", types::truncate_str(text, 30))
                         }
                         computer_use::CuAction::Key { key } => format!("key({})", key),
                         computer_use::CuAction::Scroll { x, y, .. } => {
@@ -26509,7 +26540,17 @@ All relative paths and commands execute from this directory.",
             artifacts: vec![],
             usage,
         };
-        let _ = sub_agent::write_result(std::path::Path::new(&result_path), &agent_result);
+        if let Err(e) = sub_agent::write_result(std::path::Path::new(&result_path), &agent_result) {
+            // The parent discovers sub-agent completion ONLY through this
+            // file; a swallowed failure strands it polling until timeout.
+            slog(&session_log_for_summary, |l| {
+                l.error(&format!(
+                    "Failed to write sub-agent result file {}: {}",
+                    result_path, e
+                ))
+            });
+            eprintln!("Failed to write sub-agent result file {}: {}", result_path, e);
+        }
     }
 
     result
@@ -27682,7 +27723,7 @@ async fn run_with_presence(
             l.debug(&format!(
                 "CU-first routing: force_direct={}, task={}",
                 envelope.force_direct,
-                &envelope.task[..envelope.task.len().min(60)]
+                types::truncate_str(&envelope.task, 60)
             ))
         });
 
@@ -27724,11 +27765,14 @@ async fn run_with_presence(
                     slog(&session_log, |l| {
                         l.info(&format!(
                             "CU escalated to agent: {}",
-                            &task[..task.len().min(80)]
+                            types::truncate_str(&task, 80)
                         ))
                     });
                     bus.send(AppEvent::PresenceLog {
-                        message: format!("Escalating to agent: {}", &task[..task.len().min(80)]),
+                        message: format!(
+                            "Escalating to agent: {}",
+                            types::truncate_str(&task, 80)
+                        ),
                         level: None,
                         turn: None,
                     });
@@ -32309,7 +32353,7 @@ async fn try_cu_first(
             "try_cu_first: ref_images={}, frame_images={}, task={}",
             reference_images.len(),
             frame_images.len(),
-            &task[..task.len().min(60)]
+            types::truncate_str(task, 60)
         ))
     });
 
@@ -32377,13 +32421,13 @@ async fn try_cu_first(
     slog(session_log, |l| {
         l.info(&format!(
             "CU-first: {} (provider: {}, model: {})",
-            &task[..task.len().min(80)],
+            types::truncate_str(task, 80),
             cu_provider.name(),
             cu_provider.model()
         ))
     });
     bus.send(event::AppEvent::PresenceLog {
-        message: format!("Trying CU: {}", &task[..task.len().min(80)]),
+        message: format!("Trying CU: {}", types::truncate_str(task, 80)),
         level: None,
         turn: None,
     });
@@ -33075,7 +33119,7 @@ async fn run_cu_task(
                 actions_desc.push(format!(
                     "{}({})",
                     tc.name,
-                    &tc.arguments[..tc.arguments.len().min(100)]
+                    types::truncate_str(&tc.arguments, 100)
                 ));
             }
             slog(session_log, |l| {
@@ -33095,7 +33139,7 @@ async fn run_cu_task(
                 l.info(&format!(
                     "CU turn {} text: {}",
                     turn,
-                    &response.content[..response.content.len().min(500)]
+                    types::truncate_str(&response.content, 500)
                 ))
             });
         }
@@ -33188,7 +33232,7 @@ async fn run_cu_task(
         }
 
         if is_done {
-            let summary = &response.content[..response.content.len().min(200)];
+            let summary = types::truncate_str(&response.content, 200);
             slog(session_log, |l| l.cu_task_complete(turn, true, summary));
             break;
         }
@@ -33462,7 +33506,7 @@ async fn execute_cu_calls(
                     format!("double_click({},{})", x, y)
                 }
                 computer_use::CuAction::Type { text } => {
-                    format!("type(\"{}\")", &text[..text.len().min(50)])
+                    format!("type(\"{}\")", types::truncate_str(text, 50))
                 }
                 computer_use::CuAction::Key { key } => format!("key({})", key),
                 computer_use::CuAction::Scroll {
@@ -33486,7 +33530,7 @@ async fn execute_cu_calls(
                 }
                 computer_use::CuAction::MouseUp { x, y, .. } => format!("mouse_up({},{})", x, y),
                 computer_use::CuAction::Paste { text } => {
-                    format!("paste(\"{}\")", &text[..text.len().min(50)])
+                    format!("paste(\"{}\")", types::truncate_str(text, 50))
                 }
                 computer_use::CuAction::HoldKey { key, ms } => {
                     format!("hold_key({},{}ms)", key, ms)
@@ -35867,9 +35911,17 @@ async fn main() -> Result<(), CallerError> {
                                     }
                                 }
                                 event::ControlMsg::Input { text } => {
-                                    // Write human_response file for askHuman IPC
+                                    // Write human_response file for askHuman IPC.
+                                    // The agent polls for this file; a swallowed
+                                    // failure leaves it waiting forever.
                                     let resp_path = log_dir_for_stdin.join("human_response");
-                                    let _ = std::fs::write(&resp_path, text.as_bytes());
+                                    if let Err(e) = std::fs::write(&resp_path, text.as_bytes()) {
+                                        eprintln!(
+                                            "Failed to write askHuman response {}: {}",
+                                            resp_path.display(),
+                                            e
+                                        );
+                                    }
                                 }
                                 event::ControlMsg::FollowUp {
                                     text, direct: _, ..

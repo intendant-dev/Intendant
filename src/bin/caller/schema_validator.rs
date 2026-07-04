@@ -152,7 +152,7 @@ fn validate_field(
 
             // Check max length — truncate and quarantine if exceeded
             let result_str = if let Some(max_len) = max_length {
-                if s.len() > *max_len {
+                if s.chars().count() > *max_len {
                     let payload = quarantine_fn(name, "string_overflow", s);
                     quarantined.push(payload);
                     // Truncate to max_length
@@ -479,6 +479,30 @@ mod tests {
         assert_eq!(result["ref_number"], "ABCDE");
         assert_eq!(quarantined.len(), 1);
         assert_eq!(quarantined[0].content_type, "string_overflow");
+    }
+
+    #[test]
+    fn validate_string_max_length_counts_multibyte_chars() {
+        let schema = make_schema(vec![FieldSpec {
+            name: "ref_number".into(),
+            field_type: FieldType::String {
+                max_length: Some(2),
+                allowed_values: None,
+                tainted: false,
+            },
+            required: true,
+            description: None,
+        }]);
+
+        let value = serde_json::json!({"ref_number": "\u{00e9}\u{00e9}"});
+        let (result, quarantined) = validate(&schema, &value, &mut noop_quarantine).unwrap();
+        assert_eq!(result["ref_number"], "\u{00e9}\u{00e9}");
+        assert!(quarantined.is_empty());
+
+        let value = serde_json::json!({"ref_number": "\u{00e9}\u{00e9}\u{00e9}"});
+        let (result, quarantined) = validate(&schema, &value, &mut noop_quarantine).unwrap();
+        assert_eq!(result["ref_number"], "\u{00e9}\u{00e9}");
+        assert_eq!(quarantined.len(), 1);
     }
 
     #[test]

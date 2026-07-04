@@ -662,7 +662,17 @@ pub async fn close_workspace(
     workspace.message = reason.or_else(|| Some("closed".to_string()));
     workspace.updated_at = now_string();
     if let Some(pid) = workspace.process_id {
-        let _ = crate::platform::terminate_process_tree_now(pid);
+        let targets = crate::platform::terminate_process_tree_now(pid);
+        let still_alive: Vec<u32> = targets
+            .into_iter()
+            .filter(|target| crate::platform::process_alive(*target))
+            .collect();
+        if !still_alive.is_empty() {
+            eprintln!(
+                "[browser-workspace] failed to terminate workspace process tree rooted at pid {}: still alive {:?}",
+                pid, still_alive
+            );
+        }
     }
     if let Some(child) = child.as_mut() {
         let _ = child.start_kill();

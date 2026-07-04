@@ -8,7 +8,7 @@
 use crate::daemon_identity::{b64u, DaemonIdentity};
 use crate::error::CallerError;
 use crate::event::{AppEvent, ControlMsg};
-use crate::types::LogLevel;
+use crate::types::{truncate_str, LogLevel};
 use base64::Engine as _;
 use bytes::BytesMut;
 use rtc::peer_connection::configuration::setting_engine::SettingEngine;
@@ -4001,7 +4001,7 @@ fn dashboard_preview_text(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        format!("{}...", truncate_str(s, max))
     }
 }
 
@@ -10320,6 +10320,15 @@ fn sha256_b64u(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashboard_preview_text_truncates_on_char_boundary() {
+        let text = format!("{}{}", "a".repeat(199), "\u{00e9}");
+        assert_eq!(
+            dashboard_preview_text(&text, 200),
+            format!("{}...", "a".repeat(199))
+        );
+    }
 
     fn runtime() -> ControlRuntime {
         ControlRuntime {

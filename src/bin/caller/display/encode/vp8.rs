@@ -93,13 +93,16 @@ impl Vp8Encoder {
         // Real-time CPU usage tradeoff: higher = faster encode, lower
         // quality.  6 (the libvpx maximum for VP8) matches what the
         // upstream `vpx-encode` crate uses for VP9.
-        let _ = unsafe {
+        let err = unsafe {
             vpx_codec_control_(
                 &mut ctx,
                 vp8e_enc_control_id::VP8E_SET_CPUUSED as c_int,
                 6 as c_int,
             )
         };
+        if err != VPX_CODEC_OK {
+            eprintln!("[display/encode/vp8] WARN: VP8 realtime CPU tuning failed: {err:?}");
+        }
 
         Ok(Self {
             ctx,

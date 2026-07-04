@@ -207,7 +207,13 @@ pub fn scan_completed_results(sub_agent_dir: &Path) -> Vec<SubAgentResult> {
             if result_file.exists() {
                 if let Ok(result) = read_result(&result_file) {
                     results.push(result);
-                    let _ = std::fs::write(reported_marker, b"reported");
+                    if let Err(err) = std::fs::write(&reported_marker, b"reported") {
+                        eprintln!(
+                            "[sub-agent] failed to write reported marker {}: {}",
+                            reported_marker.display(),
+                            err
+                        );
+                    }
                 }
             }
         }

@@ -1884,7 +1884,20 @@ pub async fn run_session(
     // to the transcript ensures it survives crashes.
     let result_path = transcript.path().with_file_name("result.json");
     if let Ok(json) = serde_json::to_string_pretty(&result) {
-        let _ = tokio::fs::write(&result_path, json).await;
+        if let Err(err) = tokio::fs::write(&result_path, json).await {
+            let message = format!(
+                "live_audio: CRITICAL: failed to persist call result {}: {}",
+                result_path.display(),
+                err
+            );
+            eprintln!("{message}");
+            if let Err(log_err) = transcript.log("app", &message).await {
+                eprintln!(
+                    "live_audio: CRITICAL: failed to record result-persist failure in transcript: {}",
+                    log_err
+                );
+            }
+        }
     }
 
     Ok(result)

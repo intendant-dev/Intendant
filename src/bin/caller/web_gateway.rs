@@ -13406,7 +13406,7 @@ async fn read_post_body<S: AsyncRead + Unpin>(header_text: &str, stream: &mut S)
         .unwrap_or(0);
     let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
     if peeked_body.len() >= content_length {
-        return peeked_body[..content_length].to_string();
+        return crate::types::truncate_str(peeked_body, content_length).to_string();
     }
     let mut full = peeked_body.to_string();
     let remaining = content_length.saturating_sub(peeked_body.len());
@@ -22133,7 +22133,7 @@ pub fn spawn_web_gateway(
                         let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
                         let body_owned;
                         let body_text = if peeked_body.len() >= content_length {
-                            &peeked_body[..content_length]
+                            crate::types::truncate_str(peeked_body, content_length)
                         } else {
                             let remaining = content_length.saturating_sub(peeked_body.len());
                             let mut full = peeked_body.to_string();
@@ -22266,7 +22266,7 @@ pub fn spawn_web_gateway(
                         let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
                         let body_owned;
                         let body_text = if peeked_body.len() >= content_length {
-                            &peeked_body[..content_length]
+                            crate::types::truncate_str(peeked_body, content_length)
                         } else {
                             let remaining = content_length.saturating_sub(peeked_body.len());
                             let mut full = peeked_body.to_string();
@@ -24431,7 +24431,7 @@ pub fn spawn_web_gateway(
                             let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
                             let body_owned;
                             let body_text = if peeked_body.len() >= content_length {
-                                &peeked_body[..content_length]
+                                crate::types::truncate_str(peeked_body, content_length)
                             } else {
                                 let remaining = content_length.saturating_sub(peeked_body.len());
                                 let mut full = peeked_body.to_string();
@@ -26951,7 +26951,7 @@ async fn read_request_body<S: AsyncRead + Unpin>(stream: &mut S, header_text: &s
     }
     let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
     if peeked_body.len() >= content_length {
-        return peeked_body[..content_length].to_string();
+        return crate::types::truncate_str(peeked_body, content_length).to_string();
     }
     let remaining = content_length.saturating_sub(peeked_body.len());
     let mut full = peeked_body.to_string();
@@ -26985,7 +26985,7 @@ async fn read_request_body_capped<S: AsyncRead + Unpin>(
     }
     let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
     if peeked_body.len() >= content_length {
-        return Ok(peeked_body[..content_length].to_string());
+        return Ok(crate::types::truncate_str(peeked_body, content_length).to_string());
     }
     let remaining = content_length.saturating_sub(peeked_body.len());
     let mut full = peeked_body.to_string();
@@ -29936,6 +29936,16 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn read_request_body_capped_truncates_peeked_body_on_char_boundary() {
+        let mut stream = tokio::io::empty();
+        let header_text = "POST /api/peers HTTP/1.1\r\nContent-Length: 1\r\n\r\n\u{00e9}";
+        let body = read_request_body_capped(&mut stream, header_text, 32)
+            .await
+            .unwrap();
+        assert_eq!(body, "");
+    }
 
     struct EnvVarGuard {
         key: &'static str,
