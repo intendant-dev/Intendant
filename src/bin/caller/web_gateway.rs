@@ -23030,6 +23030,1206 @@ pub fn spawn_web_gateway(
                                 use tokio::io::AsyncWriteExt;
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
+                            RouteHandlerId::FsStat => {
+                                use tokio::io::AsyncWriteExt;
+                                let path = query_param(request_line, "path").unwrap_or_default();
+                                let response = match inspect_dashboard_fs_path(&path) {
+                                    Ok(status) => json_response(
+                                        "200 OK",
+                                        serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string()),
+                                    ),
+                                    Err(e) => json_error("400 Bad Request", e),
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::FsList => {
+                                use tokio::io::AsyncWriteExt;
+                                let path = query_param(request_line, "path").unwrap_or_default();
+                                let response = match list_dashboard_fs_dir(&path) {
+                                    Ok(body) => json_ok(body),
+                                    Err(e) => json_error("400 Bad Request", e),
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::FsRead => {
+                                use tokio::io::AsyncWriteExt;
+                                let path = query_param(request_line, "path").unwrap_or_default();
+                                let range_header = dashboard_http_header_value(&header_text, "range");
+                                match dashboard_fs_read_file(&path, range_header) {
+                                    Ok(file) => {
+                                        let status = if file.partial {
+                                            "206 Partial Content"
+                                        } else {
+                                            "200 OK"
+                                        };
+                                        let content_range = if file.partial {
+                                            format!(
+                                                "Content-Range: bytes {}-{}/{}\r\n",
+                                                file.range_start,
+                                                file.range_end.saturating_sub(1),
+                                                file.total_size
+                                            )
+                                        } else {
+                                            String::new()
+                                        };
+                                        // Full (non-range) reads carry the content
+                                        // hash so the editor has a conflict baseline
+                                        // for its later write-back.
+                                        let sha_header = if file.partial {
+                                            String::new()
+                                        } else {
+                                            format!("X-Content-Sha256: {}\r\n", fs_sha256_hex(&file.bytes))
+                                        };
+                                        let header = format!(
+                                            "HTTP/1.1 {}\r\n\
+                                             Content-Type: {}\r\n\
+                                             Content-Length: {}\r\n\
+                                             Accept-Ranges: bytes\r\n\
+                                             {}\
+                                             {}\
+                                             Content-Disposition: attachment; filename=\"{}\"\r\n\
+                                             Cache-Control: no-cache\r\n\
+                                             Access-Control-Allow-Origin: *\r\n\
+                                             Access-Control-Expose-Headers: X-Content-Sha256\r\n\
+                                             Connection: close\r\n\
+                                             \r\n",
+                                            status,
+                                            file.content_type,
+                                            file.bytes.len(),
+                                            content_range,
+                                            sha_header,
+                                            file.filename.replace('"', ""),
+                                        );
+                                        let _ = stream.write_all(header.as_bytes()).await;
+                                        let _ = stream.write_all(&file.bytes).await;
+                                    }
+                                    Err(error) => {
+                                        let response = if let Some(total_size) = error.total_size {
+                                            let body =
+                                                serde_json::json!({ "error": error.message }).to_string();
+                                            format!(
+                                                "HTTP/1.1 {}\r\n\
+                                                 Content-Type: application/json\r\n\
+                                                 Content-Length: {}\r\n\
+                                                 Content-Range: bytes */{}\r\n\
+                                                 Accept-Ranges: bytes\r\n\
+                                                 Cache-Control: no-cache\r\n\
+                                                 Access-Control-Allow-Origin: *\r\n\
+                                                 Connection: close\r\n\
+                                                 \r\n\
+                                                 {}",
+                                                error.status,
+                                                body.len(),
+                                                total_size,
+                                                body
+                                            )
+                                        } else {
+                                            json_error(&error.status, error.message)
+                                        };
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    }
+                                }
+                            }
+                            RouteHandlerId::FsMkdir => {
+                                use tokio::io::AsyncWriteExt;
+                                let body_text = read_post_body(&header_text, &mut stream).await;
+                                let response = match serde_json::from_str::<FsMkdirRequest>(&body_text) {
+                                    Ok(req) => match authorize_http_filesystem_access(
+                                        &http_access_context,
+                                        peer_connection_identity.as_ref(),
+                                        crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                        crate::peer::access_policy::FilesystemAccessKind::Write,
+                                        &req.path,
+                                        &bus,
+                                    ) {
+                                        Ok(()) => match mkdir_dashboard_fs_path(&req.path) {
+                                            Ok(body) => json_ok(body),
+                                            Err((status, message)) => json_error(&status, message),
+                                        },
+                                        Err(message) => json_error("403 Forbidden", message),
+                                    },
+                                    Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::FsRename => {
+                                use tokio::io::AsyncWriteExt;
+                                let body_text = read_post_body(&header_text, &mut stream).await;
+                                let response = match serde_json::from_str::<FsRenameRequest>(&body_text) {
+                                    // Removing the source entry and creating the
+                                    // destination are both writes — each leg passes
+                                    // the write-scope gate on its own path.
+                                    Ok(req) => match authorize_http_filesystem_access(
+                                        &http_access_context,
+                                        peer_connection_identity.as_ref(),
+                                        crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                        crate::peer::access_policy::FilesystemAccessKind::Write,
+                                        &req.from,
+                                        &bus,
+                                    )
+                                    .and_then(|()| {
+                                        authorize_http_filesystem_access(
+                                            &http_access_context,
+                                            peer_connection_identity.as_ref(),
+                                            crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                            crate::peer::access_policy::FilesystemAccessKind::Write,
+                                            &req.to,
+                                            &bus,
+                                        )
+                                    }) {
+                                        Ok(()) => {
+                                            let (status, body) = tokio::task::spawn_blocking(move || {
+                                                apply_dashboard_fs_rename(&req.from, &req.to)
+                                            })
+                                            .await
+                                            .unwrap_or_else(|e| {
+                                                (
+                                                    "500 Internal Server Error".to_string(),
+                                                    serde_json::json!({
+                                                        "error": format!(
+                                                            "filesystem rename task failed: {e}"
+                                                        )
+                                                    }),
+                                                )
+                                            });
+                                            json_response(&status, body.to_string())
+                                        }
+                                        Err(message) => json_error("403 Forbidden", message),
+                                    },
+                                    Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::FsDelete => {
+                                use tokio::io::AsyncWriteExt;
+                                let body_text = read_post_body(&header_text, &mut stream).await;
+                                let response = match serde_json::from_str::<FsDeleteRequest>(&body_text) {
+                                    Ok(req) => match authorize_http_filesystem_access(
+                                        &http_access_context,
+                                        peer_connection_identity.as_ref(),
+                                        crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                        crate::peer::access_policy::FilesystemAccessKind::Write,
+                                        &req.path,
+                                        &bus,
+                                    ) {
+                                        Ok(()) => {
+                                            let (status, body) = tokio::task::spawn_blocking(move || {
+                                                apply_dashboard_fs_delete(&req.path, req.recursive)
+                                            })
+                                            .await
+                                            .unwrap_or_else(|e| {
+                                                (
+                                                    "500 Internal Server Error".to_string(),
+                                                    serde_json::json!({
+                                                        "error": format!(
+                                                            "filesystem delete task failed: {e}"
+                                                        )
+                                                    }),
+                                                )
+                                            });
+                                            json_response(&status, body.to_string())
+                                        }
+                                        Err(message) => json_error("403 Forbidden", message),
+                                    },
+                                    Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::CurrentHistory => {
+                                // GET /api/session/current/history — serialized History.
+                                use tokio::io::AsyncWriteExt;
+                                let (status, body) = handle_history_get(file_watcher.as_ref()).await;
+                                let response = format!(
+                                    "HTTP/1.1 {}\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    status,
+                                    body.len(),
+                                    body,
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::CurrentRollback => {
+                                // POST /api/session/current/rollback body:
+                                //   {"round_id": N,
+                                //    "revert_files": bool (default true),
+                                //    "revert_conversation": bool (default false)}
+                                use tokio::io::AsyncWriteExt;
+                                let body_text = read_post_body(&header_text, &mut stream).await;
+                                let agent_state = query_ctx.as_ref().map(|ctx| ctx.agent_state.clone());
+                                let (status, body) = handle_history_rollback(
+                                    &body_text,
+                                    file_watcher.as_ref(),
+                                    agent_state.as_ref(),
+                                    &bus,
+                                )
+                                .await;
+                                let response = format!(
+                                    "HTTP/1.1 {}\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    status,
+                                    body.len(),
+                                    body,
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::CurrentRedo => {
+                                // POST /api/session/current/redo — no body required.
+                                use tokio::io::AsyncWriteExt;
+                                let _ = read_post_body(&header_text, &mut stream).await;
+                                let agent_state = query_ctx.as_ref().map(|ctx| ctx.agent_state.clone());
+                                let (status, body) =
+                                    handle_history_redo(file_watcher.as_ref(), agent_state.as_ref()).await;
+                                let response = format!(
+                                    "HTTP/1.1 {}\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    status,
+                                    body.len(),
+                                    body,
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::CurrentPrune => {
+                                // POST /api/session/current/prune — no body required.
+                                use tokio::io::AsyncWriteExt;
+                                let _ = read_post_body(&header_text, &mut stream).await;
+                                let (status, body) = handle_history_prune(file_watcher.as_ref()).await;
+                                let response = format!(
+                                    "HTTP/1.1 {}\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    status,
+                                    body.len(),
+                                    body,
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::CurrentAgentOutput => {
+                                use tokio::io::AsyncWriteExt;
+                                let log_dir =
+                                    current_session_log_dir(session_log.as_ref(), query_ctx.as_ref());
+                                let body_text = read_post_body(&header_text, &mut stream).await;
+                                let response = match log_dir {
+                                    Some(dir) => current_agent_output_post_response(&body_text, &dir),
+                                    None => upload_error_response("404 Not Found", "no active session log"),
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::CurrentUploadsPost => {
+                                // POST /api/session/current/uploads?name=<fn>&destination=task|workspace
+                                //   Content-Type: <mime>
+                                //   <raw bytes>
+                                //
+                                // Streams the body into a tempfile, commits it into
+                                // the project-local ignored upload store
+                                // (`.intendant/uploads/<session-id>/`), and
+                                // broadcasts UploadReady so all connected browsers
+                                // see it.
+                                //
+                                // Route sits in the `/api/session/current/*` family
+                                // alongside `changes`, `history`, `rollback`, etc.
+                                // That namespace is browser-session managed — not
+                                // part of `is_federation_path`, so bearer-token auth
+                                // doesn't apply. If a WAN-exposed deploy wants to
+                                // protect uploads, gate the whole family at once.
+                                use tokio::io::AsyncWriteExt;
+                                let response = 'upload: {
+                                    let Some(ref root) = project_root_for_changes else {
+                                        break 'upload upload_error_response(
+                                            "400 Bad Request",
+                                            "no project root",
+                                        );
+                                    };
+
+                                    let name = query_param(request_line, "name")
+                                        .unwrap_or_else(|| "upload.bin".to_string());
+                                    let requested_destination = query_param(request_line, "destination")
+                                        .as_deref()
+                                        .and_then(crate::upload_store::UploadDestination::from_str)
+                                        .unwrap_or(crate::upload_store::UploadDestination::Task);
+                                    let mime = content_type_header(&header_text);
+                                    if header_text
+                                        .lines()
+                                        .any(|l| l.trim().eq_ignore_ascii_case("expect: 100-continue"))
+                                    {
+                                        let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+                                    }
+
+                                    match stream_body_to_tempfile(
+                                        &header_text,
+                                        &discard,
+                                        &mut stream,
+                                        UPLOAD_MAX_BYTES,
+                                    )
+                                    .await
+                                    {
+                                        Err(e) => {
+                                            let status = if e.contains("too large") {
+                                                "413 Payload Too Large"
+                                            } else {
+                                                "400 Bad Request"
+                                            };
+                                            break 'upload upload_error_response(status, &e);
+                                        }
+                                        Ok((tmp, size)) => {
+                                            let (session_dir, session_id) = {
+                                                if let Some(ref slog) = session_log {
+                                                    match slog.lock() {
+                                                        Ok(l) => (
+                                                            l.dir().to_path_buf(),
+                                                            l.session_id().to_string(),
+                                                        ),
+                                                        Err(_) => {
+                                                            break 'upload upload_error_response(
+                                                                "500 Internal Server Error",
+                                                                "session log lock poisoned",
+                                                            );
+                                                        }
+                                                    }
+                                                } else {
+                                                    (
+                                                        pending_upload_session_dir(root),
+                                                        daemon_session_id
+                                                            .clone()
+                                                            .unwrap_or_else(|| "pending".to_string()),
+                                                    )
+                                                }
+                                            };
+                                            let destination = effective_upload_destination(
+                                                requested_destination,
+                                                session_log.is_some(),
+                                            );
+                                            match crate::upload_store::commit_upload(
+                                                tmp,
+                                                &name,
+                                                &mime,
+                                                size as u64,
+                                                destination,
+                                                &session_dir,
+                                                &session_id,
+                                                root,
+                                            ) {
+                                                Ok(descriptor) => {
+                                                    bus.send(crate::event::AppEvent::UploadReady {
+                                                        descriptor: descriptor.clone(),
+                                                    });
+                                                    let body = serde_json::to_string(&descriptor)
+                                                        .unwrap_or_else(|_| "{}".to_string());
+                                                    format!(
+                                                        "HTTP/1.1 200 OK\r\n\
+                                                         Content-Type: application/json\r\n\
+                                                         Content-Length: {}\r\n\
+                                                         Cache-Control: no-cache\r\n\
+                                                         Access-Control-Allow-Origin: *\r\n\
+                                                         Connection: close\r\n\
+                                                         \r\n\
+                                                         {}",
+                                                        body.len(),
+                                                        body
+                                                    )
+                                                }
+                                                Err(e) => upload_error_response(
+                                                    "500 Internal Server Error",
+                                                    &format!("commit upload: {e}"),
+                                                ),
+                                            }
+                                        }
+                                    }
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::CurrentUploadsGet => {
+                                // GET /api/session/current/uploads           — list uploads for the current session
+                                // GET /api/session/current/uploads/<id>/raw  — stream bytes of one upload
+                                use tokio::io::AsyncWriteExt;
+                                let response = 'get_upload: {
+                                    let Some(ref root) = project_root_for_changes else {
+                                        break 'get_upload upload_error_response(
+                                            "404 Not Found",
+                                            "no project root",
+                                        );
+                                    };
+                                    let session_dir = if let Some(ref slog) = session_log {
+                                        match slog.lock() {
+                                            Ok(l) => l.dir().to_path_buf(),
+                                            Err(_) => {
+                                                break 'get_upload upload_error_response(
+                                                    "500 Internal Server Error",
+                                                    "session log lock poisoned",
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        pending_upload_session_dir(root)
+                                    };
+                                    // Path after /api/session/current/uploads
+                                    let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
+                                    let path = path_and_q.split('?').next().unwrap_or("");
+                                    let suffix = path
+                                        .trim_start_matches("/api/session/current/uploads")
+                                        .trim_matches('/');
+                                    if suffix.is_empty() {
+                                        let uploads = crate::upload_store::list_uploads(&session_dir, root);
+                                        let body = serde_json::to_string(&uploads)
+                                            .unwrap_or_else(|_| "[]".to_string());
+                                        format!(
+                                            "HTTP/1.1 200 OK\r\n\
+                                             Content-Type: application/json\r\n\
+                                             Content-Length: {}\r\n\
+                                             Cache-Control: no-cache\r\n\
+                                             Access-Control-Allow-Origin: *\r\n\
+                                             Connection: close\r\n\
+                                             \r\n\
+                                             {}",
+                                            body.len(),
+                                            body
+                                        )
+                                    } else if let Some(id) = suffix.strip_suffix("/raw") {
+                                        // GET raw bytes for one upload.
+                                        match crate::upload_store::find_upload(id, &session_dir, root) {
+                                            None => {
+                                                upload_error_response("404 Not Found", "upload not found")
+                                            }
+                                            Some(d) => {
+                                                match std::fs::read(&d.path) {
+                                                    Ok(bytes) => {
+                                                        let header = format!(
+                                                            "HTTP/1.1 200 OK\r\n\
+                                                             Content-Type: {}\r\n\
+                                                             Content-Length: {}\r\n\
+                                                             Content-Disposition: inline; filename=\"{}\"\r\n\
+                                                             Cache-Control: no-cache\r\n\
+                                                             Access-Control-Allow-Origin: *\r\n\
+                                                             Connection: close\r\n\
+                                                             \r\n",
+                                                            d.mime,
+                                                            bytes.len(),
+                                                            d.name.replace('"', ""),
+                                                        );
+                                                        let _ = stream.write_all(header.as_bytes()).await;
+                                                        let _ = stream.write_all(&bytes).await;
+                                                        // Skip the trailing write_all below.
+                                                        break 'get_upload String::new();
+                                                    }
+                                                    Err(e) => upload_error_response(
+                                                        "500 Internal Server Error",
+                                                        &format!("read upload: {e}"),
+                                                    ),
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        upload_error_response("404 Not Found", "unknown upload route")
+                                    }
+                                };
+                                if !response.is_empty() {
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                }
+                            }
+                            RouteHandlerId::CurrentUploadDelete => {
+                                // DELETE /api/session/current/uploads/<id> — remove the file + sidecar.
+                                use tokio::io::AsyncWriteExt;
+                                let response = {
+                                    let session_dir = if let Some(ref slog) = session_log {
+                                        match slog.lock() {
+                                            Ok(l) => Ok(Some(l.dir().to_path_buf())),
+                                            Err(_) => Err("session log lock poisoned"),
+                                        }
+                                    } else {
+                                        Ok(None)
+                                    };
+                                    match session_dir {
+                                        Err(error) => json_response(
+                                            "500 Internal Server Error",
+                                            serde_json::json!({ "error": error }).to_string(),
+                                        ),
+                                        Ok(session_dir) => {
+                                            let path_and_q =
+                                                request_line.split_whitespace().nth(1).unwrap_or("");
+                                            let path = path_and_q.split('?').next().unwrap_or("");
+                                            let id = path
+                                                .trim_start_matches("/api/session/current/uploads/")
+                                                .trim_matches('/');
+                                            let (status, body, deleted_id) =
+                                                current_upload_delete_response_body(
+                                                    project_root_for_changes.as_deref(),
+                                                    session_dir.as_deref(),
+                                                    id,
+                                                );
+                                            if let Some(id) = deleted_id {
+                                                bus.send(crate::event::AppEvent::UploadDeleted { id });
+                                            }
+                                            json_response(status, body)
+                                        }
+                                    }
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::SessionDelete => {
+                                // DELETE /api/session/{id}[/{target}]  (native DELETE)
+                                // POST  /api/session/{id}/delete[/{target}]  (WKWebView fallback)
+                                use tokio::io::AsyncWriteExt;
+                                let rest = request_line
+                                    .split("/api/session/")
+                                    .nth(1)
+                                    .and_then(|r| r.split_whitespace().next())
+                                    .unwrap_or("");
+                                let rest_parts: Vec<&str> = rest
+                                    .split('/')
+                                    .filter(|s| !s.is_empty() && *s != "delete")
+                                    .collect();
+                                let session_id = rest_parts.first().copied().unwrap_or("");
+                                let target = rest_parts.get(1).copied().unwrap_or("session");
+                                let body = delete_session_data(session_id, target);
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::SessionAgentOutput => {
+                                use tokio::io::AsyncWriteExt;
+                                let rest = request_line
+                                    .split("/api/session/")
+                                    .nth(1)
+                                    .and_then(|r| r.split_whitespace().next())
+                                    .unwrap_or("");
+                                let path = rest.split('?').next().unwrap_or(rest);
+                                let rest_parts: Vec<&str> =
+                                    path.split('/').filter(|s| !s.is_empty()).collect();
+                                let session_id = rest_parts.first().copied().unwrap_or("");
+                                let is_agent_output_route =
+                                    rest_parts.get(1).copied() == Some("agent-output");
+                                let source = query_param(request_line, "source")
+                                    .unwrap_or_else(|| "intendant".to_string());
+                                let body_text = read_post_body(&header_text, &mut stream).await;
+                                let response = if is_agent_output_route {
+                                    session_agent_output_post_response(&body_text, session_id, &source)
+                                } else {
+                                    upload_error_response("404 Not Found", "unknown session output route")
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::SessionSubRouter => {
+                                use tokio::io::AsyncWriteExt;
+                                // Extract the rest after /api/session/ and split into parts
+                                let rest = request_line
+                                    .split("/api/session/")
+                                    .nth(1)
+                                    .and_then(|r| r.split_whitespace().next())
+                                    .unwrap_or("");
+                                let rest_parts: Vec<&str> = rest.split('/').collect();
+
+                                let route_name = rest_parts
+                                    .get(1)
+                                    .map(|part| part.split('?').next().unwrap_or(part))
+                                    .unwrap_or("");
+
+                                if rest_parts.len() >= 2 && route_name == "context-snapshot" {
+                                    // GET /api/session/{id}/context-snapshot?file=...
+                                    // Replays exactly one archived context snapshot
+                                    // on demand so historical session replay can stay
+                                    // lightweight by default.
+                                    let raw_id = rest_parts[0];
+                                    let session_id = raw_id.split('?').next().unwrap_or(raw_id);
+                                    let source = query_param(request_line, "source")
+                                        .unwrap_or_else(|| "intendant".to_string());
+                                    let (status, body) = get_session_context_snapshot_from_home(
+                                        &crate::platform::home_dir(),
+                                        session_id,
+                                        &source,
+                                        request_line,
+                                    );
+                                    let response = format!(
+                                        "HTTP/1.1 {status}\r\n\
+                                         Content-Type: application/json\r\n\
+                                         Content-Length: {}\r\n\
+                                         Cache-Control: no-cache\r\n\
+                                         Connection: close\r\n\
+                                         \r\n\
+                                         {}",
+                                        body.len(),
+                                        body
+                                    );
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                } else if rest_parts.len() >= 2 && route_name == "recordings" {
+                                    // Session recording sub-routes: /api/session/{id}/recordings[/...]
+                                    let session_id = rest_parts[0];
+                                    let rec_rest = &rest_parts[2..]; // parts after "recordings"
+
+                                    if !session_lookup_id_is_safe(session_id) {
+                                        let response =
+                                            upload_error_response("400 Bad Request", "invalid session id");
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    } else if rec_rest.len() == 2 && rec_rest[1] == "segments" {
+                                        // GET /api/session/{id}/recordings/{stream}/segments
+                                        let stream_name = rec_rest[0];
+                                        let body =
+                                            if let Some(session_dir) = resolve_session_dir(session_id) {
+                                                let stream_dir =
+                                                    session_dir.join("recordings").join(stream_name);
+                                                let segments = crate::recording::parse_segment_csv_pub(
+                                                    &stream_dir.join("segments.csv"),
+                                                    &stream_dir,
+                                                );
+                                                let seg_json: Vec<serde_json::Value> = segments
+                                                    .iter()
+                                                    .map(|s| {
+                                                        serde_json::json!({
+                                                            "filename": s.filename,
+                                                            "start_secs": s.start_secs,
+                                                            "end_secs": s.end_secs,
+                                                        })
+                                                    })
+                                                    .collect();
+                                                serde_json::to_string(&seg_json).unwrap_or("[]".to_string())
+                                            } else {
+                                                "[]".to_string()
+                                            };
+                                        let response = format!(
+                                            "HTTP/1.1 200 OK\r\n\
+                                             Content-Type: application/json\r\n\
+                                             Content-Length: {}\r\n\
+                                             Cache-Control: no-cache\r\n\
+                                             Connection: close\r\n\
+                                             \r\n\
+                                             {}",
+                                            body.len(),
+                                            body
+                                        );
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    } else if rec_rest.len() == 2 && rec_rest[1] == "playlist.m3u8" {
+                                        // GET /api/session/{id}/recordings/{stream}/playlist.m3u8
+                                        let stream_name = rec_rest[0];
+                                        let segments = resolve_session_dir(session_id)
+                                            .map(|session_dir| {
+                                                let stream_dir =
+                                                    session_dir.join("recordings").join(stream_name);
+                                                crate::recording::parse_segment_csv_pub(
+                                                    &stream_dir.join("segments.csv"),
+                                                    &stream_dir,
+                                                )
+                                            })
+                                            .unwrap_or_default();
+                                        let m3u8 = recording_playlist_m3u8(&segments);
+                                        let response = format!(
+                                            "HTTP/1.1 200 OK\r\n\
+                                             Content-Type: application/vnd.apple.mpegurl\r\n\
+                                             Content-Length: {}\r\n\
+                                             Cache-Control: no-cache\r\n\
+                                             Connection: close\r\n\
+                                             \r\n\
+                                             {}",
+                                            m3u8.len(),
+                                            m3u8
+                                        );
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    } else if rec_rest.len() == 2 {
+                                        // GET /api/session/{id}/recordings/{stream}/{filename}
+                                        let stream_name = rec_rest[0];
+                                        let filename = rec_rest[1];
+                                        let valid = filename.starts_with("seg_")
+                                            && (filename.ends_with(".mp4") || filename.ends_with(".ts"))
+                                            && filename.len() < 30
+                                            && !filename.contains("..");
+                                        if valid {
+                                            let seg_ct = if filename.ends_with(".ts") {
+                                                "video/mp2t"
+                                            } else {
+                                                "video/mp4"
+                                            };
+                                            let seg_path = resolve_session_dir(session_id).map(|d| {
+                                                d.join("recordings").join(stream_name).join(filename)
+                                            });
+                                            if let Some(path) = seg_path.filter(|p| p.exists()) {
+                                                match tokio::fs::read(&path).await {
+                                                    Ok(data) => {
+                                                        let header = format!(
+                                                            "HTTP/1.1 200 OK\r\n\
+                                                             Content-Type: {}\r\n\
+                                                             Content-Length: {}\r\n\
+                                                             Cache-Control: public, max-age=3600\r\n\
+                                                             Connection: close\r\n\
+                                                             \r\n",
+                                                            seg_ct,
+                                                            data.len()
+                                                        );
+                                                        let _ = stream.write_all(header.as_bytes()).await;
+                                                        let _ = stream.write_all(&data).await;
+                                                    }
+                                                    Err(_) => {
+                                                        let body = "Failed to read segment";
+                                                        let response = format!(
+                                                            "HTTP/1.1 500 Internal Server Error\r\n\
+                                                             Content-Type: text/plain\r\n\
+                                                             Content-Length: {}\r\n\
+                                                             Connection: close\r\n\
+                                                             \r\n\
+                                                             {}",
+                                                            body.len(),
+                                                            body
+                                                        );
+                                                        let _ = stream.write_all(response.as_bytes()).await;
+                                                    }
+                                                }
+                                            } else {
+                                                let body = "Segment not found";
+                                                let response = format!(
+                                                    "HTTP/1.1 404 Not Found\r\n\
+                                                     Content-Type: text/plain\r\n\
+                                                     Content-Length: {}\r\n\
+                                                     Connection: close\r\n\
+                                                     \r\n\
+                                                     {}",
+                                                    body.len(),
+                                                    body
+                                                );
+                                                let _ = stream.write_all(response.as_bytes()).await;
+                                            }
+                                        } else {
+                                            let body = "Invalid filename";
+                                            let response = format!(
+                                                "HTTP/1.1 400 Bad Request\r\n\
+                                                 Content-Type: text/plain\r\n\
+                                                 Content-Length: {}\r\n\
+                                                 Connection: close\r\n\
+                                                 \r\n\
+                                                 {}",
+                                                body.len(),
+                                                body
+                                            );
+                                            let _ = stream.write_all(response.as_bytes()).await;
+                                        }
+                                    } else {
+                                        // GET /api/session/{id}/recordings — list streams
+                                        let (status, body) =
+                                            session_recordings_list_response_body(session_id);
+                                        let response = format!(
+                                            "HTTP/1.1 {status}\r\n\
+                                             Content-Type: application/json\r\n\
+                                             Content-Length: {}\r\n\
+                                             Cache-Control: no-cache\r\n\
+                                             Connection: close\r\n\
+                                             \r\n\
+                                             {}",
+                                            body.len(),
+                                            body
+                                        );
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    }
+                                } else if rest_parts.len() >= 2 && route_name == "report" {
+                                    // GET /api/session/{id}/report — download a zip of
+                                    // the current session's text artifacts for sharing
+                                    // with the dev. Pass id="current" to target the
+                                    // live daemon's own session via WebQueryCtx.
+                                    use tokio::io::AsyncWriteExt;
+                                    let session_id = rest_parts[0];
+                                    if session_id != "current" && !session_lookup_id_is_safe(session_id) {
+                                        let response =
+                                            upload_error_response("400 Bad Request", "invalid session id");
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    } else {
+                                        let resolved_dir: Option<PathBuf> = if session_id == "current" {
+                                            current_session_log_dir(
+                                                session_log.as_ref(),
+                                                query_ctx.as_ref(),
+                                            )
+                                        } else {
+                                            resolve_session_dir(session_id)
+                                        };
+                                        match resolved_dir {
+                                            Some(dir) => match build_session_report_zip(&dir) {
+                                                Ok(bytes) => {
+                                                    let fname = dir
+                                                        .file_name()
+                                                        .map(|n| n.to_string_lossy().to_string())
+                                                        .unwrap_or_else(|| "session".to_string());
+                                                    let header = format!(
+                                                        "HTTP/1.1 200 OK\r\n\
+                                                         Content-Type: application/zip\r\n\
+                                                         Content-Length: {}\r\n\
+                                                         Content-Disposition: attachment; filename=\"intendant-session-{}.zip\"\r\n\
+                                                         Cache-Control: no-cache\r\n\
+                                                         Connection: close\r\n\
+                                                         \r\n",
+                                                        bytes.len(),
+                                                        fname
+                                                    );
+                                                    let _ = stream.write_all(header.as_bytes()).await;
+                                                    let _ = stream.write_all(&bytes).await;
+                                                }
+                                                Err(e) => {
+                                                    let body = format!("Failed to build report: {}", e);
+                                                    let response = format!(
+                                                        "HTTP/1.1 500 Internal Server Error\r\n\
+                                                         Content-Type: text/plain\r\n\
+                                                         Content-Length: {}\r\n\
+                                                         Connection: close\r\n\
+                                                         \r\n\
+                                                         {}",
+                                                        body.len(),
+                                                        body
+                                                    );
+                                                    let _ = stream.write_all(response.as_bytes()).await;
+                                                }
+                                            },
+                                            None => {
+                                                let body = "Session not found";
+                                                let response = format!(
+                                                    "HTTP/1.1 404 Not Found\r\n\
+                                                     Content-Type: text/plain\r\n\
+                                                     Content-Length: {}\r\n\
+                                                     Connection: close\r\n\
+                                                     \r\n\
+                                                     {}",
+                                                    body.len(),
+                                                    body
+                                                );
+                                                let _ = stream.write_all(response.as_bytes()).await;
+                                            }
+                                        }
+                                    }
+                                } else if rest_parts.len() >= 2 && route_name == "frames" {
+                                    // Session frame sub-routes: /api/session/{id}/frames[/{filename}]
+                                    use tokio::io::AsyncWriteExt;
+                                    let session_id = rest_parts[0];
+                                    let frame_rest = &rest_parts[2..];
+
+                                    if !session_lookup_id_is_safe(session_id) {
+                                        let response =
+                                            upload_error_response("400 Bad Request", "invalid session id");
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    } else if frame_rest.len() == 1 {
+                                        // GET /api/session/{id}/frames/{filename}
+                                        let filename = frame_rest[0];
+                                        let valid = (filename.ends_with(".jpg")
+                                            || filename.ends_with(".png"))
+                                            && filename.len() < 80
+                                            && !filename.contains("..");
+                                        if valid {
+                                            let ct = if filename.ends_with(".png") {
+                                                "image/png"
+                                            } else {
+                                                "image/jpeg"
+                                            };
+                                            let frame_path = resolve_session_dir(session_id)
+                                                .map(|d| d.join("frames").join(filename));
+                                            if let Some(path) = frame_path.filter(|p| p.exists()) {
+                                                match tokio::fs::read(&path).await {
+                                                    Ok(data) => {
+                                                        let header = format!(
+                                                            "HTTP/1.1 200 OK\r\n\
+                                                             Content-Type: {}\r\n\
+                                                             Content-Length: {}\r\n\
+                                                             Cache-Control: public, max-age=3600\r\n\
+                                                             Connection: close\r\n\
+                                                             \r\n",
+                                                            ct,
+                                                            data.len()
+                                                        );
+                                                        let _ = stream.write_all(header.as_bytes()).await;
+                                                        let _ = stream.write_all(&data).await;
+                                                    }
+                                                    Err(_) => {
+                                                        let body = "Failed to read frame";
+                                                        let response = format!(
+                                                            "HTTP/1.1 500 Internal Server Error\r\n\
+                                                             Content-Type: text/plain\r\n\
+                                                             Content-Length: {}\r\n\
+                                                             Connection: close\r\n\
+                                                             \r\n\
+                                                             {}",
+                                                            body.len(),
+                                                            body
+                                                        );
+                                                        let _ = stream.write_all(response.as_bytes()).await;
+                                                    }
+                                                }
+                                            } else {
+                                                let body = "Frame not found";
+                                                let response = format!(
+                                                    "HTTP/1.1 404 Not Found\r\n\
+                                                     Content-Type: text/plain\r\n\
+                                                     Content-Length: {}\r\n\
+                                                     Connection: close\r\n\
+                                                     \r\n\
+                                                     {}",
+                                                    body.len(),
+                                                    body
+                                                );
+                                                let _ = stream.write_all(response.as_bytes()).await;
+                                            }
+                                        } else {
+                                            let body = "Invalid filename";
+                                            let response = format!(
+                                                "HTTP/1.1 400 Bad Request\r\n\
+                                                 Content-Type: text/plain\r\n\
+                                                 Content-Length: {}\r\n\
+                                                 Connection: close\r\n\
+                                                 \r\n\
+                                                 {}",
+                                                body.len(),
+                                                body
+                                            );
+                                            let _ = stream.write_all(response.as_bytes()).await;
+                                        }
+                                    } else {
+                                        // GET /api/session/{id}/frames — list frame filenames
+                                        let body = if let Some(session_dir) =
+                                            resolve_session_dir(session_id)
+                                        {
+                                            let frames_dir = session_dir.join("frames");
+                                            let mut names: Vec<String> = Vec::new();
+                                            if frames_dir.is_dir() {
+                                                if let Ok(entries) = std::fs::read_dir(&frames_dir) {
+                                                    for e in entries.flatten() {
+                                                        let n = e.file_name().to_string_lossy().to_string();
+                                                        if n.ends_with(".jpg") || n.ends_with(".png") {
+                                                            names.push(n);
+                                                        }
+                                                    }
+                                                }
+                                                names.sort();
+                                            }
+                                            serde_json::to_string(&names).unwrap_or("[]".to_string())
+                                        } else {
+                                            "[]".to_string()
+                                        };
+                                        let response = format!(
+                                            "HTTP/1.1 200 OK\r\n\
+                                             Content-Type: application/json\r\n\
+                                             Content-Length: {}\r\n\
+                                             Cache-Control: no-cache\r\n\
+                                             Connection: close\r\n\
+                                             \r\n\
+                                             {}",
+                                            body.len(),
+                                            body
+                                        );
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    }
+                                } else {
+                                    // GET /api/session/{id} — session detail
+                                    let raw_id = rest_parts[0];
+                                    let session_id = raw_id.split('?').next().unwrap_or(raw_id);
+                                    let source = query_param(request_line, "source")
+                                        .unwrap_or_else(|| "intendant".to_string());
+                                    let entry_limit = session_detail_entry_limit_from_request(request_line);
+                                    let entry_before = session_detail_before_from_request(request_line);
+                                    let session_id_owned = session_id.to_string();
+                                    let source_owned = source.clone();
+                                    let body =
+                                        if !session_lookup_id_is_safe(session_id) {
+                                            serde_json::json!({"error": "invalid session id"}).to_string()
+                                        } else {
+                                            match tokio::task::spawn_blocking(move || {
+                                                let home = crate::platform::home_dir();
+                                                if source_owned == "intendant" {
+                                                    get_session_detail_from_home_with_page(
+                                                        &home,
+                                                        &session_id_owned,
+                                                        entry_limit,
+                                                        entry_before,
+                                                    )
+                                                } else {
+                                                    external_session_detail_from_home_with_page(
+                                                        &home,
+                                                        &source_owned,
+                                                        &session_id_owned,
+                                                        entry_limit,
+                                                        entry_before,
+                                                    )
+                                                    .unwrap_or_else(|| {
+                                                        serde_json::json!({
+                                                            "error": "session not found"
+                                                        })
+                                                        .to_string()
+                                                    })
+                                                }
+                                            })
+                                            .await
+                                            {
+                                                Ok(body) => body,
+                                                Err(e) => serde_json::json!({
+                                                    "error": format!("session detail task failed: {e}")
+                                                })
+                                                .to_string(),
+                                            }
+                                        };
+                                    let status = if !session_lookup_id_is_safe(session_id) {
+                                        "400 Bad Request"
+                                    } else {
+                                        session_detail_http_status(&body)
+                                    };
+                                    let response = format!(
+                                        "HTTP/1.1 {status}\r\n\
+                                         Content-Type: application/json\r\n\
+                                         Content-Length: {}\r\n\
+                                         Cache-Control: no-cache\r\n\
+                                         Connection: close\r\n\
+                                         \r\n\
+                                         {}",
+                                        body.len(),
+                                        body
+                                    );
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                }
+                            }
+                            RouteHandlerId::McAnchors => {
+                                use tokio::io::AsyncWriteExt;
+                                let response = match session_log.as_ref() {
+                                    Some(log) => match log.lock() {
+                                        Ok(log) => {
+                                            let active_log_dir = log.dir().to_path_buf();
+                                            managed_context_anchors_response_from_home(
+                                                request_line,
+                                                Some(active_log_dir.as_path()),
+                                                &crate::platform::home_dir(),
+                                            )
+                                        }
+                                        Err(_) => json_error(
+                                            "500 Internal Server Error",
+                                            "session log lock poisoned",
+                                        ),
+                                    },
+                                    None => managed_context_anchors_response_from_home(
+                                        request_line,
+                                        None,
+                                        &crate::platform::home_dir(),
+                                    ),
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::McRecords => {
+                                use tokio::io::AsyncWriteExt;
+                                let response = match session_log.as_ref() {
+                                    Some(log) => match log.lock() {
+                                        Ok(log) => {
+                                            let active_log_dir = log.dir().to_path_buf();
+                                            managed_context_records_response_from_home(
+                                                request_line,
+                                                Some(active_log_dir.as_path()),
+                                                &crate::platform::home_dir(),
+                                            )
+                                        }
+                                        Err(_) => json_error(
+                                            "500 Internal Server Error",
+                                            "session log lock poisoned",
+                                        ),
+                                    },
+                                    None => managed_context_records_response_from_home(
+                                        request_line,
+                                        None,
+                                        &crate::platform::home_dir(),
+                                    ),
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::McFission => {
+                                use tokio::io::AsyncWriteExt;
+                                let response = match session_log.as_ref() {
+                                    Some(log) => match log.lock() {
+                                        Ok(log) => {
+                                            let active_log_dir = log.dir().to_path_buf();
+                                            managed_context_fission_response_from_home(
+                                                request_line,
+                                                Some(active_log_dir.as_path()),
+                                                &crate::platform::home_dir(),
+                                            )
+                                        }
+                                        Err(_) => json_error(
+                                            "500 Internal Server Error",
+                                            "session log lock poisoned",
+                                        ),
+                                    },
+                                    None => managed_context_fission_response_from_home(
+                                        request_line,
+                                        None,
+                                        &crate::platform::home_dir(),
+                                    ),
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::SessionsStream => {
+                                let request_line_for_stream = request_line.to_string();
+                                let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+                                let stream_task = tokio::task::spawn_blocking(move || {
+                                    stream_sessions_from_request(&request_line_for_stream, tx);
+                                });
+                                let response = "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/x-ndjson\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\n\
+                                     \r\n";
+                                use tokio::io::AsyncWriteExt;
+                                if stream.write_all(response.as_bytes()).await.is_ok() {
+                                    while let Some(line) = rx.recv().await {
+                                        if stream.write_all(line.as_bytes()).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                                let _ = stream_task.await;
+                            }
+                            RouteHandlerId::SessionsSearch => {
+                                let query = query_param(request_line, "q").unwrap_or_default();
+                                let source_filter = query_param(request_line, "source")
+                                    .unwrap_or_else(|| "all".to_string());
+                                let mode = query_param(request_line, "mode").unwrap_or_default();
+                                let project_filter = session_project_filter_from_request(request_line);
+                                let body = sessions_search_response_body(
+                                    query,
+                                    source_filter,
+                                    mode,
+                                    project_filter,
+                                )
+                                .await;
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(),
+                                    body
+                                );
+                                use tokio::io::AsyncWriteExt;
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
                         }
                     } else if req_method == "GET" && req_path == "/connect/bootstrap" {
                         use tokio::io::AsyncWriteExt;
@@ -23167,205 +24367,6 @@ pub fn spawn_web_gateway(
                             body.len(),
                             body
                         );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/fs/stat" {
-                        use tokio::io::AsyncWriteExt;
-                        let path = query_param(request_line, "path").unwrap_or_default();
-                        let response = match inspect_dashboard_fs_path(&path) {
-                            Ok(status) => json_response(
-                                "200 OK",
-                                serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string()),
-                            ),
-                            Err(e) => json_error("400 Bad Request", e),
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/fs/list" {
-                        use tokio::io::AsyncWriteExt;
-                        let path = query_param(request_line, "path").unwrap_or_default();
-                        let response = match list_dashboard_fs_dir(&path) {
-                            Ok(body) => json_ok(body),
-                            Err(e) => json_error("400 Bad Request", e),
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/fs/read" {
-                        use tokio::io::AsyncWriteExt;
-                        let path = query_param(request_line, "path").unwrap_or_default();
-                        let range_header = dashboard_http_header_value(&header_text, "range");
-                        match dashboard_fs_read_file(&path, range_header) {
-                            Ok(file) => {
-                                let status = if file.partial {
-                                    "206 Partial Content"
-                                } else {
-                                    "200 OK"
-                                };
-                                let content_range = if file.partial {
-                                    format!(
-                                        "Content-Range: bytes {}-{}/{}\r\n",
-                                        file.range_start,
-                                        file.range_end.saturating_sub(1),
-                                        file.total_size
-                                    )
-                                } else {
-                                    String::new()
-                                };
-                                // Full (non-range) reads carry the content
-                                // hash so the editor has a conflict baseline
-                                // for its later write-back.
-                                let sha_header = if file.partial {
-                                    String::new()
-                                } else {
-                                    format!("X-Content-Sha256: {}\r\n", fs_sha256_hex(&file.bytes))
-                                };
-                                let header = format!(
-                                    "HTTP/1.1 {}\r\n\
-                                     Content-Type: {}\r\n\
-                                     Content-Length: {}\r\n\
-                                     Accept-Ranges: bytes\r\n\
-                                     {}\
-                                     {}\
-                                     Content-Disposition: attachment; filename=\"{}\"\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Access-Control-Allow-Origin: *\r\n\
-                                     Access-Control-Expose-Headers: X-Content-Sha256\r\n\
-                                     Connection: close\r\n\
-                                     \r\n",
-                                    status,
-                                    file.content_type,
-                                    file.bytes.len(),
-                                    content_range,
-                                    sha_header,
-                                    file.filename.replace('"', ""),
-                                );
-                                let _ = stream.write_all(header.as_bytes()).await;
-                                let _ = stream.write_all(&file.bytes).await;
-                            }
-                            Err(error) => {
-                                let response = if let Some(total_size) = error.total_size {
-                                    let body =
-                                        serde_json::json!({ "error": error.message }).to_string();
-                                    format!(
-                                        "HTTP/1.1 {}\r\n\
-                                         Content-Type: application/json\r\n\
-                                         Content-Length: {}\r\n\
-                                         Content-Range: bytes */{}\r\n\
-                                         Accept-Ranges: bytes\r\n\
-                                         Cache-Control: no-cache\r\n\
-                                         Access-Control-Allow-Origin: *\r\n\
-                                         Connection: close\r\n\
-                                         \r\n\
-                                         {}",
-                                        error.status,
-                                        body.len(),
-                                        total_size,
-                                        body
-                                    )
-                                } else {
-                                    json_error(&error.status, error.message)
-                                };
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            }
-                        }
-                    } else if req_method == "POST" && req_path == "/api/fs/mkdir" {
-                        use tokio::io::AsyncWriteExt;
-                        let body_text = read_post_body(&header_text, &mut stream).await;
-                        let response = match serde_json::from_str::<FsMkdirRequest>(&body_text) {
-                            Ok(req) => match authorize_http_filesystem_access(
-                                &http_access_context,
-                                peer_connection_identity.as_ref(),
-                                crate::peer::access_policy::PeerOperation::FilesystemWrite,
-                                crate::peer::access_policy::FilesystemAccessKind::Write,
-                                &req.path,
-                                &bus,
-                            ) {
-                                Ok(()) => match mkdir_dashboard_fs_path(&req.path) {
-                                    Ok(body) => json_ok(body),
-                                    Err((status, message)) => json_error(&status, message),
-                                },
-                                Err(message) => json_error("403 Forbidden", message),
-                            },
-                            Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/fs/rename" {
-                        use tokio::io::AsyncWriteExt;
-                        let body_text = read_post_body(&header_text, &mut stream).await;
-                        let response = match serde_json::from_str::<FsRenameRequest>(&body_text) {
-                            // Removing the source entry and creating the
-                            // destination are both writes — each leg passes
-                            // the write-scope gate on its own path.
-                            Ok(req) => match authorize_http_filesystem_access(
-                                &http_access_context,
-                                peer_connection_identity.as_ref(),
-                                crate::peer::access_policy::PeerOperation::FilesystemWrite,
-                                crate::peer::access_policy::FilesystemAccessKind::Write,
-                                &req.from,
-                                &bus,
-                            )
-                            .and_then(|()| {
-                                authorize_http_filesystem_access(
-                                    &http_access_context,
-                                    peer_connection_identity.as_ref(),
-                                    crate::peer::access_policy::PeerOperation::FilesystemWrite,
-                                    crate::peer::access_policy::FilesystemAccessKind::Write,
-                                    &req.to,
-                                    &bus,
-                                )
-                            }) {
-                                Ok(()) => {
-                                    let (status, body) = tokio::task::spawn_blocking(move || {
-                                        apply_dashboard_fs_rename(&req.from, &req.to)
-                                    })
-                                    .await
-                                    .unwrap_or_else(|e| {
-                                        (
-                                            "500 Internal Server Error".to_string(),
-                                            serde_json::json!({
-                                                "error": format!(
-                                                    "filesystem rename task failed: {e}"
-                                                )
-                                            }),
-                                        )
-                                    });
-                                    json_response(&status, body.to_string())
-                                }
-                                Err(message) => json_error("403 Forbidden", message),
-                            },
-                            Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/fs/delete" {
-                        use tokio::io::AsyncWriteExt;
-                        let body_text = read_post_body(&header_text, &mut stream).await;
-                        let response = match serde_json::from_str::<FsDeleteRequest>(&body_text) {
-                            Ok(req) => match authorize_http_filesystem_access(
-                                &http_access_context,
-                                peer_connection_identity.as_ref(),
-                                crate::peer::access_policy::PeerOperation::FilesystemWrite,
-                                crate::peer::access_policy::FilesystemAccessKind::Write,
-                                &req.path,
-                                &bus,
-                            ) {
-                                Ok(()) => {
-                                    let (status, body) = tokio::task::spawn_blocking(move || {
-                                        apply_dashboard_fs_delete(&req.path, req.recursive)
-                                    })
-                                    .await
-                                    .unwrap_or_else(|e| {
-                                        (
-                                            "500 Internal Server Error".to_string(),
-                                            serde_json::json!({
-                                                "error": format!(
-                                                    "filesystem delete task failed: {e}"
-                                                )
-                                            }),
-                                        )
-                                    });
-                                    json_response(&status, body.to_string())
-                                }
-                                Err(message) => json_error("403 Forbidden", message),
-                            },
-                            Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
-                        };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/api/settings" {
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
@@ -23779,975 +24780,6 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if (req_method == "DELETE" || req_method == "POST")
-                        && req_path.starts_with("/api/session/")
-                        && req_path.ends_with("/delete")
-                    {
-                        // DELETE /api/session/{id}[/{target}]  (native DELETE)
-                        // POST  /api/session/{id}/delete[/{target}]  (WKWebView fallback)
-                        use tokio::io::AsyncWriteExt;
-                        let rest = request_line
-                            .split("/api/session/")
-                            .nth(1)
-                            .and_then(|r| r.split_whitespace().next())
-                            .unwrap_or("");
-                        let rest_parts: Vec<&str> = rest
-                            .split('/')
-                            .filter(|s| !s.is_empty() && *s != "delete")
-                            .collect();
-                        let session_id = rest_parts.first().copied().unwrap_or("");
-                        let target = rest_parts.get(1).copied().unwrap_or("session");
-                        let body = delete_session_data(session_id, target);
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "DELETE" && req_path.starts_with("/api/session/") {
-                        // Plain DELETE without /delete in path (curl, regular browser)
-                        use tokio::io::AsyncWriteExt;
-                        let rest = request_line
-                            .split("/api/session/")
-                            .nth(1)
-                            .and_then(|r| r.split_whitespace().next())
-                            .unwrap_or("");
-                        let rest_parts: Vec<&str> =
-                            rest.split('/').filter(|s| !s.is_empty()).collect();
-                        let session_id = rest_parts.first().copied().unwrap_or("");
-                        let target = rest_parts.get(1).copied().unwrap_or("session");
-                        let body = delete_session_data(session_id, target);
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST"
-                        && req_path == "/api/session/current/agent-output"
-                    {
-                        use tokio::io::AsyncWriteExt;
-                        let log_dir =
-                            current_session_log_dir(session_log.as_ref(), query_ctx.as_ref());
-                        let body_text = read_post_body(&header_text, &mut stream).await;
-                        let response = match log_dir {
-                            Some(dir) => current_agent_output_post_response(&body_text, &dir),
-                            None => upload_error_response("404 Not Found", "no active session log"),
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST"
-                        && req_path.starts_with("/api/session/")
-                        && req_path.ends_with("/agent-output")
-                    {
-                        use tokio::io::AsyncWriteExt;
-                        let rest = request_line
-                            .split("/api/session/")
-                            .nth(1)
-                            .and_then(|r| r.split_whitespace().next())
-                            .unwrap_or("");
-                        let path = rest.split('?').next().unwrap_or(rest);
-                        let rest_parts: Vec<&str> =
-                            path.split('/').filter(|s| !s.is_empty()).collect();
-                        let session_id = rest_parts.first().copied().unwrap_or("");
-                        let is_agent_output_route =
-                            rest_parts.get(1).copied() == Some("agent-output");
-                        let source = query_param(request_line, "source")
-                            .unwrap_or_else(|| "intendant".to_string());
-                        let body_text = read_post_body(&header_text, &mut stream).await;
-                        let response = if is_agent_output_route {
-                            session_agent_output_post_response(&body_text, session_id, &source)
-                        } else {
-                            upload_error_response("404 Not Found", "unknown session output route")
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/session/current/uploads" {
-                        // POST /api/session/current/uploads?name=<fn>&destination=task|workspace
-                        //   Content-Type: <mime>
-                        //   <raw bytes>
-                        //
-                        // Streams the body into a tempfile, commits it into
-                        // the project-local ignored upload store
-                        // (`.intendant/uploads/<session-id>/`), and
-                        // broadcasts UploadReady so all connected browsers
-                        // see it.
-                        //
-                        // Route sits in the `/api/session/current/*` family
-                        // alongside `changes`, `history`, `rollback`, etc.
-                        // That namespace is browser-session managed — not
-                        // part of `is_federation_path`, so bearer-token auth
-                        // doesn't apply. If a WAN-exposed deploy wants to
-                        // protect uploads, gate the whole family at once.
-                        use tokio::io::AsyncWriteExt;
-                        let response = 'upload: {
-                            let Some(ref root) = project_root_for_changes else {
-                                break 'upload upload_error_response(
-                                    "400 Bad Request",
-                                    "no project root",
-                                );
-                            };
-
-                            let name = query_param(request_line, "name")
-                                .unwrap_or_else(|| "upload.bin".to_string());
-                            let requested_destination = query_param(request_line, "destination")
-                                .as_deref()
-                                .and_then(crate::upload_store::UploadDestination::from_str)
-                                .unwrap_or(crate::upload_store::UploadDestination::Task);
-                            let mime = content_type_header(&header_text);
-                            if header_text
-                                .lines()
-                                .any(|l| l.trim().eq_ignore_ascii_case("expect: 100-continue"))
-                            {
-                                let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
-                            }
-
-                            match stream_body_to_tempfile(
-                                &header_text,
-                                &discard,
-                                &mut stream,
-                                UPLOAD_MAX_BYTES,
-                            )
-                            .await
-                            {
-                                Err(e) => {
-                                    let status = if e.contains("too large") {
-                                        "413 Payload Too Large"
-                                    } else {
-                                        "400 Bad Request"
-                                    };
-                                    break 'upload upload_error_response(status, &e);
-                                }
-                                Ok((tmp, size)) => {
-                                    let (session_dir, session_id) = {
-                                        if let Some(ref slog) = session_log {
-                                            match slog.lock() {
-                                                Ok(l) => (
-                                                    l.dir().to_path_buf(),
-                                                    l.session_id().to_string(),
-                                                ),
-                                                Err(_) => {
-                                                    break 'upload upload_error_response(
-                                                        "500 Internal Server Error",
-                                                        "session log lock poisoned",
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                            (
-                                                pending_upload_session_dir(root),
-                                                daemon_session_id
-                                                    .clone()
-                                                    .unwrap_or_else(|| "pending".to_string()),
-                                            )
-                                        }
-                                    };
-                                    let destination = effective_upload_destination(
-                                        requested_destination,
-                                        session_log.is_some(),
-                                    );
-                                    match crate::upload_store::commit_upload(
-                                        tmp,
-                                        &name,
-                                        &mime,
-                                        size as u64,
-                                        destination,
-                                        &session_dir,
-                                        &session_id,
-                                        root,
-                                    ) {
-                                        Ok(descriptor) => {
-                                            bus.send(crate::event::AppEvent::UploadReady {
-                                                descriptor: descriptor.clone(),
-                                            });
-                                            let body = serde_json::to_string(&descriptor)
-                                                .unwrap_or_else(|_| "{}".to_string());
-                                            format!(
-                                                "HTTP/1.1 200 OK\r\n\
-                                                 Content-Type: application/json\r\n\
-                                                 Content-Length: {}\r\n\
-                                                 Cache-Control: no-cache\r\n\
-                                                 Access-Control-Allow-Origin: *\r\n\
-                                                 Connection: close\r\n\
-                                                 \r\n\
-                                                 {}",
-                                                body.len(),
-                                                body
-                                            )
-                                        }
-                                        Err(e) => upload_error_response(
-                                            "500 Internal Server Error",
-                                            &format!("commit upload: {e}"),
-                                        ),
-                                    }
-                                }
-                            }
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET"
-                        && path_is_or_under(req_path, "/api/session/current/uploads")
-                    {
-                        // GET /api/session/current/uploads           — list uploads for the current session
-                        // GET /api/session/current/uploads/<id>/raw  — stream bytes of one upload
-                        use tokio::io::AsyncWriteExt;
-                        let response = 'get_upload: {
-                            let Some(ref root) = project_root_for_changes else {
-                                break 'get_upload upload_error_response(
-                                    "404 Not Found",
-                                    "no project root",
-                                );
-                            };
-                            let session_dir = if let Some(ref slog) = session_log {
-                                match slog.lock() {
-                                    Ok(l) => l.dir().to_path_buf(),
-                                    Err(_) => {
-                                        break 'get_upload upload_error_response(
-                                            "500 Internal Server Error",
-                                            "session log lock poisoned",
-                                        );
-                                    }
-                                }
-                            } else {
-                                pending_upload_session_dir(root)
-                            };
-                            // Path after /api/session/current/uploads
-                            let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
-                            let path = path_and_q.split('?').next().unwrap_or("");
-                            let suffix = path
-                                .trim_start_matches("/api/session/current/uploads")
-                                .trim_matches('/');
-                            if suffix.is_empty() {
-                                let uploads = crate::upload_store::list_uploads(&session_dir, root);
-                                let body = serde_json::to_string(&uploads)
-                                    .unwrap_or_else(|_| "[]".to_string());
-                                format!(
-                                    "HTTP/1.1 200 OK\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Access-Control-Allow-Origin: *\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    body.len(),
-                                    body
-                                )
-                            } else if let Some(id) = suffix.strip_suffix("/raw") {
-                                // GET raw bytes for one upload.
-                                match crate::upload_store::find_upload(id, &session_dir, root) {
-                                    None => {
-                                        upload_error_response("404 Not Found", "upload not found")
-                                    }
-                                    Some(d) => {
-                                        match std::fs::read(&d.path) {
-                                            Ok(bytes) => {
-                                                let header = format!(
-                                                    "HTTP/1.1 200 OK\r\n\
-                                                     Content-Type: {}\r\n\
-                                                     Content-Length: {}\r\n\
-                                                     Content-Disposition: inline; filename=\"{}\"\r\n\
-                                                     Cache-Control: no-cache\r\n\
-                                                     Access-Control-Allow-Origin: *\r\n\
-                                                     Connection: close\r\n\
-                                                     \r\n",
-                                                    d.mime,
-                                                    bytes.len(),
-                                                    d.name.replace('"', ""),
-                                                );
-                                                let _ = stream.write_all(header.as_bytes()).await;
-                                                let _ = stream.write_all(&bytes).await;
-                                                // Skip the trailing write_all below.
-                                                break 'get_upload String::new();
-                                            }
-                                            Err(e) => upload_error_response(
-                                                "500 Internal Server Error",
-                                                &format!("read upload: {e}"),
-                                            ),
-                                        }
-                                    }
-                                }
-                            } else {
-                                upload_error_response("404 Not Found", "unknown upload route")
-                            }
-                        };
-                        if !response.is_empty() {
-                            let _ = stream.write_all(response.as_bytes()).await;
-                        }
-                    } else if req_method == "DELETE"
-                        && req_path.starts_with("/api/session/current/uploads/")
-                    {
-                        // DELETE /api/session/current/uploads/<id> — remove the file + sidecar.
-                        use tokio::io::AsyncWriteExt;
-                        let response = {
-                            let session_dir = if let Some(ref slog) = session_log {
-                                match slog.lock() {
-                                    Ok(l) => Ok(Some(l.dir().to_path_buf())),
-                                    Err(_) => Err("session log lock poisoned"),
-                                }
-                            } else {
-                                Ok(None)
-                            };
-                            match session_dir {
-                                Err(error) => json_response(
-                                    "500 Internal Server Error",
-                                    serde_json::json!({ "error": error }).to_string(),
-                                ),
-                                Ok(session_dir) => {
-                                    let path_and_q =
-                                        request_line.split_whitespace().nth(1).unwrap_or("");
-                                    let path = path_and_q.split('?').next().unwrap_or("");
-                                    let id = path
-                                        .trim_start_matches("/api/session/current/uploads/")
-                                        .trim_matches('/');
-                                    let (status, body, deleted_id) =
-                                        current_upload_delete_response_body(
-                                            project_root_for_changes.as_deref(),
-                                            session_dir.as_deref(),
-                                            id,
-                                        );
-                                    if let Some(id) = deleted_id {
-                                        bus.send(crate::event::AppEvent::UploadDeleted { id });
-                                    }
-                                    json_response(status, body)
-                                }
-                            }
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/managed-context/anchors" {
-                        use tokio::io::AsyncWriteExt;
-                        let response = match session_log.as_ref() {
-                            Some(log) => match log.lock() {
-                                Ok(log) => {
-                                    let active_log_dir = log.dir().to_path_buf();
-                                    managed_context_anchors_response_from_home(
-                                        request_line,
-                                        Some(active_log_dir.as_path()),
-                                        &crate::platform::home_dir(),
-                                    )
-                                }
-                                Err(_) => json_error(
-                                    "500 Internal Server Error",
-                                    "session log lock poisoned",
-                                ),
-                            },
-                            None => managed_context_anchors_response_from_home(
-                                request_line,
-                                None,
-                                &crate::platform::home_dir(),
-                            ),
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/managed-context/records" {
-                        use tokio::io::AsyncWriteExt;
-                        let response = match session_log.as_ref() {
-                            Some(log) => match log.lock() {
-                                Ok(log) => {
-                                    let active_log_dir = log.dir().to_path_buf();
-                                    managed_context_records_response_from_home(
-                                        request_line,
-                                        Some(active_log_dir.as_path()),
-                                        &crate::platform::home_dir(),
-                                    )
-                                }
-                                Err(_) => json_error(
-                                    "500 Internal Server Error",
-                                    "session log lock poisoned",
-                                ),
-                            },
-                            None => managed_context_records_response_from_home(
-                                request_line,
-                                None,
-                                &crate::platform::home_dir(),
-                            ),
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/managed-context/fission" {
-                        use tokio::io::AsyncWriteExt;
-                        let response = match session_log.as_ref() {
-                            Some(log) => match log.lock() {
-                                Ok(log) => {
-                                    let active_log_dir = log.dir().to_path_buf();
-                                    managed_context_fission_response_from_home(
-                                        request_line,
-                                        Some(active_log_dir.as_path()),
-                                        &crate::platform::home_dir(),
-                                    )
-                                }
-                                Err(_) => json_error(
-                                    "500 Internal Server Error",
-                                    "session log lock poisoned",
-                                ),
-                            },
-                            None => managed_context_fission_response_from_home(
-                                request_line,
-                                None,
-                                &crate::platform::home_dir(),
-                            ),
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/session/current/history" {
-                        // GET /api/session/current/history — serialized History.
-                        use tokio::io::AsyncWriteExt;
-                        let (status, body) = handle_history_get(file_watcher.as_ref()).await;
-                        let response = format!(
-                            "HTTP/1.1 {}\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            status,
-                            body.len(),
-                            body,
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/session/current/rollback" {
-                        // POST /api/session/current/rollback body:
-                        //   {"round_id": N,
-                        //    "revert_files": bool (default true),
-                        //    "revert_conversation": bool (default false)}
-                        use tokio::io::AsyncWriteExt;
-                        let body_text = read_post_body(&header_text, &mut stream).await;
-                        let agent_state = query_ctx.as_ref().map(|ctx| ctx.agent_state.clone());
-                        let (status, body) = handle_history_rollback(
-                            &body_text,
-                            file_watcher.as_ref(),
-                            agent_state.as_ref(),
-                            &bus,
-                        )
-                        .await;
-                        let response = format!(
-                            "HTTP/1.1 {}\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            status,
-                            body.len(),
-                            body,
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/session/current/redo" {
-                        // POST /api/session/current/redo — no body required.
-                        use tokio::io::AsyncWriteExt;
-                        let _ = read_post_body(&header_text, &mut stream).await;
-                        let agent_state = query_ctx.as_ref().map(|ctx| ctx.agent_state.clone());
-                        let (status, body) =
-                            handle_history_redo(file_watcher.as_ref(), agent_state.as_ref()).await;
-                        let response = format!(
-                            "HTTP/1.1 {}\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            status,
-                            body.len(),
-                            body,
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/session/current/prune" {
-                        // POST /api/session/current/prune — no body required.
-                        use tokio::io::AsyncWriteExt;
-                        let _ = read_post_body(&header_text, &mut stream).await;
-                        let (status, body) = handle_history_prune(file_watcher.as_ref()).await;
-                        let response = format!(
-                            "HTTP/1.1 {}\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            status,
-                            body.len(),
-                            body,
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path.starts_with("/api/session/") {
-                        use tokio::io::AsyncWriteExt;
-                        // Extract the rest after /api/session/ and split into parts
-                        let rest = request_line
-                            .split("/api/session/")
-                            .nth(1)
-                            .and_then(|r| r.split_whitespace().next())
-                            .unwrap_or("");
-                        let rest_parts: Vec<&str> = rest.split('/').collect();
-
-                        let route_name = rest_parts
-                            .get(1)
-                            .map(|part| part.split('?').next().unwrap_or(part))
-                            .unwrap_or("");
-
-                        if rest_parts.len() >= 2 && route_name == "context-snapshot" {
-                            // GET /api/session/{id}/context-snapshot?file=...
-                            // Replays exactly one archived context snapshot
-                            // on demand so historical session replay can stay
-                            // lightweight by default.
-                            let raw_id = rest_parts[0];
-                            let session_id = raw_id.split('?').next().unwrap_or(raw_id);
-                            let source = query_param(request_line, "source")
-                                .unwrap_or_else(|| "intendant".to_string());
-                            let (status, body) = get_session_context_snapshot_from_home(
-                                &crate::platform::home_dir(),
-                                session_id,
-                                &source,
-                                request_line,
-                            );
-                            let response = format!(
-                                "HTTP/1.1 {status}\r\n\
-                                 Content-Type: application/json\r\n\
-                                 Content-Length: {}\r\n\
-                                 Cache-Control: no-cache\r\n\
-                                 Connection: close\r\n\
-                                 \r\n\
-                                 {}",
-                                body.len(),
-                                body
-                            );
-                            let _ = stream.write_all(response.as_bytes()).await;
-                        } else if rest_parts.len() >= 2 && route_name == "recordings" {
-                            // Session recording sub-routes: /api/session/{id}/recordings[/...]
-                            let session_id = rest_parts[0];
-                            let rec_rest = &rest_parts[2..]; // parts after "recordings"
-
-                            if !session_lookup_id_is_safe(session_id) {
-                                let response =
-                                    upload_error_response("400 Bad Request", "invalid session id");
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            } else if rec_rest.len() == 2 && rec_rest[1] == "segments" {
-                                // GET /api/session/{id}/recordings/{stream}/segments
-                                let stream_name = rec_rest[0];
-                                let body =
-                                    if let Some(session_dir) = resolve_session_dir(session_id) {
-                                        let stream_dir =
-                                            session_dir.join("recordings").join(stream_name);
-                                        let segments = crate::recording::parse_segment_csv_pub(
-                                            &stream_dir.join("segments.csv"),
-                                            &stream_dir,
-                                        );
-                                        let seg_json: Vec<serde_json::Value> = segments
-                                            .iter()
-                                            .map(|s| {
-                                                serde_json::json!({
-                                                    "filename": s.filename,
-                                                    "start_secs": s.start_secs,
-                                                    "end_secs": s.end_secs,
-                                                })
-                                            })
-                                            .collect();
-                                        serde_json::to_string(&seg_json).unwrap_or("[]".to_string())
-                                    } else {
-                                        "[]".to_string()
-                                    };
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    body.len(),
-                                    body
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            } else if rec_rest.len() == 2 && rec_rest[1] == "playlist.m3u8" {
-                                // GET /api/session/{id}/recordings/{stream}/playlist.m3u8
-                                let stream_name = rec_rest[0];
-                                let segments = resolve_session_dir(session_id)
-                                    .map(|session_dir| {
-                                        let stream_dir =
-                                            session_dir.join("recordings").join(stream_name);
-                                        crate::recording::parse_segment_csv_pub(
-                                            &stream_dir.join("segments.csv"),
-                                            &stream_dir,
-                                        )
-                                    })
-                                    .unwrap_or_default();
-                                let m3u8 = recording_playlist_m3u8(&segments);
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
-                                     Content-Type: application/vnd.apple.mpegurl\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    m3u8.len(),
-                                    m3u8
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            } else if rec_rest.len() == 2 {
-                                // GET /api/session/{id}/recordings/{stream}/{filename}
-                                let stream_name = rec_rest[0];
-                                let filename = rec_rest[1];
-                                let valid = filename.starts_with("seg_")
-                                    && (filename.ends_with(".mp4") || filename.ends_with(".ts"))
-                                    && filename.len() < 30
-                                    && !filename.contains("..");
-                                if valid {
-                                    let seg_ct = if filename.ends_with(".ts") {
-                                        "video/mp2t"
-                                    } else {
-                                        "video/mp4"
-                                    };
-                                    let seg_path = resolve_session_dir(session_id).map(|d| {
-                                        d.join("recordings").join(stream_name).join(filename)
-                                    });
-                                    if let Some(path) = seg_path.filter(|p| p.exists()) {
-                                        match tokio::fs::read(&path).await {
-                                            Ok(data) => {
-                                                let header = format!(
-                                                    "HTTP/1.1 200 OK\r\n\
-                                                     Content-Type: {}\r\n\
-                                                     Content-Length: {}\r\n\
-                                                     Cache-Control: public, max-age=3600\r\n\
-                                                     Connection: close\r\n\
-                                                     \r\n",
-                                                    seg_ct,
-                                                    data.len()
-                                                );
-                                                let _ = stream.write_all(header.as_bytes()).await;
-                                                let _ = stream.write_all(&data).await;
-                                            }
-                                            Err(_) => {
-                                                let body = "Failed to read segment";
-                                                let response = format!(
-                                                    "HTTP/1.1 500 Internal Server Error\r\n\
-                                                     Content-Type: text/plain\r\n\
-                                                     Content-Length: {}\r\n\
-                                                     Connection: close\r\n\
-                                                     \r\n\
-                                                     {}",
-                                                    body.len(),
-                                                    body
-                                                );
-                                                let _ = stream.write_all(response.as_bytes()).await;
-                                            }
-                                        }
-                                    } else {
-                                        let body = "Segment not found";
-                                        let response = format!(
-                                            "HTTP/1.1 404 Not Found\r\n\
-                                             Content-Type: text/plain\r\n\
-                                             Content-Length: {}\r\n\
-                                             Connection: close\r\n\
-                                             \r\n\
-                                             {}",
-                                            body.len(),
-                                            body
-                                        );
-                                        let _ = stream.write_all(response.as_bytes()).await;
-                                    }
-                                } else {
-                                    let body = "Invalid filename";
-                                    let response = format!(
-                                        "HTTP/1.1 400 Bad Request\r\n\
-                                         Content-Type: text/plain\r\n\
-                                         Content-Length: {}\r\n\
-                                         Connection: close\r\n\
-                                         \r\n\
-                                         {}",
-                                        body.len(),
-                                        body
-                                    );
-                                    let _ = stream.write_all(response.as_bytes()).await;
-                                }
-                            } else {
-                                // GET /api/session/{id}/recordings — list streams
-                                let (status, body) =
-                                    session_recordings_list_response_body(session_id);
-                                let response = format!(
-                                    "HTTP/1.1 {status}\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    body.len(),
-                                    body
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            }
-                        } else if rest_parts.len() >= 2 && route_name == "report" {
-                            // GET /api/session/{id}/report — download a zip of
-                            // the current session's text artifacts for sharing
-                            // with the dev. Pass id="current" to target the
-                            // live daemon's own session via WebQueryCtx.
-                            use tokio::io::AsyncWriteExt;
-                            let session_id = rest_parts[0];
-                            if session_id != "current" && !session_lookup_id_is_safe(session_id) {
-                                let response =
-                                    upload_error_response("400 Bad Request", "invalid session id");
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            } else {
-                                let resolved_dir: Option<PathBuf> = if session_id == "current" {
-                                    current_session_log_dir(
-                                        session_log.as_ref(),
-                                        query_ctx.as_ref(),
-                                    )
-                                } else {
-                                    resolve_session_dir(session_id)
-                                };
-                                match resolved_dir {
-                                    Some(dir) => match build_session_report_zip(&dir) {
-                                        Ok(bytes) => {
-                                            let fname = dir
-                                                .file_name()
-                                                .map(|n| n.to_string_lossy().to_string())
-                                                .unwrap_or_else(|| "session".to_string());
-                                            let header = format!(
-                                                "HTTP/1.1 200 OK\r\n\
-                                                 Content-Type: application/zip\r\n\
-                                                 Content-Length: {}\r\n\
-                                                 Content-Disposition: attachment; filename=\"intendant-session-{}.zip\"\r\n\
-                                                 Cache-Control: no-cache\r\n\
-                                                 Connection: close\r\n\
-                                                 \r\n",
-                                                bytes.len(),
-                                                fname
-                                            );
-                                            let _ = stream.write_all(header.as_bytes()).await;
-                                            let _ = stream.write_all(&bytes).await;
-                                        }
-                                        Err(e) => {
-                                            let body = format!("Failed to build report: {}", e);
-                                            let response = format!(
-                                                "HTTP/1.1 500 Internal Server Error\r\n\
-                                                 Content-Type: text/plain\r\n\
-                                                 Content-Length: {}\r\n\
-                                                 Connection: close\r\n\
-                                                 \r\n\
-                                                 {}",
-                                                body.len(),
-                                                body
-                                            );
-                                            let _ = stream.write_all(response.as_bytes()).await;
-                                        }
-                                    },
-                                    None => {
-                                        let body = "Session not found";
-                                        let response = format!(
-                                            "HTTP/1.1 404 Not Found\r\n\
-                                             Content-Type: text/plain\r\n\
-                                             Content-Length: {}\r\n\
-                                             Connection: close\r\n\
-                                             \r\n\
-                                             {}",
-                                            body.len(),
-                                            body
-                                        );
-                                        let _ = stream.write_all(response.as_bytes()).await;
-                                    }
-                                }
-                            }
-                        } else if rest_parts.len() >= 2 && route_name == "frames" {
-                            // Session frame sub-routes: /api/session/{id}/frames[/{filename}]
-                            use tokio::io::AsyncWriteExt;
-                            let session_id = rest_parts[0];
-                            let frame_rest = &rest_parts[2..];
-
-                            if !session_lookup_id_is_safe(session_id) {
-                                let response =
-                                    upload_error_response("400 Bad Request", "invalid session id");
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            } else if frame_rest.len() == 1 {
-                                // GET /api/session/{id}/frames/{filename}
-                                let filename = frame_rest[0];
-                                let valid = (filename.ends_with(".jpg")
-                                    || filename.ends_with(".png"))
-                                    && filename.len() < 80
-                                    && !filename.contains("..");
-                                if valid {
-                                    let ct = if filename.ends_with(".png") {
-                                        "image/png"
-                                    } else {
-                                        "image/jpeg"
-                                    };
-                                    let frame_path = resolve_session_dir(session_id)
-                                        .map(|d| d.join("frames").join(filename));
-                                    if let Some(path) = frame_path.filter(|p| p.exists()) {
-                                        match tokio::fs::read(&path).await {
-                                            Ok(data) => {
-                                                let header = format!(
-                                                    "HTTP/1.1 200 OK\r\n\
-                                                     Content-Type: {}\r\n\
-                                                     Content-Length: {}\r\n\
-                                                     Cache-Control: public, max-age=3600\r\n\
-                                                     Connection: close\r\n\
-                                                     \r\n",
-                                                    ct,
-                                                    data.len()
-                                                );
-                                                let _ = stream.write_all(header.as_bytes()).await;
-                                                let _ = stream.write_all(&data).await;
-                                            }
-                                            Err(_) => {
-                                                let body = "Failed to read frame";
-                                                let response = format!(
-                                                    "HTTP/1.1 500 Internal Server Error\r\n\
-                                                     Content-Type: text/plain\r\n\
-                                                     Content-Length: {}\r\n\
-                                                     Connection: close\r\n\
-                                                     \r\n\
-                                                     {}",
-                                                    body.len(),
-                                                    body
-                                                );
-                                                let _ = stream.write_all(response.as_bytes()).await;
-                                            }
-                                        }
-                                    } else {
-                                        let body = "Frame not found";
-                                        let response = format!(
-                                            "HTTP/1.1 404 Not Found\r\n\
-                                             Content-Type: text/plain\r\n\
-                                             Content-Length: {}\r\n\
-                                             Connection: close\r\n\
-                                             \r\n\
-                                             {}",
-                                            body.len(),
-                                            body
-                                        );
-                                        let _ = stream.write_all(response.as_bytes()).await;
-                                    }
-                                } else {
-                                    let body = "Invalid filename";
-                                    let response = format!(
-                                        "HTTP/1.1 400 Bad Request\r\n\
-                                         Content-Type: text/plain\r\n\
-                                         Content-Length: {}\r\n\
-                                         Connection: close\r\n\
-                                         \r\n\
-                                         {}",
-                                        body.len(),
-                                        body
-                                    );
-                                    let _ = stream.write_all(response.as_bytes()).await;
-                                }
-                            } else {
-                                // GET /api/session/{id}/frames — list frame filenames
-                                let body = if let Some(session_dir) =
-                                    resolve_session_dir(session_id)
-                                {
-                                    let frames_dir = session_dir.join("frames");
-                                    let mut names: Vec<String> = Vec::new();
-                                    if frames_dir.is_dir() {
-                                        if let Ok(entries) = std::fs::read_dir(&frames_dir) {
-                                            for e in entries.flatten() {
-                                                let n = e.file_name().to_string_lossy().to_string();
-                                                if n.ends_with(".jpg") || n.ends_with(".png") {
-                                                    names.push(n);
-                                                }
-                                            }
-                                        }
-                                        names.sort();
-                                    }
-                                    serde_json::to_string(&names).unwrap_or("[]".to_string())
-                                } else {
-                                    "[]".to_string()
-                                };
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    body.len(),
-                                    body
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            }
-                        } else {
-                            // GET /api/session/{id} — session detail
-                            let raw_id = rest_parts[0];
-                            let session_id = raw_id.split('?').next().unwrap_or(raw_id);
-                            let source = query_param(request_line, "source")
-                                .unwrap_or_else(|| "intendant".to_string());
-                            let entry_limit = session_detail_entry_limit_from_request(request_line);
-                            let entry_before = session_detail_before_from_request(request_line);
-                            let session_id_owned = session_id.to_string();
-                            let source_owned = source.clone();
-                            let body =
-                                if !session_lookup_id_is_safe(session_id) {
-                                    serde_json::json!({"error": "invalid session id"}).to_string()
-                                } else {
-                                    match tokio::task::spawn_blocking(move || {
-                                        let home = crate::platform::home_dir();
-                                        if source_owned == "intendant" {
-                                            get_session_detail_from_home_with_page(
-                                                &home,
-                                                &session_id_owned,
-                                                entry_limit,
-                                                entry_before,
-                                            )
-                                        } else {
-                                            external_session_detail_from_home_with_page(
-                                                &home,
-                                                &source_owned,
-                                                &session_id_owned,
-                                                entry_limit,
-                                                entry_before,
-                                            )
-                                            .unwrap_or_else(|| {
-                                                serde_json::json!({
-                                                    "error": "session not found"
-                                                })
-                                                .to_string()
-                                            })
-                                        }
-                                    })
-                                    .await
-                                    {
-                                        Ok(body) => body,
-                                        Err(e) => serde_json::json!({
-                                            "error": format!("session detail task failed: {e}")
-                                        })
-                                        .to_string(),
-                                    }
-                                };
-                            let status = if !session_lookup_id_is_safe(session_id) {
-                                "400 Bad Request"
-                            } else {
-                                session_detail_http_status(&body)
-                            };
-                            let response = format!(
-                                "HTTP/1.1 {status}\r\n\
-                                 Content-Type: application/json\r\n\
-                                 Content-Length: {}\r\n\
-                                 Cache-Control: no-cache\r\n\
-                                 Connection: close\r\n\
-                                 \r\n\
-                                 {}",
-                                body.len(),
-                                body
-                            );
-                            let _ = stream.write_all(response.as_bytes()).await;
-                        }
                     } else if req_path == "/api/displays" {
                         // Display enumeration endpoint
                         use tokio::io::AsyncWriteExt;
@@ -25342,54 +25374,6 @@ pub fn spawn_web_gateway(
                              {body}",
                             body.len(),
                         );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path == "/api/sessions/stream" {
-                        let request_line_for_stream = request_line.to_string();
-                        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
-                        let stream_task = tokio::task::spawn_blocking(move || {
-                            stream_sessions_from_request(&request_line_for_stream, tx);
-                        });
-                        let response = "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/x-ndjson\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n";
-                        use tokio::io::AsyncWriteExt;
-                        if stream.write_all(response.as_bytes()).await.is_ok() {
-                            while let Some(line) = rx.recv().await {
-                                if stream.write_all(line.as_bytes()).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                        let _ = stream_task.await;
-                    } else if req_path == "/api/sessions/search" {
-                        let query = query_param(request_line, "q").unwrap_or_default();
-                        let source_filter = query_param(request_line, "source")
-                            .unwrap_or_else(|| "all".to_string());
-                        let mode = query_param(request_line, "mode").unwrap_or_default();
-                        let project_filter = session_project_filter_from_request(request_line);
-                        let body = sessions_search_response_body(
-                            query,
-                            source_filter,
-                            mode,
-                            project_filter,
-                        )
-                        .await;
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
-                        use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_path == "/debug" {
                         // Debug endpoint: returns agent state + voice connection info
@@ -29848,13 +29832,8 @@ fn dashboard_http_operation(
         ("POST", "/api/settings") | ("POST", "/api/api-keys") => {
             return Some(PeerOperation::Settings);
         }
-        ("GET", "/api/fs/stat") | ("GET", "/api/fs/list") | ("GET", "/api/fs/read") => {
-            return Some(PeerOperation::FilesystemRead);
-        }
-        // POST /api/fs/write is table-declared.
-        ("POST", "/api/fs/mkdir")
-        | ("POST", "/api/fs/rename")
-        | ("POST", "/api/fs/delete") => return Some(PeerOperation::FilesystemWrite),
+        // The /api/fs/* family is table-declared (method-exact there and
+        // here, so no residual rule is needed).
         ("POST", "/api/diagnostics/visual-freshness") => {
             return Some(PeerOperation::DisplayInput);
         }
@@ -41896,6 +41875,20 @@ mod tests {
             "/api/session/abc123/log",
             "/api/session/abc123/delete",
             "/api/session/abc123/agent-output",
+            "/api/session/abc123/x/agent-output",
+            "/api/session/abc123/recordings",
+            "/api/session/abc123/recordings/s1/segments",
+            "/api/session/abc123/recordings/s1/playlist.m3u8",
+            "/api/session/abc123/frames",
+            "/api/session/abc123/frames/f1.jpg",
+            "/api/session/abc123/context-snapshot",
+            "/api/session/abc123/report",
+            "/api/session/abc123",
+            "/api/session/a/b/c/delete",
+            "/api/session/current",
+            "/api/session/current/delete",
+            "/api/session/current/uploads/u1/raw",
+            "/api/session",
             "/api/sessionx",
             "/api/sessions",
             "/api/sessions/stream",
@@ -41955,8 +41948,28 @@ mod tests {
     #[test]
     fn dashboard_http_operation_matches_frozen_legacy_reference() {
         // (method, path) pairs where the table deliberately diverges from
-        // the legacy snapshot. Empty in phase 0.
-        let allowed_divergences: &[(&str, &str)] = &[];
+        // the legacy snapshot, each a fail-closed tightening:
+        //
+        // /api/sessions/stream and /api/sessions/search were served by
+        // method-agnostic dispatch arms but never classified — browser
+        // principals hit them with no IAM gate at all (peers were already
+        // SessionInspect-gated by federation_http_operation). Their table
+        // rows declare SessionInspect, so they now classify on every
+        // method instead of never.
+        let allowed_divergences: &[(&str, &str)] = &[
+            ("GET", "/api/sessions/stream"),
+            ("POST", "/api/sessions/stream"),
+            ("DELETE", "/api/sessions/stream"),
+            ("PUT", "/api/sessions/stream"),
+            ("PATCH", "/api/sessions/stream"),
+            ("HEAD", "/api/sessions/stream"),
+            ("GET", "/api/sessions/search"),
+            ("POST", "/api/sessions/search"),
+            ("DELETE", "/api/sessions/search"),
+            ("PUT", "/api/sessions/search"),
+            ("PATCH", "/api/sessions/search"),
+            ("HEAD", "/api/sessions/search"),
+        ];
 
         for method in ["GET", "POST", "DELETE", "PUT", "PATCH", "HEAD"] {
             for path in classifier_corpus_paths() {
@@ -41986,12 +41999,6 @@ mod tests {
             ("POST", "/connect/dashboard/close"),
             ("GET", "/frames/f1"),
             ("GET", "/api/project-root"),
-            ("GET", "/api/fs/stat"),
-            ("GET", "/api/fs/list"),
-            ("GET", "/api/fs/read"),
-            ("POST", "/api/fs/mkdir"),
-            ("POST", "/api/fs/rename"),
-            ("POST", "/api/fs/delete"),
             ("POST", "/api/settings"),
             ("GET", "/api/settings"),
             ("POST", "/api/diagnostics/visual-freshness"),
@@ -42001,23 +42008,6 @@ mod tests {
             ("POST", "/session"),
             ("GET", "/recordings"),
             ("GET", "/recordings/stream1/meta"),
-            ("DELETE", "/api/session/abc123"),
-            ("POST", "/api/session/abc123/delete"),
-            ("POST", "/api/session/current/agent-output"),
-            ("POST", "/api/session/abc123/agent-output"),
-            ("POST", "/api/session/current/uploads"),
-            ("GET", "/api/session/current/uploads"),
-            ("GET", "/api/session/current/uploads/u1"),
-            ("DELETE", "/api/session/current/uploads/u1"),
-            ("GET", "/api/managed-context/anchors"),
-            ("GET", "/api/managed-context/records"),
-            ("GET", "/api/managed-context/fission"),
-            ("GET", "/api/session/current/history"),
-            ("POST", "/api/session/current/rollback"),
-            ("POST", "/api/session/current/redo"),
-            ("POST", "/api/session/current/prune"),
-            ("GET", "/api/session/abc123/log"),
-            ("GET", "/api/session/abc123/meta"),
             ("GET", "/api/displays"),
             ("GET", "/api/access/overview"),
             ("GET", "/api/access/iam/state"),
@@ -42040,8 +42030,6 @@ mod tests {
             ("POST", "/api/peers/pairing/request-access"),
             ("GET", "/api/peers/pairing/requests"),
             ("POST", "/api/coordinator/route"),
-            ("GET", "/api/sessions/stream"),
-            ("GET", "/api/sessions/search"),
             ("GET", "/debug"),
             ("POST", "/mcp"),
             ("GET", "/mcp"),
