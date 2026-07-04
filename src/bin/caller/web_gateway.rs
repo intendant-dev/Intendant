@@ -1919,6 +1919,8 @@ const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_we
 const WASM_STATION_JS: &str = include_str!("../../../static/wasm-station/station_web.js");
 const WASM_STATION_BIN: &[u8] = include_bytes!("../../../static/wasm-station/station_web_bg.wasm");
 const THREE_MODULE_JS: &str = include_str!("../../../static/three.module.min.js");
+const CODEMIRROR_BUNDLE_JS: &str = include_str!("../../../static/codemirror-bundle.js");
+const CODEMIRROR_BUNDLE_CSS: &str = include_str!("../../../static/codemirror-bundle.css");
 const SOURCE_VIEWER_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const DASHBOARD_IMAGE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 // Browser-facing external replay is a live UI bootstrap, not an archival export.
@@ -1954,6 +1956,7 @@ pub struct ActiveSessionState {
 }
 
 impl ActiveSessionState {
+    #[allow(dead_code)]
     pub fn empty() -> SharedActiveSession {
         Arc::new(tokio::sync::RwLock::new(Self {
             daemon_session_id: None,
@@ -2001,6 +2004,8 @@ struct FsPathStatus {
     is_dir: bool,
     is_file: bool,
     readable: bool,
+    size: Option<u64>,
+    modified_ms: Option<u64>,
     parent: Option<String>,
     parent_exists: bool,
     parent_is_dir: bool,
@@ -2021,6 +2026,29 @@ struct FsListEntry {
 #[derive(Debug, Deserialize)]
 struct FsMkdirRequest {
     path: String,
+}
+
+/// Body of `POST /api/fs/write` — the dashboard editor's save request.
+///
+/// Exactly one of `content` (UTF-8 text) or `content_b64` (raw bytes) carries
+/// the new file contents. Every write must state its precondition: an
+/// `expected_sha256` of the bytes the client last read (optimistic
+/// concurrency), `create_new` for files that must not exist yet, or an
+/// explicit `force` to overwrite unconditionally. A write with no
+/// precondition is rejected so nothing clobbers a changed file silently.
+#[derive(Debug, Deserialize)]
+struct FsWriteRequest {
+    path: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    content_b64: Option<String>,
+    #[serde(default)]
+    expected_sha256: Option<String>,
+    #[serde(default)]
+    create_new: bool,
+    #[serde(default)]
+    force: bool,
 }
 
 /// Debug state for the voice model, tracked server-side from WebSocket messages.
@@ -2111,6 +2139,7 @@ impl Default for WebGatewayConfig {
 /// - WebSocket connections are bridged to the EventBus (inbound control
 ///   messages) and broadcast channel (outbound events), mirroring the
 ///   Unix control socket in `control.rs`.
+///
 /// Scan session.jsonl for persisted provider/model/autonomy values.
 ///
 /// The agent loop writes these as plain log entries at startup
@@ -2165,6 +2194,7 @@ fn scan_replay_status(contents: &str) -> (Option<String>, Option<String>, Option
 /// row through `session_log_entry_to_app_event` → `app_event_to_outbound`
 /// and injecting the original `ts` field, so replay drives the exact
 /// same rendering path as live broadcast.
+#[allow(dead_code)]
 fn replay_jsonl_to_outbound_entries(
     contents: &str,
     log_dir: &std::path::Path,
@@ -2869,6 +2899,15 @@ fn external_backend_session_from_replay(contents: &str) -> Option<(String, Strin
     None
 }
 
+/// Debug lines log placeholder thread ids (Claude Code's
+/// `claude-code-session` before the stream announces the real one).
+/// Scraping those into a replay session id stamps every session-less row
+/// with a session that never exists — frontends then materialize a ghost
+/// window for it and can even hand it the prompt target.
+fn scraped_external_thread_id_is_canonical(id: &str) -> bool {
+    crate::external_agent::AgentBackend::ClaudeCode.thread_id_is_canonical(id)
+}
+
 fn external_backend_session_id_from_replay(contents: &str) -> Option<String> {
     if let Some((_, id)) = external_backend_session_from_replay(contents) {
         return Some(id);
@@ -3224,6 +3263,7 @@ fn annotate_context_snapshot_raw_value_exact_replay(
     }
 }
 
+#[allow(dead_code)]
 fn session_log_replay_payload_from_dir(
     log_dir: &std::path::Path,
 ) -> Option<(String, Option<String>)> {
@@ -3383,6 +3423,7 @@ fn session_log_id(session_log: &Arc<Mutex<crate::session_log::SessionLog>>) -> O
         .filter(|id| !id.trim().is_empty())
 }
 
+#[allow(dead_code)]
 fn session_log_replay_from_dir(log_dir: &std::path::Path) -> Option<String> {
     session_log_replay_payload_from_dir(log_dir).map(|(payload, _)| payload)
 }
@@ -3412,7 +3453,7 @@ fn agent_output_chunks_with_fallback(
                     }
                 }
             }
-            dirs.sort_by(|a, b| session_log_mtime(b).cmp(&session_log_mtime(a)));
+            dirs.sort_by_key(|b| std::cmp::Reverse(session_log_mtime(b)));
 
             for dir in dirs {
                 let missing: Vec<String> = ids
@@ -3650,7 +3691,7 @@ pub(crate) fn session_agent_output_post_response(
 }
 
 fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
-    if session_id.contains('/') {
+    if crate::session_names::session_id_looks_like_path(session_id) {
         return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
     }
 
@@ -3958,15 +3999,22 @@ fn apply_external_wrapper_index_to_sessions(home: &Path, sessions: &mut [serde_j
 }
 
 fn external_agent_thread_id_from_message(message: &str) -> Option<String> {
-    if let Some(thread_id) = message.strip_prefix("External agent thread: ") {
-        return clean_external_thread_id(thread_id);
-    }
-    if message.starts_with("Mode: external agent") {
-        if let Some((_, thread_id)) = message.rsplit_once("thread: ") {
-            return clean_external_thread_id(thread_id);
-        }
-    }
-    None
+    let scraped = if let Some(thread_id) = message.strip_prefix("External agent thread: ") {
+        clean_external_thread_id(thread_id)
+    } else if message.starts_with("Mode: external agent") {
+        message
+            .rsplit_once("thread: ")
+            .and_then(|(_, thread_id)| clean_external_thread_id(thread_id))
+    } else {
+        None
+    };
+    // Debug lines log placeholder thread ids (Claude Code's
+    // `claude-code-session` before the stream announces the real one).
+    // Treating a placeholder as a session's external id poisons every
+    // consumer: the sessions list hydrates dashboard metadata with it,
+    // status routing then retargets at a window that never exists, and
+    // the ghost window it conjures can steal the prompt target.
+    scraped.filter(|id| scraped_external_thread_id_is_canonical(id))
 }
 
 fn external_agent_source_from_message(message: &str) -> Option<String> {
@@ -4179,6 +4227,18 @@ fn embedded_static_asset(path: &str) -> Option<&'static EmbeddedStaticAsset> {
             true,
         );
         insert(
+            "/codemirror-bundle.js",
+            "application/javascript",
+            CODEMIRROR_BUNDLE_JS.as_bytes(),
+            true,
+        );
+        insert(
+            "/codemirror-bundle.css",
+            "text/css",
+            CODEMIRROR_BUNDLE_CSS.as_bytes(),
+            true,
+        );
+        insert(
             "/audio-processor.js",
             "application/javascript",
             AUDIO_PROCESSOR_JS.as_bytes(),
@@ -4188,8 +4248,18 @@ fn embedded_static_asset(path: &str) -> Option<&'static EmbeddedStaticAsset> {
         insert("/icon-128.png", "image/png", ICON_128_PNG, false);
         insert("/favicon.ico", "image/png", ICON_128_PNG, false);
         insert("/icon-512.png", "image/png", ICON_512_PNG, false);
-        insert("/icon-512-maskable.png", "image/png", ICON_512_MASKABLE_PNG, false);
-        insert("/apple-touch-icon.png", "image/png", APPLE_TOUCH_ICON_PNG, false);
+        insert(
+            "/icon-512-maskable.png",
+            "image/png",
+            ICON_512_MASKABLE_PNG,
+            false,
+        );
+        insert(
+            "/apple-touch-icon.png",
+            "image/png",
+            APPLE_TOUCH_ICON_PNG,
+            false,
+        );
         insert(
             "/manifest.webmanifest",
             "application/manifest+json",
@@ -4586,7 +4656,7 @@ fn build_session_report_zip(session_dir: &std::path::Path) -> std::io::Result<Ve
         if path.is_file() {
             let data = std::fs::read(&path)?;
             zip.start_file(*name, options)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(std::io::Error::other)?;
             zip.write_all(&data)?;
         }
     }
@@ -4605,16 +4675,14 @@ fn build_session_report_zip(session_dir: &std::path::Path) -> std::io::Result<Ve
                     let zip_name = format!("turns/{}", fname);
                     let data = std::fs::read(&path)?;
                     zip.start_file(&zip_name, options)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                        .map_err(std::io::Error::other)?;
                     zip.write_all(&data)?;
                 }
             }
         }
     }
 
-    let cursor = zip
-        .finish()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let cursor = zip.finish().map_err(std::io::Error::other)?;
     Ok(cursor.into_inner())
 }
 
@@ -4694,10 +4762,7 @@ fn extract_host_header_ip(headers: &str) -> Option<std::net::IpAddr> {
         //   - Hostname: example.com
         let host_part = if let Some(inner) = rest.strip_prefix('[') {
             // IPv6 literal in brackets; chop at the closing bracket.
-            match inner.split(']').next() {
-                Some(s) => s,
-                None => return None,
-            }
+            inner.split(']').next()?
         } else if let Some(colon) = rest.find(':') {
             &rest[..colon]
         } else {
@@ -5131,6 +5196,7 @@ fn session_detail_http_status(body: &str) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn get_session_detail_from_home(home: &Path, session_id: &str) -> String {
     get_session_detail_from_home_with_limit(home, session_id, None)
 }
@@ -5160,6 +5226,7 @@ pub(crate) fn session_detail_response_body_with_page(
     }
 }
 
+#[allow(dead_code)]
 fn get_session_detail_from_home_with_limit(
     home: &Path,
     session_id: &str,
@@ -5557,6 +5624,7 @@ pub(crate) async fn sessions_search_response_body_with_cancel(
     body
 }
 
+#[allow(dead_code)]
 fn session_log_search_from_home(
     home: &Path,
     query: &str,
@@ -5566,6 +5634,7 @@ fn session_log_search_from_home(
     session_log_search_from_home_with_projects(home, query, source_filter, mode, &[])
 }
 
+#[allow(dead_code)]
 fn session_log_search_from_home_with_projects(
     home: &Path,
     query: &str,
@@ -6260,14 +6329,14 @@ fn codex_line_may_affect_session_list(line: &str) -> bool {
         .payload
         .as_ref()
         .and_then(|payload| payload.kind.as_deref());
-    match (kind.kind.as_deref(), payload_kind) {
-        (Some("session_meta" | "turn_context"), _) => true,
-        (Some("event_msg"), _) => true,
-        (Some("response_item"), Some("message" | "function_call")) => true,
-        (Some("response_item"), None) => true,
-        (None, _) => true,
-        _ => false,
-    }
+    matches!(
+        (kind.kind.as_deref(), payload_kind),
+        (Some("session_meta" | "turn_context"), _)
+            | (Some("event_msg"), _)
+            | (Some("response_item"), Some("message" | "function_call"))
+            | (Some("response_item"), None)
+            | (None, _)
+    )
 }
 
 fn codex_payload_text(payload: &serde_json::Value) -> Option<(String, String)> {
@@ -6586,8 +6655,7 @@ fn mark_external_entries_superseded_from(
     rollback_ts: &str,
 ) -> Vec<u32> {
     let mut superseded_user_turns = Vec::new();
-    for idx in start_index..entries.len() {
-        let entry = &entries[idx];
+    for entry in entries.iter_mut().skip(start_index) {
         if entry
             .get("superseded")
             .and_then(|v| v.as_bool())
@@ -6605,7 +6673,7 @@ fn mark_external_entries_superseded_from(
             .get("user_turn_index")
             .and_then(|v| v.as_u64())
             .and_then(|v| u32::try_from(v).ok());
-        if let Some(obj) = entries[idx].as_object_mut() {
+        if let Some(obj) = entry.as_object_mut() {
             obj.insert("superseded".to_string(), serde_json::Value::Bool(true));
             obj.insert(
                 "superseded_at".to_string(),
@@ -6944,7 +7012,9 @@ fn preload_session_index() {
                 scope.spawn(move || preload_namespace_dir(&dir, namespace, apply));
             }
             let intendant_dir = base.join("intendant-row");
-            scope.spawn(move || preload_namespace_dir(&intendant_dir, "intendant-row", preload_intendant_entry));
+            scope.spawn(move || {
+                preload_namespace_dir(&intendant_dir, "intendant-row", preload_intendant_entry)
+            });
         });
     });
 }
@@ -7008,12 +7078,10 @@ fn preload_row_entry(namespace: &'static str, bytes: &[u8]) {
     let mut cache = session_list_row_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    cache
-        .entry(slot)
-        .or_insert(SessionListRowCacheEntry {
-            key,
-            row: entry.value,
-        });
+    cache.entry(slot).or_insert(SessionListRowCacheEntry {
+        key,
+        row: entry.value,
+    });
 }
 
 fn preload_codex_entry(namespace: &'static str, bytes: &[u8]) {
@@ -7272,7 +7340,7 @@ fn collect_recent_files(root: &Path, suffix: &str, limit: usize) -> Vec<PathBuf>
             .map(|canonical| seen.insert(canonical))
             .unwrap_or(true)
     });
-    files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
+    files.sort_by_key(|b| std::cmp::Reverse(file_mtime_secs(b)));
     files.truncate(limit);
     files
 }
@@ -7640,8 +7708,8 @@ fn session_changed_sort_key(session: &serde_json::Value) -> i64 {
         .unwrap_or_else(|| session_created_sort_key(session))
 }
 
-fn sort_sessions_newest_first(sessions: &mut Vec<serde_json::Value>) {
-    sessions.sort_by(|a, b| session_changed_sort_key(b).cmp(&session_changed_sort_key(a)));
+fn sort_sessions_newest_first(sessions: &mut [serde_json::Value]) {
+    sessions.sort_by_key(|b| std::cmp::Reverse(session_changed_sort_key(b)));
 }
 
 fn session_source(session: &serde_json::Value) -> &str {
@@ -8109,9 +8177,7 @@ fn codex_parent_baseline_for_summary(
     usage_events_by_id: &HashMap<String, Vec<CodexUsageEvent>>,
     exact_parent_baselines: &HashMap<(String, i64), Option<SessionUsage>>,
 ) -> Option<SessionUsage> {
-    let Some(parent_id) = summary.lineage.parent_id.as_deref() else {
-        return None;
-    };
+    let parent_id = summary.lineage.parent_id.as_deref()?;
 
     let cutoff = summary
         .created_at
@@ -8125,9 +8191,7 @@ fn codex_parent_baseline_for_summary(
         }
     }
 
-    let Some(parent_events) = usage_events_by_id.get(parent_id) else {
-        return None;
-    };
+    let parent_events = usage_events_by_id.get(parent_id)?;
     codex_usage_at_or_before(parent_events, summary.created_at.as_deref())
 }
 
@@ -8455,6 +8519,7 @@ fn codex_dir(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".codex"))
 }
 
+#[allow(dead_code)]
 fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
     list_codex_sessions_with_limit(home, EXTERNAL_SESSION_SCAN_LIMIT)
 }
@@ -8527,7 +8592,7 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
     let index_path = codex.join("session_index.jsonl");
     if let Some(contents) = read_codex_session_index_for_list(&index_path) {
         for line in contents.lines() {
-            let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
+            let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
             let Some(id) = value_str(&obj, "id") else {
@@ -8564,7 +8629,7 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
         ".jsonl",
         scan_limit,
     ));
-    files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
+    files.sort_by_key(|b| std::cmp::Reverse(file_mtime_secs(b)));
     files.truncate(scan_limit);
     let mut summaries = Vec::new();
     for path in files {
@@ -8591,7 +8656,7 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
         let Some(parent_path) = path_by_id.get(parent_id) else {
             continue;
         };
-        if file_size(parent_path) <= (EXTERNAL_SESSION_READ_LIMIT * 2) as u64 {
+        if file_size(parent_path) <= (EXTERNAL_SESSION_READ_LIMIT * 2) {
             continue;
         }
         let cutoff = summary
@@ -8832,6 +8897,7 @@ fn claude_session_list_row_from_file(path: &Path) -> Option<serde_json::Value> {
     Some(session)
 }
 
+#[allow(dead_code)]
 fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
     list_claude_sessions_with_limit(home, EXTERNAL_SESSION_SCAN_LIMIT)
 }
@@ -8958,6 +9024,7 @@ fn gemini_session_list_row_from_file(
     Some(session)
 }
 
+#[allow(dead_code)]
 fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
     list_gemini_sessions_with_limit(home, EXTERNAL_SESSION_SCAN_LIMIT)
 }
@@ -9027,6 +9094,7 @@ fn find_codex_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
         .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
 }
 
+#[allow(dead_code)]
 fn external_session_detail_from_home(
     home: &Path,
     source: &str,
@@ -9035,6 +9103,7 @@ fn external_session_detail_from_home(
     external_session_detail_from_home_with_limit(home, source, session_id, None)
 }
 
+#[allow(dead_code)]
 fn external_session_detail_from_home_with_limit(
     home: &Path,
     source: &str,
@@ -9965,6 +10034,7 @@ pub(crate) fn external_session_entries_from_home(
     external_session_entries_from_file(&source, session_id, &path)
 }
 
+#[allow(dead_code)]
 fn external_session_activity_replay_from_home(
     home: &Path,
     source: &str,
@@ -10589,6 +10659,7 @@ fn session_id_matches_any_requested(candidate: &str, requested_ids: &HashSet<Str
     })
 }
 
+#[allow(dead_code)]
 fn filter_session_list_by_ids(body: &str, ids: &[String]) -> String {
     if ids.is_empty() {
         return body.to_string();
@@ -10701,6 +10772,7 @@ fn hydrate_codex_session_goals_for_ids(home: &Path, body: &str, ids: &[String]) 
     serde_json::to_string(&rows).unwrap_or_else(|_| body.to_string())
 }
 
+#[allow(dead_code)]
 fn filter_session_list_by_ids_with_codex_goal_hydration(
     home: &Path,
     body: &str,
@@ -11146,7 +11218,7 @@ fn extend_codex_observed_worktree_session_hints(
             ".jsonl",
             WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
         ));
-        files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
+        files.sort_by_key(|b| std::cmp::Reverse(file_mtime_secs(b)));
         files.truncate(WORKTREE_OBSERVED_SESSION_FILE_LIMIT);
     }
 
@@ -11221,7 +11293,7 @@ fn agent_session_files_from_rows(
             files.push(path);
         }
     }
-    files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
+    files.sort_by_key(|b| std::cmp::Reverse(file_mtime_secs(b)));
     files.truncate(limit);
     files
 }
@@ -13772,9 +13844,7 @@ async fn connect_dashboard_offer_response(
     let grant = match verified_client_key {
         Some(key) => {
             let cert_dir = crate::access::backend::select_backend().cert_dir();
-            let loaded = load_local_iam_state_for_request(&cert_dir)
-                .ok()
-                .flatten();
+            let loaded = load_local_iam_state_for_request(&cert_dir).ok().flatten();
             let bound = loaded.as_ref().and_then(|state| {
                 crate::access::iam::principal_for_client_key(
                     state,
@@ -15385,9 +15455,9 @@ fn effective_upload_destination(
 /// Parse a query-string value by key out of a full `request_line`
 /// (e.g. `POST /api/session/current/uploads?name=foo.pdf&destination=task HTTP/1.1`).
 /// Returns the URL-decoded value, or `None` if the key isn't present.
-fn query_param<'a>(request_line: &'a str, key: &str) -> Option<String> {
+fn query_param(request_line: &str, key: &str) -> Option<String> {
     let path_and_q = request_line.split_whitespace().nth(1)?;
-    let query = path_and_q.splitn(2, '?').nth(1)?;
+    let query = path_and_q.split_once('?')?.1;
     for pair in query.split('&') {
         let mut it = pair.splitn(2, '=');
         let k = it.next()?;
@@ -16279,6 +16349,11 @@ fn inspect_dashboard_fs_path(raw: &str) -> Result<FsPathStatus, String> {
         is_dir,
         is_file,
         readable,
+        size: metadata.as_ref().map(|m| m.len()),
+        modified_ms: metadata
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(system_time_unix_ms),
         parent,
         parent_exists: parent_metadata.is_some(),
         parent_is_dir: parent_metadata.map(|m| m.is_dir()).unwrap_or(false),
@@ -16604,6 +16679,294 @@ pub(crate) fn dashboard_fs_mkdir_response_body(raw: &str) -> (String, String) {
         Ok(body) => ("200 OK".to_string(), body.to_string()),
         Err((status, message)) => (status, serde_json::json!({ "error": message }).to_string()),
     }
+}
+
+fn system_time_unix_ms(time: std::time::SystemTime) -> Option<u64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+pub(crate) fn fs_sha256_hex(bytes: &[u8]) -> String {
+    crate::file_watcher::hex_encode(&crate::file_watcher::sha256_hash(bytes))
+}
+
+/// The write half of the dashboard editor. What the caller must have done
+/// already: routed the raw request path through
+/// `authorize_http_filesystem_access` (HTTP) or
+/// `authorize_dashboard_control_method` (tunnel) with
+/// `FilesystemWrite`/`Write` — this function performs no IAM checks of its
+/// own.
+pub(crate) struct FsWriteArgs {
+    pub path: String,
+    pub expected_sha256: Option<String>,
+    pub create_new: bool,
+    pub force: bool,
+}
+
+/// Extract the write payload from an `FsWriteRequest`, enforcing that exactly
+/// one of `content` / `content_b64` is present.
+fn fs_write_request_bytes(req: &FsWriteRequest) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    match (&req.content, &req.content_b64) {
+        (Some(_), Some(_)) => {
+            Err("provide either content or content_b64, not both".to_string())
+        }
+        (Some(text), None) => Ok(text.clone().into_bytes()),
+        (None, Some(b64)) => base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|_| "content_b64 is not valid base64".to_string()),
+        (None, None) => Err("missing content (or content_b64)".to_string()),
+    }
+}
+
+/// Write `bytes` to `args.path` atomically (tempfile in the destination
+/// directory, fsync, rename — permissions of an existing file are preserved),
+/// honouring the request's precondition:
+///
+/// - `create_new` — the file must not exist yet (`409` `code:"exists"`).
+/// - `expected_sha256` — the file must still hash to the value the client
+///   last read; otherwise `409` `code:"conflict"` with the current hash so
+///   the editor can offer reload/overwrite. A vanished file is `409`
+///   `code:"missing"`.
+/// - `force` — write unconditionally.
+/// - none of the above — `400` `code:"precondition_required"`.
+///
+/// The hash check and the rename are not one transaction; a concurrent
+/// writer can still slip between them (the same window every editor has).
+/// The precondition exists to catch the common case — the file changed while
+/// it sat open in a dashboard buffer — not to serialize writers.
+pub(crate) fn apply_dashboard_fs_write(
+    args: &FsWriteArgs,
+    bytes: &[u8],
+) -> (String, serde_json::Value) {
+    if bytes.len() > UPLOAD_MAX_BYTES {
+        return (
+            "413 Payload Too Large".to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "content too large: {} bytes (cap is {})",
+                    bytes.len(),
+                    UPLOAD_MAX_BYTES
+                )
+            }),
+        );
+    }
+    let path = match expand_dashboard_fs_path(&args.path) {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({ "error": e }),
+            )
+        }
+    };
+    let metadata = std::fs::metadata(&path).ok();
+    let (target, existed) = if let Some(metadata) = metadata {
+        if !metadata.is_file() {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({
+                    "error": format!("{} is not a regular file", path.display())
+                }),
+            );
+        }
+        match std::fs::canonicalize(&path) {
+            Ok(canonical) => (canonical, true),
+            Err(e) => {
+                return (
+                    dashboard_fs_io_status(&e).to_string(),
+                    serde_json::json!({
+                        "error": format!("{} is not accessible: {e}", path.display())
+                    }),
+                )
+            }
+        }
+    } else {
+        let Some(name) = path.file_name().map(|n| n.to_os_string()) else {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({
+                    "error": format!("{} has no file name", path.display())
+                }),
+            );
+        };
+        let Some(parent) = path.parent() else {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({
+                    "error": format!("{} has no parent directory", path.display())
+                }),
+            );
+        };
+        let canonical_parent = match std::fs::canonicalize(parent) {
+            Ok(canonical) => canonical,
+            Err(_) => {
+                return (
+                    "404 Not Found".to_string(),
+                    serde_json::json!({
+                        "error": format!(
+                            "parent directory {} does not exist — create it first",
+                            parent.display()
+                        ),
+                        "code": "missing_parent",
+                    }),
+                )
+            }
+        };
+        if !canonical_parent.is_dir() {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({
+                    "error": format!("{} is not a directory", canonical_parent.display())
+                }),
+            );
+        }
+        (canonical_parent.join(name), false)
+    };
+
+    if args.create_new {
+        if existed {
+            return (
+                "409 Conflict".to_string(),
+                serde_json::json!({
+                    "error": format!("{} already exists", target.display()),
+                    "code": "exists",
+                }),
+            );
+        }
+    } else if let Some(expected) = args
+        .expected_sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !existed {
+            return (
+                "409 Conflict".to_string(),
+                serde_json::json!({
+                    "error": format!("{} no longer exists on disk", target.display()),
+                    "code": "missing",
+                }),
+            );
+        }
+        let current = match std::fs::read(&target) {
+            Ok(current) => current,
+            Err(e) => {
+                return (
+                    dashboard_fs_io_status(&e).to_string(),
+                    serde_json::json!({
+                        "error": format!("could not read {}: {e}", target.display())
+                    }),
+                )
+            }
+        };
+        let current_sha256 = fs_sha256_hex(&current);
+        if !current_sha256.eq_ignore_ascii_case(expected) {
+            let modified_ms = std::fs::metadata(&target)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(system_time_unix_ms);
+            return (
+                "409 Conflict".to_string(),
+                serde_json::json!({
+                    "error": format!("{} changed on disk since it was read", target.display()),
+                    "code": "conflict",
+                    "current_sha256": current_sha256,
+                    "size": current.len(),
+                    "modified_ms": modified_ms,
+                }),
+            );
+        }
+    } else if !args.force {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": "write requires expected_sha256, create_new, or force",
+                "code": "precondition_required",
+            }),
+        );
+    }
+
+    let Some(dir) = target.parent() else {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!("{} has no parent directory", target.display())
+            }),
+        );
+    };
+    let write_result = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".intendant-fswrite-")
+            .suffix(".tmp")
+            .tempfile_in(dir)?;
+        tmp.write_all(bytes)?;
+        tmp.as_file_mut().sync_all()?;
+        if existed {
+            if let Ok(current) = std::fs::metadata(&target) {
+                let _ = std::fs::set_permissions(tmp.path(), current.permissions());
+            }
+        }
+        crate::upload_store::persist_tempfile(tmp, &target)
+    })();
+    if let Err(e) = write_result {
+        return (
+            dashboard_fs_io_status(&e).to_string(),
+            serde_json::json!({
+                "error": format!("could not write {}: {e}", target.display())
+            }),
+        );
+    }
+
+    let modified_ms = std::fs::metadata(&target)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(system_time_unix_ms);
+    (
+        "200 OK".to_string(),
+        serde_json::json!({
+            "ok": true,
+            "path": target.to_string_lossy().to_string(),
+            "size": bytes.len(),
+            "sha256": fs_sha256_hex(bytes),
+            "created": !existed,
+            "modified_ms": modified_ms,
+        }),
+    )
+}
+
+/// Tunnel-facing wrapper: apply a write whose payload arrived out-of-band
+/// (dashboard-control upload frames) with the request fields as JSON params.
+/// Returns `(http-ish status code, body)` for `http_body_response`.
+pub(crate) fn dashboard_fs_write_response_parts(
+    params: &serde_json::Value,
+    bytes: &[u8],
+) -> (u16, String) {
+    let args = FsWriteArgs {
+        path: params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        expected_sha256: params
+            .get("expected_sha256")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        create_new: params
+            .get("create_new")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        force: params.get("force").and_then(|v| v.as_bool()).unwrap_or(false),
+    };
+    let (status_line, body) = apply_dashboard_fs_write(&args, bytes);
+    let code = status_line
+        .split_whitespace()
+        .next()
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(500);
+    (code, body.to_string())
 }
 
 /// Extract the `Content-Type` request header value, or a generic default.
@@ -17459,6 +17822,25 @@ pub(crate) fn project_root_response_body(project_root: Option<&Path>) -> String 
     .to_string()
 }
 
+/// Availability of the external-agent backends (Codex, Claude Code):
+/// the configured command, whether it resolves to an executable, and
+/// when this daemon last ran a session with it. Deliberately independent
+/// of provider fueling — external agents bring their own credentials, so
+/// the dashboard pairs this with the `fueled` flag instead of letting the
+/// first-run nudge claim an unfueled daemon can't do anything.
+pub(crate) fn external_agents_response_body(project_root: Option<&Path>) -> String {
+    let agent_config = project_root
+        .and_then(|root| crate::project::Project::from_root(root.to_path_buf()).ok())
+        .map(|project| project.config.agent)
+        .unwrap_or_default();
+    let home = crate::platform::home_dir();
+    serde_json::json!({
+        "external_agents":
+            crate::external_agent::backend_availability_json(&agent_config, &home),
+    })
+    .to_string()
+}
+
 pub(crate) async fn displays_response_body(
     session_registry: &Option<crate::display::SharedSessionRegistry>,
 ) -> String {
@@ -17714,11 +18096,18 @@ fn mcp_cors_header_segment(header_text: &str, is_tls: bool) -> String {
 /// `tools/call` would actually allow, so clients never advertise tools that
 /// call-time enforcement will refuse.
 fn filter_mcp_tools_by_access(listed: &mut serde_json::Value, access: &HttpAccessContext) {
-    if let Some(tools) = listed.get_mut("tools").and_then(serde_json::Value::as_array_mut) {
+    if let Some(tools) = listed
+        .get_mut("tools")
+        .and_then(serde_json::Value::as_array_mut)
+    {
         tools.retain(|tool| {
             tool.get("name")
                 .and_then(serde_json::Value::as_str)
-                .map(|name| access.decision(crate::mcp::mcp_tool_operation(name)).allowed)
+                .map(|name| {
+                    access
+                        .decision(crate::mcp::mcp_tool_operation(name))
+                        .allowed
+                })
                 .unwrap_or(false)
         });
     }
@@ -18514,6 +18903,8 @@ pub fn spawn_web_gateway(
             "/wasm-station/station_web.js",
             "/wasm-station/station_web_bg.wasm",
             "/three.module.min.js",
+            "/codemirror-bundle.js",
+            "/codemirror-bundle.css",
             "/icon-128.png",
         ]
         .iter()
@@ -19313,6 +19704,7 @@ pub fn spawn_web_gateway(
                             in_secs: f64,
                             out_secs: f64,
                             fps: u32,
+                            #[allow(dead_code)]
                             expected: usize,
                             frames: Vec<(String, String)>, // (frame_id, base64_data)
                         }
@@ -19334,8 +19726,7 @@ pub fn spawn_web_gateway(
 
                         // Shell-session lane for this connection: root sees
                         // every session, scoped principals see owned/shared.
-                        let ws_terminal_actor =
-                            dashboard_control_grant_inbound.terminal_actor();
+                        let ws_terminal_actor = dashboard_control_grant_inbound.terminal_actor();
 
                         // Per-connection audio transcription buffer.
                         // PCM16 bytes are accumulated and drained every ~3s.
@@ -20009,8 +20400,8 @@ pub fn spawn_web_gateway(
                                                     {
                                                         let mut rreg = rec_reg.write().await;
                                                         if rreg.is_enabled() {
-                                                            if !rreg.is_recording(&stream) {
-                                                                if crate::recording::is_ffmpeg_available() {
+                                                            if !rreg.is_recording(&stream)
+                                                                && crate::recording::is_ffmpeg_available() {
                                                                     if let Err(e) = rreg.start_stream(&stream).await {
                                                                         eprintln!("camera recording start failed: {}", e);
                                                                     } else {
@@ -20019,7 +20410,6 @@ pub fn spawn_web_gateway(
                                                                         });
                                                                     }
                                                                 }
-                                                            }
                                                             let _ = rreg
                                                                 .feed_frame(&stream, &jpeg_bytes)
                                                                 .await;
@@ -20248,8 +20638,6 @@ pub fn spawn_web_gateway(
                                                 json["clip_id"].as_str().unwrap_or("").to_string();
                                             let frame_id =
                                                 json["frame_id"].as_str().unwrap_or("").to_string();
-                                            let timestamp_secs =
-                                                json["timestamp_secs"].as_f64().unwrap_or(0.0);
                                             if let Some(data_b64) = json["data"].as_str() {
                                                 // Register frame in frame registry
                                                 use base64::Engine;
@@ -20290,8 +20678,6 @@ pub fn spawn_web_gateway(
                                         Some("clip_end") => {
                                             let clip_id =
                                                 json["clip_id"].as_str().unwrap_or("").to_string();
-                                            let frames_sent =
-                                                json["frames_sent"].as_u64().unwrap_or(0) as usize;
                                             let mut injected = false;
 
                                             if let Some(acc) = clip_accumulators.remove(&clip_id) {
@@ -20303,18 +20689,18 @@ pub fn spawn_web_gateway(
                                                             if let Ok(mut q) = ciq.lock() {
                                                                 let label = if acc.note.is_empty() {
                                                                     format!(
-                                                                        "[Video Clip] {} {}-{} ({} frames, {}fps)",
+                                                                        "[Video Clip] {} {:.1}s-{:.1}s ({} frames, {}fps)",
                                                                         acc.stream,
-                                                                        format!("{:.1}s", acc.in_secs),
-                                                                        format!("{:.1}s", acc.out_secs),
+                                                                        acc.in_secs,
+                                                                        acc.out_secs,
                                                                         frames_registered, acc.fps,
                                                                     )
                                                                 } else {
                                                                     format!(
-                                                                        "[Video Clip] {} {}-{} ({} frames, {}fps). {}",
+                                                                        "[Video Clip] {} {:.1}s-{:.1}s ({} frames, {}fps). {}",
                                                                         acc.stream,
-                                                                        format!("{:.1}s", acc.in_secs),
-                                                                        format!("{:.1}s", acc.out_secs),
+                                                                        acc.in_secs,
+                                                                        acc.out_secs,
                                                                         frames_registered, acc.fps, acc.note,
                                                                     )
                                                                 };
@@ -21038,8 +21424,7 @@ pub fn spawn_web_gateway(
                                                 .as_str()
                                                 .unwrap_or("shell-0")
                                                 .to_string();
-                                            let shared =
-                                                json["shared"].as_bool().unwrap_or(true);
+                                            let shared = json["shared"].as_bool().unwrap_or(true);
                                             let key = crate::terminal::TerminalKey {
                                                 host_id: host_id.clone(),
                                                 terminal_id: terminal_id.clone(),
@@ -21677,8 +22062,9 @@ pub fn spawn_web_gateway(
                             // Non-fleet APIs are same-origin (or app-scheme)
                             // only; a cross-origin preflight gets no ACAO and
                             // the browser stops there.
-                            let allowed = extract_origin_header(&header_text)
-                                .filter(|origin| is_own_or_app_origin(origin, is_tls, &header_text));
+                            let allowed = extract_origin_header(&header_text).filter(|origin| {
+                                is_own_or_app_origin(origin, is_tls, &header_text)
+                            });
                             match allowed {
                                 Some(origin) => format!(
                                     "HTTP/1.1 204 No Content\r\n\
@@ -21811,11 +22197,9 @@ pub fn spawn_web_gateway(
                     // `inbound_bearer_token` docs on `spawn_web_gateway`
                     // for the design rationale.
                     if is_federation_path(request_line) {
-                        if let Some(op) =
-                            crate::peer::access_policy::federation_http_operation(
-                                req_method, req_path,
-                            )
-                        {
+                        if let Some(op) = crate::peer::access_policy::federation_http_operation(
+                            req_method, req_path,
+                        ) {
                             let decision = http_access_context.decision(op);
                             if !decision.allowed {
                                 use tokio::io::AsyncWriteExt;
@@ -22061,10 +22445,9 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/fs/stat"
-                    {
+                    } else if req_method == "GET" && req_path == "/api/fs/stat" {
                         use tokio::io::AsyncWriteExt;
-                        let path = query_param(&request_line, "path").unwrap_or_default();
+                        let path = query_param(request_line, "path").unwrap_or_default();
                         let response = match inspect_dashboard_fs_path(&path) {
                             Ok(status) => json_response(
                                 "200 OK",
@@ -22073,19 +22456,17 @@ pub fn spawn_web_gateway(
                             Err(e) => json_error("400 Bad Request", e),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/fs/list"
-                    {
+                    } else if req_method == "GET" && req_path == "/api/fs/list" {
                         use tokio::io::AsyncWriteExt;
-                        let path = query_param(&request_line, "path").unwrap_or_default();
+                        let path = query_param(request_line, "path").unwrap_or_default();
                         let response = match list_dashboard_fs_dir(&path) {
                             Ok(body) => json_ok(body),
                             Err(e) => json_error("400 Bad Request", e),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/fs/read"
-                    {
+                    } else if req_method == "GET" && req_path == "/api/fs/read" {
                         use tokio::io::AsyncWriteExt;
-                        let path = query_param(&request_line, "path").unwrap_or_default();
+                        let path = query_param(request_line, "path").unwrap_or_default();
                         let range_header = dashboard_http_header_value(&header_text, "range");
                         match dashboard_fs_read_file(&path, range_header) {
                             Ok(file) => {
@@ -22104,21 +22485,35 @@ pub fn spawn_web_gateway(
                                 } else {
                                     String::new()
                                 };
+                                // Full (non-range) reads carry the content
+                                // hash so the editor has a conflict baseline
+                                // for its later write-back.
+                                let sha_header = if file.partial {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "X-Content-Sha256: {}\r\n",
+                                        fs_sha256_hex(&file.bytes)
+                                    )
+                                };
                                 let header = format!(
                                     "HTTP/1.1 {}\r\n\
                                      Content-Type: {}\r\n\
                                      Content-Length: {}\r\n\
                                      Accept-Ranges: bytes\r\n\
                                      {}\
+                                     {}\
                                      Content-Disposition: attachment; filename=\"{}\"\r\n\
                                      Cache-Control: no-cache\r\n\
                                      Access-Control-Allow-Origin: *\r\n\
+                                     Access-Control-Expose-Headers: X-Content-Sha256\r\n\
                                      Connection: close\r\n\
                                      \r\n",
                                     status,
                                     file.content_type,
                                     file.bytes.len(),
                                     content_range,
+                                    sha_header,
                                     file.filename.replace('"', ""),
                                 );
                                 let _ = stream.write_all(header.as_bytes()).await;
@@ -22150,8 +22545,7 @@ pub fn spawn_web_gateway(
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
                         }
-                    } else if req_method == "POST" && req_path == "/api/fs/mkdir"
-                    {
+                    } else if req_method == "POST" && req_path == "/api/fs/mkdir" {
                         use tokio::io::AsyncWriteExt;
                         let body_text = read_post_body(&header_text, &mut stream).await;
                         let response = match serde_json::from_str::<FsMkdirRequest>(&body_text) {
@@ -22172,8 +22566,73 @@ pub fn spawn_web_gateway(
                             Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/settings"
-                    {
+                    } else if req_method == "POST" && req_path == "/api/fs/write" {
+                        use tokio::io::AsyncWriteExt;
+                        // read_post_body has no cap of its own; bound the
+                        // body before reading it. The JSON envelope adds
+                        // base64/escaping overhead on top of the content
+                        // cap that apply_dashboard_fs_write enforces, so
+                        // allow half again as much envelope.
+                        let content_length: usize = header_text
+                            .lines()
+                            .find(|l| l.to_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        let response = if content_length > UPLOAD_MAX_BYTES + UPLOAD_MAX_BYTES / 2 {
+                            json_error(
+                                "413 Payload Too Large",
+                                format!(
+                                    "body too large: {content_length} bytes (cap is {})",
+                                    UPLOAD_MAX_BYTES + UPLOAD_MAX_BYTES / 2
+                                ),
+                            )
+                        } else {
+                            let body_text = read_post_body(&header_text, &mut stream).await;
+                            match serde_json::from_str::<FsWriteRequest>(&body_text) {
+                                Ok(req) => match authorize_http_filesystem_access(
+                                    &http_access_context,
+                                    peer_connection_identity.as_ref(),
+                                    crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                    crate::peer::access_policy::FilesystemAccessKind::Write,
+                                    &req.path,
+                                    &bus,
+                                ) {
+                                    Ok(()) => match fs_write_request_bytes(&req) {
+                                        Ok(bytes) => {
+                                            let args = FsWriteArgs {
+                                                path: req.path.clone(),
+                                                expected_sha256: req.expected_sha256.clone(),
+                                                create_new: req.create_new,
+                                                force: req.force,
+                                            };
+                                            let (status, body) = tokio::task::spawn_blocking(
+                                                move || apply_dashboard_fs_write(&args, &bytes),
+                                            )
+                                            .await
+                                            .unwrap_or_else(|e| {
+                                                (
+                                                    "500 Internal Server Error".to_string(),
+                                                    serde_json::json!({
+                                                        "error": format!(
+                                                            "filesystem write task failed: {e}"
+                                                        )
+                                                    }),
+                                                )
+                                            });
+                                            json_response(&status, body.to_string())
+                                        }
+                                        Err(message) => json_error("400 Bad Request", message),
+                                    },
+                                    Err(message) => json_error("403 Forbidden", message),
+                                },
+                                Err(e) => {
+                                    json_error("400 Bad Request", format!("invalid JSON: {e}"))
+                                }
+                            }
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "POST" && req_path == "/api/settings" {
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         // Read POST body — may be partially or fully outside the peek buffer
                         let content_length: usize = header_text
@@ -22202,7 +22661,8 @@ pub fn spawn_web_gateway(
                             settings_post_result(body_text, project_root.as_deref(), &bus);
                         let response = json_response(status, result);
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/diagnostics/visual-freshness"
+                    } else if req_method == "POST"
+                        && req_path == "/api/diagnostics/visual-freshness"
                     {
                         // **Phase 0 visual-freshness transcript sink** (task #83).
                         // Body is browser-emitted NDJSON (one JSON record per
@@ -22223,9 +22683,7 @@ pub fn spawn_web_gateway(
                             .map(|qs| {
                                 qs.split('&')
                                     .find_map(|kv| {
-                                        let mut parts = kv.splitn(2, '=');
-                                        let k = parts.next()?;
-                                        let v = parts.next()?;
+                                        let (k, v) = kv.split_once('=')?;
                                         if k == "session_id" {
                                             Some(v.to_string())
                                         } else {
@@ -22304,8 +22762,7 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/api-keys"
-                    {
+                    } else if req_method == "POST" && req_path == "/api/api-keys" {
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         let content_length: usize = header_text
                             .lines()
@@ -22345,6 +22802,21 @@ pub fn spawn_web_gateway(
                     } else if req_path == "/api/api-key-status" {
                         use tokio::io::AsyncWriteExt;
                         let body = api_key_status_response_body();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_path == "/api/external-agents" {
+                        use tokio::io::AsyncWriteExt;
+                        let body = external_agents_response_body(project_root.as_deref());
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -22604,8 +23076,7 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "DELETE" && req_path.starts_with("/api/session/")
-                    {
+                    } else if req_method == "DELETE" && req_path.starts_with("/api/session/") {
                         // Plain DELETE without /delete in path (curl, regular browser)
                         use tokio::io::AsyncWriteExt;
                         let rest = request_line
@@ -22631,7 +23102,8 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/session/current/agent-output"
+                    } else if req_method == "POST"
+                        && req_path == "/api/session/current/agent-output"
                     {
                         use tokio::io::AsyncWriteExt;
                         let log_dir =
@@ -22693,9 +23165,9 @@ pub fn spawn_web_gateway(
                                 );
                             };
 
-                            let name = query_param(&request_line, "name")
+                            let name = query_param(request_line, "name")
                                 .unwrap_or_else(|| "upload.bin".to_string());
-                            let requested_destination = query_param(&request_line, "destination")
+                            let requested_destination = query_param(request_line, "destination")
                                 .as_deref()
                                 .and_then(crate::upload_store::UploadDestination::from_str)
                                 .unwrap_or(crate::upload_store::UploadDestination::Task);
@@ -22817,7 +23289,7 @@ pub fn spawn_web_gateway(
                             };
                             // Path after /api/session/current/uploads
                             let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
-                            let path = path_and_q.splitn(2, '?').next().unwrap_or("");
+                            let path = path_and_q.split('?').next().unwrap_or("");
                             let suffix = path
                                 .trim_start_matches("/api/session/current/uploads")
                                 .trim_matches('/');
@@ -22900,7 +23372,7 @@ pub fn spawn_web_gateway(
                                 Ok(session_dir) => {
                                     let path_and_q =
                                         request_line.split_whitespace().nth(1).unwrap_or("");
-                                    let path = path_and_q.splitn(2, '?').next().unwrap_or("");
+                                    let path = path_and_q.split('?').next().unwrap_or("");
                                     let id = path
                                         .trim_start_matches("/api/session/current/uploads/")
                                         .trim_matches('/');
@@ -22918,15 +23390,14 @@ pub fn spawn_web_gateway(
                             }
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/managed-context/anchors"
-                    {
+                    } else if req_method == "GET" && req_path == "/api/managed-context/anchors" {
                         use tokio::io::AsyncWriteExt;
                         let response = match session_log.as_ref() {
                             Some(log) => match log.lock() {
                                 Ok(log) => {
                                     let active_log_dir = log.dir().to_path_buf();
                                     managed_context_anchors_response_from_home(
-                                        &request_line,
+                                        request_line,
                                         Some(active_log_dir.as_path()),
                                         &crate::platform::home_dir(),
                                     )
@@ -22937,21 +23408,20 @@ pub fn spawn_web_gateway(
                                 ),
                             },
                             None => managed_context_anchors_response_from_home(
-                                &request_line,
+                                request_line,
                                 None,
                                 &crate::platform::home_dir(),
                             ),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/managed-context/records"
-                    {
+                    } else if req_method == "GET" && req_path == "/api/managed-context/records" {
                         use tokio::io::AsyncWriteExt;
                         let response = match session_log.as_ref() {
                             Some(log) => match log.lock() {
                                 Ok(log) => {
                                     let active_log_dir = log.dir().to_path_buf();
                                     managed_context_records_response_from_home(
-                                        &request_line,
+                                        request_line,
                                         Some(active_log_dir.as_path()),
                                         &crate::platform::home_dir(),
                                     )
@@ -22962,14 +23432,13 @@ pub fn spawn_web_gateway(
                                 ),
                             },
                             None => managed_context_records_response_from_home(
-                                &request_line,
+                                request_line,
                                 None,
                                 &crate::platform::home_dir(),
                             ),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/managed-context/fission"
-                    {
+                    } else if req_method == "GET" && req_path == "/api/managed-context/fission" {
                         use tokio::io::AsyncWriteExt;
                         let response = match session_log.as_ref() {
                             Some(log) => match log.lock() {
@@ -22993,14 +23462,13 @@ pub fn spawn_web_gateway(
                             ),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/session/current/changes"
-                    {
+                    } else if req_method == "GET" && req_path == "/api/session/current/changes" {
                         // File change tracking endpoints:
                         //   GET /api/session/current/changes        — list all changed files
                         //   GET /api/session/current/changes/{path} — unified diff for one file
                         use tokio::io::AsyncWriteExt;
                         let (status, body) = handle_changes_request_for_home(
-                            &request_line,
+                            request_line,
                             snapshot_dir.as_deref(),
                             project_root_for_changes.as_deref(),
                             &crate::platform::home_dir(),
@@ -23019,8 +23487,7 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/session/current/history"
-                    {
+                    } else if req_method == "GET" && req_path == "/api/session/current/history" {
                         // GET /api/session/current/history — serialized History.
                         use tokio::io::AsyncWriteExt;
                         let (status, body) = handle_history_get(file_watcher.as_ref()).await;
@@ -23038,13 +23505,12 @@ pub fn spawn_web_gateway(
                             body,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/session/current/rollback"
-                    {
+                    } else if req_method == "POST" && req_path == "/api/session/current/rollback" {
                         // POST /api/session/current/rollback body:
                         //   {"round_id": N,
                         //    "revert_files": bool (default true),
                         //    "revert_conversation": bool (default false)}
-                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        use tokio::io::AsyncWriteExt;
                         let body_text = read_post_body(&header_text, &mut stream).await;
                         let agent_state = query_ctx.as_ref().map(|ctx| ctx.agent_state.clone());
                         let (status, body) = handle_history_rollback(
@@ -23068,10 +23534,9 @@ pub fn spawn_web_gateway(
                             body,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/session/current/redo"
-                    {
+                    } else if req_method == "POST" && req_path == "/api/session/current/redo" {
                         // POST /api/session/current/redo — no body required.
-                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        use tokio::io::AsyncWriteExt;
                         let _ = read_post_body(&header_text, &mut stream).await;
                         let agent_state = query_ctx.as_ref().map(|ctx| ctx.agent_state.clone());
                         let (status, body) =
@@ -23090,10 +23555,9 @@ pub fn spawn_web_gateway(
                             body,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/session/current/prune"
-                    {
+                    } else if req_method == "POST" && req_path == "/api/session/current/prune" {
                         // POST /api/session/current/prune — no body required.
-                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        use tokio::io::AsyncWriteExt;
                         let _ = read_post_body(&header_text, &mut stream).await;
                         let (status, body) = handle_history_prune(file_watcher.as_ref()).await;
                         let response = format!(
@@ -23690,22 +24154,21 @@ pub fn spawn_web_gateway(
                                 .await
                             {
                                 Ok(body_text) => {
-                                    let (status, body) = match serde_json::from_str::<
-                                        serde_json::Value,
-                                    >(&body_text)
-                                    .map_err(|e| format!("invalid JSON: {e}"))
-                                    .and_then(|params| {
-                                        access_org_present_response_value(
-                                            params,
-                                            &agent_card_value_for_targets,
-                                        )
-                                    }) {
-                                        Ok(value) => (200, value.to_string()),
-                                        Err(error) => (
-                                            400,
-                                            serde_json::json!({"error": error}).to_string(),
-                                        ),
-                                    };
+                                    let (status, body) =
+                                        match serde_json::from_str::<serde_json::Value>(&body_text)
+                                            .map_err(|e| format!("invalid JSON: {e}"))
+                                            .and_then(|params| {
+                                                access_org_present_response_value(
+                                                    params,
+                                                    &agent_card_value_for_targets,
+                                                )
+                                            }) {
+                                            Ok(value) => (200, value.to_string()),
+                                            Err(error) => (
+                                                400,
+                                                serde_json::json!({"error": error}).to_string(),
+                                            ),
+                                        };
                                     with_public_cors(json_response(status_reason(status), body))
                                 }
                                 Err((status, body)) => json_response(status_reason(status), body),
@@ -23727,8 +24190,7 @@ pub fn spawn_web_gateway(
                             Ok(value) => (200, value.to_string()),
                             Err(error) => (404, serde_json::json!({"error": error}).to_string()),
                         };
-                        let response =
-                            with_public_cors(json_response(status_reason(status), body));
+                        let response = with_public_cors(json_response(status_reason(status), body));
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_path == "/api/access/orgs/revocations/apply"
                         || req_path == "/api/access/org-grants/renew"
@@ -23747,28 +24209,27 @@ pub fn spawn_web_gateway(
                             };
                             match read_request_body_capped(&mut stream, &header_text, cap).await {
                                 Ok(body_text) => {
-                                    let handler = if req_path == "/api/access/orgs/revocations/apply"
-                                    {
-                                        access_org_orl_apply_response_value
-                                            as fn(
-                                                serde_json::Value,
-                                            )
-                                                -> Result<serde_json::Value, String>
-                                    } else {
-                                        access_org_renew_response_value
-                                    };
-                                    let (status, body) = match serde_json::from_str::<
-                                        serde_json::Value,
-                                    >(&body_text)
-                                    .map_err(|e| format!("invalid JSON: {e}"))
-                                    .and_then(handler)
-                                    {
-                                        Ok(value) => (200, value.to_string()),
-                                        Err(error) => (
-                                            400,
-                                            serde_json::json!({"error": error}).to_string(),
-                                        ),
-                                    };
+                                    let handler =
+                                        if req_path == "/api/access/orgs/revocations/apply" {
+                                            access_org_orl_apply_response_value
+                                                as fn(
+                                                    serde_json::Value,
+                                                )
+                                                    -> Result<serde_json::Value, String>
+                                        } else {
+                                            access_org_renew_response_value
+                                        };
+                                    let (status, body) =
+                                        match serde_json::from_str::<serde_json::Value>(&body_text)
+                                            .map_err(|e| format!("invalid JSON: {e}"))
+                                            .and_then(handler)
+                                        {
+                                            Ok(value) => (200, value.to_string()),
+                                            Err(error) => (
+                                                400,
+                                                serde_json::json!({"error": error}).to_string(),
+                                            ),
+                                        };
                                     with_public_cors(json_response(status_reason(status), body))
                                 }
                                 Err((status, body)) => json_response(status_reason(status), body),
@@ -23808,8 +24269,13 @@ pub fn spawn_web_gateway(
                             } else {
                                 let body_text = read_request_body(&mut stream, &header_text).await;
                                 let handler = match req_path {
-                                    "/api/access/orgs/trust" => access_org_trust_response_value
-                                        as fn(serde_json::Value) -> Result<serde_json::Value, String>,
+                                    "/api/access/orgs/trust" => {
+                                        access_org_trust_response_value
+                                            as fn(
+                                                serde_json::Value,
+                                            )
+                                                -> Result<serde_json::Value, String>
+                                    }
                                     "/api/access/orgs/revoke" => access_org_revoke_response_value,
                                     "/api/access/org-grants/revoke-member" => {
                                         access_org_revoke_member_response_value
@@ -23825,17 +24291,16 @@ pub fn spawn_web_gateway(
                                     }
                                     _ => access_org_issue_response_value,
                                 };
-                                let (status, body) = match serde_json::from_str::<serde_json::Value>(
-                                    &body_text,
-                                )
-                                .map_err(|e| format!("invalid request body: {e}"))
-                                .and_then(handler)
-                                {
-                                    Ok(value) => (200, value.to_string()),
-                                    Err(error) => {
-                                        (400, serde_json::json!({"error": error}).to_string())
-                                    }
-                                };
+                                let (status, body) =
+                                    match serde_json::from_str::<serde_json::Value>(&body_text)
+                                        .map_err(|e| format!("invalid request body: {e}"))
+                                        .and_then(handler)
+                                    {
+                                        Ok(value) => (200, value.to_string()),
+                                        Err(error) => {
+                                            (400, serde_json::json!({"error": error}).to_string())
+                                        }
+                                    };
                                 let response = with_fleet_cors(
                                     json_response(status_reason(status), body),
                                     fleet_cors_origin.as_deref(),
@@ -23931,7 +24396,7 @@ pub fn spawn_web_gateway(
                         // the dashboard can render "peers unavailable"
                         // instead of the empty list that a working-but-
                         // empty registry would produce.
-                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        use tokio::io::AsyncWriteExt;
 
                         // Extract subpath after `/api/peers`. The list/
                         // add/remove ops have an empty subpath; per-peer
@@ -24136,7 +24601,7 @@ pub fn spawn_web_gateway(
                         // ..., "client_correlation_id": "..."}}.
                         // Response: {"peer_id": "...", "task_id": "..."}
                         // on success, structured error otherwise.
-                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        use tokio::io::AsyncWriteExt;
                         let (status, body) = match peer_registry.as_ref() {
                             None => (
                                 503,
@@ -24181,8 +24646,7 @@ pub fn spawn_web_gateway(
                             body.len(),
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/worktrees/inspect"
-                    {
+                    } else if req_method == "POST" && req_path == "/api/worktrees/inspect" {
                         let body_text = read_request_body(&mut stream, &header_text).await;
                         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
                         let (status, body) = match tokio::task::spawn_blocking(move || {
@@ -24203,8 +24667,7 @@ pub fn spawn_web_gateway(
                         let response = json_response(status, body);
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/worktrees/remove"
-                    {
+                    } else if req_method == "POST" && req_path == "/api/worktrees/remove" {
                         let body_text = read_request_body(&mut stream, &header_text).await;
                         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
                         let cache = worktree_inventory_cache.clone();
@@ -24232,8 +24695,7 @@ pub fn spawn_web_gateway(
                         let response = json_response(status, body);
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/worktrees/scan"
-                    {
+                    } else if req_method == "POST" && req_path == "/api/worktrees/scan" {
                         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
                         let project_root = project_root.clone();
                         let cache = worktree_inventory_cache.clone();
@@ -24256,8 +24718,7 @@ pub fn spawn_web_gateway(
                         let response = json_response("200 OK", body);
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/worktrees"
-                    {
+                    } else if req_method == "GET" && req_path == "/api/worktrees" {
                         let body = worktree_inventory_cache
                             .lock()
                             .ok()
@@ -24471,7 +24932,7 @@ pub fn spawn_web_gateway(
                                 &body_owned
                             };
                             let (mcp_session_id, codex_managed_context, tool_profile) =
-                                mcp_context_from_request_line(&request_line);
+                                mcp_context_from_request_line(request_line);
                             let outcome = handle_mcp_http_request(
                                 body_text,
                                 mcp,
@@ -24573,6 +25034,8 @@ pub fn spawn_web_gateway(
                             "/wasm-web/presence_web.js",
                             "/wasm-station/station_web.js",
                             "/three.module.min.js",
+                            "/codemirror-bundle.js",
+                            "/codemirror-bundle.css",
                             "/audio-processor.js",
                             "/icon-128.png",
                             "/favicon.ico",
@@ -25163,10 +25626,7 @@ fn access_overview_response_value_with_identities_and_iam(
                 let Some(current_principal_id) = current_principal_id.as_deref() else {
                     return true;
                 };
-                principal
-                    .get("id")
-                    .and_then(|id| id.as_str())
-                    != Some(current_principal_id)
+                principal.get("id").and_then(|id| id.as_str()) != Some(current_principal_id)
             }),
     );
     grants.extend(crate::access::iam::grant_overview_values(
@@ -25571,9 +26031,12 @@ fn fleet_access_origin_allowed(
     if let Some(registry) = peer_registry {
         for handle in registry.list() {
             let snapshot = handle.snapshot();
-            for candidate in [snapshot.ws_url.as_deref(), snapshot.browser_tcp_via_url.as_deref()]
-                .into_iter()
-                .flatten()
+            for candidate in [
+                snapshot.ws_url.as_deref(),
+                snapshot.browser_tcp_via_url.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
             {
                 if normalized_origin(candidate).as_deref() == Some(&normalized) {
                     return true;
@@ -25661,9 +26124,10 @@ pub(crate) fn is_public_org_grant_path(request_line: &str) -> bool {
     path == "/api/access/org-grants"
         || path == "/api/access/org-grants/renew"
         || path == "/api/access/orgs/revocations/apply"
-        || (path.strip_prefix("/api/access/orgs/")
+        || (path
+            .strip_prefix("/api/access/orgs/")
             .and_then(|rest| rest.strip_suffix("/revocations"))
-            .is_some_and(|handle| crate::access::org::valid_org_handle(handle)))
+            .is_some_and(crate::access::org::valid_org_handle))
 }
 
 /// Public presentation of a signed org grant document. The document itself
@@ -25801,22 +26265,22 @@ pub(crate) fn access_org_issue_response_value(
         })
         .unwrap_or_default();
     let request = crate::access::org::IssueOrgGrantRequest {
-            handle: &handle,
-            client_key_fingerprint: params
-                .get("client_key_fingerprint")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            peer_fingerprint: params
-                .get("peer_fingerprint")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            subject_label: params.get("label").and_then(|v| v.as_str()).unwrap_or(""),
-            role_id: params
-                .get("role_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("role:observer"),
-            targets,
-            ttl_ms: params.get("ttl_ms").and_then(|v| v.as_u64()),
+        handle: &handle,
+        client_key_fingerprint: params
+            .get("client_key_fingerprint")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        peer_fingerprint: params
+            .get("peer_fingerprint")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        subject_label: params.get("label").and_then(|v| v.as_str()).unwrap_or(""),
+        role_id: params
+            .get("role_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("role:observer"),
+        targets,
+        ttl_ms: params.get("ttl_ms").and_then(|v| v.as_u64()),
     };
     let now = crate::access::client_key::now_unix_ms() as u64;
     let (doc, org_root_key) = if let Some(identity) = root_identity.as_ref() {
@@ -25881,9 +26345,15 @@ pub(crate) fn access_org_issuer_delegate_response_value(
     let cert = crate::access::org::delegate_org_issuer(
         &identity,
         &handle,
-        params.get("issuer_key").and_then(|v| v.as_str()).unwrap_or(""),
+        params
+            .get("issuer_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
         params.get("label").and_then(|v| v.as_str()).unwrap_or(""),
-        params.get("max_role").and_then(|v| v.as_str()).unwrap_or(""),
+        params
+            .get("max_role")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
         params.get("ttl_ms").and_then(|v| v.as_u64()),
         crate::access::client_key::now_unix_ms() as u64,
     )?;
@@ -25961,12 +26431,13 @@ pub(crate) fn access_org_orl_apply_response_value(
     {
         return Err("org revocation list is too large".to_string());
     }
-    let orl: crate::access::org::OrgRevocationList = serde_json::from_value(params)
-        .map_err(|e| format!("invalid org revocation list: {e}"))?;
+    let orl: crate::access::org::OrgRevocationList =
+        serde_json::from_value(params).map_err(|e| format!("invalid org revocation list: {e}"))?;
     let cert_dir = crate::access::backend::select_backend().cert_dir();
     let mut state = crate::access::iam::load_state(&cert_dir)
         .map_err(|e| format!("load local IAM state: {e}"))?;
-    let applied = crate::access::org::apply_orl(&mut state, &cert_dir, &orl, now).map_err(|e| e.to_string())?;
+    let applied = crate::access::org::apply_orl(&mut state, &cert_dir, &orl, now)
+        .map_err(|e| e.to_string())?;
     if applied.changed {
         crate::access::iam::save_state(&cert_dir, &state)
             .map_err(|e| format!("save local IAM state: {e}"))?;
@@ -26037,7 +26508,13 @@ pub(crate) fn access_org_revoke_member_response_value(
     })?;
     let now = crate::access::client_key::now_unix_ms() as u64;
     let orl = crate::access::org::orl_revoke(
-        &identity, &cert_dir, &handle, &grant_ids, &subjects, &issuer_keys, now,
+        &identity,
+        &cert_dir,
+        &handle,
+        &grant_ids,
+        &subjects,
+        &issuer_keys,
+        now,
     )?;
     let applied = crate::access::iam::load_state(&cert_dir)
         .ok()
@@ -26746,7 +27223,7 @@ pub(crate) fn peers_pairing_identities_list() -> (u16, String) {
 }
 
 fn peers_pairing_identities_list_from_cert_dir(cert_dir: &Path) -> (u16, String) {
-    match crate::peer::access_policy::list_identities(&cert_dir) {
+    match crate::peer::access_policy::list_identities(cert_dir) {
         Ok(records) => {
             let identities: Vec<serde_json::Value> =
                 records.into_iter().map(identity_summary_json).collect();
@@ -26783,7 +27260,7 @@ fn peers_pairing_identity_revoke_from_cert_dir(cert_dir: &Path, body_text: &str)
             serde_json::json!({"error": "identity is required"}).to_string(),
         );
     }
-    match crate::peer::access_policy::revoke_identity(&cert_dir, &body.identity) {
+    match crate::peer::access_policy::revoke_identity(cert_dir, &body.identity) {
         Ok(record) => (200, identity_summary_json(record).to_string()),
         Err(e) => (
             400,
@@ -27611,7 +28088,7 @@ async fn resolve_url_to_socket_addr(url: &str) -> Option<std::net::SocketAddr> {
     // Strip any path / query that follows the authority. Authority
     // for an IPv6 literal is `[::1]:8766`, which contains neither
     // `/` nor `?` inside the brackets, so split-on-first is safe.
-    let authority = rest.split(|c| c == '/' || c == '?').next()?;
+    let authority = rest.split(['/', '?']).next()?;
     // Fast path for `ipv4:port` or `[ipv6]:port`: parse directly.
     if let Ok(addr) = authority.parse::<std::net::SocketAddr>() {
         return Some(addr);
@@ -28754,13 +29231,16 @@ fn dashboard_http_operation(
         ("GET", "/api/settings") | ("GET", "/api/api-key-status") => {
             return Some(PeerOperation::Settings);
         }
+        ("GET", "/api/external-agents") => return Some(PeerOperation::SessionInspect),
         ("POST", "/api/settings") | ("POST", "/api/api-keys") => {
             return Some(PeerOperation::Settings);
         }
         ("GET", "/api/fs/stat") | ("GET", "/api/fs/list") | ("GET", "/api/fs/read") => {
             return Some(PeerOperation::FilesystemRead);
         }
-        ("POST", "/api/fs/mkdir") => return Some(PeerOperation::FilesystemWrite),
+        ("POST", "/api/fs/mkdir") | ("POST", "/api/fs/write") => {
+            return Some(PeerOperation::FilesystemWrite)
+        }
         ("POST", "/api/diagnostics/visual-freshness") => {
             return Some(PeerOperation::DisplayInput);
         }
@@ -29348,7 +29828,7 @@ fn resolve_peer_connection_identity_from_cert_dir(
     };
     let peer_mode = peer_client_header_present(header_text);
 
-    let record = crate::peer::access_policy::lookup_identity(&cert_dir, fingerprint)
+    let record = crate::peer::access_policy::lookup_identity(cert_dir, fingerprint)
         .map_err(|e| (500, serde_json::json!({"error": e.to_string()}).to_string()))?;
     let now_unix = crate::access::client_key::now_unix_ms() / 1000;
     match record {
@@ -29394,6 +29874,24 @@ fn peer_identity_allows_ws_control(
     let Some(identity) = identity else {
         return true;
     };
+    // The dashboard-control tunnel is multi-capability; its signaling relay
+    // opens for any profile that can use something inside it, and every
+    // method/frame is then individually authorized on this same identity.
+    if matches!(ctrl, ControlMsg::PeerDashboardControlSignal { .. }) {
+        if crate::peer::access_policy::profile_allows_dashboard_control_tunnel(&identity.profile)
+        {
+            return true;
+        }
+        bus.send(AppEvent::PresenceLog {
+            message: format!(
+                "[ws] denied peer dashboard-control signaling from {}: profile={} allows no tunnel capability",
+                identity.label, identity.profile,
+            ),
+            level: Some(LogLevel::Warn),
+            turn: None,
+        });
+        return false;
+    }
     let op = crate::peer::access_policy::control_msg_operation(ctrl);
     let decision = crate::access::iam::evaluate_principal_operation(
         &peer_identity_access_principal(identity, "peer-ws"),
@@ -29447,10 +29945,20 @@ fn ws_frame_operation(frame_type: &str) -> Option<crate::peer::access_policy::Pe
         }
         // Live voice/media session machinery. Parity: api_voice_session,
         // api_presence_video_frame, api_media_annotation_*, api_media_clip_*.
-        "presence_connect" | "presence_disconnect" | "make_active" | "user_audio"
-        | "video_frame" | "voice_log" | "voice_diagnostic" | "presence_checkpoint"
-        | "live_usage_update" | "annotation_attach" | "annotation_submit" | "clip_start"
-        | "clip_frame" | "clip_end" => Some(PeerOperation::RuntimeControl),
+        "presence_connect"
+        | "presence_disconnect"
+        | "make_active"
+        | "user_audio"
+        | "video_frame"
+        | "voice_log"
+        | "voice_diagnostic"
+        | "presence_checkpoint"
+        | "live_usage_update"
+        | "annotation_attach"
+        | "annotation_submit"
+        | "clip_start"
+        | "clip_frame"
+        | "clip_end" => Some(PeerOperation::RuntimeControl),
         // Presence tool dispatch. Parity: api_mcp_tool_call → Message.
         "tool_request" | "async_query" => Some(PeerOperation::Message),
         _ => None,
@@ -29525,6 +30033,32 @@ fn ws_grant_allows_control(
 ) -> bool {
     if peer_identity.is_some() {
         return true;
+    }
+    // Relaying signaling to a connected peer delegates THIS daemon's peer
+    // identity — the receiving peer authorizes the tunnel against its
+    // grants for this daemon, not against the human grant that asked for
+    // the relay. That delegation is its own named permission (peer.use),
+    // never inferred from local capabilities.
+    if matches!(
+        ctrl,
+        ControlMsg::PeerDashboardControlSignal { .. } | ControlMsg::PeerFileTransferSignal { .. }
+    ) {
+        let decision =
+            grant.access_decision(crate::peer::access_policy::PeerOperation::PeerUse);
+        if decision.allowed {
+            return true;
+        }
+        bus.send(AppEvent::PresenceLog {
+            message: format!(
+                "[ws] denied {} peer signaling relay: permission={} reason={}",
+                grant.wire_kind(),
+                decision.permission,
+                decision.reason,
+            ),
+            level: Some(LogLevel::Warn),
+            turn: None,
+        });
+        return false;
     }
     let op = crate::peer::access_policy::control_msg_operation(ctrl);
     let decision = grant.access_decision(op);
@@ -29883,7 +30417,7 @@ fn build_config_inner(
 ) -> WebGatewayConfig {
     // If an explicit provider is given, use it directly.
     if let Some(provider) = live_provider {
-        let model = live_model.unwrap_or_else(|| match provider {
+        let model = live_model.unwrap_or(match provider {
             "openai" => "gpt-4o-realtime-preview",
             _ => "gemini-2.5-flash-native-audio-preview-12-2025",
         });
@@ -29949,11 +30483,12 @@ fn build_config_inner(
             ..Default::default()
         }
     } else {
-        let mut cfg = WebGatewayConfig::default();
-        cfg.transcription_enabled = transcription_enabled;
-        cfg.ice_servers = ice_servers;
-        cfg.federation_allow_h264 = federation_allow_h264;
-        cfg
+        WebGatewayConfig {
+            transcription_enabled,
+            ice_servers,
+            federation_allow_h264,
+            ..Default::default()
+        }
     }
 }
 
@@ -35531,7 +36066,15 @@ mod tests {
         // every path-shaped id must be refused outright, on every OS.
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".intendant").join("logs")).unwrap();
-        for id in ["..", r"..\..", r"C:\outside\dir", r"C:evil", r"logs\x", ".", ""] {
+        for id in [
+            "..",
+            r"..\..",
+            r"C:\outside\dir",
+            r"C:evil",
+            r"logs\x",
+            ".",
+            "",
+        ] {
             assert!(
                 intendant_session_dir_from_home(home.path(), id).is_none(),
                 "path-shaped session id {id:?} must be refused"
@@ -36017,12 +36560,20 @@ mod tests {
     fn ipv4_mapped_ipv6_loopback_counts_as_loopback() {
         use std::net::IpAddr;
 
-        assert!(client_ip_is_loopback("127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(client_ip_is_loopback(
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        ));
         assert!(client_ip_is_loopback("::1".parse::<IpAddr>().unwrap()));
         // What a 127.0.0.1 client looks like on a dual-stack wildcard bind.
-        assert!(client_ip_is_loopback("::ffff:127.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(!client_ip_is_loopback("::ffff:192.168.1.10".parse::<IpAddr>().unwrap()));
-        assert!(!client_ip_is_loopback("192.168.1.10".parse::<IpAddr>().unwrap()));
+        assert!(client_ip_is_loopback(
+            "::ffff:127.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(!client_ip_is_loopback(
+            "::ffff:192.168.1.10".parse::<IpAddr>().unwrap()
+        ));
+        assert!(!client_ip_is_loopback(
+            "192.168.1.10".parse::<IpAddr>().unwrap()
+        ));
         assert!(!client_ip_is_loopback("fe80::1".parse::<IpAddr>().unwrap()));
     }
 
@@ -36183,9 +36734,7 @@ mod tests {
         assert!(is_loopback_cleartext_mcp_request(
             loopback,
             false,
-            &format!(
-                "POST /mcp?session_id=child&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
-            )
+            &format!("POST /mcp?session_id=child&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n")
         ));
     }
 
@@ -36199,8 +36748,7 @@ mod tests {
 
         // Tokenless loopback keeps working — bound to its own principal.
         let local =
-            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain)
-                .unwrap();
+            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain).unwrap();
         assert_eq!(local.principal.id, "principal:local-process:loopback");
         assert_eq!(local.principal.kind, "root_session");
         assert!(
@@ -36210,8 +36758,8 @@ mod tests {
         );
 
         // Tokenless non-loopback is refused.
-        let err = mcp_http_access_context(tmp.path(), None, None, false, false, lan, plain)
-            .unwrap_err();
+        let err =
+            mcp_http_access_context(tmp.path(), None, None, false, false, lan, plain).unwrap_err();
         assert_eq!(err.0, 401);
 
         // A wrong explicit token fails loud even on loopback.
@@ -36339,9 +36887,7 @@ mod tests {
             false,
             false,
             loopback,
-            &format!(
-                "POST /mcp?session_id=kid-1&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
-            ),
+            &format!("POST /mcp?session_id=kid-1&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"),
         )
         .unwrap();
         assert_eq!(scoped.principal.kind, "agent_session");
@@ -36463,9 +37009,7 @@ mod tests {
             false,
             false,
             loopback,
-            &format!(
-                "POST /mcp?session_id=kid-9&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
-            ),
+            &format!("POST /mcp?session_id=kid-9&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"),
         )
         .unwrap();
         assert_eq!(agent.principal.id, "principal:agent-session:any");
@@ -36483,8 +37027,7 @@ mod tests {
         .unwrap();
         crate::access::iam::save_state(tmp.path(), &state).unwrap();
         let local =
-            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain)
-                .unwrap();
+            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain).unwrap();
         assert_eq!(local.principal.kind, "local_process");
         assert_eq!(local.principal.role_id, "role:terminal");
     }
@@ -36539,9 +37082,7 @@ mod tests {
             false,
             false,
             loopback,
-            &format!(
-                "POST /mcp?session_id=kid-1&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
-            ),
+            &format!("POST /mcp?session_id=kid-1&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"),
         )
         .unwrap();
         assert_eq!(agent.principal.id, "principal:agent-session:kid-1");
@@ -36586,12 +37127,18 @@ mod tests {
             "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: https://evil.example\r\n\r\n";
         assert_eq!(mcp_cors_header_segment(foreign, false), "Vary: Origin\r\n");
         let no_origin = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
-        assert_eq!(mcp_cors_header_segment(no_origin, false), "Vary: Origin\r\n");
+        assert_eq!(
+            mcp_cors_header_segment(no_origin, false),
+            "Vary: Origin\r\n"
+        );
         // Scheme must match the connection: an http origin cannot claim a
         // TLS daemon's identity.
         let tls_mismatch =
             "POST /mcp HTTP/1.1\r\nHost: daemon.local:8765\r\nOrigin: http://daemon.local:8765\r\n\r\n";
-        assert_eq!(mcp_cors_header_segment(tls_mismatch, true), "Vary: Origin\r\n");
+        assert_eq!(
+            mcp_cors_header_segment(tls_mismatch, true),
+            "Vary: Origin\r\n"
+        );
         let tls_own =
             "POST /mcp HTTP/1.1\r\nHost: daemon.local:8765\r\nOrigin: https://daemon.local:8765\r\n\r\n";
         assert!(mcp_cors_header_segment(tls_own, true)
@@ -37000,6 +37547,8 @@ mod tests {
             "/wasm-web/presence_web.js",
             "/wasm-station/station_web.js",
             "/three.module.min.js",
+            "/codemirror-bundle.js",
+            "/codemirror-bundle.css",
         ] {
             let asset = embedded_static_asset(path).expect(path);
             assert_eq!(asset.etag, asset_etag(asset.body));
@@ -40555,8 +41104,169 @@ mod tests {
             dashboard_http_operation("GET", "/api/fs/read"),
             Some(PeerOperation::FilesystemRead)
         );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/fs/write"),
+            Some(PeerOperation::FilesystemWrite)
+        );
+        // GET must not inherit the write classification, and look-alike
+        // paths must not classify at all.
+        assert_eq!(dashboard_http_operation("GET", "/api/fs/write"), None);
+        assert_eq!(dashboard_http_operation("POST", "/api/fs/writeable"), None);
         assert_eq!(dashboard_http_operation("POST", "/api/coordinator/route"), None);
         assert_eq!(dashboard_http_operation("GET", "/config"), None);
+    }
+
+    #[test]
+    fn fs_write_request_bytes_requires_exactly_one_content_field() {
+        let parse = |body: serde_json::Value| {
+            fs_write_request_bytes(&serde_json::from_value::<FsWriteRequest>(body).unwrap())
+        };
+        assert_eq!(
+            parse(serde_json::json!({ "path": "/x", "content": "hi" })).unwrap(),
+            b"hi"
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "path": "/x", "content_b64": "aGk=" })).unwrap(),
+            b"hi"
+        );
+        assert!(parse(serde_json::json!({ "path": "/x" }))
+            .unwrap_err()
+            .contains("missing content"));
+        assert!(
+            parse(serde_json::json!({ "path": "/x", "content": "a", "content_b64": "YQ==" }))
+                .unwrap_err()
+                .contains("not both")
+        );
+        assert!(
+            parse(serde_json::json!({ "path": "/x", "content_b64": "!!!" }))
+                .unwrap_err()
+                .contains("not valid base64")
+        );
+    }
+
+    #[test]
+    fn apply_dashboard_fs_write_preconditions_and_atomics() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("app.conf");
+        let write = |path: &std::path::Path,
+                     bytes: &[u8],
+                     expected: Option<String>,
+                     create_new: bool,
+                     force: bool| {
+            apply_dashboard_fs_write(
+                &FsWriteArgs {
+                    path: path.to_string_lossy().to_string(),
+                    expected_sha256: expected,
+                    create_new,
+                    force,
+                },
+                bytes,
+            )
+        };
+
+        // A write with no stated precondition is refused.
+        let (status, body) = write(&target, b"v1", None, false, false);
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(body["code"], "precondition_required");
+        assert!(!target.exists());
+
+        // create_new creates, and refuses to run twice.
+        let (status, body) = write(&target, b"v1", None, true, false);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["created"], true);
+        assert_eq!(body["sha256"].as_str(), Some(fs_sha256_hex(b"v1").as_str()));
+        assert_eq!(std::fs::read(&target).unwrap(), b"v1");
+        let (status, body) = write(&target, b"v1", None, true, false);
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body["code"], "exists");
+
+        // The matching baseline replaces content; a stale one conflicts and
+        // reports the current hash without touching the file.
+        let (status, body) = write(&target, b"v2", Some(fs_sha256_hex(b"v1")), false, false);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["created"], false);
+        assert_eq!(std::fs::read(&target).unwrap(), b"v2");
+        let (status, body) = write(&target, b"v3", Some(fs_sha256_hex(b"v1")), false, false);
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body["code"], "conflict");
+        assert_eq!(
+            body["current_sha256"].as_str(),
+            Some(fs_sha256_hex(b"v2").as_str())
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"v2");
+
+        // force overwrites unconditionally; a baseline against a vanished
+        // file reports code:"missing".
+        let (status, _) = write(&target, b"v4", None, false, true);
+        assert_eq!(status, "200 OK");
+        assert_eq!(std::fs::read(&target).unwrap(), b"v4");
+        let gone = dir.path().join("gone.conf");
+        let (status, body) = write(&gone, b"x", Some(fs_sha256_hex(b"x")), false, false);
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body["code"], "missing");
+
+        // Relative paths, directory targets, and missing parents are refused.
+        let (status, _) = apply_dashboard_fs_write(
+            &FsWriteArgs {
+                path: "relative/path".to_string(),
+                expected_sha256: None,
+                create_new: true,
+                force: false,
+            },
+            b"x",
+        );
+        assert_eq!(status, "400 Bad Request");
+        let (status, _) = write(dir.path(), b"x", None, false, true);
+        assert_eq!(status, "400 Bad Request");
+        let orphan = dir.path().join("no-such-dir").join("file.txt");
+        let (status, body) = write(&orphan, b"x", None, true, false);
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body["code"], "missing_parent");
+
+        // Oversized payloads are refused before any disk IO.
+        let huge = vec![0u8; UPLOAD_MAX_BYTES + 1];
+        let (status, _) = write(&target, &huge, None, false, true);
+        assert_eq!(status, "413 Payload Too Large");
+        assert_eq!(std::fs::read(&target).unwrap(), b"v4");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_dashboard_fs_write_preserves_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("script.sh");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (status, _) = apply_dashboard_fs_write(
+            &FsWriteArgs {
+                path: target.to_string_lossy().to_string(),
+                expected_sha256: Some(fs_sha256_hex(b"#!/bin/sh\n")),
+                create_new: false,
+                force: false,
+            },
+            b"#!/bin/sh\necho updated\n",
+        );
+        assert_eq!(status, "200 OK");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(std::fs::read(&target).unwrap(), b"#!/bin/sh\necho updated\n");
+    }
+
+    #[test]
+    fn fs_stat_reports_size_and_mtime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("sized.txt");
+        std::fs::write(&file, b"12345").unwrap();
+        let status = inspect_dashboard_fs_path(&file.to_string_lossy()).unwrap();
+        assert_eq!(status.size, Some(5));
+        assert!(status.modified_ms.unwrap_or(0) > 0);
+        let missing = inspect_dashboard_fs_path(&dir.path().join("nope").to_string_lossy())
+            .unwrap();
+        assert_eq!(missing.size, None);
+        assert_eq!(missing.modified_ms, None);
     }
 
     #[test]
@@ -40588,6 +41298,116 @@ mod tests {
         assert!(response.contains("403 Forbidden"));
         assert!(response.contains("access.manage"));
         assert!(response.contains("Alice browser"));
+    }
+
+    #[test]
+    fn peer_signal_relay_requires_peer_use_across_lanes() {
+        use crate::peer::access_policy::PeerOperation;
+
+        // The relay routes classify as PeerUse on the HTTP lane.
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/peers/intendant:peer-b/dashboard-control-webrtc"),
+            Some(PeerOperation::PeerUse)
+        );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/peers/intendant:peer-b/file-transfer-webrtc"),
+            Some(PeerOperation::PeerUse)
+        );
+
+        // A files-scoped human cannot delegate the daemon's peer identity…
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "test",
+            "dashboard-control",
+        );
+        access_iam_upsert_user_client_grant_response_value_with_cert_dir(
+            tmp.path(),
+            serde_json::json!({
+                "kind": "browser_certificate",
+                "label": "Files-only browser",
+                "fingerprint": "F1:1E",
+                "role_id": "role:files-write"
+            }),
+            &actor,
+        )
+        .unwrap();
+        let files_only = http_access_context(tmp.path(), None, Some("f11e"), true, true).unwrap();
+        assert!(files_only.decision(PeerOperation::FilesystemWrite).allowed);
+        let relay = files_only.decision(PeerOperation::PeerUse);
+        assert!(!relay.allowed);
+        assert_eq!(relay.permission, "peer.use");
+
+        // …while operator and the dedicated peer-user role can.
+        for (fingerprint, hex, role) in [
+            ("0B:E4", "0be4", "role:operator"),
+            ("9E:E5", "9ee5", "role:peer-user"),
+        ] {
+            access_iam_upsert_user_client_grant_response_value_with_cert_dir(
+                tmp.path(),
+                serde_json::json!({
+                    "kind": "browser_certificate",
+                    "label": format!("{role} browser"),
+                    "fingerprint": fingerprint,
+                    "role_id": role
+                }),
+                &actor,
+            )
+            .unwrap();
+            let access = http_access_context(tmp.path(), None, Some(hex), true, true).unwrap();
+            assert!(
+                access.decision(PeerOperation::PeerUse).allowed,
+                "{role} should relay peer signaling"
+            );
+            assert!(
+                !access.decision(PeerOperation::PeerManage).allowed,
+                "{role} must not administer peers"
+            );
+        }
+    }
+
+    #[test]
+    fn ws_grant_gate_requires_peer_use_for_signal_relay() {
+        let signal = ControlMsg::PeerDashboardControlSignal {
+            session_id: "s".into(),
+            signal: crate::peer::WebRtcSignal::Unknown,
+        };
+        let transfer = ControlMsg::PeerFileTransferSignal {
+            session_id: "s".into(),
+            signal: crate::peer::WebRtcSignal::Unknown,
+        };
+        let bus = EventBus::new();
+
+        // Trusted local dashboards keep full relay authority.
+        let trusted = crate::dashboard_control::DashboardControlGrant::TrustedLocal;
+        assert!(ws_grant_allows_control(&trusted, None, &signal, &bus));
+        assert!(ws_grant_allows_control(&trusted, None, &transfer, &bus));
+
+        // A scoped human without peer.use is refused on both relay frames,
+        // even though the file-transfer frame's receiving-side class
+        // (FilesystemRead) is within the grant.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "test",
+            "dashboard-control",
+        );
+        access_iam_upsert_user_client_grant_response_value_with_cert_dir(
+            tmp.path(),
+            serde_json::json!({
+                "kind": "browser_certificate",
+                "label": "Files-only browser",
+                "fingerprint": "F1:1E",
+                "role_id": "role:files-write"
+            }),
+            &actor,
+        )
+        .unwrap();
+        let scoped = http_access_context(tmp.path(), None, Some("f11e"), true, true).unwrap();
+        let scoped_grant = crate::dashboard_control::DashboardControlGrant::UserClient {
+            principal: scoped.principal.clone(),
+            iam_state: scoped.iam_state.clone().expect("scoped iam state"),
+        };
+        assert!(!ws_grant_allows_control(&scoped_grant, None, &signal, &bus));
+        assert!(!ws_grant_allows_control(&scoped_grant, None, &transfer, &bus));
     }
 
     #[test]
@@ -40832,7 +41652,10 @@ mod tests {
             ws_frame_operation("display_offer"),
             Some(PeerOperation::DisplayView)
         );
-        assert_eq!(ws_frame_operation("key"), Some(PeerOperation::RuntimeControl));
+        assert_eq!(
+            ws_frame_operation("key"),
+            Some(PeerOperation::RuntimeControl)
+        );
         assert_eq!(
             ws_frame_operation("term_subscribe"),
             Some(PeerOperation::RuntimeControl)
@@ -40845,8 +41668,14 @@ mod tests {
             ws_frame_operation("user_audio"),
             Some(PeerOperation::RuntimeControl)
         );
-        assert_eq!(ws_frame_operation("tool_request"), Some(PeerOperation::Message));
-        assert_eq!(ws_frame_operation("async_query"), Some(PeerOperation::Message));
+        assert_eq!(
+            ws_frame_operation("tool_request"),
+            Some(PeerOperation::Message)
+        );
+        assert_eq!(
+            ws_frame_operation("async_query"),
+            Some(PeerOperation::Message)
+        );
         // Tunnel signaling stays open: the tunnel enforces the same grant
         // per-frame itself, and scoped clients must be able to establish it.
         assert_eq!(ws_frame_operation("dashboard_control_offer"), None);
@@ -40862,8 +41691,7 @@ mod tests {
     #[test]
     fn ws_frame_gate_scopes_bound_certificates_and_leaves_local_open() {
         let mut state = crate::access::iam::LocalIamState::default();
-        let actor =
-            crate::access::iam::AccessPrincipal::root_dashboard_session("test", "http");
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "http");
         crate::access::iam::upsert_user_client_grant(
             &mut state,
             crate::access::iam::UserClientGrantUpsertRequest {
@@ -40875,9 +41703,8 @@ mod tests {
             &actor,
         )
         .unwrap();
-        let principal =
-            crate::access::iam::principal_for_browser_mtls_cert(&state, "AA:22", "ws")
-                .expect("bound principal resolves");
+        let principal = crate::access::iam::principal_for_browser_mtls_cert(&state, "AA:22", "ws")
+            .expect("bound principal resolves");
         let scoped = crate::dashboard_control::DashboardControlGrant::UserClient {
             principal,
             iam_state: state,
@@ -40892,7 +41719,11 @@ mod tests {
             "t": "terminal_open", "host_id": "local", "terminal_id": "shell-0",
         });
         assert!(!deny_ws_frame_if_unauthorized(
-            &scoped, &open, &direct_tx, &bus, &mut logged,
+            &scoped,
+            &open,
+            &direct_tx,
+            &bus,
+            &mut logged,
         ));
         assert!(direct_rx.try_recv().is_err(), "allowed frame sends nothing");
 
@@ -40901,7 +41732,11 @@ mod tests {
         let input = serde_json::json!({ "t": "display_input", "display_id": 1 });
         for _ in 0..2 {
             assert!(deny_ws_frame_if_unauthorized(
-                &scoped, &input, &direct_tx, &bus, &mut logged,
+                &scoped,
+                &input,
+                &direct_tx,
+                &bus,
+                &mut logged,
             ));
             let denied = direct_rx.try_recv().expect("denial frame sent");
             let denied: serde_json::Value = serde_json::from_str(&denied).unwrap();
@@ -40934,7 +41769,11 @@ mod tests {
             iam_state: observer_state,
         };
         assert!(deny_ws_frame_if_unauthorized(
-            &observer, &open, &direct_tx, &bus, &mut logged,
+            &observer,
+            &open,
+            &direct_tx,
+            &bus,
+            &mut logged,
         ));
         let first = direct_rx.try_recv().expect("terminal_error sent");
         let first: serde_json::Value = serde_json::from_str(&first).unwrap();
@@ -40946,13 +41785,21 @@ mod tests {
         // Observer can still view displays over /ws.
         let offer = serde_json::json!({ "t": "display_offer", "display_id": 1 });
         assert!(!deny_ws_frame_if_unauthorized(
-            &observer, &offer, &direct_tx, &bus, &mut logged,
+            &observer,
+            &offer,
+            &direct_tx,
+            &bus,
+            &mut logged,
         ));
 
         // Plain local dashboards (no client certificate) stay fully open.
         let local = crate::dashboard_control::DashboardControlGrant::TrustedLocal;
         assert!(!deny_ws_frame_if_unauthorized(
-            &local, &input, &direct_tx, &bus, &mut logged,
+            &local,
+            &input,
+            &direct_tx,
+            &bus,
+            &mut logged,
         ));
 
         // ControlMsg fall-through: role:terminal cannot steer the agent...
@@ -45240,7 +46087,8 @@ mod tests {
     fn persisted_entry_rejects_corrupt_body() {
         let dir = tempfile::tempdir().unwrap();
         let key = persisted_test_key("corrupt");
-        let path = session_index_entry_path_in(dir.path(), key.namespace, &session_list_cache_slot(&key));
+        let path =
+            session_index_entry_path_in(dir.path(), key.namespace, &session_list_cache_slot(&key));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{not json").unwrap();
         assert!(load_persisted_session_entry_in::<serde_json::Value>(dir.path(), &key).is_none());

@@ -116,9 +116,8 @@ fn update_session_meta_after_round_complete(
     let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) else {
         return;
     };
-    match meta.status.as_deref() {
-        Some("completed" | "interrupted") => return,
-        _ => {}
+    if let Some("completed" | "interrupted") = meta.status.as_deref() {
+        return;
     }
     meta.status = Some("idle".to_string());
     if let Some(turn) = last_turn {
@@ -427,32 +426,26 @@ impl SessionLog {
     /// Find a session by its ID (UUID prefix or full UUID).
     /// Checks `~/.intendant/logs/{id}/` directly, then scans for prefix matches.
     pub fn find_session_by_id(session_id: &str) -> Option<PathBuf> {
-        let logs_dir = crate::platform::home_dir().join(".intendant").join("logs");
+        Self::find_session_by_id_in_home(&crate::platform::home_dir(), session_id)
+    }
+
+    pub fn find_session_by_id_in_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+        // Path-form ids ("resume by path": absolute, or containing a
+        // separator) resolve through the anchored helper — the path must
+        // land inside the logs root, so a pasted log-dir path keeps
+        // working without turning session lookup into an
+        // arbitrary-directory read. This runs FIRST because
+        // `logs_dir.join(absolute_path)` would silently replace the base.
+        if crate::session_names::session_id_looks_like_path(session_id) {
+            return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
+        }
+
+        let logs_dir = home.join(".intendant").join("logs");
 
         // Direct match (dir name == session_id)
         let direct = logs_dir.join(session_id);
         if direct.is_dir() && direct.join("session_meta.json").exists() {
             return Some(direct);
-        }
-
-        // Backward compat: if session_id looks like a path (absolute, or
-        // containing any path separator on this platform), treat it as a
-        // direct path. A bare UUID prefix has no separators and is not
-        // absolute, so it falls through to the prefix scan below. Checking
-        // for both '/' and the platform separator keeps Windows absolute
-        // paths (`C:\...`, which use '\\') from being misclassified.
-        let looks_like_path = {
-            let p = Path::new(session_id);
-            p.is_absolute()
-                || session_id.contains('/')
-                || session_id.contains(std::path::MAIN_SEPARATOR)
-        };
-        if looks_like_path {
-            let dir = PathBuf::from(session_id);
-            if dir.is_dir() {
-                return Some(dir);
-            }
-            return None;
         }
 
         // Scan for prefix match or meta match
@@ -632,6 +625,7 @@ impl SessionLog {
     // ---- Error categorization ----
 
     /// Log a categorized error with structured metadata.
+    #[allow(dead_code)]
     pub fn categorized_error(
         &mut self,
         category: &str,
@@ -727,26 +721,23 @@ impl SessionLog {
             }
         }
         // Count model turns from the rebuilt transcript
-        let model_turns = self
-            .dir
-            .join("transcript.jsonl")
-            .exists()
-            .then(|| {
-                fs::read_to_string(self.dir.join("transcript.jsonl"))
-                    .ok()
-                    .map(|c| {
-                        c.lines()
-                            .filter(|l| {
-                                serde_json::from_str::<serde_json::Value>(l)
-                                    .ok()
-                                    .and_then(|v| v["role"].as_str().map(|r| r == "model"))
-                                    .unwrap_or(false)
-                            })
-                            .count()
-                    })
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
+        let model_turns = if self.dir.join("transcript.jsonl").exists() {
+            fs::read_to_string(self.dir.join("transcript.jsonl"))
+                .ok()
+                .map(|c| {
+                    c.lines()
+                        .filter(|l| {
+                            serde_json::from_str::<serde_json::Value>(l)
+                                .ok()
+                                .and_then(|v| v["role"].as_str().map(|r| r == "model"))
+                                .unwrap_or(false)
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
         let summary = SessionSummary {
             duration_secs: duration,
@@ -2120,6 +2111,7 @@ impl SessionLog {
     }
 
     /// Log a tool request received from the browser presence model.
+    #[allow(dead_code)]
     pub fn tool_request(&mut self, tool: &str, args: &serde_json::Value) {
         self.emit(LogEvent {
             ts: Self::ts(),
@@ -2141,6 +2133,7 @@ impl SessionLog {
     }
 
     /// Log a tool response sent back to the browser presence model.
+    #[allow(dead_code)]
     pub fn tool_response(&mut self, tool: &str, result: &str) {
         let preview = if result.len() > 200 {
             truncate_str(result, 200)
@@ -2229,6 +2222,7 @@ impl SessionLog {
     }
 
     /// Log a parsed raw model-context snapshot for dashboard inspection.
+    #[allow(dead_code)]
     pub fn context_snapshot(
         &mut self,
         source: &str,
@@ -2276,12 +2270,10 @@ impl SessionLog {
         raw: &serde_json::Value,
     ) {
         let rendered = serde_json::to_string_pretty(raw).unwrap_or_else(|_| raw.to_string());
-        let effective_turn = turn.or_else(|| {
-            if self.current_turn > 0 {
-                Some(self.current_turn)
-            } else {
-                None
-            }
+        let effective_turn = turn.or(if self.current_turn > 0 {
+            Some(self.current_turn)
+        } else {
+            None
         });
         let snapshot_id = Uuid::new_v4();
         let relative = if let Some(file_turn) = effective_turn {
@@ -2439,6 +2431,7 @@ impl SessionLog {
     /// A single turn may run many commands, each producing its own output
     /// chunk; we append so the file reflects the full turn history rather
     /// than only the last chunk.
+    #[allow(dead_code)]
     pub fn agent_output(&mut self, stdout: &str, stderr: &str, source: Option<&str>) {
         self.agent_output_with_id(stdout, stderr, source, None);
     }
@@ -3756,6 +3749,7 @@ pub fn session_log_entry_to_app_event(
 pub struct ConversationTurn {
     pub role: String, // "user" or "model"
     pub text: String,
+    #[allow(dead_code)]
     pub seq: u64,
 }
 
@@ -4269,13 +4263,27 @@ mod tests {
     }
 
     #[test]
-    fn find_session_by_id_direct_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let session_dir = dir.path().join("my-session");
+    fn find_session_by_id_path_form_is_anchored_to_logs_root() {
+        let home = tempfile::tempdir().unwrap();
+        let logs = home.path().join(".intendant").join("logs");
+        let session_dir = logs.join("my-session");
         fs::create_dir_all(&session_dir).unwrap();
-        // Without session_meta.json, the direct path check still works
-        let result = SessionLog::find_session_by_id(session_dir.to_str().unwrap());
-        assert_eq!(result, Some(session_dir));
+
+        // A pasted log-dir path resolves (no session_meta.json needed) —
+        // compare canonicalized because the resolver canonicalizes.
+        let result =
+            SessionLog::find_session_by_id_in_home(home.path(), session_dir.to_str().unwrap());
+        assert_eq!(result, Some(fs::canonicalize(&session_dir).unwrap()));
+
+        // A directory outside the logs root is not a session, even though
+        // it exists: path-form lookup must not read arbitrary directories.
+        let outside = tempfile::tempdir().unwrap();
+        let escape = outside.path().join("my-session");
+        fs::create_dir_all(&escape).unwrap();
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), escape.to_str().unwrap()),
+            None
+        );
     }
 
     #[test]

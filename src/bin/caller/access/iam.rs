@@ -1580,6 +1580,7 @@ pub fn policy_for_role(role_id: &str) -> String {
         "role:terminal" => "policy:terminal".to_string(),
         "role:files-read" => "policy:files-read".to_string(),
         "role:files-write" => "policy:files-write".to_string(),
+        "role:peer-user" => "policy:peer-user".to_string(),
         "role:operator" => "policy:operator".to_string(),
         other => format!("policy:{}", slug_component(other)),
     }
@@ -1740,6 +1741,7 @@ fn permission_label(id: &str) -> &'static str {
         "access.manage" => "Access manage",
         "peer.inspect" => "Peer inspect",
         "peer.manage" => "Peer manage",
+        "peer.use" => "Peer use",
         "session.inspect" => "Session inspect",
         "session.manage" => "Session manage",
         "terminal.use" => "Terminal (legacy)",
@@ -1771,7 +1773,12 @@ fn permission_summary(id: &str) -> &'static str {
             "Approve, revoke, or change access grants. Reserved for root sessions unless explicitly delegated later."
         }
         "peer.inspect" => "Read configured peer routes and peer eligibility.",
-        "peer.manage" => "Create, remove, pair, and use daemon peer routes.",
+        "peer.manage" => {
+            "Create, remove, and pair daemon peer routes (implies peer.use)."
+        }
+        "peer.use" => {
+            "Open tunnels to connected peers with this daemon's peer credentials; what a tunnel may do is decided by the peer's grants for this daemon, not by this grant."
+        }
         "session.inspect" => "Read session lists, logs, reports, recordings, and replay metadata.",
         "session.manage" => "Delete, rewind, prune, upload to, or otherwise mutate sessions.",
         "terminal.use" => {
@@ -2003,6 +2010,9 @@ pub fn permissions_allow(permissions: &[String], permission: &str) -> bool {
                     permission,
                     "terminal.view" | "terminal.write" | "shell.spawn"
                 ))
+            // peer.manage predates the manage/use split and covered the
+            // signaling relays; grants that carry it keep tunnel access.
+            || (candidate == "peer.manage" && permission == "peer.use")
     })
 }
 
@@ -2036,6 +2046,7 @@ pub fn operation_permission_id(op: crate::peer::access_policy::PeerOperation) ->
         PeerOperation::AccessManage => "access.manage",
         PeerOperation::PeerInspect => "peer.inspect",
         PeerOperation::PeerManage => "peer.manage",
+        PeerOperation::PeerUse => "peer.use",
         PeerOperation::SessionInspect => "session.inspect",
         PeerOperation::SessionManage => "session.manage",
         PeerOperation::TerminalView => "terminal.view",
@@ -2142,6 +2153,7 @@ fn builtin_role_templates() -> Vec<IamRole> {
                 "access.inspect".to_string(),
                 "peer.inspect".to_string(),
                 "peer.manage".to_string(),
+                "peer.use".to_string(),
                 "session.inspect".to_string(),
                 "session.manage".to_string(),
                 "terminal.view".to_string(),
@@ -2238,11 +2250,28 @@ fn builtin_role_templates() -> Vec<IamRole> {
             source: "builtin".to_string(),
         },
         IamRole {
+            id: "role:peer-user".to_string(),
+            label: "Peer user".to_string(),
+            status: "enforced".to_string(),
+            summary: "Reach connected peers through this daemon (peer files, terminal, \
+                      display tunnels); what each tunnel may do is decided by that \
+                      peer's grants for this daemon. Combine with local roles as needed."
+                .to_string(),
+            permissions: vec![
+                "presence.read".to_string(),
+                "stats.read".to_string(),
+                "access.inspect".to_string(),
+                "peer.inspect".to_string(),
+                "peer.use".to_string(),
+            ],
+            source: "builtin".to_string(),
+        },
+        IamRole {
             id: "role:operator".to_string(),
             label: "Operator".to_string(),
             status: "enforced".to_string(),
             summary:
-                "Operate sessions, display, shell, files, and approvals without access/settings administration."
+                "Operate sessions, display, shell, files, peers, and approvals without access/settings administration."
                     .to_string(),
             permissions: vec![
                 "presence.read".to_string(),
@@ -2254,6 +2283,10 @@ fn builtin_role_templates() -> Vec<IamRole> {
                 "approval.resolve".to_string(),
                 "access.inspect".to_string(),
                 "peer.inspect".to_string(),
+                // Operating includes reaching connected peers (peer files,
+                // terminal, display) — but not administering the peer
+                // relationships themselves (peer.manage stays admin-side).
+                "peer.use".to_string(),
                 "session.inspect".to_string(),
                 "session.manage".to_string(),
                 "terminal.view".to_string(),
@@ -2285,6 +2318,7 @@ fn root_permission_ids() -> Vec<String> {
         "access.manage",
         "peer.inspect",
         "peer.manage",
+        "peer.use",
         "session.inspect",
         "session.manage",
         "terminal.view",
@@ -2616,6 +2650,46 @@ fn set_private_perms(path: &Path) -> AccessResult<()> {
 mod tests {
     use super::*;
 
+    /// The peer.manage → manage/use split: grants that predate peer.use and
+    /// carry peer.manage keep tunnel access, the reverse never holds, and
+    /// the builtin roles divide the two deliberately (operator uses peers
+    /// without administering them; files/terminal roles get neither).
+    #[test]
+    fn peer_use_split_implication_and_roles() {
+        let legacy = vec!["peer.manage".to_string()];
+        assert!(permissions_allow(&legacy, "peer.use"));
+        assert!(permissions_allow(&legacy, "peer.manage"));
+        let use_only = vec!["peer.use".to_string()];
+        assert!(!permissions_allow(&use_only, "peer.manage"));
+        assert!(permissions_excess(&use_only, &legacy).is_none());
+        assert_eq!(
+            permissions_excess(&legacy, &use_only).map(String::as_str),
+            Some("peer.manage")
+        );
+
+        let roles = builtin_role_templates();
+        let permissions = |id: &str| {
+            roles
+                .iter()
+                .find(|role| role.id == id)
+                .unwrap_or_else(|| panic!("{id} missing"))
+                .permissions
+                .clone()
+        };
+        assert!(permissions_allow(&permissions("role:operator"), "peer.use"));
+        assert!(!permissions_allow(&permissions("role:operator"), "peer.manage"));
+        assert!(permissions_allow(&permissions("role:peer-user"), "peer.use"));
+        assert!(permissions_allow(&permissions("role:peer-user"), "peer.inspect"));
+        assert!(!permissions_allow(&permissions("role:peer-user"), "filesystem.read"));
+        for role in ["role:files-write", "role:files-read", "role:terminal", "role:observer"] {
+            assert!(
+                !permissions_allow(&permissions(role), "peer.use"),
+                "{role} must not reach peer tunnels by default"
+            );
+        }
+        assert!(permissions_allow(&permissions("role:root"), "peer.use"));
+    }
+
     /// The terminal.use → view/write/spawn split: the legacy aggregate in a
     /// custom role's permission list keeps granting all three, containment
     /// expands it on both sides, and persisted builtin roles are refreshed
@@ -2748,7 +2822,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
-        fs_scope: None,
+            fs_scope: None,
         });
 
         save_state(tmp.path(), &state).unwrap();
@@ -2863,7 +2937,10 @@ mod tests {
                 })
                 .unwrap_or(false)
         };
-        assert!(has("role:operator"), "operator must hold credentials.manage");
+        assert!(
+            has("role:operator"),
+            "operator must hold credentials.manage"
+        );
         assert!(!has("role:observer"));
         assert!(!has("role:session-reader"));
         assert!(!has("role:terminal"));
@@ -2919,7 +2996,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
-        fs_scope: None,
+            fs_scope: None,
         });
 
         let grants = grant_overview_values(&state, "local-daemon");
@@ -2959,7 +3036,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
-        fs_scope: None,
+            fs_scope: None,
         });
         state
     }
@@ -3217,8 +3294,7 @@ mod tests {
         .unwrap();
         assert_eq!(wildcard.grant.status, "revoked");
         assert!(principal_for_agent_session(&state, "other", "http").is_none());
-        let lapsed_other =
-            principal_for_agent_session_any_status(&state, "other", "http").unwrap();
+        let lapsed_other = principal_for_agent_session_any_status(&state, "other", "http").unwrap();
         assert_eq!(lapsed_other.id, "principal:agent-session:any");
         assert!(
             !evaluate_principal_operation_with_state(

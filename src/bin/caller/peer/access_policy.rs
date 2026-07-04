@@ -112,6 +112,13 @@ pub enum PeerOperation {
     AccessManage,
     PeerInspect,
     PeerManage,
+    /// Open a tunnel to a connected peer through this daemon's peer
+    /// credentials (dashboard-control, file-transfer, or display
+    /// signaling relay). Deliberately distinct from `PeerManage`: using a
+    /// peer relationship delegates this daemon's peer identity — what the
+    /// tunnel may then do is decided by the *peer's* grants for this
+    /// daemon, not by the local grant that opened it.
+    PeerUse,
     SessionInspect,
     SessionManage,
     /// Attach to a visible shell session: scrollback replay + live output.
@@ -154,7 +161,7 @@ pub fn normalize_profile(raw: &str) -> Result<String, CallerError> {
     Ok(profile.to_ascii_lowercase())
 }
 
-pub const ALL_OPERATIONS: [PeerOperation; 21] = [
+pub const ALL_OPERATIONS: [PeerOperation; 22] = [
     PeerOperation::PresenceRead,
     PeerOperation::StatsRead,
     PeerOperation::DisplayView,
@@ -166,6 +173,7 @@ pub const ALL_OPERATIONS: [PeerOperation; 21] = [
     PeerOperation::AccessManage,
     PeerOperation::PeerInspect,
     PeerOperation::PeerManage,
+    PeerOperation::PeerUse,
     PeerOperation::SessionInspect,
     PeerOperation::SessionManage,
     PeerOperation::TerminalView,
@@ -183,9 +191,9 @@ pub const ALL_OPERATIONS: [PeerOperation; 21] = [
 /// so the cap relation is operation-set containment, mirroring how role
 /// ceilings intersect permissions in the human lane.
 pub fn profile_fits_under(granted: &str, cap: &str) -> bool {
-    ALL_OPERATIONS.iter().all(|op| {
-        !profile_allows_operation(granted, *op) || profile_allows_operation(cap, *op)
-    })
+    ALL_OPERATIONS
+        .iter()
+        .all(|op| !profile_allows_operation(granted, *op) || profile_allows_operation(cap, *op))
 }
 
 pub fn profile_class(profile: &str) -> ProfileClass {
@@ -249,9 +257,36 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
     }
 }
 
+#[allow(dead_code)]
 pub fn profile_allows_control_msg(profile: &str, ctrl: &ControlMsg) -> bool {
+    if matches!(ctrl, ControlMsg::PeerDashboardControlSignal { .. }) {
+        return profile_allows_dashboard_control_tunnel(profile);
+    }
     let op = control_msg_operation(ctrl);
     profile_allows_operation(profile, op)
+}
+
+/// Every capability family the dashboard-control tunnel carries. The
+/// tunnel's WebRTC signaling relay is a transport door, not a single
+/// operation: it opens for an identity that can use at least one of these,
+/// and every method/frame inside is then authorized individually against
+/// the same identity (`dashboard_control_method_operation` /
+/// `dashboard_control_frame_operation` and their `/ws` twins). Presence-
+/// and stats-only profiles have nothing reachable inside, so the door
+/// stays shut for them.
+pub const DASHBOARD_CONTROL_TUNNEL_OPERATIONS: &[PeerOperation] = &[
+    PeerOperation::SessionInspect,
+    PeerOperation::FilesystemRead,
+    PeerOperation::FilesystemWrite,
+    PeerOperation::TerminalView,
+    PeerOperation::DisplayView,
+    PeerOperation::Message,
+];
+
+pub fn profile_allows_dashboard_control_tunnel(profile: &str) -> bool {
+    DASHBOARD_CONTROL_TUNNEL_OPERATIONS
+        .iter()
+        .any(|op| profile_allows_operation(profile, *op))
 }
 
 pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
@@ -259,6 +294,9 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         ControlMsg::Status { .. } => PeerOperation::PresenceRead,
         ControlMsg::Usage => PeerOperation::StatsRead,
         ControlMsg::WebRtcSignal { .. } => PeerOperation::DisplayView,
+        // Fallback classification only: gates special-case this variant
+        // through `profile_allows_dashboard_control_tunnel` (the tunnel is
+        // multi-capability, so its door is any-of, not this single op).
         ControlMsg::PeerDashboardControlSignal { .. } => PeerOperation::SessionInspect,
         ControlMsg::PeerFileTransferSignal { .. } => PeerOperation::FilesystemRead,
         ControlMsg::RequestDisplayInputAuthority { .. }
@@ -332,6 +370,7 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
     }
 }
 
+#[allow(dead_code)]
 pub fn profile_allows_federated_display_input(profile: &str) -> bool {
     profile_allows_operation(profile, PeerOperation::DisplayInput)
 }
@@ -382,6 +421,7 @@ pub fn filesystem_access_allowed(
     ))
 }
 
+#[allow(dead_code)]
 pub fn profile_allows_federation_http(profile: &str, request_line: &str) -> bool {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
@@ -421,6 +461,19 @@ pub fn federation_http_operation(method: &str, path: &str) -> Option<PeerOperati
     }
     if path.starts_with("/api/peers/pairing/") {
         return Some(PeerOperation::PeerManage);
+    }
+    // Signaling relays to a connected peer (`/api/peers/{id}/<signal-op>`)
+    // are peer *use*, not peer administration: they open a tunnel that the
+    // receiving peer authorizes against its own grants for this daemon.
+    if method == "POST" {
+        let mut segments = path.strip_prefix("/api/peers/").into_iter().flat_map(|rest| rest.split('/'));
+        if let (Some(id), Some(op), None) = (segments.next(), segments.next(), segments.next()) {
+            if !id.is_empty()
+                && matches!(op, "webrtc" | "file-transfer-webrtc" | "dashboard-control-webrtc")
+            {
+                return Some(PeerOperation::PeerUse);
+            }
+        }
     }
     if under("/api/peers") {
         if method == "GET" {
@@ -650,6 +703,42 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_control_tunnel_door_opens_for_any_tunnel_capability() {
+        // Every profile that can use something inside the tunnel gets
+        // through the door; per-method authorization inside does the rest.
+        for profile in [
+            "file-operator",
+            "file-reader",
+            "session-reader",
+            "terminal-operator",
+            "read-only-display",
+            "task-runner",
+            "operator",
+            "peer-root",
+        ] {
+            assert!(
+                profile_allows_dashboard_control_tunnel(profile),
+                "{profile} should reach the dashboard-control tunnel"
+            );
+        }
+        // Nothing inside the tunnel is reachable for these; door stays shut.
+        for profile in ["presence-only", "stats"] {
+            assert!(
+                !profile_allows_dashboard_control_tunnel(profile),
+                "{profile} should not reach the dashboard-control tunnel"
+            );
+        }
+
+        let signal = ControlMsg::PeerDashboardControlSignal {
+            session_id: "s".into(),
+            signal: crate::peer::WebRtcSignal::Unknown,
+        };
+        assert!(profile_allows_control_msg("file-operator", &signal));
+        assert!(profile_allows_control_msg("file-reader", &signal));
+        assert!(!profile_allows_control_msg("stats", &signal));
+    }
+
+    #[test]
     fn peer_prefixed_profile_aliases_keep_legacy_permissions() {
         assert_eq!(profile_class("peer-operator"), ProfileClass::Operator);
         assert_eq!(profile_class("peer-root"), ProfileClass::AdminPeer);
@@ -718,6 +807,41 @@ mod tests {
             "peer-operator",
             "GET /api/access/iam/state HTTP/1.1"
         ));
+    }
+
+    #[test]
+    fn peer_signal_relays_classify_as_peer_use() {
+        // The three signaling relays are peer use, not peer administration.
+        for op in ["webrtc", "file-transfer-webrtc", "dashboard-control-webrtc"] {
+            assert_eq!(
+                federation_http_operation("POST", &format!("/api/peers/intendant:peer-b/{op}")),
+                Some(PeerOperation::PeerUse),
+                "{op}"
+            );
+        }
+        // Everything else under /api/peers keeps its class: mutations are
+        // manage, pairing arms win over the id/op shape, GETs are inspect,
+        // and deeper or look-alike op segments never classify as use.
+        assert_eq!(
+            federation_http_operation("POST", "/api/peers/intendant:peer-b/message"),
+            Some(PeerOperation::PeerManage)
+        );
+        assert_eq!(
+            federation_http_operation("POST", "/api/peers/pairing/join"),
+            Some(PeerOperation::PeerManage)
+        );
+        assert_eq!(
+            federation_http_operation("GET", "/api/peers/intendant:peer-b/dashboard-control-webrtc"),
+            Some(PeerOperation::PeerInspect)
+        );
+        assert_eq!(
+            federation_http_operation("POST", "/api/peers/intendant:peer-b/webrtc/extra"),
+            Some(PeerOperation::PeerManage)
+        );
+        // Only the admin peer profile may use relays transitively.
+        assert!(profile_allows_operation("peer-root", PeerOperation::PeerUse));
+        assert!(!profile_allows_operation("file-operator", PeerOperation::PeerUse));
+        assert!(!profile_allows_operation("peer-operator", PeerOperation::PeerUse));
     }
 
     #[test]

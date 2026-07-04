@@ -115,7 +115,12 @@ cannot reach bindings by name).
 
 ### Activity
 
-The default tab. Five subtabs:
+The default tab, and the classic DOM control surface. It remains fully
+supported as the legacy fallback (the accessibility floor, the low-GPU path,
+and the surface most automation drives today), but [Station](./station.md)
+is the designated canonical control surface going forward.
+
+Five subtabs:
 
 - **Log** — a scrollable, color-coded event stream of everything in the system,
   grouped by turn with visual separators, with a verbosity selector
@@ -274,6 +279,14 @@ canonical dashboard equivalent. View settings shape the scene: layout
 (`orbital` / `constellation`), mood (`calm` / `cockpit`), and fov, motion, ar,
 and density tuning.
 
+Station is the designated successor to the classic Activity surface as the
+canonical way to operate agents; the DOM Logs view remains the legacy
+fallback. Today the scene is a 3D constellation backdrop with the working UI
+painted as screen-space HUD panels; the destination is action panes living
+*in* the scene, and eventually WebXR spatial computing. The dedicated
+[Station](./station.md) chapter carries the architecture, an honest
+current-state inventory, and the roadmap.
+
 ### Sessions
 
 A browser of past and current sessions. Four subtabs:
@@ -330,10 +343,43 @@ the active compacted session is not mistaken for the target of the mutation.
 
 ### Files
 
-Browse staged uploads and download files from the local daemon or a configured
-peer target. The target summary uses the same access abstraction as Terminal:
-local/mTLS, hosted transports, and peer dashboard-control routes are shown as
-targets with their available capabilities rather than as transport internals.
+Edit, browse, download, and upload files on the local daemon or a configured
+peer target. The tab is split into two sub-tabs: **Editor** (the default) and
+**Transfers** (the download/transfer-history/upload tooling). The target
+summary uses the same access abstraction as Terminal: local/mTLS, hosted
+transports, and peer dashboard-control routes are shown as targets with their
+available capabilities rather than as transport internals.
+
+The **Editor** sub-tab is a full-bleed workbench: a slim toolbar (target
+picker + one-line route summary + new file/folder), a lazy directory tree
+rail on the left (rooted at the project root locally, `~` on peers;
+hidden-file toggle), and a multi-tab CodeMirror editor filling the rest
+(vendored bundle, `static/codemirror-bundle.js`, lazy-loaded on first use;
+syntax highlighting by filename, dirty markers, hover-reveal close, a
+Reload-or-Overwrite conflict banner, Cmd/Ctrl-S). One accent answers "whose
+disk is this?": the active editor tab's underline, the tree selection, and
+the statusbar host chip render blue while editing this daemon and mauve on a
+peer (`--files-accent`). Reads and writes ride the same fs API family as
+everything else and are therefore IAM-scoped end to end:
+
+- Local targets use `GET /api/fs/stat|list|read` and `POST /api/fs/write`
+  (both classified `FilesystemWrite`→`write_roots` for mutation, and gated by
+  `authorize_http_filesystem_access` exactly like `mkdir`).
+- Peer targets ride the peer's dashboard-control tunnel: `api_fs_stat/list`
+  requests, `api_fs_read` byte streams, and `api_fs_write` upload frames.
+  Enforcement happens on the receiving daemon against its own peer profile
+  (`file-operator` vs `file-reader`) and per-peer filesystem roots; the
+  browser only picks where a request is sent, never whether it is allowed.
+- Saves are conflict-checked: full reads return the content's sha256
+  (`X-Content-Sha256` header on HTTP, `sha256` in the byte-stream result),
+  the editor sends it back as `expected_sha256`, and a mismatch returns
+  `409 {code:"conflict", current_sha256}`, which the UI surfaces as a
+  Reload-or-Overwrite banner instead of clobbering. New files save with
+  `create_new`; `force` is the explicit overwrite escape hatch. Writes land
+  atomically (same-directory tempfile, fsync, permission-preserving rename).
+- Guardrails: binary or non-UTF-8 and >2 MB files are refused with a pointer
+  to the Downloads flow; per-request write payloads cap at the shared 100 MB
+  upload limit; UTF-8 files keep their dominant line-ending style on save.
 
 ### Access
 
@@ -401,15 +447,22 @@ and peer federation:
   `root` is user/client authority and `peer-profile` is daemon-to-daemon
   authority. Local user/client bindings can also use enforced scoped roles:
   `scoped-human` (access model inspection only), `observer`, `session-reader`,
-  `terminal`, `files-read`, `files-write`, and `operator`. Directory-scoped file
-  access, public shares, organization groups, and external identity policy are
-  design targets, not hidden enforcement.
+  `terminal`, `files-read`, `files-write`, `peer-user`, and `operator`.
+  Directory-scoped file access, public shares, organization groups, and
+  external identity policy are design targets, not hidden enforcement.
 - A **permission** is the operation gate the daemon enforces. Access
   administration now separates `access.inspect` from `access.manage`, and peer
-  topology separates `peer.inspect` from `peer.manage`. Owner/root dashboard
-  sessions have all four. Existing peer profiles are mapped conservatively:
-  `peer-root` can inspect access and inspect/manage peer topology, but
-  `access.manage` remains reserved for trusted root user/client sessions.
+  topology separates `peer.inspect`, `peer.manage`, and `peer.use`.
+  `peer.use` is the delegation gate: opening a tunnel to a connected peer
+  (dashboard-control, file-transfer, or display signaling) presents *this
+  daemon's* peer credentials, and the receiving peer authorizes everything
+  inside the tunnel against its own grants for this daemon — so relaying is
+  never inferred from local capabilities, it is granted by name
+  (`operator` and `peer-user` carry it; `peer.manage` implies it for
+  compatibility). Owner/root dashboard sessions have all of these. Existing
+  peer profiles are mapped conservatively: `peer-root` can inspect access and
+  inspect/manage/use peer topology, but `access.manage` remains reserved for
+  trusted root user/client sessions.
 - A **transport** is only how the route is carried: browser mTLS, hosted
   Connect/WebRTC tunnel, local/debug HTTP, or daemon-to-daemon peer mTLS. The
   product UI should not make Connect a separate access system.
@@ -1582,6 +1635,11 @@ unexpected transport.
 Pairing authorization follows the access/peer split: request and identity lists
 require `access.inspect`, invite/approve/revoke require `access.manage`, and
 join/request-access/poll remain peer-topology operations gated by `peer.manage`.
+The signaling relays that open tunnels to an already-connected peer
+(`api_peer_webrtc_signal`, `api_peer_file_transfer_signal`,
+`api_peer_dashboard_control_signal`, and their
+`POST /api/peers/{id}/…-webrtc` HTTP twins) are gated by `peer.use` instead —
+using a peer relationship is not administering it.
 General peer and coordinator controls are covered by the same rule. Peer add,
 remove, eligibility discovery, per-peer message/task/approval, peer-display
 signaling, and coordinator route calls use `api_peer_add`, `api_peer_remove`,
@@ -1684,19 +1742,38 @@ Remaining design questions before production rollout:
 
 ## HTTP endpoints
 
+Routing matches the parsed `(method, path)` — exact routes or their
+`/`-nested sub-routes, query string stripped — so the dispatch chain and the
+per-route IAM/Origin gates always classify a request identically. Grouped by
+family (sub-routes elided where the family is uniform):
+
 | Endpoint | Description |
 |----------|-------------|
 | `GET /` | The dashboard SPA |
 | `GET /config` | Live-model configuration JSON (provider, model, sample rates, git SHA) |
 | `GET /debug` | Debug JSON (agent state, voice connection, active browser) |
 | `POST /session` | Mint ephemeral session tokens for Gemini Live / OpenAI Realtime |
-| `GET /wasm-web/*` | Compiled WASM + JS glue (content-hash cache-busted) |
+| `GET /wasm-web/*`, `GET /wasm-station/*` | Compiled WASM + JS glue (content-hash cache-busted) |
 | `GET /audio-processor.js` | AudioWorklet processor for mic capture |
-| `GET /api/sessions` | List past sessions |
-| `GET /api/session/{id}` | Session detail |
-| `GET /api/session/{id}/recordings/*` | Recording segments for a past session |
-| `GET /recordings/*` | Current-session recording segments |
+| `GET /.well-known/agent-card.json` | Agent card (identity + capabilities) for peers and integrations |
+| `POST /mcp` | Streamable-HTTP MCP server (per-tool IAM; see [MCP server](./mcp-server.md)) |
 | `WS /` or `WS /ws` | Main WebSocket: events, TUI terminal and fallback Shell terminal I/O, presence protocol, WebRTC signaling |
+| `GET /api/sessions` | List past sessions (`/stream` NDJSON variant, `/search` full-text) |
+| `GET /api/session/{id}/*` | Per-session detail, report, agent output, log replay, recordings, frame assets; `POST .../delete` |
+| `POST /api/session/current/*` | Current-session ops: `history`, `rollback`, `redo`, `prune`, `changes`, `agent-output`, `control-msg` |
+| `GET/POST /api/session/current/uploads[/*]` | Task attachment store (list, upload, raw fetch, delete) |
+| `GET /api/managed-context/{records,anchors,fission}` | Managed-context state: rewind records, anchors, fission groups |
+| `GET /recordings/*`, `GET /frames/*` | Current-session recording segments and captured frame assets |
+| `GET /api/fs/{stat,list,read}`, `POST /api/fs/mkdir` | Scoped filesystem browsing (fs scope enforced per grant) |
+| `GET/POST /api/settings`, `POST /api/api-keys`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key management |
+| `GET /api/external-agents` | External-agent backend availability (configured command, installed, last used) — drives the fueling nudge and new-session picker |
+| `GET /api/displays`, `POST /api/diagnostics/visual-freshness` | Display inventory; visual-freshness probe marker |
+| `GET /api/access/{overview,iam/state}`, `GET /api/dashboard/targets` | Trust-architecture snapshots (IAM state, fleet targets) |
+| `POST /api/access/...` | Trust mutations: enrollment decide, IAM grant upsert/update, org trust/revoke, org-grant issue/renew/revoke-member, issuer init/delegate/install, revocation-list apply |
+| `GET/POST /api/peers[/*]` | Peer federation: registry reads (GET), pairing + management (POST) |
+| `POST /api/coordinator/route` | Multi-agent coordinator task routing (peer lane) |
+| `GET /api/worktrees`, `POST /api/worktrees/{inspect,scan,remove}` | Agent worktree inventory and lifecycle |
+| `GET /connect/{bootstrap,status}`, `POST /connect/dashboard/{offer,ice,close}` | Intendant Connect tunnel: bootstrap metadata and dashboard-control WebRTC signaling |
 
 The full WebSocket message protocol (inbound key/resize/presence/WebRTC frames,
 outbound term/state/log-replay/tool-response frames) and the gateway's internal

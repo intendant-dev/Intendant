@@ -187,7 +187,7 @@ fn write_intendant_session_name(home: &Path, session_id: &str, name: &str) -> Re
 }
 
 fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
-    if session_id.contains('/') {
+    if session_id_looks_like_path(session_id) {
         return intendant_session_dir_from_slash_path(home, session_id);
     }
 
@@ -225,6 +225,23 @@ fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<Path
     None
 }
 
+/// True when a session "id" is actually a filesystem path: absolute, or
+/// containing '/' or the platform separator. Checking '/' alone would
+/// misclassify Windows absolute paths (`C:\...`) as bare ids, while on
+/// Unix a backslash stays what it is — a legal filename character.
+/// Every resolver that accepts a path-form id must pair this with
+/// [`intendant_session_dir_from_slash_path`] so the path stays anchored
+/// to the logs root.
+pub(crate) fn session_id_looks_like_path(session_id: &str) -> bool {
+    Path::new(session_id).is_absolute()
+        || session_id.contains('/')
+        || session_id.contains(std::path::MAIN_SEPARATOR)
+}
+
+/// Resolve a path-form session id. The candidate and the logs root are
+/// both canonicalized, and the candidate must land inside
+/// `<home>/.intendant/logs` — symlinked homes still work, symlink and
+/// `..` escapes do not.
 pub(crate) fn intendant_session_dir_from_slash_path(
     home: &Path,
     session_id: &str,
@@ -236,7 +253,6 @@ pub(crate) fn intendant_session_dir_from_slash_path(
     let logs_dir = home.join(".intendant").join("logs");
     let logs_dir = std::fs::canonicalize(logs_dir).ok()?;
     let candidate = std::fs::canonicalize(candidate).ok()?;
-    // Slash-form session paths must resolve inside the Intendant logs root.
     candidate.starts_with(&logs_dir).then_some(candidate)
 }
 
@@ -284,6 +300,27 @@ mod tests {
         .unwrap();
         assert_eq!(meta["name"], "Renamed");
         assert_eq!(meta["task"], "Original task");
+    }
+
+    #[test]
+    fn session_id_path_detection_is_platform_aware() {
+        assert!(session_id_looks_like_path("/abs/olute"));
+        assert!(session_id_looks_like_path("rel/ative"));
+        assert!(!session_id_looks_like_path("abc123"));
+        assert!(!session_id_looks_like_path("sess-2026.07.03"));
+        #[cfg(windows)]
+        {
+            // Windows absolute paths use backslashes; contains('/') alone
+            // misclassified them as bare ids.
+            assert!(session_id_looks_like_path("C:\\Users\\x\\logs\\sess"));
+            assert!(session_id_looks_like_path("rel\\ative"));
+        }
+        #[cfg(unix)]
+        {
+            // On Unix a backslash is a legal filename character, not a
+            // separator — such an id stays a bare id.
+            assert!(!session_id_looks_like_path("weird\\name"));
+        }
     }
 
     #[test]

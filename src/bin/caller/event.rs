@@ -88,6 +88,7 @@ impl ContextInjection {
     /// Create a user injection that originated from a queued steer. The id
     /// round-trips back out via `AppEvent::SteerDelivered` when the item is
     /// drained so frontends can correlate their pending-steer UI.
+    #[allow(dead_code)]
     pub fn text_with_steer_id(msg: String, steer_id: String) -> Self {
         Self::text_with_steer_id_for_target(msg, steer_id, None)
     }
@@ -1261,6 +1262,14 @@ pub enum ControlMsg {
         /// external agent. Empty/missing falls back to the configured command.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_command: Option<String>,
+        /// Optional one-shot Claude Code model override for this session.
+        /// Only applies when the resolved agent is Claude Code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_model: Option<String>,
+        /// Optional one-shot Claude Code permission mode for this session.
+        /// Only applies when the resolved agent is Claude Code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_permission_mode: Option<String>,
         /// Optional one-shot Codex sandbox mode for this session. Only applies
         /// when the resolved agent is Codex.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3301,6 +3310,8 @@ mod tests {
                 project_root: None,
                 agent: Some("codex".to_string()),
                 agent_command: Some("/opt/codex/bin/codex".to_string()),
+                claude_model: None,
+                claude_permission_mode: None,
                 codex_sandbox: Some("danger-full-access".to_string()),
                 codex_approval_policy: Some("never".to_string()),
                 codex_managed_context: Some("managed".to_string()),
@@ -3567,6 +3578,8 @@ mod tests {
                 project_root,
                 agent,
                 agent_command,
+                claude_model,
+                claude_permission_mode,
                 codex_sandbox,
                 codex_approval_policy,
                 codex_managed_context,
@@ -3579,6 +3592,8 @@ mod tests {
                 attachments,
             } => {
                 assert_eq!(task, "fix bug");
+                assert!(claude_model.is_none());
+                assert!(claude_permission_mode.is_none());
                 assert_eq!(name.as_deref(), Some("Bugfix work"));
                 assert_eq!(project_root.as_deref(), Some("/repo"));
                 assert_eq!(agent.as_deref(), Some("codex"));

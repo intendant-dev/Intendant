@@ -1,4 +1,4 @@
-use crate::live_audio_types::{FieldSpec, FieldType, QuarantinePayload, ResponseSchema};
+use crate::live_audio_types::{FieldType, QuarantinePayload, ResponseSchema};
 
 /// A single validation error found during schema validation.
 #[derive(Debug, Clone)]
@@ -15,6 +15,7 @@ impl std::fmt::Display for ValidationError {
 
 /// Callback for quarantining oversized or rejected string content.
 /// Returns the quarantine payload reference (without the content itself).
+#[allow(dead_code)]
 type QuarantineFn<'a> = &'a mut dyn FnMut(&str, &str, &str) -> QuarantinePayload;
 
 /// Validate a JSON value against a ResponseSchema.
@@ -306,6 +307,7 @@ fn field_type_to_json_schema(ft: &FieldType) -> serde_json::Value {
 
 /// Convert a ResponseSchema to Gemini's generation_config.response_schema format.
 /// Gemini uses a subset of JSON Schema with some differences.
+#[allow(dead_code)]
 pub fn to_gemini_response_schema(schema: &ResponseSchema) -> serde_json::Value {
     // Gemini uses the same JSON Schema subset, so delegate to the standard conversion.
     to_json_schema(schema)

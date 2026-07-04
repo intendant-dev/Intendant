@@ -129,9 +129,7 @@ impl SupervisorState {
 
         let mut current = session_id;
         for _ in 0..8 {
-            let Some(next) = self.session_aliases.get(current) else {
-                return None;
-            };
+            let next = self.session_aliases.get(current)?;
             if self.sessions.contains_key(next) {
                 return Some(next.clone());
             }
@@ -389,6 +387,8 @@ impl SessionSupervisor {
                 project_root,
                 agent,
                 agent_command,
+                claude_model,
+                claude_permission_mode,
                 codex_sandbox,
                 codex_approval_policy,
                 codex_managed_context,
@@ -424,6 +424,8 @@ impl SessionSupervisor {
                                 project_root,
                                 agent,
                                 agent_command,
+                                None,
+                                None,
                                 codex_sandbox,
                                 codex_approval_policy,
                                 codex_managed_context,
@@ -447,6 +449,8 @@ impl SessionSupervisor {
                         || display_target.is_some()
                         || agent.is_some()
                         || agent_command.is_some()
+                        || claude_model.is_some()
+                        || claude_permission_mode.is_some()
                         || codex_sandbox.is_some()
                         || codex_approval_policy.is_some()
                         || codex_managed_context.is_some()
@@ -468,6 +472,8 @@ impl SessionSupervisor {
                     project_root,
                     agent,
                     agent_command,
+                    claude_model,
+                    claude_permission_mode,
                     codex_sandbox,
                     codex_approval_policy,
                     codex_managed_context,
@@ -531,6 +537,8 @@ impl SessionSupervisor {
                                 None,
                                 None,
                                 None,
+                                None,
+                                None,
                                 orchestrate,
                                 direct,
                                 Vec::new(),
@@ -557,6 +565,8 @@ impl SessionSupervisor {
                 }
                 self.start_new_session(
                     task,
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -835,6 +845,8 @@ impl SessionSupervisor {
         project_root: Option<String>,
         agent: Option<String>,
         agent_command: Option<String>,
+        claude_model: Option<String>,
+        claude_permission_mode: Option<String>,
         codex_sandbox: Option<String>,
         codex_approval_policy: Option<String>,
         codex_managed_context: Option<String>,
@@ -895,8 +907,8 @@ impl SessionSupervisor {
         );
         self.activate_shared_session(session_log.clone()).await;
 
-        if !reference_frame_ids.is_empty() {
-            if self
+        if !reference_frame_ids.is_empty()
+            && self
                 .spawn_cu_task(
                     &session_id,
                     &task,
@@ -907,13 +919,12 @@ impl SessionSupervisor {
                     display_target,
                 )
                 .await
-            {
-                self.config.bus.send(AppEvent::SessionStarted {
-                    session_id: session_id.clone(),
-                    task: Some(task.clone()),
-                });
-                return;
-            }
+        {
+            self.config.bus.send(AppEvent::SessionStarted {
+                session_id: session_id.clone(),
+                task: Some(task.clone()),
+            });
+            return;
         }
 
         let use_direct = direct.unwrap_or(false)
@@ -953,6 +964,41 @@ impl SessionSupervisor {
                 return;
             };
             apply_session_agent_command(&mut project, backend, command);
+        }
+        if let Some(model) = claude_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error(
+                    "Session create failed: claude_model requires Claude Code".to_string(),
+                );
+                return;
+            };
+            if let Err(e) = apply_session_claude_model(&mut project, backend, model.to_string()) {
+                self.loop_error(format!("Session create failed: {}", e));
+                return;
+            }
+        }
+        if let Some(mode) = claude_permission_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error(
+                    "Session create failed: claude_permission_mode requires Claude Code"
+                        .to_string(),
+                );
+                return;
+            };
+            if let Err(e) =
+                apply_session_claude_permission_mode(&mut project, backend, mode.to_string())
+            {
+                self.loop_error(format!("Session create failed: {}", e));
+                return;
+            }
         }
         if let Some(mode) = normalize_session_codex_sandbox(codex_sandbox.as_deref()) {
             let Some(ref backend) = backend else {
@@ -3746,6 +3792,35 @@ fn apply_session_codex_managed_context(
     }
 }
 
+fn apply_session_claude_model(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    model: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::ClaudeCode => {
+            project.config.agent.claude_code.model = Some(model);
+            Ok(())
+        }
+        _ => Err("claude_model requires Claude Code".to_string()),
+    }
+}
+
+fn apply_session_claude_permission_mode(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    mode: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::ClaudeCode => {
+            project.config.agent.claude_code.permission_mode =
+                crate::project::normalize_claude_permission_mode(&mode);
+            Ok(())
+        }
+        _ => Err("claude_permission_mode requires Claude Code".to_string()),
+    }
+}
+
 fn apply_session_codex_sandbox(
     project: &mut Project,
     backend: &external_agent::AgentBackend,
@@ -4115,8 +4190,12 @@ fn emit_follow_up_status(
 }
 
 fn external_resume_log_dir(session_id: &str, force_new: bool) -> PathBuf {
+    external_resume_log_dir_in_home(&crate::platform::home_dir(), session_id, force_new)
+}
+
+fn external_resume_log_dir_in_home(home: &Path, session_id: &str, force_new: bool) -> PathBuf {
     if !force_new {
-        if let Some(dir) = session_log::SessionLog::find_session_by_id(session_id) {
+        if let Some(dir) = session_log::SessionLog::find_session_by_id_in_home(home, session_id) {
             return dir;
         }
     }
@@ -4163,7 +4242,7 @@ pub(crate) fn effective_external_resume_token_in_home(
 
     let mut candidates = Vec::new();
     for candidate in [session_id.trim(), requested_resume_token] {
-        if !candidate.is_empty() && !candidates.iter().any(|id: &&str| *id == candidate) {
+        if !candidate.is_empty() && !candidates.contains(&candidate) {
             candidates.push(candidate);
         }
     }
@@ -4267,19 +4346,16 @@ fn session_log_dir_for_id_in_home(home: &Path, session_id: &str) -> Option<PathB
     if session_id.is_empty() {
         return None;
     }
+    // Path-form ids resolve through the anchored helper (inside the logs
+    // root only), and BEFORE the direct join below — joining an absolute
+    // path would silently replace the logs dir as the base.
+    if crate::session_names::session_id_looks_like_path(session_id) {
+        return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
+    }
     let logs_dir = home.join(".intendant").join("logs");
     let direct = logs_dir.join(session_id);
     if direct.is_dir() && direct.join("session_meta.json").exists() {
         return Some(direct);
-    }
-
-    let path = Path::new(session_id);
-    let looks_like_path = path.is_absolute()
-        || session_id.contains('/')
-        || session_id.contains(std::path::MAIN_SEPARATOR);
-    if looks_like_path {
-        let dir = PathBuf::from(session_id);
-        return dir.is_dir().then_some(dir);
     }
 
     let entries = std::fs::read_dir(logs_dir).ok()?;
@@ -4894,13 +4970,20 @@ mod tests {
 
     #[test]
     fn external_resume_log_dir_reuses_requested_wrapper_log() {
-        let dir = tempfile::tempdir().unwrap();
-        let wrapper_dir = dir.path().join("wrapper-session");
+        let home = tempfile::tempdir().unwrap();
+        let wrapper_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-session");
         let log = session_log::SessionLog::open(wrapper_dir.clone()).unwrap();
-        log.write_meta(Some(dir.path()), Some("previous external task"));
+        log.write_meta(Some(home.path()), Some("previous external task"));
 
-        let resolved = external_resume_log_dir(wrapper_dir.to_str().unwrap(), false);
-        assert_eq!(resolved, wrapper_dir);
+        // Path-form resume ids resolve only inside the logs root (the
+        // resolver canonicalizes, so compare canonicalized).
+        let resolved =
+            external_resume_log_dir_in_home(home.path(), wrapper_dir.to_str().unwrap(), false);
+        assert_eq!(resolved, std::fs::canonicalize(&wrapper_dir).unwrap());
     }
 
     #[test]

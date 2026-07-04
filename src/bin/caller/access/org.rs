@@ -44,7 +44,10 @@ pub fn valid_org_handle(handle: &str) -> bool {
 
 /// Load (or create on first use) the org root key. Reuses the daemon
 /// identity plumbing: Ed25519 PKCS#8 on disk, 0600 on Unix.
-pub fn load_or_create_org_identity(cert_dir: &Path, handle: &str) -> Result<DaemonIdentity, String> {
+pub fn load_or_create_org_identity(
+    cert_dir: &Path,
+    handle: &str,
+) -> Result<DaemonIdentity, String> {
     if !valid_org_handle(handle) {
         return Err(format!(
             "invalid org handle {handle:?}: use 2-40 chars of a-z, 0-9, and '-'"
@@ -201,7 +204,9 @@ pub fn delegate_org_issuer(
         return Err("issuer key must be a 32-byte Ed25519 public key".to_string());
     }
     if issuer_key == identity.public_key_b64u() {
-        return Err("the org root key cannot be its own issuer; delegate a different key".to_string());
+        return Err(
+            "the org root key cannot be its own issuer; delegate a different key".to_string(),
+        );
     }
     let ttl = ttl_ms.unwrap_or(MAX_ORG_ISSUER_TTL_MS);
     if ttl == 0 || ttl > MAX_ORG_ISSUER_TTL_MS {
@@ -211,7 +216,9 @@ pub fn delegate_org_issuer(
     }
     let max_role = max_role.trim();
     if !max_role.is_empty() && !max_role.starts_with("role:") && !max_role.starts_with("peer:") {
-        return Err("issuer scope must be a role:* or peer:* id (or empty for both lanes)".to_string());
+        return Err(
+            "issuer scope must be a role:* or peer:* id (or empty for both lanes)".to_string(),
+        );
     }
     let mut cert = OrgIssuerCert {
         v: 1,
@@ -403,7 +410,9 @@ pub fn verify_org_grant(doc: &OrgGrantDocument, now_unix_ms: u64) -> Result<(), 
         return Err("org grant subject is missing a fingerprint".to_string());
     }
     if has_client && has_peer {
-        return Err("org grant subject must bind exactly one of a client key or a peer daemon".to_string());
+        return Err(
+            "org grant subject must bind exactly one of a client key or a peer daemon".to_string(),
+        );
     }
     if has_peer {
         crate::peer::access_policy::normalize_fingerprint(&doc.subject.peer_fingerprint)
@@ -424,11 +433,7 @@ pub fn verify_org_grant(doc: &OrgGrantDocument, now_unix_ms: u64) -> Result<(), 
     if doc.expires_at_unix_ms <= now_unix_ms {
         return Err("org grant has expired".to_string());
     }
-    if doc
-        .expires_at_unix_ms
-        .saturating_sub(doc.issued_at_unix_ms)
-        > MAX_ORG_GRANT_TTL_MS
-    {
+    if doc.expires_at_unix_ms.saturating_sub(doc.issued_at_unix_ms) > MAX_ORG_GRANT_TTL_MS {
         return Err("org grant lifetime exceeds the 90 day cap".to_string());
     }
     // Outside-in: the trusted root validates the (at most one) issuer
@@ -521,9 +526,7 @@ fn trusted_org_for_doc<'a>(
 
     let handle = doc.org.handle.trim();
     let Some(trusted) = state.trusted_orgs.iter().find(|org| {
-        org.handle == handle
-            && org.root_key == doc.org.root_key
-            && is_enforced_status(&org.status)
+        org.handle == handle && org.root_key == doc.org.root_key && is_enforced_status(&org.status)
     }) else {
         return Err(AccessError(format!(
             "this daemon does not trust org {handle} with that root key; a root session must trust it under Access → Advanced → Organizations first"
@@ -712,11 +715,13 @@ pub fn materialize_org_grant(
         created_at_unix_ms: Some(now_unix_ms),
         revoked_at_unix_ms: None,
         expires_at_unix_ms: Some(doc.expires_at_unix_ms),
-        issued_via: doc.chain.first().map(|cert| cert.issuer_key.trim().to_string()),
+        issued_via: doc
+            .chain
+            .first()
+            .map(|cert| cert.issuer_key.trim().to_string()),
         fs_scope: None,
     };
-    let grant = if let Some(existing) = state.grants.iter_mut().find(|grant| grant.id == grant_id)
-    {
+    let grant = if let Some(existing) = state.grants.iter_mut().find(|grant| grant.id == grant_id) {
         if existing.status == "revoked" || existing.revoked_at_unix_ms.is_some() {
             return Err(AccessError(format!(
                 "org grant {} was revoked locally on this daemon; local IAM wins — the org must issue a new grant, or a root session can re-enable this one",
@@ -819,8 +824,9 @@ pub fn install_issuer_cert(
     cert: &OrgIssuerCert,
     now_unix_ms: u64,
 ) -> Result<(), String> {
-    let issuer = load_issuer_identity(cert_dir, handle)?
-        .ok_or_else(|| format!("this daemon holds no issuer key for org {handle:?}; initialize one first"))?;
+    let issuer = load_issuer_identity(cert_dir, handle)?.ok_or_else(|| {
+        format!("this daemon holds no issuer key for org {handle:?}; initialize one first")
+    })?;
     if cert.issuer_key.trim() != issuer.public_key_b64u() {
         return Err("the certificate names a different issuer key".to_string());
     }
@@ -833,7 +839,8 @@ pub fn install_issuer_cert(
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let body = serde_json::to_string_pretty(cert).map_err(|e| e.to_string())?;
-    std::fs::write(&path, format!("{body}\n")).map_err(|e| format!("write {}: {e}", path.display()))?;
+    std::fs::write(&path, format!("{body}\n"))
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -861,14 +868,13 @@ pub fn materialize_org_peer_grant(
 ) -> AccessResult<MaterializedOrgPeerGrant> {
     use crate::peer::access_policy as pol;
     if !doc.subject.is_peer() {
-        return Err(AccessError(
-            "not a peer-subject document".to_string(),
-        ));
+        return Err(AccessError("not a peer-subject document".to_string()));
     }
     let trusted = trusted_org_for_doc(state, doc, daemon_ids, now_unix_ms)?;
     let handle = doc.org.handle.trim().to_string();
-    let profile = peer_profile_from_role(&doc.role_id)
-        .ok_or_else(|| AccessError("peer-subject documents use peer:<profile> roles".to_string()))?;
+    let profile = peer_profile_from_role(&doc.role_id).ok_or_else(|| {
+        AccessError("peer-subject documents use peer:<profile> roles".to_string())
+    })?;
     let profile = pol::normalize_profile(profile).map_err(|e| AccessError(e.to_string()))?;
 
     // Fail closed: the human and peer lanes are separate trust decisions,
@@ -886,8 +892,8 @@ pub fn materialize_org_peer_grant(
         )));
     }
 
-    let fingerprint =
-        pol::normalize_fingerprint(&doc.subject.peer_fingerprint).map_err(|e| AccessError(e.to_string()))?;
+    let fingerprint = pol::normalize_fingerprint(&doc.subject.peer_fingerprint)
+        .map_err(|e| AccessError(e.to_string()))?;
     let expires_at_unix = (doc.expires_at_unix_ms / 1000) as i64;
     let label = if doc.subject.label.trim().is_empty() {
         format!("{handle} member daemon")
@@ -895,8 +901,8 @@ pub fn materialize_org_peer_grant(
         doc.subject.label.trim().to_string()
     };
 
-    let existing = pol::lookup_identity(cert_dir, &fingerprint)
-        .map_err(|e| AccessError(e.to_string()))?;
+    let existing =
+        pol::lookup_identity(cert_dir, &fingerprint).map_err(|e| AccessError(e.to_string()))?;
     if let Some(existing) = existing.as_ref() {
         if matches!(existing.status, pol::PeerIdentityStatus::Revoked) {
             return Err(AccessError(
@@ -936,7 +942,10 @@ pub fn materialize_org_peer_grant(
         expires_at_unix: Some(expires_at_unix),
         source: Some(format!("org:{handle}")),
         org_grant_id: Some(doc.grant_id.trim().to_string()),
-        issued_via: doc.chain.first().map(|cert| cert.issuer_key.trim().to_string()),
+        issued_via: doc
+            .chain
+            .first()
+            .map(|cert| cert.issuer_key.trim().to_string()),
     };
     pol::write_identity_record(cert_dir, &record).map_err(|e| AccessError(e.to_string()))?;
 
@@ -1065,8 +1074,13 @@ pub fn present_org_grant_value(
     let cert_dir = crate::access::backend::select_backend().cert_dir();
     let mut state = crate::access::iam::load_state(&cert_dir)
         .map_err(|e| format!("load local IAM state: {e}"))?;
-    let outcome =
-        present_org_grant_state(&mut state, &cert_dir, doc_value, extra_daemon_ids, now_unix_ms)?;
+    let outcome = present_org_grant_state(
+        &mut state,
+        &cert_dir,
+        doc_value,
+        extra_daemon_ids,
+        now_unix_ms,
+    )?;
     if outcome.changed() {
         crate::access::iam::save_state(&cert_dir, &state)
             .map_err(|e| format!("save local IAM state: {e}"))?;
@@ -1153,10 +1167,10 @@ pub fn load_or_init_orl(
 ) -> Result<OrgRevocationList, String> {
     let path = orl_path(cert_dir, handle);
     if path.exists() {
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
-        let orl: OrgRevocationList = serde_json::from_str(&raw)
-            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let orl: OrgRevocationList =
+            serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
         verify_orl(&orl)?;
         if orl.org.root_key != identity.public_key_b64u() {
             return Err(format!(
@@ -1226,7 +1240,12 @@ pub fn orl_revoke(
         if key.contains(',') {
             return Err(format!("invalid issuer key {key:?}"));
         }
-        if !key.is_empty() && !orl.revoked_issuer_keys.iter().any(|existing| existing == key) {
+        if !key.is_empty()
+            && !orl
+                .revoked_issuer_keys
+                .iter()
+                .any(|existing| existing == key)
+        {
             orl.revoked_issuer_keys.push(key.to_string());
             added = true;
         }
@@ -1275,9 +1294,7 @@ pub fn apply_orl(
     verify_orl(orl).map_err(AccessError)?;
     let handle = orl.org.handle.trim().to_string();
     let Some(index) = state.trusted_orgs.iter().position(|org| {
-        org.handle == handle
-            && org.root_key == orl.org.root_key
-            && is_enforced_status(&org.status)
+        org.handle == handle && org.root_key == orl.org.root_key && is_enforced_status(&org.status)
     }) else {
         return Err(AccessError(format!(
             "this daemon does not trust org {handle} with that root key, so its revocation list does not apply here"
@@ -1397,7 +1414,9 @@ pub fn apply_orl(
         grant.source == source
             && is_enforced_status(&grant.status)
             && (local_grant_ids.iter().any(|id| id == &grant.id)
-                || revoked_principals.iter().any(|id| id == &grant.principal_id)
+                || revoked_principals
+                    .iter()
+                    .any(|id| id == &grant.principal_id)
                 || grant
                     .issued_via
                     .as_deref()
@@ -1457,11 +1476,7 @@ pub fn renew_org_grant(
         return Err("document and revocation list belong to different orgs".to_string());
     }
     let doc_grant_id = doc.grant_id.trim();
-    if orl
-        .revoked_grant_ids
-        .iter()
-        .any(|id| id == doc_grant_id)
-    {
+    if orl.revoked_grant_ids.iter().any(|id| id == doc_grant_id) {
         return Err(format!(
             "org grant {doc_grant_id} is revoked; it cannot be renewed"
         ));
@@ -1480,7 +1495,10 @@ pub fn renew_org_grant(
             .iter()
             .any(|key| key == cert.issuer_key.trim())
         {
-            return Err("the issuer key that signed this document is revoked; it cannot be renewed".to_string());
+            return Err(
+                "the issuer key that signed this document is revoked; it cannot be renewed"
+                    .to_string(),
+            );
         }
     }
     let span = doc
@@ -1601,10 +1619,7 @@ pub fn trust_org(
         actor_principal_id: "principal:root:dashboard".to_string(),
         action: "trust_org".to_string(),
         target_id: format!("org:{}", entry.handle),
-        summary: format!(
-            "Trusted org {} with cap {}",
-            entry.handle, entry.max_role
-        ),
+        summary: format!("Trusted org {} with cap {}", entry.handle, entry.max_role),
     });
     Ok(entry)
 }
@@ -1733,7 +1748,15 @@ mod tests {
     fn org_grant_signs_verifies_and_materializes() {
         let identity = org_identity();
         let mut state = LocalIamState::default();
-        trust_org(&mut state, "acme", &identity.public_key_b64u(), None, None, test_now()).unwrap();
+        trust_org(
+            &mut state,
+            "acme",
+            &identity.public_key_b64u(),
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
         let doc = issue(&identity, &state, "role:session-reader");
         verify_org_grant(&doc, test_now()).unwrap();
 
@@ -1754,27 +1777,35 @@ mod tests {
         // The member's key now resolves with the granted role.
         let principal =
             crate::access::iam::principal_for_client_key(&state, "member-key", "test").unwrap();
-        assert!(crate::access::iam::evaluate_principal_operation_with_state(
-            &state,
-            &principal,
-            crate::peer::access_policy::PeerOperation::SessionInspect,
-        )
-        .allowed);
-        assert!(!crate::access::iam::evaluate_principal_operation_with_state(
-            &state,
-            &principal,
-            crate::peer::access_policy::PeerOperation::AccessManage,
-        )
-        .allowed);
+        assert!(
+            crate::access::iam::evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::SessionInspect,
+            )
+            .allowed
+        );
+        assert!(
+            !crate::access::iam::evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::AccessManage,
+            )
+            .allowed
+        );
 
         // Re-presentation is idempotent (same grant id, refreshed record)
         // and quiet: offers attach documents on every connect, so an
         // unchanged presentation must not grow state or the audit log.
         assert!(outcome.changed);
         let audit_len = state.audit_events.len();
-        let again =
-            materialize_org_grant(&mut state, &doc, &["intendant:host-a".to_string()], test_now())
-                .unwrap();
+        let again = materialize_org_grant(
+            &mut state,
+            &doc,
+            &["intendant:host-a".to_string()],
+            test_now(),
+        )
+        .unwrap();
         assert_eq!(again.grant.id, outcome.grant.id);
         assert!(!again.changed);
         assert_eq!(state.audit_events.len(), audit_len);
@@ -1792,7 +1823,15 @@ mod tests {
     fn re_presentation_cannot_resurrect_local_revocations() {
         let identity = org_identity();
         let mut state = LocalIamState::default();
-        trust_org(&mut state, "acme", &identity.public_key_b64u(), None, None, test_now()).unwrap();
+        trust_org(
+            &mut state,
+            "acme",
+            &identity.public_key_b64u(),
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
         let doc = issue(&identity, &state, "role:session-reader");
         let outcome =
             materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now()).unwrap();
@@ -1807,8 +1846,8 @@ mod tests {
             .unwrap();
         grant.status = "revoked".to_string();
         grant.revoked_at_unix_ms = Some(test_now());
-        let err = materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now())
-            .unwrap_err();
+        let err =
+            materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now()).unwrap_err();
         assert!(err.to_string().contains("revoked locally"), "{err}");
 
         // A locally revoked principal is refused the same way.
@@ -1825,16 +1864,27 @@ mod tests {
             .find(|principal| principal.id == outcome.principal.id)
             .unwrap()
             .status = "revoked".to_string();
-        let err = materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now())
-            .unwrap_err();
-        assert!(err.to_string().contains("principal was revoked locally"), "{err}");
+        let err =
+            materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now()).unwrap_err();
+        assert!(
+            err.to_string().contains("principal was revoked locally"),
+            "{err}"
+        );
     }
 
     #[test]
     fn present_org_grant_state_parses_verifies_and_caps_size() {
         let identity = org_identity();
         let mut state = LocalIamState::default();
-        trust_org(&mut state, "acme", &identity.public_key_b64u(), None, None, test_now()).unwrap();
+        trust_org(
+            &mut state,
+            "acme",
+            &identity.public_key_b64u(),
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
         let doc = issue(&identity, &state, "role:session-reader");
         let value = serde_json::to_value(&doc).unwrap();
 
@@ -1878,10 +1928,7 @@ mod tests {
         assert!(ids.contains(&host_label));
         assert!(ids.contains(&format!("intendant:{host_label}")));
         // Dedup: the host label passed as an extra appears once.
-        assert_eq!(
-            ids.iter().filter(|id| **id == host_label).count(),
-            1
-        );
+        assert_eq!(ids.iter().filter(|id| **id == host_label).count(), 1);
     }
 
     #[test]
@@ -1895,7 +1942,15 @@ mod tests {
         let err = materialize_org_grant(&mut state, &doc, &ids, test_now()).unwrap_err();
         assert!(err.to_string().contains("does not trust org acme"));
 
-        trust_org(&mut state, "acme", &identity.public_key_b64u(), None, None, test_now()).unwrap();
+        trust_org(
+            &mut state,
+            "acme",
+            &identity.public_key_b64u(),
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
 
         // Tampered role: signature fails.
         let mut tampered = doc.clone();
@@ -1907,7 +1962,10 @@ mod tests {
         // Role above the org cap (default operator): rejected, not downgraded.
         let root_doc = issue(&identity, &state, "role:root");
         let err = materialize_org_grant(&mut state, &root_doc, &ids, test_now()).unwrap_err();
-        assert!(err.to_string().contains("exceeds this daemon's cap"), "{err}");
+        assert!(
+            err.to_string().contains("exceeds this daemon's cap"),
+            "{err}"
+        );
 
         // Targets that do not include this daemon: refused.
         let mut elsewhere = issue(&identity, &state, "role:observer");
@@ -1938,7 +1996,15 @@ mod tests {
     fn orl_applies_monotonically_and_blocks_rematerialization() {
         let (dir, identity) = org_identity_with_dir();
         let mut state = LocalIamState::default();
-        trust_org(&mut state, "acme", &identity.public_key_b64u(), None, None, test_now()).unwrap();
+        trust_org(
+            &mut state,
+            "acme",
+            &identity.public_key_b64u(),
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
         let doc = issue(&identity, &state, "role:session-reader");
         let outcome =
             materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now()).unwrap();
@@ -1988,8 +2054,8 @@ mod tests {
         // still-signed document is refused by the persisted list.
         let again = apply_orl(&mut state, dir.path(), &orl, test_now()).unwrap();
         assert!(!again.changed);
-        let err = materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now())
-            .unwrap_err();
+        let err =
+            materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now()).unwrap_err();
         assert!(err.to_string().contains("revocation list"), "{err}");
 
         // Subject revocation sweeps by fingerprint and blocks new docs for
@@ -2008,8 +2074,8 @@ mod tests {
         .unwrap();
         assert_eq!(orl2.seq, 2);
         apply_orl(&mut state, dir.path(), &orl2, test_now()).unwrap();
-        let err = materialize_org_grant(&mut state, &doc2, &["*".to_string()], test_now())
-            .unwrap_err();
+        let err =
+            materialize_org_grant(&mut state, &doc2, &["*".to_string()], test_now()).unwrap_err();
         assert!(err.to_string().contains("subject key is revoked"), "{err}");
 
         // A stale (superseded) list is refused loudly.
@@ -2035,7 +2101,15 @@ mod tests {
         assert_eq!(state.trusted_orgs[0].last_orl_seq, 2);
         assert!(!state.trusted_orgs[0].orl_revoked_subjects.is_empty());
         let other = org_identity();
-        trust_org(&mut state, "acme", &other.public_key_b64u(), None, None, test_now()).unwrap();
+        trust_org(
+            &mut state,
+            "acme",
+            &other.public_key_b64u(),
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
         assert_eq!(state.trusted_orgs[0].last_orl_seq, 0);
         assert!(state.trusted_orgs[0].orl_revoked_grant_ids.is_empty());
     }
@@ -2104,7 +2178,15 @@ mod tests {
     fn peer_subject_documents_fail_closed_cap_and_materialize_into_peer_store() {
         let (dir, identity) = org_identity_with_dir();
         let mut state = LocalIamState::default();
-        trust_org(&mut state, "acme", &identity.public_key_b64u(), None, None, test_now()).unwrap();
+        trust_org(
+            &mut state,
+            "acme",
+            &identity.public_key_b64u(),
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
         let peer_fp = "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66";
         let issue_peer = |state: &LocalIamState, role: &str| {
             issue_org_grant(
@@ -2131,7 +2213,9 @@ mod tests {
         let mut cross = doc.clone();
         cross.subject.client_key_fingerprint = cross.subject.peer_fingerprint.clone();
         cross.subject.peer_fingerprint = String::new();
-        assert!(verify_org_grant(&cross, test_now()).unwrap_err().contains("signature"));
+        assert!(verify_org_grant(&cross, test_now())
+            .unwrap_err()
+            .contains("signature"));
 
         // Fail closed: no peer cap, no peer authority.
         let ids = ["*".to_string()];
@@ -2153,7 +2237,10 @@ mod tests {
         let op_doc = issue_peer(&state, "peer:operator").unwrap();
         let err = materialize_org_peer_grant(&mut state, dir.path(), &op_doc, &ids, test_now())
             .unwrap_err();
-        assert!(err.to_string().contains("exceeds this daemon's peer cap"), "{err}");
+        assert!(
+            err.to_string().contains("exceeds this daemon's peer cap"),
+            "{err}"
+        );
 
         // In-cap materializes into the peer identity store with expiry,
         // provenance, and grant id; re-presentation is a quiet no-op.
@@ -2162,7 +2249,10 @@ mod tests {
         assert!(outcome.changed);
         assert_eq!(outcome.record.profile, "session-reader");
         assert_eq!(outcome.record.source.as_deref(), Some("org:acme"));
-        assert_eq!(outcome.record.org_grant_id.as_deref(), Some(doc.grant_id.as_str()));
+        assert_eq!(
+            outcome.record.org_grant_id.as_deref(),
+            Some(doc.grant_id.as_str())
+        );
         assert!(outcome.record.is_active((test_now() / 1000) as i64));
         let audit_len = state.audit_events.len();
         let again =
@@ -2178,8 +2268,9 @@ mod tests {
             &[],
             &[peer_fp.to_string()],
             &[],
-            test_now())
-            .unwrap();
+            test_now(),
+        )
+        .unwrap();
         let applied = apply_orl(&mut state, dir.path(), &orl, test_now()).unwrap();
         assert_eq!(applied.revoked_peer_identities, 1);
         let record = crate::peer::access_policy::lookup_identity(dir.path(), peer_fp)
@@ -2195,7 +2286,15 @@ mod tests {
     fn issuer_delegation_signs_verifies_scopes_and_revokes() {
         let (dir, root) = org_identity_with_dir();
         let mut state = LocalIamState::default();
-        trust_org(&mut state, "acme", &root.public_key_b64u(), None, None, test_now()).unwrap();
+        trust_org(
+            &mut state,
+            "acme",
+            &root.public_key_b64u(),
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
 
         let issuer_dir = tempfile::tempdir().unwrap();
         let issuer = DaemonIdentity::load_or_create(issuer_dir.path().join("issuer.pk8")).unwrap();
@@ -2213,9 +2312,20 @@ mod tests {
         // Tamper: scope change breaks the root signature.
         let mut tampered = cert.clone();
         tampered.max_role = "role:root".to_string();
-        assert!(verify_org_issuer_cert(&tampered, test_now()).unwrap_err().contains("signature"));
+        assert!(verify_org_issuer_cert(&tampered, test_now())
+            .unwrap_err()
+            .contains("signature"));
         // The root cannot delegate to itself.
-        assert!(delegate_org_issuer(&root, "acme", &root.public_key_b64u(), "", "", None, test_now()).is_err());
+        assert!(delegate_org_issuer(
+            &root,
+            "acme",
+            &root.public_key_b64u(),
+            "",
+            "",
+            None,
+            test_now()
+        )
+        .is_err());
 
         // Issuer-signed document verifies via the chain and materializes
         // with the issuer recorded.
@@ -2239,16 +2349,27 @@ mod tests {
         verify_org_grant(&doc, test_now()).unwrap();
         let outcome =
             materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now()).unwrap();
-        assert_eq!(outcome.grant.issued_via.as_deref(), Some(issuer.public_key_b64u().as_str()));
+        assert_eq!(
+            outcome.grant.issued_via.as_deref(),
+            Some(issuer.public_key_b64u().as_str())
+        );
         // A stranger key with the same cert is refused (sig mismatch).
         let stranger = org_identity();
         let mut forged = doc.clone();
         forged.sig = stranger.sign_b64u(&org_grant_signing_payload(&forged));
-        assert!(verify_org_grant(&forged, test_now()).unwrap_err().contains("signature"));
+        assert!(verify_org_grant(&forged, test_now())
+            .unwrap_err()
+            .contains("signature"));
 
         // Peer-scoped issuers cannot sign human documents.
         let peer_scoped = delegate_org_issuer(
-            &root, "acme", &issuer.public_key_b64u(), "peer signer", "peer:session-reader", None, test_now(),
+            &root,
+            "acme",
+            &issuer.public_key_b64u(),
+            "peer signer",
+            "peer:session-reader",
+            None,
+            test_now(),
         )
         .unwrap();
         let mut wrong_kind = doc.clone();
@@ -2272,8 +2393,8 @@ mod tests {
         .unwrap();
         let applied = apply_orl(&mut state, dir.path(), &orl, test_now()).unwrap();
         assert_eq!(applied.revoked_grants, 1);
-        let err = materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now())
-            .unwrap_err();
+        let err =
+            materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now()).unwrap_err();
         assert!(err.to_string().contains("issuer key"), "{err}");
         let err = renew_org_grant(&root, &orl, &doc, test_now() + 1000).unwrap_err();
         assert!(err.contains("issuer key"), "{err}");
@@ -2287,7 +2408,15 @@ mod tests {
     fn issuer_role_scope_caps_materialization() {
         let root = org_identity();
         let mut state = LocalIamState::default();
-        trust_org(&mut state, "acme", &root.public_key_b64u(), None, None, test_now()).unwrap();
+        trust_org(
+            &mut state,
+            "acme",
+            &root.public_key_b64u(),
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
 
         let issuer_dir = tempfile::tempdir().unwrap();
         let issuer = DaemonIdentity::load_or_create(issuer_dir.path().join("issuer.pk8")).unwrap();
@@ -2341,8 +2470,8 @@ mod tests {
         )
         .unwrap();
         verify_org_grant(&above, test_now()).unwrap();
-        let err = materialize_org_grant(&mut state, &above, &["*".to_string()], test_now())
-            .unwrap_err();
+        let err =
+            materialize_org_grant(&mut state, &above, &["*".to_string()], test_now()).unwrap_err();
         assert!(
             err.to_string().contains("exceeds the issuer's scope"),
             "{err}"
@@ -2361,8 +2490,8 @@ mod tests {
         let mut ghost = within.clone();
         ghost.chain = vec![ghost_cert];
         ghost.sig = issuer.sign_b64u(&org_grant_signing_payload(&ghost));
-        let err = materialize_org_grant(&mut state, &ghost, &["*".to_string()], test_now())
-            .unwrap_err();
+        let err =
+            materialize_org_grant(&mut state, &ghost, &["*".to_string()], test_now()).unwrap_err();
         assert!(err.to_string().contains("failing closed"), "{err}");
     }
 
@@ -2373,7 +2502,15 @@ mod tests {
 
         let (dir, root) = org_identity_with_dir();
         let mut state = LocalIamState::default();
-        trust_org(&mut state, "acme", &root.public_key_b64u(), None, None, test_now()).unwrap();
+        trust_org(
+            &mut state,
+            "acme",
+            &root.public_key_b64u(),
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
 
         // An approved org-materialized peer identity that the list revokes.
         let record = crate::peer::access_policy::PeerIdentityRecord {
@@ -2394,14 +2531,25 @@ mod tests {
         };
         crate::peer::access_policy::write_identity_record(dir.path(), &record).unwrap();
 
-        let orl = orl_revoke(&root, dir.path(), "acme", &["g-1".to_string()], &[], &[], test_now())
-            .unwrap();
+        let orl = orl_revoke(
+            &root,
+            dir.path(),
+            "acme",
+            &["g-1".to_string()],
+            &[],
+            &[],
+            test_now(),
+        )
+        .unwrap();
 
         // Make the identity record unwritable (the file, not the directory —
         // truncating an existing file never consults directory permissions):
         // the apply must fail loudly and must NOT advance the org's
         // revocation sequence, so a later re-apply still performs the sweep.
-        let record_path = dir.path().join("peer-access-identities").join("aabbccdd.json");
+        let record_path = dir
+            .path()
+            .join("peer-access-identities")
+            .join("aabbccdd.json");
         let writable = std::fs::metadata(&record_path).unwrap().permissions();
         let mut readonly = writable.clone();
         readonly.set_mode(0o444);
@@ -2421,21 +2569,35 @@ mod tests {
     fn revoking_org_trust_revokes_its_materialized_grants() {
         let identity = org_identity();
         let mut state = LocalIamState::default();
-        trust_org(&mut state, "acme", &identity.public_key_b64u(), None, None, test_now()).unwrap();
+        trust_org(
+            &mut state,
+            "acme",
+            &identity.public_key_b64u(),
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
         let doc = issue(&identity, &state, "role:observer");
         materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now()).unwrap();
         assert!(
             crate::access::iam::principal_for_client_key(&state, "member-key", "test").is_some()
         );
 
-        let revoked = revoke_org(&mut state, tempfile::tempdir().unwrap().path(), "acme", test_now()).unwrap();
+        let revoked = revoke_org(
+            &mut state,
+            tempfile::tempdir().unwrap().path(),
+            "acme",
+            test_now(),
+        )
+        .unwrap();
         assert_eq!(revoked, 1);
         assert!(
             crate::access::iam::principal_for_client_key(&state, "member-key", "test").is_none()
         );
         // And new presentations are refused.
-        let err = materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now())
-            .unwrap_err();
+        let err =
+            materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now()).unwrap_err();
         assert!(err.to_string().contains("does not trust org acme"));
     }
 }

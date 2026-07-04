@@ -273,6 +273,72 @@ impl Conversation {
         count
     }
 
+    /// Repair tool-call/result pairing across the WHOLE history after a
+    /// mid-conversation mutation (`drop_turns` / `summarize_turns`). Two
+    /// corruption shapes, both rejected by provider APIs:
+    /// - an assistant tool call whose result was dropped — a synthetic
+    ///   result is inserted where that call's batch closes, so pairing
+    ///   and adjacency survive;
+    /// - a tool result whose assistant call was dropped — the orphan is
+    ///   removed.
+    /// `resolve_dangling_tool_calls` only patches the trailing batch (the
+    /// interrupt case); mutation can strand pairs anywhere in history.
+    pub fn repair_tool_call_pairing(&mut self) -> usize {
+        let mut repaired = 0;
+        let old = std::mem::take(&mut self.messages);
+        let mut out: Vec<Message> = Vec::with_capacity(old.len());
+        // Unanswered (id, name) pairs from the most recent assistant
+        // tool-call batch; any non-tool message closes the batch.
+        let mut open: Vec<(String, String)> = Vec::new();
+        let synthetic = |call_id: &str, name: &str| Message {
+            role: "tool".to_string(),
+            content: "[dropped] The result of this tool call was removed by context management."
+                .to_string(),
+            tool_call_id: Some(call_id.to_string()),
+            tool_name: Some(name.to_string()),
+            ..Default::default()
+        };
+        for msg in old {
+            if msg.role == "tool" {
+                let id = msg.tool_call_id.as_deref().unwrap_or("");
+                if let Some(pos) = open.iter().position(|(open_id, _)| open_id == id) {
+                    open.remove(pos);
+                    out.push(msg);
+                } else {
+                    // Orphaned (or duplicate) result — no open call owns it.
+                    repaired += 1;
+                }
+                continue;
+            }
+            for (id, name) in open.drain(..) {
+                out.push(synthetic(&id, &name));
+                repaired += 1;
+            }
+            if msg.role == "assistant" {
+                if let Some(ref calls) = msg.tool_calls {
+                    open = calls
+                        .iter()
+                        .map(|tc| {
+                            let key = if tc.call_id.is_empty() {
+                                &tc.id
+                            } else {
+                                &tc.call_id
+                            };
+                            (key.clone(), tc.name.clone())
+                        })
+                        .collect();
+                }
+            }
+            out.push(msg);
+        }
+        for (id, name) in open.drain(..) {
+            out.push(synthetic(&id, &name));
+            repaired += 1;
+        }
+        self.messages = out;
+        repaired
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
@@ -503,6 +569,9 @@ impl Conversation {
         for &i in to_remove.iter().rev() {
             self.messages.remove(i);
         }
+        // Dropping arbitrary messages can split a tool-call/result pair;
+        // repair before the next provider call rejects the history.
+        self.repair_tool_call_pairing();
     }
 
     pub fn summarize_turns(&mut self, indices: &[usize], summary: &str) {
@@ -551,6 +620,10 @@ impl Conversation {
                 ..Default::default()
             },
         );
+        // Same repair as drop_turns: the replaced range can have split a
+        // tool-call/result pair (and the summary message itself closes
+        // any batch it landed inside).
+        self.repair_tool_call_pairing();
     }
 
     /// Save conversation messages to a JSONL file (one JSON object per line).
@@ -1411,6 +1484,131 @@ mod tests {
         });
         // 50% is below 0.60 threshold
         assert!(!conv.auto_compact_at(0.60));
+    }
+
+    fn tool_call_ref(call_id: &str, name: &str) -> ToolCallRef {
+        ToolCallRef {
+            id: format!("fc_{call_id}"),
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+        }
+    }
+
+    /// Build: sys, user, assistant(+call_1), tool(call_1), assistant,
+    /// user, assistant(+call_2), tool(call_2), user, assistant.
+    /// A mid-history tool turn (indices 2-3) plus a later one (6-7),
+    /// with a protected tail.
+    fn conversation_with_two_tool_turns() -> Conversation {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_user("first task".to_string());
+        conv.add_assistant_tool_calls(
+            "running one".to_string(),
+            vec![tool_call_ref("call_1", "exec_command")],
+            None,
+        );
+        conv.add_tool_result("call_1", "exec_command", "output one");
+        conv.add_assistant("done one".to_string());
+        conv.add_user("second task".to_string());
+        conv.add_assistant_tool_calls(
+            "running two".to_string(),
+            vec![tool_call_ref("call_2", "write_file")],
+            None,
+        );
+        conv.add_tool_result("call_2", "write_file", "output two");
+        conv.add_user("wrap up".to_string());
+        conv.add_assistant("all done".to_string());
+        conv
+    }
+
+    #[test]
+    fn drop_turns_repairs_mid_history_dangling_tool_call() {
+        let mut conv = conversation_with_two_tool_turns();
+        // Drop only the mid-history tool RESULT (index 3): its assistant
+        // call at index 2 would dangle and the provider would reject the
+        // history.
+        conv.drop_turns(&[3]);
+
+        // A synthetic result now answers call_1, adjacent to its batch.
+        let messages = conv.messages();
+        let call_pos = messages
+            .iter()
+            .position(|m| {
+                m.tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|tc| tc.call_id == "call_1"))
+            })
+            .expect("assistant call kept");
+        let next = &messages[call_pos + 1];
+        assert_eq!(next.role, "tool");
+        assert_eq!(next.tool_call_id.as_deref(), Some("call_1"));
+        assert!(next.content.contains("[dropped]"), "{}", next.content);
+        // The untouched later pair survives verbatim.
+        assert!(messages
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("call_2") && m.content == "output two"));
+    }
+
+    #[test]
+    fn drop_turns_removes_orphaned_tool_results() {
+        let mut conv = conversation_with_two_tool_turns();
+        // Drop the mid-history ASSISTANT carrying call_1 (index 2): its
+        // tool result at index 3 becomes an orphan no provider accepts.
+        conv.drop_turns(&[2]);
+
+        let messages = conv.messages();
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_1")),
+            "orphaned result must be removed"
+        );
+        // Every remaining tool result still has its call.
+        for msg in messages.iter().filter(|m| m.role == "tool") {
+            let id = msg.tool_call_id.as_deref().unwrap();
+            assert!(messages.iter().any(|m| {
+                m.tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|tc| tc.call_id == id))
+            }));
+        }
+    }
+
+    #[test]
+    fn summarize_turns_repairs_split_tool_pairs() {
+        let mut conv = conversation_with_two_tool_turns();
+        // Summarize a range that keeps the assistant call (index 2) but
+        // swallows its result (indices 3-5).
+        conv.summarize_turns(&[3, 4, 5], "earlier work summarized");
+
+        let messages = conv.messages();
+        let call_pos = messages
+            .iter()
+            .position(|m| {
+                m.tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|tc| tc.call_id == "call_1"))
+            })
+            .expect("assistant call kept");
+        let next = &messages[call_pos + 1];
+        assert_eq!(next.role, "tool");
+        assert_eq!(next.tool_call_id.as_deref(), Some("call_1"));
+        assert!(next.content.contains("[dropped]"));
+        assert!(messages
+            .iter()
+            .any(|m| m.content.contains("[Context Summary] earlier work summarized")));
+    }
+
+    #[test]
+    fn repair_tool_call_pairing_noop_on_clean_history() {
+        let mut conv = conversation_with_two_tool_turns();
+        let before = conv.messages().to_vec();
+        assert_eq!(conv.repair_tool_call_pairing(), 0);
+        assert_eq!(conv.messages().len(), before.len());
+        for (a, b) in conv.messages().iter().zip(before.iter()) {
+            assert_eq!(a.role, b.role);
+            assert_eq!(a.content, b.content);
+        }
     }
 
     #[test]

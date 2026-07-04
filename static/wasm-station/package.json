@@ -2,6 +2,7 @@
   "name": "station-web",
   "type": "module",
   "version": "0.1.0",
+  "license": "MIT",
   "files": [
     "station_web_bg.wasm",
     "station_web.js",

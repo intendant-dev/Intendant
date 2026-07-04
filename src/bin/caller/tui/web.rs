@@ -213,6 +213,7 @@ fn encode_term(data: &[u8]) -> String {
 pub struct WebTui {
     connections: HashMap<String, WebConnection>,
     /// Broadcast channel for non-term events (OutboundEvents).
+    #[allow(dead_code)]
     broadcast_tx: broadcast::Sender<String>,
 }
 
@@ -229,6 +230,7 @@ impl WebTui {
         })
     }
 
+    #[allow(dead_code)]
     fn broadcast_term(tx: &broadcast::Sender<String>, data: &[u8]) {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(data);

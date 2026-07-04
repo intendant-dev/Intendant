@@ -611,6 +611,8 @@ body.access-page #tab-access {
 .settings-pane-body {
   padding: 20px;
   max-width: 760px;
+  width: 100%;
+  margin: 0 auto;
   overflow-y: auto;
   flex: 1;
 }
@@ -625,6 +627,8 @@ body.access-page #tab-access {
 .access-pane-body {
   padding: 18px 20px;
   max-width: 1120px;
+  width: 100%;
+  margin: 0 auto;
   overflow-y: auto;
   flex: 1;
 }
@@ -1656,6 +1660,25 @@ body.access-page #tab-access {
 .vault-entry-row .lbl { color: var(--text); font-weight: 500; }
 .vault-entry-row .secret { font-family: var(--mono, monospace); font-size: 11px; color: var(--subtext0); overflow-wrap: anywhere; }
 .vault-entry-row .vault-entry-actions { margin-left: auto; display: flex; gap: 6px; }
+.custody-trail { display: flex; flex-direction: column; }
+.custody-row {
+  display: flex; align-items: baseline; gap: 8px; padding: 5px 2px;
+  border-bottom: 1px solid var(--surface0); font-size: 11.5px; min-width: 0; flex-wrap: wrap;
+}
+.custody-row:last-child { border-bottom: none; }
+.custody-ts { color: var(--overlay1); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.custody-chip {
+  flex: 0 0 auto; padding: 1px 8px; border-radius: 999px;
+  font-size: 10px; font-weight: 700; letter-spacing: .04em;
+  background: var(--surface0); color: var(--subtext1);
+}
+.custody-chip.grant { background: rgba(166, 227, 161, 0.14); color: var(--green); }
+.custody-chip.revoke { background: rgba(249, 226, 175, 0.14); color: var(--yellow); }
+.custody-chip.expire { background: rgba(108, 112, 134, 0.22); color: var(--overlay1); }
+.custody-chip.egress { background: rgba(137, 180, 250, 0.14); color: var(--blue); }
+.custody-chip.reset { background: rgba(243, 139, 168, 0.12); color: var(--red); }
+.custody-main { color: var(--text); flex: 0 1 auto; min-width: 0; }
+.custody-meta { color: var(--subtext0); flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere; }
 .vault-form-grid { display: grid; grid-template-columns: minmax(110px, 160px) 1fr; gap: 8px; align-items: center; }
 .vault-form-grid label { font-size: 11px; color: var(--subtext1); }
 .vault-form-grid input, .vault-form-grid select, .vault-phrase-input {
@@ -1902,7 +1925,9 @@ body.access-page #tab-access {
 }
 .files-pane {
   padding: 20px;
-  max-width: 820px;
+  max-width: 860px;
+  width: 100%;
+  margin: 0 auto;
   overflow-y: auto;
   flex: 1;
 }
@@ -2013,6 +2038,510 @@ body.access-page #tab-access {
 .target-chip.off {
   opacity: 0.72;
 }
+/* ── Files tab: editor ──
+   Full-bleed workbench under the Files subtabs. --files-accent is the
+   machine tint: blue when editing this daemon, mauve on a peer — the
+   active editor tab, tree selection, and statusbar host chip all answer
+   "whose disk is this?" without reading a label. */
+#tab-files {
+  --files-accent: var(--blue);
+}
+.files-ide-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+  flex-shrink: 0;
+  min-height: 44px;
+}
+.files-ide-toolbar label {
+  color: var(--subtext0);
+  font-size: 12px;
+  font-weight: 600;
+}
+.files-ide-toolbar select {
+  min-height: 30px;
+  max-width: 220px;
+  padding: 5px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+}
+.files-ide-toolbar select:focus {
+  outline: none;
+  border-color: var(--files-accent);
+}
+.files-ide-toolbar-spacer {
+  flex: 1;
+}
+/* The target summary rides along in the toolbar as one quiet line: dot,
+   name, route kind. Its full presentation (detail line, capability chips)
+   belongs to pages with room for it. Scoped through the toolbar because
+   renderDashboardTargetSummary rewrites the element's own class list. */
+.files-ide-toolbar .target-summary {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 46%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  overflow: hidden;
+}
+.files-ide-toolbar .target-summary .target-summary-detail,
+.files-ide-toolbar .target-summary .target-summary-chips {
+  display: none;
+}
+.files-ide-toolbar .target-summary .target-summary-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.files-ide-toolbar .target-summary .target-summary-name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.files-ide-toolbar .target-summary .target-summary-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.files-ide-body {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+  gap: 0;
+  flex: 1;
+  min-height: 0;
+  background: var(--base);
+}
+.files-ide-tree-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--crust);
+  border-right: 1px solid var(--surface0);
+}
+.files-ide-tree-toolbar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: 4px;
+  padding: 6px;
+  border-bottom: 1px solid var(--surface0);
+}
+.files-ide-tree-toolbar input {
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+}
+.files-ide-tree-toolbar input:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.files-ide-tree-toolbar .ui-btn {
+  padding: 4px 8px;
+  font-size: 11px;
+}
+.files-ide-tree-toolbar .ui-btn[aria-pressed="true"] {
+  border-color: var(--blue);
+  color: var(--blue);
+}
+.files-ide-tree {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 0;
+}
+.files-ide-tree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 3px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.files-ide-tree-row {
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+.files-ide-tree-row:hover {
+  background: rgba(49, 50, 68, 0.5);
+}
+.files-ide-tree-row:focus-visible {
+  outline: 2px solid var(--files-accent);
+  outline-offset: -2px;
+}
+.files-ide-tree-row.active {
+  background: rgba(49, 50, 68, 0.65);
+  box-shadow: inset 2px 0 0 var(--files-accent);
+  color: var(--text);
+}
+.files-ide-tree-row.hidden-entry {
+  color: var(--overlay1);
+}
+.files-ide-tree-row .files-ide-tree-caret {
+  width: 12px;
+  flex: none;
+  color: var(--overlay1);
+  font-size: 10px;
+}
+.files-ide-tree-row .files-ide-tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.files-ide-tree-row.dir .files-ide-tree-name {
+  color: var(--lavender);
+}
+.files-ide-tree-row.hidden-entry .files-ide-tree-name {
+  color: var(--overlay1);
+}
+.files-ide-tree-notice {
+  padding: 3px 8px 3px 26px;
+  color: var(--overlay1);
+  font-size: 11px;
+}
+.files-ide-create-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+}
+.files-ide-create-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  border: 1px solid var(--files-accent);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+}
+.files-ide-create-row input:focus {
+  outline: none;
+}
+.files-ide-editor-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.files-ide-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  padding: 0 6px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+  min-height: 34px;
+  flex-shrink: 0;
+}
+.files-ide-tabs:empty {
+  display: none;
+}
+.files-ide-tab {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 220px;
+  padding: 0 8px 0 12px;
+  border: 0;
+  background: transparent;
+  box-shadow: inset 0 -2px 0 transparent;
+  color: var(--overlay1);
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.12s ease, box-shadow 0.12s ease;
+}
+.files-ide-tab:hover {
+  color: var(--subtext1);
+}
+.files-ide-tab:focus-visible {
+  outline: 2px solid var(--files-accent);
+  outline-offset: -2px;
+}
+.files-ide-tab.active {
+  color: var(--text);
+  box-shadow: inset 0 -2px 0 var(--files-accent);
+}
+.files-ide-tab .files-ide-tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.files-ide-tab .files-ide-tab-dirty {
+  color: var(--peach);
+  font-size: 14px;
+  line-height: 1;
+  display: none;
+}
+.files-ide-tab.dirty .files-ide-tab-dirty {
+  display: inline;
+}
+/* The close control stays out of the way until the tab is under the
+   pointer (or active); a dirty tab shows its dot in that same slot. */
+.files-ide-tab .files-ide-tab-close {
+  border: 0;
+  background: transparent;
+  color: var(--overlay1);
+  font-size: 13px;
+  line-height: 1;
+  padding: 1px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.files-ide-tab:hover .files-ide-tab-close,
+.files-ide-tab.active .files-ide-tab-close,
+.files-ide-tab .files-ide-tab-close:focus-visible {
+  opacity: 1;
+}
+.files-ide-tab.dirty:hover .files-ide-tab-dirty {
+  display: none;
+}
+.files-ide-tab .files-ide-tab-close:hover {
+  background: var(--surface1);
+  color: var(--text);
+}
+.files-ide-tab .files-ide-tab-close.confirm-discard {
+  color: var(--red);
+  font-size: 10px;
+  font-weight: 700;
+  opacity: 1;
+}
+.files-ide-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 10px 6px 12px;
+  border-bottom: 1px solid var(--surface0);
+  box-shadow: inset 3px 0 0 var(--yellow);
+  background: rgba(249, 226, 175, 0.07);
+  color: var(--yellow);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.files-ide-banner.error {
+  box-shadow: inset 3px 0 0 var(--red);
+  background: rgba(243, 139, 168, 0.07);
+  color: var(--red);
+}
+.files-ide-banner .ui-btn {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+.files-ide-banner.hidden {
+  display: none;
+}
+.files-ide-editor-host {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.files-ide-editor-host .CodeMirror {
+  position: absolute;
+  inset: 0;
+  height: 100%;
+  background: var(--base);
+  color: var(--text);
+  font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code', Menlo, Monaco, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.files-ide-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  text-align: center;
+  padding: 20px;
+}
+.files-ide-empty .ui-empty-title {
+  color: var(--subtext0);
+  font-size: 13px;
+  font-weight: 600;
+}
+.files-ide-empty .ui-empty-sub {
+  color: var(--overlay1);
+  font-size: 12px;
+  max-width: 420px;
+}
+.files-ide-statusbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  /* Right padding keeps Save clear of the app's floating mic/screenshot
+     controls, which overlay the bottom-right corner of every pane. */
+  padding: 5px 96px 5px 10px;
+  border-top: 1px solid var(--surface0);
+  background: var(--crust);
+  font-size: 11.5px;
+  color: var(--subtext0);
+  min-height: 36px;
+  flex-shrink: 0;
+}
+.files-ide-status-host {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border: 1px solid var(--surface0);
+  border-radius: 999px;
+  background: var(--mantle);
+  color: var(--subtext1);
+  max-width: 190px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
+}
+.files-ide-status-host.visible {
+  display: inline-flex;
+}
+.files-ide-host-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--files-accent);
+  flex-shrink: 0;
+}
+.files-ide-status-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex-shrink: 3;
+}
+.files-ide-status-meta {
+  color: var(--overlay1);
+  white-space: nowrap;
+}
+.files-ide-statusbar-spacer {
+  flex: 1;
+}
+.files-ide-save-status {
+  color: var(--overlay1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex-shrink: 2;
+  max-width: 42%;
+}
+.files-ide-save-status.error {
+  color: var(--red);
+}
+.files-ide-save-status.ok {
+  color: var(--green);
+}
+@media (max-width: 900px) {
+  .files-ide-toolbar {
+    flex-wrap: wrap;
+    min-height: 0;
+  }
+  .files-ide-target-summary {
+    order: 5;
+    flex-basis: 100%;
+    max-width: 100%;
+  }
+  .files-ide-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(140px, 220px) minmax(0, 1fr);
+  }
+  .files-ide-tree-pane {
+    border-right: 0;
+    border-bottom: 1px solid var(--surface0);
+  }
+}
+
+/* CodeMirror theme: Catppuccin Mocha via the dashboard palette. */
+.cm-s-intendant.CodeMirror {
+  background: var(--base);
+  color: var(--text);
+}
+.cm-s-intendant .CodeMirror-gutters {
+  background: var(--mantle);
+  color: var(--overlay0);
+  border-right: 1px solid var(--surface0);
+}
+.cm-s-intendant .CodeMirror-linenumber {
+  color: var(--overlay0);
+}
+.cm-s-intendant .CodeMirror-cursor {
+  border-left: 2px solid var(--text);
+}
+.cm-s-intendant .CodeMirror-selected {
+  background: var(--surface1);
+}
+.cm-s-intendant.CodeMirror-focused .CodeMirror-selected {
+  background: var(--surface1);
+}
+.cm-s-intendant .CodeMirror-activeline-background {
+  background: rgba(49, 50, 68, 0.45);
+}
+.cm-s-intendant .CodeMirror-matchingbracket {
+  color: var(--teal) !important;
+  border-bottom: 1px solid var(--teal);
+  background: transparent;
+}
+.cm-s-intendant .CodeMirror-nonmatchingbracket {
+  color: var(--red) !important;
+}
+.cm-s-intendant .cm-keyword { color: var(--mauve); }
+.cm-s-intendant .cm-atom { color: var(--teal); }
+.cm-s-intendant .cm-number { color: var(--peach); }
+.cm-s-intendant .cm-def { color: var(--blue); }
+.cm-s-intendant .cm-variable { color: var(--text); }
+.cm-s-intendant .cm-variable-2 { color: var(--lavender); }
+.cm-s-intendant .cm-variable-3, .cm-s-intendant .cm-type { color: var(--yellow); }
+.cm-s-intendant .cm-property { color: var(--sapphire); }
+.cm-s-intendant .cm-operator { color: var(--sapphire); }
+.cm-s-intendant .cm-comment { color: var(--overlay0); font-style: italic; }
+.cm-s-intendant .cm-string { color: var(--green); }
+.cm-s-intendant .cm-string-2 { color: var(--teal); }
+.cm-s-intendant .cm-meta { color: var(--sapphire); }
+.cm-s-intendant .cm-qualifier { color: var(--yellow); }
+.cm-s-intendant .cm-builtin { color: var(--blue); }
+.cm-s-intendant .cm-bracket { color: var(--subtext1); }
+.cm-s-intendant .cm-tag { color: var(--red); }
+.cm-s-intendant .cm-attribute { color: var(--yellow); }
+.cm-s-intendant .cm-header { color: var(--blue); font-weight: 600; }
+.cm-s-intendant .cm-quote { color: var(--green); }
+.cm-s-intendant .cm-hr { color: var(--overlay1); }
+.cm-s-intendant .cm-link { color: var(--sapphire); text-decoration: underline; }
+.cm-s-intendant .cm-error { color: var(--red); }
+.cm-s-intendant .cm-negative { color: var(--red); }
+.cm-s-intendant .cm-positive { color: var(--green); }
+
 .files-download-host-row {
   display: grid;
   grid-template-columns: auto minmax(0, 260px);
@@ -2193,6 +2722,8 @@ body.access-page #tab-access {
 .debug-pane {
   padding: 20px;
   max-width: 820px;
+  width: 100%;
+  margin: 0 auto;
   overflow-y: auto;
   flex: 1;
 }
@@ -12222,6 +12753,20 @@ body.display-fullscreen-open {
                           <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
                         </div>
                       </div>
+                      <label class="sessions-new-session-field" for="new-session-claude-model">
+                        Claude model
+                        <input id="new-session-claude-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. haiku (empty = global setting)" disabled>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-claude-permission-mode">
+                        Permissions
+                        <select id="new-session-claude-permission-mode" disabled>
+                          <option value="">Global setting</option>
+                          <option value="default">default</option>
+                          <option value="acceptEdits">acceptEdits</option>
+                          <option value="plan">plan</option>
+                          <option value="bypassPermissions">bypassPermissions</option>
+                        </select>
+                      </label>
                       <label class="sessions-new-session-field" for="new-session-codex-sandbox">
                         Sandbox
                         <select id="new-session-codex-sandbox" disabled>
@@ -12279,6 +12824,55 @@ body.display-fullscreen-open {
 
     <!-- Files Tab -->
     <div id="tab-files" class="tab-pane">
+      <div class="subtabs">
+        <button class="subtab-btn active" data-files-tab="editor">Editor</button>
+        <button class="subtab-btn" data-files-tab="transfers">Transfers</button>
+      </div>
+      <div class="subtab-panes">
+        <div class="subtab-pane active" id="files-pane-editor" aria-label="File editor">
+          <div class="files-ide-toolbar">
+            <label for="files-ide-host">Target</label>
+            <select id="files-ide-host" onchange="onFilesIdeHostChanged()">
+              <option value="">This daemon</option>
+            </select>
+            <div id="files-ide-target-summary" class="target-summary" aria-live="polite"></div>
+            <span class="files-ide-toolbar-spacer"></span>
+            <button id="files-ide-new-file-btn" class="ui-btn" type="button" onclick="filesIdeBeginCreate('file')">New file</button>
+            <button id="files-ide-new-folder-btn" class="ui-btn" type="button" onclick="filesIdeBeginCreate('folder')">New folder</button>
+          </div>
+          <div class="files-ide-body">
+            <div class="files-ide-tree-pane">
+              <div class="files-ide-tree-toolbar">
+                <button id="files-ide-up-btn" class="ui-btn" type="button" title="Parent directory" onclick="filesIdeTreeUp()">&#8593;</button>
+                <input id="files-ide-root" type="text" autocomplete="off" spellcheck="false" placeholder="/folder or ~/folder"
+                       onkeydown="if (event.key === 'Enter') filesIdeSetRoot(this.value)">
+                <button id="files-ide-hidden-btn" class="ui-btn" type="button" title="Show hidden files" aria-pressed="false" onclick="filesIdeToggleHidden()">.h</button>
+                <button id="files-ide-tree-refresh-btn" class="ui-btn" type="button" title="Refresh" onclick="filesIdeRefreshTree()">&#10227;</button>
+              </div>
+              <div id="files-ide-tree" class="files-ide-tree" role="tree" aria-label="File browser"></div>
+              <div id="files-ide-tree-status" class="files-download-status" aria-live="polite"></div>
+            </div>
+            <div class="files-ide-editor-pane">
+              <div id="files-ide-tabs" class="files-ide-tabs" role="tablist"></div>
+              <div id="files-ide-banner" class="files-ide-banner hidden" aria-live="polite"></div>
+              <div id="files-ide-editor-host" class="files-ide-editor-host">
+                <div id="files-ide-empty" class="files-ide-empty">
+                  <div class="ui-empty-title">No file open</div>
+                  <div class="ui-empty-sub">Choose a file from the browser on the left, or create one with New file. Every write is checked against this target's filesystem grants.</div>
+                </div>
+              </div>
+              <div class="files-ide-statusbar">
+                <span id="files-ide-status-host" class="files-ide-status-host"><span class="files-ide-host-dot"></span><span id="files-ide-status-host-label"></span></span>
+                <span id="files-ide-status-path" class="files-ide-status-path" title=""></span>
+                <span id="files-ide-status-meta" class="files-ide-status-meta"></span>
+                <span class="files-ide-statusbar-spacer"></span>
+                <span id="files-ide-save-status" class="files-ide-save-status" aria-live="polite"></span>
+                <button id="files-ide-save-btn" class="ui-btn primary" type="button" onclick="filesIdeSaveActive()" disabled>Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="subtab-pane" id="files-pane-transfers">
       <div class="files-pane">
         <section class="files-tool ui-card" aria-labelledby="files-download-heading">
           <div class="ui-section-head">
@@ -12336,6 +12930,8 @@ body.display-fullscreen-open {
           <div id="files-upload-status" class="files-download-status" aria-live="polite"></div>
           <div id="files-staged-list" class="files-staged-list"></div>
         </section>
+      </div>
+        </div>
       </div>
     </div>
 
@@ -12640,6 +13236,12 @@ body.display-fullscreen-open {
               <div class="acc-section-sub">Provider credentials, end-to-end encrypted under your passkeys and a recovery phrase. The hosted store holds only ciphertext; daemons only ever borrow time-boxed leases.</div>
             </div>
             <div id="access-vault-section"></div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">Custody trail</div>
+              <div class="acc-section-sub">Every lease grant, expiry, revocation, and browser-relay change this daemon has seen — who, what, and when. Recorded by the daemon itself, kept on its disk, never sent anywhere.</div>
+            </div>
+            <div id="access-custody-section"></div>
 
             <div class="acc-section-head">
               <div class="acc-section-title">Roles &amp; permissions</div>
@@ -13562,6 +14164,48 @@ function updateLogEmptyState() {
    lease state refreshes, so it clears the moment fuel lands. */
 const LOG_EMPTY_DEFAULT_TITLE = 'No activity yet';
 const LOG_EMPTY_DEFAULT_HINT = 'Send a task below to start the agent, or pick a session from Sessions.';
+
+/* External-agent availability (Codex / Claude Code): which backends this
+   daemon can actually spawn. External agents run on their own accounts,
+   so the fueling nudge must not read as "nothing works" while one is
+   present — and the new-session picker greys out backends whose CLI is
+   missing so a doomed spawn is visible before Start. */
+let externalAgentAvailability = null; // null = not yet known
+let externalAgentAvailabilityFetch = null;
+function refreshExternalAgentAvailability() {
+  if (!externalAgentAvailabilityFetch) {
+    externalAgentAvailabilityFetch = fetchExternalAgentAvailability()
+      .then(body => {
+        if (Array.isArray(body?.external_agents)) {
+          externalAgentAvailability = body.external_agents;
+          applyExternalAgentAvailabilityToNewSessionPicker();
+        }
+        return externalAgentAvailability;
+      })
+      .catch(() => null)
+      .finally(() => { externalAgentAvailabilityFetch = null; });
+  }
+  return externalAgentAvailabilityFetch;
+}
+function installedExternalAgents() {
+  return Array.isArray(externalAgentAvailability)
+    ? externalAgentAvailability.filter(agent => agent && agent.installed)
+    : [];
+}
+function applyExternalAgentAvailabilityToNewSessionPicker() {
+  const select = document.getElementById('new-session-agent');
+  if (!select || !Array.isArray(externalAgentAvailability)) return;
+  for (const agent of externalAgentAvailability) {
+    const option = select.querySelector(`option[value="${agent.id}"]`);
+    if (!option) continue;
+    const missing = agent.installed === false;
+    option.disabled = missing;
+    option.title = missing
+      ? `${agent.command || agent.id} was not found on the daemon host`
+      : '';
+  }
+}
+
 let unfueledCheckInFlight = false;
 async function refreshUnfueledEmptyState() {
   if (unfueledCheckInFlight) return true;
@@ -13578,12 +14222,15 @@ async function refreshUnfueledEmptyState() {
     // which the default hosted (operator) binding does not hold.
     const statusFueled = dashboardControlTransport?.lastStatus?.fueled;
     if (typeof statusFueled === 'boolean') {
+      if (!statusFueled) await refreshExternalAgentAvailability();
       applyUnfueledEmptyState(!statusFueled);
       return true;
     }
     const keys = await fetchApiKeyStatus();
     if (!keys || typeof keys !== 'object') return false;
-    applyUnfueledEmptyState(!(keys.openai || keys.anthropic || keys.gemini));
+    const unfueled = !(keys.openai || keys.anthropic || keys.gemini);
+    if (unfueled) await refreshExternalAgentAvailability();
+    applyUnfueledEmptyState(unfueled);
     return true;
   } catch {
     // Unknown (transport not up yet, or a daemon predating the flag):
@@ -13599,20 +14246,25 @@ function applyUnfueledEmptyState(unfueled) {
   const hint = empty?.querySelector('.ui-empty-hint');
   if (!empty || !title || !hint) return;
   const action = document.getElementById('log-empty-fuel');
+  const externalNote = document.getElementById('log-empty-external-agents');
   if (!unfueled) {
     if (empty.dataset.unfueled) {
       delete empty.dataset.unfueled;
       title.textContent = LOG_EMPTY_DEFAULT_TITLE;
       hint.textContent = LOG_EMPTY_DEFAULT_HINT;
       if (action) action.remove();
+      if (externalNote) externalNote.remove();
     }
     return;
   }
   empty.dataset.unfueled = 'true';
-  title.textContent = 'This daemon has no fuel yet';
+  // Scope the claim to the built-in agent: an unfueled daemon still runs
+  // external agents (their accounts), terminal, files, and display.
+  title.textContent = 'The built-in agent has no fuel yet';
   if (DASHBOARD_CONNECT_MODE) {
-    hint.textContent = 'It is claimed and connected, but holds no provider credential. '
-      + 'Grant a time-boxed lease from your vault and the agent can start working.';
+    hint.textContent = 'This daemon is claimed and connected, but holds no provider '
+      + 'credential for the built-in agent. Grant a time-boxed lease from your vault '
+      + 'and it can start working.';
     if (!document.getElementById('log-empty-fuel')) {
       const btn = document.createElement('button');
       btn.id = 'log-empty-fuel';
@@ -13622,10 +14274,33 @@ function applyUnfueledEmptyState(unfueled) {
       hint.insertAdjacentElement('afterend', btn);
     }
   } else {
-    hint.textContent = 'The daemon found no provider API key. Add ANTHROPIC_API_KEY, '
-      + 'OPENAI_API_KEY, or GEMINI_API_KEY to .env and restart — or claim it through a '
-      + 'rendezvous and grant a lease from your vault.';
+    hint.textContent = 'The daemon found no provider API key for the built-in agent. '
+      + 'Add ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY to .env and restart — '
+      + 'or claim it through a rendezvous and grant a lease from your vault.';
   }
+  applyUnfueledExternalAgentNote(empty);
+}
+
+/* The nudge's counterweight: name the external agents that still work.
+   Only rendered while the unfueled state is showing. */
+function applyUnfueledExternalAgentNote(empty) {
+  const installed = installedExternalAgents();
+  let note = document.getElementById('log-empty-external-agents');
+  if (!installed.length) {
+    if (note) note.remove();
+    return;
+  }
+  if (!note) {
+    note = document.createElement('div');
+    note.id = 'log-empty-external-agents';
+    note.className = 'ui-empty-hint';
+    empty.appendChild(note);
+  }
+  const names = installed.map(agent => agent.label || agent.id).join(' and ');
+  const plural = installed.length > 1;
+  note.textContent = `${names} ${plural ? 'are' : 'is'} installed and `
+    + `${plural ? 'run on their own accounts' : 'runs on its own account'}`
+    + ' — external-agent sessions work without fuel.';
 }
 // Probe once the transport can answer; in connect mode the data channel
 // (possibly via TURN) can take a while, so keep retrying for ~40s rather
@@ -15248,6 +15923,83 @@ async function vaultRefreshLeases({ force = false } = {}) {
   }
   renderAccessVaultSection();
   refreshUnfueledEmptyState().catch(() => {});
+  vaultRefreshCustody().catch(() => {});
+}
+
+/* Custody trail: the daemon's own record of lease/relay lifecycle events,
+   fetched over the same credentials.manage-gated channel as the leases. */
+const custodyTrailState = { events: [], supported: null, fetchedAt: 0 };
+
+async function vaultRefreshCustody({ force = false } = {}) {
+  if (!vaultLeaseTransportReady()) return;
+  if (!force && Date.now() - custodyTrailState.fetchedAt < 30_000) return;
+  custodyTrailState.fetchedAt = Date.now();
+  try {
+    const result = await vaultLeaseRpc('api_credential_custody_trail');
+    custodyTrailState.events = Array.isArray(result?.events) ? result.events : [];
+    custodyTrailState.supported = true;
+  } catch {
+    // Older daemon or a session without credentials.manage.
+    custodyTrailState.supported = false;
+  }
+  renderAccessCustodySection();
+}
+
+const CUSTODY_EVENT_VIEW = {
+  lease_granted: { chip: 'granted', cls: 'grant' },
+  lease_revoked: { chip: 'revoked', cls: 'revoke' },
+  lease_expired: { chip: 'expired', cls: 'expire' },
+  egress_registered: { chip: 'relay on', cls: 'egress' },
+  egress_unregistered: { chip: 'relay off', cls: 'egress' },
+  custody_reset: { chip: 'reset', cls: 'reset' },
+};
+
+function renderAccessCustodySection() {
+  const mount = document.getElementById('access-custody-section');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const note = text => {
+    const el = document.createElement('div');
+    el.className = 'vault-note';
+    el.textContent = text;
+    mount.appendChild(el);
+  };
+  if (custodyTrailState.supported === false) {
+    note('This session cannot read the custody trail — it needs credentials.manage, or the daemon predates it.');
+    return;
+  }
+  if (!custodyTrailState.events.length) {
+    note('No custody events yet — lease grants, expiries, revocations, and relay changes will appear here.');
+    return;
+  }
+  const list = document.createElement('div');
+  list.className = 'custody-trail';
+  const shown = custodyTrailState.events.slice(0, 50);
+  for (const event of shown) {
+    const row = document.createElement('div');
+    row.className = 'custody-row';
+    const ts = document.createElement('span');
+    ts.className = 'custody-ts';
+    ts.textContent = formatLogTimestampLabel(event.at_unix_ms);
+    const view = CUSTODY_EVENT_VIEW[event.event] || { chip: event.event, cls: '' };
+    const chip = document.createElement('span');
+    chip.className = 'custody-chip' + (view.cls ? ' ' + view.cls : '');
+    chip.textContent = view.chip;
+    const main = document.createElement('span');
+    main.className = 'custody-main';
+    main.textContent = [event.label, event.kind].filter(Boolean).join(' · ');
+    const meta = document.createElement('span');
+    meta.className = 'custody-meta';
+    meta.textContent = [event.actor ? `by ${event.actor}` : '', event.detail]
+      .filter(Boolean)
+      .join(' — ');
+    row.append(ts, chip, main, meta);
+    list.appendChild(row);
+  }
+  mount.appendChild(list);
+  if (custodyTrailState.events.length > shown.length) {
+    note(`…and ${custodyTrailState.events.length - shown.length} older events on the daemon.`);
+  }
 }
 
 async function vaultFuelEntry(entry) {
@@ -16159,6 +16911,11 @@ function renderAccessVaultSection() {
   // Background renders must not clobber a phrase or key mid-typing.
   if (mount.contains(document.activeElement) && document.activeElement.matches('input, textarea, select')) return;
 
+  // The custody trail lives directly under this section and shares its
+  // refresh cadence (30s freshness guard inside).
+  renderAccessCustodySection();
+  vaultRefreshCustody().catch(() => {});
+
   const card = document.createElement('div');
   card.className = 'vault-card';
 
@@ -16292,6 +17049,11 @@ window.intendantVault = {
     jobs: vaultEgressJobs.size,
   }),
   probeEgress: kind => vaultLeaseRpc('api_credential_egress_probe', { kind }),
+  custody: () => ({
+    supported: custodyTrailState.supported,
+    events: custodyTrailState.events.map(event => ({ ...event })),
+  }),
+  refreshCustody: () => vaultRefreshCustody({ force: true }),
 };
 
 /* Sign an offer. Absence is legacy-compatible (the daemon falls back to
@@ -16603,6 +17365,21 @@ let shellWaitingNoticeShown = false;
 let shellPendingResize = null;
 const SHELL_QUEUED_INPUT_MAX_BYTES = 64 * 1024;
 let activeTermSubtab = 'tui';
+
+// Files editor state. Declared here, far above the editor's functions,
+// because a #files deep link applies the route synchronously while the
+// module is still evaluating — the first filesIdeOnTabShown call must
+// find this state already initialized (TDZ otherwise aborts the module).
+const FILES_IDE_MAX_EDIT_BYTES = 2 * 1024 * 1024;
+const FILES_IDE_MAX_TABS = 20;
+const VALID_FILES_SUBTABS = ['editor', 'transfers'];
+const filesIdeBuffers = new Map(); // key -> buffer
+const filesIdeTreeStates = new Map(); // hostId -> tree state
+let filesIdeActiveKey = '';
+let filesIdeCm = null;
+let filesIdeLibPromise = null;
+let filesIdeInitialized = false;
+let activeFilesSubtab = 'editor';
 
 // Shell key bar state: sticky modifiers (Ctrl, Alt) that transform the
 // next character typed on the soft keyboard. Cleared after one use.
@@ -28493,8 +29270,14 @@ function setDaemonSessionId(sessionId) {
 
 function applySessionIdentity(meta = {}) {
   const sid = String(meta.session_id || meta.intendant_session_id || '').trim();
-  const backendSessionId = String(meta.backend_session_id || meta.backendSessionId || '').trim();
+  let backendSessionId = String(meta.backend_session_id || meta.backendSessionId || '').trim();
   const backendSource = String(meta.backend_source || meta.backendSource || meta.source || '').trim();
+  // Placeholder thread ids (Claude Code before its stream announces the
+  // real session id) must never become a backend alias: status routing
+  // would retarget at a window that never materializes, and the ghost
+  // window it conjures can steal the prompt target. Old session logs and
+  // scraped debug lines still carry the placeholder, so filter centrally.
+  if (backendSessionId === 'claude-code-session') backendSessionId = '';
   if (!sid || (!backendSessionId && !backendSource)) return;
   const wrapperMeta = sessionMetadataById.get(sid) || {};
   const next = {
@@ -35679,8 +36462,20 @@ function cacheSessionUsage(c) {
 
 function usageForForegroundSession() {
   const sid = resolvePromptTargetSessionId();
-  if (sid && sessionUsageById.has(sid)) return sessionUsageById.get(sid);
-  if (sid && sessionUsageById.size > 0) return null;
+  if (sid) {
+    if (sessionUsageById.has(sid)) return sessionUsageById.get(sid);
+    // External sessions re-key the foreground to the backend-native id
+    // while usage commands keep riding the Intendant log id; look the
+    // usage up across the identity group before concluding "no data" —
+    // returning null here stomps the header meter to '--' on every
+    // usage batch.
+    for (const related of relatedSessionIdsForSession(sid)) {
+      if (related !== sid && sessionUsageById.has(related)) {
+        return sessionUsageById.get(related);
+      }
+    }
+    if (sessionUsageById.size > 0) return null;
+  }
   return latestGlobalUsage;
 }
 
@@ -37104,6 +37899,7 @@ function renderDashboardTargetSummary(elementId, hostId, context = '') {
 
 function renderDashboardTargetSummaries() {
   renderDashboardTargetSummary('files-target-summary', filesDownloadSelectedPeerId(), 'files');
+  renderDashboardTargetSummary('files-ide-target-summary', filesIdeSelectedHostId(), 'files');
   renderDashboardTargetSummary('shell-target-summary', currentShellHostId(), 'shell');
   renderAccessAdminSummaries();
 }
@@ -46662,6 +47458,11 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 document.querySelectorAll('#tab-terminal .subtab-btn[data-term-tab]').forEach(btn => {
   btn.addEventListener('click', () => routeTo('terminal', btn.dataset.termTab));
 });
+
+// Files sub-tab switching (Editor | Transfers).
+document.querySelectorAll('#tab-files .subtab-btn[data-files-tab]').forEach(btn => {
+  btn.addEventListener('click', () => routeTo('files', btn.dataset.filesTab));
+});
 document.getElementById('shell-host-select')?.addEventListener('change', ev => {
   setShellHost(ev.target?.value || SHELL_HOST_ID);
 });
@@ -46751,6 +47552,9 @@ function parseRoute() {
   if (tab === 'terminal' && subtab && !VALID_TERM_SUBTABS.includes(subtab)) {
     return { tab, subtab: null };
   }
+  if (tab === 'files' && subtab && !VALID_FILES_SUBTABS.includes(subtab)) {
+    return { tab, subtab: null };
+  }
   if (tab === 'settings' && subtab && !VALID_SETTINGS_SUBTABS.includes(subtab)) {
     return { tab, subtab: null };
   }
@@ -46835,6 +47639,8 @@ function routeTo(tab, subtab) {
     switchActivitySubtab(subtab);
   } else if (tab === 'terminal' && subtab) {
     switchTerminalSubtab(subtab);
+  } else if (tab === 'files' && subtab) {
+    switchFilesSubtab(subtab);
   } else if (tab === 'access') {
     switchAccessSubtab(subtab || activeAccessSubtab || 'overview');
   } else if (tab === 'settings' && subtab) {
@@ -46868,6 +47674,8 @@ function applyCurrentRoute() {
     switchActivitySubtab(subtab);
   } else if (tab === 'terminal' && subtab) {
     switchTerminalSubtab(subtab);
+  } else if (tab === 'files' && subtab) {
+    switchFilesSubtab(subtab);
   } else if (tab === 'access') {
     switchAccessSubtab(subtab || activeAccessSubtab || 'overview');
   } else if (tab === 'settings' && subtab) {
@@ -46924,6 +47732,7 @@ function switchTab(tabId) {
   }
   if (tabId === 'files') {
     paneDeferredRenders.delete('files');
+    filesIdeOnTabShown();
     refreshFilesDownloadAvailability();
     renderFilesTransfers();
     refreshFilesTransferJobs();
@@ -52712,6 +53521,14 @@ async function fetchApiKeyStatus() {
     if (!resp.ok) throw new Error(`/api/api-key-status returned ${resp.status}`);
     return resp.json();
   }, 'api_key_status');
+}
+
+async function fetchExternalAgentAvailability() {
+  return dashboardTransport.rpcOrHttp('api_external_agents', {}, async () => {
+    const resp = await fetch('/api/external-agents');
+    if (!resp.ok) throw new Error(`/api/external-agents returned ${resp.status}`);
+    return resp.json();
+  }, 'api_external_agents');
 }
 
 async function fetchProjectRoot() {
@@ -60827,6 +61644,7 @@ function refreshFilesDownloadHostOptions() {
   select.value = stillPresent ? previous : '';
   onFilesDownloadHostChanged({ preserveStatus: true });
   renderDashboardTargetSummary('files-target-summary', filesDownloadSelectedPeerId(), 'files');
+  refreshFilesIdeHostOptions();
 }
 
 function onFilesDownloadHostChanged(options = {}) {
@@ -62610,6 +63428,901 @@ function fsPathLooksAbsolute(path) {
   return value === '~' || value.startsWith('~/') || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
 }
 
+// ── Files tab: editor ──
+//
+// A small IDE over the fs API family. Reads ride GET /api/fs/* (or the
+// api_fs_* tunnel methods), writes ride POST /api/fs/write (or api_fs_write
+// upload frames). Peers are reached over their dashboard-control tunnel and
+// enforce their own IAM profile + filesystem write roots server-side; this
+// UI only decides *where* to send a request, never *whether* it is allowed.
+// Saves are optimistic-concurrency: every read keeps the content sha256 and
+// every save sends it back as expected_sha256; a 409 opens the
+// reload/overwrite banner instead of clobbering.
+
+function switchFilesSubtab(name) {
+  if (!VALID_FILES_SUBTABS.includes(name)) name = 'editor';
+  activeFilesSubtab = name;
+  document.querySelectorAll('#tab-files .subtab-btn[data-files-tab]').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.filesTab === name);
+  });
+  document.querySelectorAll('#tab-files .subtab-pane').forEach(pane => {
+    pane.classList.toggle('active', pane.id === `files-pane-${name}`);
+  });
+  if (name === 'editor') filesIdeOnTabShown();
+}
+
+// The machine tint: one accent answers "whose disk is this?" — blue for
+// this daemon, mauve for a peer. Applied to the active editor tab, tree
+// selection, and the statusbar host chip via --files-accent.
+function filesIdeApplyAccent(hostId) {
+  document
+    .getElementById('tab-files')
+    ?.style.setProperty('--files-accent', hostId ? 'var(--mauve)' : 'var(--blue)');
+}
+
+function filesIdeSelectedHostId() {
+  return document.getElementById('files-ide-host')?.value.trim() || '';
+}
+
+function filesIdeHostLabel(hostId) {
+  if (!hostId) return 'This daemon';
+  const peer = daemons.find(d => d.host_id === hostId);
+  return peer?.label || hostId;
+}
+
+function filesIdeBufferKey(hostId, path) {
+  return `${hostId || ''} ${path}`;
+}
+
+function filesIdeTreeState(hostId) {
+  const key = hostId || '';
+  let state = filesIdeTreeStates.get(key);
+  if (!state) {
+    state = {
+      root: '',
+      rootParent: null,
+      listings: new Map(), // dir path -> {entries, truncated}
+      expanded: new Set(),
+      showHidden: false,
+      contextDir: '',
+      creating: null, // {kind: 'file'|'folder', dir}
+    };
+    filesIdeTreeStates.set(key, state);
+  }
+  return state;
+}
+
+// -- editor library (vendored CodeMirror bundle, lazy-loaded on first use)
+
+function filesIdeEnsureEditorLib() {
+  if (window.CodeMirror) return Promise.resolve();
+  if (filesIdeLibPromise) return filesIdeLibPromise;
+  filesIdeLibPromise = new Promise((resolve, reject) => {
+    const fail = why => {
+      filesIdeLibPromise = null;
+      reject(new Error(why));
+    };
+    const css = document.createElement('link');
+    css.rel = 'stylesheet';
+    css.href = '/codemirror-bundle.css';
+    css.onerror = () => fail('Editor stylesheet failed to load');
+    document.head.appendChild(css);
+    const script = document.createElement('script');
+    script.src = '/codemirror-bundle.js';
+    script.onload = () => (window.CodeMirror ? resolve() : fail('Editor library loaded without CodeMirror'));
+    script.onerror = () => fail('Editor library failed to load');
+    document.head.appendChild(script);
+  });
+  return filesIdeLibPromise;
+}
+
+// -- transport: one call surface for "this daemon" (HTTP or connect tunnel)
+//    and peers (their dashboard-control tunnel)
+
+function filesIdeNormalizePayload(payload) {
+  const rawStatus = Number(payload?._httpStatus);
+  const status = Number.isFinite(rawStatus) && rawStatus >= 100 && rawStatus <= 599 ? rawStatus : 200;
+  const ok = typeof payload?._httpOk === 'boolean' ? payload._httpOk : status >= 200 && status < 300;
+  let body = payload;
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    body = { ...body };
+    delete body._httpStatus;
+    delete body._httpOk;
+  }
+  return { ok, status, body: body || {} };
+}
+
+async function filesIdePeerConnection(hostId) {
+  const conn = await peerDashboardControlConnectionForHost(hostId, { timeoutMs: 30000 });
+  if (!conn) throw new Error('Peer tunnel unavailable');
+  return conn;
+}
+
+async function filesIdeRpc(hostId, method, params, httpFallback) {
+  if (hostId) {
+    const conn = await filesIdePeerConnection(hostId);
+    const payload = await conn.request(method, params);
+    return filesIdeNormalizePayload(payload);
+  }
+  const resp = await dashboardJsonFetch(method, params, httpFallback, method);
+  const body = await resp.json().catch(() => ({}));
+  return { ok: resp.ok, status: resp.status, body: body || {} };
+}
+
+function filesIdeList(hostId, path) {
+  return filesIdeRpc(hostId, 'api_fs_list', { path }, () =>
+    authedFetch('/api/fs/list?path=' + encodeURIComponent(path))
+  );
+}
+
+function filesIdeStat(hostId, path) {
+  return filesIdeRpc(hostId, 'api_fs_stat', { path }, () =>
+    authedFetch('/api/fs/stat?path=' + encodeURIComponent(path))
+  );
+}
+
+function filesIdeMkdir(hostId, path) {
+  return filesIdeRpc(hostId, 'api_fs_mkdir', { path }, () =>
+    authedFetch('/api/fs/mkdir', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    })
+  );
+}
+
+async function filesIdeSha256Hex(bytes) {
+  try {
+    if (window.crypto?.subtle) {
+      const digest = await crypto.subtle.digest('SHA-256', bytes);
+      return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+    }
+  } catch (_) { /* fall through */ }
+  return '';
+}
+
+/// Read a whole file: {bytes: Uint8Array, sha256: string}. The sha comes from
+/// the daemon when it offers one (X-Content-Sha256 / result.sha256) so the
+/// conflict baseline matches what the daemon will hash at save time; older
+/// peers without it fall back to a local digest of the same bytes.
+async function filesIdeReadFile(hostId, path) {
+  if (hostId) {
+    const conn = await filesIdePeerConnection(hostId);
+    const result = await conn.requestBytes('api_fs_read', { path });
+    if (result?.ok === false) throw new Error(result?.error || 'File read failed');
+    const bytes = result?.bytes instanceof Uint8Array ? result.bytes : new Uint8Array(0);
+    const sha = typeof result?.sha256 === 'string' && result.sha256
+      ? result.sha256
+      : await filesIdeSha256Hex(bytes);
+    return { bytes, sha256: sha };
+  }
+  if (dashboardConnectModeEnabled()) {
+    if (!dashboardByteStreamMethodAvailable('api_fs_read')) {
+      throw new Error('File reads are unavailable until this dashboard reconnects');
+    }
+    const result = await dashboardControlTransport.requestBytes('api_fs_read', { path });
+    if (result?.ok === false) throw new Error(result?.error || 'File read failed');
+    const bytes = result?.bytes instanceof Uint8Array ? result.bytes : new Uint8Array(0);
+    const sha = typeof result?.sha256 === 'string' && result.sha256
+      ? result.sha256
+      : await filesIdeSha256Hex(bytes);
+    return { bytes, sha256: sha };
+  }
+  const resp = await authedFetch('/api/fs/read?path=' + encodeURIComponent(path));
+  if (!resp.ok) {
+    const detail = await resp.json().catch(() => ({}));
+    throw new Error(detail.error || `File read failed (${resp.status})`);
+  }
+  const buffer = await resp.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  const sha = resp.headers?.get?.('x-content-sha256') || (await filesIdeSha256Hex(bytes));
+  return { bytes, sha256: sha };
+}
+
+/// Write a whole file. Returns the normalized {ok, status, body} response;
+/// 409 bodies carry {code, current_sha256, ...} for the conflict banner.
+async function filesIdeWriteFile(hostId, path, bytes, opts = {}) {
+  const params = { path };
+  if (opts.expected_sha256) params.expected_sha256 = opts.expected_sha256;
+  if (opts.create_new) params.create_new = true;
+  if (opts.force) params.force = true;
+  if (hostId) {
+    const conn = await filesIdePeerConnection(hostId);
+    if (conn.lastStatus && conn.lastStatus.api_fs_write_available === false) {
+      return {
+        ok: false,
+        status: 403,
+        body: { error: `${filesIdeHostLabel(hostId)} grants read-only file access to this daemon` },
+      };
+    }
+    const payload = await conn.uploadBytes('api_fs_write', params, bytes);
+    return filesIdeNormalizePayload(payload);
+  }
+  if (dashboardConnectModeEnabled()) {
+    if (!(dashboardTransport?.canUseRpc?.() && dashboardControlTransport?.lastStatus?.api_fs_write_available !== false)) {
+      return { ok: false, status: 503, body: { error: 'File writes are unavailable until this dashboard reconnects' } };
+    }
+    const payload = await dashboardControlTransport.uploadBytes('api_fs_write', params, bytes);
+    return filesIdeNormalizePayload(payload);
+  }
+  const resp = await authedFetch('/api/fs/write', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...params, content_b64: dashboardControlBytesToBase64(bytes) }),
+  });
+  const body = await resp.json().catch(() => ({}));
+  return { ok: resp.ok, status: resp.status, body: body || {} };
+}
+
+// -- tree pane
+
+function filesIdeSetTreeStatus(kind, text) {
+  const el = document.getElementById('files-ide-tree-status');
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.toggle('error', kind === 'error');
+}
+
+async function filesIdeLoadListing(hostId, path) {
+  const state = filesIdeTreeState(hostId);
+  const resp = await filesIdeList(hostId, path);
+  if (!resp.ok) throw new Error(resp.body.error || `Directory load failed (${resp.status})`);
+  const canonical = resp.body.path || path;
+  state.listings.set(canonical, {
+    entries: Array.isArray(resp.body.entries) ? resp.body.entries : [],
+    truncated: Boolean(resp.body.truncated),
+    parent: resp.body.parent || null,
+  });
+  return { canonical, parent: resp.body.parent || null };
+}
+
+async function filesIdeSetRoot(rawPath) {
+  const hostId = filesIdeSelectedHostId();
+  const state = filesIdeTreeState(hostId);
+  const target = String(rawPath || '').trim() || state.root || (hostId ? '~' : (dashboardProjectRoot || '~'));
+  filesIdeSetTreeStatus('', 'Loading…');
+  try {
+    // A file path opens the file and roots its directory.
+    const stat = await filesIdeStat(hostId, target);
+    let rootPath = target;
+    if (stat.ok && stat.body.exists && stat.body.is_file) {
+      rootPath = stat.body.parent || target;
+      filesIdeOpenFile(hostId, stat.body.path || target);
+    } else if (stat.ok && stat.body.exists && stat.body.is_dir) {
+      rootPath = stat.body.path || target;
+    } else if (stat.ok && !stat.body.exists) {
+      rootPath = stat.body.nearest_existing_parent || target;
+    }
+    const { canonical, parent } = await filesIdeLoadListing(hostId, rootPath);
+    state.root = canonical;
+    state.rootParent = parent;
+    state.expanded.clear();
+    state.contextDir = canonical;
+    state.creating = null;
+    filesIdeSetTreeStatus('', '');
+    renderFilesIdeTree();
+  } catch (e) {
+    filesIdeSetTreeStatus('error', e.message || 'Directory load failed');
+  }
+}
+
+function filesIdeTreeUp() {
+  const state = filesIdeTreeState(filesIdeSelectedHostId());
+  if (state.rootParent) filesIdeSetRoot(state.rootParent);
+}
+
+function filesIdeToggleHidden() {
+  const state = filesIdeTreeState(filesIdeSelectedHostId());
+  state.showHidden = !state.showHidden;
+  const btn = document.getElementById('files-ide-hidden-btn');
+  if (btn) btn.setAttribute('aria-pressed', state.showHidden ? 'true' : 'false');
+  renderFilesIdeTree();
+}
+
+function filesIdeRefreshTree() {
+  const state = filesIdeTreeState(filesIdeSelectedHostId());
+  state.listings.clear();
+  filesIdeSetRoot(state.root);
+}
+
+async function filesIdeToggleDir(path) {
+  const hostId = filesIdeSelectedHostId();
+  const state = filesIdeTreeState(hostId);
+  state.contextDir = path;
+  if (state.expanded.has(path)) {
+    state.expanded.delete(path);
+    renderFilesIdeTree();
+    return;
+  }
+  try {
+    if (!state.listings.has(path)) {
+      filesIdeSetTreeStatus('', 'Loading…');
+      await filesIdeLoadListing(hostId, path);
+      filesIdeSetTreeStatus('', '');
+    }
+    state.expanded.add(path);
+    renderFilesIdeTree();
+  } catch (e) {
+    filesIdeSetTreeStatus('error', e.message || 'Directory load failed');
+  }
+}
+
+function filesIdeTreeRows(state, dir, depth, rows) {
+  const listing = state.listings.get(dir);
+  if (!listing) return;
+  if (state.creating && state.creating.dir === dir) {
+    rows.push({ create: true, depth });
+  }
+  for (const entry of listing.entries) {
+    if (entry.hidden && !state.showHidden) continue;
+    rows.push({ entry, depth });
+    if (entry.is_dir && state.expanded.has(entry.path)) {
+      filesIdeTreeRows(state, entry.path, depth + 1, rows);
+    }
+  }
+  if (listing.truncated) {
+    rows.push({ notice: 'Showing first 500 entries', depth });
+  }
+}
+
+function renderFilesIdeTree() {
+  const container = document.getElementById('files-ide-tree');
+  if (!container) return;
+  const hostId = filesIdeSelectedHostId();
+  const state = filesIdeTreeState(hostId);
+  const rootInput = document.getElementById('files-ide-root');
+  if (rootInput && document.activeElement !== rootInput) rootInput.value = state.root;
+  const upBtn = document.getElementById('files-ide-up-btn');
+  if (upBtn) upBtn.disabled = !state.rootParent;
+  if (!state.root) {
+    container.innerHTML = '<div class="files-ide-tree-notice">Loading…</div>';
+    return;
+  }
+  const rows = [];
+  filesIdeTreeRows(state, state.root, 0, rows);
+  const html = [];
+  for (const row of rows) {
+    const pad = 8 + row.depth * 14;
+    if (row.create) {
+      const kind = state.creating.kind;
+      html.push(
+        `<div class="files-ide-create-row" style="padding-left:${pad}px">` +
+        `<span class="files-ide-tree-caret">${kind === 'folder' ? '▸' : ''}</span>` +
+        `<input id="files-ide-create-input" type="text" autocomplete="off" spellcheck="false" placeholder="${kind === 'folder' ? 'folder name' : 'file name'}">` +
+        `</div>`
+      );
+      continue;
+    }
+    if (row.notice) {
+      html.push(`<div class="files-ide-tree-notice" style="padding-left:${pad + 18}px">${escapeHtml(row.notice)}</div>`);
+      continue;
+    }
+    const entry = row.entry;
+    const isDir = Boolean(entry.is_dir);
+    const expanded = isDir && state.expanded.has(entry.path);
+    const caret = isDir ? (expanded ? '▾' : '▸') : '';
+    const classes = ['files-ide-tree-row', isDir ? 'dir' : 'file'];
+    if (entry.hidden) classes.push('hidden-entry');
+    if (!isDir && filesIdeBufferKey(hostId, entry.path) === filesIdeActiveKey) classes.push('active');
+    if (isDir && state.contextDir === entry.path) classes.push('active');
+    const name = escapeHtml(entry.name || '');
+    const pathAttr = escapeHtml(entry.path || '');
+    const suffix = entry.is_symlink ? ' ⇢' : '';
+    html.push(
+      `<button type="button" class="${classes.join(' ')}" data-path="${pathAttr}" data-dir="${isDir ? '1' : '0'}" style="padding-left:${pad}px" title="${pathAttr}">` +
+      `<span class="files-ide-tree-caret">${caret}</span>` +
+      `<span class="files-ide-tree-name">${name}${suffix}</span>` +
+      `</button>`
+    );
+  }
+  container.innerHTML = html.join('') || '<div class="files-ide-tree-notice">Empty directory</div>';
+  container.querySelectorAll('.files-ide-tree-row').forEach(btn => {
+    const path = btn.dataset.path || '';
+    if (btn.dataset.dir === '1') {
+      btn.addEventListener('click', () => filesIdeToggleDir(path));
+    } else {
+      btn.addEventListener('click', () => filesIdeOpenFile(filesIdeSelectedHostId(), path));
+    }
+  });
+  const createInput = document.getElementById('files-ide-create-input');
+  if (createInput) {
+    createInput.focus();
+    createInput.addEventListener('keydown', ev => {
+      if (ev.key === 'Enter') filesIdeCommitCreate(createInput.value);
+      if (ev.key === 'Escape') filesIdeCancelCreate();
+    });
+    createInput.addEventListener('blur', () => {
+      // Give Enter a beat to commit first.
+      setTimeout(() => {
+        const state = filesIdeTreeState(filesIdeSelectedHostId());
+        if (state.creating) filesIdeCancelCreate();
+      }, 150);
+    });
+  }
+}
+
+function filesIdeBeginCreate(kind) {
+  const hostId = filesIdeSelectedHostId();
+  const state = filesIdeTreeState(hostId);
+  if (!state.root) {
+    showControlToast('error', 'Open a folder first');
+    return;
+  }
+  // Create inside the last clicked directory when its listing is visible;
+  // otherwise fall back to the tree root.
+  const contextVisible = state.contextDir
+    && state.listings.has(state.contextDir)
+    && (state.contextDir === state.root || state.expanded.has(state.contextDir));
+  const dir = contextVisible ? state.contextDir : state.root;
+  state.creating = { kind: kind === 'folder' ? 'folder' : 'file', dir };
+  renderFilesIdeTree();
+}
+
+function filesIdeCancelCreate() {
+  const state = filesIdeTreeState(filesIdeSelectedHostId());
+  state.creating = null;
+  renderFilesIdeTree();
+}
+
+async function filesIdeCommitCreate(rawName) {
+  const hostId = filesIdeSelectedHostId();
+  const state = filesIdeTreeState(hostId);
+  const creating = state.creating;
+  const name = String(rawName || '').trim();
+  state.creating = null;
+  if (!creating || !name) {
+    renderFilesIdeTree();
+    return;
+  }
+  if (name.includes('/') || name.includes('\\')) {
+    filesIdeSetTreeStatus('error', 'Name must not contain path separators');
+    renderFilesIdeTree();
+    return;
+  }
+  const path = creating.dir.replace(/\/+$/, '') + '/' + name;
+  if (creating.kind === 'folder') {
+    try {
+      const resp = await filesIdeMkdir(hostId, path);
+      if (!resp.ok) throw new Error(resp.body.error || `Folder create failed (${resp.status})`);
+      state.listings.delete(creating.dir);
+      await filesIdeLoadListing(hostId, creating.dir);
+      filesIdeSetTreeStatus('', '');
+    } catch (e) {
+      filesIdeSetTreeStatus('error', e.message || 'Folder create failed');
+    }
+    renderFilesIdeTree();
+    return;
+  }
+  renderFilesIdeTree();
+  filesIdeOpenFile(hostId, path, { createNew: true });
+}
+
+// -- buffers, tabs, editor
+
+function filesIdeActiveBuffer() {
+  return filesIdeBuffers.get(filesIdeActiveKey) || null;
+}
+
+function filesIdeDetectEol(text) {
+  return /\r\n/.test(text) ? '\r\n' : '\n';
+}
+
+function filesIdeModeSpecFor(name) {
+  const CM = window.CodeMirror;
+  if (!CM || typeof CM.findModeByFileName !== 'function') return null;
+  const info = CM.findModeByFileName(String(name || ''));
+  if (!info) return null;
+  return info.mime && info.mime !== 'null' ? info.mime : info.mode || null;
+}
+
+async function filesIdeOpenFile(hostId, path, options = {}) {
+  const key = filesIdeBufferKey(hostId, path);
+  const existing = filesIdeBuffers.get(key);
+  if (existing) {
+    filesIdeActivate(key);
+    return;
+  }
+  if (filesIdeBuffers.size >= FILES_IDE_MAX_TABS) {
+    showControlToast('error', `Too many open files (cap is ${FILES_IDE_MAX_TABS}) — close a tab first`);
+    return;
+  }
+  const name = String(path).split(/[\\/]/).filter(Boolean).pop() || path;
+  filesIdeSetSaveStatus('', options.createNew ? '' : `Opening ${name}…`);
+  try {
+    await filesIdeEnsureEditorLib();
+    let text = '';
+    let sha = '';
+    if (!options.createNew) {
+      const stat = await filesIdeStat(hostId, path);
+      if (stat.ok && stat.body.exists && !stat.body.is_file) {
+        throw new Error(`${name} is not a regular file`);
+      }
+      if (stat.ok && stat.body.exists && Number(stat.body.size) > FILES_IDE_MAX_EDIT_BYTES) {
+        throw new Error(`${name} is ${humanBytes(Number(stat.body.size))} — too large to edit here (cap ${humanBytes(FILES_IDE_MAX_EDIT_BYTES)}); use Downloads below`);
+      }
+      const read = await filesIdeReadFile(hostId, path);
+      if (read.bytes.byteLength > FILES_IDE_MAX_EDIT_BYTES) {
+        throw new Error(`${name} is ${humanBytes(read.bytes.byteLength)} — too large to edit here (cap ${humanBytes(FILES_IDE_MAX_EDIT_BYTES)}); use Downloads below`);
+      }
+      if (read.bytes.includes(0)) {
+        throw new Error(`${name} looks binary — use Downloads below instead`);
+      }
+      try {
+        text = new TextDecoder('utf-8', { fatal: true }).decode(read.bytes);
+      } catch (_) {
+        throw new Error(`${name} is not valid UTF-8 — use Downloads below instead`);
+      }
+      sha = read.sha256 || '';
+    }
+    const eol = filesIdeDetectEol(text);
+    const doc = window.CodeMirror.Doc(text.replace(/\r\n/g, '\n'), filesIdeModeSpecFor(name));
+    const buffer = {
+      key,
+      host: hostId || '',
+      path,
+      name,
+      doc,
+      baselineSha: sha,
+      eol,
+      isNew: Boolean(options.createNew),
+      saving: false,
+      conflict: null,
+      lastError: '',
+      cleanGeneration: doc.changeGeneration(),
+    };
+    filesIdeBuffers.set(key, buffer);
+    // Keystroke-frequency handler: only touch the DOM when the dirty flag
+    // actually flips (the tab strip re-render re-attaches listeners).
+    doc.on('change', () => {
+      const dirty = filesIdeBufferDirty(buffer);
+      if (dirty !== buffer.renderedDirty) filesIdeRenderTabs();
+      if (buffer.key === filesIdeActiveKey) {
+        const saveBtn = document.getElementById('files-ide-save-btn');
+        if (saveBtn && !buffer.saving) saveBtn.disabled = !dirty && !buffer.conflict;
+      }
+    });
+    filesIdeSetSaveStatus('', '');
+    filesIdeActivate(key);
+  } catch (e) {
+    filesIdeSetSaveStatus('error', e.message || 'Open failed');
+    showControlToast('error', e.message || 'Open failed');
+  }
+}
+
+function filesIdeBufferDirty(buffer) {
+  if (!buffer) return false;
+  if (buffer.isNew) return true;
+  return !buffer.doc.isClean(buffer.cleanGeneration);
+}
+
+function filesIdeActivate(key) {
+  const buffer = filesIdeBuffers.get(key);
+  if (!buffer) return;
+  filesIdeActiveKey = key;
+  const host = document.getElementById('files-ide-editor-host');
+  const empty = document.getElementById('files-ide-empty');
+  if (!filesIdeCm && host && window.CodeMirror) {
+    filesIdeCm = window.CodeMirror(host, {
+      value: window.CodeMirror.Doc('', null),
+      theme: 'intendant',
+      lineNumbers: true,
+      matchBrackets: true,
+      autoCloseBrackets: true,
+      styleActiveLine: true,
+      indentUnit: 4,
+      tabSize: 4,
+      indentWithTabs: false,
+      viewportMargin: 30,
+      extraKeys: {
+        'Cmd-S': () => filesIdeSaveActive(),
+        'Ctrl-S': () => filesIdeSaveActive(),
+        'Cmd-/': 'toggleComment',
+        'Ctrl-/': 'toggleComment',
+      },
+    });
+  }
+  if (empty) empty.classList.add('hidden');
+  if (filesIdeCm) {
+    filesIdeCm.swapDoc(buffer.doc);
+    requestAnimationFrame(() => {
+      filesIdeCm.refresh();
+      filesIdeCm.focus();
+    });
+  }
+  filesIdeRenderTabs();
+  filesIdeRenderChrome();
+  renderFilesIdeTree();
+}
+
+function filesIdeCloseTab(key, confirmed) {
+  const buffer = filesIdeBuffers.get(key);
+  if (!buffer) return;
+  if (filesIdeBufferDirty(buffer) && !confirmed) {
+    // Native confirm dialogs block the page; use a two-step close instead.
+    buffer.closeArmed = true;
+    filesIdeRenderTabs();
+    setTimeout(() => {
+      const still = filesIdeBuffers.get(key);
+      if (still) {
+        still.closeArmed = false;
+        filesIdeRenderTabs();
+      }
+    }, 3000);
+    return;
+  }
+  filesIdeBuffers.delete(key);
+  if (filesIdeActiveKey === key) {
+    filesIdeActiveKey = '';
+    const next = filesIdeBuffers.keys().next();
+    if (!next.done) {
+      filesIdeActivate(next.value);
+      return;
+    }
+    if (filesIdeCm && window.CodeMirror) filesIdeCm.swapDoc(window.CodeMirror.Doc('', null));
+    const empty = document.getElementById('files-ide-empty');
+    if (empty) empty.classList.remove('hidden');
+    filesIdeRenderChrome();
+  }
+  filesIdeRenderTabs();
+  renderFilesIdeTree();
+}
+
+function filesIdeRenderTabs() {
+  const container = document.getElementById('files-ide-tabs');
+  if (!container) return;
+  const html = [];
+  for (const buffer of filesIdeBuffers.values()) {
+    const dirty = filesIdeBufferDirty(buffer);
+    buffer.renderedDirty = dirty;
+    const classes = ['files-ide-tab'];
+    if (buffer.key === filesIdeActiveKey) classes.push('active');
+    if (dirty) classes.push('dirty');
+    const hostBadge = buffer.host ? `${escapeHtml(filesIdeHostLabel(buffer.host))} · ` : '';
+    const closeLabel = buffer.closeArmed ? 'Discard?' : '×';
+    const closeClass = buffer.closeArmed ? 'files-ide-tab-close confirm-discard' : 'files-ide-tab-close';
+    html.push(
+      `<div class="${classes.join(' ')}" role="tab" data-key="${escapeHtml(buffer.key)}" title="${hostBadge}${escapeHtml(buffer.path)}">` +
+      `<span class="files-ide-tab-dirty">●</span>` +
+      `<span class="files-ide-tab-name">${escapeHtml(buffer.name)}</span>` +
+      `<button type="button" class="${closeClass}" aria-label="Close ${escapeHtml(buffer.name)}">${closeLabel}</button>` +
+      `</div>`
+    );
+  }
+  container.innerHTML = html.join('');
+  container.querySelectorAll('.files-ide-tab').forEach(tab => {
+    const key = tab.dataset.key || '';
+    tab.addEventListener('click', ev => {
+      if (ev.target.closest('.files-ide-tab-close')) return;
+      filesIdeActivate(key);
+    });
+    tab.querySelector('.files-ide-tab-close')?.addEventListener('click', () => {
+      const buffer = filesIdeBuffers.get(key);
+      filesIdeCloseTab(key, Boolean(buffer?.closeArmed));
+    });
+  });
+}
+
+function filesIdeSetSaveStatus(kind, text) {
+  const el = document.getElementById('files-ide-save-status');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'files-ide-save-status' + (kind ? ` ${kind}` : '');
+}
+
+function filesIdeRenderChrome() {
+  const buffer = filesIdeActiveBuffer();
+  const pathEl = document.getElementById('files-ide-status-path');
+  const metaEl = document.getElementById('files-ide-status-meta');
+  const saveBtn = document.getElementById('files-ide-save-btn');
+  const banner = document.getElementById('files-ide-banner');
+  const hostChip = document.getElementById('files-ide-status-host');
+  const hostLabel = document.getElementById('files-ide-status-host-label');
+  // The tint and chip follow what Save would touch: the active buffer's
+  // machine, or the browse target while nothing is open.
+  const chipHost = buffer ? buffer.host : filesIdeSelectedHostId();
+  filesIdeApplyAccent(chipHost);
+  if (hostChip && hostLabel) {
+    hostLabel.textContent = filesIdeHostLabel(chipHost);
+    hostChip.title = chipHost ? `Editing on peer ${filesIdeHostLabel(chipHost)}` : 'Editing on this daemon';
+    hostChip.classList.add('visible');
+  }
+  if (pathEl) {
+    pathEl.textContent = buffer ? buffer.path : '';
+    pathEl.title = buffer ? buffer.path : '';
+  }
+  if (metaEl) {
+    if (buffer) {
+      const CM = window.CodeMirror;
+      const info = CM && CM.findModeByFileName ? CM.findModeByFileName(buffer.name) : null;
+      const lang = info?.name || 'Plain text';
+      const eol = buffer.eol === '\r\n' ? 'CRLF' : 'LF';
+      metaEl.textContent = `${lang} · ${eol}${buffer.isNew ? ' · new file' : ''}`;
+    } else {
+      metaEl.textContent = '';
+    }
+  }
+  if (saveBtn) {
+    saveBtn.disabled = !buffer || buffer.saving || (!filesIdeBufferDirty(buffer) && !buffer.conflict);
+    saveBtn.textContent = buffer?.saving ? 'Saving…' : 'Save';
+  }
+  if (banner) {
+    if (buffer?.conflict) {
+      const kind = buffer.conflict.code;
+      const message = kind === 'missing'
+        ? 'This file no longer exists on disk.'
+        : kind === 'exists'
+          ? 'A file with this name appeared on disk since you started.'
+          : 'This file changed on disk since it was opened.';
+      banner.className = 'files-ide-banner';
+      banner.innerHTML =
+        `<span>${escapeHtml(message)}</span>` +
+        `<button type="button" class="ui-btn" onclick="filesIdeReloadActive()">Reload from disk</button>` +
+        `<button type="button" class="ui-btn" onclick="filesIdeOverwriteActive()">Overwrite</button>`;
+    } else if (buffer?.lastError) {
+      banner.className = 'files-ide-banner error';
+      banner.innerHTML = `<span>${escapeHtml(buffer.lastError)}</span>`;
+    } else {
+      banner.className = 'files-ide-banner hidden';
+      banner.innerHTML = '';
+    }
+  }
+}
+
+function filesIdeSerializeBuffer(buffer) {
+  let text = buffer.doc.getValue('\n');
+  if (buffer.eol === '\r\n') text = text.replace(/\n/g, '\r\n');
+  return new TextEncoder().encode(text);
+}
+
+async function filesIdeSaveActive(saveOptions = {}) {
+  const buffer = filesIdeActiveBuffer();
+  if (!buffer || buffer.saving) return;
+  buffer.saving = true;
+  buffer.lastError = '';
+  filesIdeRenderChrome();
+  filesIdeSetSaveStatus('', 'Saving…');
+  try {
+    const bytes = filesIdeSerializeBuffer(buffer);
+    const generation = buffer.doc.changeGeneration();
+    const opts = {};
+    if (saveOptions.force) {
+      opts.force = true;
+    } else if (buffer.isNew) {
+      opts.create_new = true;
+    } else if (buffer.baselineSha) {
+      opts.expected_sha256 = buffer.baselineSha;
+    } else {
+      // No baseline (e.g. a peer daemon predating read hashes): a plain save
+      // must not silently clobber, so route through the conflict banner.
+      buffer.conflict = { code: 'conflict' };
+      throw new Error('No conflict baseline for this file — use Overwrite to save anyway');
+    }
+    const resp = await filesIdeWriteFile(buffer.host, buffer.path, bytes, opts);
+    if (resp.status === 409) {
+      buffer.conflict = { code: resp.body.code || 'conflict', currentSha: resp.body.current_sha256 || '' };
+      throw new Error(resp.body.error || 'File changed on disk');
+    }
+    if (!resp.ok) {
+      throw new Error(resp.body.error || `Save failed (${resp.status})`);
+    }
+    buffer.baselineSha = resp.body.sha256 || '';
+    buffer.isNew = false;
+    buffer.conflict = null;
+    // Compare against the generation captured before serialize: keystrokes
+    // that landed while the save was in flight keep the buffer dirty.
+    buffer.cleanGeneration = generation;
+    filesIdeSetSaveStatus('ok', `Saved ${new Date().toLocaleTimeString()}`);
+    const state = filesIdeTreeState(buffer.host);
+    const dir = buffer.path.slice(0, buffer.path.lastIndexOf('/')) || '/';
+    if (state.listings.has(dir)) {
+      filesIdeLoadListing(buffer.host, dir).then(() => renderFilesIdeTree()).catch(() => {});
+    }
+  } catch (e) {
+    buffer.lastError = buffer.conflict ? '' : (e.message || 'Save failed');
+    filesIdeSetSaveStatus('error', e.message || 'Save failed');
+  } finally {
+    buffer.saving = false;
+    filesIdeRenderTabs();
+    filesIdeRenderChrome();
+  }
+}
+
+async function filesIdeReloadActive() {
+  const buffer = filesIdeActiveBuffer();
+  if (!buffer) return;
+  try {
+    filesIdeSetSaveStatus('', 'Reloading…');
+    const read = await filesIdeReadFile(buffer.host, buffer.path);
+    let text;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(read.bytes);
+    } catch (_) {
+      throw new Error('File is no longer valid UTF-8');
+    }
+    const cursor = buffer.doc.getCursor();
+    buffer.eol = filesIdeDetectEol(text);
+    buffer.doc.setValue(text.replace(/\r\n/g, '\n'));
+    buffer.doc.setCursor(cursor);
+    buffer.baselineSha = read.sha256 || '';
+    buffer.isNew = false;
+    buffer.conflict = null;
+    buffer.lastError = '';
+    buffer.cleanGeneration = buffer.doc.changeGeneration();
+    filesIdeSetSaveStatus('', 'Reloaded from disk');
+  } catch (e) {
+    filesIdeSetSaveStatus('error', e.message || 'Reload failed');
+  }
+  filesIdeRenderTabs();
+  filesIdeRenderChrome();
+}
+
+function filesIdeOverwriteActive() {
+  const buffer = filesIdeActiveBuffer();
+  if (!buffer) return;
+  buffer.conflict = null;
+  filesIdeSaveActive({ force: true });
+}
+
+// -- host wiring + tab lifecycle
+
+function refreshFilesIdeHostOptions() {
+  const select = document.getElementById('files-ide-host');
+  if (!select) return;
+  const previous = select.value || '';
+  const options = [{ id: '', label: 'This daemon', connected: true }];
+  for (const peer of daemons) {
+    options.push({
+      id: peer.host_id,
+      label: peer.label || peer.host_id,
+      connected: peer.connected !== false,
+    });
+  }
+  select.innerHTML = '';
+  for (const option of options) {
+    const el = document.createElement('option');
+    el.value = option.id;
+    el.textContent = option.connected ? option.label : `${option.label} (offline)`;
+    select.appendChild(el);
+  }
+  select.value = options.some(option => option.id === previous) ? previous : '';
+  renderDashboardTargetSummary('files-ide-target-summary', filesIdeSelectedHostId(), 'files');
+}
+
+function onFilesIdeHostChanged() {
+  const hostId = filesIdeSelectedHostId();
+  renderDashboardTargetSummary('files-ide-target-summary', hostId, 'files');
+  const state = filesIdeTreeState(hostId);
+  const hiddenBtn = document.getElementById('files-ide-hidden-btn');
+  if (hiddenBtn) hiddenBtn.setAttribute('aria-pressed', state.showHidden ? 'true' : 'false');
+  if (state.root) {
+    renderFilesIdeTree();
+  } else {
+    filesIdeSetRoot('');
+  }
+  filesIdeRenderChrome();
+}
+
+function filesIdeOnTabShown() {
+  if (!filesIdeInitialized) {
+    filesIdeInitialized = true;
+    refreshFilesIdeHostOptions();
+    filesIdeSetRoot('');
+    window.addEventListener('beforeunload', ev => {
+      for (const buffer of filesIdeBuffers.values()) {
+        if (filesIdeBufferDirty(buffer)) {
+          ev.preventDefault();
+          ev.returnValue = '';
+          return;
+        }
+      }
+    });
+  } else {
+    renderDashboardTargetSummary('files-ide-target-summary', filesIdeSelectedHostId(), 'files');
+  }
+  filesIdeRenderChrome();
+  if (filesIdeCm) requestAnimationFrame(() => filesIdeCm.refresh());
+}
+
 function configureFsPicker({ mode, target, title, placeholder, useLabel, showCreate }) {
   fsPickerMode = mode || 'directory';
   fsPickerTarget = target || 'project';
@@ -63034,6 +64747,61 @@ window.openAgentBinaryPicker = openAgentBinaryPicker;
 	window.cancelFsPickerDownload = cancelFsPickerDownload;
 	window.openSessionConfigBinaryPicker = openSessionConfigBinaryPicker;
 	window.createPickerDirectory = createPickerDirectory;
+	window.onFilesIdeHostChanged = onFilesIdeHostChanged;
+	window.filesIdeBeginCreate = filesIdeBeginCreate;
+	window.filesIdeTreeUp = filesIdeTreeUp;
+	window.filesIdeSetRoot = filesIdeSetRoot;
+	window.filesIdeToggleHidden = filesIdeToggleHidden;
+	window.filesIdeRefreshTree = filesIdeRefreshTree;
+	window.filesIdeSaveActive = filesIdeSaveActive;
+	window.filesIdeReloadActive = filesIdeReloadActive;
+	window.filesIdeOverwriteActive = filesIdeOverwriteActive;
+	window.intendantDashboardFilesIde = {
+	  _debugSnapshot() {
+	    const buffer = filesIdeActiveBuffer();
+	    return {
+	      host: filesIdeSelectedHostId(),
+	      root: filesIdeTreeState(filesIdeSelectedHostId()).root,
+	      openTabs: Array.from(filesIdeBuffers.values()).map(b => ({
+	        host: b.host,
+	        path: b.path,
+	        dirty: filesIdeBufferDirty(b),
+	        isNew: b.isNew,
+	        conflict: b.conflict ? b.conflict.code : null,
+	      })),
+	      active: buffer
+	        ? {
+	            path: buffer.path,
+	            host: buffer.host,
+	            dirty: filesIdeBufferDirty(buffer),
+	            baselineSha: buffer.baselineSha,
+	            eol: buffer.eol,
+	            text: buffer.doc.getValue('\n'),
+	          }
+	        : null,
+	      saveStatus: document.getElementById('files-ide-save-status')?.textContent || '',
+	      banner: document.getElementById('files-ide-banner')?.textContent || '',
+	    };
+	  },
+	  async _debugOpen(path, options = {}) {
+	    await filesIdeOpenFile(filesIdeSelectedHostId(), path, options);
+	    return this._debugSnapshot();
+	  },
+	  _debugSetText(text) {
+	    const buffer = filesIdeActiveBuffer();
+	    if (!buffer) throw new Error('no active buffer');
+	    buffer.doc.setValue(String(text));
+	    return this._debugSnapshot();
+	  },
+	  async _debugSave(options = {}) {
+	    await filesIdeSaveActive(options);
+	    return this._debugSnapshot();
+	  },
+	  async _debugSetRoot(path) {
+	    await filesIdeSetRoot(path);
+	    return this._debugSnapshot();
+	  },
+	};
 	window.intendantDashboardFiles = {
 	  _debugTransferSnapshot() {
 	    return filesTransferSnapshot();
@@ -63487,6 +65255,14 @@ function renderNewSessionAgentControls(options = {}) {
   const managedContextNote = document.getElementById('new-session-managed-context-note');
   if (!select || !commandInput) return;
 
+  // Grey out backends whose CLI is missing on the daemon host; kick the
+  // probe on first render and re-apply when it lands.
+  if (Array.isArray(externalAgentAvailability)) {
+    applyExternalAgentAvailabilityToNewSessionPicker();
+  } else {
+    refreshExternalAgentAvailability();
+  }
+
   const currentOption = select.querySelector('option[value=""]');
   if (currentOption) {
     currentOption.textContent = newSessionConfiguredAgent
@@ -63512,6 +65288,21 @@ function renderNewSessionAgentControls(options = {}) {
     : 'Select an external agent';
   if (!hasExternalAgent || options.replaceCommand) {
     commandInput.value = '';
+  }
+  const claudeModelInp = document.getElementById('new-session-claude-model');
+  const claudeModeSel = document.getElementById('new-session-claude-permission-mode');
+  if (claudeModelInp) {
+    const appliesToClaude = effectiveAgent === 'claude-code';
+    claudeModelInp.disabled = !appliesToClaude;
+    if (!appliesToClaude) claudeModelInp.value = '';
+    claudeModelInp.placeholder = appliesToClaude
+      ? 'e.g. haiku (empty = global setting)'
+      : 'Applies to Claude Code sessions';
+  }
+  if (claudeModeSel) {
+    const appliesToClaude = effectiveAgent === 'claude-code';
+    claudeModeSel.disabled = !appliesToClaude;
+    if (!appliesToClaude) claudeModeSel.value = '';
   }
   if (managedContextSel) {
     const appliesToCodex = effectiveAgent === 'codex';
@@ -63776,6 +65567,12 @@ async function startNewSession() {
     msg.agent = selectedAgent;
     const agentCommand = document.getElementById('new-session-agent-command')?.value.trim() || '';
     if (agentCommand) msg.agent_command = agentCommand;
+  }
+  if (effectiveNewSessionAgentId() === 'claude-code') {
+    const model = document.getElementById('new-session-claude-model')?.value.trim() || '';
+    if (model) msg.claude_model = model;
+    const mode = document.getElementById('new-session-claude-permission-mode')?.value || '';
+    if (mode) msg.claude_permission_mode = mode;
   }
   if (effectiveNewSessionAgentId() === 'codex') {
     if (newSessionCodexLaunchDefaultsLoaded) {

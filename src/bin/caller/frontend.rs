@@ -37,6 +37,7 @@ pub enum UserAction {
     /// Cycle verbosity (TUI: `v`, MCP: `set_verbosity` tool).
     SetVerbosity { level: Verbosity },
     /// Submit a follow-up message after a round completes (TUI: textarea, MCP: `start_task` when waiting).
+    #[allow(dead_code)]
     SubmitFollowUp { text: String },
     /// Shut down the agent (TUI: `q`/Ctrl-C, MCP: `quit` tool).
     Quit,

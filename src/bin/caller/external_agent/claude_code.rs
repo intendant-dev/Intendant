@@ -477,9 +477,9 @@ impl CcReader {
             .get("mcp_servers")
             .and_then(|s| s.as_array())
             .and_then(|servers| {
-                servers.iter().find(|server| {
-                    server.get("name").and_then(|n| n.as_str()) == Some("intendant")
-                })
+                servers
+                    .iter()
+                    .find(|server| server.get("name").and_then(|n| n.as_str()) == Some("intendant"))
             })
             .and_then(|server| server.get("status").and_then(|s| s.as_str()))
             .unwrap_or("missing")
@@ -670,10 +670,7 @@ impl CcReader {
     }
 
     fn handle_result(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
-        let was_interrupt = self
-            .shared
-            .interrupt_pending
-            .swap(false, Ordering::SeqCst);
+        let was_interrupt = self.shared.interrupt_pending.swap(false, Ordering::SeqCst);
 
         if let Some(model_usage) = msg.get("modelUsage") {
             if let Some(window) = context_window_from_model_usage(model_usage, &self.model) {
@@ -739,7 +736,10 @@ impl CcReader {
         let Some(request) = msg.get("request") else {
             return;
         };
-        let subtype = request.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+        let subtype = request
+            .get("subtype")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
 
         if subtype == "can_use_tool" {
             let tool_name = request
@@ -1201,9 +1201,7 @@ impl ExternalAgent for ClaudeCodeAgent {
         };
         let line = serde_json::to_string(&request)?;
         if let Err(e) = self.write_line(&line).await {
-            self.shared
-                .interrupt_pending
-                .store(false, Ordering::SeqCst);
+            self.shared.interrupt_pending.store(false, Ordering::SeqCst);
             return Err(e);
         }
         Ok(())
@@ -1513,7 +1511,9 @@ mod tests {
         );
         let long = "x".repeat(300);
         assert_eq!(
-            tool_input_preview(&serde_json::json!({ "command": long })).chars().count(),
+            tool_input_preview(&serde_json::json!({ "command": long }))
+                .chars()
+                .count(),
             200
         );
         assert!(tool_input_preview(&serde_json::json!({"other": 1})).contains("other"));
@@ -1784,7 +1784,9 @@ mod tests {
             Arc::new(StdMutex::new(HashMap::new())),
             true,
         );
-        reader_shared.interrupt_pending.store(true, Ordering::SeqCst);
+        reader_shared
+            .interrupt_pending
+            .store(true, Ordering::SeqCst);
         let out = reader.process_line(
             r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s1"}"#,
         );
@@ -1890,7 +1892,10 @@ mod tests {
         let out = reader.process_line(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"s1"}"#,
         );
-        assert!(out.events.iter().all(|e| !matches!(e, AgentEvent::Log { .. })));
+        assert!(out
+            .events
+            .iter()
+            .all(|e| !matches!(e, AgentEvent::Log { .. })));
         let out = reader.process_line(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"},"session_id":"s1"}"#,
         );
@@ -1941,10 +1946,8 @@ mod tests {
         agent.mcp_session_id = Some("session with spaces".to_string());
         agent.mcp_auth_token = Some("token&symbols".to_string());
 
-        let expected_token = crate::web_gateway::session_scoped_mcp_token(
-            "token&symbols",
-            "session with spaces",
-        );
+        let expected_token =
+            crate::web_gateway::session_scoped_mcp_token("token&symbols", "session with spaces");
         assert_eq!(
             agent.intendant_mcp_url(8765),
             format!(

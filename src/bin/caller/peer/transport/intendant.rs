@@ -140,6 +140,7 @@ pub struct TransportCredentials {
 }
 
 impl IntendantWsTransport {
+    #[allow(dead_code)]
     pub fn new(url: String, events_tx: mpsc::Sender<PeerEvent>) -> Self {
         Self::with_credentials(url, events_tx, TransportCredentials::default())
     }
@@ -166,6 +167,7 @@ impl IntendantWsTransport {
     /// pinning. Common case for operators who use mTLS at the
     /// proxy layer (no app-level pinning) plus a bearer token for
     /// app-layer auth.
+    #[allow(dead_code)]
     pub fn with_bearer(
         url: String,
         events_tx: mpsc::Sender<PeerEvent>,

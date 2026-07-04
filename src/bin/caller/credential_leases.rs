@@ -146,6 +146,18 @@ fn sweep_locked(leases: &mut HashMap<String, CredentialLease>, now: u64) {
         if let Some(lease) = leases.remove(&kind) {
             graves.insert(kind.clone(), lease.expires_at_unix_ms());
             queue_dry_notice(&kind, &lease.label);
+            crate::credential_audit::record(
+                crate::credential_audit::EVENT_LEASE_EXPIRED,
+                &kind,
+                &lease.label,
+                &lease.granted_by,
+                format!(
+                    "ran out {}s ago · ttl {}m · offline {}h",
+                    now.saturating_sub(lease.expires_at_unix_ms()) / 1_000,
+                    lease.ttl_ms / 60_000,
+                    lease.offline_ms / 3_600_000,
+                ),
+            );
         }
         if let Err(err) = drop_materialization(&materialization_root(), &kind) {
             eprintln!("[credential-leases] expired lease cleanup for {kind} failed: {err}");
@@ -427,6 +439,9 @@ pub fn startup_materialization_sweep() {
             }
         }
     }
+    // A restart is a custody epoch: whatever the trail shows as live
+    // before this point died with the old process.
+    crate::credential_audit::record_reset();
 }
 
 /// Why access-token-mode material is refused, or None when it is clean.
@@ -549,6 +564,23 @@ pub fn grant(
         .write()
         .expect("lease tombstones poisoned")
         .remove(kind);
+    crate::credential_audit::record(
+        crate::credential_audit::EVENT_LEASE_GRANTED,
+        kind,
+        label.trim(),
+        granted_by.trim(),
+        format!(
+            "ttl {}m · offline {}h · mode {}{}",
+            ttl_ms / 60_000,
+            offline_ms / 3_600_000,
+            mode.as_str(),
+            if replaced {
+                " · replaced previous"
+            } else {
+                ""
+            },
+        ),
+    );
     Ok(GrantOutcome {
         replaced,
         ..outcome
@@ -569,31 +601,44 @@ pub fn renew(lease_id: &str) -> Result<u64, String> {
 
 /// Revoke by lease id, by kind, or everything (`None`). Returns how many
 /// leases were dropped; the material is zeroized on drop. Revocation is
-/// deliberate forgetting — it leaves no "expired" tombstone.
-pub fn revoke(selector: Option<&str>) -> usize {
+/// deliberate forgetting — it leaves no "expired" tombstone. `actor` is
+/// who asked (a principal label, or "daemon shutdown"), recorded in the
+/// custody trail.
+pub fn revoke(selector: Option<&str>, actor: &str) -> usize {
     let mut leases = store().write().expect("lease store poisoned");
     let before = leases.len();
-    let mut dropped: Vec<String> = Vec::new();
+    let mut dropped: Vec<(String, String)> = Vec::new();
     match selector {
         None => {
-            dropped.extend(leases.keys().cloned());
+            dropped.extend(
+                leases
+                    .iter()
+                    .map(|(kind, lease)| (kind.clone(), lease.label.clone())),
+            );
             leases.clear();
         }
         Some(selector) => {
             leases.retain(|kind, lease| {
                 let keep = kind != selector && lease.lease_id != selector;
                 if !keep {
-                    dropped.push(kind.clone());
+                    dropped.push((kind.clone(), lease.label.clone()));
                 }
                 keep
             });
         }
     }
-    for kind in dropped {
+    for (kind, label) in dropped {
         if let Err(err) = drop_materialization(&materialization_root(), &kind) {
             eprintln!("[credential-leases] revoked lease cleanup for {kind} failed: {err}");
             queue_materialization_cleanup(&kind);
         }
+        crate::credential_audit::record(
+            crate::credential_audit::EVENT_LEASE_REVOKED,
+            &kind,
+            &label,
+            actor,
+            "material dropped and zeroized".to_string(),
+        );
     }
     before - leases.len()
 }
@@ -732,7 +777,7 @@ mod tests {
         let renewed_expiry = renew(&outcome.lease_id).unwrap();
         assert!(renewed_expiry >= outcome.expires_at_unix_ms);
 
-        assert_eq!(revoke(Some(&outcome.lease_id)), 1);
+        assert_eq!(revoke(Some(&outcome.lease_id), "test"), 1);
         assert!(leased_secret("api_key:anthropic").is_none());
         // Revocation is deliberate — it must not read as "went dry".
         assert!(expired_lease_note().is_none());
@@ -947,7 +992,7 @@ mod tests {
                 .as_str(),
             "api_key"
         );
-        revoke(None);
+        revoke(None, "test");
         reset();
     }
 

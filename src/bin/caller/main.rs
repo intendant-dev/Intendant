@@ -9,14 +9,12 @@ mod autonomy;
 mod ax;
 mod browser_workspace;
 mod computer_use;
-mod windows_uia;
-#[cfg(target_os = "linux")]
-mod x11_input;
 mod connect_rendezvous;
 mod context_rewind;
 mod control;
 mod control_plane;
 mod conversation;
+mod credential_audit;
 mod credential_egress;
 mod credential_leases;
 mod ctl;
@@ -66,9 +64,6 @@ mod terminal;
 mod tool_batch;
 mod tools;
 mod transcription;
-#[cfg(windows)]
-#[path = "../../win_sandbox.rs"]
-mod win_sandbox;
 mod transfer_store;
 mod tui;
 mod types;
@@ -77,8 +72,14 @@ mod user_mode;
 mod vision;
 mod web_gateway;
 mod web_tls;
+#[cfg(windows)]
+#[path = "../../win_sandbox.rs"]
+mod win_sandbox;
+mod windows_uia;
 mod worktree;
 mod worktree_inventory;
+#[cfg(target_os = "linux")]
+mod x11_input;
 
 use autonomy::{AutonomyLevel, AutonomyState, SharedAutonomy};
 use conversation::Conversation;
@@ -2019,6 +2020,7 @@ fn external_tool_source_output_total_truncation_notice() -> String {
     )
 }
 
+#[allow(dead_code)]
 fn external_tool_output_looks_like_large_source(text: &str) -> bool {
     let mut signals = ExternalToolSourceSignals::default();
     signals.observe(text);
@@ -2345,8 +2347,9 @@ struct ExternalContextRewindRequest {
     surgical: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum ManagedContextRewindTurnStopStatus {
+    #[default]
     NotRequested,
     StopRequestedNoToolObserved,
     StopRequestedCompleted {
@@ -2363,12 +2366,6 @@ enum ManagedContextRewindTurnStopStatus {
     StopRequestFailed {
         message: String,
     },
-}
-
-impl Default for ManagedContextRewindTurnStopStatus {
-    fn default() -> Self {
-        Self::NotRequested
-    }
 }
 
 #[derive(Debug, Default)]
@@ -4168,7 +4165,7 @@ fn scan_context_rewind_anchor_catalog(
                     .filter(|line| !context_rewind_line_is_dead(*line, &dead_line_spans));
                 if let Some(first) = live.next() {
                     anchor.first_line = first;
-                    anchor.last_line = live.last().unwrap_or(first);
+                    anchor.last_line = live.next_back().unwrap_or(first);
                 }
             }
         }
@@ -6114,10 +6111,7 @@ fn shellish_command_tokens(command: &str) -> Vec<String> {
 }
 
 fn shell_token_basename(token: &str) -> &str {
-    token
-        .rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or(token)
+    token.rsplit(['/', '\\']).next().unwrap_or(token)
 }
 
 fn shell_token_is_assignment(token: &str) -> bool {
@@ -9102,7 +9096,7 @@ async fn drain_external_child_turn(
         project_root: config.project_root,
         log_dir: config.log_dir,
         approval_registry: config.approval_registry,
-        json_approval: config.json_approval.clone(),
+        json_approval: config.json_approval,
         agent_source: config.agent_source.clone(),
         suppress_agent_started: config.suppress_agent_started,
         persist_model_responses_inline: config.persist_model_responses_inline,
@@ -10419,7 +10413,7 @@ async fn drain_external_agent_events_with_prefetched(
                 project_root: config.project_root,
                 log_dir: config.log_dir,
                 approval_registry: config.approval_registry,
-                json_approval: config.json_approval.clone(),
+                json_approval: config.json_approval,
                 agent_source: config.agent_source.clone(),
                 suppress_agent_started: config.suppress_agent_started,
                 persist_model_responses_inline: config.persist_model_responses_inline,
@@ -10948,24 +10942,20 @@ async fn drain_external_agent_events_with_prefetched(
                     }
                     continue;
                 }
-                if event_is_primary
-                    && agent.supports_item_anchor_rewind()
-                    && managed_context_rewind_only_pressure.is_some()
-                    && !managed_context_rewind_only_tool_allowed(&tool_name, &preview)
-                {
-                    let pressure = managed_context_rewind_only_pressure
-                        .expect("checked managed context pressure");
-                    if !item_id.is_empty() {
-                        managed_context_blocked_tool_items.insert(item_id.clone());
-                    }
-                    pending_backend_recovery.get_or_insert_with(|| ExternalBackendRecovery {
+                if event_is_primary && agent.supports_item_anchor_rewind() {
+                    if let Some(pressure) = managed_context_rewind_only_pressure {
+                        if !managed_context_rewind_only_tool_allowed(&tool_name, &preview) {
+                            if !item_id.is_empty() {
+                                managed_context_blocked_tool_items.insert(item_id.clone());
+                            }
+                            pending_backend_recovery.get_or_insert_with(|| ExternalBackendRecovery {
                         message: format!(
                             "managed Codex attempted normal tool '{}' while context pressure was rewind-only ({}/{})",
                             tool_name, pressure.used_tokens, pressure.rewind_only_limit
                         ),
                         recovery_hint: None,
                     });
-                    let content = format!(
+                            let content = format!(
                         "Blocked {} tool '{}' while managed context is rewind-only ({}/{} tokens); only status and managed-context recovery tools are allowed until pressure drops.",
                         agent.name(),
                         external_tool_preview_text(&tool_name, &preview)
@@ -10973,19 +10963,6 @@ async fn drain_external_agent_events_with_prefetched(
                         pressure.used_tokens,
                         pressure.rewind_only_limit
                     );
-                    slog(config.session_log, |l| l.warn(&content));
-                    config.bus.send(AppEvent::LogEntry {
-                        session_id: config.session_id.clone(),
-                        level: "warn".to_string(),
-                        source: "Intendant".to_string(),
-                        content,
-                        turn: None,
-                    });
-                    if !managed_context_pressure_interrupt_sent {
-                        managed_context_pressure_interrupt_sent = true;
-                        if let Err(e) = agent.interrupt_turn().await {
-                            let content =
-                                format!("Managed-context tool-gate interrupt failed: {}", e);
                             slog(config.session_log, |l| l.warn(&content));
                             config.bus.send(AppEvent::LogEntry {
                                 session_id: config.session_id.clone(),
@@ -10994,9 +10971,26 @@ async fn drain_external_agent_events_with_prefetched(
                                 content,
                                 turn: None,
                             });
+                            if !managed_context_pressure_interrupt_sent {
+                                managed_context_pressure_interrupt_sent = true;
+                                if let Err(e) = agent.interrupt_turn().await {
+                                    let content = format!(
+                                        "Managed-context tool-gate interrupt failed: {}",
+                                        e
+                                    );
+                                    slog(config.session_log, |l| l.warn(&content));
+                                    config.bus.send(AppEvent::LogEntry {
+                                        session_id: config.session_id.clone(),
+                                        level: "warn".to_string(),
+                                        source: "Intendant".to_string(),
+                                        content,
+                                        turn: None,
+                                    });
+                                }
+                            }
+                            continue;
                         }
                     }
-                    continue;
                 }
                 if let Some(pressure) = managed_context_active_density_steer.filter(|_| {
                     event_is_primary
@@ -11224,7 +11218,7 @@ async fn drain_external_agent_events_with_prefetched(
                     )
                     .await;
 
-                    let rx = if let Some(ref slot) = config.json_approval {
+                    let rx = if let Some(slot) = config.json_approval {
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         {
                             let mut guard = slot.lock().unwrap();
@@ -11373,7 +11367,7 @@ async fn drain_external_agent_events_with_prefetched(
                         category: cat,
                     });
 
-                    let rx = if let Some(ref slot) = config.json_approval {
+                    let rx = if let Some(slot) = config.json_approval {
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         {
                             let mut guard = slot.lock().unwrap();
@@ -11850,6 +11844,7 @@ enum LoopExitReason {
     /// User denied a command.
     Denied,
     /// An error occurred.
+    #[allow(dead_code)]
     Error,
     /// User requested interruption mid-turn.
     Interrupted,
@@ -13602,7 +13597,6 @@ async fn maybe_auto_launch_xvfb(
     xvfb_guard: &mut Option<vision::XvfbGuard>,
     provider_name: &str,
     session_log: &SharedSessionLog,
-    bus: &EventBus,
 ) {
     if xvfb_guard.is_some() {
         return;
@@ -22897,12 +22891,12 @@ Also: {"source": "bare"}"#;
         let mut active = HashSet::new();
         let mut previews = HashMap::new();
         let mut seq = HashMap::new();
-        let mut add = |id: &str,
-                       preview: &str,
-                       order: u64,
-                       active: &mut HashSet<String>,
-                       previews: &mut HashMap<String, String>,
-                       seq: &mut HashMap<String, u64>| {
+        let add = |id: &str,
+                   preview: &str,
+                   order: u64,
+                   active: &mut HashSet<String>,
+                   previews: &mut HashMap<String, String>,
+                   seq: &mut HashMap<String, u64>| {
             active.insert(id.to_string());
             previews.insert(id.to_string(), preview.to_string());
             seq.insert(id.to_string(), order);
@@ -24609,7 +24603,7 @@ async fn run_agent_loop(
     json_approval: Option<&JsonApprovalSlot>,
     approval_registry: &event::ApprovalRegistry,
     context_injection: &event::ContextInjectionQueue,
-    mut xvfb_guard: &mut Option<vision::XvfbGuard>,
+    xvfb_guard: &mut Option<vision::XvfbGuard>,
     session_registry: Option<&display::SharedSessionRegistry>,
     // When true, askHuman is unavailable and approvals without a json_approval
     // slot are auto-denied (headless non-JSON mode).
@@ -25442,12 +25436,12 @@ async fn run_agent_loop(
                             if need.is_none_or(|(prev, _)| cat.severity() > prev.severity()) {
                                 need = Some((cat, true));
                             }
-                        } else if autonomy_state.needs_approval(cat) {
-                            if need.is_none_or(|(prev, was_deny)| {
+                        } else if autonomy_state.needs_approval(cat)
+                            && need.is_none_or(|(prev, was_deny)| {
                                 !was_deny && cat.severity() > prev.severity()
-                            }) {
-                                need = Some((cat, false));
-                            }
+                            })
+                        {
+                            need = Some((cat, false));
                         }
                     }
                 }
@@ -25508,7 +25502,7 @@ async fn run_agent_loop(
                                     cat,
                                     &preview,
                                     &autonomy,
-                                    &bus,
+                                    bus,
                                 )
                                 .await;
                             }
@@ -25526,7 +25520,7 @@ async fn run_agent_loop(
                                     cat,
                                     &preview,
                                     &autonomy,
-                                    &bus,
+                                    bus,
                                 )
                                 .await;
                             }
@@ -25588,7 +25582,7 @@ async fn run_agent_loop(
                                     cat,
                                     &preview,
                                     &autonomy,
-                                    &bus,
+                                    bus,
                                 )
                                 .await;
                             }
@@ -25601,7 +25595,7 @@ async fn run_agent_loop(
                                     cat,
                                     &preview,
                                     &autonomy,
-                                    &bus,
+                                    bus,
                                 )
                                 .await;
                             }
@@ -25662,14 +25656,7 @@ async fn run_agent_loop(
 
             // Run agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(
-                &json_str,
-                &mut xvfb_guard,
-                provider.name(),
-                &session_log,
-                bus,
-            )
-            .await;
+            maybe_auto_launch_xvfb(&json_str, xvfb_guard, provider.name(), &session_log).await;
             let preview = format_commands_preview(&json_str);
             bus.send(AppEvent::AgentStarted {
                 session_id: local_session_id.clone(),
@@ -25885,12 +25872,12 @@ Proceed with explicit assumptions and continue without additional questions."
                             if need.is_none_or(|(prev, _)| cat.severity() > prev.severity()) {
                                 need = Some((cat, true));
                             }
-                        } else if autonomy_state.needs_approval(cat) {
-                            if need.is_none_or(|(prev, was_deny)| {
+                        } else if autonomy_state.needs_approval(cat)
+                            && need.is_none_or(|(prev, was_deny)| {
                                 !was_deny && cat.severity() > prev.severity()
-                            }) {
-                                need = Some((cat, false));
-                            }
+                            })
+                        {
+                            need = Some((cat, false));
                         }
                     }
                 }
@@ -25951,7 +25938,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                     cat,
                                     &preview,
                                     &autonomy,
-                                    &bus,
+                                    bus,
                                 )
                                 .await;
                             }
@@ -25969,7 +25956,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                     cat,
                                     &preview,
                                     &autonomy,
-                                    &bus,
+                                    bus,
                                 )
                                 .await;
                             }
@@ -26031,7 +26018,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                     cat,
                                     &preview,
                                     &autonomy,
-                                    &bus,
+                                    bus,
                                 )
                                 .await;
                             }
@@ -26044,7 +26031,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                     cat,
                                     &preview,
                                     &autonomy,
-                                    &bus,
+                                    bus,
                                 )
                                 .await;
                             }
@@ -26100,14 +26087,7 @@ Proceed with explicit assumptions and continue without additional questions."
 
             // Log the full JSON being sent to the agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(
-                &json_str,
-                &mut xvfb_guard,
-                provider.name(),
-                &session_log,
-                bus,
-            )
-            .await;
+            maybe_auto_launch_xvfb(&json_str, xvfb_guard, provider.name(), &session_log).await;
 
             let preview = format_commands_preview(&json_str);
             bus.send(AppEvent::AgentStarted {
@@ -26374,7 +26354,7 @@ fn get_task_from_flags_or_env(flags: &CliFlags) -> Result<String, CallerError> {
     }
     if let Some(ref path) = flags.task_file {
         return std::fs::read_to_string(path)
-            .map(|s| s.trim_end_matches(|c| c == '\r' || c == '\n').to_string())
+            .map(|s| s.trim_end_matches(['\r', '\n']).to_string())
             .map_err(|e| CallerError::Config(format!("Failed to read --task-file {path}: {e}")));
     }
     if let Ok(task) = env::var("INTENDANT_TASK") {
@@ -26598,7 +26578,10 @@ All relative paths and commands execute from this directory.",
                     result_path, e
                 ))
             });
-            eprintln!("Failed to write sub-agent result file {}: {}", result_path, e);
+            eprintln!(
+                "Failed to write sub-agent result file {}: {}",
+                result_path, e
+            );
         }
     }
 
@@ -27766,7 +27749,7 @@ async fn run_with_presence(
         }
 
         // ── CU-first routing: all tasks go to fast CU model first ──
-        let mut task_for_agent: Option<String> = None;
+        let task_for_agent: Option<String>;
 
         slog(&session_log, |l| {
             l.debug(&format!(
@@ -27818,10 +27801,7 @@ async fn run_with_presence(
                         ))
                     });
                     bus.send(AppEvent::PresenceLog {
-                        message: format!(
-                            "Escalating to agent: {}",
-                            types::truncate_str(&task, 80)
-                        ),
+                        message: format!("Escalating to agent: {}", types::truncate_str(&task, 80)),
                         level: None,
                         turn: None,
                     });
@@ -27861,11 +27841,12 @@ async fn run_with_presence(
                 && persistent_codex_config
                     .as_ref()
                     .is_some_and(|prev| !codex_runtime_config_equal(prev, &current_codex_config));
-        let claude_config_changed =
-            matches!(agent_backend, Some(external_agent::AgentBackend::ClaudeCode))
-                && persistent_claude_config
-                    .as_ref()
-                    .is_some_and(|prev| !claude_runtime_config_equal(prev, &current_claude_config));
+        let claude_config_changed = matches!(
+            agent_backend,
+            Some(external_agent::AgentBackend::ClaudeCode)
+        ) && persistent_claude_config
+            .as_ref()
+            .is_some_and(|prev| !claude_runtime_config_equal(prev, &current_claude_config));
 
         if persistent_agent.is_some()
             && (agent_backend != persistent_agent_backend
@@ -28029,12 +28010,14 @@ async fn run_with_presence(
                     } else {
                         None
                     };
-                persistent_claude_config =
-                    if matches!(agent_backend, Some(external_agent::AgentBackend::ClaudeCode)) {
-                        Some(current_claude_config.clone())
-                    } else {
-                        None
-                    };
+                persistent_claude_config = if matches!(
+                    agent_backend,
+                    Some(external_agent::AgentBackend::ClaudeCode)
+                ) {
+                    Some(current_claude_config.clone())
+                } else {
+                    None
+                };
             }
 
             let session_dir = session_log
@@ -28831,7 +28814,9 @@ async fn run_with_presence(
                 persistent_conv = Some(conv);
             } else {
                 // ── Subsequent task: inject into existing conversation ──
-                let conv = persistent_conv.as_mut().unwrap();
+                let Some(conv) = persistent_conv.as_mut() else {
+                    unreachable!("persistent conversation was initialized above");
+                };
 
                 let resolved = conv.resolve_dangling_tool_calls();
                 if resolved > 0 {
@@ -31636,9 +31621,7 @@ async fn run_external_agent_mode(
                                 )
                             });
                         slog(&session_log, |l| {
-                            l.warn(&format!(
-                                "Managed Codex reported recovery required; sending managed-context recovery kickstart instead of ending the session"
-                            ))
+                            l.warn("Managed Codex reported recovery required; sending managed-context recovery kickstart instead of ending the session")
                         });
                         record_external_round_inline(
                             &session_log,
@@ -32093,6 +32076,7 @@ All relative paths and commands execute from this directory.",
 }
 
 /// Set up a fresh conversation with project context, memory, skills, and task.
+#[allow(dead_code)]
 fn setup_fresh_conversation(conv: &mut Conversation, project: &Project, task: &str) {
     setup_fresh_conversation_no_task(conv, project);
     conv.add_user(task.to_string());
@@ -32178,6 +32162,7 @@ async fn resolve_frame_ids(
 ///
 /// Captures the on-disk path so backends like Codex can pass `LocalImage`
 /// (file reference) instead of inline base64 in JSON-RPC.
+#[allow(dead_code)]
 async fn resolve_frame_attachments(
     frame_ids: &[String],
     registry: &Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
@@ -33351,7 +33336,6 @@ async fn run_cu_task(
 
 /// Execute native computer-use tool calls via the xdotool executor
 /// and add results (with screenshots) to the conversation.
-#[allow(clippy::too_many_arguments)]
 /// Handle native `shared_view` tool calls: dashboard visibility into
 /// agent-owned displays (sandboxes, VMs, virtual displays). Sharing the
 /// user's own screen is explicit opt-in — unlike the MCP path, this handler
@@ -33705,7 +33689,6 @@ fn configure_sandbox_env(flags: &CliFlags, project: &Project, log_dir: &std::pat
         Err(e) => {
             eprintln!("[sandbox] failed to encode write paths ({e}); sandbox disabled");
             env::remove_var("INTENDANT_SANDBOX_WRITE_PATHS");
-            return;
         }
     }
 
@@ -34140,7 +34123,9 @@ async fn main() -> Result<(), CallerError> {
             Ok(true) => eprintln!("[access] owner bootstrap: root grant pinned to client key"),
             Ok(false) => eprintln!("[access] owner bootstrap: client key already holds root"),
             Err(e) => {
-                return Err(CallerError::Config(format!("--owner bootstrap failed: {e}")));
+                return Err(CallerError::Config(format!(
+                    "--owner bootstrap failed: {e}"
+                )));
             }
         }
     }
@@ -34205,7 +34190,7 @@ async fn main() -> Result<(), CallerError> {
                 }
                 // Drop every credential lease (zeroizes memory, deletes
                 // materialized oauth auth files) before the process dies.
-                let _ = credential_leases::revoke(None);
+                let _ = credential_leases::revoke(None, "daemon shutdown");
                 // Clean up control socket
                 control::cleanup();
                 // Restore terminal (best-effort) so the shell isn't left in raw mode
@@ -35106,14 +35091,10 @@ async fn main() -> Result<(), CallerError> {
 
         // Wire outbound broadcaster: converts AppEvents to OutboundEvents on the
         // shared broadcast channel (control socket / web gateway).
-        let _outbound_broadcaster = if let Some(ref tx) = app.control_tx {
-            Some(event::spawn_outbound_broadcaster(
-                bus.subscribe(),
-                tx.clone(),
-            ))
-        } else {
-            None
-        };
+        let _outbound_broadcaster = app
+            .control_tx
+            .as_ref()
+            .map(|tx| event::spawn_outbound_broadcaster(bus.subscribe(), tx.clone()));
 
         // Wire session log writer: persists bus events that aren't logged inline.
         let _session_log_writer =

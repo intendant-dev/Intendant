@@ -110,12 +110,14 @@ pub trait Encoder: Send + 'static {
     ) -> Result<Vec<EncodedPacket>, String>;
 
     /// The MIME type of the encoded output (e.g. `"video/VP8"`, `"video/H264"`).
+    #[allow(dead_code)]
     fn codec_mime(&self) -> &'static str;
 
     /// Canonical [`PayloadSpec`] for this encoder. Attached to every
     /// emitted packet; also returned here for code that needs the spec
     /// without going through encode (e.g. the pool constructing encoder
     /// handles before the first frame is available).
+    #[allow(dead_code)]
     fn payload_spec(&self) -> &PayloadSpec;
 }
 
@@ -131,6 +133,7 @@ pub enum CodecChoice {
 }
 
 impl CodecChoice {
+    #[allow(dead_code)]
     pub fn mime(&self) -> &'static str {
         match self {
             CodecChoice::Vp8 => "video/VP8",
@@ -269,6 +272,7 @@ pub fn parse_h264_fmtp(sdp: &str) -> Vec<H264FmtpProfile> {
 /// We do *not* accept High (100), Main (77), or other profiles because our
 /// encoder does not produce those.  A decoder that only accepts High will
 /// fail on Baseline input.
+#[allow(dead_code)]
 pub fn is_compatible_h264_profile(profile: &H264FmtpProfile) -> bool {
     // packetization-mode must be 0 or 1.
     if profile.packetization_mode > 1 {
@@ -306,6 +310,7 @@ pub fn is_compatible_h264_profile(profile: &H264FmtpProfile) -> bool {
 /// **Legacy helper, broader than the pool path needs.** The encoder-pool path
 /// uses [`offer_has_poolable_h264_variant`] instead, which mirrors the exact
 /// profile / packetization / level that our H.264 encoder can produce.
+#[allow(dead_code)]
 pub fn has_compatible_h264_offer(sdp: &str) -> bool {
     let profiles = parse_h264_fmtp(sdp);
     if profiles.is_empty() {
@@ -439,6 +444,7 @@ pub fn offer_has_poolable_h264_variant(sdp: &str) -> bool {
 /// (profile_idc 0x42) with packetization-mode 0 or 1.  If no `a=fmtp:`
 /// line exists for an H264 payload type, it is accepted per RFC 6184
 /// defaults.
+#[allow(dead_code)]
 pub fn select_codec(
     offer_sdp: &str,
     width: u32,
@@ -593,8 +599,8 @@ pub fn bgra_to_i420(bgra: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8
     let h = height as usize;
     let s = stride as usize;
 
-    let uv_w = (w + 1) / 2;
-    let uv_h = (h + 1) / 2;
+    let uv_w = w.div_ceil(2);
+    let uv_h = h.div_ceil(2);
 
     let y_size = w * h;
     let uv_size = uv_w * uv_h;
@@ -703,11 +709,11 @@ fn rounded_fixed_avg_clamped_u8(n: i32, count: i32) -> u8 {
 /// is local — the function signature and output shape don't change.
 pub fn downscale_i420(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
     debug_assert!(
-        src_w % 2 == 0 && src_h % 2 == 0,
+        src_w.is_multiple_of(2) && src_h.is_multiple_of(2),
         "downscale_i420: src dims must be even, got {src_w}x{src_h}"
     );
     debug_assert!(
-        dst_w % 2 == 0 && dst_h % 2 == 0,
+        dst_w.is_multiple_of(2) && dst_h.is_multiple_of(2),
         "downscale_i420: dst dims must be even, got {dst_w}x{dst_h}"
     );
     let src_w = src_w as usize;

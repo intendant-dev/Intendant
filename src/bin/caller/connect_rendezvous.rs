@@ -82,13 +82,6 @@ struct ErrorRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct AckRequest {
-    daemon_id: String,
-    request_id: String,
-    ok: bool,
-}
-
-#[derive(Debug, Serialize)]
 struct ClaimProofRequest {
     protocol: &'static str,
     daemon_id: String,
@@ -247,9 +240,7 @@ async fn report_dry_credentials(
     }
     let credentials: Vec<serde_json::Value> = notices
         .iter()
-        .map(|notice| {
-            serde_json::json!({ "kind": notice.kind, "label": notice.label })
-        })
+        .map(|notice| serde_json::json!({ "kind": notice.kind, "label": notice.label }))
         .collect();
     let url = match join_url(base_url, "api/daemon/dry") {
         Ok(url) => url,
@@ -267,7 +258,10 @@ async fn report_dry_credentials(
         .await;
     match result {
         Ok(resp) if resp.status().is_success() => {}
-        Ok(resp) => eprintln!("[connect] dry-credential report failed: HTTP {}", resp.status()),
+        Ok(resp) => eprintln!(
+            "[connect] dry-credential report failed: HTTP {}",
+            resp.status()
+        ),
         Err(e) => eprintln!("[connect] dry-credential report failed: {e}"),
     }
 }
@@ -449,8 +443,16 @@ async fn handle_event(
                             origin.to_string().trim_end_matches('/').to_string()
                         };
                         let account_hint = match (
-                            event.account_name.as_deref().map(str::trim).filter(|v| !v.is_empty()),
-                            event.user_id.as_deref().map(str::trim).filter(|v| !v.is_empty()),
+                            event
+                                .account_name
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|v| !v.is_empty()),
+                            event
+                                .user_id
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|v| !v.is_empty()),
                         ) {
                             (Some(name), _) => format!("@{name}"),
                             (None, Some(id)) => id.chars().take(12).collect(),
@@ -510,20 +512,21 @@ async fn handle_event(
             }
         }
         "ice" => {
-            let ok = match (event.session_id.as_deref(), event.candidate.as_ref()) {
+            let applied = match (event.session_id.as_deref(), event.candidate.as_ref()) {
                 (Some(session_id), Some(candidate)) => dashboard_control
                     .add_ice_candidate(session_id, candidate)
                     .await
                     .unwrap_or(false),
                 _ => false,
             };
-            let _ = post_ack(client, base_url, config, daemon_id, &event.id, ok).await;
+            if !applied {
+                eprintln!("[connect] dropped ICE candidate for event {}", event.id);
+            }
         }
         "close" => {
             if let Some(session_id) = event.session_id.as_deref() {
                 dashboard_control.close(session_id).await;
             }
-            let _ = post_ack(client, base_url, config, daemon_id, &event.id, true).await;
         }
         "claim_challenge" => {
             let Some(claim_id) = event.claim_id.as_deref().filter(|s| !s.trim().is_empty()) else {
@@ -664,10 +667,12 @@ fn connect_dashboard_grant_from_state(
                 "connect-dashboard-control",
             )
         }) {
-            return Ok(crate::dashboard_control::DashboardControlGrant::UserClient {
-                principal,
-                iam_state: state,
-            });
+            return Ok(
+                crate::dashboard_control::DashboardControlGrant::UserClient {
+                    principal,
+                    iam_state: state,
+                },
+            );
         }
     }
 
@@ -677,20 +682,24 @@ fn connect_dashboard_grant_from_state(
         account_name,
         "connect-dashboard-control",
     ) {
-        Some(principal) => Ok(crate::dashboard_control::DashboardControlGrant::UserClient {
-            principal,
-            iam_state: state,
-        }),
+        Some(principal) => Ok(
+            crate::dashboard_control::DashboardControlGrant::UserClient {
+                principal,
+                iam_state: state,
+            },
+        ),
         None => match crate::access::iam::principal_for_connect_account_any_status(
             &state,
             user_id.unwrap_or_default(),
             account_name,
             "connect-dashboard-control",
         ) {
-            Some(principal) => Ok(crate::dashboard_control::DashboardControlGrant::UserClient {
-                principal,
-                iam_state: state,
-            }),
+            Some(principal) => Ok(
+                crate::dashboard_control::DashboardControlGrant::UserClient {
+                    principal,
+                    iam_state: state,
+                },
+            ),
             None => Err(connect_account_not_authorized_message(
                 user_id,
                 account_name,
@@ -714,7 +723,10 @@ fn connect_account_not_authorized_message(
     let identity = match (account_name, user_id) {
         (Some(name), Some(id)) => format!("@{name} ({})", id.chars().take(12).collect::<String>()),
         (Some(name), None) => format!("@{name}"),
-        (None, Some(id)) => format!("Connect account {}", id.chars().take(12).collect::<String>()),
+        (None, Some(id)) => format!(
+            "Connect account {}",
+            id.chars().take(12).collect::<String>()
+        ),
         (None, None) => "This client".to_string(),
     };
     let mut message = format!(
@@ -766,29 +778,6 @@ async fn post_error(
         error: error.to_string(),
     };
     authenticated(config, client.post(join_url(base_url, "api/daemon/error")?))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-}
-
-async fn post_ack(
-    client: &Client,
-    base_url: &Url,
-    config: &ConnectConfig,
-    daemon_id: &str,
-    request_id: &str,
-    ok: bool,
-) -> Result<(), String> {
-    let body = AckRequest {
-        daemon_id: daemon_id.to_string(),
-        request_id: request_id.to_string(),
-        ok,
-    };
-    authenticated(config, client.post(join_url(base_url, "api/daemon/ack")?))
         .json(&body)
         .send()
         .await
@@ -1026,8 +1015,7 @@ mod tests {
             fingerprint: "fp-unenrolled".to_string(),
             public_key_b64u: "unused".to_string(),
         };
-        let error =
-            connect_dashboard_grant_from_state(state, None, None, Some(&key)).unwrap_err();
+        let error = connect_dashboard_grant_from_state(state, None, None, Some(&key)).unwrap_err();
         assert!(error.contains("fp-unenrolled"));
         assert!(error.contains("People & Devices"));
     }

@@ -133,10 +133,12 @@ impl PeerRegistry {
 
     /// Number of peers currently registered. Useful for tests and
     /// the aggregate dashboard indicator.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.inner.peers.read().unwrap().len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -159,6 +161,7 @@ impl PeerRegistry {
     /// card. If the peer is already registered (same id), returns
     /// [`PeerError::Rejected`] — idempotent re-registration is a
     /// follow-up concern.
+    #[allow(dead_code)]
     pub async fn add_peer(&self, card_url: &str) -> Result<PeerId, PeerError> {
         self.add_peer_with_via_and_auth(card_url, Vec::new(), None)
             .await
@@ -167,6 +170,7 @@ impl PeerRegistry {
     /// Variant of [`add_peer`] that lets the connecting operator
     /// override the card's transport URLs at peer-add time. See
     /// [`add_peer_with_via_and_auth`] for the auth-aware variant.
+    #[allow(dead_code)]
     pub async fn add_peer_with_via(
         &self,
         card_url: &str,
@@ -359,6 +363,7 @@ impl PeerRegistry {
     ///   from `intendant.toml` `[[peer]]` sections
     /// - Loopback registration (registering the local daemon as a
     ///   "peer" of itself, for dashboard symmetry)
+    #[allow(dead_code)]
     pub async fn add_peer_with_card(&self, card: AgentCard) -> Result<PeerId, PeerError> {
         self.add_peer_with_card_and_auth(card, Vec::new(), None, None)
             .await

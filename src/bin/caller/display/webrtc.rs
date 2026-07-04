@@ -339,6 +339,7 @@ impl TcpRelayRegistry {
     /// WebRTC session closes (browser-initiated close, peer teardown,
     /// transport disconnect). Missing entries are silently ignored
     /// — idempotent cleanup.
+    #[allow(dead_code)]
     pub fn unregister(&self, ufrag: &str) {
         self.registry.lock().unwrap().remove(ufrag);
     }
@@ -513,7 +514,7 @@ pub fn inject_relay_tcp_candidate(sdp: &str, primary_addr: SocketAddr) -> String
         out.push_str(line);
         if !inserted
             && line
-                .trim_end_matches(|c| c == '\r' || c == '\n')
+                .trim_end_matches(['\r', '\n'])
                 .starts_with("a=candidate:")
         {
             out.push_str(&candidate_line);
@@ -1081,6 +1082,7 @@ pub enum TileControlMessage {
 /// pump.
 pub type TileControlHandler = Arc<dyn Fn(TileControlMessage) + Send + Sync>;
 
+#[allow(dead_code)]
 pub fn noop_tile_control_handler() -> TileControlHandler {
     Arc::new(|_| {})
 }
@@ -1248,7 +1250,6 @@ fn rtc_codec_parameters(codec: CodecKind) -> Result<RTCRtpCodecParameters, Calle
     Ok(RTCRtpCodecParameters {
         rtp_codec,
         payload_type,
-        ..Default::default()
     })
 }
 
@@ -5179,12 +5180,11 @@ fn active_codec_from_subscriptions(
     subscriptions: &[EncoderSubscription],
     prefs: &PeerCodecPreferences,
 ) -> Option<CodecKind> {
-    for &codec in &prefs.supported {
-        if subscriptions.iter().any(|s| s.id.codec == codec) {
-            return Some(codec);
-        }
-    }
-    None
+    prefs
+        .supported
+        .iter()
+        .find(|&&codec| subscriptions.iter().any(|s| s.id.codec == codec))
+        .copied()
 }
 
 /// Build the **negotiated** codec preferences the intake uses for

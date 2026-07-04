@@ -102,12 +102,15 @@ pub enum PeerOp {
     DelegateTask {
         task: PeerTask,
     },
+    #[allow(dead_code)]
     CancelTask {
         task: TaskId,
     },
+    #[allow(dead_code)]
     QueryTaskStatus {
         task: TaskId,
     },
+    #[allow(dead_code)]
     InvokeCapability {
         name: String,
         args: serde_json::Value,
@@ -163,8 +166,10 @@ pub enum PeerOpAck {
     /// Response to `DelegateTask` — the peer-assigned task id.
     TaskId(TaskId),
     /// Response to `QueryTaskStatus`.
+    #[allow(dead_code)]
     TaskStatus(TaskUpdate),
     /// Response to `InvokeCapability`.
+    #[allow(dead_code)]
     Value(serde_json::Value),
 }
 
@@ -190,6 +195,7 @@ pub struct PeerTask {
 
     /// Structured context to pass through (file paths, prior state,
     /// anything not expressible in natural language).
+    #[allow(dead_code)]
     pub context: serde_json::Value,
 
     /// Optional caller-supplied correlation id. Unused in phase 1.
@@ -197,6 +203,7 @@ pub struct PeerTask {
     /// coordinator that retries a delegation after a timeout passes
     /// the same id so the peer can deduplicate. Adding the field now
     /// so the wire type is stable before retry logic lands.
+    #[allow(dead_code)]
     pub client_correlation_id: Option<String>,
 }
 
@@ -257,6 +264,7 @@ pub trait PeerTransport: Send + Sync {
     /// transport is not an error.
     async fn disconnect(&mut self) -> Result<(), PeerError>;
 
+    #[allow(dead_code)]
     fn is_connected(&self) -> bool;
 
     /// Execute one operation. Must call [`check_feature`] at the top

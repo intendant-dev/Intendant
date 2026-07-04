@@ -330,6 +330,20 @@ async function main() {
     assert(keysAfterRevoke, 'key status did not flip back after revoke');
     console.log('PASS lease-revoke material dropped, daemon unfueled again');
 
+    // ── Custody trail: the daemon's own record of what just happened ──
+    const trail = await rpc('api_credential_custody_trail');
+    assert(Array.isArray(trail.events) && trail.events.length >= 2,
+      `expected custody events: ${JSON.stringify(trail).slice(0, 200)}`);
+    const trailKinds = trail.events.map(e => e.event);
+    assert(trailKinds.includes('lease_granted'), 'trail must record the grant');
+    assert(trailKinds.includes('lease_revoked'), 'trail must record the revocation');
+    const trailGrant = trail.events.find(e => e.event === 'lease_granted' && e.kind === 'api_key:anthropic');
+    assert(trailGrant && trailGrant.actor,
+      `trail grant must name the granting principal: ${JSON.stringify(trailGrant)}`);
+    assert(!JSON.stringify(trail).includes('sk-ant-e2e-lease-material'),
+      'the custody trail must never carry credential material');
+    console.log(`PASS lease-audit custody trail records grant + revoke (grant by "${trailGrant.actor}")`);
+
     // ── OAuth materialization lifecycle (Codex + Claude Code) ──
     // OAuth leases materialize a private auth file for the child process;
     // revocation must delete it.

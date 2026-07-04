@@ -1192,7 +1192,7 @@ fn find_executable_under(root: &Path, names: &[&str], max_depth: usize) -> Optio
             continue;
         }
         if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
-            if names.iter().any(|name| *name == file_name) && is_regular_file(&path) {
+            if names.contains(&file_name) && is_regular_file(&path) {
                 return Some(path);
             }
         }
