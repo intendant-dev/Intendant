@@ -78,6 +78,7 @@ impl SyntheticDirtySources {
 
     /// Override the cursor synthetic-dirty radius. `radius_px` is the
     /// half-side of the dirty box. Default 32 (= 64×64 box).
+    #[allow(dead_code)]
     pub fn with_cursor_radius(mut self, radius_px: u32) -> Self {
         self.cursor_radius_px = radius_px;
         self
@@ -161,6 +162,7 @@ impl SyntheticDirtySources {
     /// Convenience for testing/tracing: collect synthetic rects AND
     /// the tiles they map to under the given grid. Returns
     /// `(rects, tile_set)`.
+    #[allow(dead_code)]
     pub fn collect_into_tiles(
         &mut self,
         grid: &TileGrid,
@@ -174,7 +176,7 @@ impl SyntheticDirtySources {
 
     fn cursor_box(&self, (cx, cy): (i32, i32)) -> Rect {
         let r = self.cursor_radius_px as i32;
-        let side = (self.cursor_radius_px * 2) as u32;
+        let side = self.cursor_radius_px * 2;
         Rect::new(cx - r, cy - r, side, side)
     }
 }

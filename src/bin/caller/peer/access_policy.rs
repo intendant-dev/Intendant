@@ -183,9 +183,9 @@ pub const ALL_OPERATIONS: [PeerOperation; 21] = [
 /// so the cap relation is operation-set containment, mirroring how role
 /// ceilings intersect permissions in the human lane.
 pub fn profile_fits_under(granted: &str, cap: &str) -> bool {
-    ALL_OPERATIONS.iter().all(|op| {
-        !profile_allows_operation(granted, *op) || profile_allows_operation(cap, *op)
-    })
+    ALL_OPERATIONS
+        .iter()
+        .all(|op| !profile_allows_operation(granted, *op) || profile_allows_operation(cap, *op))
 }
 
 pub fn profile_class(profile: &str) -> ProfileClass {
@@ -249,6 +249,7 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
     }
 }
 
+#[allow(dead_code)]
 pub fn profile_allows_control_msg(profile: &str, ctrl: &ControlMsg) -> bool {
     if matches!(ctrl, ControlMsg::PeerDashboardControlSignal { .. }) {
         return profile_allows_dashboard_control_tunnel(profile);
@@ -361,6 +362,7 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
     }
 }
 
+#[allow(dead_code)]
 pub fn profile_allows_federated_display_input(profile: &str) -> bool {
     profile_allows_operation(profile, PeerOperation::DisplayInput)
 }
@@ -411,6 +413,7 @@ pub fn filesystem_access_allowed(
     ))
 }
 
+#[allow(dead_code)]
 pub fn profile_allows_federation_http(profile: &str, request_line: &str) -> bool {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");

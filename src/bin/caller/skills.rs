@@ -199,6 +199,16 @@ pub fn discover_skills(project_root: Option<&Path>) -> Vec<Skill> {
             &mut skills,
             &mut seen_names,
         );
+        // Visible project path: skills/ (this repo's own skills/ ships
+        // through this one). Directories without a parseable SKILL.md are
+        // skipped, so unrelated skills/ folders in other projects are
+        // harmless.
+        load_skills_from_dir(
+            &root.join("skills"),
+            SkillSource::Project,
+            &mut skills,
+            &mut seen_names,
+        );
     }
 
     // 2. Personal skills (standard path first, then legacy)
@@ -478,6 +488,29 @@ Instructions here.
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].config.name, "lint");
         assert_eq!(skills[0].source, SkillSource::Project);
+    }
+
+    #[test]
+    fn discover_skills_visible_project_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("skills").join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
+
+        // The documented `<project_root>/skills/` path loads (this repo's
+        // own skills/ directory ships through it).
+        let skills = discover_skills(Some(tmp.path()));
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].config.name, "lint");
+        assert_eq!(skills[0].source, SkillSource::Project);
+
+        // Dotted paths still win over it for the same name.
+        let standard_dir = tmp.path().join(".agents").join("skills").join("lint");
+        std::fs::create_dir_all(&standard_dir).unwrap();
+        std::fs::write(standard_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
+        let skills = discover_skills(Some(tmp.path()));
+        assert_eq!(skills.len(), 1);
+        assert!(skills[0].source_path.to_string_lossy().contains(".agents"));
     }
 
     #[test]

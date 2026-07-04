@@ -325,6 +325,7 @@ pub fn layer_state_is_wanted(state: &LayerCapacityState) -> bool {
 /// Compute one peer's wanted-layer set from its per-RID capacity-state
 /// map. Caller (4d.3c aggregator) maintains the state map across
 /// ticks; this is a pure projection.
+#[allow(dead_code)]
 pub fn per_peer_wanted_layers(
     states: &HashMap<SimulcastRid, LayerCapacityState>,
 ) -> HashSet<SimulcastRid> {
@@ -670,10 +671,7 @@ pub enum CapacityAction {
 ///
 /// `None` input passes through as `None` — preserves the no-RR
 /// contract from 4d.3a's pre-RR filter.
-pub fn fresh_health<'a>(
-    raw: Option<&'a PeerLayerHealth>,
-    prev_count: u64,
-) -> Option<&'a PeerLayerHealth> {
+pub fn fresh_health(raw: Option<&PeerLayerHealth>, prev_count: u64) -> Option<&PeerLayerHealth> {
     raw.filter(|h| h.round_trip_time_measurements > prev_count)
 }
 
@@ -932,10 +930,10 @@ pub fn spawn_layer_policy_coordinator(
                         rr_subs.retain(|id, _| current_peers.contains_key(id));
                         for (id, peer) in current_peers.iter() {
                             twcc_subs
-                                .entry(id.clone())
+                                .entry(*id)
                                 .or_insert_with(|| peer.subscribe_twcc_health());
                             rr_subs
-                                .entry(id.clone())
+                                .entry(*id)
                                 .or_insert_with(|| {
                                     peer.subscribe_remote_inbound_health()
                                 });
@@ -1017,14 +1015,14 @@ pub fn spawn_layer_policy_coordinator(
                             // SAFE: peer_subs populated from
                             // current_peers above; entry exists.
                             let health =
-                                twcc_subs.get(peer_id).unwrap().borrow().clone();
+                                *twcc_subs.get(peer_id).unwrap().borrow();
                             let next = step_aggregate_layer_capacity(
                                 prev,
                                 health.as_ref(),
                                 &config,
                                 now,
                             );
-                            twcc_state.insert(peer_id.clone(), next);
+                            twcc_state.insert(*peer_id, next);
                             let mut wanted = aggregate_state_wanted_upper_layers(
                                 next,
                                 &upper_layers,
@@ -1053,7 +1051,7 @@ pub fn spawn_layer_policy_coordinator(
                                 HashSet::new();
                             peer_wanted.insert(floor.clone());
                             for rid in &upper_layers {
-                                let key = (peer_id.clone(), rid.clone());
+                                let key = (*peer_id, rid.clone());
                                 let prev = rr_state
                                     .get(&key)
                                     .copied()

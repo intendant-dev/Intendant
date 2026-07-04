@@ -95,7 +95,7 @@ impl FrameRegistry {
         let iter = self.frame_order.iter().rev();
         let mut results: Vec<&FrameMeta> = iter
             .filter_map(|fid| self.frames.get(fid))
-            .filter(|meta| stream.map_or(true, |s| meta.stream == s))
+            .filter(|meta| stream.is_none_or(|s| meta.stream == s))
             .take(count)
             .collect();
         results.reverse(); // chronological order

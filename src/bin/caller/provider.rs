@@ -171,10 +171,7 @@ impl ProviderHttpResponse {
         match self {
             ProviderHttpResponse::Direct(response) => Ok(response.json().await?),
             ProviderHttpResponse::Egress(response) => {
-                let body = response
-                    .body_text()
-                    .await
-                    .map_err(CallerError::Provider)?;
+                let body = response.body_text().await.map_err(CallerError::Provider)?;
                 serde_json::from_str(&body).map_err(CallerError::Json)
             }
         }
@@ -516,6 +513,7 @@ impl OpenAIProvider {
         }
     }
 
+    #[allow(dead_code)]
     pub fn new_plain(
         api_key: String,
         model: String,
@@ -814,7 +812,7 @@ impl ChatProvider for OpenAIProvider {
         if self.use_tools {
             self.custom_tools
                 .clone()
-                .unwrap_or_else(|| crate::tools::all_tools())
+                .unwrap_or_else(crate::tools::all_tools)
         } else {
             vec![]
         }
@@ -1508,7 +1506,9 @@ impl ChatProvider for AnthropicProvider {
             "prompt-caching-2024-07-31"
         };
 
-        let response = self.post_messages(&request_json, beta_header, false).await?;
+        let response = self
+            .post_messages(&request_json, beta_header, false)
+            .await?;
 
         if !response.status_success() {
             let status = response.status_line();
@@ -1629,7 +1629,7 @@ impl ChatProvider for AnthropicProvider {
         if self.use_tools {
             self.custom_tools
                 .clone()
-                .unwrap_or_else(|| crate::tools::all_tools())
+                .unwrap_or_else(crate::tools::all_tools)
         } else {
             vec![]
         }
@@ -2437,7 +2437,7 @@ impl ChatProvider for GeminiProvider {
         if self.use_tools {
             self.custom_tools
                 .clone()
-                .unwrap_or_else(|| crate::tools::all_tools())
+                .unwrap_or_else(crate::tools::all_tools)
         } else {
             vec![]
         }
@@ -3024,8 +3024,10 @@ pub(crate) fn mask_api_keys(s: &str) -> String {
 
 pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
     let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
-    let anthropic_key =
-        provider_auth_for("ANTHROPIC_API_KEY", crate::credential_egress::KIND_ANTHROPIC);
+    let anthropic_key = provider_auth_for(
+        "ANTHROPIC_API_KEY",
+        crate::credential_egress::KIND_ANTHROPIC,
+    );
     let gemini_key = provider_auth_for("GEMINI_API_KEY", crate::credential_egress::KIND_GEMINI);
 
     let preferred = env::var("PROVIDER").ok();
@@ -3073,8 +3075,7 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
         // Only Gemini key available (no explicit PROVIDER)
         (None, None, _) if gemini_key.is_some() => {
             let key = gemini_key.unwrap();
-            let model =
-                env::var("MODEL_NAME").unwrap_or_else(|_| "gemini-2.5-pro".to_string());
+            let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gemini-2.5-pro".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             Ok(Box::new(GeminiProvider::new(key, model, ctx, max_out)))
@@ -3102,6 +3103,7 @@ fn unfueled_error_text() -> String {
 /// Like `select_provider()` but accepts explicit provider/model overrides
 /// instead of reading from the primary `PROVIDER`/`MODEL_NAME` env vars.
 /// Falls back to env-based API key resolution.
+#[allow(dead_code)]
 pub fn select_provider_with_overrides(
     provider_name: Option<&str>,
     model_name: Option<&str>,
@@ -3116,8 +3118,10 @@ pub fn select_provider_with_overrides(
         .or_else(|| env::var("PRESENCE_MODEL").ok());
 
     let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
-    let anthropic_key =
-        provider_auth_for("ANTHROPIC_API_KEY", crate::credential_egress::KIND_ANTHROPIC);
+    let anthropic_key = provider_auth_for(
+        "ANTHROPIC_API_KEY",
+        crate::credential_egress::KIND_ANTHROPIC,
+    );
     let gemini_key = provider_auth_for("GEMINI_API_KEY", crate::credential_egress::KIND_GEMINI);
 
     match provider_str.as_deref() {
@@ -3180,8 +3184,10 @@ pub fn select_cu_provider(
         .or_else(|| env::var("CU_MODEL").ok());
 
     let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
-    let anthropic_key =
-        provider_auth_for("ANTHROPIC_API_KEY", crate::credential_egress::KIND_ANTHROPIC);
+    let anthropic_key = provider_auth_for(
+        "ANTHROPIC_API_KEY",
+        crate::credential_egress::KIND_ANTHROPIC,
+    );
     let gemini_key = provider_auth_for("GEMINI_API_KEY", crate::credential_egress::KIND_GEMINI);
 
     // CU providers get native CU tools + escalation function tool
@@ -3296,8 +3302,10 @@ pub fn select_presence_provider(
         .or_else(|| env::var("PRESENCE_MODEL").ok());
 
     let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
-    let anthropic_key =
-        provider_auth_for("ANTHROPIC_API_KEY", crate::credential_egress::KIND_ANTHROPIC);
+    let anthropic_key = provider_auth_for(
+        "ANTHROPIC_API_KEY",
+        crate::credential_egress::KIND_ANTHROPIC,
+    );
     let gemini_key = provider_auth_for("GEMINI_API_KEY", crate::credential_egress::KIND_GEMINI);
 
     let tools = presence::presence_tools();

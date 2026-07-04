@@ -171,6 +171,7 @@ impl PresenceLayer {
     }
 
     /// Return a shared handle to the paused flag for external pause/resume control.
+    #[allow(dead_code)]
     pub fn paused_flag(&self) -> Arc<AtomicUsize> {
         self.paused.clone()
     }
@@ -646,19 +647,16 @@ pub fn recall_memory(
     let mut sections: Vec<String> = Vec::new();
 
     // Source 1: Knowledge store
-    match knowledge::load(knowledge_path) {
-        Ok(store) => {
-            let results = knowledge::query(&store, &query);
-            if !results.is_empty() {
-                let formatted: Vec<String> = results
-                    .iter()
-                    .take(10)
-                    .map(|e| format!("[{}] {}: {}", e.channel, e.key, e.summary))
-                    .collect();
-                sections.push(formatted.join("\n"));
-            }
+    if let Ok(store) = knowledge::load(knowledge_path) {
+        let results = knowledge::query(&store, &query);
+        if !results.is_empty() {
+            let formatted: Vec<String> = results
+                .iter()
+                .take(10)
+                .map(|e| format!("[{}] {}: {}", e.channel, e.key, e.summary))
+                .collect();
+            sections.push(formatted.join("\n"));
         }
-        Err(_) => {}
     }
 
     // Source 2: Voice transcript search
@@ -1104,6 +1102,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
 #[derive(Debug, Clone)]
 pub struct CheckpointState {
     pub summary: String,
+    #[allow(dead_code)]
     pub last_event_seq: u64,
 }
 
@@ -1166,10 +1165,12 @@ impl PresenceSession {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         self.connected_count > 0
     }
 
+    #[allow(dead_code)]
     pub fn session_id(&self) -> &str {
         &self.session_id
     }

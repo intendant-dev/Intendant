@@ -108,7 +108,7 @@ fn try_strip_header(line: &str) -> Option<&str> {
             break;
         }
     }
-    if hashes >= 1 && hashes <= 4 && bytes.get(hashes) == Some(&b' ') {
+    if (1..=4).contains(&hashes) && bytes.get(hashes) == Some(&b' ') {
         Some(&line[hashes + 1..])
     } else {
         None

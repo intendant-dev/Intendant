@@ -91,6 +91,7 @@ impl Verbosity {
     }
 
     /// Short indicator shown in log panel for each verbosity level.
+    #[allow(dead_code)]
     pub fn hint(self) -> &'static str {
         match self {
             Self::Quiet => "Warn+Error only",

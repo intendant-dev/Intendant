@@ -292,7 +292,9 @@ pub fn inspect_worktree(
                 code: "head-changed".to_string(),
                 severity: "warning".to_string(),
                 label: "HEAD changed".to_string(),
-                detail: "The worktree HEAD changed since the cached scan; scan again before removing.".to_string(),
+                detail:
+                    "The worktree HEAD changed since the cached scan; scan again before removing."
+                        .to_string(),
             });
         }
     }
@@ -910,7 +912,10 @@ fn worktree_review_reasons(entry: &WorktreeEntry) -> Vec<WorktreeReviewReason> {
             "active-sessions",
             "warning",
             "Active sessions",
-            format!("{} active session(s) are linked to this worktree.", entry.active_sessions),
+            format!(
+                "{} active session(s) are linked to this worktree.",
+                entry.active_sessions
+            ),
         ));
     }
     if entry.conflicted > 0 {
@@ -1550,12 +1555,14 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.code == "untracked"));
-        assert!(inspected.status_files.iter().any(|file| {
-            file.path == "README.md" && file.category == "unstaged"
-        }));
-        assert!(inspected.status_files.iter().any(|file| {
-            file.path == "scratch.txt" && file.category == "untracked"
-        }));
+        assert!(inspected
+            .status_files
+            .iter()
+            .any(|file| { file.path == "README.md" && file.category == "unstaged" }));
+        assert!(inspected
+            .status_files
+            .iter()
+            .any(|file| { file.path == "scratch.txt" && file.category == "untracked" }));
     }
 
     #[test]

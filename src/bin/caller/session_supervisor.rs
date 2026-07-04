@@ -129,9 +129,7 @@ impl SupervisorState {
 
         let mut current = session_id;
         for _ in 0..8 {
-            let Some(next) = self.session_aliases.get(current) else {
-                return None;
-            };
+            let next = self.session_aliases.get(current)?;
             if self.sessions.contains_key(next) {
                 return Some(next.clone());
             }
@@ -909,8 +907,8 @@ impl SessionSupervisor {
         );
         self.activate_shared_session(session_log.clone()).await;
 
-        if !reference_frame_ids.is_empty() {
-            if self
+        if !reference_frame_ids.is_empty()
+            && self
                 .spawn_cu_task(
                     &session_id,
                     &task,
@@ -921,13 +919,12 @@ impl SessionSupervisor {
                     display_target,
                 )
                 .await
-            {
-                self.config.bus.send(AppEvent::SessionStarted {
-                    session_id: session_id.clone(),
-                    task: Some(task.clone()),
-                });
-                return;
-            }
+        {
+            self.config.bus.send(AppEvent::SessionStarted {
+                session_id: session_id.clone(),
+                task: Some(task.clone()),
+            });
+            return;
         }
 
         let use_direct = direct.unwrap_or(false)
@@ -4245,7 +4242,7 @@ pub(crate) fn effective_external_resume_token_in_home(
 
     let mut candidates = Vec::new();
     for candidate in [session_id.trim(), requested_resume_token] {
-        if !candidate.is_empty() && !candidates.iter().any(|id: &&str| *id == candidate) {
+        if !candidate.is_empty() && !candidates.contains(&candidate) {
             candidates.push(candidate);
         }
     }

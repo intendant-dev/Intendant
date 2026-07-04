@@ -55,10 +55,12 @@ impl TileUpdateReplayBuffer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[allow(dead_code)]
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
     }

@@ -1,9 +1,9 @@
-/// Map DOM KeyboardEvent.code to macOS virtual keycode (CGKeyCode).
-///
-/// Phase 1: physical key semantics only -- this maps physical key positions,
-/// not character output. Non-US layouts will produce incorrect characters
-/// for text entry. This mirrors the evdev keymap in `keymap.rs` but targets
-/// macOS virtual keycodes from Carbon's Events.h (kVK_* constants).
+//! Map DOM KeyboardEvent.code to macOS virtual keycode (CGKeyCode).
+//!
+//! Phase 1: physical key semantics only -- this maps physical key positions,
+//! not character output. Non-US layouts will produce incorrect characters
+//! for text entry. This mirrors the evdev keymap in `keymap.rs` but targets
+//! macOS virtual keycodes from Carbon's Events.h (kVK_* constants).
 
 /// Returns the macOS virtual keycode for the given DOM `KeyboardEvent.code`
 /// value, or `None` if the code is unrecognised.

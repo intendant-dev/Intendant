@@ -219,6 +219,7 @@ pub enum PeerEvent {
 pub struct WebRtcSessionId(pub String);
 
 impl WebRtcSessionId {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         &self.0
     }

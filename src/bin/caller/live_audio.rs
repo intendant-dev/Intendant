@@ -171,6 +171,7 @@ pub struct LiveAudioSession {
 
 impl LiveAudioSession {
     /// Send raw PCM16 audio to the model.
+    #[allow(dead_code)]
     pub async fn send_audio(&self, pcm16: &[u8]) -> Result<(), CallerError> {
         let b64 = BASE64.encode(pcm16);
         let msg = match self.provider {
@@ -619,21 +620,27 @@ impl AudioStreamBridge {
     }
 }
 
-/// Start a bidirectional audio bridge.
-///
-/// - **Capture**: reads from PulseAudio monitor (app audio) and sends to the live model
-/// - **Playback**: receives model audio output and writes to PulseAudio sink (app mic input)
+// Start a bidirectional audio bridge.
+//
+// - **Capture**: reads from PulseAudio monitor (app audio) and sends to the live model
+// - **Playback**: receives model audio output and writes to PulseAudio sink (app mic input)
 // ---------------------------------------------------------------------------
 // Vortex wire protocol (must match VortexAudioDaemon)
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 const VORTEX_MSG_CONFIGURE: u32 = 0x01;
+#[allow(dead_code)]
 const VORTEX_MSG_PCM_OUTPUT: u32 = 0x02;
+#[allow(dead_code)]
 const VORTEX_MSG_PCM_INPUT: u32 = 0x03;
+#[allow(dead_code)]
 const VORTEX_MSG_START: u32 = 0x04;
+#[allow(dead_code)]
 const VORTEX_MSG_STOP: u32 = 0x05;
 
 /// Read one Vortex wire protocol message: [u32 LE type][u32 LE len][payload].
+#[allow(dead_code)]
 async fn vortex_read_msg(
     reader: &mut (impl AsyncReadExt + Unpin),
 ) -> Result<(u32, Vec<u8>), CallerError> {
@@ -655,6 +662,7 @@ async fn vortex_read_msg(
 }
 
 /// Write one Vortex wire protocol message.
+#[allow(dead_code)]
 async fn vortex_write_msg(
     writer: &mut (impl AsyncWriteExt + Unpin),
     msg_type: u32,
@@ -789,9 +797,9 @@ pub async fn start_audio_bridge(
     .await
 }
 
-/// Network audio bridge: connects to a bh-bridge on the host over TCP.
-/// The TCP stream is full-duplex raw PCM16 mono — host→client is captured
-/// app audio, client→host is model audio for playback.
+// Network audio bridge: connects to a bh-bridge on the host over TCP.
+// The TCP stream is full-duplex raw PCM16 mono -- host to client is captured
+// app audio, client to host is model audio for playback.
 // ---------------------------------------------------------------------------
 // Vortex direct shared memory bridge (no daemon needed)
 // ---------------------------------------------------------------------------
@@ -806,6 +814,7 @@ const VORTEX_RING_MASK: u64 = (VORTEX_RING_SAMPLES - 1) as u64;
 
 // Field offsets into VortexSharedAudioState (bytes)
 const OFF_MAGIC: usize = 0;
+#[allow(dead_code)]
 const OFF_IS_ACTIVE: usize = 16;
 const OFF_OUT_WRITE_POS: usize = 24;
 const OFF_OUT_READ_POS: usize = 32;
@@ -1005,6 +1014,7 @@ async fn start_vortex_shm_bridge(
 ///
 /// Unix-only: binds a `UnixListener`. Gated off Windows for Tier-0.
 #[cfg(unix)]
+#[allow(dead_code)]
 async fn start_vortex_audio_bridge(
     session_write: Arc<Mutex<WsSink>>,
     provider: LiveAudioProvider,
@@ -1027,7 +1037,7 @@ async fn start_vortex_audio_bridge(
         .0;
     eprintln!("live_audio: vortex daemon connected");
 
-    let (mut read_half, mut write_half) = tokio::io::split(stream);
+    let (mut read_half, write_half) = tokio::io::split(stream);
 
     // Handshake: read CONFIGURE
     let (msg_type, payload) = vortex_read_msg(&mut read_half).await?;
@@ -1072,10 +1082,8 @@ async fn start_vortex_audio_bridge(
             match vortex_read_msg(&mut reader).await {
                 Ok((VORTEX_MSG_PCM_OUTPUT, payload)) => {
                     let pcm16 = vortex_capture_convert(&payload);
-                    if !pcm16.is_empty() {
-                        if cap_tx.send(pcm16).is_err() {
-                            break;
-                        }
+                    if !pcm16.is_empty() && cap_tx.send(pcm16).is_err() {
+                        break;
                     }
                 }
                 Ok((VORTEX_MSG_STOP, _)) => break,
@@ -1173,38 +1181,33 @@ async fn start_network_audio_bridge(
         let mut buf = vec![0u8; chunk_size];
         let mut chunks_sent = 0usize;
 
-        loop {
-            match reader.read_exact(&mut buf).await {
-                Ok(_) => {
-                    chunks_sent += 1;
-                    let b64 = BASE64.encode(&buf);
-                    let msg = match capture_provider {
-                        LiveAudioProvider::Gemini => serde_json::json!({
-                            "realtime_input": {
-                                "media_chunks": [{
-                                    "mime_type": format!("audio/pcm;rate={}", capture_rate),
-                                    "data": b64
-                                }]
-                            }
-                        }),
-                        LiveAudioProvider::OpenAI => serde_json::json!({
-                            "type": "input_audio_buffer.append",
-                            "audio": b64
-                        }),
-                    };
-                    if let Some(ref tee) = capture_tee_tx {
-                        let _ = tee.send(buf.clone());
+        while reader.read_exact(&mut buf).await.is_ok() {
+            chunks_sent += 1;
+            let b64 = BASE64.encode(&buf);
+            let msg = match capture_provider {
+                LiveAudioProvider::Gemini => serde_json::json!({
+                    "realtime_input": {
+                        "media_chunks": [{
+                            "mime_type": format!("audio/pcm;rate={}", capture_rate),
+                            "data": b64
+                        }]
                     }
-                    let mut sink = capture_write.lock().await;
-                    if sink
-                        .send(WsMessage::Text(msg.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => break,
+                }),
+                LiveAudioProvider::OpenAI => serde_json::json!({
+                    "type": "input_audio_buffer.append",
+                    "audio": b64
+                }),
+            };
+            if let Some(ref tee) = capture_tee_tx {
+                let _ = tee.send(buf.clone());
+            }
+            let mut sink = capture_write.lock().await;
+            if sink
+                .send(WsMessage::Text(msg.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
             }
         }
         eprintln!(
@@ -1273,37 +1276,32 @@ async fn start_local_audio_bridge(
         let chunk_size = (capture_rate as usize) * 2 / 10;
         let mut buf = vec![0u8; chunk_size];
 
-        loop {
-            match stdout.read_exact(&mut buf).await {
-                Ok(_) => {
-                    let b64 = BASE64.encode(&buf);
-                    let msg = match capture_provider {
-                        LiveAudioProvider::Gemini => serde_json::json!({
-                            "realtime_input": {
-                                "media_chunks": [{
-                                    "mime_type": format!("audio/pcm;rate={}", capture_rate),
-                                    "data": b64
-                                }]
-                            }
-                        }),
-                        LiveAudioProvider::OpenAI => serde_json::json!({
-                            "type": "input_audio_buffer.append",
-                            "audio": b64
-                        }),
-                    };
-                    if let Some(ref tee) = capture_tee_tx {
-                        let _ = tee.send(buf.clone());
+        while stdout.read_exact(&mut buf).await.is_ok() {
+            let b64 = BASE64.encode(&buf);
+            let msg = match capture_provider {
+                LiveAudioProvider::Gemini => serde_json::json!({
+                    "realtime_input": {
+                        "media_chunks": [{
+                            "mime_type": format!("audio/pcm;rate={}", capture_rate),
+                            "data": b64
+                        }]
                     }
-                    let mut sink = capture_write.lock().await;
-                    if sink
-                        .send(WsMessage::Text(msg.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => break,
+                }),
+                LiveAudioProvider::OpenAI => serde_json::json!({
+                    "type": "input_audio_buffer.append",
+                    "audio": b64
+                }),
+            };
+            if let Some(ref tee) = capture_tee_tx {
+                let _ = tee.send(buf.clone());
+            }
+            let mut sink = capture_write.lock().await;
+            if sink
+                .send(WsMessage::Text(msg.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
             }
         }
 
@@ -1511,21 +1509,18 @@ async fn whisper_inbound_loop(
         let wav = transcription::encode_wav(&audio_buf, sample_rate, 1);
         audio_buf.clear();
 
-        match transcriber.transcribe(&wav).await {
-            Ok(segment) => {
-                let text = segment.text.trim();
-                if !text.is_empty() {
-                    let entry = serde_json::json!({
-                        "ts": chrono::Utc::now().to_rfc3339(),
-                        "speaker": "app",
-                        "text": text,
-                    });
-                    let mut line = serde_json::to_string(&entry).unwrap_or_default();
-                    line.push('\n');
-                    let _ = transcript_file.write_all(line.as_bytes()).await;
-                }
+        if let Ok(segment) = transcriber.transcribe(&wav).await {
+            let text = segment.text.trim();
+            if !text.is_empty() {
+                let entry = serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "speaker": "app",
+                    "text": text,
+                });
+                let mut line = serde_json::to_string(&entry).unwrap_or_default();
+                line.push('\n');
+                let _ = transcript_file.write_all(line.as_bytes()).await;
             }
-            Err(_) => {} // Transcription failures are non-fatal
         }
     }
 }

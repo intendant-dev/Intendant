@@ -71,11 +71,15 @@ pub fn run_service_cli(args: &[String]) -> i32 {
 enum Backend {
     /// system == true installs the machine-wide unit (root); false the
     /// `--user` unit with lingering.
-    Systemd { system: bool },
+    Systemd {
+        system: bool,
+    },
     Launchd,
     /// boot == true is the elevated path (S4U task at machine boot);
     /// false a logon-triggered task for unelevated installs.
-    WindowsTask { boot: bool },
+    WindowsTask {
+        boot: bool,
+    },
     CronReboot,
 }
 
@@ -255,7 +259,11 @@ fn systemd_unit(
         .iter()
         .map(|(k, v)| format!("Environment={}\n", systemd_quote(&format!("{k}={v}"))))
         .collect();
-    let wanted_by = if system { "multi-user.target" } else { "default.target" };
+    let wanted_by = if system {
+        "multi-user.target"
+    } else {
+        "default.target"
+    };
     format!(
         "[Unit]\nDescription=Intendant daemon\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nExecStart={exec}\nWorkingDirectory={home}\n{env_lines}Restart=on-failure\nRestartSec={BACKOFF_START_SECS}\n\n[Install]\nWantedBy={wanted_by}\n"
     )
@@ -395,7 +403,12 @@ fn supervisor_run_args(
     envs: &[(String, String)],
     daemon_args: &[String],
 ) -> Vec<String> {
-    let mut args = vec!["service".to_string(), "run".to_string(), "--log".to_string(), log.to_string()];
+    let mut args = vec![
+        "service".to_string(),
+        "run".to_string(),
+        "--log".to_string(),
+        log.to_string(),
+    ];
     for (k, v) in envs {
         args.push("--env".to_string());
         args.push(format!("{k}={v}"));
@@ -458,15 +471,17 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
                 // Without lingering, user units die at logout — the exact
                 // thing a service install exists to prevent.
                 let user = std::env::var("USER").unwrap_or_default();
-                if !user.is_empty()
-                    && run_ok("loginctl", &["enable-linger", &user]).is_err()
-                {
+                if !user.is_empty() && run_ok("loginctl", &["enable-linger", &user]).is_err() {
                     println!(
                         "note: could not enable lingering; run 'sudo loginctl enable-linger {user}' or the daemon stops at logout."
                     );
                 }
             }
-            println!("installed systemd {} unit {}", if system { "system" } else { "user" }, unit_path.display());
+            println!(
+                "installed systemd {} unit {}",
+                if system { "system" } else { "user" },
+                unit_path.display()
+            );
             println!(
                 "claim phrase / logs: journalctl {}-u intendant -f",
                 if system { "" } else { "--user " }
@@ -481,7 +496,10 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
             let target = format!("gui/{}", crate::platform::unix_uid());
             // Re-bootstrap after an uninstall/reinstall cycle: boot out any
             // stale registration first (ignore failure — usually not loaded).
-            let _ = run_ok("launchctl", &["bootout", &format!("{target}/{LAUNCHD_LABEL}")]);
+            let _ = run_ok(
+                "launchctl",
+                &["bootout", &format!("{target}/{LAUNCHD_LABEL}")],
+            );
             let plist_str = plist_path.display().to_string();
             if run_ok("launchctl", &["bootstrap", &target, &plist_str]).is_err() {
                 // Older macOS fallback.
@@ -504,7 +522,14 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
             write_private(&xml_path, &xml)?;
             run_ok(
                 "schtasks",
-                &["/create", "/tn", WINDOWS_TASK_NAME, "/xml", &xml_path.display().to_string(), "/f"],
+                &[
+                    "/create",
+                    "/tn",
+                    WINDOWS_TASK_NAME,
+                    "/xml",
+                    &xml_path.display().to_string(),
+                    "/f",
+                ],
             )?;
             if now {
                 run_ok("schtasks", &["/run", "/tn", WINDOWS_TASK_NAME])?;
@@ -556,8 +581,7 @@ fn windows_user_id() -> String {
 
 fn write_private(path: &std::path::Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
     // The definition may carry the connect token; keep it owner-only
@@ -637,7 +661,10 @@ fn cli_uninstall() -> Result<(), String> {
             Some(s) => &[s],
             None => &[],
         };
-        let _ = run_ok("systemctl", &[scope_args, &["disable", "--now", "intendant"]].concat());
+        let _ = run_ok(
+            "systemctl",
+            &[scope_args, &["disable", "--now", "intendant"]].concat(),
+        );
         let _ = std::fs::remove_file(&unit_path);
         let _ = run_ok("systemctl", &[scope_args, &["daemon-reload"]].concat());
         println!("removed {}", unit_path.display());
@@ -714,8 +741,14 @@ fn cli_status() -> Result<(), String> {
     let mut found = false;
 
     for (unit_path, scope) in [
-        (PathBuf::from("/etc/systemd/system").join(SYSTEMD_UNIT_NAME), None),
-        (home.join(".config/systemd/user").join(SYSTEMD_UNIT_NAME), Some("--user")),
+        (
+            PathBuf::from("/etc/systemd/system").join(SYSTEMD_UNIT_NAME),
+            None,
+        ),
+        (
+            home.join(".config/systemd/user").join(SYSTEMD_UNIT_NAME),
+            Some("--user"),
+        ),
     ] {
         if !unit_path.exists() {
             continue;
@@ -725,7 +758,11 @@ fn cli_status() -> Result<(), String> {
             Some(s) => &[s],
             None => &[],
         };
-        let active = run_ok("systemctl", &[scope_args, &["is-active", "--quiet", "intendant"]].concat()).is_ok();
+        let active = run_ok(
+            "systemctl",
+            &[scope_args, &["is-active", "--quiet", "intendant"]].concat(),
+        )
+        .is_ok();
         println!(
             "systemd unit {} — {}",
             unit_path.display(),
@@ -807,7 +844,10 @@ fn cli_run(rest: &[String]) -> i32 {
                     return 2;
                 }
             },
-            "--env" => match iter.next().and_then(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))) {
+            "--env" => match iter.next().and_then(|kv| {
+                kv.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            }) {
                 Some(pair) => envs.push(pair),
                 None => {
                     eprintln!("error: --env requires KEY=VALUE");
@@ -850,10 +890,17 @@ fn cli_run(rest: &[String]) -> i32 {
     loop {
         // Rotate at spawn boundaries so one file handle serves a whole
         // daemon lifetime.
-        if std::fs::metadata(&log_path).map(|m| m.len() > LOG_ROTATE_BYTES).unwrap_or(false) {
+        if std::fs::metadata(&log_path)
+            .map(|m| m.len() > LOG_ROTATE_BYTES)
+            .unwrap_or(false)
+        {
             let _ = std::fs::rename(&log_path, log_path.with_extension("log.old"));
         }
-        let log_file = match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        let log_file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
             Ok(file) => file,
             Err(error) => {
                 eprintln!("error: open {}: {error}", log_path.display());
@@ -895,13 +942,18 @@ fn cli_run(rest: &[String]) -> i32 {
                     &log_file,
                     &format!(
                         "daemon exited ({}) after {uptime}s — restarting in {backoff}s",
-                        status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string())
+                        status
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|e| e.to_string())
                     ),
                 );
             }
             Err(error) => {
                 backoff = next_backoff(backoff, 0);
-                log_line(&log_file, &format!("spawn failed: {error} — retrying in {backoff}s"));
+                log_line(
+                    &log_file,
+                    &format!("spawn failed: {error} — retrying in {backoff}s"),
+                );
             }
         }
         std::thread::sleep(std::time::Duration::from_secs(backoff));
@@ -921,7 +973,10 @@ mod tests {
         let unit = systemd_unit(
             "/opt/intendant/target/release/intendant",
             &args(&["--no-tui", "--owner", "fp with space", "50%$x"]),
-            &[("INTENDANT_CONNECT_TOKEN".to_string(), "tok\"quote".to_string())],
+            &[(
+                "INTENDANT_CONNECT_TOKEN".to_string(),
+                "tok\"quote".to_string(),
+            )],
             "/home/box",
             true,
         );
@@ -940,7 +995,10 @@ mod tests {
         let plist = launchd_plist(
             "/Users/ada/intendant/target/release/intendant",
             &args(&["--no-tui", "--owner", "a<b&c"]),
-            &[("INTENDANT_CONNECT_DAEMON_ID".to_string(), "box<1>".to_string())],
+            &[(
+                "INTENDANT_CONNECT_DAEMON_ID".to_string(),
+                "box<1>".to_string(),
+            )],
             "/Users/ada",
             "/Users/ada/.intendant/logs/service.log",
         );
@@ -995,7 +1053,10 @@ mod tests {
         assert_eq!(windows_arg_quote("with space"), "\"with space\"");
         assert_eq!(windows_arg_quote(r#"say "hi""#), r#""say \"hi\"""#);
         // Trailing backslash before the closing quote must double.
-        assert_eq!(windows_arg_quote(r"C:\dir with space\"), r#""C:\dir with space\\""#);
+        assert_eq!(
+            windows_arg_quote(r"C:\dir with space\"),
+            r#""C:\dir with space\\""#
+        );
         assert_eq!(windows_arg_quote(""), "\"\"");
     }
 
@@ -1006,7 +1067,10 @@ mod tests {
         assert_eq!(next_backoff(48, 0), 60);
         assert_eq!(next_backoff(60, 0), 60);
         // A long healthy run resets the ladder.
-        assert_eq!(next_backoff(60, BACKOFF_RESET_UPTIME_SECS), BACKOFF_START_SECS);
+        assert_eq!(
+            next_backoff(60, BACKOFF_RESET_UPTIME_SECS),
+            BACKOFF_START_SECS
+        );
     }
 
     #[test]

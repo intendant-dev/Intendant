@@ -19,6 +19,7 @@ pub struct RecordingGuard {
     stdin: Option<tokio::process::ChildStdin>,
     stream_name: String,
     segments_dir: PathBuf,
+    #[allow(dead_code)]
     started_at: chrono::DateTime<chrono::Utc>,
     /// Background bridge task (frame-fed path only). Aborted on drop.
     bridge_task: Option<tokio::task::JoinHandle<()>>,
@@ -32,6 +33,7 @@ pub enum StopRecordingOutcome {
 
 impl RecordingGuard {
     /// Check if the ffmpeg process is still alive.
+    #[allow(dead_code)]
     pub fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
@@ -44,6 +46,7 @@ impl RecordingGuard {
         &self.segments_dir
     }
 
+    #[allow(dead_code)]
     pub fn started_at(&self) -> chrono::DateTime<chrono::Utc> {
         self.started_at
     }
@@ -305,9 +308,8 @@ pub async fn start_display_recording(
         },
     )
     .await
-    .map_err(|e| {
+    .inspect_err(|_| {
         let _ = std::fs::remove_dir_all(&segments_dir);
-        e
     })?;
 
     if use_screencapture_feeder {
@@ -446,9 +448,8 @@ pub async fn start_frame_recording(
     // hand out a RecordingGuard that will quietly produce empty segments.
     verify_ffmpeg_started(&mut child, &log_path, "image2pipe")
         .await
-        .map_err(|e| {
+        .inspect_err(|_| {
             let _ = std::fs::remove_dir_all(&segments_dir);
-            e
         })?;
 
     // Take stdin out of the child before moving it into the guard
@@ -475,6 +476,7 @@ pub struct SegmentInfo {
 
 /// Result of seeking to a timestamp within a recording.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SeekResult {
     pub segment_path: PathBuf,
     pub offset_secs: f64,
@@ -632,6 +634,7 @@ impl RecordingRegistry {
     }
 
     /// Seek to a specific time offset (seconds from recording start) within a stream.
+    #[allow(dead_code)]
     pub fn seek(&self, stream_name: &str, offset_secs: f64) -> Option<SeekResult> {
         let segments = self.segments(stream_name);
         for seg in &segments {
@@ -718,10 +721,7 @@ pub fn parse_segment_csv_pub(csv_path: &Path, segments_dir: &Path) -> Vec<Segmen
 }
 
 fn parse_segment_csv(csv_path: &Path, segments_dir: &Path) -> Vec<SegmentInfo> {
-    let content = match std::fs::read_to_string(csv_path) {
-        Ok(c) => c,
-        Err(_) => String::new(),
-    };
+    let content = std::fs::read_to_string(csv_path).unwrap_or_default();
     let mut segments = Vec::new();
     for line in content.lines() {
         let line = line.trim();

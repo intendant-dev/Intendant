@@ -124,6 +124,7 @@ impl PinnedFingerprintVerifier {
     /// Each is parsed via [`parse_fingerprint`]; the first parse
     /// failure aborts and returns an error mentioning the offending
     /// entry so the operator can fix their config.
+    #[allow(dead_code)]
     pub fn from_strings<I, S>(strings: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = S>,
@@ -231,6 +232,7 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
 /// and the agent-card HTTP fetch path (via reqwest's
 /// `use_preconfigured_tls`) when the peer's `auth.transport` is
 /// `PinnedMutualTls`.
+#[allow(dead_code)]
 pub fn pinned_client_config(verifier: PinnedFingerprintVerifier) -> rustls::ClientConfig {
     pinned_client_config_with_client_auth(verifier, None)
         .expect("pinned client config without client auth is valid")

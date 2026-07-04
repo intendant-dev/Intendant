@@ -85,6 +85,7 @@ pub(crate) fn log_event(level: LogLevel, source: &str, message: String) -> PeerE
 /// (Model/Agent/SubAgent) collapse to `Info` because the peer Log
 /// event has a separate `source` field that carries the
 /// differentiation.
+#[allow(dead_code)]
 pub(crate) fn upcast_log_level(level: &crate::types::LogLevel) -> LogLevel {
     use crate::types::LogLevel as L;
     match level {
@@ -116,6 +117,7 @@ pub(crate) fn wire_log_level(s: &str) -> LogLevel {
 /// for `ApprovalRequest.category`. Lowercase snake_case to match
 /// the convention other autonomous daemons (OpenClaw) use for
 /// category tags.
+#[allow(dead_code)]
 pub(crate) fn action_category_wire(cat: &crate::autonomy::ActionCategory) -> String {
     use crate::autonomy::ActionCategory as C;
     match cat {
@@ -166,6 +168,7 @@ pub(crate) fn status_from_phase(phase: &str) -> PeerStatus {
 // ---------------------------------------------------------------------------
 
 /// Stateful `AppEvent` → `PeerEvent` upcaster.
+#[allow(dead_code)]
 pub struct AppEventUpcaster {
     /// Monotonic counter for synthesizing stable IDs when the source
     /// event doesn't carry a natural one.
@@ -201,6 +204,7 @@ impl Default for AppEventUpcaster {
 }
 
 impl AppEventUpcaster {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             seq: 0,
@@ -223,6 +227,7 @@ impl AppEventUpcaster {
     /// failed. TaskComplete propagates its own outcome — a failed
     /// task means the in-flight agent is failing too, so we don't
     /// want to stamp it Success alongside a failed turn.
+    #[allow(dead_code)]
     fn close_pending_agent(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
         self.current_agent_turn
             .take()
@@ -234,6 +239,7 @@ impl AppEventUpcaster {
 
     /// Drain any in-flight turn activity. Called from `DoneSignal`,
     /// `TaskComplete`, and the next `TurnStarted` (defensive).
+    #[allow(dead_code)]
     fn close_pending_turn(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
         self.current_turn
             .take()
@@ -243,6 +249,7 @@ impl AppEventUpcaster {
             })
     }
 
+    #[allow(dead_code)]
     fn next_seq(&mut self) -> u64 {
         self.seq = self.seq.saturating_add(1);
         self.seq
@@ -253,6 +260,7 @@ impl AppEventUpcaster {
     /// `ModelResponseDelta` and `ModelResponse` so they share state
     /// seamlessly — whichever arrives first seeds the ID, subsequent
     /// events reuse it.
+    #[allow(dead_code)]
     fn current_or_new_message_id(&mut self) -> MessageId {
         if let Some(id) = &self.current_message_id {
             return id.clone();
@@ -264,6 +272,7 @@ impl AppEventUpcaster {
     }
 
     /// Map an `AppEvent` to zero or more `PeerEvent`s.
+    #[allow(dead_code)]
     pub fn upcast(&mut self, event: &AppEvent) -> Vec<PeerEvent> {
         match event {
             // ---- Dropped internal events ----
@@ -329,8 +338,6 @@ impl AppEventUpcaster {
                     format!("/{}: FAILED — {}", action, message)
                 },
             )],
-
-
 
             // ---- Turn lifecycle ----
             AppEvent::TurnStarted { turn, .. } => {
@@ -1073,7 +1080,6 @@ impl AppEventUpcaster {
                 }
             }
 
-
             AppEvent::ClaudeConfigChanged {
                 model,
                 model_cleared,
@@ -1102,7 +1108,6 @@ impl AppEventUpcaster {
                     )]
                 }
             }
-
 
             // ---- Budget / safety ----
             AppEvent::BudgetWarning { pct, remaining } => vec![log_event(
@@ -1476,8 +1481,6 @@ impl WireEventUpcaster {
                     format!("/{}: FAILED — {}", action, message)
                 },
             )],
-
-
 
             // ---- Turn lifecycle ----
             OutboundEvent::TurnStarted { turn, .. } => {
@@ -2152,7 +2155,6 @@ impl WireEventUpcaster {
                 }
             }
 
-
             OutboundEvent::ClaudeConfigChanged {
                 model,
                 model_cleared,
@@ -2181,7 +2183,6 @@ impl WireEventUpcaster {
                     )]
                 }
             }
-
 
             // ---- Budget / safety ----
             OutboundEvent::BudgetWarning { pct, remaining } => vec![log_event(

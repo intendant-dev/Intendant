@@ -95,6 +95,7 @@ impl DisplayTarget {
     }
 
     /// Return the stream name used in frame/recording registries.
+    #[allow(dead_code)]
     pub fn stream_name(&self) -> String {
         match self {
             DisplayTarget::Virtual { id } => format!("display_{}", id),
@@ -109,6 +110,7 @@ impl DisplayTarget {
 
     /// Convert a raw display ID to a `DisplayTarget`.
     /// `0` maps to `UserSession`, positive values to `Virtual`.
+    #[allow(dead_code)]
     pub fn from_display_id(id: i32) -> Self {
         if id <= 0 {
             DisplayTarget::UserSession
@@ -119,6 +121,7 @@ impl DisplayTarget {
 
     /// Bridge for `Command.display: Option<i32>` (the JSON wire format).
     /// Returns the explicit target if provided, otherwise the given default.
+    #[allow(dead_code)]
     pub fn from_command_display(display: Option<i32>, default: Self) -> Self {
         match display {
             Some(id) => Self::from_display_id(id),
@@ -280,6 +283,7 @@ pub struct CuToolCall {
     /// Parsed actions (one for Anthropic/Gemini, possibly many for OpenAI).
     pub actions: Vec<CuAction>,
     /// Provider-specific metadata (safety checks, etc.).
+    #[allow(dead_code)]
     pub metadata: CuCallMetadata,
 }
 
@@ -287,8 +291,10 @@ pub struct CuToolCall {
 #[derive(Debug, Clone, Default)]
 pub struct CuCallMetadata {
     /// OpenAI: pending safety checks that must be acknowledged in the result.
+    #[allow(dead_code)]
     pub pending_safety_checks: Vec<serde_json::Value>,
     /// Gemini: safety decision string.
+    #[allow(dead_code)]
     pub safety_decision: Option<String>,
 }
 

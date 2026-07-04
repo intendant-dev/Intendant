@@ -165,6 +165,7 @@ impl PeerHandle {
         self.inner.connection.clone()
     }
 
+    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         matches!(*self.inner.connection.borrow(), ConnectionState::Connected)
     }
@@ -210,6 +211,7 @@ impl PeerHandle {
     /// Operator-supplied browser-side TCP via URL for this peer.
     /// Exposed here for diagnostics; the dashboard reads the same
     /// value out of [`PeerSnapshot::browser_tcp_via_url`].
+    #[allow(dead_code)]
     pub fn browser_tcp_via_url(&self) -> Option<&str> {
         self.inner.browser_tcp_via_url.as_deref()
     }
@@ -251,6 +253,7 @@ impl PeerHandle {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn cancel_task(&self, task: &TaskId) -> Result<(), PeerError> {
         if !self.features().task_cancel {
             return Err(PeerError::UnsupportedCapability("task_cancel".into()));
@@ -264,6 +267,7 @@ impl PeerHandle {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn query_task(&self, task: &TaskId) -> Result<TaskUpdate, PeerError> {
         if !self.features().task_query {
             return Err(PeerError::UnsupportedCapability("task_query".into()));
@@ -280,6 +284,7 @@ impl PeerHandle {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn invoke(
         &self,
         capability: &str,
