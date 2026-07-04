@@ -14334,8 +14334,10 @@ function applyUnfueledEmptyState(unfueled) {
   applyUnfueledExternalAgentNote(empty);
 }
 
-/* The nudge's counterweight: name the external agents that still work.
-   Only rendered while the unfueled state is showing. */
+/* The nudge's counterweight: name the external agents that still work,
+   by actual auth posture — a leased or locally-signed-in backend needs
+   no fuel, a signed-out one needs its own login or an oauth lease from
+   the vault. Only rendered while the unfueled state is showing. */
 function applyUnfueledExternalAgentNote(empty) {
   const installed = installedExternalAgents();
   let note = document.getElementById('log-empty-external-agents');
@@ -14349,11 +14351,20 @@ function applyUnfueledExternalAgentNote(empty) {
     note.className = 'ui-empty-hint';
     empty.appendChild(note);
   }
-  const names = installed.map(agent => agent.label || agent.id).join(' and ');
-  const plural = installed.length > 1;
-  note.textContent = `${names} ${plural ? 'are' : 'is'} installed and `
-    + `${plural ? 'run on their own accounts' : 'runs on its own account'}`
-    + ' — external-agent sessions work without fuel.';
+  const parts = installed.map(agent => {
+    const name = agent.label || agent.id;
+    if (agent.leased) {
+      return `${name} is fueled with a subscription lease and ready`;
+    }
+    if (agent.local_login === true) {
+      return `${name} is signed in on the daemon and needs no fuel`;
+    }
+    if (agent.local_login === false) {
+      return `${name} is installed but signed out — sign it in on the daemon, or lease its subscription from your vault`;
+    }
+    return `${name} is installed and runs on its own login — or a subscription lease from your vault`;
+  });
+  note.textContent = parts.join('. ') + '.';
 }
 // Probe once the transport can answer; in connect mode the data channel
 // (possibly via TURN) can take a while, so keep retrying for ~40s rather
