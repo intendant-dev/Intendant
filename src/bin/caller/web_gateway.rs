@@ -22055,13 +22055,17 @@ pub fn spawn_web_gateway(
                     if request_line.starts_with("OPTIONS") {
                         use tokio::io::AsyncWriteExt;
                         let (_, opt_path, _) = parse_request_target(request_line);
-                        let response = if opt_path.starts_with("/api/")
+                        let response = if (opt_path.starts_with("/api/")
                             && !is_fleet_cors_access_path(opt_path)
-                            && !is_public_peer_access_request_path(request_line)
+                            && !is_public_peer_access_request_path(request_line))
+                            || opt_path == "/mcp"
                         {
-                            // Non-fleet APIs are same-origin (or app-scheme)
-                            // only; a cross-origin preflight gets no ACAO and
-                            // the browser stops there.
+                            // Non-fleet APIs and /mcp are same-origin (or
+                            // app-scheme) only; a cross-origin preflight gets
+                            // no ACAO and the browser stops there. (/mcp
+                            // responses use the same own/app-origin rule via
+                            // mcp_cors_header_segment — the preflight must not
+                            // be looser than the endpoint.)
                             let allowed = extract_origin_header(&header_text).filter(|origin| {
                                 is_own_or_app_origin(origin, is_tls, &header_text)
                             });

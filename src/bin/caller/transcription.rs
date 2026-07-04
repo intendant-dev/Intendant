@@ -84,6 +84,14 @@ pub struct WhisperTranscriber {
 
 impl WhisperTranscriber {
     pub fn new(config: &TranscriptionConfig) -> Result<Self, CallerError> {
+        // Enforce the opt-in at the boundary: transcription ships user audio
+        // to an API, so a disabled config must never yield a working
+        // transcriber, no matter which surface asks.
+        if !config.enabled {
+            return Err(CallerError::Config(
+                "transcription is disabled — enable it with [transcription] enabled = true in intendant.toml".to_string(),
+            ));
+        }
         let api_key =
             crate::credential_leases::provider_api_key("OPENAI_API_KEY").ok_or_else(|| {
                 CallerError::Config(
@@ -253,6 +261,15 @@ mod tests {
         assert_eq!(wav.len(), 44);
         let data_size = u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]);
         assert_eq!(data_size, 0);
+    }
+
+    #[test]
+    fn disabled_config_never_yields_a_transcriber() {
+        // The opt-in is enforced at the constructor (checked before the API
+        // key so this holds regardless of the test environment): a default
+        // (disabled) config must not produce a working transcriber.
+        let config = TranscriptionConfig::default();
+        assert!(WhisperTranscriber::new(&config).is_err());
     }
 
     #[test]
