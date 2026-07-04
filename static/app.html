@@ -8057,11 +8057,50 @@ body.context-focus-active {
   top: 34px;
 }
 /* Card action buttons are compact ui-btn variants; ui-btn (+.danger)
-   carries look and hover states. */
+   carries look and hover states. At rest they go quiet (ghost) so the
+   list reads as content instead of a wall of buttons; engaging the card
+   with pointer or keyboard restores them, and touch devices — which
+   have no hover — keep them fully visible. Only colors change, so rows
+   never shift. */
 .session-card .sc-actions .ui-btn {
   min-height: 24px;
   padding: 3px 9px;
   font-size: 11px;
+  background: transparent;
+  border-color: transparent;
+  color: var(--overlay1);
+  transition: color 0.12s ease, border-color 0.12s ease, background-color 0.12s ease;
+}
+.session-card:hover .sc-actions .ui-btn,
+.session-card:focus-within .sc-actions .ui-btn {
+  background: var(--surface0);
+  border-color: var(--surface1);
+  color: var(--text);
+}
+.session-card:hover .sc-actions .ui-btn:hover {
+  border-color: var(--blue);
+}
+.session-card:hover .sc-actions .ui-btn.danger,
+.session-card:focus-within .sc-actions .ui-btn.danger {
+  background: transparent;
+  border-color: rgba(243, 139, 168, 0.7);
+  color: var(--red);
+}
+.session-card:hover .sc-actions .ui-btn.danger:hover {
+  border-color: var(--red);
+  background: rgba(243, 139, 168, 0.08);
+}
+@media (hover: none) {
+  .session-card .sc-actions .ui-btn {
+    background: var(--surface0);
+    border-color: var(--surface1);
+    color: var(--text);
+  }
+  .session-card .sc-actions .ui-btn.danger {
+    background: transparent;
+    border-color: rgba(243, 139, 168, 0.7);
+    color: var(--red);
+  }
 }
 .sc-delete-btn:disabled,
 .sc-delete-btn.pending,
@@ -60345,6 +60384,25 @@ function renderSessionStatsFallback(sessions) {
       { label: 'Total tokens', value: total.toLocaleString() },
       { label: 'Estimated cost', value: formatUsd(sessionCost(latest.estimated_cost), 4) },
     ]));
+  }
+
+  // Third card: cache economics. Prompt reuse is where this system's
+  // token bill is won or lost, and the numbers are already in `totals` —
+  // this completes the row as volume | recency | efficiency. (The live
+  // usage view has its own third card, so only the fallback needs one.)
+  if (totals.allInput > 0) {
+    const pct = (part, whole) => (whole > 0 ? `${((part / whole) * 100).toFixed(1)}%` : '—');
+    const latestInput = latest ? sessionNumber(latest.prompt_tokens) : 0;
+    const latestCached = latest ? sessionNumber(latest.cached_tokens) : 0;
+    const rows = [
+      { label: 'Hit rate', value: pct(totals.allCached, totals.allInput) },
+      { label: 'Cached tokens', value: totals.allCached.toLocaleString() },
+      { label: 'Fresh input', value: Math.max(0, totals.allInput - totals.allCached).toLocaleString() },
+    ];
+    if (latestInput > 0) {
+      rows.push({ label: 'Latest session', value: pct(latestCached, latestInput) });
+    }
+    cardsEl.appendChild(renderStatsSummaryCard('Cache', 'Prompt reuse across all sessions', rows));
   }
 
   if (costEl) {
