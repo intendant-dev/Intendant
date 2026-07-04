@@ -30034,19 +30034,26 @@ fn ws_grant_allows_control(
     if peer_identity.is_some() {
         return true;
     }
-    // Same tunnel-door rule as the peer lane: signaling relay opens for a
-    // grant that can use at least one capability the tunnel carries.
-    if matches!(ctrl, ControlMsg::PeerDashboardControlSignal { .. }) {
-        if crate::peer::access_policy::DASHBOARD_CONTROL_TUNNEL_OPERATIONS
-            .iter()
-            .any(|op| grant.access_decision(*op).allowed)
-        {
+    // Relaying signaling to a connected peer delegates THIS daemon's peer
+    // identity — the receiving peer authorizes the tunnel against its
+    // grants for this daemon, not against the human grant that asked for
+    // the relay. That delegation is its own named permission (peer.use),
+    // never inferred from local capabilities.
+    if matches!(
+        ctrl,
+        ControlMsg::PeerDashboardControlSignal { .. } | ControlMsg::PeerFileTransferSignal { .. }
+    ) {
+        let decision =
+            grant.access_decision(crate::peer::access_policy::PeerOperation::PeerUse);
+        if decision.allowed {
             return true;
         }
         bus.send(AppEvent::PresenceLog {
             message: format!(
-                "[ws] denied {} dashboard-control signaling: grant allows no tunnel capability",
+                "[ws] denied {} peer signaling relay: permission={} reason={}",
                 grant.wire_kind(),
+                decision.permission,
+                decision.reason,
             ),
             level: Some(LogLevel::Warn),
             turn: None,
@@ -41291,6 +41298,116 @@ mod tests {
         assert!(response.contains("403 Forbidden"));
         assert!(response.contains("access.manage"));
         assert!(response.contains("Alice browser"));
+    }
+
+    #[test]
+    fn peer_signal_relay_requires_peer_use_across_lanes() {
+        use crate::peer::access_policy::PeerOperation;
+
+        // The relay routes classify as PeerUse on the HTTP lane.
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/peers/intendant:peer-b/dashboard-control-webrtc"),
+            Some(PeerOperation::PeerUse)
+        );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/peers/intendant:peer-b/file-transfer-webrtc"),
+            Some(PeerOperation::PeerUse)
+        );
+
+        // A files-scoped human cannot delegate the daemon's peer identity…
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "test",
+            "dashboard-control",
+        );
+        access_iam_upsert_user_client_grant_response_value_with_cert_dir(
+            tmp.path(),
+            serde_json::json!({
+                "kind": "browser_certificate",
+                "label": "Files-only browser",
+                "fingerprint": "F1:1E",
+                "role_id": "role:files-write"
+            }),
+            &actor,
+        )
+        .unwrap();
+        let files_only = http_access_context(tmp.path(), None, Some("f11e"), true, true).unwrap();
+        assert!(files_only.decision(PeerOperation::FilesystemWrite).allowed);
+        let relay = files_only.decision(PeerOperation::PeerUse);
+        assert!(!relay.allowed);
+        assert_eq!(relay.permission, "peer.use");
+
+        // …while operator and the dedicated peer-user role can.
+        for (fingerprint, hex, role) in [
+            ("0B:E4", "0be4", "role:operator"),
+            ("9E:E5", "9ee5", "role:peer-user"),
+        ] {
+            access_iam_upsert_user_client_grant_response_value_with_cert_dir(
+                tmp.path(),
+                serde_json::json!({
+                    "kind": "browser_certificate",
+                    "label": format!("{role} browser"),
+                    "fingerprint": fingerprint,
+                    "role_id": role
+                }),
+                &actor,
+            )
+            .unwrap();
+            let access = http_access_context(tmp.path(), None, Some(hex), true, true).unwrap();
+            assert!(
+                access.decision(PeerOperation::PeerUse).allowed,
+                "{role} should relay peer signaling"
+            );
+            assert!(
+                !access.decision(PeerOperation::PeerManage).allowed,
+                "{role} must not administer peers"
+            );
+        }
+    }
+
+    #[test]
+    fn ws_grant_gate_requires_peer_use_for_signal_relay() {
+        let signal = ControlMsg::PeerDashboardControlSignal {
+            session_id: "s".into(),
+            signal: crate::peer::WebRtcSignal::Unknown,
+        };
+        let transfer = ControlMsg::PeerFileTransferSignal {
+            session_id: "s".into(),
+            signal: crate::peer::WebRtcSignal::Unknown,
+        };
+        let bus = EventBus::new();
+
+        // Trusted local dashboards keep full relay authority.
+        let trusted = crate::dashboard_control::DashboardControlGrant::TrustedLocal;
+        assert!(ws_grant_allows_control(&trusted, None, &signal, &bus));
+        assert!(ws_grant_allows_control(&trusted, None, &transfer, &bus));
+
+        // A scoped human without peer.use is refused on both relay frames,
+        // even though the file-transfer frame's receiving-side class
+        // (FilesystemRead) is within the grant.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "test",
+            "dashboard-control",
+        );
+        access_iam_upsert_user_client_grant_response_value_with_cert_dir(
+            tmp.path(),
+            serde_json::json!({
+                "kind": "browser_certificate",
+                "label": "Files-only browser",
+                "fingerprint": "F1:1E",
+                "role_id": "role:files-write"
+            }),
+            &actor,
+        )
+        .unwrap();
+        let scoped = http_access_context(tmp.path(), None, Some("f11e"), true, true).unwrap();
+        let scoped_grant = crate::dashboard_control::DashboardControlGrant::UserClient {
+            principal: scoped.principal.clone(),
+            iam_state: scoped.iam_state.clone().expect("scoped iam state"),
+        };
+        assert!(!ws_grant_allows_control(&scoped_grant, None, &signal, &bus));
+        assert!(!ws_grant_allows_control(&scoped_grant, None, &transfer, &bus));
     }
 
     #[test]

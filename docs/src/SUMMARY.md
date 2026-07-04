@@ -17,6 +17,7 @@
 - [Presence Layer](./presence.md)
 - [TUI & Autonomy](./tui.md)
 - [Web Dashboard](./web-dashboard.md)
+- [Station](./station.md)
 - [MCP Server](./mcp-server.md)
 - [Integrations](./integrations.md)
 - [Session Logging](./session-logging.md)

@@ -2122,14 +2122,17 @@ fn dashboard_control_method_operation(
         }
         "api_peer_pairing_invite" => Some(PeerOperation::AccessManage),
         "api_peers" | "api_peer_eligible" => Some(PeerOperation::PeerInspect),
+        // Signaling relays open tunnels the receiving peer authorizes
+        // against its own grants for this daemon — peer use, not peer
+        // administration.
+        "api_peer_webrtc_signal"
+        | "api_peer_file_transfer_signal"
+        | "api_peer_dashboard_control_signal" => Some(PeerOperation::PeerUse),
         "api_peer_add"
         | "api_peer_remove"
         | "api_peer_message"
         | "api_peer_task"
         | "api_peer_approval"
-        | "api_peer_webrtc_signal"
-        | "api_peer_file_transfer_signal"
-        | "api_peer_dashboard_control_signal"
         | "api_peer_pairing_join"
         | "api_peer_pairing_request_access"
         | "api_peer_pairing_request_access_poll"
@@ -4531,6 +4534,10 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         runtime,
         crate::peer::access_policy::PeerOperation::PeerManage,
     );
+    let peer_use = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::PeerUse,
+    );
     let message =
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Message);
     let capabilities = [
@@ -4538,6 +4545,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("access_manage_available", access_manage),
         ("peer_inspect_available", peer_inspect),
         ("peer_manage_available", peer_manage),
+        ("peer_use_available", peer_use),
         (
             "api_peers_available",
             peer_registry_available && peer_inspect,
@@ -4686,15 +4694,15 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ),
         (
             "api_peer_webrtc_signal_available",
-            peer_registry_available && peer_manage,
+            peer_registry_available && peer_use,
         ),
         (
             "api_peer_file_transfer_signal_available",
-            peer_registry_available && peer_manage,
+            peer_registry_available && peer_use,
         ),
         (
             "api_peer_dashboard_control_signal_available",
-            peer_registry_available && peer_manage,
+            peer_registry_available && peer_use,
         ),
         ("api_peer_pairing_available", peer_manage || access_manage),
         ("api_peer_pairing_invite_available", access_manage),

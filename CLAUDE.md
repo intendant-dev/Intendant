@@ -1,17 +1,19 @@
 # CLAUDE.md
 
-> **Living document — last verified 2026-07-03 against `main` @ `2800e1ce`.**
+> **Living document — last verified 2026-07-04 against `main` @ `3fb8eb30`.**
 > This is a *tight orientation* for working in the repo. The deep reference lives in
 > the mdBook under `docs/src/` (mapped below). **Both this file and those docs lag the
 > code** — Intendant moves fast (~500 commits/month) and the docs are *not* updated on
 > every change. When this file, the docs, and the source disagree, **trust the source**,
 > then fix the doc. See what changed since this was written with
-> `git log --oneline 2800e1ce..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
+> `git log --oneline 3fb8eb30..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
 > file — when you edit CLAUDE.md, run `cp CLAUDE.md AGENTS.md` in the same commit; CI enforces they match.)
 
 ## What Intendant Is
 
 Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. Beyond running its own agent loop, it **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines**. Provider-agnostic (OpenAI, Anthropic, Gemini); cross-platform (macOS, Linux, Windows — all first-class); every capability reachable from any interface (CLI, TUI, web dashboard, MCP, voice).
+
+Past the single box, the ambition is a **network of agentic networks** — fleets of daemons owned by people and organizations, where owners grant other people and other daemons scoped access to their machines, infrastructure, and resources. Three pillars carry it: the **trust architecture** (authority is only ever minted by the target daemon's local IAM; browser identity keys protected by passkeys; org root keys sign grant documents and revocation lists; the hosted rendezvous is zero-authority and self-hostable), **credential custody** (daemons borrow time-boxed leases from a passkey-sealed vault or relay calls through the owner's browser — a disposable box's disk holds no durable secrets), and the **zero-install client** (the entire client is a browser tab: claim a fresh daemon with a twelve-word phrase, watch every fleet display live, phone included). The name is the thesis: agents perform, orchestrators conduct, the Intendant runs the house — and answers to the owner.
 
 ## The Three Binaries (security boundary)
 
@@ -43,7 +45,9 @@ Read the relevant chapter before changing a subsystem:
 | Presence layer (server text + browser voice) | `docs/src/presence.md` |
 | TUI + the autonomy/approval model | `docs/src/tui.md` |
 | Web dashboard (tabs, sessions, live voice) | `docs/src/web-dashboard.md` |
+| Station (rendered control canvas): architecture + roadmap to immersive 3D/XR | `docs/src/station.md` |
 | MCP server + client (trust model) | `docs/src/mcp-server.md` |
+| MCP client, external CLIs, audio stack, system tools, control socket, CI | `docs/src/integrations.md` |
 | Full `intendant.toml` + env reference | `docs/src/configuration.md` |
 | Session logging, replay, rehydration | `docs/src/session-logging.md` |
 | Windows backends and gotchas | `docs/src/windows-support.md` |

@@ -5099,7 +5099,7 @@ const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advisor">
               var watched = pick.solo === 'no';
               if (pick.fuel !== 'sub') {
                 plan.push(watched
-                  ? '<b>Anthropic & Gemini: client egress.</b> Calls relay through this browser — the box never holds a key at all. OpenAI’s API refuses browser relay, so lease it with the offline window at “while connected only”.'
+                  ? '<b>Anthropic & Gemini: client egress.</b> The box never holds a key — its provider calls detour through this browser, and stop when it closes. OpenAI’s API refuses browser relay, so lease that one with the offline window at “while connected only”.'
                   : '<b>API keys: leases with a 24 h offline window.</b> Borrowed in memory only, never on disk, revocable from any signed-in device.');
               }
               if (pick.fuel !== 'api') {
@@ -5110,7 +5110,7 @@ const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advisor">
               }
             }
             document.getElementById('advplan').innerHTML = plan.map(function (item) { return '<li>' + item + '</li>'; }).join('');
-            var note = { vps: 'A disposable box should hold nothing durable: with egress or access-token leases, wiping it loses nothing and leaks nothing.',
+            var note = { vps: 'A disposable box should hold nothing durable. With client egress the key was never on it; with access-token leases what lands there dies in minutes. Wipe it — or lose it — and nothing leaks.',
                          server: 'Nothing rests on disk either way — leases only bound what a runtime compromise could spend before you revoke.',
                          laptop: 'Custody buys the least on the machine your browser already runs on.' }[pick.box];
             if (svc) {
@@ -5223,7 +5223,7 @@ fn landing_ui_html(origin: &str) -> String {
     .hero p {{ margin: 0 auto 28px; font-size: 17.5px; color: var(--muted); max-width: 680px; }}
     .cta {{ display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }}
     /* Framed product shots */
-    .heroshot {{ position: relative; margin: 50px 0 0; }}
+    .heroshot {{ position: relative; margin: 92px 0 0; }}
     .heroshot::before {{
       content: ""; position: absolute; inset: -60px 0 auto; height: 340px;
       background: radial-gradient(640px 260px at 50% 20%, rgba(137, 180, 250, .16), transparent 70%);
@@ -5268,6 +5268,19 @@ fn landing_ui_html(origin: &str) -> String {
       border-radius: 12px; box-shadow: var(--shadow); overflow: hidden;
     }}
     .shotnote {{ margin-top: 10px; font-size: 13px; color: var(--muted-2); }}
+    /* Custody: the two fueling modes, told by what travels */
+    .fuelmap {{ margin-top: 16px; display: grid; gap: 9px; }}
+    .fuelrow {{ display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }}
+    .fueltag {{
+      flex: 0 0 auto; min-width: 96px; text-align: center; padding: 2px 8px;
+      border: 1px solid var(--line-strong); border-radius: 6px;
+      font: 700 10.5px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: .08em; text-transform: uppercase; color: var(--accent);
+    }}
+    .fuelrow:last-child .fueltag {{ color: var(--ok); }}
+    .fuelflow {{ flex: 1; min-width: 230px; font-size: 13px; color: var(--muted-2); }}
+    .fuelflow em {{ font-style: normal; color: var(--muted); }}
+    .fuelflow .fx {{ opacity: .65; padding: 0 1px; }}
     /* The phone row: a bezel, not a browser frame */
     .phonepic {{ display: grid; justify-items: center; }}
     .phonepic .shotnote {{ text-align: center; }}
@@ -5288,7 +5301,9 @@ fn landing_ui_html(origin: &str) -> String {
     .card h3 {{ margin: 0 0 8px; font-size: 16px; }}
     .card p {{ margin: 0; font-size: 14px; color: var(--muted); }}
     /* Install */
-    .install-section {{ padding: 84px 0 0; }}
+    /* Sits directly under the hero: "how do I use it" is the first answer
+       the page gives, so it gets hero-adjacent spacing, not section spacing. */
+    .install-section {{ padding: 46px 0 0; }}
     .igrid {{ display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr); gap: 30px; align-items: start; }}
     .terminal {{
       background: var(--top); border: 1px solid var(--line-strong);
@@ -5335,7 +5350,9 @@ fn landing_ui_html(origin: &str) -> String {
       .trow.rev .txt {{ order: 0; }}
       .tour {{ padding-top: 60px; }}
       .igrid {{ grid-template-columns: minmax(0, 1fr); }}
-      section.features, .install-section, .trustrow {{ padding-top: 56px; }}
+      section.features, .trustrow {{ padding-top: 56px; }}
+      .install-section {{ padding-top: 36px; }}
+      .heroshot {{ margin-top: 64px; }}
     }}
   </style>
 </head>
@@ -5366,6 +5383,35 @@ fn landing_ui_html(origin: &str) -> String {
       <div class="cta">
         <a class="btn" href="/connect">Open your dashboard</a>
         <a class="btn ghost" href="#install">Install a daemon</a>
+      </div>
+    </section>
+
+    <section class="install-section" id="install">
+      <h2>Stand up a daemon in about ninety seconds</h2>
+      <p class="sectionlede">
+        Four answers about the machine the agent will live on, and the exact
+        command appears. That machine is the only one that installs anything
+        — you can be reading this from your phone.
+      </p>
+      <div class="igrid">
+        {advisor}
+        <div>
+          <div class="steps">
+            <div class="step"><b><span class="n">1</span>Install</b>
+              One command on a fresh box pins root authority to your browser's key. Nothing sensitive travels.</div>
+            <div class="step"><b><span class="n">2</span>Claim</b>
+              The daemon prints a twelve-word phrase; claim it from the browser you're already holding.</div>
+            <div class="step"><b><span class="n">3</span>Fuel</b>
+              Grant time-boxed credential leases from your encrypted vault — or relay calls through your browser and never hand over a key at all.</div>
+          </div>
+          <p class="installnote">
+            New here? <a href="/connect">Sign in</a> first — your key is in the
+            dashboard's Access drawer. Nothing sensitive travels in the command
+            or lands on the box: the daemon boots already owned by you, you claim
+            it with a twelve-word phrase, and it borrows credentials from your
+            vault only while you let it.
+          </p>
+        </div>
       </div>
     </section>
 
@@ -5427,10 +5473,19 @@ fn landing_ui_html(origin: &str) -> String {
           <div class="eyebrow">Credential custody</div>
           <h3>Fueling, not surrendering</h3>
           <p>Provider keys and subscription OAuth live end-to-end encrypted
-          behind your passkeys. Daemons borrow time-boxed leases that renew
-          from your browser and expire on their own — or relay calls through
-          the browser so a key never leaves it. Either way the machine's disk
-          holds nothing worth stealing, and revocation is immediate.</p>
+          behind your passkeys, and a machine gets fuel one of two ways. A
+          lease is borrowed authority — held in memory, renewed from your
+          browser, dead on expiry or the moment you revoke it. Client egress
+          goes further: the key never leaves your browser at all — the box's
+          provider calls detour through the tab you're signed in on. A
+          disposable VPS can be wiped, or seized, with nothing on it worth
+          taking.</p>
+          <div class="fuelmap">
+            <div class="fuelrow"><span class="fueltag">lease</span>
+              <span class="fuelflow">the key travels: vault <span class="fx">→</span> daemon memory <em>(expires on its own)</em> <span class="fx">→</span> provider calls from the box</span></div>
+            <div class="fuelrow"><span class="fueltag">client egress</span>
+              <span class="fuelflow">the calls travel: daemon <span class="fx">→</span> your browser <em>(the key stays here)</em> <span class="fx">→</span> provider</span></div>
+          </div>
         </div>
         <div class="pic">
           <div class="shot">
@@ -5508,35 +5563,6 @@ fn landing_ui_html(origin: &str) -> String {
           <p>Daemons federate: shared displays, cross-machine sessions, and
           organization-signed access — all enforced locally by each daemon's
           own IAM, never by this service.</p>
-        </div>
-      </div>
-    </section>
-
-    <section class="install-section" id="install">
-      <h2>Stand up a daemon in about ninety seconds</h2>
-      <p class="sectionlede">
-        Four answers about the machine the agent will live on, and the exact
-        command appears. That machine is the only one that installs anything
-        — you can be reading this from your phone.
-      </p>
-      <div class="igrid">
-        {advisor}
-        <div>
-          <div class="steps">
-            <div class="step"><b><span class="n">1</span>Install</b>
-              One command on a fresh box pins root authority to your browser's key. Nothing sensitive travels.</div>
-            <div class="step"><b><span class="n">2</span>Claim</b>
-              The daemon prints a twelve-word phrase; claim it from the browser you're already holding.</div>
-            <div class="step"><b><span class="n">3</span>Fuel</b>
-              Grant time-boxed credential leases from your encrypted vault — or relay calls through your browser and never hand over a key at all.</div>
-          </div>
-          <p class="installnote">
-            New here? <a href="/connect">Sign in</a> first — your key is in the
-            dashboard's Access drawer. Nothing sensitive travels in the command
-            or lands on the box: the daemon boots already owned by you, you claim
-            it with a twelve-word phrase, and it borrows credentials from your
-            vault only while you let it.
-          </p>
         </div>
       </div>
     </section>
@@ -7425,6 +7451,20 @@ mod tests {
         // installs nothing, on any device — only the agent's machine does.
         assert!(html.contains("Nothing to install on your side"));
         assert!(html.contains("nothing to install on your side of the glass"));
+        // "How do I use it" is the page's first answer: the install
+        // questionnaire sits directly under the hero, before the shot tour.
+        let install_at = html.find(r#"<section class="install-section""#).unwrap();
+        let heroshot_at = html.find(r#"<section class="heroshot""#).unwrap();
+        let tour_at = html.find(r#"<section class="tour""#).unwrap();
+        assert!(
+            install_at < heroshot_at && heroshot_at < tour_at,
+            "install must lead, then the product tour"
+        );
+        // Custody names the two fueling modes by what travels: the key
+        // (lease) vs the calls (client egress — the disposable-box mode).
+        assert!(html.contains(r#"class="fuelmap""#));
+        assert!(html.contains("the key travels:"));
+        assert!(html.contains("the calls travel:"));
         // The canonical mark, not an ad-hoc monogram: favicon + header logo.
         assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/logo.svg">"#));
         assert!(html.contains(r#"<link rel="icon" type="image/png" href="/favicon.png">"#));
