@@ -4364,7 +4364,7 @@ fn is_mcp_request_path(request_line: &str) -> bool {
 /// its prefix (`/api/peersonal`), no longer matches — only the route itself
 /// and its sub-routes do. `path` must come from `parse_request_target`, so
 /// the query is already stripped.
-fn path_is_or_under(path: &str, base: &str) -> bool {
+pub(crate) fn path_is_or_under(path: &str, base: &str) -> bool {
     path == base
         || path
             .strip_prefix(base)
@@ -22794,7 +22794,244 @@ pub fn spawn_web_gateway(
                         }
                     }
 
-                    if req_method == "GET" && req_path == "/connect/bootstrap" {
+                    if let Some((route, _route_captures)) =
+                        crate::gateway_routes::match_route(req_method, req_path)
+                    {
+                        // Table-dispatched routes: declared once in
+                        // gateway_routes::ROUTES (which the IAM gate above already
+                        // consulted through dashboard_http_operation). The legacy
+                        // chain below shrinks as route families port — a route is
+                        // served by the table or the chain, never both. Handler
+                        // bodies moved here verbatim from their chain arms.
+                        use crate::gateway_routes::RouteHandlerId;
+                        match route.handler {
+                            RouteHandlerId::FsWrite => {
+                                use tokio::io::AsyncWriteExt;
+                                // read_post_body has no cap of its own; bound the
+                                // body before reading it. The JSON envelope adds
+                                // base64/escaping overhead on top of the content
+                                // cap that apply_dashboard_fs_write enforces, so
+                                // allow half again as much envelope.
+                                let content_length: usize = header_text
+                                    .lines()
+                                    .find(|l| l.to_lowercase().starts_with("content-length:"))
+                                    .and_then(|l| l.split(':').nth(1))
+                                    .and_then(|v| v.trim().parse().ok())
+                                    .unwrap_or(0);
+                                let response = if content_length > UPLOAD_MAX_BYTES + UPLOAD_MAX_BYTES / 2 {
+                                    json_error(
+                                        "413 Payload Too Large",
+                                        format!(
+                                            "body too large: {content_length} bytes (cap is {})",
+                                            UPLOAD_MAX_BYTES + UPLOAD_MAX_BYTES / 2
+                                        ),
+                                    )
+                                } else {
+                                    let body_text = read_post_body(&header_text, &mut stream).await;
+                                    match serde_json::from_str::<FsWriteRequest>(&body_text) {
+                                        Ok(req) => match authorize_http_filesystem_access(
+                                            &http_access_context,
+                                            peer_connection_identity.as_ref(),
+                                            crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                            crate::peer::access_policy::FilesystemAccessKind::Write,
+                                            &req.path,
+                                            &bus,
+                                        ) {
+                                            Ok(()) => match fs_write_request_bytes(&req) {
+                                                Ok(bytes) => {
+                                                    let args = FsWriteArgs {
+                                                        path: req.path.clone(),
+                                                        expected_sha256: req.expected_sha256.clone(),
+                                                        create_new: req.create_new,
+                                                        force: req.force,
+                                                    };
+                                                    let (status, body) =
+                                                        tokio::task::spawn_blocking(move || {
+                                                            apply_dashboard_fs_write(&args, &bytes)
+                                                        })
+                                                        .await
+                                                        .unwrap_or_else(|e| {
+                                                            (
+                                                                "500 Internal Server Error".to_string(),
+                                                                serde_json::json!({
+                                                                    "error": format!(
+                                                                        "filesystem write task failed: {e}"
+                                                                    )
+                                                                }),
+                                                            )
+                                                        });
+                                                    json_response(&status, body.to_string())
+                                                }
+                                                Err(message) => json_error("400 Bad Request", message),
+                                            },
+                                            Err(message) => json_error("403 Forbidden", message),
+                                        },
+                                        Err(e) => {
+                                            json_error("400 Bad Request", format!("invalid JSON: {e}"))
+                                        }
+                                    }
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::SessionCurrentChanges => {
+                                // File change tracking endpoints:
+                                //   GET /api/session/current/changes        — list all changed files
+                                //   GET /api/session/current/changes/{path} — unified diff for one file
+                                use tokio::io::AsyncWriteExt;
+                                let (status, body) = handle_changes_request_for_home(
+                                    request_line,
+                                    snapshot_dir.as_deref(),
+                                    project_root_for_changes.as_deref(),
+                                    &crate::platform::home_dir(),
+                                );
+                                let response = format!(
+                                    "HTTP/1.1 {}\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    status,
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::WorktreesInspect => {
+                                let body_text = read_request_body(&mut stream, &header_text).await;
+                                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                                let (status, body) = match tokio::task::spawn_blocking(move || {
+                                    inspect_worktree_inventory_response(&home, &body_text)
+                                })
+                                .await
+                                {
+                                    Ok(result) => result,
+                                    Err(e) => (
+                                        "500 Internal Server Error",
+                                        serde_json::json!({
+                                            "ok": false,
+                                            "error": format!("worktree inspect task failed: {e}")
+                                        })
+                                        .to_string(),
+                                    ),
+                                };
+                                let response = json_response(status, body);
+                                use tokio::io::AsyncWriteExt;
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::WorktreesRemove => {
+                                let body_text = read_request_body(&mut stream, &header_text).await;
+                                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                                let cache = worktree_inventory_cache.clone();
+                                let (status, body) = match tokio::task::spawn_blocking(move || {
+                                    let result = remove_worktree_inventory_response(&home, &body_text);
+                                    if result.0 == "200 OK" {
+                                        if let Ok(mut guard) = cache.lock() {
+                                            *guard = None;
+                                        }
+                                    }
+                                    result
+                                })
+                                .await
+                                {
+                                    Ok(result) => result,
+                                    Err(e) => (
+                                        "500 Internal Server Error",
+                                        serde_json::json!({
+                                            "ok": false,
+                                            "error": format!("worktree removal task failed: {e}")
+                                        })
+                                        .to_string(),
+                                    ),
+                                };
+                                let response = json_response(status, body);
+                                use tokio::io::AsyncWriteExt;
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::WorktreesScan => {
+                                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                                let project_root = project_root.clone();
+                                let cache = worktree_inventory_cache.clone();
+                                let body = match tokio::task::spawn_blocking(move || {
+                                    let body =
+                                        scan_worktree_inventory_response(&home, project_root.as_deref());
+                                    if let Ok(mut guard) = cache.lock() {
+                                        *guard = Some(body.clone());
+                                    }
+                                    body
+                                })
+                                .await
+                                {
+                                    Ok(body) => body,
+                                    Err(e) => serde_json::json!({
+                                        "error": format!("worktree scan task failed: {e}")
+                                    })
+                                    .to_string(),
+                                };
+                                let response = json_response("200 OK", body);
+                                use tokio::io::AsyncWriteExt;
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::WorktreesList => {
+                                let body = worktree_inventory_cache
+                                    .lock()
+                                    .ok()
+                                    .and_then(|guard| guard.clone())
+                                    .unwrap_or_else(empty_worktree_inventory_response);
+                                let response = json_response("200 OK", body);
+                                use tokio::io::AsyncWriteExt;
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::SessionsList => {
+                                // Session listing endpoint. CORS `*` so the
+                                // multi-host Stats tab can fetch sibling
+                                // daemons' session lists to populate its "All
+                                // Sessions" and "Disk Usage" cards per host.
+                                let ids_filter = session_ids_filter_from_request(request_line);
+                                let limit = session_list_limit_from_request(request_line);
+                                let usage_view = session_list_usage_view_from_request(request_line);
+                                let body = match tokio::task::spawn_blocking(move || {
+                                    let body = match ids_filter {
+                                        Some(ids) => cached_list_sessions_for_ids(&ids),
+                                        None => match limit {
+                                            Some(limit) => cached_list_sessions_with_limit(limit),
+                                            None => cached_list_sessions(),
+                                        },
+                                    };
+                                    let body = limit_session_list_body(&body, limit);
+                                    if usage_view {
+                                        session_list_body_usage_view(&body)
+                                    } else {
+                                        body
+                                    }
+                                })
+                                .await
+                                {
+                                    Ok(body) => body,
+                                    Err(e) => serde_json::json!({
+                                        "error": format!("session list task failed: {e}")
+                                    })
+                                    .to_string(),
+                                };
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(),
+                                    body
+                                );
+                                use tokio::io::AsyncWriteExt;
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                        }
+                    } else if req_method == "GET" && req_path == "/connect/bootstrap" {
                         use tokio::io::AsyncWriteExt;
                         let body = connect_bootstrap_html();
                         let response = html_response("200 OK", body);
@@ -23047,73 +23284,6 @@ pub fn spawn_web_gateway(
                                 Err(message) => json_error("403 Forbidden", message),
                             },
                             Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/fs/write" {
-                        use tokio::io::AsyncWriteExt;
-                        // read_post_body has no cap of its own; bound the
-                        // body before reading it. The JSON envelope adds
-                        // base64/escaping overhead on top of the content
-                        // cap that apply_dashboard_fs_write enforces, so
-                        // allow half again as much envelope.
-                        let content_length: usize = header_text
-                            .lines()
-                            .find(|l| l.to_lowercase().starts_with("content-length:"))
-                            .and_then(|l| l.split(':').nth(1))
-                            .and_then(|v| v.trim().parse().ok())
-                            .unwrap_or(0);
-                        let response = if content_length > UPLOAD_MAX_BYTES + UPLOAD_MAX_BYTES / 2 {
-                            json_error(
-                                "413 Payload Too Large",
-                                format!(
-                                    "body too large: {content_length} bytes (cap is {})",
-                                    UPLOAD_MAX_BYTES + UPLOAD_MAX_BYTES / 2
-                                ),
-                            )
-                        } else {
-                            let body_text = read_post_body(&header_text, &mut stream).await;
-                            match serde_json::from_str::<FsWriteRequest>(&body_text) {
-                                Ok(req) => match authorize_http_filesystem_access(
-                                    &http_access_context,
-                                    peer_connection_identity.as_ref(),
-                                    crate::peer::access_policy::PeerOperation::FilesystemWrite,
-                                    crate::peer::access_policy::FilesystemAccessKind::Write,
-                                    &req.path,
-                                    &bus,
-                                ) {
-                                    Ok(()) => match fs_write_request_bytes(&req) {
-                                        Ok(bytes) => {
-                                            let args = FsWriteArgs {
-                                                path: req.path.clone(),
-                                                expected_sha256: req.expected_sha256.clone(),
-                                                create_new: req.create_new,
-                                                force: req.force,
-                                            };
-                                            let (status, body) =
-                                                tokio::task::spawn_blocking(move || {
-                                                    apply_dashboard_fs_write(&args, &bytes)
-                                                })
-                                                .await
-                                                .unwrap_or_else(|e| {
-                                                    (
-                                                        "500 Internal Server Error".to_string(),
-                                                        serde_json::json!({
-                                                            "error": format!(
-                                                                "filesystem write task failed: {e}"
-                                                            )
-                                                        }),
-                                                    )
-                                                });
-                                            json_response(&status, body.to_string())
-                                        }
-                                        Err(message) => json_error("400 Bad Request", message),
-                                    },
-                                    Err(message) => json_error("403 Forbidden", message),
-                                },
-                                Err(e) => {
-                                    json_error("400 Bad Request", format!("invalid JSON: {e}"))
-                                }
-                            }
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/api/fs/rename" {
@@ -24026,33 +24196,6 @@ pub fn spawn_web_gateway(
                                 &crate::platform::home_dir(),
                             ),
                         };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET"
-                        && path_is_or_under(req_path, "/api/session/current/changes")
-                    {
-                        // File change tracking endpoints:
-                        //   GET /api/session/current/changes        — list all changed files
-                        //   GET /api/session/current/changes/{path} — unified diff for one file
-                        use tokio::io::AsyncWriteExt;
-                        let (status, body) = handle_changes_request_for_home(
-                            request_line,
-                            snapshot_dir.as_deref(),
-                            project_root_for_changes.as_deref(),
-                            &crate::platform::home_dir(),
-                        );
-                        let response = format!(
-                            "HTTP/1.1 {}\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            status,
-                            body.len(),
-                            body
-                        );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "GET" && req_path == "/api/session/current/history" {
                         // GET /api/session/current/history — serialized History.
@@ -25200,87 +25343,6 @@ pub fn spawn_web_gateway(
                             body.len(),
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/worktrees/inspect" {
-                        let body_text = read_request_body(&mut stream, &header_text).await;
-                        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-                        let (status, body) = match tokio::task::spawn_blocking(move || {
-                            inspect_worktree_inventory_response(&home, &body_text)
-                        })
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(e) => (
-                                "500 Internal Server Error",
-                                serde_json::json!({
-                                    "ok": false,
-                                    "error": format!("worktree inspect task failed: {e}")
-                                })
-                                .to_string(),
-                            ),
-                        };
-                        let response = json_response(status, body);
-                        use tokio::io::AsyncWriteExt;
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/worktrees/remove" {
-                        let body_text = read_request_body(&mut stream, &header_text).await;
-                        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-                        let cache = worktree_inventory_cache.clone();
-                        let (status, body) = match tokio::task::spawn_blocking(move || {
-                            let result = remove_worktree_inventory_response(&home, &body_text);
-                            if result.0 == "200 OK" {
-                                if let Ok(mut guard) = cache.lock() {
-                                    *guard = None;
-                                }
-                            }
-                            result
-                        })
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(e) => (
-                                "500 Internal Server Error",
-                                serde_json::json!({
-                                    "ok": false,
-                                    "error": format!("worktree removal task failed: {e}")
-                                })
-                                .to_string(),
-                            ),
-                        };
-                        let response = json_response(status, body);
-                        use tokio::io::AsyncWriteExt;
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/worktrees/scan" {
-                        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-                        let project_root = project_root.clone();
-                        let cache = worktree_inventory_cache.clone();
-                        let body = match tokio::task::spawn_blocking(move || {
-                            let body =
-                                scan_worktree_inventory_response(&home, project_root.as_deref());
-                            if let Ok(mut guard) = cache.lock() {
-                                *guard = Some(body.clone());
-                            }
-                            body
-                        })
-                        .await
-                        {
-                            Ok(body) => body,
-                            Err(e) => serde_json::json!({
-                                "error": format!("worktree scan task failed: {e}")
-                            })
-                            .to_string(),
-                        };
-                        let response = json_response("200 OK", body);
-                        use tokio::io::AsyncWriteExt;
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/worktrees" {
-                        let body = worktree_inventory_cache
-                            .lock()
-                            .ok()
-                            .and_then(|guard| guard.clone())
-                            .unwrap_or_else(empty_worktree_inventory_response);
-                        let response = json_response("200 OK", body);
-                        use tokio::io::AsyncWriteExt;
-                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_path == "/api/sessions/stream" {
                         let request_line_for_stream = request_line.to_string();
                         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -25315,51 +25377,6 @@ pub fn spawn_web_gateway(
                             project_filter,
                         )
                         .await;
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
-                        use tokio::io::AsyncWriteExt;
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path == "/api/sessions" {
-                        // Session listing endpoint. CORS `*` so the
-                        // multi-host Stats tab can fetch sibling
-                        // daemons' session lists to populate its "All
-                        // Sessions" and "Disk Usage" cards per host.
-                        let ids_filter = session_ids_filter_from_request(request_line);
-                        let limit = session_list_limit_from_request(request_line);
-                        let usage_view = session_list_usage_view_from_request(request_line);
-                        let body = match tokio::task::spawn_blocking(move || {
-                            let body = match ids_filter {
-                                Some(ids) => cached_list_sessions_for_ids(&ids),
-                                None => match limit {
-                                    Some(limit) => cached_list_sessions_with_limit(limit),
-                                    None => cached_list_sessions(),
-                                },
-                            };
-                            let body = limit_session_list_body(&body, limit);
-                            if usage_view {
-                                session_list_body_usage_view(&body)
-                            } else {
-                                body
-                            }
-                        })
-                        .await
-                        {
-                            Ok(body) => body,
-                            Err(e) => serde_json::json!({
-                                "error": format!("session list task failed: {e}")
-                            })
-                            .to_string(),
-                        };
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -29789,6 +29806,19 @@ fn dashboard_http_operation(
 ) -> Option<crate::peer::access_policy::PeerOperation> {
     use crate::peer::access_policy::PeerOperation;
 
+    // Routes declared in the gateway route table carry their own IAM
+    // operation; the hand-written residual below only covers families
+    // that have not been ported yet (it shrinks as they move and is
+    // deleted in the final migration phase). A residual rule may still
+    // answer for a ported path on a method the table doesn't declare —
+    // that keeps method-blind legacy classifications (e.g. GET
+    // /api/worktrees/inspect, which dispatch never served) byte-stable
+    // until the family's reckoning.
+    match crate::gateway_routes::classify(req_method, req_path) {
+        crate::gateway_routes::TableClassification::Matched(op) => return op,
+        crate::gateway_routes::TableClassification::NoMatch => {}
+    }
+
     if !req_path.starts_with("/api/") {
         return None;
     }
@@ -29821,8 +29851,8 @@ fn dashboard_http_operation(
         ("GET", "/api/fs/stat") | ("GET", "/api/fs/list") | ("GET", "/api/fs/read") => {
             return Some(PeerOperation::FilesystemRead);
         }
+        // POST /api/fs/write is table-declared.
         ("POST", "/api/fs/mkdir")
-        | ("POST", "/api/fs/write")
         | ("POST", "/api/fs/rename")
         | ("POST", "/api/fs/delete") => return Some(PeerOperation::FilesystemWrite),
         ("POST", "/api/diagnostics/visual-freshness") => {
@@ -29849,7 +29879,11 @@ fn dashboard_http_operation(
             _ => None,
         };
     }
-    // Worktree and session-list routes are exact in dispatch.
+    // Worktree routes are table-declared with their real (exact) methods;
+    // these residual rules only fire for OTHER methods, which dispatch
+    // never served but this classifier always gated. Kept so ported
+    // families stay classification-identical until the residual is
+    // retired wholesale in the final migration phase.
     if req_path == "/api/worktrees/inspect" {
         return Some(PeerOperation::SessionInspect);
     }
@@ -29859,9 +29893,7 @@ fn dashboard_http_operation(
     if req_path == "/api/worktrees" {
         return Some(PeerOperation::SessionInspect);
     }
-    if req_path == "/api/sessions" {
-        return Some(PeerOperation::SessionInspect);
-    }
+    // /api/sessions (any method) is table-declared.
     if path_is_or_under(req_path, "/api/peers") {
         return crate::peer::access_policy::federation_http_operation(req_method, req_path);
     }
@@ -41735,6 +41767,299 @@ mod tests {
             dashboard_http_operation("GET", "/api/session/current/changes/src/main.rs"),
             Some(PeerOperation::SessionManage)
         );
+    }
+
+    /// Frozen copy of `dashboard_http_operation` as it stood when the
+    /// gateway route table landed (phase 0 of the migration). The
+    /// differential test below pins the live table-first classifier to
+    /// this snapshot across the whole route corpus, so porting a family
+    /// can never silently change an IAM answer. Deliberate divergences
+    /// (fail-closed tightenings of method-blind legacy rules) get an
+    /// explicit allowlist entry there instead of an edit here. Deleted
+    /// together with the residual classifier in the final phase.
+    fn legacy_reference_dashboard_http_operation(
+        req_method: &str,
+        req_path: &str,
+    ) -> Option<crate::peer::access_policy::PeerOperation> {
+        use crate::peer::access_policy::PeerOperation;
+
+        if !req_path.starts_with("/api/") {
+            return None;
+        }
+
+        match (req_method, req_path) {
+            ("POST", "/api/access/enrollment-requests/decide")
+            | ("POST", "/api/access/orgs/trust")
+            | ("POST", "/api/access/orgs/revoke")
+            | ("POST", "/api/access/org-grants/issue")
+            | ("POST", "/api/access/org-grants/revoke-member")
+            | ("POST", "/api/access/org-grants/issuers/init")
+            | ("POST", "/api/access/org-grants/issuers/delegate")
+            | ("POST", "/api/access/org-grants/issuers/install") => {
+                return Some(PeerOperation::AccessManage)
+            }
+            ("GET", "/api/access/enrollment-requests") => {
+                return Some(PeerOperation::AccessInspect)
+            }
+            ("GET", "/api/access/overview")
+            | ("GET", "/api/access/iam/state")
+            | ("GET", "/api/dashboard/targets") => return Some(PeerOperation::AccessInspect),
+            ("POST", "/api/access/iam/user-client-grants")
+            | ("POST", "/api/access/iam/grants/update") => {
+                return Some(PeerOperation::AccessManage)
+            }
+            ("GET", "/api/project-root") => return Some(PeerOperation::Settings),
+            ("GET", "/api/settings") | ("GET", "/api/api-key-status") => {
+                return Some(PeerOperation::Settings);
+            }
+            ("GET", "/api/external-agents") => return Some(PeerOperation::SessionInspect),
+            ("POST", "/api/settings") | ("POST", "/api/api-keys") => {
+                return Some(PeerOperation::Settings);
+            }
+            ("GET", "/api/fs/stat") | ("GET", "/api/fs/list") | ("GET", "/api/fs/read") => {
+                return Some(PeerOperation::FilesystemRead);
+            }
+            ("POST", "/api/fs/mkdir")
+            | ("POST", "/api/fs/write")
+            | ("POST", "/api/fs/rename")
+            | ("POST", "/api/fs/delete") => return Some(PeerOperation::FilesystemWrite),
+            ("POST", "/api/diagnostics/visual-freshness") => {
+                return Some(PeerOperation::DisplayInput);
+            }
+            ("GET", "/api/displays") => return Some(PeerOperation::DisplayView),
+            _ => {}
+        }
+
+        if path_is_or_under(req_path, "/api/managed-context") {
+            return Some(PeerOperation::SessionInspect);
+        }
+        if path_is_or_under(req_path, "/api/session/current") {
+            return Some(PeerOperation::SessionManage);
+        }
+        if path_is_or_under(req_path, "/api/session") {
+            return match req_method {
+                "GET" => Some(PeerOperation::SessionInspect),
+                "POST" | "DELETE" => Some(PeerOperation::SessionManage),
+                _ => None,
+            };
+        }
+        if req_path == "/api/worktrees/inspect" {
+            return Some(PeerOperation::SessionInspect);
+        }
+        if req_path == "/api/worktrees/scan" || req_path == "/api/worktrees/remove" {
+            return Some(PeerOperation::SessionManage);
+        }
+        if req_path == "/api/worktrees" {
+            return Some(PeerOperation::SessionInspect);
+        }
+        if req_path == "/api/sessions" {
+            return Some(PeerOperation::SessionInspect);
+        }
+        if path_is_or_under(req_path, "/api/peers") {
+            return crate::peer::access_policy::federation_http_operation(req_method, req_path);
+        }
+
+        None
+    }
+
+    /// Every (method, path) the classifier can be asked about: all served
+    /// routes, the audit's look-alike regression cases, subtree probes,
+    /// and non-API paths — crossed with more methods than any route
+    /// declares.
+    fn classifier_corpus_paths() -> &'static [&'static str] {
+        &[
+            "/api/project-root",
+            "/api/fs/stat",
+            "/api/fs/list",
+            "/api/fs/read",
+            "/api/fs/mkdir",
+            "/api/fs/write",
+            "/api/fs/writeable",
+            "/api/fs/rename",
+            "/api/fs/delete",
+            "/api/fs/deleted",
+            "/api/settings",
+            "/api/api-keys",
+            "/api/api-key-status",
+            "/api/external-agents",
+            "/api/diagnostics/visual-freshness",
+            "/api/session/current/agent-output",
+            "/api/session/current/uploads",
+            "/api/session/current/uploads/u1",
+            "/api/session/current/changes",
+            "/api/session/current/changes/src/main.rs",
+            "/api/session/current/changesx",
+            "/api/session/current/history",
+            "/api/session/current/rollback",
+            "/api/session/current/redo",
+            "/api/session/current/prune",
+            "/api/session/abc123/log",
+            "/api/session/abc123/delete",
+            "/api/session/abc123/agent-output",
+            "/api/sessionx",
+            "/api/sessions",
+            "/api/sessions/stream",
+            "/api/sessions/search",
+            "/api/sessionsfoo",
+            "/api/managed-context/anchors",
+            "/api/managed-context/records",
+            "/api/managed-context/fission",
+            "/api/managed-contextx",
+            "/api/worktrees",
+            "/api/worktrees/inspect",
+            "/api/worktrees/inspect-old",
+            "/api/worktrees/remove",
+            "/api/worktrees/scan",
+            "/api/worktreesx",
+            "/api/displays",
+            "/api/access/overview",
+            "/api/access/iam/state",
+            "/api/access/iam/user-client-grants",
+            "/api/access/iam/grants/update",
+            "/api/access/enrollment-requests",
+            "/api/access/enrollment-requests/decide",
+            "/api/access/orgs/trust",
+            "/api/access/orgs/revoke",
+            "/api/access/orgs/acme/revocations",
+            "/api/access/orgs/revocations/apply",
+            "/api/access/org-grants",
+            "/api/access/org-grants/renew",
+            "/api/access/org-grants/issue",
+            "/api/access/org-grants/revoke-member",
+            "/api/access/org-grants/issuers/init",
+            "/api/access/org-grants/issuers/delegate",
+            "/api/access/org-grants/issuers/install",
+            "/api/dashboard/targets",
+            "/api/peers",
+            "/api/peers/p1/message",
+            "/api/peers/pairing/requests",
+            "/api/peersfoo",
+            "/api/coordinator/route",
+            "/api/",
+            "/api",
+            "/mcp",
+            "/debug",
+            "/config",
+            "/connect/status",
+            "/session",
+            "/recordings",
+            "/",
+        ]
+    }
+
+    /// The differential migration test: the live (table-first) classifier
+    /// must answer exactly like the frozen legacy snapshot for the whole
+    /// corpus. When porting a family deliberately tightens a method-blind
+    /// legacy rule, add the (method, path) here with a justification —
+    /// never weaken silently.
+    #[test]
+    fn dashboard_http_operation_matches_frozen_legacy_reference() {
+        // (method, path) pairs where the table deliberately diverges from
+        // the legacy snapshot. Empty in phase 0.
+        let allowed_divergences: &[(&str, &str)] = &[];
+
+        for method in ["GET", "POST", "DELETE", "PUT", "PATCH", "HEAD"] {
+            for path in classifier_corpus_paths() {
+                if allowed_divergences.contains(&(method, path)) {
+                    continue;
+                }
+                assert_eq!(
+                    dashboard_http_operation(method, path),
+                    legacy_reference_dashboard_http_operation(method, path),
+                    "classification for {method} {path} diverged from the \
+                     frozen legacy reference",
+                );
+            }
+        }
+    }
+
+    /// Routes still served by the legacy dispatch chain must never match
+    /// the table — a route is served by exactly one of the two. Entries
+    /// leave this list as their families port.
+    #[test]
+    fn route_table_does_not_shadow_legacy_chain_routes() {
+        let legacy_served: &[(&str, &str)] = &[
+            ("GET", "/connect/bootstrap"),
+            ("GET", "/connect/status"),
+            ("POST", "/connect/dashboard/offer"),
+            ("POST", "/connect/dashboard/ice"),
+            ("POST", "/connect/dashboard/close"),
+            ("GET", "/frames/f1"),
+            ("GET", "/api/project-root"),
+            ("GET", "/api/fs/stat"),
+            ("GET", "/api/fs/list"),
+            ("GET", "/api/fs/read"),
+            ("POST", "/api/fs/mkdir"),
+            ("POST", "/api/fs/rename"),
+            ("POST", "/api/fs/delete"),
+            ("POST", "/api/settings"),
+            ("GET", "/api/settings"),
+            ("POST", "/api/diagnostics/visual-freshness"),
+            ("POST", "/api/api-keys"),
+            ("GET", "/api/api-key-status"),
+            ("GET", "/api/external-agents"),
+            ("POST", "/session"),
+            ("GET", "/recordings"),
+            ("GET", "/recordings/stream1/meta"),
+            ("DELETE", "/api/session/abc123"),
+            ("POST", "/api/session/abc123/delete"),
+            ("POST", "/api/session/current/agent-output"),
+            ("POST", "/api/session/abc123/agent-output"),
+            ("POST", "/api/session/current/uploads"),
+            ("GET", "/api/session/current/uploads"),
+            ("GET", "/api/session/current/uploads/u1"),
+            ("DELETE", "/api/session/current/uploads/u1"),
+            ("GET", "/api/managed-context/anchors"),
+            ("GET", "/api/managed-context/records"),
+            ("GET", "/api/managed-context/fission"),
+            ("GET", "/api/session/current/history"),
+            ("POST", "/api/session/current/rollback"),
+            ("POST", "/api/session/current/redo"),
+            ("POST", "/api/session/current/prune"),
+            ("GET", "/api/session/abc123/log"),
+            ("GET", "/api/session/abc123/meta"),
+            ("GET", "/api/displays"),
+            ("GET", "/api/access/overview"),
+            ("GET", "/api/access/iam/state"),
+            ("POST", "/api/access/iam/user-client-grants"),
+            ("POST", "/api/access/iam/grants/update"),
+            ("GET", "/api/access/enrollment-requests"),
+            ("POST", "/api/access/enrollment-requests/decide"),
+            ("POST", "/api/access/orgs/trust"),
+            ("POST", "/api/access/orgs/revoke"),
+            ("GET", "/api/access/orgs/acme/revocations"),
+            ("POST", "/api/access/orgs/revocations/apply"),
+            ("POST", "/api/access/org-grants"),
+            ("POST", "/api/access/org-grants/renew"),
+            ("POST", "/api/access/org-grants/issue"),
+            ("POST", "/api/access/org-grants/revoke-member"),
+            ("GET", "/api/dashboard/targets"),
+            ("GET", "/api/peers"),
+            ("POST", "/api/peers"),
+            ("POST", "/api/peers/p1/message"),
+            ("POST", "/api/peers/pairing/request-access"),
+            ("GET", "/api/peers/pairing/requests"),
+            ("POST", "/api/coordinator/route"),
+            ("GET", "/api/sessions/stream"),
+            ("GET", "/api/sessions/search"),
+            ("GET", "/debug"),
+            ("POST", "/mcp"),
+            ("GET", "/mcp"),
+            ("DELETE", "/mcp"),
+            ("GET", "/config"),
+            ("GET", "/.well-known/agent-card.json"),
+            ("GET", "/index.html"),
+            ("GET", "/"),
+        ];
+        for (method, path) in legacy_served {
+            assert!(
+                crate::gateway_routes::match_route(method, path).is_none(),
+                "{method} {path} is still served by the legacy chain but \
+                 matches the route table — port the family (removing its \
+                 chain arm) before declaring it, then move it out of this \
+                 list",
+            );
+        }
     }
 
     #[test]
