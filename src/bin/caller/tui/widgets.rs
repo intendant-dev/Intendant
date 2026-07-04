@@ -1,4 +1,4 @@
-use crate::tui::app::{App, LogEntry, LogSource, LogTab, ViewState};
+use crate::tui::app::{App, AppMode, LogEntry, LogSource, LogTab, ViewState};
 use crate::tui::markdown;
 use crate::tui::theme;
 use crate::types::{LogLevel, Phase};
@@ -177,8 +177,12 @@ pub fn render_action_panel(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(phase_text, style.add_modifier(Modifier::BOLD)),
     ]);
 
+    let quit_hint = match app.mode {
+        AppMode::Normal | AppMode::FollowUp => "Ctrl-C/q=quit",
+        _ => "Ctrl-C=quit",
+    };
     let line2 = Line::from(vec![Span::styled(
-        "   ?=help  q=quit  v=verbosity  i=inspect  +/-=autonomy",
+        format!("   ?=help  {quit_hint}  v=verbosity  i=inspect  +/-=autonomy"),
         Style::default().fg(theme::LOG_DIM_FG).bg(theme::ACTION_BG),
     )]);
 
@@ -231,8 +235,18 @@ pub fn render_log_panel(f: &mut Frame, area: Rect, app: &App, view: &ViewState) 
             .turn
             .and_then(|t| turn_counts.get(&t).map(|&c| c.saturating_sub(1)))
             .unwrap_or(0);
-        let entry_lines =
-            format_log_entry_with_turn(entry, &view.expanded_turns, is_focused, hidden_count);
+        let expand_hint = match app.mode {
+            AppMode::Approval => Some("Right to expand"),
+            AppMode::Normal | AppMode::Help | AppMode::Inspect => Some("Enter/Right to expand"),
+            AppMode::AskHuman | AppMode::FollowUp => None,
+        };
+        let entry_lines = format_log_entry_with_turn(
+            entry,
+            &view.expanded_turns,
+            is_focused,
+            hidden_count,
+            expand_hint,
+        );
         lines.extend(entry_lines);
         entries_shown += 1;
     }
@@ -334,6 +348,7 @@ fn format_log_entry_with_turn(
     expanded_turns: &std::collections::HashSet<usize>,
     is_focused: bool,
     hidden_count: usize,
+    expand_hint: Option<&str>,
 ) -> Vec<Line<'static>> {
     // Determine if this entry's turn is collapsed (only first entry shown by filter)
     let turn_collapsed = entry
@@ -420,10 +435,11 @@ fn format_log_entry_with_turn(
         let extra_lines = content_lines.len().saturating_sub(1);
         let total_hidden = hidden_count + extra_lines;
         if total_hidden > 0 {
-            first_spans.push(Span::styled(
-                format!("  (+{total_hidden} more — Enter to expand)"),
-                Style::default().fg(theme::LOG_DIM_FG),
-            ));
+            let suffix = match expand_hint {
+                Some(hint) => format!("  (+{total_hidden} more — {hint})"),
+                None => format!("  (+{total_hidden} more)"),
+            };
+            first_spans.push(Span::styled(suffix, Style::default().fg(theme::LOG_DIM_FG)));
         }
     }
 
@@ -473,7 +489,13 @@ fn format_log_entry_with_turn(
 
 #[allow(dead_code)]
 fn format_log_entry(entry: &LogEntry) -> Vec<Line<'static>> {
-    format_log_entry_with_turn(entry, &std::collections::HashSet::new(), false, 0)
+    format_log_entry_with_turn(
+        entry,
+        &std::collections::HashSet::new(),
+        false,
+        0,
+        Some("Enter/Right to expand"),
+    )
 }
 
 /// Render inspect overlay for one focused log entry.
@@ -687,7 +709,7 @@ pub fn render_follow_up_panel(f: &mut Frame, area: Rect, app: &mut App) {
 
     // Hint
     let hint = Line::from(vec![Span::styled(
-        " Enter=submit | Shift+Enter=newline | Esc/q=quit",
+        " Enter=submit | Shift+Enter=newline | Esc=browse log | q=quit",
         Style::default().fg(theme::INPUT_HINT_FG),
     )]);
     f.render_widget(
@@ -931,7 +953,8 @@ mod tests {
         };
         // Turn 1 not in expanded set → collapsed → single line
         let expanded = std::collections::HashSet::new();
-        let lines = format_log_entry_with_turn(&entry, &expanded, false, 0);
+        let lines =
+            format_log_entry_with_turn(&entry, &expanded, false, 0, Some("Enter/Right to expand"));
         assert_eq!(lines.len(), 1);
     }
 
@@ -947,7 +970,8 @@ mod tests {
         // Turn 1 expanded → all lines
         let mut expanded = std::collections::HashSet::new();
         expanded.insert(1);
-        let lines = format_log_entry_with_turn(&entry, &expanded, false, 0);
+        let lines =
+            format_log_entry_with_turn(&entry, &expanded, false, 0, Some("Enter/Right to expand"));
         assert_eq!(lines.len(), 3);
     }
 
@@ -962,7 +986,8 @@ mod tests {
         };
         // Collapsed with 5 hidden entries → hint appended
         let expanded = std::collections::HashSet::new();
-        let lines = format_log_entry_with_turn(&entry, &expanded, false, 5);
+        let lines =
+            format_log_entry_with_turn(&entry, &expanded, false, 5, Some("Enter/Right to expand"));
         assert_eq!(lines.len(), 1);
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
@@ -971,8 +996,31 @@ mod tests {
             text
         );
         assert!(
-            text.contains("Enter to expand"),
+            text.contains("Enter/Right to expand"),
             "expected expand instruction"
+        );
+    }
+
+    #[test]
+    fn format_log_entry_collapsed_can_advertise_right_only() {
+        let entry = LogEntry {
+            ts: "00:00:00".to_string(),
+            level: LogLevel::Model,
+            content: "exec ls -la".to_string(),
+            source: LogSource::Agent,
+            turn: Some(1),
+        };
+        let expanded = std::collections::HashSet::new();
+        let lines =
+            format_log_entry_with_turn(&entry, &expanded, false, 5, Some("Right to expand"));
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("Right to expand"),
+            "expected approval-safe expand instruction"
+        );
+        assert!(
+            !text.contains("Enter/Right"),
+            "approval hint must not advertise Enter"
         );
     }
 

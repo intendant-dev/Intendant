@@ -233,9 +233,7 @@ impl CcShared {
                 .cumulative_fresh_tokens
                 .load(Ordering::Relaxed)
                 .saturating_sub(goal.tokens_at_set);
-            if goal.status == "active"
-                && goal.token_budget.is_some_and(|budget| used >= budget)
-            {
+            if goal.status == "active" && goal.token_budget.is_some_and(|budget| used >= budget) {
                 goal.status = "budgetLimited".to_string();
             }
         }
@@ -354,10 +352,10 @@ fn approval_response_payload(
     }
 }
 
-/// Context-meter snapshot from an Anthropic API usage object. The same
-/// shape arrives on `message_delta` stream events, assistant messages, and
-/// the turn's `result`; prompt-side tokens (fresh + cached) approximate the
-/// live context footprint.
+/// Context-meter snapshot from an Anthropic API usage object. The reader
+/// consumes this shape from `message_delta` stream events and the turn's
+/// `result`; prompt-side tokens (fresh + cached) approximate the live
+/// context footprint.
 fn usage_snapshot_from_api_usage(
     usage: &serde_json::Value,
     model: &str,
@@ -799,7 +797,10 @@ impl CcReader {
             // thread_action, not as a user turn). Absorb it: emitting
             // TurnCompleted here would prematurely complete whatever real
             // turn was queued behind the compaction.
-            out.log("info", "Compaction settled — continuing on the fresh context");
+            out.log(
+                "info",
+                "Compaction settled — continuing on the fresh context",
+            );
             return;
         }
         if let Some(usage) = msg.get("usage") {
@@ -1196,10 +1197,8 @@ impl ClaudeCodeAgent {
         }
         let token_budget = super::parse_goal_token_budget(params)?;
 
-        let is_update = objective.is_some()
-            || status.is_some()
-            || token_budget.is_some()
-            || op == "goal-set";
+        let is_update =
+            objective.is_some() || status.is_some() || token_budget.is_some() || op == "goal-set";
         if !is_update {
             // goal / goal-get / goal-status with no fields: report.
             return match self.shared.goal_snapshot() {
@@ -1242,10 +1241,7 @@ impl ClaudeCodeAgent {
                         status: status.unwrap_or_else(|| "active".to_string()),
                         token_budget: token_budget.flatten(),
                         set_at: std::time::Instant::now(),
-                        tokens_at_set: self
-                            .shared
-                            .cumulative_fresh_tokens
-                            .load(Ordering::Relaxed),
+                        tokens_at_set: self.shared.cumulative_fresh_tokens.load(Ordering::Relaxed),
                     });
                 }
             }
@@ -1503,8 +1499,10 @@ impl ExternalAgent for ClaudeCodeAgent {
                     self.shared.compact_pending.store(false, Ordering::SeqCst);
                     return Err(e);
                 }
-                Ok("Compaction requested — Claude Code is summarizing the conversation in place"
-                    .into())
+                Ok(
+                    "Compaction requested — Claude Code is summarizing the conversation in place"
+                        .into(),
+                )
             }
             op if op == "goal" || op.starts_with("goal-") => {
                 self.dispatch_goal_action(op, params).await
@@ -1530,8 +1528,7 @@ impl ExternalAgent for ClaudeCodeAgent {
             None => message.to_string(),
         };
         // Claude Code has no separate developer-instructions channel here, so
-        // Intendant-specific guidance rides on the first prompt (same pattern
-        // as the Gemini CU addendum).
+        // Intendant-specific guidance rides on the first prompt.
         let augmented = if self.web_port.is_some() && !self.prompt_sent {
             self.prompt_sent = true;
             format!("{}{}", message, CLAUDE_CODE_BOOTSTRAP_ADDENDUM)
@@ -1669,12 +1666,7 @@ mod tests {
 
     #[test]
     fn claude_code_agent_defaults() {
-        let agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "auto".into(),
-            None,
-            vec![], None);
+        let agent = ClaudeCodeAgent::new("claude".into(), None, "auto".into(), None, vec![], None);
         assert_eq!(agent.command, "claude");
         assert!(agent.model.is_none());
         assert_eq!(agent.permission_mode, "auto");
@@ -1705,12 +1697,8 @@ mod tests {
         // Claude Code inherits the default `rollback_turns` from the
         // trait, which returns the "not supported" typed error the
         // outer loop keys on to fall back to a session reset.
-        let mut agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "auto".into(),
-            None,
-            vec![], None);
+        let mut agent =
+            ClaudeCodeAgent::new("claude".into(), None, "auto".into(), None, vec![], None);
         let err = agent.rollback_turns(3).await.unwrap_err();
         match err {
             CallerError::ExternalAgent(msg) => {
@@ -1726,12 +1714,8 @@ mod tests {
 
     #[tokio::test]
     async fn context_snapshot_has_no_transcript_fallback() {
-        let mut agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "auto".into(),
-            None,
-            vec![], None);
+        let mut agent =
+            ClaudeCodeAgent::new("claude".into(), None, "auto".into(), None, vec![], None);
 
         let snapshot = agent.context_snapshot().await.unwrap();
         assert!(snapshot.is_none());
@@ -1742,24 +1726,16 @@ mod tests {
         // interrupt_turn is a real protocol message now, but it still needs
         // a live child; before initialize it must fail without touching the
         // interrupt flag.
-        let mut agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "default".into(),
-            None,
-            vec![], None);
+        let mut agent =
+            ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
         assert!(agent.interrupt_turn().await.is_err());
         assert!(!agent.shared.interrupt_pending.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
     async fn steer_before_initialize_errors() {
-        let mut agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "default".into(),
-            None,
-            vec![], None);
+        let mut agent =
+            ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
         assert!(agent.steer_turn("more context").await.is_err());
     }
 
@@ -2347,13 +2323,14 @@ mod tests {
         // Claude Code gets the same bootstrap treatment as managed Codex,
         // minus the managed_context mode (server defaults to vanilla). The
         // injected token is session-scoped, never the raw process token.
-        let mut agent =
-            ClaudeCodeAgent::new(
+        let mut agent = ClaudeCodeAgent::new(
             "claude".into(),
             None,
             "default".into(),
             None,
-            vec![], Some(8765));
+            vec![],
+            Some(8765),
+        );
         agent.mcp_session_id = Some("session with spaces".to_string());
         agent.mcp_auth_token = Some("token&symbols".to_string());
 
@@ -2369,12 +2346,8 @@ mod tests {
 
     #[test]
     fn intendant_mcp_url_without_scope_still_carries_core_profile() {
-        let agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "default".into(),
-            None,
-            vec![], None);
+        let agent =
+            ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
         assert_eq!(
             agent.intendant_mcp_url(9000),
             "http://localhost:9000/mcp?tool_profile=core"
@@ -2383,12 +2356,8 @@ mod tests {
 
     #[tokio::test]
     async fn start_thread_returns_resume_id_as_canonical() {
-        let mut agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "default".into(),
-            None,
-            vec![], None);
+        let mut agent =
+            ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
         // Fresh start: placeholder until the stream announces the real id.
         let thread = agent.start_thread().await.unwrap();
         assert_eq!(thread.thread_id, PLACEHOLDER_THREAD_ID);
@@ -2428,12 +2397,8 @@ mod tests {
 
     #[test]
     fn fork_handling_is_respawn_resume_with_canonical_id_only() {
-        let mut agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "default".into(),
-            None,
-            vec![], None);
+        let mut agent =
+            ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
         // No id announced yet → the drain must refuse the fork.
         assert_eq!(
             agent.fork_handling(),
@@ -2451,12 +2416,8 @@ mod tests {
 
     #[tokio::test]
     async fn thread_action_compact_requires_writer_and_rejects_unknown_ops() {
-        let mut agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "default".into(),
-            None,
-            vec![], None);
+        let mut agent =
+            ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
         // compact needs a live process (writer); before initialize it errors.
         let err = agent
             .thread_action("compact", &serde_json::Value::Null)
@@ -2474,10 +2435,7 @@ mod tests {
     #[test]
     fn out_of_band_compact_result_is_absorbed_not_turn_completed() {
         let mut reader = test_reader();
-        reader
-            .shared
-            .compact_pending
-            .store(true, Ordering::SeqCst);
+        reader.shared.compact_pending.store(true, Ordering::SeqCst);
         // The free result that follows a thread_action("compact"): no turn.
         let out = reader.process_line(
             r#"{"type":"result","subtype":"success","num_turns":0,"usage":{"input_tokens":0,"output_tokens":0},"session_id":"s1"}"#,
@@ -2499,10 +2457,7 @@ mod tests {
 
         // A REAL turn result while the flag is set (compaction raced a queued
         // user message): flag is consumed, the turn completes normally.
-        reader
-            .shared
-            .compact_pending
-            .store(true, Ordering::SeqCst);
+        reader.shared.compact_pending.store(true, Ordering::SeqCst);
         let out = reader.process_line(
             r#"{"type":"result","subtype":"success","num_turns":2,"result":"done","session_id":"s1"}"#,
         );
@@ -2525,12 +2480,8 @@ mod tests {
 
     #[tokio::test]
     async fn goal_engine_set_get_pause_resume_clear() {
-        let mut agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "default".into(),
-            None,
-            vec![], None);
+        let mut agent =
+            ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
         let (tx, mut rx) = mpsc::unbounded_channel();
         agent.event_tx = Some(tx);
 
@@ -2552,7 +2503,10 @@ mod tests {
             }
             other => panic!("expected GoalUpdated, got {other:?}"),
         }
-        let notice = agent.pending_goal_notice.clone().expect("idle set queues a prelude");
+        let notice = agent
+            .pending_goal_notice
+            .clone()
+            .expect("idle set queues a prelude");
         assert!(notice.contains("Ship the widget") && notice.contains("1000"));
 
         // Get: reports without touching state.
@@ -2656,9 +2610,7 @@ mod tests {
             out.events
                 .iter()
                 .filter_map(|e| match e {
-                    AgentEvent::Log { level, message } => {
-                        Some((level.clone(), message.clone()))
-                    }
+                    AgentEvent::Log { level, message } => Some((level.clone(), message.clone())),
                     _ => None,
                 })
                 .collect()

@@ -323,9 +323,9 @@ pressure.
 
 | Platform | Capture | Input injection | Hardware H.264 encode | Clipboard |
 |---|---|---|---|---|
-| **Linux / X11** | XShm via `x11rb` (`display/x11.rs`), `XGetImage` fallback | `xdotool` | ffmpeg VA-API, `libx264` software fallback (`encode/h264_linux.rs`) | `xclip` |
+| **Linux / X11** | XShm/root-window capture via `x11rb` (`display/x11.rs`), `XGetImage` fallback | `x11rb`/XTest in-process | ffmpeg VA-API, `libx264` software fallback (`encode/h264_linux.rs`) | `x11rb` clipboard in-process |
 | **Linux / Wayland** | PipeWire via XDG Desktop Portal `ScreenCast` (`display/wayland.rs`) | XDG Desktop Portal `RemoteDesktop` `notify_*` D-Bus methods (via `ashpd`) | same as X11 | `wl-copy` / `wl-paste` |
-| **macOS** | ScreenCaptureKit (`display/macos.rs`) | `cliclick` | VideoToolbox, zero-copy from SCK frames (`encode/h264_macos.rs`) | `pbcopy` / `pbpaste`, `osascript` for images |
+| **macOS** | ScreenCaptureKit (`display/macos.rs`) | CoreGraphics `CGEvent` in-process | VideoToolbox, zero-copy from SCK frames (`encode/h264_macos.rs`) | `pbcopy` / `pbpaste`, `osascript` for images |
 | **Windows** | GDI `BitBlt` default, DXGI Desktop Duplication opt-in via `INTENDANT_WINDOWS_CAPTURE=dxgi` (`display/windows.rs`) | Win32 `SendInput` | Media Foundation software MFT, NVENC where available (`encode/h264_windows.rs`) — this is the **baseline** codec on Windows | `arboard` crate (in-process Win32) |
 
 VP8 (`encode/vp8.rs`, libvpx) is the always-on baseline on macOS/Linux and is
@@ -367,9 +367,12 @@ the agent's click coordinates match the screenshot it receives.
 ## Recording
 
 Display recording runs in parallel with WebRTC streaming via ffmpeg
-(`recording.rs`): `x11grab` input on Linux, `avfoundation` on macOS. Recordings
-are segmented into MP4 files (default 60 s) for efficient seeking; the dashboard
-provides a player with timeline, seeking, and speed control.
+(`recording.rs`). When a `DisplaySession` exists, frames are subscribed from the
+session, JPEG-encoded, and piped to ffmpeg via `image2pipe`. Without a session,
+the legacy fallback uses `x11grab` on Linux and `screencapture` feeding
+`image2pipe` on macOS. Recordings are segmented into MP4 files (default 60 s)
+for efficient seeking; the dashboard provides a player with timeline, seeking,
+and speed control.
 
 ```toml
 [recording]

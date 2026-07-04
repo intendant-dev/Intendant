@@ -83,10 +83,11 @@ pub struct TokenUsage {
 /// A tool call returned by the model.
 #[derive(Debug, Clone)]
 pub struct ToolCall {
-    /// The item ID (fc_-prefixed for Responses API, call_-prefixed for others).
+    /// Provider item identity when the provider exposes one.
     pub id: String,
-    /// The correlation key used to pair calls with outputs (call_-prefixed).
-    /// For Responses API this is distinct from `id`; for other providers it equals `id`.
+    /// Local correlation key used to pair calls with tool results.
+    /// For some providers this is distinct from `id`; for others it equals
+    /// the provider item identity or a synthetic local id.
     pub call_id: String,
     pub name: String,
     pub arguments: String,
@@ -101,8 +102,9 @@ pub struct ChatResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Native computer-use tool calls (parsed from provider-specific format).
     pub cu_calls: Vec<super::computer_use::CuToolCall>,
-    /// Raw output items from the Responses API (reasoning + function_call items).
-    /// Echoed back verbatim in subsequent requests per the API contract.
+    /// Opaque provider transcript items that must be echoed back verbatim in
+    /// subsequent requests. Currently used for OpenAI Responses output items
+    /// and Gemini raw parts carrying `thoughtSignature`.
     pub raw_output: Option<Vec<serde_json::Value>>,
 }
 
@@ -3295,9 +3297,9 @@ pub fn select_cu_provider(
 /// Auto-detect prefers gemini (gemini-2.5-flash) when GEMINI_API_KEY is set,
 /// falling back to the cheapest available provider.
 ///
-/// Presence providers are created with `new_plain()` — no native agent tools.
-/// The presence layer has its own tool set (submit_task, check_status, etc.)
-/// managed at the conversation level, not through the provider.
+/// Presence providers receive the presence-native tool set through provider
+/// tool calling. These are distinct from the main agent tools and include
+/// presence actions such as submit_task and check_status.
 pub fn select_presence_provider(
     provider_name: Option<&str>,
     model_name: Option<&str>,

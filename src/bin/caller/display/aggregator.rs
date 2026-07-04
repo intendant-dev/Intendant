@@ -776,12 +776,12 @@ pub fn diff_wanted_aggregate(
 /// outside this set are wasted CPU — the encoder produces frames
 /// that no peer's WebRTC track can decode. The bound is applied
 /// LAST: `effective = ((twcc∩rr) ∪ pinned) ∩ demanded`. Local
-/// DisplaySlot demands `{f,h,q}` (multi-RID offer), so its
-/// behavior is unchanged. Federated `q`-only demands `{q}`, so
-/// `f`/`h` pause regardless of loss state. Mixed local+federated
-/// demands `{f,h,q}` (union) for as long as the local peer is
-/// live. Zero peers → demanded is empty → effective is empty
-/// (encoders pause immediately, no debounce-window-of-wasted-CPU).
+/// DisplaySlot defaults to `{f}`; opt-in multi-RID offers demand
+/// `{f,h,q}`. Federated floor-RID viewers demand `{q}`, so `f`/`h`
+/// pause unless another live peer can consume them. Mixed demand is
+/// the union of live peers' negotiated RIDs. With zero peers, demanded and
+/// effective are empty (encoders pause immediately, no
+/// debounce-window-of-wasted-CPU).
 ///
 /// The single-RID peer's pin is by construction ⊆ demanded
 /// (their pin is their only negotiated RID, which is in their

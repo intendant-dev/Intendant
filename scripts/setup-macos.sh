@@ -94,17 +94,6 @@ check_core() {
         all_ok=false
     fi
 
-    # OpenSSL (build-time dep for the openssl-sys crate). Homebrew's
-    # openssl@3 provides pkg-config metadata that openssl-sys finds at
-    # build time — without it, cargo fails with
-    # "Could not find openssl via pkg-config".
-    if brew list --formula 2>/dev/null | grep -q '^openssl@3$'; then
-        ok "openssl@3 (Homebrew)"
-    else
-        miss "openssl@3" "brew install openssl@3"
-        all_ok=false
-    fi
-
     $all_ok
 }
 
@@ -132,7 +121,7 @@ check_computer_use() {
 #
 # Two modes:
 #   1. Vortex Audio (preferred): HAL plugin with direct shm bridge. No system
-#      default changes, per-app routing, works in VMs.
+#      default-device changes; apps open the Vortex device directly.
 #   2. BlackHole (fallback): Virtual loopback via system default switching.
 #      Simpler setup but changes system-wide audio defaults during calls.
 check_audio() {
@@ -141,35 +130,26 @@ check_audio() {
     echo ""
     echo "Audio routing dependencies:"
 
-    if has_cmd SwitchAudioSource; then
-        ok "SwitchAudioSource"
-    else
-        miss "SwitchAudioSource" "brew install switchaudio-osx"
-        all_ok=false
-    fi
-
-    if has_cmd sox; then
-        ok "sox"
-    else
-        miss "sox" "brew install sox"
-        all_ok=false
-    fi
-
     # Vortex Audio (preferred)
     if has_audio_device "Vortex Audio"; then
-        ok "Vortex Audio (HAL plugin)"
-        # Check if it's the default input
-        local cur_input
-        cur_input="$(SwitchAudioSource -c -t input 2>/dev/null)"
-        if [[ "$cur_input" == "Vortex Audio" ]]; then
-            ok "Vortex Audio is default input"
-        else
-            miss "Vortex Audio not default input" "current: $cur_input"
-            all_ok=false
-        fi
+        ok "Vortex Audio (HAL plugin, direct shm)"
     else
         miss "Vortex Audio" "install Vortex guest tools (scripts/install-vortex-audio.sh)"
-        # Fall back to checking BlackHole
+
+        if has_cmd SwitchAudioSource; then
+            ok "SwitchAudioSource (BlackHole fallback)"
+        else
+            miss "SwitchAudioSource" "brew install switchaudio-osx"
+            all_ok=false
+        fi
+
+        if has_cmd sox; then
+            ok "sox (BlackHole fallback)"
+        else
+            miss "sox" "brew install sox"
+            all_ok=false
+        fi
+
         if has_blackhole "BlackHole 2ch"; then
             ok "BlackHole 2ch (fallback)"
         else
@@ -326,24 +306,6 @@ install_vortex_audio() {
     info "installing Vortex guest tools..."
     sudo installer -pkg "$pkg" -target /
     NEEDS_REBOOT=true
-}
-
-set_vortex_defaults() {
-    if ! has_audio_device "Vortex Audio"; then return; fi
-    if ! has_cmd SwitchAudioSource; then return; fi
-
-    local cur_input cur_output
-    cur_input="$(SwitchAudioSource -c -t input 2>/dev/null)"
-    cur_output="$(SwitchAudioSource -c -t output 2>/dev/null)"
-
-    if [[ "$cur_input" != "Vortex Audio" ]]; then
-        info "setting Vortex Audio as default input..."
-        SwitchAudioSource -s "Vortex Audio" -t input
-    fi
-    if [[ "$cur_output" != "Vortex Audio" ]]; then
-        info "setting Vortex Audio as default output..."
-        SwitchAudioSource -s "Vortex Audio" -t output
-    fi
 }
 
 # Disable screensaver, screen lock, and display/system sleep.
@@ -507,20 +469,17 @@ run_install() {
     # Phase 5: Managed browser for CDP browser workspaces
     install_managed_browser
 
-    # Phase 6: Set audio defaults
-    set_vortex_defaults
-
-    # Phase 7: Disable screensaver so the agent isn't interrupted
+    # Phase 6: Disable screensaver so the agent isn't interrupted
     disable_screen_lock
 
-    # Phase 8: App bundle
+    # Phase 7: App bundle
     echo ""
     info "building macOS app bundle..."
     if [ -f scripts/bundle-macos.sh ]; then
         bash scripts/bundle-macos.sh
     fi
 
-    # Phase 9: Final status
+    # Phase 8: Final status
     echo ""
     echo "════════════════════════════════════════════════════════"
     echo "  Setup complete!"

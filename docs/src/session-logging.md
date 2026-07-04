@@ -243,8 +243,10 @@ client (`replay_jsonl_to_outbound_entries` in `web_gateway.rs`):
 - Each subsequent line is converted to an `OutboundEvent`-shaped object with its
   original `ts` preserved, so replay reproduces the exact event sequence the
   Activity tab would have shown live.
-- External-agent activity replay intentionally includes only user/assistant
-  messages (not every internal event).
+- External-agent activity replay is a bounded UI bootstrap with
+  full-audit-transcript semantics: it includes user/assistant transcript entries,
+  command output, rollback metadata, session goals, and context snapshots where
+  available, while still omitting internal events that are not useful to render.
 
 Live events then continue to stream over the same WebSocket. See
 [Web Dashboard](./web-dashboard.md) for the tab structure and

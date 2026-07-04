@@ -112,8 +112,9 @@ without narration, and dashboard chat / tasks dispatch directly to the worker.
 ## Browser-Side Live Presence
 
 When the dashboard is open with voice enabled, the browser connects directly to
-Gemini Live or OpenAI Realtime (the API key lives in browser `localStorage` and
-is **never sent to the Intendant server**). The browser's voice model becomes
+Gemini Live or OpenAI Realtime. Voice keys are read from the encrypted client
+vault when it is unlocked, with browser `localStorage` used only as legacy
+fallback storage and as a migration source. The browser's voice model becomes
 presence, calling the exact same tools over the WebSocket tool request/response
 protocol.
 
@@ -337,7 +338,9 @@ model or the browser voice model is driving.
 - **openai.rs** — OpenAI Realtime integration.
 - **callbacks.rs** — JS callback management for voice/tool events.
 
-Build (does **not** happen during `cargo build`):
+Normal `cargo build` checks `crates/presence-web`, `crates/presence-core`, and
+`crates/station-web` and auto-rebuilds stale WASM artifacts with `wasm-pack`
+when it is installed. Manual fallback:
 
 ```bash
 cd crates/presence-web
@@ -345,9 +348,9 @@ wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence
 cargo build --release -p intendant   # re-embed the compiled WASM
 ```
 
-The `static/wasm-web/` files are pre-compiled artifacts; any change to
-`presence-web/` or `presence-core/` requires the `wasm-pack` step plus a
-re-embed build.
+The `static/wasm-web/` files are pre-compiled artifacts. If `wasm-pack` is not
+installed or the build script reports an auto-rebuild failure, run the manual
+command and then `cargo build` to re-embed the compiled WASM.
 
 ## See Also
 

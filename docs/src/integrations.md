@@ -85,28 +85,26 @@ devices. The backend is chosen per platform (`audio_routing.rs`):
                 live audio / phone-call session
                               │
         ┌─────────────────────┼─────────────────────┐
-     macOS                 Linux                  (host helper)
-        │                     │                       │
-  Vortex Audio HAL      PulseAudio null sinks    bh-bridge --port
-  (preferred): a         (pactl module-null-     (BlackHole fallback
-  "Vortex Audio"         sink for mic + speaker,  on macOS): host runs
-  device + daemon        default source/sink      a small bridge that
-  over a Unix socket     swapped for the session) shuttles BlackHole I/O
+  Unix with Vortex       Linux fallback        macOS fallback
+        │                     │                     │
+  Vortex Audio HAL      PulseAudio null sinks  BlackHole 2ch/16ch
+  direct POSIX shm      (pactl module-null-    via SwitchAudioSource
+  rings, no daemon      sink for mic + speaker, and sox
+  or socket             defaults restored)
 ```
 
-- **macOS (preferred): Vortex Audio.** A Core Audio HAL plugin shipped in
-  `vendor/vortex-guest-tools/` that exposes a "Vortex Audio" device to all apps
-  and bridges audio over a Unix socket to a guest daemon — no system audio
-  reroute and no reboot. `scripts/setup-macos.sh` installs it (or
+- **Unix preferred: Vortex Audio.** The Vortex HAL plugin shipped in
+  `vendor/vortex-guest-tools/` exposes a "Vortex Audio" device to apps.
+  Intendant probes `/vortex-audio` and exchanges PCM through the plugin's
+  POSIX shared-memory rings directly — no daemon, no socket, no system audio
+  reroute. `scripts/setup-macos.sh` installs it on macOS (or
   `scripts/update-vortex-pkg.sh` updates the package); see
   [Computer Use & Live Audio](./computer-use-and-audio.md).
-- **macOS fallback: BlackHole.** When Vortex is not present, a `BlackHole 2ch` /
-  `16ch` virtual device is used, driven by a host-side `bh-bridge` helper.
 - **Linux: PulseAudio null sinks.** `pactl` creates null sinks for the mic and
   speaker paths, and the session temporarily swaps the default source/sink,
   restoring them on teardown. (`pulseaudio-utils` provides `pactl`.)
-- **Device management (macOS): `SwitchAudioSource`** lists and selects input
-  devices; **`sox`** is used for audio format handling.
+- **macOS fallback: BlackHole.** When Vortex is not present, `BlackHole 2ch` /
+  `16ch` virtual devices are driven with `SwitchAudioSource` and `sox`.
 
 The phone-call skill places outbound SIP calls via `pjsua`, with the live voice
 model conducting the conversation and returning structured data. The live audio
@@ -138,13 +136,13 @@ display (`:ID`) and is repeatable.
 
 ## System tools
 
-Intendant shells out to platform tools for capture, input injection, and search.
+Intendant uses platform APIs and tools for capture, input injection, and search.
 Install them via the setup scripts (next section); the agent degrades gracefully
 with a clear error when one is missing.
 
 | Purpose | macOS | Linux (X11) | Linux (Wayland) |
 |---------|-------|-------------|-----------------|
-| Input injection | `cliclick` | `xdotool` | `ydotool` |
+| Input injection | in-process CGEvents | `x11rb`/XTest | portal `InputEvent`s |
 | Display capture | ScreenCaptureKit | libxcb + libxcb-shm (XShm) | PipeWire (DMA-BUF) |
 | H.264 encode | VideoToolbox | ffmpeg + x264 / VA-API | ffmpeg + x264 / VA-API |
 | VP8 encode | libvpx | libvpx | libvpx |
@@ -162,7 +160,7 @@ X11 displays are auto-launched via Xvfb when the agent first needs one. See
 | Script | Purpose |
 |--------|---------|
 | `setup-linux.sh` | Install the Debian/Ubuntu `APT_PACKAGES` set + toolchain build deps, build, and provision a managed Chrome for Testing browser; `--check` to report only |
-| `setup-macos.sh` | Install macOS deps (cliclick, ffmpeg, sox, SwitchAudioSource, Vortex/BlackHole, wasm-pack), build, and provision a managed Chrome for Testing browser; `--check` to report only |
+| `setup-macos.sh` | Install macOS deps (ffmpeg, Vortex/BlackHole fallback deps, wasm-pack), build, and provision a managed Chrome for Testing browser; `--check` to report only |
 | `setup-windows.ps1` | Windows toolchain + build for `x86_64-pc-windows-msvc`, plus managed Chrome for Testing provisioning (see [Windows Support](./windows-support.md)) |
 | `bundle-macos.sh` | Build and codesign the macOS `.app` (WKWebView wrapper over the `intendant://` scheme) and install to `/Applications` |
 | `setup-lan.sh`, `setup-lan-macos.sh`, `setup-lan-guest-macos.sh`, `setup-lan.bat` | Wrappers/orchestrators around the native `intendant access` cert enrollment flow |
@@ -183,8 +181,10 @@ managed browser cache used by CDP browser workspaces.
 | `windows.yml` | push/PR to `main` (Rust/Cargo paths) | Cross-platform `cargo test -p intendant --bins` on Windows (`x86_64-pc-windows-msvc`), macOS (`aarch64-apple-darwin`), and Linux (`x86_64-unknown-linux-gnu`) to catch platform-specific build breaks and Unix-only test assumptions |
 | `audit.yml` | push/PR (Cargo paths) + weekly cron (Mon 08:00 UTC) | `cargo audit` against the RustSec advisory DB |
 | `docs.yml` | docs changes | Build and deploy this mdBook |
+| `agents-md-sync.yml` | push/PR touching `CLAUDE.md` or `AGENTS.md`, plus manual dispatch | Fails when tracked `AGENTS.md` differs byte-for-byte from `CLAUDE.md` |
 
-The `tests/e2e/` integration tests make real API calls and are **not** in CI.
+The E2E scenarios under `tests/skills/` make real API calls / need a display and
+are **not** in CI.
 Run `cargo test --bins` and `cargo clippy` locally before committing. The TLS
 stack is pure-Rust `ring` / `rustls` / `rcgen` (no OpenSSL), which is why the
 Windows CI job installs NASM (for `ring`'s assembly) but no `libssl`.
@@ -235,14 +235,16 @@ external scripts and tools. It is opt-in.
 {"event": "status", "turn": 3, "phase": "thinking", "autonomy": "medium", "session_id": "abc-123", "task": "fix tests"}
 {"event": "usage", "main": {"provider": "openai", "model": "gpt-5.5", "tokens_used": 12000, "context_window": 128000, "usage_pct": 9.4}}
 {"event": "usage_update", "main": {"provider": "openai", "model": "gpt-5.5", "tokens_used": 15000, "context_window": 128000, "usage_pct": 11.7}}
-{"event": "display_ready", "display_id": "virtual-99", "width": 1024, "height": 768}
+{"event": "display_ready", "display_id": 99, "width": 1024, "height": 768}
 {"event": "command_result", "action": "get_restart_status", "ok": true, "message": "ok", "data": {}}
 ```
 
 - `status` includes `session_id` and `task`. The `usage` event answers
   `{"action":"usage"}`; `usage_update` is broadcast automatically after each
   turn (with a `presence` field when the presence layer is active).
-  `display_ready` fires when a display becomes available for WebRTC streaming.
+  `display_ready` fires when a display becomes available for WebRTC streaming;
+  its `display_id` is numeric. Request parameters that target a display use
+  strings such as `display_99` in their own fields.
   `command_result.ok` is `false` when a control action fails (e.g.
   `schedule_controller_restart` with `restart_after="now"` and no executable
   restart action).

@@ -72,6 +72,20 @@ pub fn validate(
         }
     }
 
+    // The advertised JSON Schema says `additionalProperties: false` — honor
+    // it. This input comes from an untrusted voice model mid-call, so an
+    // unknown field is a hard reject, not a silent drop: the caller's error
+    // path quarantines the raw payload, and nothing undeclared ever passes
+    // through unexamined.
+    for key in obj.keys() {
+        if !schema.fields.iter().any(|f| &f.name == key) {
+            errors.push(ValidationError {
+                field: key.clone(),
+                message: "unknown field (the schema is additionalProperties: false)".into(),
+            });
+        }
+    }
+
     if errors.is_empty() {
         Ok((serde_json::Value::Object(result), quarantined))
     } else {
@@ -670,16 +684,26 @@ mod tests {
     }
 
     #[test]
-    fn extra_fields_in_value_are_dropped() {
+    fn extra_fields_in_value_are_rejected() {
+        // The advertised schema is additionalProperties: false; an unknown
+        // field from the untrusted voice model is a hard validation error
+        // (the caller quarantines the raw payload on that path), never a
+        // silent drop.
         let schema = make_schema(vec![FieldSpec {
             name: "ok".into(),
             field_type: FieldType::Boolean,
             required: true,
             description: None,
         }]);
-        let value = serde_json::json!({"ok": true, "extra": "should be dropped"});
+        let value = serde_json::json!({"ok": true, "extra": "undeclared"});
+        let errors = validate(&schema, &value, &mut noop_quarantine).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "extra");
+        assert!(errors[0].message.contains("unknown field"));
+
+        // Without the stray key the same value validates.
+        let value = serde_json::json!({"ok": true});
         let (result, _) = validate(&schema, &value, &mut noop_quarantine).unwrap();
-        assert!(result.get("extra").is_none());
         assert_eq!(result["ok"], true);
     }
 }

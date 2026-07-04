@@ -2127,11 +2127,11 @@ pub struct WebGatewayConfig {
     /// Whether the *federated* (peer-to-peer) display path may negotiate
     /// H.264. Default false ⇒ the browser pins VP8 for federation (the
     /// safe default for lossy TURN-relayed paths). When true the browser
-    /// skips the VP8 pin and lets codec order default, allowing the peer's
-    /// H.264 encoder (intra-refresh libx264 / NVENC) to be selected. Does
-    /// NOT affect the *local* DisplaySlot path, which already defaults
-    /// codec order. Sourced from `[webrtc].federation_allow_h264` in
-    /// intendant.toml.
+    /// prefers H.264, allowing the peer's federated H.264 layer
+    /// (quarter-resolution, capped bitrate, periodic IDRs, same-SSRC NACK,
+    /// small slices) to be selected. Does NOT affect the *local* DisplaySlot
+    /// path, which already defaults codec order. Sourced from
+    /// `[webrtc].federation_allow_h264` in intendant.toml.
     #[serde(default)]
     pub federation_allow_h264: bool,
     /// Public peer access-request hardening. This is gateway runtime state,
@@ -5874,7 +5874,9 @@ fn session_log_search_file_path(
     }
 
     match source {
-        "intendant" => Some(resolve_bare_session_dir_from_home(home, session_id)?.join("session.jsonl")),
+        "intendant" => {
+            Some(resolve_bare_session_dir_from_home(home, session_id)?.join("session.jsonl"))
+        }
         "codex" => find_codex_session_file(home, session_id),
         "claude-code" => find_claude_session_file(home, session_id),
         "gemini" => find_gemini_session_file(home, session_id),
@@ -6980,19 +6982,11 @@ fn session_index_entry_path(namespace: &str, slot: &str) -> PathBuf {
 }
 
 fn write_session_index_entry(path: &Path, body: &[u8]) {
-    static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
     let Some(parent) = path.parent() else { return };
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let tmp = parent.join(format!(
-        ".tmp.{}.{}",
-        std::process::id(),
-        WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let _ = crate::file_watcher::atomic_write(path, body);
 }
 
 fn load_persisted_session_entry_in<T: serde::de::DeserializeOwned>(
@@ -7112,7 +7106,9 @@ fn preload_namespace_dir(dir: &Path, namespace: &'static str, apply: PreloadAppl
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(".tmp.") {
+        if name.starts_with(".tmp.")
+            || (name.starts_with(".intendant-write-") && name.ends_with(".tmp"))
+        {
             // Writers rename these away within the same call; anything
             // older than a minute is litter from a crashed daemon.
             let aged = entry
@@ -8894,8 +8890,7 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
             summary.bytes,
         );
         summary.lineage.apply_to_session_json(&mut session);
-        let parent_baseline =
-            codex_parent_baseline_for_summary(&summary, &exact_parent_baselines);
+        let parent_baseline = codex_parent_baseline_for_summary(&summary, &exact_parent_baselines);
         let usage = parent_baseline
             .map(|baseline| summary.usage.saturating_sub(baseline))
             .unwrap_or(summary.usage);
@@ -16884,9 +16879,7 @@ pub(crate) struct FsWriteArgs {
 fn fs_write_request_bytes(req: &FsWriteRequest) -> Result<Vec<u8>, String> {
     use base64::Engine as _;
     match (&req.content, &req.content_b64) {
-        (Some(_), Some(_)) => {
-            Err("provide either content or content_b64, not both".to_string())
-        }
+        (Some(_), Some(_)) => Err("provide either content or content_b64, not both".to_string()),
         (Some(text), None) => Ok(text.clone().into_bytes()),
         (None, Some(b64)) => base64::engine::general_purpose::STANDARD
             .decode(b64)
@@ -17084,7 +17077,7 @@ pub(crate) fn apply_dashboard_fs_write(
                 let _ = std::fs::set_permissions(tmp.path(), current.permissions());
             }
         }
-        crate::upload_store::persist_tempfile(tmp, &target)
+        crate::file_watcher::persist_tempfile(tmp, &target)
     })();
     if let Err(e) = write_result {
         return (
@@ -17133,7 +17126,10 @@ pub(crate) fn dashboard_fs_write_response_parts(
             .get("create_new")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        force: params.get("force").and_then(|v| v.as_bool()).unwrap_or(false),
+        force: params
+            .get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     };
     let (status_line, body) = apply_dashboard_fs_write(&args, bytes);
     (status_line_u16(&status_line), body.to_string())
@@ -18348,13 +18344,8 @@ pub(crate) fn handle_set_api_keys(body: &str) -> String {
 
     let new_content = lines.join("\n") + "\n";
 
-    // Atomic write: temp file + rename.
-    let tmp_path = config_dir.join(".env.tmp");
-    if let Err(e) = std::fs::write(&tmp_path, &new_content) {
+    if let Err(e) = crate::file_watcher::atomic_write(&env_path, new_content.as_bytes()) {
         return serde_json::json!({"error": format!("Write failed: {}", e)}).to_string();
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, &env_path) {
-        return serde_json::json!({"error": format!("Rename failed: {}", e)}).to_string();
     }
 
     // Set env vars in the current process so future provider instantiations
@@ -22980,10 +22971,7 @@ pub fn spawn_web_gateway(
                                 let sha_header = if file.partial {
                                     String::new()
                                 } else {
-                                    format!(
-                                        "X-Content-Sha256: {}\r\n",
-                                        fs_sha256_hex(&file.bytes)
-                                    )
+                                    format!("X-Content-Sha256: {}\r\n", fs_sha256_hex(&file.bytes))
                                 };
                                 let header = format!(
                                     "HTTP/1.1 {}\r\n\
@@ -23095,20 +23083,21 @@ pub fn spawn_web_gateway(
                                                 create_new: req.create_new,
                                                 force: req.force,
                                             };
-                                            let (status, body) = tokio::task::spawn_blocking(
-                                                move || apply_dashboard_fs_write(&args, &bytes),
-                                            )
-                                            .await
-                                            .unwrap_or_else(|e| {
-                                                (
-                                                    "500 Internal Server Error".to_string(),
-                                                    serde_json::json!({
-                                                        "error": format!(
-                                                            "filesystem write task failed: {e}"
-                                                        )
-                                                    }),
-                                                )
-                                            });
+                                            let (status, body) =
+                                                tokio::task::spawn_blocking(move || {
+                                                    apply_dashboard_fs_write(&args, &bytes)
+                                                })
+                                                .await
+                                                .unwrap_or_else(|e| {
+                                                    (
+                                                        "500 Internal Server Error".to_string(),
+                                                        serde_json::json!({
+                                                            "error": format!(
+                                                                "filesystem write task failed: {e}"
+                                                            )
+                                                        }),
+                                                    )
+                                                });
                                             json_response(&status, body.to_string())
                                         }
                                         Err(message) => json_error("400 Bad Request", message),
@@ -24637,35 +24626,34 @@ pub fn spawn_web_gateway(
                             .trim_start_matches('/');
                         let segments: Vec<&str> =
                             subpath.split('/').filter(|s| !s.is_empty()).collect();
-                        let (status, body) =
-                            if segments.is_empty() && req_method == "POST" {
-                                match read_request_body_capped(
-                                    &mut stream,
+                        let (status, body) = if segments.is_empty() && req_method == "POST" {
+                            match read_request_body_capped(
+                                &mut stream,
+                                &header_text,
+                                crate::peer::access_request::effective_body_limit_bytes(
+                                    &peer_access_request_config,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(body_text) => peer_access_request_create(
+                                    &body_text,
                                     &header_text,
-                                    crate::peer::access_request::effective_body_limit_bytes(
-                                        &peer_access_request_config,
-                                    ),
-                                )
-                                .await
-                                {
-                                    Ok(body_text) => peer_access_request_create(
-                                        &body_text,
-                                        &header_text,
-                                        is_tls,
-                                        Some(source_hint.clone()),
-                                        &peer_access_request_config,
-                                    ),
-                                    Err((status, body)) => (status, body),
-                                }
-                            } else if segments.len() == 1 && req_method == "GET" {
-                                peer_access_request_status(segments[0])
-                            } else {
-                                (
+                                    is_tls,
+                                    Some(source_hint.clone()),
+                                    &peer_access_request_config,
+                                ),
+                                Err((status, body)) => (status, body),
+                            }
+                        } else if segments.len() == 1 && req_method == "GET" {
+                            peer_access_request_status(segments[0])
+                        } else {
+                            (
                                 404,
                                 serde_json::json!({"error": "unknown peer access request endpoint"})
                                     .to_string(),
                             )
-                            };
+                        };
                         let response = with_public_cors(json_response(status_reason(status), body));
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_path == "/api/access/iam/user-client-grants"
@@ -24998,8 +24986,7 @@ pub fn spawn_web_gateway(
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_invite(&body_text)
-                        } else if segments == ["pairing", "request-access"]
-                            && req_method == "POST"
+                        } else if segments == ["pairing", "request-access"] && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_request_access(&body_text).await
@@ -25013,13 +25000,9 @@ pub fn spawn_web_gateway(
                                 &body_text,
                             )
                             .await
-                        } else if segments == ["pairing", "requests"]
-                            && req_method == "GET"
-                        {
+                        } else if segments == ["pairing", "requests"] && req_method == "GET" {
                             peers_pairing_requests_list()
-                        } else if segments == ["pairing", "identities"]
-                            && req_method == "GET"
-                        {
+                        } else if segments == ["pairing", "identities"] && req_method == "GET" {
                             peers_pairing_identities_list()
                         } else if segments == ["pairing", "identities", "revoke"]
                             && req_method == "POST"
@@ -25042,15 +25025,12 @@ pub fn spawn_web_gateway(
                                     })
                                     .to_string(),
                                 ),
-                                Some(registry)
-                                    if segments.is_empty() && req_method == "GET" =>
-                                {
+                                Some(registry) if segments.is_empty() && req_method == "GET" => {
                                     (200, peers_list_response_body(registry))
                                 }
                                 Some(registry)
                                     if segments.is_empty()
-                                        && (req_method == "POST"
-                                            || req_method == "DELETE") =>
+                                        && (req_method == "POST" || req_method == "DELETE") =>
                                 {
                                     let body_text =
                                         read_request_body(&mut stream, &header_text).await;
@@ -25062,8 +25042,7 @@ pub fn spawn_web_gateway(
                                     }
                                 }
                                 Some(registry)
-                                    if segments == ["eligible"]
-                                        && req_method == "GET" =>
+                                    if segments == ["eligible"] && req_method == "GET" =>
                                 {
                                     // GET /api/peers/eligible?capability=display
                                     // — list peers that satisfy all listed
@@ -25076,8 +25055,7 @@ pub fn spawn_web_gateway(
                                     peers_eligible(registry, query_str)
                                 }
                                 Some(registry)
-                                    if segments == ["pairing", "join"]
-                                        && req_method == "POST" =>
+                                    if segments == ["pairing", "join"] && req_method == "POST" =>
                                 {
                                     let body_text =
                                         read_request_body(&mut stream, &header_text).await;
@@ -25088,9 +25066,7 @@ pub fn spawn_web_gateway(
                                     )
                                     .await
                                 }
-                                Some(registry)
-                                    if segments.len() == 2 && req_method == "POST" =>
-                                {
+                                Some(registry) if segments.len() == 2 && req_method == "POST" => {
                                     let id = url_path_decode(segments[0]);
                                     let op = segments[1];
                                     let body_text =
@@ -30455,8 +30431,7 @@ fn peer_identity_allows_ws_control(
     // opens for any profile that can use something inside it, and every
     // method/frame is then individually authorized on this same identity.
     if matches!(ctrl, ControlMsg::PeerDashboardControlSignal { .. }) {
-        if crate::peer::access_policy::profile_allows_dashboard_control_tunnel(&identity.profile)
-        {
+        if crate::peer::access_policy::profile_allows_dashboard_control_tunnel(&identity.profile) {
             return true;
         }
         bus.send(AppEvent::PresenceLog {
@@ -30620,8 +30595,7 @@ fn ws_grant_allows_control(
         ctrl,
         ControlMsg::PeerDashboardControlSignal { .. } | ControlMsg::PeerFileTransferSignal { .. }
     ) {
-        let decision =
-            grant.access_decision(crate::peer::access_policy::PeerOperation::PeerUse);
+        let decision = grant.access_decision(crate::peer::access_policy::PeerOperation::PeerUse);
         if decision.allowed {
             return true;
         }
@@ -41700,7 +41674,10 @@ mod tests {
         assert_eq!(dashboard_http_operation("GET", "/api/fs/delete"), None);
         assert_eq!(dashboard_http_operation("POST", "/api/fs/writeable"), None);
         assert_eq!(dashboard_http_operation("POST", "/api/fs/deleted"), None);
-        assert_eq!(dashboard_http_operation("POST", "/api/coordinator/route"), None);
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/coordinator/route"),
+            None
+        );
         assert_eq!(dashboard_http_operation("GET", "/config"), None);
         // The prefix families use the same boundary rule as dispatch:
         // exact or a real `/` segment — dispatch's look-alike non-routes
@@ -41989,7 +41966,10 @@ mod tests {
         assert_eq!(status, "200 OK");
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);
-        assert_eq!(std::fs::read(&target).unwrap(), b"#!/bin/sh\necho updated\n");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"#!/bin/sh\necho updated\n"
+        );
     }
 
     #[test]
@@ -42000,8 +41980,8 @@ mod tests {
         let status = inspect_dashboard_fs_path(&file.to_string_lossy()).unwrap();
         assert_eq!(status.size, Some(5));
         assert!(status.modified_ms.unwrap_or(0) > 0);
-        let missing = inspect_dashboard_fs_path(&dir.path().join("nope").to_string_lossy())
-            .unwrap();
+        let missing =
+            inspect_dashboard_fs_path(&dir.path().join("nope").to_string_lossy()).unwrap();
         assert_eq!(missing.size, None);
         assert_eq!(missing.modified_ms, None);
     }
@@ -42043,7 +42023,10 @@ mod tests {
 
         // The relay routes classify as PeerUse on the HTTP lane.
         assert_eq!(
-            dashboard_http_operation("POST", "/api/peers/intendant:peer-b/dashboard-control-webrtc"),
+            dashboard_http_operation(
+                "POST",
+                "/api/peers/intendant:peer-b/dashboard-control-webrtc"
+            ),
             Some(PeerOperation::PeerUse)
         );
         assert_eq!(
@@ -42144,7 +42127,12 @@ mod tests {
             iam_state: scoped.iam_state.clone().expect("scoped iam state"),
         };
         assert!(!ws_grant_allows_control(&scoped_grant, None, &signal, &bus));
-        assert!(!ws_grant_allows_control(&scoped_grant, None, &transfer, &bus));
+        assert!(!ws_grant_allows_control(
+            &scoped_grant,
+            None,
+            &transfer,
+            &bus
+        ));
     }
 
     #[test]
@@ -46953,8 +46941,8 @@ mod tests {
             summary.daily_usage.get("2026-07-01"),
             Some(&total_usage(100))
         );
-        let mtime_day = usage_day_from_timestamp(summary.file_updated_at.as_deref())
-            .expect("file mtime day");
+        let mtime_day =
+            usage_day_from_timestamp(summary.file_updated_at.as_deref()).expect("file mtime day");
         let daily_total: u64 = summary
             .daily_usage
             .values()
@@ -47094,10 +47082,7 @@ mod tests {
         let mut wrong_schema: serde_json::Value = serde_json::from_slice(&live_bytes).unwrap();
         wrong_schema["schema"] = serde_json::json!(99);
         assert_eq!(
-            preload_row_entry(
-                "claude-code",
-                &serde_json::to_vec(&wrong_schema).unwrap()
-            ),
+            preload_row_entry("claude-code", &serde_json::to_vec(&wrong_schema).unwrap()),
             PreloadOutcome::Skipped
         );
 

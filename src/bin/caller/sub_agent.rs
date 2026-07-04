@@ -226,7 +226,10 @@ pub fn scan_completed_results(sub_agent_dir: &Path) -> Vec<SubAgentResult> {
     results
 }
 
-/// Orchestrator project state checkpoint, persisted between context compactions.
+/// PARKED: disk form for orchestrator project state checkpoints.
+///
+/// The live checkpoint path uses the knowledge store (`store_memory` on the
+/// `project_state` channel). These disk helpers remain unwired.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectState {
     pub completed_tasks: Vec<String>,
@@ -236,7 +239,7 @@ pub struct ProjectState {
     pub updated_at: String,
 }
 
-/// Write a project state checkpoint to the given directory.
+/// Write the parked disk project-state checkpoint to the given directory.
 #[allow(dead_code)]
 pub fn write_project_state(dir: &Path, state: &ProjectState) -> Result<(), CallerError> {
     if let Some(parent) = dir.parent() {
@@ -286,7 +289,7 @@ pub fn write_project_state(dir: &Path, state: &ProjectState) -> Result<(), Calle
     Ok(())
 }
 
-/// Read a project state checkpoint from the given directory.
+/// Read the parked disk project-state checkpoint from the given directory.
 #[allow(dead_code)]
 pub fn read_project_state(dir: &Path) -> Result<ProjectState, CallerError> {
     let path = dir.join("project_state.json");

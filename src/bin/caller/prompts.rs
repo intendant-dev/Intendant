@@ -126,7 +126,11 @@ fn substitute_platform(prompt: &str) -> String {
             "Debian 12",
             "You run as an unprivileged user with passwordless sudo access \
              and control over the desktop environment (XFCE4). \
-             Use `sudo` when commands require elevated privileges.",
+             Use `sudo` when commands require elevated privileges. \
+             Shell commands run through bash. GUI commands target an \
+             auto-launched Xvfb virtual display with DISPLAY/XAUTHORITY set \
+             automatically; X11 tools such as xdotool, xrandr, and import \
+             are available on this platform.",
         )
     };
     prompt
