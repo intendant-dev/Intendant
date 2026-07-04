@@ -14164,6 +14164,48 @@ function updateLogEmptyState() {
    lease state refreshes, so it clears the moment fuel lands. */
 const LOG_EMPTY_DEFAULT_TITLE = 'No activity yet';
 const LOG_EMPTY_DEFAULT_HINT = 'Send a task below to start the agent, or pick a session from Sessions.';
+
+/* External-agent availability (Codex / Claude Code): which backends this
+   daemon can actually spawn. External agents run on their own accounts,
+   so the fueling nudge must not read as "nothing works" while one is
+   present — and the new-session picker greys out backends whose CLI is
+   missing so a doomed spawn is visible before Start. */
+let externalAgentAvailability = null; // null = not yet known
+let externalAgentAvailabilityFetch = null;
+function refreshExternalAgentAvailability() {
+  if (!externalAgentAvailabilityFetch) {
+    externalAgentAvailabilityFetch = fetchExternalAgentAvailability()
+      .then(body => {
+        if (Array.isArray(body?.external_agents)) {
+          externalAgentAvailability = body.external_agents;
+          applyExternalAgentAvailabilityToNewSessionPicker();
+        }
+        return externalAgentAvailability;
+      })
+      .catch(() => null)
+      .finally(() => { externalAgentAvailabilityFetch = null; });
+  }
+  return externalAgentAvailabilityFetch;
+}
+function installedExternalAgents() {
+  return Array.isArray(externalAgentAvailability)
+    ? externalAgentAvailability.filter(agent => agent && agent.installed)
+    : [];
+}
+function applyExternalAgentAvailabilityToNewSessionPicker() {
+  const select = document.getElementById('new-session-agent');
+  if (!select || !Array.isArray(externalAgentAvailability)) return;
+  for (const agent of externalAgentAvailability) {
+    const option = select.querySelector(`option[value="${agent.id}"]`);
+    if (!option) continue;
+    const missing = agent.installed === false;
+    option.disabled = missing;
+    option.title = missing
+      ? `${agent.command || agent.id} was not found on the daemon host`
+      : '';
+  }
+}
+
 let unfueledCheckInFlight = false;
 async function refreshUnfueledEmptyState() {
   if (unfueledCheckInFlight) return true;
@@ -14180,12 +14222,15 @@ async function refreshUnfueledEmptyState() {
     // which the default hosted (operator) binding does not hold.
     const statusFueled = dashboardControlTransport?.lastStatus?.fueled;
     if (typeof statusFueled === 'boolean') {
+      if (!statusFueled) await refreshExternalAgentAvailability();
       applyUnfueledEmptyState(!statusFueled);
       return true;
     }
     const keys = await fetchApiKeyStatus();
     if (!keys || typeof keys !== 'object') return false;
-    applyUnfueledEmptyState(!(keys.openai || keys.anthropic || keys.gemini));
+    const unfueled = !(keys.openai || keys.anthropic || keys.gemini);
+    if (unfueled) await refreshExternalAgentAvailability();
+    applyUnfueledEmptyState(unfueled);
     return true;
   } catch {
     // Unknown (transport not up yet, or a daemon predating the flag):
@@ -14201,20 +14246,25 @@ function applyUnfueledEmptyState(unfueled) {
   const hint = empty?.querySelector('.ui-empty-hint');
   if (!empty || !title || !hint) return;
   const action = document.getElementById('log-empty-fuel');
+  const externalNote = document.getElementById('log-empty-external-agents');
   if (!unfueled) {
     if (empty.dataset.unfueled) {
       delete empty.dataset.unfueled;
       title.textContent = LOG_EMPTY_DEFAULT_TITLE;
       hint.textContent = LOG_EMPTY_DEFAULT_HINT;
       if (action) action.remove();
+      if (externalNote) externalNote.remove();
     }
     return;
   }
   empty.dataset.unfueled = 'true';
-  title.textContent = 'This daemon has no fuel yet';
+  // Scope the claim to the built-in agent: an unfueled daemon still runs
+  // external agents (their accounts), terminal, files, and display.
+  title.textContent = 'The built-in agent has no fuel yet';
   if (DASHBOARD_CONNECT_MODE) {
-    hint.textContent = 'It is claimed and connected, but holds no provider credential. '
-      + 'Grant a time-boxed lease from your vault and the agent can start working.';
+    hint.textContent = 'This daemon is claimed and connected, but holds no provider '
+      + 'credential for the built-in agent. Grant a time-boxed lease from your vault '
+      + 'and it can start working.';
     if (!document.getElementById('log-empty-fuel')) {
       const btn = document.createElement('button');
       btn.id = 'log-empty-fuel';
@@ -14224,10 +14274,33 @@ function applyUnfueledEmptyState(unfueled) {
       hint.insertAdjacentElement('afterend', btn);
     }
   } else {
-    hint.textContent = 'The daemon found no provider API key. Add ANTHROPIC_API_KEY, '
-      + 'OPENAI_API_KEY, or GEMINI_API_KEY to .env and restart — or claim it through a '
-      + 'rendezvous and grant a lease from your vault.';
+    hint.textContent = 'The daemon found no provider API key for the built-in agent. '
+      + 'Add ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY to .env and restart — '
+      + 'or claim it through a rendezvous and grant a lease from your vault.';
   }
+  applyUnfueledExternalAgentNote(empty);
+}
+
+/* The nudge's counterweight: name the external agents that still work.
+   Only rendered while the unfueled state is showing. */
+function applyUnfueledExternalAgentNote(empty) {
+  const installed = installedExternalAgents();
+  let note = document.getElementById('log-empty-external-agents');
+  if (!installed.length) {
+    if (note) note.remove();
+    return;
+  }
+  if (!note) {
+    note = document.createElement('div');
+    note.id = 'log-empty-external-agents';
+    note.className = 'ui-empty-hint';
+    empty.appendChild(note);
+  }
+  const names = installed.map(agent => agent.label || agent.id).join(' and ');
+  const plural = installed.length > 1;
+  note.textContent = `${names} ${plural ? 'are' : 'is'} installed and `
+    + `${plural ? 'run on their own accounts' : 'runs on its own account'}`
+    + ' — external-agent sessions work without fuel.';
 }
 // Probe once the transport can answer; in connect mode the data channel
 // (possibly via TURN) can take a while, so keep retrying for ~40s rather
@@ -53450,6 +53523,14 @@ async function fetchApiKeyStatus() {
   }, 'api_key_status');
 }
 
+async function fetchExternalAgentAvailability() {
+  return dashboardTransport.rpcOrHttp('api_external_agents', {}, async () => {
+    const resp = await fetch('/api/external-agents');
+    if (!resp.ok) throw new Error(`/api/external-agents returned ${resp.status}`);
+    return resp.json();
+  }, 'api_external_agents');
+}
+
 async function fetchProjectRoot() {
   return dashboardTransport.rpcOrHttp('api_project_root', {}, async () => {
     const resp = await fetch('/api/project-root');
@@ -65173,6 +65254,14 @@ function renderNewSessionAgentControls(options = {}) {
   const fastWrap = document.getElementById('new-session-codex-fast-wrap');
   const managedContextNote = document.getElementById('new-session-managed-context-note');
   if (!select || !commandInput) return;
+
+  // Grey out backends whose CLI is missing on the daemon host; kick the
+  // probe on first render and re-apply when it lands.
+  if (Array.isArray(externalAgentAvailability)) {
+    applyExternalAgentAvailabilityToNewSessionPicker();
+  } else {
+    refreshExternalAgentAvailability();
+  }
 
   const currentOption = select.querySelector('option[value=""]');
   if (currentOption) {
