@@ -26111,8 +26111,21 @@ fn access_overview_response_value_with_identities_and_iam(
         if fingerprint.is_empty() {
             continue;
         }
+        // Effective status matches the gateway auth gate (is_active): an
+        // approved-but-expired org materialization must read "expired"
+        // here, not "active" — the overview is where an operator checks
+        // what can actually reach this daemon.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         let status = match identity.status {
-            crate::peer::access_policy::PeerIdentityStatus::Approved => "active",
+            crate::peer::access_policy::PeerIdentityStatus::Approved
+                if identity.is_active(now_unix) =>
+            {
+                "active"
+            }
+            crate::peer::access_policy::PeerIdentityStatus::Approved => "expired",
             crate::peer::access_policy::PeerIdentityStatus::Revoked => "revoked",
         };
         let principal_id = format!("principal:inbound-peer-daemon:{fingerprint}");
@@ -26150,7 +26163,11 @@ fn access_overview_response_value_with_identities_and_iam(
             "source": "peer_access_identity",
             "status": status,
             "created_at_unix": identity.created_at_unix,
-            "revoked_at_unix": identity.revoked_at_unix
+            "revoked_at_unix": identity.revoked_at_unix,
+            "expires_at_unix": identity.expires_at_unix,
+            "identity_source": identity.source.clone(),
+            "org_grant_id": identity.org_grant_id.clone(),
+            "issued_via": identity.issued_via.clone()
         }));
         transports.push(serde_json::json!({
             "id": transport_id,
@@ -27836,15 +27853,27 @@ fn access_request_summary_json(
 fn identity_summary_json(
     record: crate::peer::access_policy::PeerIdentityRecord,
 ) -> serde_json::Value {
+    // `active` mirrors the gateway auth gate (approved AND unexpired), so
+    // an org-materialized identity past its expiry reads as inert here —
+    // the raw status/expiry/provenance fields let the UI say why.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     serde_json::json!({
         "fingerprint": record.fingerprint,
         "label": record.label,
         "profile": record.profile,
         "status": record.status,
+        "active": record.is_active(now_unix),
         "card_url": record.card_url,
         "request_id": record.request_id,
         "created_at_unix": record.created_at_unix,
         "revoked_at_unix": record.revoked_at_unix,
+        "expires_at_unix": record.expires_at_unix,
+        "source": record.source,
+        "org_grant_id": record.org_grant_id,
+        "issued_via": record.issued_via,
     })
 }
 

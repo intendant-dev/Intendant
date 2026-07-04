@@ -176,6 +176,19 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_access_org_renew",
     "api_dashboard_targets",
     "api_coordinator_route",
+    // Credential custody (vault leases + client egress). Advertised so the
+    // SPA can tell "daemon too old to support leases" apart from "denied";
+    // the per-method availability booleans in status carry the grant
+    // answer. Raw egress_* relay frames are a separate wire family and are
+    // deliberately not listed here.
+    "api_credential_lease_grant",
+    "api_credential_lease_renew",
+    "api_credential_lease_revoke",
+    "api_credential_lease_status",
+    "api_credential_custody_trail",
+    "api_credential_egress_register",
+    "api_credential_egress_unregister",
+    "api_credential_egress_probe",
 ];
 const UDP_BUF_LEN: usize = 2000;
 const COMMAND_CHANNEL: usize = 16;
@@ -4572,6 +4585,10 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::PeerUse);
     let message =
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Message);
+    let credentials_manage = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::CredentialsManage,
+    );
     let capabilities = [
         ("access_inspect_available", access_inspect),
         ("access_manage_available", access_manage),
@@ -4610,6 +4627,23 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
             access_manage,
         ),
         ("api_access_iam_update_grant_available", access_manage),
+        // Credential custody: one boolean per advertised RPC so the SPA's
+        // lease/egress readiness can distinguish "denied for this session"
+        // from "unsupported daemon" (feature list) without probing calls.
+        ("api_credential_lease_grant_available", credentials_manage),
+        ("api_credential_lease_renew_available", credentials_manage),
+        ("api_credential_lease_revoke_available", credentials_manage),
+        ("api_credential_lease_status_available", credentials_manage),
+        ("api_credential_custody_trail_available", credentials_manage),
+        (
+            "api_credential_egress_register_available",
+            credentials_manage,
+        ),
+        (
+            "api_credential_egress_unregister_available",
+            credentials_manage,
+        ),
+        ("api_credential_egress_probe_available", credentials_manage),
         ("api_dashboard_targets_available", access_inspect),
         ("api_agent_card_available", presence_read),
         ("api_cached_bootstrap_events_available", session_inspect),
