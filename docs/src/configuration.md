@@ -246,8 +246,9 @@ preserve Codex's normal user configuration inheritance.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `command` | string | `claude` | Path or command name |
-| `model` | string | unset | Model override |
+| `model` | string | unset | Model override — an alias (`fable`, `opus`, `sonnet`, `haiku`; the CLI resolves it to the latest model) or a full model id |
 | `permission_mode` | string | `default` | `default`, `acceptEdits`, `plan`, `bypassPermissions` (legacy `auto` = `default`) |
+| `effort` | string | unset | Reasoning effort passed as `--effort`: `low`, `medium`, `high`, `xhigh`, `max` (unset omits the flag) |
 | `allowed_tools` | array | `[]` (all) | Restrict the tool set |
 
 Unknown or empty values for `approval_policy`, `sandbox`, `reasoning_effort`,

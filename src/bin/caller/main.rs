@@ -1407,6 +1407,7 @@ async fn create_external_agent(
                 cfg.command.clone(),
                 cfg.model.clone(),
                 cfg.permission_mode.clone(),
+                cfg.effort.clone(),
                 cfg.allowed_tools.clone(),
                 web_port,
             ));
@@ -6926,19 +6927,36 @@ fn emit_codex_session_capabilities_for_drain(
     });
 }
 
+/// Thread actions the Claude Code adapter supports: `compact` dispatches a
+/// native `/compact` user message through `ClaudeCodeAgent::thread_action`;
+/// `fork` respawns a resumed process with `--fork-session` via the drain's
+/// `ForkHandling::RespawnResume` path; the `goal*` family runs the
+/// wrapper-level goal engine (adapter-owned state riding the universal
+/// `GoalUpdated`/`GoalCleared` rails).
+fn claude_code_thread_action_capabilities() -> Vec<String> {
+    [
+        "compact",
+        "fork",
+        "goal",
+        "goal-set",
+        "goal-edit",
+        "goal-get",
+        "goal-clear",
+        "goal-pause",
+        "goal-resume",
+        "goal-complete",
+        "goal-budget-limited",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 /// Capabilities of a supervised Claude Code session: follow-up turns,
 /// native mid-turn steering (a user message written mid-turn is absorbed
 /// into the running turn), and native interrupts (stream-json
 /// `control_request`). The Codex-specific knobs stay unset so frontends
 /// keep those controls hidden.
-/// Thread actions the Claude Code adapter supports: `compact` dispatches a
-/// native `/compact` user message through `ClaudeCodeAgent::thread_action`;
-/// `fork` respawns a resumed process with `--fork-session` via the drain's
-/// `ForkHandling::RespawnResume` path.
-fn claude_code_thread_action_capabilities() -> Vec<String> {
-    ["compact", "fork"].into_iter().map(str::to_string).collect()
-}
-
 fn claude_code_external_session_capabilities() -> types::SessionCapabilities {
     types::SessionCapabilities {
         follow_up: true,
@@ -14141,7 +14159,19 @@ mod tests {
     #[test]
     fn claude_code_capabilities_advertise_universal_thread_actions() {
         let caps = claude_code_external_session_capabilities();
-        assert_eq!(caps.thread_actions, ["compact", "fork"].map(String::from));
+        for op in ["compact", "fork", "goal", "goal-edit", "goal-clear"] {
+            assert!(
+                caps.thread_actions.iter().any(|candidate| candidate == op),
+                "missing advertised Claude thread action: {op}"
+            );
+        }
+        // Never advertise ops the adapter rejects.
+        for op in ["side", "fast", "review", "memory-reset", "undo"] {
+            assert!(
+                !caps.thread_actions.iter().any(|candidate| candidate == op),
+                "advertised unsupported Claude thread action: {op}"
+            );
+        }
         // The codex-named alias stays empty so codex-only UI (tier chip,
         // fast toggle heuristics) never lights up on Claude sessions.
         assert!(caps.codex_thread_actions.is_empty());
