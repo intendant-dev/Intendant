@@ -1270,6 +1270,91 @@ impl ClaudeCodeAgent {
         ))
     }
 
+    /// Send a live-reconfig control request (verified on CC 2.1.201:
+    /// `set_model` and `set_permission_mode` succeed on a running process —
+    /// no restart). Fire-and-forget like interrupt: the reader logs the
+    /// CLI's ack or failure when the `control_response` arrives.
+    async fn write_control_request(
+        &mut self,
+        kind: &str,
+        request: serde_json::Value,
+    ) -> Result<(), CallerError> {
+        if self.writer.is_none() {
+            return Err(CallerError::ExternalAgent("Not initialized".into()));
+        }
+        let request_id = format!(
+            "intendant-{kind}-{}",
+            self.control_counter.fetch_add(1, Ordering::Relaxed) + 1
+        );
+        let request = CcControlRequest {
+            msg_type: "control_request".into(),
+            request_id,
+            request,
+        };
+        let line = serde_json::to_string(&request)?;
+        self.write_line(&line).await
+    }
+
+    /// Live model switch. Only changes the RUNNING process (and the latch a
+    /// respawn reads); the persisted per-session pin is the Launch-config
+    /// overlay's job (`ConfigureSessionAgent`).
+    async fn set_model_live(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
+        let model = params
+            .get("model")
+            .or_else(|| params.get("value"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                CallerError::ExternalAgent(
+                    "model requires a model id or alias (e.g. sonnet)".into(),
+                )
+            })?;
+        self.write_control_request(
+            "set-model",
+            serde_json::json!({ "subtype": "set_model", "model": model }),
+        )
+        .await?;
+        self.model = Some(model.to_string());
+        // The reader re-learns the live model from the next system:init /
+        // message_start, so usage snapshots key correctly after the switch.
+        Ok(format!("model switched to {model} for the running session"))
+    }
+
+    /// Live permission-mode switch (the status system message echoes the new
+    /// `permissionMode`).
+    async fn set_permission_mode_live(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
+        let mode = params
+            .get("mode")
+            .or_else(|| params.get("permission_mode"))
+            .or_else(|| params.get("value"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                CallerError::ExternalAgent(
+                    "permission-mode requires a mode (default, acceptEdits, plan, bypassPermissions)"
+                        .into(),
+                )
+            })?;
+        let mode = crate::project::normalize_claude_permission_mode(mode);
+        self.write_control_request(
+            "set-permission-mode",
+            serde_json::json!({ "subtype": "set_permission_mode", "mode": mode }),
+        )
+        .await?;
+        self.permission_mode = mode.clone();
+        Ok(format!(
+            "permission mode switched to {mode} for the running session"
+        ))
+    }
+
     async fn write_user_message(&self, text: &str) -> Result<(), CallerError> {
         let user_msg = CcUserMessage {
             msg_type: "user".into(),
@@ -1507,10 +1592,14 @@ impl ExternalAgent for ClaudeCodeAgent {
             op if op == "goal" || op.starts_with("goal-") => {
                 self.dispatch_goal_action(op, params).await
             }
+            "model" | "model-set" | "set-model" => self.set_model_live(params).await,
+            "permission-mode" | "permission_mode" | "permissions" => {
+                self.set_permission_mode_live(params).await
+            }
             // `fork` never reaches this method: the drain sees
             // `ForkHandling::RespawnResume` and respawns instead.
             other => Err(CallerError::ExternalAgent(format!(
-                "thread action /{} not supported by Claude Code (supported: compact, fork, goal…)",
+                "thread action /{} not supported by Claude Code (supported: compact, fork, goal…, model, permission-mode)",
                 other
             ))),
         }
@@ -2584,6 +2673,45 @@ mod tests {
         assert_eq!(goal.status.as_deref(), Some("budgetLimited"));
         assert_eq!(goal.tokens_used, Some(60));
         assert_eq!(goal.token_budget, Some(50));
+    }
+
+    #[tokio::test]
+    async fn model_and_permission_mode_ops_validate_and_fail_closed() {
+        let mut agent =
+            ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
+
+        // Missing params → an actionable error naming what's required.
+        let err = agent
+            .thread_action("model", &serde_json::Value::Null)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("model requires"), "got: {err}");
+        let err = agent
+            .thread_action("permission-mode", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("permission-mode requires"),
+            "got: {err}"
+        );
+
+        // Valid params but no running process → fail closed as uninitialized
+        // and leave the spawn latches untouched.
+        let err = agent
+            .thread_action("model", &serde_json::json!({ "model": "sonnet" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Not initialized"), "got: {err}");
+        let err = agent
+            .thread_action(
+                "permission-mode",
+                &serde_json::json!({ "mode": "acceptEdits" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Not initialized"), "got: {err}");
+        assert!(agent.model.is_none());
+        assert_eq!(agent.permission_mode, "default");
     }
 
     #[test]

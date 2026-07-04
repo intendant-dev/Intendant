@@ -13896,6 +13896,46 @@ body.display-fullscreen-open {
         <option value="off">off</option>
       </select>
     </div>
+    <div class="session-config-row" id="session-config-claude-model-row">
+      <label for="session-config-claude-model">Model</label>
+      <select id="session-config-claude-model" onchange="onSessionConfigClaudeModelChange()">
+        <option value="inherit">inherit Control default</option>
+        <option value="fable">fable — latest Fable</option>
+        <option value="opus">opus — latest Opus</option>
+        <option value="sonnet">sonnet — latest Sonnet</option>
+        <option value="haiku">haiku — latest Haiku</option>
+        <option value="__custom__">Custom model id…</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-claude-model-custom-row" style="display:none">
+      <label for="session-config-claude-model-custom">Custom id</label>
+      <input id="session-config-claude-model-custom" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. claude-haiku-4-5-20251001">
+    </div>
+    <div class="session-config-row" id="session-config-claude-permission-row">
+      <label for="session-config-claude-permission-mode">Permissions</label>
+      <select id="session-config-claude-permission-mode">
+        <option value="inherit">inherit Control default</option>
+        <option value="default">default</option>
+        <option value="acceptEdits">acceptEdits</option>
+        <option value="plan">plan</option>
+        <option value="bypassPermissions">bypassPermissions</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-claude-tools-row">
+      <label for="session-config-claude-allowed-tools">Allowed tools</label>
+      <input id="session-config-claude-allowed-tools" type="text" autocomplete="off" spellcheck="false" placeholder="inherit — or rules, comma-separated; all = unrestricted">
+    </div>
+    <div class="session-config-row" id="session-config-claude-effort-row">
+      <label for="session-config-claude-effort">Effort</label>
+      <select id="session-config-claude-effort">
+        <option value="inherit">inherit Control default</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+        <option value="xhigh">xhigh</option>
+        <option value="max">max</option>
+      </select>
+    </div>
     <div class="session-config-status" id="session-config-status"></div>
     <div class="modal-actions">
       <button class="modal-cancel" type="button" onclick="closeSessionConfigModal()">Cancel</button>
@@ -32730,12 +32770,51 @@ function openSessionConfigModal(sessionOrId) {
   if (approvalSel) approvalSel.value = sessionConfigExplicitApprovalPolicy(meta);
   if (archiveRow) archiveRow.style.display = source === 'codex' ? '' : 'none';
   if (archiveSel) archiveSel.value = sessionConfigExplicitArchiveMode(meta);
+  const isClaude = source === 'claude-code';
+  for (const rowId of ['session-config-claude-model-row', 'session-config-claude-permission-row',
+    'session-config-claude-tools-row', 'session-config-claude-effort-row']) {
+    const row = document.getElementById(rowId);
+    if (row) row.style.display = isClaude ? '' : 'none';
+  }
+  if (isClaude) {
+    // Pins prefill; missing pin = inherit. A pinned model that isn't one
+    // of the aliases lands in the Custom row.
+    const aliases = ['fable', 'opus', 'sonnet', 'haiku'];
+    const pinnedModel = String(meta.claude_model || meta.claudeModel || '').trim();
+    const modelSel = document.getElementById('session-config-claude-model');
+    const customInput = document.getElementById('session-config-claude-model-custom');
+    if (modelSel) {
+      modelSel.value = !pinnedModel ? 'inherit'
+        : (aliases.includes(pinnedModel) ? pinnedModel : '__custom__');
+    }
+    if (customInput) {
+      customInput.value = pinnedModel && !aliases.includes(pinnedModel) ? pinnedModel : '';
+    }
+    const modeSel = document.getElementById('session-config-claude-permission-mode');
+    if (modeSel) {
+      modeSel.value = String(meta.claude_permission_mode || meta.claudePermissionMode || '').trim() || 'inherit';
+    }
+    const toolsInput = document.getElementById('session-config-claude-allowed-tools');
+    if (toolsInput) {
+      const tools = meta.claude_allowed_tools ?? meta.claudeAllowedTools;
+      toolsInput.value = Array.isArray(tools)
+        ? (tools.length ? tools.join(', ') : 'all')
+        : '';
+    }
+    const effortSel = document.getElementById('session-config-claude-effort');
+    if (effortSel) {
+      effortSel.value = String(meta.claude_effort || meta.claudeEffort || '').trim() || 'inherit';
+    }
+  }
+  updateSessionConfigClaudeCustomRow();
   const status = document.getElementById('session-config-status');
   if (status) {
     status.className = 'session-config-status';
     status.textContent = source === 'codex'
       ? 'Managed requires a patched Codex binary. Save & restart applies changes now.'
-      : 'Save & restart applies changes now.';
+      : (isClaude
+        ? 'Save applies model & permissions to the live session; tools & effort apply at the next launch (or Save & restart).'
+        : 'Save & restart applies changes now.');
   }
   const modal = document.getElementById('session-config-modal');
   if (modal) modal.style.display = 'flex';
@@ -32822,7 +32901,8 @@ function handleSessionConfigResult(result) {
     pending.sandboxMode,
     pending.approvalPolicy,
     pending.mode,
-    pending.archiveMode
+    pending.archiveMode,
+    pending.claudeForm
   );
   scheduleSessionsMetadataRefresh(200);
   showControlToast('success', pending.restart ? 'Launch config saved; restarting session' : 'Launch config saved');
@@ -32839,7 +32919,31 @@ function handleSessionConfigResult(result) {
   if (pending.restart) restartSessionWindowAction(restartSessionId);
 }
 
-function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mode, archiveMode) {
+// Mirror the just-saved claude pins onto a cached row / live meta with the
+// wire's sentinel semantics ('inherit' clears; tools 'all' pins []).
+function applyClaudePinsLocal(target, claudeForm, { snake }) {
+  if (!claudeForm) return;
+  const keys = snake
+    ? { model: 'claude_model', mode: 'claude_permission_mode', tools: 'claude_allowed_tools', effort: 'claude_effort' }
+    : { model: 'claudeModel', mode: 'claudePermissionMode', tools: 'claudeAllowedTools', effort: 'claudeEffort' };
+  const setOrClear = (key, value) => {
+    if (value === 'inherit' || value === '') delete target[key];
+    else target[key] = value;
+  };
+  setOrClear(keys.model, claudeForm.model);
+  setOrClear(keys.mode, claudeForm.permissionMode);
+  setOrClear(keys.effort, claudeForm.effort);
+  if (claudeForm.allowedTools === 'inherit' || claudeForm.allowedTools === '') {
+    delete target[keys.tools];
+  } else if (claudeForm.allowedTools === 'all' || claudeForm.allowedTools === '*') {
+    target[keys.tools] = [];
+  } else {
+    target[keys.tools] = claudeForm.allowedTools
+      .split(',').map(rule => rule.trim()).filter(Boolean);
+  }
+}
+
+function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mode, archiveMode, claudeForm) {
   const ids = Array.from(new Set([
     meta.sessionId,
     meta.backendSessionId,
@@ -32861,6 +32965,9 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
         codexContextArchive: archiveMode || '',
       } : {}),
     };
+    if (meta.source === 'claude-code') {
+      applyClaudePinsLocal(next, claudeForm, { snake: false });
+    }
     sessionMetadataById.set(id, next);
     if (sessionWindows.has(id)) updateSessionWindow(id, next);
   }
@@ -32902,9 +33009,36 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
         delete session.codex_context_archive;
       }
     }
+    if (meta.source === 'claude-code') {
+      applyClaudePinsLocal(session, claudeForm, { snake: true });
+    }
   }
   persistSessionWindowState();
 }
+
+// The Claude launch-config form, read with the wire's sentinel semantics.
+function sessionConfigClaudeFormValues() {
+  const modelChoice = document.getElementById('session-config-claude-model')?.value || 'inherit';
+  const custom = document.getElementById('session-config-claude-model-custom')?.value.trim() || '';
+  const model = modelChoice === '__custom__' ? (custom || 'inherit') : modelChoice;
+  const permissionMode = document.getElementById('session-config-claude-permission-mode')?.value || 'inherit';
+  const toolsRaw = document.getElementById('session-config-claude-allowed-tools')?.value.trim() || '';
+  const allowedTools = toolsRaw === '' ? 'inherit' : toolsRaw;
+  const effort = document.getElementById('session-config-claude-effort')?.value || 'inherit';
+  return { model, permissionMode, allowedTools, effort };
+}
+
+function updateSessionConfigClaudeCustomRow() {
+  const sel = document.getElementById('session-config-claude-model');
+  const row = document.getElementById('session-config-claude-model-custom-row');
+  if (!sel || !row) return;
+  const claudeVisible = document.getElementById('session-config-claude-model-row')?.style.display !== 'none';
+  row.style.display = claudeVisible && sel.value === '__custom__' ? '' : 'none';
+}
+function onSessionConfigClaudeModelChange() {
+  updateSessionConfigClaudeCustomRow();
+}
+window.onSessionConfigClaudeModelChange = onSessionConfigClaudeModelChange;
 
 function saveSessionConfigModal(options = {}) {
   if (!sessionConfigEditing || !app) return;
@@ -32922,6 +33056,10 @@ function saveSessionConfigModal(options = {}) {
   const archiveMode = normalizeContextArchiveModeOptional(
     document.getElementById('session-config-context-archive')?.value || ''
   );
+  // Claude pins reflect the form exactly: every field is sent as a value or
+  // the explicit 'inherit' clear sentinel (a missing field would silently
+  // KEEP an existing pin — see the supervisor's clear-before-merge dance).
+  const claudeForm = sessionConfigClaudeFormValues();
   const payload = {
     action: 'configure_session_agent',
     session_id: sessionConfigEditing.sessionId,
@@ -32934,6 +33072,12 @@ function saveSessionConfigModal(options = {}) {
       codex_approval_policy: approvalPolicy || 'inherit',
       codex_managed_context: mode || 'inherit',
       codex_context_archive: archiveMode || 'inherit',
+    } : {}),
+    ...(sessionConfigEditing.source === 'claude-code' ? {
+      claude_model: claudeForm.model,
+      claude_permission_mode: claudeForm.permissionMode,
+      claude_allowed_tools: claudeForm.allowedTools,
+      claude_effort: claudeForm.effort,
     } : {}),
   };
   try {
@@ -32956,6 +33100,7 @@ function saveSessionConfigModal(options = {}) {
       approvalPolicy,
       mode,
       archiveMode,
+      claudeForm: sessionConfigEditing.source === 'claude-code' ? claudeForm : null,
       restart: options.restart === true,
       timeoutHandle: setTimeout(() => {
         const pending = sessionConfigSavePending;
@@ -32977,6 +33122,25 @@ function saveSessionConfigModal(options = {}) {
       status.textContent = options.restart === true ? 'Saving launch config before restart...' : 'Saving launch config...';
     }
     dispatchControlMsg(payload);
+    // Model & permission pins also apply LIVE to an attached claude session
+    // (verified set_model / set_permission_mode control requests) — unless a
+    // restart is coming anyway, which respawns with the saved pins.
+    if (
+      sessionConfigEditing.source === 'claude-code' &&
+      options.restart !== true &&
+      !sessionWindowIsDetached(sessionConfigEditing.sessionId)
+    ) {
+      if (claudeForm.model !== 'inherit') {
+        dispatchCodexThreadAction('model', { model: claudeForm.model }, sessionConfigEditing.sessionId);
+      }
+      if (claudeForm.permissionMode !== 'inherit') {
+        dispatchCodexThreadAction(
+          'permission-mode',
+          { mode: claudeForm.permissionMode },
+          sessionConfigEditing.sessionId,
+        );
+      }
+    }
   } catch (e) {
     if (sessionConfigSavePending?.timeoutHandle) {
       clearTimeout(sessionConfigSavePending.timeoutHandle);

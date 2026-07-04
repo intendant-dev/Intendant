@@ -3878,6 +3878,12 @@ fn merge_intendant_wrapper_into_external_session(
         ("agent_command", "agent_command"),
         ("codex_command", "codex_command"),
         ("codex_managed_context", "codex_managed_context"),
+        // Claude launch pins ride the wrapper row the same way, so the
+        // Launch-config modal can prefill from the sessions list.
+        ("claude_model", "claude_model"),
+        ("claude_permission_mode", "claude_permission_mode"),
+        ("claude_allowed_tools", "claude_allowed_tools"),
+        ("claude_effort", "claude_effort"),
     ] {
         if let Some(value) = wrapper_obj.get(wrapper_key) {
             obj.insert(target_key.to_string(), value.clone());

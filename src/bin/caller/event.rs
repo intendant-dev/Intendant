@@ -1151,6 +1151,18 @@ pub enum ControlMsg {
         codex_managed_context: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_context_archive: Option<String>,
+        /// Claude Code launch pins. "inherit"/"global" (or empty) clears a
+        /// pin; the tools list is comma-separated with "all"/"*" pinning the
+        /// explicitly-unrestricted empty list. For the permission mode,
+        /// "default" is a real mode and pins (only inherit/global clear).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_permission_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_allowed_tools: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_effort: Option<String>,
     },
     /// Stop a live managed session. Unlike hiding a dashboard card, this
     /// removes the live session from daemon state and asks the backend process
@@ -1183,6 +1195,16 @@ pub enum ControlMsg {
         codex_managed_context: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_context_archive: Option<String>,
+        /// Claude Code one-shot launch pins for the restarted process (same
+        /// sentinel semantics as `ConfigureSessionAgent`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_permission_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_allowed_tools: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_effort: Option<String>,
     },
     /// Set the Claude Code model override (`--model`). `None`/missing lets
     /// the claude CLI pick its configured default. Applies to the NEXT task
@@ -1410,6 +1432,9 @@ pub enum ControlMsg {
         codex_managed_context: Option<String>,
         /// Per-session Codex context replay/archive override. Only applies
         /// when `source` resolves to Codex.
+        /// (Claude Code carries no resume-time one-shots: a resumed claude
+        /// session rehydrates its pins from the persisted launch overlay —
+        /// use `ConfigureSessionAgent`/`RestartSession` to change them.)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_context_archive: Option<String>,
     },
@@ -3714,6 +3739,10 @@ mod tests {
                 codex_approval_policy,
                 codex_managed_context,
                 codex_context_archive,
+                claude_model,
+                claude_permission_mode,
+                claude_allowed_tools,
+                claude_effort,
             } => {
                 assert_eq!(session_id, "abc123");
                 assert_eq!(source.as_deref(), Some("codex"));
@@ -3724,6 +3753,31 @@ mod tests {
                 assert_eq!(codex_approval_policy.as_deref(), Some("never"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
                 assert_eq!(codex_context_archive.as_deref(), Some("off"));
+                assert!(claude_model.is_none());
+                assert!(claude_permission_mode.is_none());
+                assert!(claude_allowed_tools.is_none());
+                assert!(claude_effort.is_none());
+            }
+            _ => panic!("expected ConfigureSessionAgent"),
+        }
+
+        let json = r#"{"action":"configure_session_agent","session_id":"cc-1","source":"claude-code","claude_model":"opus","claude_permission_mode":"acceptEdits","claude_allowed_tools":"Read,Bash(cargo test *)","claude_effort":"xhigh"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ConfigureSessionAgent {
+                claude_model,
+                claude_permission_mode,
+                claude_allowed_tools,
+                claude_effort,
+                ..
+            } => {
+                assert_eq!(claude_model.as_deref(), Some("opus"));
+                assert_eq!(claude_permission_mode.as_deref(), Some("acceptEdits"));
+                assert_eq!(
+                    claude_allowed_tools.as_deref(),
+                    Some("Read,Bash(cargo test *)")
+                );
+                assert_eq!(claude_effort.as_deref(), Some("xhigh"));
             }
             _ => panic!("expected ConfigureSessionAgent"),
         }
@@ -3797,6 +3851,10 @@ mod tests {
                 codex_approval_policy,
                 codex_managed_context,
                 codex_context_archive,
+                claude_model,
+                claude_permission_mode,
+                claude_allowed_tools,
+                claude_effort,
             } => {
                 assert_eq!(source, "codex");
                 assert_eq!(session_id, "thread-1");
@@ -3810,6 +3868,10 @@ mod tests {
                 assert_eq!(codex_approval_policy.as_deref(), Some("never"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
                 assert_eq!(codex_context_archive.as_deref(), Some("exact"));
+                assert!(claude_model.is_none());
+                assert!(claude_permission_mode.is_none());
+                assert!(claude_allowed_tools.is_none());
+                assert!(claude_effort.is_none());
             }
             _ => panic!("expected RestartSession"),
         }
