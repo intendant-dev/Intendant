@@ -15,6 +15,18 @@ use std::time::{Duration, Instant};
 
 const REGISTER_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Register failures split by what retrying can fix. `Rejected` is a 4xx
+/// verdict from the service — a missing/invalid daemon token or a gated
+/// rendezvous — configuration, not weather: hammering once a second
+/// changes nothing (observed live against a token-gated service), so
+/// those retry on this slow clock instead of `retry_delay_ms`.
+const REGISTER_REJECTED_RETRY: Duration = Duration::from_secs(60);
+
+enum RegisterError {
+    Rejected(String),
+    Transient(String),
+}
+
 #[derive(Debug, Serialize)]
 struct RegisterRequest {
     protocol: &'static str,
@@ -175,7 +187,17 @@ async fn run_connect_rendezvous_client(
     loop {
         match register(&client, &base_url, &config, &daemon_id, &daemon_public_key).await {
             Ok(()) => {}
-            Err(e) => {
+            Err(RegisterError::Rejected(e)) => {
+                eprintln!(
+                    "[connect] register rejected: {e} — the rendezvous refused this daemon \
+                     (check INTENDANT_CONNECT_TOKEN, or whether the service gates \
+                     registration); retrying every {}s",
+                    REGISTER_REJECTED_RETRY.as_secs()
+                );
+                tokio::time::sleep(REGISTER_REJECTED_RETRY).await;
+                continue;
+            }
+            Err(RegisterError::Transient(e)) => {
                 eprintln!("[connect] register failed: {e}");
                 tokio::time::sleep(retry_delay).await;
                 continue;
@@ -206,7 +228,16 @@ async fn run_connect_rendezvous_client(
                             Ok(()) => {
                                 last_register = Instant::now();
                             }
-                            Err(e) => {
+                            Err(RegisterError::Rejected(e)) => {
+                                eprintln!(
+                                    "[connect] refresh register rejected: {e} — retrying \
+                                     every {}s",
+                                    REGISTER_REJECTED_RETRY.as_secs()
+                                );
+                                tokio::time::sleep(REGISTER_REJECTED_RETRY).await;
+                                break;
+                            }
+                            Err(RegisterError::Transient(e)) => {
                                 eprintln!("[connect] refresh register failed: {e}");
                                 tokio::time::sleep(retry_delay).await;
                                 break;
@@ -272,7 +303,7 @@ async fn register(
     config: &ConnectConfig,
     daemon_id: &str,
     daemon_public_key: &str,
-) -> Result<(), String> {
+) -> Result<(), RegisterError> {
     let request = RegisterRequest {
         protocol: "intendant-connect-rendezvous-v1",
         daemon_id: daemon_id.to_string(),
@@ -280,14 +311,28 @@ async fn register(
     };
     authenticated(
         config,
-        client.post(join_url(base_url, "api/daemon/register")?),
+        client.post(
+            join_url(base_url, "api/daemon/register").map_err(RegisterError::Transient)?,
+        ),
     )
     .json(&request)
     .send()
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| RegisterError::Transient(e.to_string()))?
     .error_for_status()
-    .map_err(|e| e.to_string())?
+    .map_err(|e| {
+        // 429 is a client error by status class but pure weather by
+        // meaning — keep it on the fast retry clock.
+        let rejected = e
+            .status()
+            .map(|s| s.is_client_error() && s != reqwest::StatusCode::TOO_MANY_REQUESTS)
+            .unwrap_or(false);
+        if rejected {
+            RegisterError::Rejected(e.to_string())
+        } else {
+            RegisterError::Transient(e.to_string())
+        }
+    })?
     .json::<RegisterResponse>()
     .await
     .map(|response| {
@@ -303,7 +348,7 @@ async fn register(
             }
         }
     })
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| RegisterError::Transient(e.to_string()))?;
     Ok(())
 }
 

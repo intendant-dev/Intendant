@@ -34404,7 +34404,18 @@ async fn main() -> Result<(), CallerError> {
             event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
+        {
+            // Fallback roots (no .git / intendant.toml — e.g. a service's
+            // $HOME WorkingDirectory) must never be baseline-scanned: it
+            // blocks boot for minutes and shadow-copies the whole tree.
+            eprintln!(
+                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+                 intendant.toml) — start intendant inside a project to enable rewind",
+                project.root.display()
+            );
+            (None, None, None)
+        } else {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
@@ -34629,7 +34640,18 @@ async fn main() -> Result<(), CallerError> {
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
+        {
+            // Fallback roots (no .git / intendant.toml — e.g. a service's
+            // $HOME WorkingDirectory) must never be baseline-scanned: it
+            // blocks boot for minutes and shadow-copies the whole tree.
+            eprintln!(
+                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+                 intendant.toml) — start intendant inside a project to enable rewind",
+                project.root.display()
+            );
+            (None, None, None)
+        } else {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
@@ -35103,7 +35125,18 @@ async fn main() -> Result<(), CallerError> {
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
+        {
+            // Fallback roots (no .git / intendant.toml — e.g. a service's
+            // $HOME WorkingDirectory) must never be baseline-scanned: it
+            // blocks boot for minutes and shadow-copies the whole tree.
+            eprintln!(
+                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+                 intendant.toml) — start intendant inside a project to enable rewind",
+                project.root.display()
+            );
+            (None, None, None)
+        } else {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
@@ -35769,7 +35802,18 @@ async fn main() -> Result<(), CallerError> {
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
+        {
+            // Fallback roots (no .git / intendant.toml — e.g. a service's
+            // $HOME WorkingDirectory) must never be baseline-scanned: it
+            // blocks boot for minutes and shadow-copies the whole tree.
+            eprintln!(
+                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+                 intendant.toml) — start intendant inside a project to enable rewind",
+                project.root.display()
+            );
+            (None, None, None)
+        } else {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
