@@ -19408,6 +19408,12 @@ pub fn spawn_web_gateway(
                     eprintln!(
                         "[web_gateway] accept failed on port {port}: {e} (rebinding listener)"
                     );
+                    // The dead socket still owns the port until it is
+                    // dropped — `accept()` failing does not release the
+                    // bind, and SO_REUSEADDR does not override an actively
+                    // bound listener. Rebinding while it lives self-inflicts
+                    // EADDRINUSE on every attempt, forever.
+                    drop(listener);
                     let mut delay = std::time::Duration::from_millis(250);
                     listener = loop {
                         tokio::time::sleep(delay).await;
@@ -47159,5 +47165,26 @@ mod tests {
         );
         client.expect("client connects to rebound listener");
         drop(server);
+    }
+
+    /// SO_REUSEADDR does not override an actively bound listener on Unix —
+    /// the accept-loop recovery MUST drop the dead socket before rebinding,
+    /// or every attempt self-inflicts EADDRINUSE (seen live: a daemon whose
+    /// accept loop died spun on rebind for over an hour while its own dead
+    /// listener still owned the port). Windows semantics differ, so the
+    /// still-bound assertion is Unix-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rebind_fails_while_dead_listener_is_still_bound() {
+        let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = holder.local_addr().unwrap();
+
+        assert!(
+            rebind_dead_tcp_listener(addr).is_err(),
+            "rebinding must fail while the previous listener still holds the address"
+        );
+
+        drop(holder);
+        assert!(rebind_dead_tcp_listener(addr).is_ok());
     }
 }
