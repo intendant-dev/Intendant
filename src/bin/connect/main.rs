@@ -6190,26 +6190,34 @@ function authenticationCredentialJSON(credential) {{
 
 // Fleet-sync encryption (trust architecture phase 5 follow-on): evaluate
 // the WebAuthn PRF extension during the passkey ceremony and stash the
-// per-tab secret; /app derives an AES key from it so private fleet fields
-// sync end-to-end encrypted. The server never sees the PRF output.
+// per-tab secrets; /app derives AES keys from them so private fleet fields
+// and the credential vault sync end-to-end encrypted. Two salts, one
+// gesture: `first` feeds fleet-sync, `second` feeds the vault — separate
+// PRF domains, so the two features never share key material. The server
+// never sees either output.
 const FLEET_PRF_SALT = new TextEncoder().encode('intendant-fleet-sync-v1');
+const VAULT_PRF_SALT = new TextEncoder().encode('intendant-vault-v1');
 
 function prfExtensions() {{
-  return {{ prf: {{ eval: {{ first: FLEET_PRF_SALT }} }} }};
+  return {{ prf: {{ eval: {{ first: FLEET_PRF_SALT, second: VAULT_PRF_SALT }} }} }};
 }}
 
 function stashPrfSecret(credential) {{
   try {{
     const results = credential.getClientExtensionResults?.();
+    const toB64u = buf => {{
+      const bytes = new Uint8Array(buf);
+      let bin = '';
+      for (const b of bytes) bin += String.fromCharCode(b);
+      return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }};
     const first = results?.prf?.results?.first;
     if (!first) return;
-    const bytes = new Uint8Array(first);
-    let bin = '';
-    for (const b of bytes) bin += String.fromCharCode(b);
-    sessionStorage.setItem(
-      'intendant_fleet_prf_v1',
-      btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-    );
+    sessionStorage.setItem('intendant_fleet_prf_v1', toB64u(first));
+    // Older authenticators may evaluate only one salt; the vault then
+    // falls back to its legacy fleet-secret derivation client-side.
+    const second = results?.prf?.results?.second;
+    if (second) sessionStorage.setItem('intendant_vault_prf_v1', toB64u(second));
   }} catch (err) {{
     console.warn('PRF secret unavailable:', err?.message || err);
   }}
