@@ -68,7 +68,6 @@ mod transfer_store;
 mod tui;
 mod types;
 mod upload_store;
-mod user_mode;
 mod vision;
 mod web_gateway;
 mod web_tls;
@@ -26641,12 +26640,11 @@ async fn run_sub_agent_mode(
     log_dir: PathBuf,
 ) -> Result<LoopStats, CallerError> {
     let project = Project::detect()?;
-    // A spawner (SubAgentSpec.system_prompt → the INTENDANT_SYSTEM_PROMPT
-    // env var) may hand this sub-agent a bespoke system prompt; it
-    // replaces the file-resolved prompt wholesale — the result-file and
-    // progress contracts are enforced in code, not by prompt text. Absent
-    // that, prompts resolve from the SysPrompt files by role, with
-    // project-root overrides.
+    // A spawner may hand this sub-agent a bespoke system prompt via the
+    // INTENDANT_SYSTEM_PROMPT env var; it replaces the file-resolved
+    // prompt wholesale — the result-file and progress contracts are
+    // enforced in code, not by prompt text. Absent that, prompts resolve
+    // from the SysPrompt files by role, with project-root overrides.
     let custom_prompt = env::var("INTENDANT_SYSTEM_PROMPT")
         .ok()
         .filter(|p| !p.trim().is_empty());
@@ -29234,304 +29232,7 @@ async fn run_with_presence(
     Ok(cumulative_stats)
 }
 
-/// Tail the orchestrator's session JSONL from `offset`, emitting new entries
-/// to the TUI as orchestrator log entries. Returns the new offset.
-fn tail_orchestrator_log(
-    log_path: &Path,
-    offset: u64,
-    bus: &EventBus,
-    session_log: &SharedSessionLog,
-) -> u64 {
-    use std::io::{BufRead, Seek, SeekFrom};
-    let Ok(mut file) = std::fs::File::open(log_path) else {
-        return offset;
-    };
-    let meta = file.metadata().ok();
-    let file_len = meta.map(|m| m.len()).unwrap_or(0);
-    if file_len <= offset {
-        return offset;
-    }
-    if file.seek(SeekFrom::Start(offset)).is_err() {
-        return offset;
-    }
-    let reader = std::io::BufReader::new(&file);
-    let mut new_offset = offset;
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-        new_offset += line.len() as u64 + 1; // +1 for newline
-        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let event = entry["event"].as_str().unwrap_or("");
-        let level = entry["level"].as_str().unwrap_or("info");
-        let message = entry["message"].as_str().unwrap_or("");
-        let turn = entry["turn"].as_u64().map(|t| t as usize);
-
-        // Skip noisy/redundant events
-        match event {
-            "session_start" | "session_end" | "messages_input" => continue,
-            _ => {}
-        }
-
-        // Map orchestrator log level to TUI LogLevel
-        let tui_level = match level {
-            "debug" => crate::types::LogLevel::Debug,
-            "warn" => crate::types::LogLevel::Warn,
-            "error" => crate::types::LogLevel::Error,
-            _ => crate::types::LogLevel::Detail,
-        };
-
-        // Format the log line with orchestrator context
-        let content = match event {
-            "turn_start" => {
-                let budget = entry["data"]["budget_pct"].as_f64().unwrap_or(0.0);
-                format!("Turn {} — budget {:.0}%", turn.unwrap_or(0), budget * 100.0)
-            }
-            "model_response" => {
-                let data = &entry["data"];
-                let tokens = data["tokens"]["total"].as_u64().unwrap_or(0);
-                let content_len = data["content_length"].as_u64().unwrap_or(0);
-                if content_len > 0 {
-                    let preview: String = message.chars().take(200).collect();
-                    format!("Model ({} tokens): {}", tokens, preview)
-                } else {
-                    format!("Model ({} tokens, tool calls)", tokens)
-                }
-            }
-            "reasoning" => {
-                if message.is_empty() {
-                    continue;
-                }
-                format!("Reasoning: {}", message)
-            }
-            "agent_input" => {
-                let funcs = entry["data"]["functions"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default();
-                format!("Agent: {}", funcs)
-            }
-            "agent_output" => {
-                let preview: String = message.chars().take(300).collect();
-                if preview.is_empty() {
-                    continue;
-                }
-                format!("Output: {}", preview)
-            }
-            "info" | "debug" | "warn" | "error" => {
-                if message.is_empty() {
-                    continue;
-                }
-                message.to_string()
-            }
-            _ => {
-                if message.is_empty() {
-                    continue;
-                }
-                format!("{}: {}", event, message)
-            }
-        };
-
-        let prefixed = format!("[orch] {}", content);
-
-        slog(session_log, |l| {
-            l.debug(&prefixed);
-        });
-
-        bus.send(AppEvent::OrchestratorLog {
-            message: prefixed.clone(),
-            level: tui_level,
-        });
-    }
-    new_offset
-}
-
-async fn run_user_mode(
-    _provider: Box<dyn provider::ChatProvider>,
-    task: String,
-    project: Project,
-    bus: EventBus,
-    _autonomy: SharedAutonomy,
-    session_log: SharedSessionLog,
-) -> Result<LoopStats, CallerError> {
-    slog(&session_log, |l| {
-        l.info("Mode: user (orchestrator subprocess)");
-    });
-    bus.send(AppEvent::OrchestratorProgress {
-        turn: 0,
-        status: "spawning".to_string(),
-        last_action: String::new(),
-    });
-
-    // Build orchestrator spec
-    let caller_path = user_mode::get_caller_path();
-    let spec = user_mode::spawn_orchestrator_spec(&task, &project, &caller_path);
-
-    // Create directories for result/progress files
-    if let Some(parent) = spec.result_file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Build and spawn the orchestrator subprocess
-    let spawn_cmd = sub_agent::build_spawn_command(&spec, &caller_path);
-    slog(&session_log, |l| {
-        l.info(&format!("Spawning orchestrator: {}", spawn_cmd));
-    });
-
-    let mut child = tokio::process::Command::new("bash")
-        .arg("-c")
-        .arg(&spawn_cmd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| CallerError::SubAgent(format!("Failed to spawn orchestrator: {}", e)))?;
-
-    // Capture stderr in a background task — extract orchestrator session log path
-    let stderr = child.stderr.take();
-    let session_log_stderr = session_log.clone();
-    let orch_session_log_path: Arc<std::sync::Mutex<Option<PathBuf>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let orch_log_path_writer = orch_session_log_path.clone();
-    let stderr_handle = tokio::spawn(async move {
-        if let Some(stderr) = stderr {
-            use tokio::io::AsyncBufReadExt;
-            let reader = tokio::io::BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                // Extract session log path from "Session log: <path>"
-                if line.starts_with("Session log: ") {
-                    let path = PathBuf::from(line.trim_start_matches("Session log: ").trim());
-                    *orch_log_path_writer
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(path);
-                }
-                slog(&session_log_stderr, |l| {
-                    l.debug(&format!("orchestrator stderr: {}", line));
-                });
-                eprintln!("orchestrator: {}", line);
-            }
-        }
-    });
-
-    // Monitor loop: poll progress file + tail orchestrator session log
-    let mut last_progress_turn: usize = 0;
-    let mut orch_log_offset: u64 = 0;
-    let mut orch_log_file: Option<PathBuf> = None;
-    let poll_interval = tokio::time::Duration::from_millis(500);
-    let mut poll_timer = tokio::time::interval(poll_interval);
-    poll_timer.tick().await; // consume the immediate first tick
-
-    let exit_status = loop {
-        tokio::select! {
-            status = child.wait() => {
-                break status.map_err(|e| CallerError::SubAgent(format!("Orchestrator wait error: {}", e)))?;
-            }
-            _ = poll_timer.tick() => {
-                // Check progress file
-                if let Ok(progress) = sub_agent::read_progress(&spec.progress_file) {
-                    if progress.turn > last_progress_turn {
-                        last_progress_turn = progress.turn;
-                        let user_msg = user_mode::format_progress_for_user(&progress);
-                        slog(&session_log, |l| {
-                            l.info(&format!("Orchestrator progress: {}", user_msg));
-                        });
-                        bus.send(AppEvent::OrchestratorProgress {
-                            turn: progress.turn,
-                            status: progress.status.clone(),
-                            last_action: progress.last_action.clone(),
-                        });
-                    }
-                }
-
-                // Tail orchestrator session log for detailed events
-                if orch_log_file.is_none() {
-                    orch_log_file = orch_session_log_path
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                }
-                if let Some(ref log_path) = orch_log_file {
-                    orch_log_offset = tail_orchestrator_log(
-                        log_path, orch_log_offset, &bus, &session_log,
-                    );
-                }
-            }
-        }
-    };
-
-    // Final tail to catch any remaining log entries written before exit
-    if let Some(ref log_path) = orch_log_file {
-        tail_orchestrator_log(log_path, orch_log_offset, &bus, &session_log);
-    }
-
-    // Wait for stderr task to finish
-    let _ = stderr_handle.await;
-
-    slog(&session_log, |l| {
-        l.info(&format!("Orchestrator exited with status: {}", exit_status));
-    });
-
-    // Read result from result file, or synthesize a failure
-    let mut loop_stats = LoopStats::default();
-    let result = if spec.result_file.exists() {
-        match sub_agent::read_result(&spec.result_file) {
-            Ok(r) => r,
-            Err(e) => sub_agent::SubAgentResult {
-                id: spec.id.clone(),
-                status: sub_agent::SubAgentStatus::Failed(format!("Result parse error: {}", e)),
-                summary: "Orchestrator finished but result could not be parsed".to_string(),
-                brief: "Orchestrator result could not be parsed.".to_string(),
-                findings: vec![],
-                artifacts: vec![],
-                usage: provider::TokenUsage::default(),
-            },
-        }
-    } else {
-        sub_agent::SubAgentResult {
-            id: spec.id.clone(),
-            status: sub_agent::SubAgentStatus::Failed(format!("exit code: {}", exit_status)),
-            summary: "Orchestrator exited without writing a result file".to_string(),
-            brief: "Orchestrator exited without a result.".to_string(),
-            findings: vec![],
-            artifacts: vec![],
-            usage: provider::TokenUsage::default(),
-        }
-    };
-
-    loop_stats.usage = result.usage.clone();
-    loop_stats.turns = last_progress_turn;
-
-    let result_msg = sub_agent::format_result_message(&result);
-    slog(&session_log, |l| {
-        l.info(&format!("Orchestrator result: {}", result_msg));
-    });
-    slog(&session_log, |l| {
-        l.debug(&format!("Task brief (orchestrator): {}", result.brief));
-    });
-    bus.send(AppEvent::SubAgentResult {
-        formatted: result_msg.clone(),
-    });
-
-    let reason = match &result.status {
-        sub_agent::SubAgentStatus::Completed => "Task complete".to_string(),
-        sub_agent::SubAgentStatus::Failed(reason) => format!("Orchestrator failed: {}", reason),
-    };
-    bus.send(AppEvent::TaskComplete {
-        session_id: session_log_id(&session_log),
-        reason: reason.clone(),
-        summary: Some(result.brief.clone()),
-    });
-
-    Ok(loop_stats)
-}
-
+#[allow(clippy::too_many_arguments)]
 async fn run_direct_mode(
     mut provider: Box<dyn provider::ChatProvider>,
     task: String,
@@ -29549,8 +29250,18 @@ async fn run_direct_mode(
     session_registry: Option<display::SharedSessionRegistry>,
     headless: bool,
     attachments: UserAttachments,
+    orchestrate: bool,
 ) -> Result<LoopStats, CallerError> {
-    let role = sub_agent::SubAgentRole::Custom("direct".to_string());
+    // `orchestrate` runs the same in-process loop with the orchestration
+    // prompt instead of the direct prompt. Orchestration used to be a
+    // separate subprocess mode (`run_user_mode`, which spawned the
+    // orchestrator as a child process and polled its progress/result
+    // files); it is now just a differently-configured internal session.
+    let role = if orchestrate {
+        sub_agent::SubAgentRole::Orchestrator
+    } else {
+        sub_agent::SubAgentRole::Custom("direct".to_string())
+    };
     let system_prompt = if provider.use_tools() {
         prompts::resolve_system_prompt_for_tools(&role, Some(&project.root))?
     } else {
@@ -29559,7 +29270,8 @@ async fn run_direct_mode(
 
     slog(&session_log, |l| {
         l.info(&format!(
-            "Mode: direct (provider: {}, context: {})",
+            "Mode: {} (provider: {}, context: {})",
+            if orchestrate { "orchestrate" } else { "direct" },
             provider.name(),
             provider.context_window()
         ));
@@ -35386,16 +35098,6 @@ async fn main() -> Result<(), CallerError> {
                             None,
                         )
                         .await
-                    } else if use_orchestration {
-                        run_user_mode(
-                            provider,
-                            task_str,
-                            project,
-                            bus_clone.clone(),
-                            autonomy,
-                            session_log,
-                        )
-                        .await
                     } else {
                         run_direct_mode(
                             provider,
@@ -35413,6 +35115,7 @@ async fn main() -> Result<(), CallerError> {
                             Some(session_registry),
                             false, // not headless — MCP has interactive approval
                             UserAttachments::default(),
+                            use_orchestration,
                         )
                         .await
                     };
@@ -36122,36 +35825,26 @@ async fn main() -> Result<(), CallerError> {
                         }
                     };
 
-                    if force_direct || is_simple_task(&task_str) {
-                        run_direct_mode(
-                            provider,
-                            task_str,
-                            project,
-                            bus_clone.clone(),
-                            autonomy_clone,
-                            session_log_clone,
-                            log_dir_clone,
-                            mcp_mgr,
-                            follow_up_rx,
-                            None, // no JSON approval in TUI mode
-                            approval_registry_clone,
-                            context_injection_clone,
-                            Some(session_registry_clone),
-                            false, // not headless — TUI handles approval
-                            UserAttachments::default(),
-                        )
-                        .await
-                    } else {
-                        run_user_mode(
-                            provider,
-                            task_str,
-                            project,
-                            bus_clone.clone(),
-                            autonomy_clone,
-                            session_log_clone,
-                        )
-                        .await
-                    }
+                    let orchestrate = !(force_direct || is_simple_task(&task_str));
+                    run_direct_mode(
+                        provider,
+                        task_str,
+                        project,
+                        bus_clone.clone(),
+                        autonomy_clone,
+                        session_log_clone,
+                        log_dir_clone,
+                        mcp_mgr,
+                        follow_up_rx,
+                        None, // no JSON approval in TUI mode
+                        approval_registry_clone,
+                        context_injection_clone,
+                        Some(session_registry_clone),
+                        false, // not headless — TUI handles approval
+                        UserAttachments::default(),
+                        orchestrate,
+                    )
+                    .await
                 };
 
                 match result {
@@ -36626,36 +36319,26 @@ async fn main() -> Result<(), CallerError> {
             let provider = provider.ok_or_else(|| {
                 CallerError::Config("Headless mode requires an API key".to_string())
             })?;
-            if flags.direct || is_simple_task(&task) {
-                run_direct_mode(
-                    provider,
-                    task.clone(),
-                    project,
-                    bus.clone(),
-                    autonomy,
-                    session_log.clone(),
-                    log_dir,
-                    mcp_mgr,
-                    follow_up_rx,
-                    json_approval_slot,
-                    event::ApprovalRegistry::default(),
-                    event::ContextInjectionQueue::default(),
-                    Some(session_registry.clone()),
-                    true, // headless mode
-                    UserAttachments::default(),
-                )
-                .await
-            } else {
-                run_user_mode(
-                    provider,
-                    task.clone(),
-                    project,
-                    EventBus::new(), // user_mode spawns orchestrator subprocess
-                    autonomy,
-                    session_log.clone(),
-                )
-                .await
-            }
+            let orchestrate = !(flags.direct || is_simple_task(&task));
+            run_direct_mode(
+                provider,
+                task.clone(),
+                project,
+                bus.clone(),
+                autonomy,
+                session_log.clone(),
+                log_dir,
+                mcp_mgr,
+                follow_up_rx,
+                json_approval_slot,
+                event::ApprovalRegistry::default(),
+                event::ContextInjectionQueue::default(),
+                Some(session_registry.clone()),
+                true, // headless mode
+                UserAttachments::default(),
+                orchestrate,
+            )
+            .await
         };
 
         let reason = match &result {

@@ -1672,36 +1672,30 @@ impl SessionSupervisor {
                         return;
                     }
                 };
-                if use_direct {
-                    run_direct_mode(
-                        provider,
-                        task.clone(),
-                        project,
-                        bus.clone(),
-                        autonomy,
-                        session_log.clone(),
-                        log_dir,
-                        None,
-                        follow_up_rx,
-                        None,
-                        approval_registry,
-                        context_injection,
-                        supervisor.config.session_registry.clone(),
-                        true,
-                        attachments,
-                    )
-                    .await
-                } else {
-                    run_user_mode(
-                        provider,
-                        task.clone(),
-                        project,
-                        bus.clone(),
-                        autonomy,
-                        session_log.clone(),
-                    )
-                    .await
-                }
+                // Both arms run the same in-process supervised loop;
+                // `orchestrate = !use_direct` only swaps in the
+                // orchestration prompt. The old subprocess orchestrator
+                // (`run_user_mode`) is gone — orchestration is an
+                // internal session like any other.
+                run_direct_mode(
+                    provider,
+                    task.clone(),
+                    project,
+                    bus.clone(),
+                    autonomy,
+                    session_log.clone(),
+                    log_dir,
+                    None,
+                    follow_up_rx,
+                    None,
+                    approval_registry,
+                    context_injection,
+                    supervisor.config.session_registry.clone(),
+                    true,
+                    attachments,
+                    !use_direct,
+                )
+                .await
             };
 
             supervisor
