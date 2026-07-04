@@ -13631,7 +13631,7 @@ mod tests {
                     codex_context_archive: Some("summary".to_string()),
                     codex_service_tier: None,
                     codex_home: Some(home.path().join(".codex").to_string_lossy().to_string()),
-                    forked_from: None,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -13745,7 +13745,7 @@ mod tests {
                     codex_context_archive: Some("summary".to_string()),
                     codex_service_tier: None,
                     codex_home: Some(home.path().join(".codex").to_string_lossy().to_string()),
-                    forked_from: None,
+                    ..Default::default()
                 },
             )
             .unwrap();
