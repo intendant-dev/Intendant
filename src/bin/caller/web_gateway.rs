@@ -3650,6 +3650,26 @@ fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<Path
         return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
     }
 
+    // Anything else must be a bare directory name — one normal path
+    // component. Windows path shapes never take the validated slash route
+    // above, and `logs_dir.join(<absolute or drive-relative>)` REPLACES
+    // the logs root, so an id like `C:\evil\dir` would replay a session
+    // log from anywhere on disk; `..` likewise walks out a level even on
+    // Unix. Refuse every path-shaped id outright (the explicit backslash
+    // check keeps Unix — where `\` is a legal filename byte — behaving
+    // exactly like Windows).
+    {
+        use std::path::Component;
+        let mut components = Path::new(session_id).components();
+        let bare_name = matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(_)), None)
+        );
+        if !bare_name || session_id.contains('\\') {
+            return None;
+        }
+    }
+
     let logs_dir = home.join(".intendant").join("logs");
     let direct = logs_dir.join(session_id);
     if direct.is_dir() {
@@ -35493,6 +35513,22 @@ mod tests {
             80,
         )
         .is_none());
+    }
+
+    #[test]
+    fn intendant_session_dir_refuses_path_shaped_session_ids() {
+        // Non-slash ids join under the logs root, and join() with an
+        // absolute / drive-relative / parent path REPLACES or escapes it
+        // — the Windows shapes never reach the validated slash route, so
+        // every path-shaped id must be refused outright, on every OS.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".intendant").join("logs")).unwrap();
+        for id in ["..", r"..\..", r"C:\outside\dir", r"C:evil", r"logs\x", ".", ""] {
+            assert!(
+                intendant_session_dir_from_home(home.path(), id).is_none(),
+                "path-shaped session id {id:?} must be refused"
+            );
+        }
     }
 
     #[test]
