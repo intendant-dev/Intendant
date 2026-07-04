@@ -433,6 +433,9 @@ pub(crate) struct StationControlsSummary {
     pub(crate) model: String,
     pub(crate) reasoning_effort: String,
     pub(crate) service_tier: String,
+    /// Global Claude Code runtime knobs (empty model = CLI default).
+    pub(crate) claude_model: String,
+    pub(crate) claude_permission_mode: String,
     pub(crate) managed_context: String,
     /// Managed-capable (Intendant-aware fork) codex binary; empty when no
     /// dedicated fork is configured.
@@ -568,6 +571,8 @@ impl Default for StationControlsSummary {
             model: String::new(),
             reasoning_effort: String::new(),
             service_tier: String::new(),
+            claude_model: String::new(),
+            claude_permission_mode: String::new(),
             managed_context: String::new(),
             managed_command: String::new(),
             context_archive: String::new(),

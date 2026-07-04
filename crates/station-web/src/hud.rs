@@ -1914,6 +1914,66 @@ impl StationInner {
                 }
             }
         }
+        // Claude Code runtime rows: same visibility contract as the Codex
+        // block — global backend OR the launch composer aimed at
+        // claude-code. Model pills are the CLI's latest-version aliases
+        // ("default" clears back to the CLI's own default); permission
+        // pills use short labels for the CLI's camelCase modes.
+        if controls.backend == "claude-code" || controls.launch_agent == "claude-code" {
+            let model = controls.claude_model.trim();
+            const MODEL_ALIASES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+            surface.rows.push(PanelRow::choices(
+                "model",
+                C_YELLOW_CSS,
+                std::iter::once((
+                    "default".to_string(),
+                    model.is_empty(),
+                    HitAction::ControlsAction {
+                        action: "claude-model:default".into(),
+                    },
+                ))
+                .chain(MODEL_ALIASES.into_iter().map(|alias| {
+                    (
+                        alias.to_string(),
+                        model.contains(alias),
+                        HitAction::ControlsAction {
+                            action: format!("claude-model:{alias}"),
+                        },
+                    )
+                }))
+                .collect(),
+            ));
+            // A pinned model outside the alias set still shows truthfully.
+            if !model.is_empty() && !MODEL_ALIASES.iter().any(|alias| model.contains(alias)) {
+                surface.rows.push(PanelRow::new(
+                    "model".to_string(),
+                    format!("custom: {model}"),
+                    C_TEAL_CSS,
+                ));
+            }
+            surface.rows.push(PanelRow::choices(
+                "permissions",
+                C_MAUVE_CSS,
+                [
+                    ("default", "default"),
+                    ("edits", "acceptEdits"),
+                    ("plan", "plan"),
+                    ("bypass", "bypassPermissions"),
+                ]
+                .into_iter()
+                .map(|(label, mode)| {
+                    (
+                        label.to_string(),
+                        controls.claude_permission_mode == mode
+                            || (mode == "default" && controls.claude_permission_mode.is_empty()),
+                        HitAction::ControlsAction {
+                            action: format!("claude-permission:{mode}"),
+                        },
+                    )
+                })
+                .collect(),
+            ));
+        }
 
         // Voice / video / display sharing toggles.
         surface.rows.push(PanelRow::choices(
