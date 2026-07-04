@@ -1144,6 +1144,10 @@ body.access-page #tab-access {
   line-height: 1;
 }
 .acc-btn:hover, .ui-btn:hover { border-color: var(--blue); }
+.acc-btn:focus-visible, .ui-btn:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
 .acc-btn.primary, .ui-btn.primary {
   border-color: var(--blue);
   background: var(--blue);
@@ -1825,7 +1829,9 @@ body.access-page #tab-access {
 .settings-save-row {
   display: flex;
   gap: 8px;
-  padding: 10px 20px;
+  /* Full-width footer bar, but its actions align with the centered
+     760px settings column above instead of hugging the viewport edge. */
+  padding: 10px max(20px, calc((100% - 760px) / 2 + 20px));
   border-top: 1px solid var(--glass-hairline-bright);
   background: var(--glass-bg);
   flex-shrink: 0;
@@ -2699,6 +2705,7 @@ body.access-page #tab-access {
   border-radius: 4px;
   background: var(--base);
   color: var(--text);
+  font-family: inherit;
   font-size: 12px;
   padding: 5px 8px;
 }
