@@ -1281,6 +1281,11 @@ pub enum ControlMsg {
         /// Only applies when the resolved agent is Claude Code.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_permission_mode: Option<String>,
+        /// Optional one-shot Claude Code reasoning-effort level
+        /// (low/medium/high/xhigh/max) for this session. Only applies when
+        /// the resolved agent is Claude Code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_effort: Option<String>,
         /// Optional one-shot Codex sandbox mode for this session. Only applies
         /// when the resolved agent is Codex.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3363,6 +3368,7 @@ mod tests {
                 agent: Some("codex".to_string()),
                 agent_command: Some("/opt/codex/bin/codex".to_string()),
                 claude_model: None,
+                claude_effort: None,
                 claude_permission_mode: None,
                 codex_sandbox: Some("danger-full-access".to_string()),
                 codex_approval_policy: Some("never".to_string()),
@@ -3632,6 +3638,7 @@ mod tests {
                 agent_command,
                 claude_model,
                 claude_permission_mode,
+                claude_effort,
                 codex_sandbox,
                 codex_approval_policy,
                 codex_managed_context,
@@ -3646,6 +3653,7 @@ mod tests {
                 assert_eq!(task, "fix bug");
                 assert!(claude_model.is_none());
                 assert!(claude_permission_mode.is_none());
+                assert!(claude_effort.is_none());
                 assert_eq!(name.as_deref(), Some("Bugfix work"));
                 assert_eq!(project_root.as_deref(), Some("/repo"));
                 assert_eq!(agent.as_deref(), Some("codex"));

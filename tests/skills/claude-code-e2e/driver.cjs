@@ -381,6 +381,37 @@ async function main() {
       Boolean(capsUniversal && ['compact', 'fork'].every((op) => capsUniversal.capabilities.thread_actions.includes(op))),
       capsUniversal ? JSON.stringify(capsUniversal.capabilities.thread_actions) : 'no thread_actions in any capabilities event');
 
+    // Phase 6.5: the wrapper goal engine. Set → immediate result; the
+    // GoalUpdated flush rides the next turn's drain (idle adapter events
+    // surface at the next drain in presence mode).
+    run.send({
+      action: 'thread_action', op: 'goal', session_id: backendSessionId,
+      params: { objective: 'Keep every reply under one sentence.', tokenBudget: 900000 },
+    });
+    const goalResult = await run.waitFor(
+      'goal set result',
+      (e) => e.event === 'codex_thread_action_result' && e.action === 'goal',
+      60000,
+    );
+    check('goal-set-dispatches', goalResult.success === true && /active/.test(goalResult.message || ''),
+      goalResult.message || '');
+    run.send({ action: 'follow_up', text: 'Acknowledge your operator goal in one short sentence.' });
+    const goalEvent = await run.waitFor(
+      'session_goal event',
+      (e) => e.event === 'session_goal' && e.goal && /one sentence/i.test(e.goal.objective || ''),
+      120000,
+    );
+    check('goal-event-reaches-dashboard',
+      goalEvent.goal.status === 'active' && goalEvent.goal.token_budget === 900000,
+      JSON.stringify(goalEvent.goal).slice(0, 140));
+    run.send({ action: 'thread_action', op: 'goal-clear', session_id: backendSessionId });
+    const goalClearResult = await run.waitFor(
+      'goal clear result',
+      (e) => e.event === 'codex_thread_action_result' && e.action === 'goal-clear',
+      60000,
+    );
+    check('goal-clear-dispatches', goalClearResult.success === true, goalClearResult.message || '');
+
     // Phase 7: /compact via the universal thread_action channel. The CLI
     // compacts in place (status: compacting → compact_boundary → a free
     // result); the session must still recall pre-compact facts afterwards.

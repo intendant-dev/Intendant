@@ -318,7 +318,11 @@ The index directory is safe to delete; it rebuilds on the next scan.
   External Codex sessions can choose both the binary path and the
   `managed_context` mode (`vanilla` or `managed`) for that session; the
   external-agent options sit in a fold that opens when an external
-  backend is selected.
+  backend is selected. Claude Code sessions get per-launch dropdowns for
+  the model (version-safe aliases — `fable`, `opus`, `sonnet`, `haiku` —
+  that the CLI resolves to the latest release, with a Custom-id escape
+  for full model names), the permission mode, and the reasoning effort
+  (`low` … `max`).
 
 External-agent session cards and Activity windows also expose **Launch config**
 for per-session binary and managed-context settings. Use **Save** to update the
