@@ -984,6 +984,7 @@ fn landing_asset_bytes(name: &str) -> Option<&'static [u8]> {
         "vault.webp" => Some(include_bytes!("assets/landing-vault.webp")),
         "station.webp" => Some(include_bytes!("assets/landing-station.webp")),
         "claim.webp" => Some(include_bytes!("assets/landing-claim.webp")),
+        "phone.webp" => Some(include_bytes!("assets/landing-phone.webp")),
         _ => None,
     }
 }
@@ -5014,41 +5015,42 @@ fn trust_ui_html(origin: &str) -> String {
 const DOCS_URL: &str = "https://lovon-spec.github.io/Intendant/";
 const REPO_URL: &str = "https://github.com/lovon-spec/intendant";
 
-/// The deployment advisor inside the landing install section: four
+/// The deployment advisor — the lead of the landing install section: four
 /// questions -> one command per platform (sh or PowerShell, `--service` where it belongs)
 /// plus an honest fueling plan for after the claim. A separate const so
 /// its CSS/JS braces stay out of the page-level `format!`; it derives
 /// the command from `location.origin` at runtime, so a self-hosted
-/// rendezvous advertises its own installer here too. Folded shut by
-/// default — the one-command story stays the headline.
-const LANDING_ADVISOR_HTML: &str = r##"<details class="advisor" id="advisor">
+/// rendezvous advertises its own installer here too. The default answers'
+/// command is server-rendered into the terminal (via the
+/// `__ADVISOR_DEFAULT_CMD__` placeholder) so the page works without JS
+/// and the one-command story is visible before any click. Every question
+/// is about the agent's machine — the client side needs no install and
+/// therefore no questions.
+const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advisor">
         <style>
-          .advisor { margin-top: 26px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(30, 30, 46, .55); }
-          .advisor summary { cursor: pointer; padding: 14px 16px; font-size: 14.5px; color: var(--muted); list-style: none; }
-          .advisor summary::before { content: "?"; display: inline-block; width: 20px; height: 20px; margin-right: 10px; border-radius: 50%; background: var(--surface-2); color: var(--accent); font-weight: 700; font-size: 12.5px; text-align: center; line-height: 20px; }
-          .advisor summary::-webkit-details-marker { display: none; }
-          .advisor summary:hover { color: var(--text); }
-          .advisor[open] summary { border-bottom: 1px solid var(--line); color: var(--text); }
+          .advisor { border: 1px solid var(--line); border-radius: var(--radius); background: rgba(30, 30, 46, .55); }
           .advbody { padding: 16px; display: grid; gap: 14px; }
-          .advq { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-          .advq .ql { font-size: 13.5px; color: var(--muted-2); min-width: 200px; }
+          .advq { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+          /* Labels take their own line so option rows keep an even rhythm
+             at any column width (no ragged orphan buttons). */
+          .advq .ql { flex: 0 0 100%; font-size: 13.5px; color: var(--muted-2); }
           .advq button { background: transparent; border: 1px solid var(--line-strong); color: var(--muted); border-radius: 999px; padding: 5px 13px; font-size: 13px; cursor: pointer; }
           .advq button:hover { color: var(--text); border-color: var(--accent); }
           .advq button.on { background: var(--surface-2); color: var(--text); border-color: var(--accent); }
           .advout { border-top: 1px solid var(--line); padding-top: 14px; display: grid; gap: 10px; }
           .advout ul { margin: 0; padding-left: 20px; font-size: 14px; color: var(--muted); display: grid; gap: 6px; }
           .advout ul b { color: var(--text); }
+          .advout ul:empty { display: none; }
         </style>
-        <summary>Not sure which shape fits? Answer four questions.</summary>
         <div class="advbody">
           <div class="advq" data-q="os">
-            <span class="ql">Operating system?</span>
+            <span class="ql">OS on the agent's machine?</span>
             <button data-v="linux" class="on">Linux</button>
             <button data-v="macos">macOS</button>
             <button data-v="windows">Windows</button>
           </div>
           <div class="advq" data-q="box">
-            <span class="ql">Where will it run?</span>
+            <span class="ql">What kind of machine?</span>
             <button data-v="vps" class="on">A rented VPS</button>
             <button data-v="server">My own always-on machine</button>
             <button data-v="laptop">The machine I'm on now</button>
@@ -5068,10 +5070,10 @@ const LANDING_ADVISOR_HTML: &str = r##"<details class="advisor" id="advisor">
             <div class="terminal">
               <div class="tbar">
                 <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-                <span class="bftitle">still one command</span>
+                <span class="bftitle" id="advtitle">fresh box — sh</span>
                 <button onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('advcmd').textContent)">copy</button>
               </div>
-              <pre><span class="ps" id="advps">$ </span><span id="advcmd"></span></pre>
+              <pre><span class="ps" id="advps">$ </span><span id="advcmd">__ADVISOR_DEFAULT_CMD__</span></pre>
             </div>
             <ul id="advplan"></ul>
             <p class="installnote" id="advnote"></p>
@@ -5088,7 +5090,7 @@ const LANDING_ADVISOR_HTML: &str = r##"<details class="advisor" id="advisor">
               ? '& ([scriptblock]::Create((irm ' + location.origin + "/install.ps1))) -Owner '\u003cyour-key\u003e'" + (svc ? ' -Service' : '')
               : 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- --owner \u003cyour-key\u003e' + (svc ? ' --service' : '');
             document.getElementById('advps').textContent = pick.os === 'windows' ? 'PS> ' : '$ ';
-
+            document.getElementById('advtitle').textContent = pick.os === 'windows' ? 'fresh box — PowerShell' : 'fresh box — sh';
             document.getElementById('advcmd').textContent = cmd;
             var plan = [];
             if (pick.box === 'laptop') {
@@ -5132,7 +5134,7 @@ const LANDING_ADVISOR_HTML: &str = r##"<details class="advisor" id="advisor">
           render();
         })();
         </script>
-      </details>"##;
+      </div>"##;
 
 /// The public landing page at `/`. Deliberately static and dependency-free;
 /// the install one-liner is origin-aware so a self-hosted rendezvous
@@ -5266,7 +5268,17 @@ fn landing_ui_html(origin: &str) -> String {
       border-radius: 12px; box-shadow: var(--shadow); overflow: hidden;
     }}
     .shotnote {{ margin-top: 10px; font-size: 13px; color: var(--muted-2); }}
+    /* The phone row: a bezel, not a browser frame */
+    .phonepic {{ display: grid; justify-items: center; }}
+    .phonepic .shotnote {{ text-align: center; }}
+    .phoneframe {{
+      width: min(280px, 72vw); padding: 10px; border-radius: 44px;
+      background: #0d0d15; border: 1px solid var(--line-strong);
+      box-shadow: var(--shadow);
+    }}
+    .phoneframe img {{ display: block; width: 100%; height: auto; border-radius: 34px; }}
     section h2 {{ font-size: 24px; margin: 0 0 20px; letter-spacing: -.3px; }}
+    .sectionlede {{ margin: -10px 0 24px; font-size: 15px; color: var(--muted); max-width: 660px; }}
     section.features {{ padding: 78px 0 0; }}
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }}
     .card {{
@@ -5345,10 +5357,11 @@ fn landing_ui_html(origin: &str) -> String {
       <p>
         Intendant is an open-source operating environment for autonomous AI
         agents: a shell, files, a display it can see and control, voice, and
-        phone calls — with layered human supervision, portable across
-        OpenAI, Anthropic, and Gemini, and at home on macOS, Linux, and
-        Windows. It runs its own agent loop and supervises Codex and
-        Claude Code as managed backends.
+        phone calls — with layered human supervision. It runs its own agent
+        loop, supervises Codex and Claude Code as managed backends, and is
+        portable across OpenAI, Anthropic, and Gemini. The agent's machine
+        can run macOS, Linux, or Windows; yours just needs a browser —
+        nothing to install on your side of the glass.
       </p>
       <div class="cta">
         <a class="btn" href="/connect">Open your dashboard</a>
@@ -5445,6 +5458,27 @@ fn landing_ui_html(origin: &str) -> String {
           <div class="shotnote">atlas, online seconds after its claim phrase was pasted.</div>
         </div>
       </div>
+
+      <div class="trow">
+        <div class="txt">
+          <div class="eyebrow">The client</div>
+          <h3>Nothing to install on your side</h3>
+          <p>Most agent environments start by installing software on the
+          device in front of you. Intendant never does: the whole client is
+          a browser tab. Approve a diff from your phone, watch the live
+          desktop from a tablet, run mission control from any laptop — same
+          daemon, same authority, zero client software. On intendant.dev
+          there is nothing to set up at all; even fully self-hosted, the
+          one-time cost is trusting a certificate, never installing an app.</p>
+        </div>
+        <div class="pic phonepic">
+          <div class="phoneframe">
+            <img loading="lazy" src="/assets/landing/phone.webp" width="780" height="1688"
+                 alt="The same Intendant session on a phone: the Activity feed showing the agent's diff, an approval-gated backfill command, and the verified result — driven entirely from a mobile browser.">
+          </div>
+          <div class="shotnote">The rollup fix from above — same session, held in one hand.</div>
+        </div>
+      </div>
     </section>
 
     <section class="features">
@@ -5463,10 +5497,11 @@ fn landing_ui_html(origin: &str) -> String {
           calls through your browser; disks hold nothing worth stealing.</p>
         </div>
         <div class="card">
-          <h3>Every interface</h3>
+          <h3>Every interface, any device</h3>
           <p>Web dashboard, terminal TUI, CLI, MCP, live voice, and phone
-          calls — every capability reachable from each of them, on macOS,
-          Linux, and Windows alike.</p>
+          calls — every capability reachable from each of them. The web
+          client runs in any browser, phone included, with nothing to
+          install client-side.</p>
         </div>
         <div class="card">
           <h3>A fleet, not a box</h3>
@@ -5479,35 +5514,31 @@ fn landing_ui_html(origin: &str) -> String {
 
     <section class="install-section" id="install">
       <h2>Stand up a daemon in about ninety seconds</h2>
+      <p class="sectionlede">
+        Four answers about the machine the agent will live on, and the exact
+        command appears. That machine is the only one that installs anything
+        — you can be reading this from your phone.
+      </p>
       <div class="igrid">
+        {advisor}
         <div>
-          <div class="terminal">
-            <div class="tbar">
-              <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-              <span class="bftitle">fresh box — sh</span>
-              <button onclick="navigator.clipboard&amp;&amp;navigator.clipboard.writeText(document.getElementById('cmd').textContent.replace(/^\$ /,''))">copy</button>
-            </div>
-            <pre id="cmd"><span class="ps">$ </span>{install_cmd}</pre>
+          <div class="steps">
+            <div class="step"><b><span class="n">1</span>Install</b>
+              One command on a fresh box pins root authority to your browser's key. Nothing sensitive travels.</div>
+            <div class="step"><b><span class="n">2</span>Claim</b>
+              The daemon prints a twelve-word phrase; claim it from the browser you're already holding.</div>
+            <div class="step"><b><span class="n">3</span>Fuel</b>
+              Grant time-boxed credential leases from your encrypted vault — or relay calls through your browser and never hand over a key at all.</div>
           </div>
           <p class="installnote">
             New here? <a href="/connect">Sign in</a> first — your key is in the
-            dashboard's Access drawer. Nothing sensitive travels in this command
+            dashboard's Access drawer. Nothing sensitive travels in the command
             or lands on the box: the daemon boots already owned by you, you claim
             it with a twelve-word phrase, and it borrows credentials from your
-            vault only while you let it. On Windows? The advisor below builds
-            the PowerShell command (<code>/install.ps1</code>).
+            vault only while you let it.
           </p>
         </div>
-        <div class="steps">
-          <div class="step"><b><span class="n">1</span>Install</b>
-            One command on a fresh box pins root authority to your browser's key. Nothing sensitive travels.</div>
-          <div class="step"><b><span class="n">2</span>Claim</b>
-            The daemon prints a twelve-word phrase; claim it from the browser you're already holding.</div>
-          <div class="step"><b><span class="n">3</span>Fuel</b>
-            Grant time-boxed credential leases from your encrypted vault — or relay calls through your browser and never hand over a key at all.</div>
-        </div>
       </div>
-      {advisor}
     </section>
 
     <section class="trustrow">
@@ -5520,6 +5551,14 @@ fn landing_ui_html(origin: &str) -> String {
           transparency log keep the service honest — and you can
           <a href="/trust">read exactly what it can and cannot do</a>,
           or run your own.</p>
+        </div>
+        <div class="card">
+          <h3>The sandbox never holds keys</h3>
+          <p>Inside each daemon, the sandboxed process that executes
+          commands never sees an API key, and the process that talks to
+          model providers never executes commands. A hijacked conversation
+          can't steal credentials; a hijacked shell can't phone home
+          through the model — by construction, not by policy.</p>
         </div>
       </div>
     </section>
@@ -5536,7 +5575,11 @@ fn landing_ui_html(origin: &str) -> String {
   </div>
 </body>
 </html>"##,
-        advisor = LANDING_ADVISOR_HTML,
+        // Server-render the default answers' command (Linux VPS ⇒ --service)
+        // so the terminal shows a real, origin-aware one-liner before any
+        // JS runs; render() redraws the same text on load.
+        advisor = LANDING_ADVISOR_HTML
+            .replace("__ADVISOR_DEFAULT_CMD__", &format!("{install_cmd} --service")),
     )
 }
 
@@ -7364,32 +7407,50 @@ mod tests {
         assert!(html.contains("Built to be distrusted"));
         // The tour shows the product: every embedded screenshot is referenced,
         // with alt text so the page reads without images.
-        for asset in ["hero.webp", "video.webp", "station.webp", "vault.webp", "claim.webp"] {
+        for asset in [
+            "hero.webp",
+            "video.webp",
+            "station.webp",
+            "vault.webp",
+            "claim.webp",
+            "phone.webp",
+        ] {
             assert!(
                 html.contains(&format!("/assets/landing/{asset}")),
                 "landing page must reference {asset}"
             );
         }
         assert!(html.contains("alt=\"The Intendant dashboard's Activity feed"));
+        // The differentiator is stated where people will read it: the client
+        // installs nothing, on any device — only the agent's machine does.
+        assert!(html.contains("Nothing to install on your side"));
+        assert!(html.contains("nothing to install on your side of the glass"));
         // The canonical mark, not an ad-hoc monogram: favicon + header logo.
         assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/logo.svg">"#));
         assert!(html.contains(r#"<link rel="icon" type="image/png" href="/favicon.png">"#));
         assert!(html.contains(r#"<img src="/logo.svg""#));
         assert!(!html.contains("data:image/svg"));
-        // The deployment advisor: folded shut (the one-command story stays
-        // the headline), four questions, and runtime-origin commands so
-        // self-hosted rendezvous advertise their own installers there too —
-        // the sh one-liner AND the PowerShell one (Windows is first-class).
-        assert!(html.contains("Not sure which shape fits?"));
-        assert!(!html.contains("<details class=\"advisor\" open"));
+        // The deployment advisor LEADS the install section — no fold to
+        // find, four questions all about the agent's machine (the client
+        // side installs nothing, so it gets no questions), and
+        // runtime-origin commands so self-hosted rendezvous advertise their
+        // own installers there too — the sh one-liner AND the PowerShell
+        // one (Windows is first-class).
+        assert!(!html.contains("<details class=\"advisor\""));
         for question in [
-            "Operating system?",
-            "Where will it run?",
+            "OS on the agent's machine?",
+            "What kind of machine?",
             "What will fuel it?",
             "Keep working with your browser closed?",
         ] {
             assert!(html.contains(question), "advisor must ask: {question}");
         }
+        // The default answers' command is server-rendered, so the page
+        // shows a working one-liner (Linux VPS ⇒ --service) without JS.
+        assert!(html.contains(
+            "curl -fsSL https://rendezvous.example/install.sh | sh -s -- --owner &lt;your-key&gt; --service"
+        ));
+        assert!(!html.contains("__ADVISOR_DEFAULT_CMD__"));
         assert!(html.contains("location.origin + '/install.sh"));
         assert!(html.contains("/install.ps1"));
         assert!(html.contains("--service"));
@@ -7440,7 +7501,14 @@ mod tests {
 
     #[test]
     fn landing_assets_are_embedded_webp() {
-        for asset in ["hero.webp", "video.webp", "station.webp", "vault.webp", "claim.webp"] {
+        for asset in [
+            "hero.webp",
+            "video.webp",
+            "station.webp",
+            "vault.webp",
+            "claim.webp",
+            "phone.webp",
+        ] {
             let bytes = landing_asset_bytes(asset)
                 .unwrap_or_else(|| panic!("missing embedded landing asset {asset}"));
             // RIFF....WEBP container magic.
