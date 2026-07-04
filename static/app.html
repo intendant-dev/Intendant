@@ -5,7 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>Intendant</title>
 <link rel="icon" type="image/png" sizes="128x128" href="/icon-128.png" id="favicon">
-<link rel="apple-touch-icon" href="/icon-128.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#11111b">
 <style>
 :root {
   --base: #1e1e2e;
@@ -10374,7 +10376,15 @@ body.display-fullscreen-open {
 
 /* ── Mobile ── */
 @media (max-width: 600px) {
-  .status-bar { font-size: 11px; gap: 8px; padding: 4px 8px; }
+  /* One swipeable line instead of four wrapped rows — the same pattern
+     as the tab bar, reclaiming ~140px of viewport above the composer. */
+  .status-bar {
+    font-size: 11px; gap: 8px; padding: 4px 8px;
+    flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .status-bar::-webkit-scrollbar { display: none; }
+  .status-bar > span, .status-bar > div { flex-shrink: 0; }
   .status-bar .provider { max-width: 92px; }
   .status-bar .model { max-width: 150px; }
   .status-bar .session { max-width: 120px; }
@@ -11578,6 +11588,43 @@ body.display-fullscreen-open {
                 <div class="control-hint">
                   One absolute path per line. Each becomes an entry in
                   <code>sandbox_workspace_write.writable_roots</code> (equivalent to <code>--add-dir</code>). Blank lines and duplicates are dropped. Press <kbd>Enter</kbd>-out or click away to save.
+                </div>
+              </fieldset>
+            </div>
+            <div id="control-claude-section" style="display:none">
+              <fieldset class="control-group">
+                <legend>Model</legend>
+                <div class="control-row">
+                  <label for="control-claude-model">Override</label>
+                  <input type="text" id="control-claude-model" placeholder="e.g. claude-haiku-4-5-20251001 or haiku (empty = claude default)">
+                </div>
+                <div class="control-hint">
+                  Sent as <code>claude --model</code>. Empty = let the claude CLI pick its configured default. Applies to the next task (the model latches when the process spawns).
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Permission mode</legend>
+                <div class="control-row">
+                  <label for="control-claude-permission-mode">Mode</label>
+                  <select id="control-claude-permission-mode">
+                    <option value="default" selected>default</option>
+                    <option value="acceptEdits">acceptEdits</option>
+                    <option value="plan">plan</option>
+                    <option value="bypassPermissions">bypassPermissions</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  <strong>default</strong>: tools outside the allowed list ask — prompts surface as Intendant approvals. <strong>acceptEdits</strong>: file edits auto-approve, commands still ask. <strong>plan</strong>: read-only planning. <strong>bypassPermissions</strong>: nothing asks — prefer an external sandbox.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Allowed tools</legend>
+                <div class="control-row">
+                  <label for="control-claude-allowed-tools">Always allowed</label>
+                  <textarea id="control-claude-allowed-tools" rows="3" placeholder="one-tool-per-line, e.g.&#10;Read&#10;Bash(cargo test *)&#10;(empty = all tools, gated by approvals)" style="flex:1;padding:4px 8px;background:var(--surface0);border:1px solid var(--surface1);color:var(--text);border-radius:4px;font-size:12px;font-family:var(--font-mono);resize:vertical"></textarea>
+                </div>
+                <div class="control-hint">
+                  Passed as <code>claude --allowedTools</code>. Listed tools (rule syntax like <code>Bash(cargo test *)</code> works) skip the permission prompt entirely; everything else follows the permission mode above. Press <kbd>Ctrl/&#8984;+Enter</kbd> or click away to save. Applies to the next task.
                 </div>
               </fieldset>
             </div>
@@ -13863,6 +13910,7 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'session_rename_result',
   'session_agent_config_result',
   'codex_config_changed',
+  'claude_config_changed',
   'usage',
   'usage_update',
   'presence_usage_update',
@@ -13889,6 +13937,9 @@ const DASHBOARD_CONTROL_MSG_RPC_ACTIONS = new Set([
   'set_codex_sandbox',
   'set_codex_approval_policy',
   'set_codex_model',
+  'set_claude_model',
+  'set_claude_permission_mode',
+  'set_claude_allowed_tools',
   'set_codex_reasoning_effort',
   'set_codex_service_tier',
   'set_codex_web_search',
@@ -24378,6 +24429,9 @@ function processCommands(cmds) {
           quiet: true,
         });
         break;
+      case 'claude_config_changed':
+        applyClaudeConfigChanged(c);
+        break;
       case 'codex_config_changed':
         applyCodexConfigChanged(c);
         break;
@@ -25179,6 +25233,11 @@ window.doPrune = doPrune;
 // persists to `intendant.toml` and broadcasts `CodexConfigChanged` back to
 // all connected dashboards, so two browsers stay in sync.
 
+let controlClaudeConfig = {
+  model: '',
+  permission_mode: 'default',
+  allowed_tools: [],
+};
 let controlCodexConfig = {
   command: 'codex',
   managed_command: '',
@@ -25273,6 +25332,11 @@ async function refreshControlPane() {
     if (!newSessionCodexFastModeTouched) {
       newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
     }
+    controlClaudeConfig = {
+      model: d.claude_model || '',
+      permission_mode: d.claude_permission_mode || 'default',
+      allowed_tools: Array.isArray(d.claude_allowed_tools) ? d.claude_allowed_tools : [],
+    };
     controlApprovalRules = {};
     for (const cat of CONTROL_APPROVAL_CATEGORIES) {
       const v = d['approval_' + cat];
@@ -25287,12 +25351,23 @@ async function refreshControlPane() {
 function renderControlPane() {
   const badge = document.getElementById('control-backend-badge');
   const codexSection = document.getElementById('control-codex-section');
+  const claudeSection = document.getElementById('control-claude-section');
   const emptyMsg = document.getElementById('control-no-backend');
   const isCodex = controlCurrentBackend === 'codex';
+  const isClaude = controlCurrentBackend === 'claude-code';
   if (badge) badge.textContent = controlCurrentBackend || 'none';
   if (codexSection) codexSection.style.display = isCodex ? '' : 'none';
-  if (emptyMsg) emptyMsg.style.display = isCodex ? 'none' : '';
+  if (claudeSection) claudeSection.style.display = isClaude ? '' : 'none';
+  if (emptyMsg) emptyMsg.style.display = (isCodex || isClaude) ? 'none' : '';
   const $ = id => document.getElementById(id);
+  if (isClaude) {
+    const modelInp = $('control-claude-model');
+    const modeSel = $('control-claude-permission-mode');
+    const toolsTA = $('control-claude-allowed-tools');
+    if (modelInp) modelInp.value = controlClaudeConfig.model || '';
+    if (modeSel) modeSel.value = controlClaudeConfig.permission_mode || 'default';
+    if (toolsTA) toolsTA.value = (controlClaudeConfig.allowed_tools || []).join('\n');
+  }
   if (isCodex) {
     const sandboxSel = $('control-codex-sandbox');
     const approvalSel = $('control-codex-approval');
@@ -25419,6 +25494,32 @@ function onControlModelCommit(ev) {
   dispatchControlMsg({ action: 'set_codex_model', model: model || null });
 }
 
+function onControlClaudeModelCommit(ev) {
+  const model = ev.target.value.trim();
+  const current = (controlClaudeConfig.model || '').trim();
+  if (model === current) return;
+  controlClaudeConfig.model = model;
+  dispatchControlMsg({ action: 'set_claude_model', model: model || null });
+}
+
+function onControlClaudePermissionModeChange(ev) {
+  const mode = ev.target.value;
+  if (mode === (controlClaudeConfig.permission_mode || 'default')) return;
+  controlClaudeConfig.permission_mode = mode;
+  dispatchControlMsg({ action: 'set_claude_permission_mode', mode });
+}
+
+function onControlClaudeAllowedToolsCommit(ev) {
+  const tools = ev.target.value
+    .split('\n')
+    .map(t => t.trim())
+    .filter(Boolean);
+  const current = controlClaudeConfig.allowed_tools || [];
+  if (tools.length === current.length && tools.every((t, i) => t === current[i])) return;
+  controlClaudeConfig.allowed_tools = tools;
+  dispatchControlMsg({ action: 'set_claude_allowed_tools', tools });
+}
+
 function onControlReasoningChange(ev) {
   const effort = ev.target.value;
   if (effort === (controlCodexConfig.reasoning_effort || '')) return;
@@ -25489,6 +25590,23 @@ function onControlWritableRootsCommit(ev) {
   }
   controlCodexConfig.writable_roots = deduped;
   dispatchControlMsg({ action: 'set_codex_writable_roots', roots: deduped });
+}
+
+// Apply a ClaudeConfigChanged event from the server — the Claude Code
+// sibling of applyCodexConfigChanged below.
+function applyClaudeConfigChanged(evt) {
+  if (evt.model !== undefined && evt.model !== null) {
+    controlClaudeConfig.model = evt.model;
+  } else if (evt.model_cleared) {
+    controlClaudeConfig.model = '';
+  }
+  if (evt.permission_mode) {
+    controlClaudeConfig.permission_mode = evt.permission_mode;
+  }
+  if (Array.isArray(evt.allowed_tools)) {
+    controlClaudeConfig.allowed_tools = evt.allowed_tools;
+  }
+  if (controlCurrentBackend === 'claude-code') renderControlPane();
 }
 
 // Apply a CodexConfigChanged event from the server, keeping the pane in
@@ -26366,6 +26484,32 @@ function wireControlPaneListeners() {
   document.querySelectorAll('.control-action-btn[data-codex-action]').forEach(btn => {
     btn.addEventListener('click', onControlActionBtnClick);
   });
+
+  // ── Claude Code section ──
+  const claudeModelInp = $('control-claude-model');
+  const claudeModeSel = $('control-claude-permission-mode');
+  const claudeToolsTA = $('control-claude-allowed-tools');
+  if (claudeModeSel) claudeModeSel.addEventListener('change', onControlClaudePermissionModeChange);
+  if (claudeModelInp) {
+    claudeModelInp.addEventListener('change', onControlClaudeModelCommit);
+    claudeModelInp.addEventListener('blur', onControlClaudeModelCommit);
+    claudeModelInp.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        onControlClaudeModelCommit(ev);
+      }
+    });
+  }
+  if (claudeToolsTA) {
+    claudeToolsTA.addEventListener('change', onControlClaudeAllowedToolsCommit);
+    claudeToolsTA.addEventListener('blur', onControlClaudeAllowedToolsCommit);
+    claudeToolsTA.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault();
+        onControlClaudeAllowedToolsCommit(ev);
+      }
+    });
+  }
 
   // ── Approval-rule listeners (internal-agent autonomy gates) ──
   document.querySelectorAll('select[data-approval-category]').forEach(sel => {
@@ -28554,7 +28698,13 @@ function sessionWindowRestoreIsInFlightFor(sessionId) {
 }
 
 function statusSessionWindowTarget(sessionId) {
-  return sessionWindowTargetForLogSession(sessionId);
+  const sid = String(sessionId || '').trim();
+  const target = sessionWindowTargetForLogSession(sid);
+  // An alias with no materialized window (e.g. a backend placeholder id
+  // recorded before the real native id was known) must not swallow phase
+  // updates while a window for the raw session id is on screen.
+  if (target !== sid && !sessionWindows.has(target) && sessionWindows.has(sid)) return sid;
+  return target;
 }
 
 function shouldMaterializeStatusSessionWindow(sessionId) {

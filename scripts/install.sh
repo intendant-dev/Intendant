@@ -24,8 +24,11 @@ Intendant bootstrap installer
 Options:
   --owner <fp>    Pin root authority to your browser key from first boot
                   (the fingerprint is public — dashboard Access drawer).
-  --service       Linux: install and start a systemd unit so the daemon
-                  survives this SSH session and restarts on failure.
+  --service       Keep the daemon running unattended: installs a boot
+                  service via the platform's native supervisor (systemd
+                  where present, launchd on macOS, cron @reboot + the
+                  built-in supervisor elsewhere) so it survives this SSH
+                  session and restarts on failure.
   --connect <url> Rendezvous to register with (defaults to the serving
                   origin's INTENDANT_CONNECT_RENDEZVOUS_URL, if set).
   --daemon-id <id>Stable daemon id at the rendezvous.
@@ -78,14 +81,13 @@ PLATFORM="$(uname -s)"
 case "$PLATFORM" in
   Linux|Darwin) ;;
   MINGW*|MSYS*|CYGWIN*)
-    die "this installer targets macOS/Linux. On Windows: clone $REPO, run scripts/setup-windows.ps1, then 'cargo build --release'." ;;
+    die "this installer targets macOS/Linux. On Windows use install.ps1 from PowerShell:
+    & ([scriptblock]::Create((irm https://intendant.dev/install.ps1))) -Owner <your-key>" ;;
   *)
     say "note: unrecognized platform $PLATFORM — continuing, but dependency setup is on you." ;;
 esac
-if [ "$SERVICE" = "1" ]; then
-  [ "$PLATFORM" = "Linux" ] || die "--service installs a systemd unit and is Linux-only; on macOS run it under launchd or a terminal multiplexer instead."
-  command -v systemctl >/dev/null 2>&1 || die "--service needs systemd (systemctl not found)"
-fi
+# --service needs no init-system check here: `intendant service install`
+# detects the platform's supervisor itself (systemd / launchd / cron).
 
 # ── Toolchain ──
 command -v git >/dev/null 2>&1 || die "git is required (install it and re-run)"
@@ -141,56 +143,15 @@ else
 fi
 
 if [ "$SERVICE" = "1" ]; then
-  # A daemon on a rented box must outlive this SSH session; a unit also
-  # restarts it on failure. The claim phrase goes to the journal.
-  UNIT_ARGS=""
-  for arg in "$@"; do
-    UNIT_ARGS="$UNIT_ARGS \"$arg\""
-  done
-  UNIT_ENV=""
-  [ -n "$CONNECT_URL" ] && UNIT_ENV="Environment=INTENDANT_CONNECT_RENDEZVOUS_URL=$CONNECT_URL"
-  if [ -n "$DAEMON_ID" ]; then
-    UNIT_ENV="$UNIT_ENV
-Environment=INTENDANT_CONNECT_DAEMON_ID=$DAEMON_ID"
-  fi
-  UNIT_BODY="[Unit]
-Description=Intendant daemon
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-ExecStart=\"$INSTALL_DIR/target/release/intendant\"$UNIT_ARGS
-WorkingDirectory=$HOME
-$UNIT_ENV
-Restart=on-failure
-RestartSec=3
-"
-  if [ "$(id -u)" = "0" ]; then
-    printf '%s\n[Install]\nWantedBy=multi-user.target\n' "$UNIT_BODY" > /etc/systemd/system/intendant.service
-    systemctl daemon-reload
-    if [ "$RUN" = "1" ]; then
-      systemctl enable --now intendant
-      say "service installed and started. Watch for the claim phrase with:"
-      say "  journalctl -u intendant -f"
-    else
-      systemctl enable intendant
-      say "service installed (not started). Start it with: systemctl start intendant"
-    fi
+  # A daemon on a rented box must outlive this SSH session and restart
+  # on failure. The binary itself picks the platform's supervisor
+  # (systemd / launchd / cron @reboot + built-in supervisor) and prints
+  # where the claim phrase lands. The INTENDANT_CONNECT_* exports above
+  # are captured into the service definition.
+  if [ "$RUN" = "1" ]; then
+    exec "$INSTALL_DIR/target/release/intendant" service install --now -- "$@"
   else
-    mkdir -p "$HOME/.config/systemd/user"
-    printf '%s\n[Install]\nWantedBy=default.target\n' "$UNIT_BODY" > "$HOME/.config/systemd/user/intendant.service"
-    systemctl --user daemon-reload
-    # Without lingering, user units die at logout — exactly what
-    # --service exists to prevent on a headless box.
-    loginctl enable-linger "$USER" 2>/dev/null || say "note: could not enable lingering; run 'sudo loginctl enable-linger $USER' or the daemon stops at logout."
-    if [ "$RUN" = "1" ]; then
-      systemctl --user enable --now intendant
-      say "user service installed and started. Watch for the claim phrase with:"
-      say "  journalctl --user -u intendant -f"
-    else
-      systemctl --user enable intendant
-      say "user service installed (not started). Start it with: systemctl --user start intendant"
-    fi
+    exec "$INSTALL_DIR/target/release/intendant" service install -- "$@"
   fi
 elif [ "$RUN" = "1" ]; then
   say "starting the daemon — it will print its claim phrase; claim it from your browser, then fuel it from the vault."

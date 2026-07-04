@@ -1910,6 +1910,10 @@ pub(crate) async fn mint_session_token(provider: &str, model: &str) -> Result<St
 const APP_HTML: &str = include_str!("../../../static/app.html");
 const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.js");
 const ICON_128_PNG: &[u8] = include_bytes!("../../../static/icon-128.png");
+const ICON_512_PNG: &[u8] = include_bytes!("../../../static/icon-512.png");
+const ICON_512_MASKABLE_PNG: &[u8] = include_bytes!("../../../static/icon-512-maskable.png");
+const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../../../static/apple-touch-icon.png");
+const MANIFEST_WEBMANIFEST: &str = include_str!("../../../static/manifest.webmanifest");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
 const WASM_STATION_JS: &str = include_str!("../../../static/wasm-station/station_web.js");
@@ -3650,6 +3654,26 @@ fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<Path
         return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
     }
 
+    // Anything else must be a bare directory name — one normal path
+    // component. Windows path shapes never take the validated slash route
+    // above, and `logs_dir.join(<absolute or drive-relative>)` REPLACES
+    // the logs root, so an id like `C:\evil\dir` would replay a session
+    // log from anywhere on disk; `..` likewise walks out a level even on
+    // Unix. Refuse every path-shaped id outright (the explicit backslash
+    // check keeps Unix — where `\` is a legal filename byte — behaving
+    // exactly like Windows).
+    {
+        use std::path::Component;
+        let mut components = Path::new(session_id).components();
+        let bare_name = matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(_)), None)
+        );
+        if !bare_name || session_id.contains('\\') {
+            return None;
+        }
+    }
+
     let logs_dir = home.join(".intendant").join("logs");
     let direct = logs_dir.join(session_id);
     if direct.is_dir() {
@@ -4163,6 +4187,15 @@ fn embedded_static_asset(path: &str) -> Option<&'static EmbeddedStaticAsset> {
         // PNG is already deflate-compressed; gzip would only add overhead.
         insert("/icon-128.png", "image/png", ICON_128_PNG, false);
         insert("/favicon.ico", "image/png", ICON_128_PNG, false);
+        insert("/icon-512.png", "image/png", ICON_512_PNG, false);
+        insert("/icon-512-maskable.png", "image/png", ICON_512_MASKABLE_PNG, false);
+        insert("/apple-touch-icon.png", "image/png", APPLE_TOUCH_ICON_PNG, false);
+        insert(
+            "/manifest.webmanifest",
+            "application/manifest+json",
+            MANIFEST_WEBMANIFEST.as_bytes(),
+            false,
+        );
         map
     });
     assets.get(path)
@@ -21951,9 +21984,18 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(&response).await;
-                    } else if let Some(asset) =
-                        static_asset_arm(req_method, req_path, &["/icon-128.png", "/favicon.ico"])
-                    {
+                    } else if let Some(asset) = static_asset_arm(
+                        req_method,
+                        req_path,
+                        &[
+                            "/icon-128.png",
+                            "/favicon.ico",
+                            "/icon-512.png",
+                            "/icon-512-maskable.png",
+                            "/apple-touch-icon.png",
+                            "/manifest.webmanifest",
+                        ],
+                    ) {
                         let response = build_static_asset_response(
                             req_method,
                             &header_text,
@@ -24532,6 +24574,12 @@ pub fn spawn_web_gateway(
                             "/wasm-station/station_web.js",
                             "/three.module.min.js",
                             "/audio-processor.js",
+                            "/icon-128.png",
+                            "/favicon.ico",
+                            "/icon-512.png",
+                            "/icon-512-maskable.png",
+                            "/apple-touch-icon.png",
+                            "/manifest.webmanifest",
                         ],
                     ) {
                         let response = build_static_asset_response(
@@ -35476,6 +35524,22 @@ mod tests {
     }
 
     #[test]
+    fn intendant_session_dir_refuses_path_shaped_session_ids() {
+        // Non-slash ids join under the logs root, and join() with an
+        // absolute / drive-relative / parent path REPLACES or escapes it
+        // — the Windows shapes never reach the validated slash route, so
+        // every path-shaped id must be refused outright, on every OS.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".intendant").join("logs")).unwrap();
+        for id in ["..", r"..\..", r"C:\outside\dir", r"C:evil", r"logs\x", ".", ""] {
+            assert!(
+                intendant_session_dir_from_home(home.path(), id).is_none(),
+                "path-shaped session id {id:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
     fn session_detail_exposes_persisted_relationships() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join(".intendant").join("logs").join("parent");
@@ -36953,6 +37017,20 @@ mod tests {
             embedded_static_asset("/favicon.ico").unwrap().body,
             ICON_128_PNG
         );
+        // The PWA surface: manifest + install icons, embedded like the rest.
+        let manifest = embedded_static_asset("/manifest.webmanifest").unwrap();
+        assert_eq!(manifest.content_type, "application/manifest+json");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(manifest.body).expect("manifest must be valid JSON");
+        assert_eq!(parsed["display"], "standalone");
+        for icon in parsed["icons"].as_array().expect("manifest icons") {
+            let src = icon["src"].as_str().unwrap();
+            assert!(
+                embedded_static_asset(src).is_some(),
+                "manifest icon {src} must itself be embedded"
+            );
+        }
+        assert!(embedded_static_asset("/apple-touch-icon.png").is_some());
         // The gzip gate is size-based: tiny assets stay identity-only.
         let audio = embedded_static_asset("/audio-processor.js").unwrap();
         assert_eq!(audio.gzip.is_some(), audio.body.len() >= GZIP_MIN_BYTES);

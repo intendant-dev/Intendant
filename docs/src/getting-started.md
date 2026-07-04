@@ -4,6 +4,50 @@ This chapter takes you from a clean checkout to a running agent: prerequisites,
 per-OS setup, building, API keys, your first run, and the full CLI flag
 reference.
 
+## Fresh box in one command
+
+Standing up a **new machine** end to end (clone, dependencies, build, launch,
+claimable from your browser) is one served command — see
+[Credential Custody](./credential-custody.md#the-bootstrap-this-unlocks) for
+the trust story behind it:
+
+```bash
+# macOS / Linux
+curl -fsSL https://intendant.dev/install.sh | sh -s -- --owner <your-key>
+```
+
+```powershell
+# Windows (PowerShell)
+& ([scriptblock]::Create((irm https://intendant.dev/install.ps1))) -Owner <your-key>
+```
+
+Add `--service` / `-Service` on an unattended box: `intendant service install`
+registers the daemon with the platform's native supervisor (systemd where
+present, launchd on macOS, Task Scheduler on Windows, cron `@reboot` plus a
+built-in restart supervisor on systemd-less Linux — no init system is a
+dependency) and prints where the claim phrase lands. `intendant service
+uninstall|status` manage it afterwards.
+
+What happens next is the whole story in three steps:
+
+1. **Claim.** The daemon prints a twelve-word claim phrase in its log (and
+   re-prints a fresh claim link every minute while unclaimed). Paste it at
+   your rendezvous — [intendant.dev/connect](https://intendant.dev/connect)
+   for the hosted service (invite-only during the pre-alpha), or your
+   [self-hosted rendezvous](./self-hosted-rendezvous.md) — and the box
+   appears under *Your computers*.
+2. **Fuel.** Open it: the dashboard greets you with *"This daemon has no fuel
+   yet"* and a **Fuel from your vault** button. Grant a time-boxed credential
+   lease (or relay provider calls through your browser) — the machine's disk
+   never holds a key. [Credential Custody](./credential-custody.md) is the
+   full story.
+3. **Work.** Send the first task from the composer, watch it in Activity, and
+   dial autonomy and approvals to taste.
+
+The rest of this chapter is the from-checkout path the installer automates —
+including the classic alternative to step 2: putting an API key in `.env` on
+a machine you fully trust.
+
 ## Prerequisites
 
 Intendant is a Rust workspace. At minimum you need:
@@ -12,7 +56,9 @@ Intendant is a Rust workspace. At minimum you need:
 - **wasm-pack** — `cargo install wasm-pack` (the dashboard's browser code is a
   WASM crate; the build auto-rebuilds it, see [WASM](#wasm-builds-automatically))
 - **ffmpeg** — display recording and software H.264 encoding
-- An **API key** for at least one provider (OpenAI, Anthropic, or Gemini)
+- Provider **credentials** — an API key in `.env` for at least one of OpenAI,
+  Anthropic, or Gemini, *or* nothing on disk at all: a claimed daemon can run
+  keyless on [vault leases](./credential-custody.md)
 
 Platform-specific runtime dependencies (display capture, input injection, audio
 routing) are best installed with the setup script for your OS.
@@ -143,6 +189,15 @@ INSTALL_APP=0 ./scripts/bundle-macos.sh   # build the bundle without installing
 ```
 
 ## API keys (.env)
+
+Two ways to give a daemon credentials, by trust posture:
+
+- **Keys on disk (`.env`)** — this section. Right for a machine you fully
+  trust: your laptop, a workstation you sit at.
+- **No keys on disk** — a claimed daemon runs unfueled and borrows time-boxed
+  leases from your browser-side vault, or relays provider calls through the
+  browser entirely; see [Credential Custody](./credential-custody.md). Right
+  for rented, shared, or disposable boxes.
 
 On startup the controller loads environment variables from `.env`, searching in
 this order (later files do not override variables already set):
