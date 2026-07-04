@@ -29813,6 +29813,24 @@ fn peer_identity_allows_ws_control(
     let Some(identity) = identity else {
         return true;
     };
+    // The dashboard-control tunnel is multi-capability; its signaling relay
+    // opens for any profile that can use something inside it, and every
+    // method/frame is then individually authorized on this same identity.
+    if matches!(ctrl, ControlMsg::PeerDashboardControlSignal { .. }) {
+        if crate::peer::access_policy::profile_allows_dashboard_control_tunnel(&identity.profile)
+        {
+            return true;
+        }
+        bus.send(AppEvent::PresenceLog {
+            message: format!(
+                "[ws] denied peer dashboard-control signaling from {}: profile={} allows no tunnel capability",
+                identity.label, identity.profile,
+            ),
+            level: Some(LogLevel::Warn),
+            turn: None,
+        });
+        return false;
+    }
     let op = crate::peer::access_policy::control_msg_operation(ctrl);
     let decision = crate::access::iam::evaluate_principal_operation(
         &peer_identity_access_principal(identity, "peer-ws"),
@@ -29944,6 +29962,25 @@ fn ws_grant_allows_control(
 ) -> bool {
     if peer_identity.is_some() {
         return true;
+    }
+    // Same tunnel-door rule as the peer lane: signaling relay opens for a
+    // grant that can use at least one capability the tunnel carries.
+    if matches!(ctrl, ControlMsg::PeerDashboardControlSignal { .. }) {
+        if crate::peer::access_policy::DASHBOARD_CONTROL_TUNNEL_OPERATIONS
+            .iter()
+            .any(|op| grant.access_decision(*op).allowed)
+        {
+            return true;
+        }
+        bus.send(AppEvent::PresenceLog {
+            message: format!(
+                "[ws] denied {} dashboard-control signaling: grant allows no tunnel capability",
+                grant.wire_kind(),
+            ),
+            level: Some(LogLevel::Warn),
+            turn: None,
+        });
+        return false;
     }
     let op = crate::peer::access_policy::control_msg_operation(ctrl);
     let decision = grant.access_decision(op);

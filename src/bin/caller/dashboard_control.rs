@@ -2237,10 +2237,78 @@ fn authorize_dashboard_control_method(
     let Some(op) = dashboard_control_method_operation(method) else {
         return Ok(());
     };
-    runtime_operation_decision(runtime, op)
+    let result = runtime_operation_decision(runtime, op)
         .ensure_allowed()
-        .map_err(|reason| format!("dashboard-control method {method} is not allowed: {reason}"))?;
-    authorize_dashboard_control_filesystem(runtime, op, params)
+        .map_err(|reason| format!("dashboard-control method {method} is not allowed: {reason}"))
+        .and_then(|()| authorize_dashboard_control_filesystem(runtime, op, params));
+    audit_dashboard_control_filesystem(runtime, op, params, &result);
+    result
+}
+
+/// Audit twin of the HTTP lane's `[peer-fs]` / `[grant-fs]` lines
+/// (`web_gateway::audit_peer_filesystem_access`) for filesystem methods that
+/// arrive over the dashboard-control tunnel, so both transports leave the
+/// same trail: peer grants log allow and deny, other grants log denials.
+fn audit_dashboard_control_filesystem(
+    runtime: &ControlRuntime,
+    op: crate::peer::access_policy::PeerOperation,
+    params: Option<&serde_json::Value>,
+    result: &Result<(), String>,
+) {
+    use crate::peer::access_policy::PeerOperation;
+    if !matches!(
+        op,
+        PeerOperation::FilesystemRead | PeerOperation::FilesystemWrite
+    ) {
+        return;
+    }
+    let path = dashboard_control_filesystem_path(params).unwrap_or_default();
+    match &runtime.grant {
+        DashboardControlGrant::Peer {
+            fingerprint,
+            label,
+            profile,
+            ..
+        } => {
+            let (allowed, detail) = match result {
+                Ok(()) => (true, "allowed".to_string()),
+                Err(e) => (false, e.clone()),
+            };
+            runtime.bus.send(AppEvent::PresenceLog {
+                message: format!(
+                    "[peer-fs] {} peer={} fingerprint={} profile={} op={:?} path={} detail={}",
+                    if allowed { "allowed" } else { "denied" },
+                    label,
+                    fingerprint,
+                    profile,
+                    op,
+                    path,
+                    detail,
+                ),
+                level: Some(if allowed {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                }),
+                turn: None,
+            });
+        }
+        grant => {
+            if let Err(e) = result {
+                runtime.bus.send(AppEvent::PresenceLog {
+                    message: format!(
+                        "[grant-fs] denied principal={} op={:?} path={} detail={}",
+                        grant.label(),
+                        op,
+                        path,
+                        e,
+                    ),
+                    level: Some(LogLevel::Warn),
+                    turn: None,
+                });
+            }
+        }
+    }
 }
 
 /// Upload frames are authorized by the method they deliver — the same
@@ -13224,6 +13292,48 @@ mod tests {
         assert_eq!(response.frame["result"]["_httpStatus"], 200);
         assert_eq!(response.frame["result"]["created"], false);
         assert_eq!(std::fs::read(&target).unwrap(), b"key = 2\n");
+    }
+
+    #[tokio::test]
+    async fn fs_write_upload_denials_are_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime();
+        rt.grant = DashboardControlGrant::Peer {
+            fingerprint: "fp".into(),
+            label: "audit-peer".into(),
+            profile: "file-operator".into(),
+            filesystem: crate::peer::access_policy::FilesystemAccessPolicy {
+                read_roots: vec![],
+                write_roots: vec![dir.path().to_path_buf()],
+            },
+        };
+        let mut events = rt.bus.subscribe();
+
+        let outside = tempfile::tempdir().unwrap();
+        let upload = test_upload_state(
+            "api_fs_write",
+            serde_json::json!({
+                "path": outside.path().join("x.txt").to_string_lossy(),
+                "create_new": true,
+            }),
+            b"x",
+        );
+        let response = api_fs_write_upload_task_response("a1".to_string(), upload, rt).await;
+        assert_eq!(response.frame["result"]["_httpStatus"], 403);
+
+        let mut audited = false;
+        while let Ok(event) = events.try_recv() {
+            if let AppEvent::PresenceLog { message, level, .. } = event {
+                if message.contains("[peer-fs] denied")
+                    && message.contains("peer=audit-peer")
+                    && message.contains("profile=file-operator")
+                {
+                    assert_eq!(level, Some(LogLevel::Warn));
+                    audited = true;
+                }
+            }
+        }
+        assert!(audited, "expected a [peer-fs] denied audit line on the bus");
     }
 
     #[tokio::test]
