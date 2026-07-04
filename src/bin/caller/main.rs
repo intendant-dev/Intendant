@@ -17,6 +17,7 @@ mod context_rewind;
 mod control;
 mod control_plane;
 mod conversation;
+mod credential_audit;
 mod credential_egress;
 mod credential_leases;
 mod ctl;
@@ -34120,7 +34121,7 @@ async fn main() -> Result<(), CallerError> {
                 }
                 // Drop every credential lease (zeroizes memory, deletes
                 // materialized oauth auth files) before the process dies.
-                let _ = credential_leases::revoke(None);
+                let _ = credential_leases::revoke(None, "daemon shutdown");
                 // Clean up control socket
                 control::cleanup();
                 // Restore terminal (best-effort) so the shell isn't left in raw mode

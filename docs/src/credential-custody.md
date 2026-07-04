@@ -117,6 +117,7 @@ the controller **in memory only**, tagged with an expiry.
 | `credential_lease_renew` | browser → daemon | extend a lease (sent automatically while connected) |
 | `credential_lease_revoke` | browser → daemon | kill a lease now; daemon wipes the material |
 | `credential_lease_status` | daemon → browser | active leases, expiries, usage counters (for the UI and the audit trail) |
+| `credential_custody_trail` | daemon → browser | the daemon's own custody record — lease grants/expiries/revocations, relay changes, restart resets; metadata only, never material. Kept at `~/.intendant/custody-audit.jsonl` (0600, bounded), rendered in Access → Advanced → Custody trail |
 
 Leases ride the same per-frame IAM checks as every other tunnel
 operation; granting requires a session whose principal holds a new
@@ -292,7 +293,9 @@ enforced by the daemon's own IAM from first boot.
    OAuth default (browser refresh + rotation write-back; daemon-verified
    refresh-free material; Codex live, Claude Code pending provider CORS).
 4. ✅ Offline-lease knob, fueling panel (per-daemon status, revocation,
-   usage audit fields), dry-daemon Web Push.
+   usage audit fields), dry-daemon Web Push. Custody trail shipped: the
+   daemon records every grant/expiry/revocation/relay change (+ restart
+   resets) locally and serves them over `credential_custody_trail`.
 5. ✅ Client-egress mode for Anthropic/Gemini (host-allowlisted browser
    relay, credit-windowed streaming, probe); per-session path indicator
    in the fueling panel and lease status.

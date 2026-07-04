@@ -1656,6 +1656,25 @@ body.access-page #tab-access {
 .vault-entry-row .lbl { color: var(--text); font-weight: 500; }
 .vault-entry-row .secret { font-family: var(--mono, monospace); font-size: 11px; color: var(--subtext0); overflow-wrap: anywhere; }
 .vault-entry-row .vault-entry-actions { margin-left: auto; display: flex; gap: 6px; }
+.custody-trail { display: flex; flex-direction: column; }
+.custody-row {
+  display: flex; align-items: baseline; gap: 8px; padding: 5px 2px;
+  border-bottom: 1px solid var(--surface0); font-size: 11.5px; min-width: 0; flex-wrap: wrap;
+}
+.custody-row:last-child { border-bottom: none; }
+.custody-ts { color: var(--overlay1); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.custody-chip {
+  flex: 0 0 auto; padding: 1px 8px; border-radius: 999px;
+  font-size: 10px; font-weight: 700; letter-spacing: .04em;
+  background: var(--surface0); color: var(--subtext1);
+}
+.custody-chip.grant { background: rgba(166, 227, 161, 0.14); color: var(--green); }
+.custody-chip.revoke { background: rgba(249, 226, 175, 0.14); color: var(--yellow); }
+.custody-chip.expire { background: rgba(108, 112, 134, 0.22); color: var(--overlay1); }
+.custody-chip.egress { background: rgba(137, 180, 250, 0.14); color: var(--blue); }
+.custody-chip.reset { background: rgba(243, 139, 168, 0.12); color: var(--red); }
+.custody-main { color: var(--text); flex: 0 1 auto; min-width: 0; }
+.custody-meta { color: var(--subtext0); flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere; }
 .vault-form-grid { display: grid; grid-template-columns: minmax(110px, 160px) 1fr; gap: 8px; align-items: center; }
 .vault-form-grid label { font-size: 11px; color: var(--subtext1); }
 .vault-form-grid input, .vault-form-grid select, .vault-phrase-input {
@@ -12605,6 +12624,12 @@ body.display-fullscreen-open {
             <div id="access-vault-section"></div>
 
             <div class="acc-section-head">
+              <div class="acc-section-title">Custody trail</div>
+              <div class="acc-section-sub">Every lease grant, expiry, revocation, and browser-relay change this daemon has seen — who, what, and when. Recorded by the daemon itself, kept on its disk, never sent anywhere.</div>
+            </div>
+            <div id="access-custody-section"></div>
+
+            <div class="acc-section-head">
               <div class="acc-section-title">Roles &amp; permissions</div>
               <div class="acc-section-sub">The exact permission matrix this daemon enforces. Roles bundle permissions; peer profiles live in the daemon-to-daemon domain.</div>
             </div>
@@ -15207,6 +15232,83 @@ async function vaultRefreshLeases({ force = false } = {}) {
   }
   renderAccessVaultSection();
   refreshUnfueledEmptyState().catch(() => {});
+  vaultRefreshCustody().catch(() => {});
+}
+
+/* Custody trail: the daemon's own record of lease/relay lifecycle events,
+   fetched over the same credentials.manage-gated channel as the leases. */
+const custodyTrailState = { events: [], supported: null, fetchedAt: 0 };
+
+async function vaultRefreshCustody({ force = false } = {}) {
+  if (!vaultLeaseTransportReady()) return;
+  if (!force && Date.now() - custodyTrailState.fetchedAt < 30_000) return;
+  custodyTrailState.fetchedAt = Date.now();
+  try {
+    const result = await vaultLeaseRpc('api_credential_custody_trail');
+    custodyTrailState.events = Array.isArray(result?.events) ? result.events : [];
+    custodyTrailState.supported = true;
+  } catch {
+    // Older daemon or a session without credentials.manage.
+    custodyTrailState.supported = false;
+  }
+  renderAccessCustodySection();
+}
+
+const CUSTODY_EVENT_VIEW = {
+  lease_granted: { chip: 'granted', cls: 'grant' },
+  lease_revoked: { chip: 'revoked', cls: 'revoke' },
+  lease_expired: { chip: 'expired', cls: 'expire' },
+  egress_registered: { chip: 'relay on', cls: 'egress' },
+  egress_unregistered: { chip: 'relay off', cls: 'egress' },
+  custody_reset: { chip: 'reset', cls: 'reset' },
+};
+
+function renderAccessCustodySection() {
+  const mount = document.getElementById('access-custody-section');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const note = text => {
+    const el = document.createElement('div');
+    el.className = 'vault-note';
+    el.textContent = text;
+    mount.appendChild(el);
+  };
+  if (custodyTrailState.supported === false) {
+    note('This session cannot read the custody trail — it needs credentials.manage, or the daemon predates it.');
+    return;
+  }
+  if (!custodyTrailState.events.length) {
+    note('No custody events yet — lease grants, expiries, revocations, and relay changes will appear here.');
+    return;
+  }
+  const list = document.createElement('div');
+  list.className = 'custody-trail';
+  const shown = custodyTrailState.events.slice(0, 50);
+  for (const event of shown) {
+    const row = document.createElement('div');
+    row.className = 'custody-row';
+    const ts = document.createElement('span');
+    ts.className = 'custody-ts';
+    ts.textContent = formatLogTimestampLabel(event.at_unix_ms);
+    const view = CUSTODY_EVENT_VIEW[event.event] || { chip: event.event, cls: '' };
+    const chip = document.createElement('span');
+    chip.className = 'custody-chip' + (view.cls ? ' ' + view.cls : '');
+    chip.textContent = view.chip;
+    const main = document.createElement('span');
+    main.className = 'custody-main';
+    main.textContent = [event.label, event.kind].filter(Boolean).join(' · ');
+    const meta = document.createElement('span');
+    meta.className = 'custody-meta';
+    meta.textContent = [event.actor ? `by ${event.actor}` : '', event.detail]
+      .filter(Boolean)
+      .join(' — ');
+    row.append(ts, chip, main, meta);
+    list.appendChild(row);
+  }
+  mount.appendChild(list);
+  if (custodyTrailState.events.length > shown.length) {
+    note(`…and ${custodyTrailState.events.length - shown.length} older events on the daemon.`);
+  }
 }
 
 async function vaultFuelEntry(entry) {
@@ -16118,6 +16220,11 @@ function renderAccessVaultSection() {
   // Background renders must not clobber a phrase or key mid-typing.
   if (mount.contains(document.activeElement) && document.activeElement.matches('input, textarea, select')) return;
 
+  // The custody trail lives directly under this section and shares its
+  // refresh cadence (30s freshness guard inside).
+  renderAccessCustodySection();
+  vaultRefreshCustody().catch(() => {});
+
   const card = document.createElement('div');
   card.className = 'vault-card';
 
@@ -16251,6 +16358,11 @@ window.intendantVault = {
     jobs: vaultEgressJobs.size,
   }),
   probeEgress: kind => vaultLeaseRpc('api_credential_egress_probe', { kind }),
+  custody: () => ({
+    supported: custodyTrailState.supported,
+    events: custodyTrailState.events.map(event => ({ ...event })),
+  }),
+  refreshCustody: () => vaultRefreshCustody({ force: true }),
 };
 
 /* Sign an offer. Absence is legacy-compatible (the daemon falls back to
