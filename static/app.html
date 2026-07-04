@@ -1656,6 +1656,25 @@ body.access-page #tab-access {
 .vault-entry-row .lbl { color: var(--text); font-weight: 500; }
 .vault-entry-row .secret { font-family: var(--mono, monospace); font-size: 11px; color: var(--subtext0); overflow-wrap: anywhere; }
 .vault-entry-row .vault-entry-actions { margin-left: auto; display: flex; gap: 6px; }
+.custody-trail { display: flex; flex-direction: column; }
+.custody-row {
+  display: flex; align-items: baseline; gap: 8px; padding: 5px 2px;
+  border-bottom: 1px solid var(--surface0); font-size: 11.5px; min-width: 0; flex-wrap: wrap;
+}
+.custody-row:last-child { border-bottom: none; }
+.custody-ts { color: var(--overlay1); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.custody-chip {
+  flex: 0 0 auto; padding: 1px 8px; border-radius: 999px;
+  font-size: 10px; font-weight: 700; letter-spacing: .04em;
+  background: var(--surface0); color: var(--subtext1);
+}
+.custody-chip.grant { background: rgba(166, 227, 161, 0.14); color: var(--green); }
+.custody-chip.revoke { background: rgba(249, 226, 175, 0.14); color: var(--yellow); }
+.custody-chip.expire { background: rgba(108, 112, 134, 0.22); color: var(--overlay1); }
+.custody-chip.egress { background: rgba(137, 180, 250, 0.14); color: var(--blue); }
+.custody-chip.reset { background: rgba(243, 139, 168, 0.12); color: var(--red); }
+.custody-main { color: var(--text); flex: 0 1 auto; min-width: 0; }
+.custody-meta { color: var(--subtext0); flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere; }
 .vault-form-grid { display: grid; grid-template-columns: minmax(110px, 160px) 1fr; gap: 8px; align-items: center; }
 .vault-form-grid label { font-size: 11px; color: var(--subtext1); }
 .vault-form-grid input, .vault-form-grid select, .vault-phrase-input {
@@ -12609,6 +12628,20 @@ body.display-fullscreen-open {
                           <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
                         </div>
                       </div>
+                      <label class="sessions-new-session-field" for="new-session-claude-model">
+                        Claude model
+                        <input id="new-session-claude-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. haiku (empty = global setting)" disabled>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-claude-permission-mode">
+                        Permissions
+                        <select id="new-session-claude-permission-mode" disabled>
+                          <option value="">Global setting</option>
+                          <option value="default">default</option>
+                          <option value="acceptEdits">acceptEdits</option>
+                          <option value="plan">plan</option>
+                          <option value="bypassPermissions">bypassPermissions</option>
+                        </select>
+                      </label>
                       <label class="sessions-new-session-field" for="new-session-codex-sandbox">
                         Sandbox
                         <select id="new-session-codex-sandbox" disabled>
@@ -13072,6 +13105,12 @@ body.display-fullscreen-open {
               <div class="acc-section-sub">Provider credentials, end-to-end encrypted under your passkeys and a recovery phrase. The hosted store holds only ciphertext; daemons only ever borrow time-boxed leases.</div>
             </div>
             <div id="access-vault-section"></div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">Custody trail</div>
+              <div class="acc-section-sub">Every lease grant, expiry, revocation, and browser-relay change this daemon has seen — who, what, and when. Recorded by the daemon itself, kept on its disk, never sent anywhere.</div>
+            </div>
+            <div id="access-custody-section"></div>
 
             <div class="acc-section-head">
               <div class="acc-section-title">Roles &amp; permissions</div>
@@ -15680,6 +15719,83 @@ async function vaultRefreshLeases({ force = false } = {}) {
   }
   renderAccessVaultSection();
   refreshUnfueledEmptyState().catch(() => {});
+  vaultRefreshCustody().catch(() => {});
+}
+
+/* Custody trail: the daemon's own record of lease/relay lifecycle events,
+   fetched over the same credentials.manage-gated channel as the leases. */
+const custodyTrailState = { events: [], supported: null, fetchedAt: 0 };
+
+async function vaultRefreshCustody({ force = false } = {}) {
+  if (!vaultLeaseTransportReady()) return;
+  if (!force && Date.now() - custodyTrailState.fetchedAt < 30_000) return;
+  custodyTrailState.fetchedAt = Date.now();
+  try {
+    const result = await vaultLeaseRpc('api_credential_custody_trail');
+    custodyTrailState.events = Array.isArray(result?.events) ? result.events : [];
+    custodyTrailState.supported = true;
+  } catch {
+    // Older daemon or a session without credentials.manage.
+    custodyTrailState.supported = false;
+  }
+  renderAccessCustodySection();
+}
+
+const CUSTODY_EVENT_VIEW = {
+  lease_granted: { chip: 'granted', cls: 'grant' },
+  lease_revoked: { chip: 'revoked', cls: 'revoke' },
+  lease_expired: { chip: 'expired', cls: 'expire' },
+  egress_registered: { chip: 'relay on', cls: 'egress' },
+  egress_unregistered: { chip: 'relay off', cls: 'egress' },
+  custody_reset: { chip: 'reset', cls: 'reset' },
+};
+
+function renderAccessCustodySection() {
+  const mount = document.getElementById('access-custody-section');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const note = text => {
+    const el = document.createElement('div');
+    el.className = 'vault-note';
+    el.textContent = text;
+    mount.appendChild(el);
+  };
+  if (custodyTrailState.supported === false) {
+    note('This session cannot read the custody trail — it needs credentials.manage, or the daemon predates it.');
+    return;
+  }
+  if (!custodyTrailState.events.length) {
+    note('No custody events yet — lease grants, expiries, revocations, and relay changes will appear here.');
+    return;
+  }
+  const list = document.createElement('div');
+  list.className = 'custody-trail';
+  const shown = custodyTrailState.events.slice(0, 50);
+  for (const event of shown) {
+    const row = document.createElement('div');
+    row.className = 'custody-row';
+    const ts = document.createElement('span');
+    ts.className = 'custody-ts';
+    ts.textContent = formatLogTimestampLabel(event.at_unix_ms);
+    const view = CUSTODY_EVENT_VIEW[event.event] || { chip: event.event, cls: '' };
+    const chip = document.createElement('span');
+    chip.className = 'custody-chip' + (view.cls ? ' ' + view.cls : '');
+    chip.textContent = view.chip;
+    const main = document.createElement('span');
+    main.className = 'custody-main';
+    main.textContent = [event.label, event.kind].filter(Boolean).join(' · ');
+    const meta = document.createElement('span');
+    meta.className = 'custody-meta';
+    meta.textContent = [event.actor ? `by ${event.actor}` : '', event.detail]
+      .filter(Boolean)
+      .join(' — ');
+    row.append(ts, chip, main, meta);
+    list.appendChild(row);
+  }
+  mount.appendChild(list);
+  if (custodyTrailState.events.length > shown.length) {
+    note(`…and ${custodyTrailState.events.length - shown.length} older events on the daemon.`);
+  }
 }
 
 async function vaultFuelEntry(entry) {
@@ -16591,6 +16707,11 @@ function renderAccessVaultSection() {
   // Background renders must not clobber a phrase or key mid-typing.
   if (mount.contains(document.activeElement) && document.activeElement.matches('input, textarea, select')) return;
 
+  // The custody trail lives directly under this section and shares its
+  // refresh cadence (30s freshness guard inside).
+  renderAccessCustodySection();
+  vaultRefreshCustody().catch(() => {});
+
   const card = document.createElement('div');
   card.className = 'vault-card';
 
@@ -16724,6 +16845,11 @@ window.intendantVault = {
     jobs: vaultEgressJobs.size,
   }),
   probeEgress: kind => vaultLeaseRpc('api_credential_egress_probe', { kind }),
+  custody: () => ({
+    supported: custodyTrailState.supported,
+    events: custodyTrailState.events.map(event => ({ ...event })),
+  }),
+  refreshCustody: () => vaultRefreshCustody({ force: true }),
 };
 
 /* Sign an offer. Absence is legacy-compatible (the daemon falls back to
@@ -28925,8 +29051,14 @@ function setDaemonSessionId(sessionId) {
 
 function applySessionIdentity(meta = {}) {
   const sid = String(meta.session_id || meta.intendant_session_id || '').trim();
-  const backendSessionId = String(meta.backend_session_id || meta.backendSessionId || '').trim();
+  let backendSessionId = String(meta.backend_session_id || meta.backendSessionId || '').trim();
   const backendSource = String(meta.backend_source || meta.backendSource || meta.source || '').trim();
+  // Placeholder thread ids (Claude Code before its stream announces the
+  // real session id) must never become a backend alias: status routing
+  // would retarget at a window that never materializes, and the ghost
+  // window it conjures can steal the prompt target. Old session logs and
+  // scraped debug lines still carry the placeholder, so filter centrally.
+  if (backendSessionId === 'claude-code-session') backendSessionId = '';
   if (!sid || (!backendSessionId && !backendSource)) return;
   const wrapperMeta = sessionMetadataById.get(sid) || {};
   const next = {
@@ -36111,8 +36243,20 @@ function cacheSessionUsage(c) {
 
 function usageForForegroundSession() {
   const sid = resolvePromptTargetSessionId();
-  if (sid && sessionUsageById.has(sid)) return sessionUsageById.get(sid);
-  if (sid && sessionUsageById.size > 0) return null;
+  if (sid) {
+    if (sessionUsageById.has(sid)) return sessionUsageById.get(sid);
+    // External sessions re-key the foreground to the backend-native id
+    // while usage commands keep riding the Intendant log id; look the
+    // usage up across the identity group before concluding "no data" —
+    // returning null here stomps the header meter to '--' on every
+    // usage batch.
+    for (const related of relatedSessionIdsForSession(sid)) {
+      if (related !== sid && sessionUsageById.has(related)) {
+        return sessionUsageById.get(related);
+      }
+    }
+    if (sessionUsageById.size > 0) return null;
+  }
   return latestGlobalUsage;
 }
 
@@ -64873,6 +65017,21 @@ function renderNewSessionAgentControls(options = {}) {
   if (!hasExternalAgent || options.replaceCommand) {
     commandInput.value = '';
   }
+  const claudeModelInp = document.getElementById('new-session-claude-model');
+  const claudeModeSel = document.getElementById('new-session-claude-permission-mode');
+  if (claudeModelInp) {
+    const appliesToClaude = effectiveAgent === 'claude-code';
+    claudeModelInp.disabled = !appliesToClaude;
+    if (!appliesToClaude) claudeModelInp.value = '';
+    claudeModelInp.placeholder = appliesToClaude
+      ? 'e.g. haiku (empty = global setting)'
+      : 'Applies to Claude Code sessions';
+  }
+  if (claudeModeSel) {
+    const appliesToClaude = effectiveAgent === 'claude-code';
+    claudeModeSel.disabled = !appliesToClaude;
+    if (!appliesToClaude) claudeModeSel.value = '';
+  }
   if (managedContextSel) {
     const appliesToCodex = effectiveAgent === 'codex';
     managedContextSel.disabled = !appliesToCodex;
@@ -65136,6 +65295,12 @@ async function startNewSession() {
     msg.agent = selectedAgent;
     const agentCommand = document.getElementById('new-session-agent-command')?.value.trim() || '';
     if (agentCommand) msg.agent_command = agentCommand;
+  }
+  if (effectiveNewSessionAgentId() === 'claude-code') {
+    const model = document.getElementById('new-session-claude-model')?.value.trim() || '';
+    if (model) msg.claude_model = model;
+    const mode = document.getElementById('new-session-claude-permission-mode')?.value || '';
+    if (mode) msg.claude_permission_mode = mode;
   }
   if (effectiveNewSessionAgentId() === 'codex') {
     if (newSessionCodexLaunchDefaultsLoaded) {

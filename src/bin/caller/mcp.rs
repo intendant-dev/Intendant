@@ -94,6 +94,9 @@ pub struct McpAppState {
     pub log_dir: std::path::PathBuf,
     controller_loop_dir_override: Option<std::path::PathBuf>,
     controller_loop_status_override: Option<serde_json::Value>,
+    /// Test override for the home that anchors persisted-session lookup
+    /// (path-form session ids must resolve inside `<home>/.intendant/logs`).
+    session_logs_home_override: Option<std::path::PathBuf>,
     /// Optional launcher for starting tasks via MCP. Set by main.rs.
     pub launcher: Option<Arc<TaskLauncher>>,
     /// Handle to the currently running agent loop, if any.
@@ -228,6 +231,7 @@ impl McpAppState {
             log_dir,
             controller_loop_dir_override: None,
             controller_loop_status_override: None,
+            session_logs_home_override: None,
             launcher: None,
             task_handle: None,
             controller_restart: None,
@@ -2382,17 +2386,25 @@ fn mcp_state_session_source_for_id(s: &McpAppState, session_id: &str) -> Option<
                 .then(|| s.active_session_source.clone())
                 .flatten()
         })
-        .or_else(|| match resolve_persisted_start_target(session_id) {
-            PersistedStartTarget::External(target) => Some(target.source),
-            PersistedStartTarget::ExternalMissingResume { source } => source,
-            PersistedStartTarget::NotFound | PersistedStartTarget::NonExternal => None,
-        })
+        .or_else(
+            || match resolve_persisted_start_target(&mcp_state_session_logs_home(s), session_id) {
+                PersistedStartTarget::External(target) => Some(target.source),
+                PersistedStartTarget::ExternalMissingResume { source } => source,
+                PersistedStartTarget::NotFound | PersistedStartTarget::NonExternal => None,
+            },
+        )
 }
 
 fn mcp_state_controller_loop_dir(s: &McpAppState) -> std::path::PathBuf {
     s.controller_loop_dir_override
         .clone()
         .unwrap_or_else(controller_loop_dir)
+}
+
+fn mcp_state_session_logs_home(s: &McpAppState) -> std::path::PathBuf {
+    s.session_logs_home_override
+        .clone()
+        .unwrap_or_else(crate::platform::home_dir)
 }
 
 fn mcp_state_controller_loop_status(s: &McpAppState) -> serde_json::Value {
@@ -7375,19 +7387,16 @@ fn find_session_log_dir_in_home(
     if session_id.is_empty() {
         return None;
     }
+    // Path-form ids resolve through the anchored helper (inside the logs
+    // root only), and BEFORE the direct join below — joining an absolute
+    // path would silently replace the logs dir as the base.
+    if crate::session_names::session_id_looks_like_path(session_id) {
+        return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
+    }
     let logs_dir = home.join(".intendant").join("logs");
     let direct = logs_dir.join(session_id);
     if direct.is_dir() && direct.join("session_meta.json").exists() {
         return Some(direct);
-    }
-
-    let path = std::path::Path::new(session_id);
-    let looks_like_path = path.is_absolute()
-        || session_id.contains('/')
-        || session_id.contains(std::path::MAIN_SEPARATOR);
-    if looks_like_path {
-        let dir = std::path::PathBuf::from(session_id);
-        return dir.is_dir().then_some(dir);
     }
 
     let entries = std::fs::read_dir(logs_dir).ok()?;
@@ -8611,7 +8620,8 @@ impl IntendantServer {
                 && params.reference_frame_ids.is_empty()
                 && params.display_target.is_none()
             {
-                match resolve_persisted_start_target(&session_id) {
+                let logs_home = mcp_state_session_logs_home(&*self.state.read().await);
+                match resolve_persisted_start_target(&logs_home, &session_id) {
                     PersistedStartTarget::External(target) => {
                         self.bus
                             .send(AppEvent::ControlCommand(ControlMsg::ResumeSession {
@@ -8793,12 +8803,17 @@ struct ExternalIdentity {
     resume_id: String,
 }
 
-fn resolve_persisted_start_target(session_id: &str) -> PersistedStartTarget {
+fn resolve_persisted_start_target(
+    logs_home: &std::path::Path,
+    session_id: &str,
+) -> PersistedStartTarget {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return PersistedStartTarget::NotFound;
     }
-    let Some(log_dir) = crate::session_log::SessionLog::find_session_by_id(session_id) else {
+    let Some(log_dir) =
+        crate::session_log::SessionLog::find_session_by_id_in_home(logs_home, session_id)
+    else {
         return PersistedStartTarget::NotFound;
     };
 
@@ -14216,6 +14231,7 @@ mod tests {
             {
                 let mut s = state.write().await;
                 s.controller_loop_dir_override = Some(loop_dir);
+                s.session_logs_home_override = Some(root.path().to_path_buf());
                 apply_observed_event_to_mcp_state(
                     &mut s,
                     &AppEvent::SessionIdentity {

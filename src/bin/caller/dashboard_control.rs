@@ -2092,6 +2092,7 @@ fn dashboard_control_method_operation(
         | "api_credential_lease_renew"
         | "api_credential_lease_revoke"
         | "api_credential_lease_status"
+        | "api_credential_custody_trail"
         | "api_credential_egress_register"
         | "api_credential_egress_unregister"
         | "api_credential_egress_probe" => Some(PeerOperation::CredentialsManage),
@@ -2527,7 +2528,8 @@ fn control_frame_response(
                     let selector = params
                         .as_ref()
                         .and_then(|p| optional_string_param(p, &["lease_id", "leaseId", "kind"]));
-                    let revoked = crate::credential_leases::revoke(selector.as_deref());
+                    let revoked =
+                        crate::credential_leases::revoke(selector.as_deref(), runtime.grant.label());
                     Some(serde_json::json!({
                         "t": "response",
                         "id": id,
@@ -2576,6 +2578,29 @@ fn control_frame_response(
                             "egress": egress,
                             "expired_note": crate::credential_leases::expired_lease_note(),
                         },
+                    }))
+                }
+                "api_credential_custody_trail" => {
+                    // The daemon's own record of custody lifecycle events —
+                    // metadata only, never material (see credential_audit.rs).
+                    let events: Vec<serde_json::Value> = crate::credential_audit::recent(100)
+                        .into_iter()
+                        .map(|event| {
+                            serde_json::json!({
+                                "at_unix_ms": event.at_unix_ms,
+                                "event": event.event,
+                                "kind": event.kind,
+                                "label": event.label,
+                                "actor": event.actor,
+                                "detail": event.detail,
+                            })
+                        })
+                        .collect();
+                    Some(serde_json::json!({
+                        "t": "response",
+                        "id": id,
+                        "ok": true,
+                        "result": { "events": events },
                     }))
                 }
                 "api_credential_egress_register" => {
@@ -11178,6 +11203,7 @@ mod tests {
             "api_credential_lease_renew",
             "api_credential_lease_revoke",
             "api_credential_lease_status",
+            "api_credential_custody_trail",
         ] {
             assert_eq!(
                 dashboard_control_method_operation(method),

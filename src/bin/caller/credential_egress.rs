@@ -103,16 +103,27 @@ pub fn register(
         ));
     }
     let now = now_unix_ms();
-    let mut relays = relays().write().expect("egress relays poisoned");
+    {
+        let mut relays = relays().write().expect("egress relays poisoned");
+        for kind in &accepted {
+            relays.insert(
+                kind.clone(),
+                RelayEntry {
+                    session_id: session_id.to_string(),
+                    label: label.trim().to_string(),
+                    frames_tx: frames_tx.clone(),
+                    since_unix_ms: now,
+                },
+            );
+        }
+    }
     for kind in &accepted {
-        relays.insert(
-            kind.clone(),
-            RelayEntry {
-                session_id: session_id.to_string(),
-                label: label.trim().to_string(),
-                frames_tx: frames_tx.clone(),
-                since_unix_ms: now,
-            },
+        crate::credential_audit::record(
+            crate::credential_audit::EVENT_EGRESS_REGISTERED,
+            kind,
+            label.trim(),
+            label.trim(),
+            format!("provider calls relay through browser session {session_id}"),
         );
     }
     Ok(accepted)
@@ -122,18 +133,33 @@ pub fn register(
 /// In-flight requests are left to finish; the browser keeps streaming
 /// responses it already started.
 pub fn unregister(session_id: &str, kinds: Option<&[String]>) -> usize {
-    let mut relays = relays().write().expect("egress relays poisoned");
-    let before = relays.len();
-    relays.retain(|kind, entry| {
-        if entry.session_id != session_id {
-            return true;
-        }
-        match kinds {
-            Some(kinds) => !kinds.iter().any(|k| k.trim() == kind),
-            None => false,
-        }
-    });
-    before - relays.len()
+    let mut dropped: Vec<(String, String)> = Vec::new();
+    {
+        let mut relays = relays().write().expect("egress relays poisoned");
+        relays.retain(|kind, entry| {
+            if entry.session_id != session_id {
+                return true;
+            }
+            let keep = match kinds {
+                Some(kinds) => !kinds.iter().any(|k| k.trim() == kind),
+                None => false,
+            };
+            if !keep {
+                dropped.push((kind.clone(), entry.label.clone()));
+            }
+            keep
+        });
+    }
+    for (kind, label) in &dropped {
+        crate::credential_audit::record(
+            crate::credential_audit::EVENT_EGRESS_UNREGISTERED,
+            kind,
+            label,
+            label,
+            format!("browser relay detached (session {session_id})"),
+        );
+    }
+    dropped.len()
 }
 
 /// Session teardown: drop its relays and fail its in-flight requests —

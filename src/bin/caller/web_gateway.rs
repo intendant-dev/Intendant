@@ -2896,6 +2896,15 @@ fn external_backend_session_from_replay(contents: &str) -> Option<(String, Strin
     None
 }
 
+/// Debug lines log placeholder thread ids (Claude Code's
+/// `claude-code-session` before the stream announces the real one).
+/// Scraping those into a replay session id stamps every session-less row
+/// with a session that never exists — frontends then materialize a ghost
+/// window for it and can even hand it the prompt target.
+fn scraped_external_thread_id_is_canonical(id: &str) -> bool {
+    crate::external_agent::AgentBackend::ClaudeCode.thread_id_is_canonical(id)
+}
+
 fn external_backend_session_id_from_replay(contents: &str) -> Option<String> {
     if let Some((_, id)) = external_backend_session_from_replay(contents) {
         return Some(id);
@@ -3677,7 +3686,7 @@ pub(crate) fn session_agent_output_post_response(
 }
 
 fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
-    if session_id.contains('/') {
+    if crate::session_names::session_id_looks_like_path(session_id) {
         return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
     }
 
@@ -3985,15 +3994,22 @@ fn apply_external_wrapper_index_to_sessions(home: &Path, sessions: &mut [serde_j
 }
 
 fn external_agent_thread_id_from_message(message: &str) -> Option<String> {
-    if let Some(thread_id) = message.strip_prefix("External agent thread: ") {
-        return clean_external_thread_id(thread_id);
-    }
-    if message.starts_with("Mode: external agent") {
-        if let Some((_, thread_id)) = message.rsplit_once("thread: ") {
-            return clean_external_thread_id(thread_id);
-        }
-    }
-    None
+    let scraped = if let Some(thread_id) = message.strip_prefix("External agent thread: ") {
+        clean_external_thread_id(thread_id)
+    } else if message.starts_with("Mode: external agent") {
+        message
+            .rsplit_once("thread: ")
+            .and_then(|(_, thread_id)| clean_external_thread_id(thread_id))
+    } else {
+        None
+    };
+    // Debug lines log placeholder thread ids (Claude Code's
+    // `claude-code-session` before the stream announces the real one).
+    // Treating a placeholder as a session's external id poisons every
+    // consumer: the sessions list hydrates dashboard metadata with it,
+    // status routing then retargets at a window that never exists, and
+    // the ghost window it conjures can steal the prompt target.
+    scraped.filter(|id| scraped_external_thread_id_is_canonical(id))
 }
 
 fn external_agent_source_from_message(message: &str) -> Option<String> {

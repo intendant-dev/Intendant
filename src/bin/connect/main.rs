@@ -146,7 +146,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/daemon/next", get(daemon_next))
         .route("/api/daemon/answer", post(daemon_answer))
         .route("/api/daemon/error", post(daemon_error))
-        .route("/api/daemon/ack", post(daemon_ack))
         .route("/api/daemon/claim-proof", post(daemon_claim_proof))
         .route("/api/daemon/dry", post(daemon_dry))
         .route("/api/browser/offer", post(browser_offer))
@@ -4172,23 +4171,6 @@ async fn daemon_error(
 }
 
 #[derive(Debug, Deserialize)]
-struct AckRequest {
-    daemon_id: String,
-    request_id: String,
-    ok: bool,
-}
-
-async fn daemon_ack(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<AckRequest>,
-) -> ApiResult<Json<serde_json::Value>> {
-    require_daemon_auth(&state, &headers)?;
-    let _ = (body.daemon_id, body.request_id, body.ok);
-    Ok(Json(json!({ "ok": true })))
-}
-
-#[derive(Debug, Deserialize)]
 struct ClaimProofRequest {
     daemon_id: String,
     request_id: String,
@@ -7485,6 +7467,11 @@ mod tests {
         assert!(!INSTALL_SH.contains("/etc/systemd/system"));
 
         assert!(INSTALL_PS1.starts_with("<#"), "ps1 installer must open with comment help");
+        // Windows PowerShell 5.1 decodes BOM-less files as ANSI, and a
+        // UTF-8 em-dash misdecodes into a cp1252 smart QUOTE — which the
+        // parser honors, unbalancing every string after it. The bootstrap
+        // script stays pure ASCII so no delivery path can corrupt it.
+        assert!(INSTALL_PS1.is_ascii(), "install.ps1 must be pure ASCII");
         for needle in [
             "param(",
             "$Owner",
