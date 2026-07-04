@@ -1,4 +1,5 @@
 use super::error::CallerError;
+#[cfg(target_os = "linux")]
 use std::process::Stdio;
 use tokio::process::Child;
 
@@ -48,17 +49,46 @@ pub(crate) fn is_our_xvfb(lock_path: &str, display_id: u32) -> bool {
 /// Kill the process that owns a lock file (if alive) and clean up.
 #[cfg(target_os = "linux")]
 pub(crate) fn kill_and_reclaim(lock_path: &str, display_id: u32) {
-    if let Some(pid) = read_lock_pid(lock_path) {
-        // Send SIGKILL via the kill command — the process is an orphaned Xvfb we're reclaiming
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        // Brief wait for the process to die
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    let Some(pid) = read_lock_pid(lock_path) else {
+        eprintln!(
+            "[vision] refusing to reclaim X lock {} for display {}: no readable pid",
+            lock_path, display_id
+        );
+        return;
+    };
+    // Send SIGKILL via the kill command — the process is an orphaned Xvfb we're reclaiming
+    match std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => {
+            for _ in 0..10 {
+                if !super::platform::process_alive(pid) {
+                    remove_stale_lock(display_id);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            eprintln!(
+                "[vision] kill -9 reported success for Xvfb pid {} on display {}, but process is still alive; leaving lock in place",
+                pid, display_id
+            );
+        }
+        Ok(status) => {
+            eprintln!(
+                "[vision] kill -9 failed for Xvfb pid {} on display {} with status {}; leaving lock in place",
+                pid, display_id, status
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "[vision] failed to run kill for Xvfb pid {} on display {}: {}; leaving lock in place",
+                pid, display_id, err
+            );
+        }
     }
-    remove_stale_lock(display_id);
 }
 
 /// Remove a stale X lock file and its socket.

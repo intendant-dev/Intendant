@@ -107,8 +107,11 @@ loop.
 | Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio |
 | MCP injection | Writes `.codex/config.toml` **and** passes `-c mcp_servers.intendant.{type,url}` flags | Inline `--mcp-config '{…}'` JSON string |
 | Multi-thread | Yes — many threads per process | No |
-| Native thread id | Yes | No (`claude-code-session` placeholder until a real id appears) |
-| Mid-turn steer | Yes (`turn/steer`) | No → queue + next-turn fallback |
+| Native thread id | Yes | Yes — announced via `AgentEvent::NativeSessionId` on the first turn (placeholder `claude-code-session` until then; `--resume` keeps the id stable so resumed threads are canonical immediately) |
+| Mid-turn steer | Yes (`turn/steer`) | Yes — a user message written mid-turn is absorbed into the running turn |
+| Mid-turn interrupt | Yes (`turn/cancel`) | Yes (`control_request` `interrupt`; the process survives for follow-up turns) |
+| Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) |
+| Reasoning trace | Yes | Yes (`thinking` blocks) |
 | Rollback turns | Yes (`thread/rollback`) | No → session reset |
 | Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | No |
 
@@ -484,20 +487,61 @@ to 50 branches), rendered as the Managed tab's fission panel (see
 
 ### Claude Code
 
-Spawned in non-interactive stream-json mode with `--permission-prompt-tool stdio`,
-so permission prompts come back over the JSON stream and become
-`AgentEvent::ApprovalRequest` / `FileApprovalRequest`. The Intendant MCP server is
-passed **inline** as a JSON string to `--mcp-config` (not a file path); the URL
-is the scoped bootstrap endpoint (`session_id` + `tool_profile=core` +
-`mcp_token`), and the child gets `$INTENDANT`, `INTENDANT_MCP_URL`, and
-`INTENDANT_SESSION_ID` so `"$INTENDANT" ctl ...` works from its shell. The
-first user message carries a bootstrap addendum naming the MCP bootstrap tools
+Spawned in non-interactive stream-json mode (`-p --input-format stream-json
+--output-format stream-json --verbose --include-partial-messages`) with
+`--permission-prompt-tool stdio`, so permission prompts arrive as
+`control_request`/`can_use_tool` messages on the JSON stream and become
+`AgentEvent::ApprovalRequest` (file tools carry the `FileChange` category).
+Protocol details that are load-bearing (verified against Claude Code 2.1.200):
+
+- **Approvals**: the allow response **must echo the original tool input as
+  `updatedInput`** — a bare `{"behavior":"allow"}` fails the CLI's schema
+  validation and the tool never runs. `AcceptForSession` additionally returns
+  `updatedPermissions` built from the request's own `permission_suggestions`
+  (`addRules`/allow entries only), always retargeted to the `session`
+  destination — a supervised run never writes grants into the checkout's
+  `.claude/settings.local.json`. `Decline` denies with a supervisor message;
+  `Cancel` denies with `interrupt: true`, aborting the whole turn. Unknown
+  control-request subtypes are rejected with a control error (fail closed),
+  never auto-approved.
+- **Tool results ride `user`-type messages** (as `tool_result` content
+  blocks), not assistant messages; the adapter closes `ToolStarted` items
+  from there, and force-closes still-open tools as cancelled at turn end.
+- **Native session id**: Claude Code stamps `session_id` on every stdout
+  message once the first turn begins. The adapter announces it via
+  `AgentEvent::NativeSessionId`; the drain loop upgrades Intendant's
+  identity (`AppEvent::SessionIdentity`) and writes the external overlay so
+  `--continue`/resume finds the native id. `--resume <id>` keeps the same
+  session id and context, so a resumed thread is canonical from
+  `start_thread`.
+- **Interrupt**: a client→CLI `control_request` with subtype `interrupt`
+  aborts the running turn (its `result` arrives as
+  `error_during_execution`, mapped to a completed turn rather than a
+  backend error when Intendant requested the interrupt); the process stays
+  usable for follow-up turns.
+- **Steer**: a user message written while a turn runs is queued by the CLI
+  and absorbed into the *running* turn (the model reads it between tool
+  calls) — Intendant's `steer_turn` is exactly that write.
+- **Usage**: per-API-call usage from `message_delta` stream events plus the
+  turn `result` feed `AgentEvent::Usage`; the context window comes from the
+  result's `modelUsage` map (200k default until the first result).
+  `thinking` blocks surface as `AgentEvent::Reasoning`. Turn `result`s with
+  error subtypes (`error_max_turns`, `error_during_execution`, …) emit
+  `AgentEvent::BackendError` before completing the turn.
+- The init message's `mcp_servers` status for the injected `intendant`
+  server is logged (warn on `failed`/missing) so a broken loopback MCP is
+  visible from frontends instead of silently running without CU tools.
+
+The Intendant MCP server is passed **inline** as a JSON string to
+`--mcp-config` (not a file path); the URL is the scoped bootstrap endpoint
+(`session_id` + `tool_profile=core` + `mcp_token`), and the child gets
+`$INTENDANT`, `INTENDANT_MCP_URL`, and `INTENDANT_SESSION_ID` so
+`"$INTENDANT" ctl ...` works from its shell. The first user message carries a
+bootstrap addendum naming the MCP bootstrap tools
 (`read_screen`/`take_screenshot`/`execute_cu_actions`, shared-view), the lazy
 `ctl --help` discovery flow, and the dashboard-validation helper.
-`--permission-mode` and `--allowedTools` are added from config when set;
-`--resume <id>` resumes a prior session. Claude Code doesn't surface a real session
-id at thread start, so Intendant keeps its own log id canonical until a usable
-native id appears.
+`--permission-mode` (normalized — the legacy Intendant value `auto` maps to
+the CLI default) and `--allowedTools` are added from config when set.
 
 ## Approval Routing
 
@@ -565,8 +609,8 @@ context_archive = "summary"          # summary | exact | off — context snapsho
 
 [agent.claude_code]
 command         = "claude"
-model           = "claude-sonnet-4-6-20250929"   # optional
-permission_mode = "auto"              # default | acceptEdits | plan | auto | bypassPermissions
+model           = "claude-sonnet-4-6"  # optional; any claude CLI --model value (e.g. "haiku")
+permission_mode = "default"           # default | acceptEdits | plan | bypassPermissions (legacy "auto" = default)
 allowed_tools   = []                  # e.g. ["Read", "Edit", "Bash"]; empty = all
 ```
 
@@ -629,10 +673,12 @@ shared state (when driven over MCP) → config default → native.
   error* by default (`steer_turn`, `rollback_turns`, `interrupt_turn`,
   `thread_action`). `drain_external_agent_events` distinguishes "feature
   unsupported by this backend" from "feature attempted but failed" partly by these
-  error messages — e.g. mid-turn steering on Claude Code returns the
+  error messages — a backend without native steering returns the
   unsupported error, and the caller falls back to **queueing** the text onto the
-  context-injection queue for delivery at the next turn. Don't reword those
-  strings without checking the drain logic.
+  context-injection queue for delivery at the next turn. Both current backends
+  (Codex, Claude Code) steer natively, so the fallback is dormant — but it is
+  the contract any future backend inherits. Don't reword those strings without
+  checking the drain logic.
 - **`--direct` does not bypass external mode.** It only forces single-agent
   execution of the *native* worker. If a backend is configured, the supervised CLI
   still runs.

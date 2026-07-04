@@ -8,7 +8,7 @@
 //! process exit. `.env` keys keep working untouched — an active lease
 //! merely shadows them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
@@ -96,6 +96,11 @@ fn tombstones() -> &'static RwLock<HashMap<String, u64>> {
     EXPIRED.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+fn pending_materialization_cleanup() -> &'static RwLock<HashSet<String>> {
+    static PENDING: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
+    PENDING.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
 fn now_unix_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
 }
@@ -103,7 +108,11 @@ fn now_unix_ms() -> u64 {
 pub fn known_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "api_key:anthropic" | "api_key:openai" | "api_key:gemini" | "oauth:codex" | "oauth:claude-code"
+        "api_key:anthropic"
+            | "api_key:openai"
+            | "api_key:gemini"
+            | "oauth:codex"
+            | "oauth:claude-code"
     )
 }
 
@@ -117,6 +126,13 @@ fn env_kind(env_name: &str) -> Option<&'static str> {
 }
 
 fn sweep_locked(leases: &mut HashMap<String, CredentialLease>, now: u64) {
+    let active_oauth: HashSet<String> = leases
+        .iter()
+        .filter(|(_, lease)| lease.expires_at_unix_ms() > now)
+        .map(|(kind, _)| kind.clone())
+        .collect();
+    retry_pending_materialization_cleanup(&materialization_root(), &active_oauth);
+
     let expired: Vec<String> = leases
         .iter()
         .filter(|(_, lease)| lease.expires_at_unix_ms() <= now)
@@ -131,17 +147,20 @@ fn sweep_locked(leases: &mut HashMap<String, CredentialLease>, now: u64) {
             graves.insert(kind.clone(), lease.expires_at_unix_ms());
             queue_dry_notice(&kind, &lease.label);
         }
-        drop_materialization(&materialization_root(), &kind);
+        if let Err(err) = drop_materialization(&materialization_root(), &kind) {
+            eprintln!("[credential-leases] expired lease cleanup for {kind} failed: {err}");
+            queue_materialization_cleanup(&kind);
+        }
     }
 }
 
 /* ── Dry-daemon notices ──
-   When a lease expires and no .env key covers the same kind, the daemon
-   has genuinely gone dry for it. The sweep queues a notice here; the
-   rendezvous client drains the queue and reports it, and the hosted
-   service turns that into a Web Push ("reconnect a fueling session") to
-   the owner's subscribed browsers. Revocation queues nothing — the user
-   just did it themselves. */
+When a lease expires and no .env key covers the same kind, the daemon
+has genuinely gone dry for it. The sweep queues a notice here; the
+rendezvous client drains the queue and reports it, and the hosted
+service turns that into a Web Push ("reconnect a fueling session") to
+the owner's subscribed browsers. Revocation queues nothing — the user
+just did it themselves. */
 
 #[derive(Debug, Clone)]
 pub struct DryNotice {
@@ -165,9 +184,11 @@ fn kind_has_env_fallback(kind: &str) -> bool {
         // lease always means dry.
         _ => &[],
     };
-    names
-        .iter()
-        .any(|name| std::env::var(name).map(|v| !v.trim().is_empty()).unwrap_or(false))
+    names.iter().any(|name| {
+        std::env::var(name)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    })
 }
 
 fn queue_dry_notice(kind: &str, label: &str) {
@@ -192,16 +213,16 @@ pub fn take_dry_notices() -> Vec<DryNotice> {
 }
 
 /* ── OAuth materialization (external agents) ──
-   Codex and Claude Code are child processes that read credentials from
-   files, not from memory we control — the documented weakening in the
-   custody chapter. An active oauth lease therefore materializes a
-   private home directory (0700) holding exactly the leased auth file
-   (0600); spawns point the agent at it (CODEX_HOME / CLAUDE_CONFIG_DIR)
-   and it is deleted on lease expiry, revocation, and the startup
-   recovery sweep. Non-secret configuration (config.toml /
-   settings.json) is copied in so behavior is preserved; the user's own
-   auth files never are. The directory lives under ~/.intendant, outside
-   any project worktree, so the rewind/snapshot machinery never sees it. */
+Codex and Claude Code are child processes that read credentials from
+files, not from memory we control — the documented weakening in the
+custody chapter. An active oauth lease therefore materializes a
+private home directory (0700) holding exactly the leased auth file
+(0600); spawns point the agent at it (CODEX_HOME / CLAUDE_CONFIG_DIR)
+and it is deleted on lease expiry, revocation, and the startup
+recovery sweep. Non-secret configuration (config.toml /
+settings.json) is copied in so behavior is preserved; the user's own
+auth files never are. The directory lives under ~/.intendant, outside
+any project worktree, so the rewind/snapshot machinery never sees it. */
 
 fn materialization_root() -> PathBuf {
     crate::platform::home_dir()
@@ -209,32 +230,42 @@ fn materialization_root() -> PathBuf {
         .join("leased-auth")
 }
 
-fn restrict_dir(path: &Path) {
+fn restrict_dir(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o700);
-            let _ = std::fs::set_permissions(path, perms);
-        }
+        let metadata =
+            std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(path, perms)
+            .map_err(|e| format!("chmod 0700 {}: {e}", path.display()))?;
+        Ok(())
     }
     #[cfg(not(unix))]
-    let _ = path;
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
-fn restrict_file(path: &Path) {
+fn restrict_file(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
-        }
+        let metadata =
+            std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)
+            .map_err(|e| format!("chmod 0600 {}: {e}", path.display()))?;
+        Ok(())
     }
     #[cfg(not(unix))]
-    let _ = path;
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 struct MaterializationPlan {
@@ -268,12 +299,21 @@ fn materialize_kind(root: &Path, kind: &str, material: &str) -> Result<(), Strin
     };
     let dir = root.join(plan.dir_name);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    restrict_dir(root);
-    restrict_dir(&dir);
+    restrict_dir(root)?;
+    restrict_dir(&dir)?;
     let auth_path = dir.join(plan.auth_name);
     std::fs::write(&auth_path, material.as_bytes())
         .map_err(|e| format!("write {}: {e}", auth_path.display()))?;
-    restrict_file(&auth_path);
+    if let Err(err) = restrict_file(&auth_path) {
+        if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
+            eprintln!(
+                "[credential-leases] cleanup after failed materialization of {} failed: {}",
+                dir.display(),
+                cleanup_err
+            );
+        }
+        return Err(err);
+    }
     if let Some((source_home, config_name)) = plan.carry_over {
         let source = source_home.join(config_name);
         let target = dir.join(config_name);
@@ -284,9 +324,53 @@ fn materialize_kind(root: &Path, kind: &str, material: &str) -> Result<(), Strin
     Ok(())
 }
 
-fn drop_materialization(root: &Path, kind: &str) {
+fn drop_materialization(root: &Path, kind: &str) -> Result<(), String> {
     if let Some(plan) = materialization_plan(kind) {
-        let _ = std::fs::remove_dir_all(root.join(plan.dir_name));
+        let path = root.join(plan.dir_name);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("remove {}: {err}", path.display())),
+        }
+    }
+    Ok(())
+}
+
+fn queue_materialization_cleanup(kind: &str) {
+    if materialization_plan(kind).is_some() {
+        pending_materialization_cleanup()
+            .write()
+            .expect("pending materialization cleanup poisoned")
+            .insert(kind.to_string());
+    }
+}
+
+fn clear_materialization_cleanup(kind: &str) {
+    pending_materialization_cleanup()
+        .write()
+        .expect("pending materialization cleanup poisoned")
+        .remove(kind);
+}
+
+fn retry_pending_materialization_cleanup(root: &Path, active_kinds: &HashSet<String>) {
+    let pending: Vec<String> = pending_materialization_cleanup()
+        .read()
+        .expect("pending materialization cleanup poisoned")
+        .iter()
+        .cloned()
+        .collect();
+    for kind in pending {
+        if active_kinds.contains(&kind) {
+            continue;
+        }
+        match drop_materialization(root, &kind) {
+            Ok(()) => {
+                clear_materialization_cleanup(&kind);
+            }
+            Err(err) => {
+                eprintln!("[credential-leases] pending cleanup for {kind} failed: {err}");
+            }
+        }
     }
 }
 
@@ -338,6 +422,9 @@ pub fn startup_materialization_sweep() {
                 "[credential-leases] startup sweep of {} failed: {err}",
                 root.display()
             );
+            for kind in ["oauth:codex", "oauth:claude-code"] {
+                queue_materialization_cleanup(kind);
+            }
         }
     }
 }
@@ -425,7 +512,9 @@ pub fn grant(
         return Err("credential material is too large".to_string());
     }
     let mode = resolve_mode(kind, mode, material)?;
-    let ttl_ms = ttl_ms.unwrap_or(DEFAULT_TTL_MS).clamp(MIN_TTL_MS, MAX_TTL_MS);
+    let ttl_ms = ttl_ms
+        .unwrap_or(DEFAULT_TTL_MS)
+        .clamp(MIN_TTL_MS, MAX_TTL_MS);
     let offline_ms = offline_ms.unwrap_or(DEFAULT_OFFLINE_MS).min(MAX_OFFLINE_MS);
     let now = now_unix_ms();
     let lease = CredentialLease {
@@ -454,12 +543,16 @@ pub fn grant(
     if let Err(error) = materialize_kind(&materialization_root(), kind, material) {
         return Err(format!("credential materialization failed: {error}"));
     }
+    clear_materialization_cleanup(kind);
     let replaced = leases.insert(kind.to_string(), lease).is_some();
     tombstones()
         .write()
         .expect("lease tombstones poisoned")
         .remove(kind);
-    Ok(GrantOutcome { replaced, ..outcome })
+    Ok(GrantOutcome {
+        replaced,
+        ..outcome
+    })
 }
 
 pub fn renew(lease_id: &str) -> Result<u64, String> {
@@ -497,7 +590,10 @@ pub fn revoke(selector: Option<&str>) -> usize {
         }
     }
     for kind in dropped {
-        drop_materialization(&materialization_root(), &kind);
+        if let Err(err) = drop_materialization(&materialization_root(), &kind) {
+            eprintln!("[credential-leases] revoked lease cleanup for {kind} failed: {err}");
+            queue_materialization_cleanup(&kind);
+        }
     }
     before - leases.len()
 }
@@ -595,12 +691,15 @@ mod tests {
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn reset() {
         store().write().unwrap().clear();
         tombstones().write().unwrap().clear();
+        pending_materialization_cleanup().write().unwrap().clear();
     }
 
     #[test]
@@ -680,7 +779,16 @@ mod tests {
         assert!(note.contains("api_key:gemini"), "{note}");
 
         // A fresh grant clears the tombstone.
-        grant("api_key:gemini", "Gemini", "gm-key-2", None, "root", None, None).unwrap();
+        grant(
+            "api_key:gemini",
+            "Gemini",
+            "gm-key-2",
+            None,
+            "root",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(expired_lease_note().is_none());
         reset();
     }
@@ -691,10 +799,7 @@ mod tests {
         materialize_kind(root.path(), "oauth:codex", r#"{"tokens":{}}"#).unwrap();
         let auth = root.path().join("codex-home").join("auth.json");
         assert!(auth.is_file());
-        assert_eq!(
-            std::fs::read_to_string(&auth).unwrap(),
-            r#"{"tokens":{}}"#
-        );
+        assert_eq!(std::fs::read_to_string(&auth).unwrap(), r#"{"tokens":{}}"#);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -717,13 +822,16 @@ mod tests {
         let dirs: Vec<_> = std::fs::read_dir(root.path()).unwrap().collect();
         assert_eq!(dirs.len(), 2, "only the two oauth kinds may materialize");
 
-        drop_materialization(root.path(), "oauth:codex");
+        drop_materialization(root.path(), "oauth:codex").unwrap();
         assert!(!root.path().join("codex-home").exists());
-        assert!(creds.is_file(), "dropping one kind must not touch the other");
-        drop_materialization(root.path(), "oauth:claude-code");
+        assert!(
+            creds.is_file(),
+            "dropping one kind must not touch the other"
+        );
+        drop_materialization(root.path(), "oauth:claude-code").unwrap();
         assert!(!root.path().join("claude-home").exists());
         // Dropping an already-gone kind is a quiet no-op.
-        drop_materialization(root.path(), "oauth:claude-code");
+        drop_materialization(root.path(), "oauth:claude-code").unwrap();
     }
 
     #[test]
@@ -820,7 +928,16 @@ mod tests {
 
         // API-key kinds have no mode split; the label is implicit, and
         // the status entry carries it through.
-        grant("api_key:gemini", "g", "gm", Some("access_token"), "root", None, None).unwrap();
+        grant(
+            "api_key:gemini",
+            "g",
+            "gm",
+            Some("access_token"),
+            "root",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             status_entries()
                 .into_iter()

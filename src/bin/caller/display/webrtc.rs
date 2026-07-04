@@ -2006,7 +2006,9 @@ fn feed_turn_inbound(
     // The turn client returns Err for non-STUN traffic from the STUN server
     // and for malformed packets; both are safe to ignore here (we have no
     // STUN server configured on this client, only TURN).
-    let _ = client.handle_read(tagged);
+    if let Err(err) = client.handle_read(tagged) {
+        eprintln!("[display/webrtc] trace: TURN inbound from {from} ignored: {err}");
+    }
 }
 
 /// True if `e` is the turn client's "no permission yet" error, which is the

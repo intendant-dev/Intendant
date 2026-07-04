@@ -561,8 +561,23 @@ impl Drop for FfmpegH264Encoder {
             Ok(Some(_)) => {}
             _ => {
                 let pid = self.child.id();
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                if let Err(err) = self.child.kill() {
+                    eprintln!(
+                        "[display/h264_linux] debug: ffmpeg encoder kill failed (pid {}): {}",
+                        pid, err
+                    );
+                }
+                match self.child.wait() {
+                    Ok(status) if status.success() => {}
+                    Ok(status) => eprintln!(
+                        "[display/h264_linux] debug: ffmpeg encoder exited after shutdown with status {} (pid {})",
+                        status, pid
+                    ),
+                    Err(err) => eprintln!(
+                        "[display/h264_linux] debug: ffmpeg encoder wait failed (pid {}): {}",
+                        pid, err
+                    ),
+                }
                 eprintln!("[display/h264_linux] killed ffmpeg encoder (pid {})", pid);
             }
         }

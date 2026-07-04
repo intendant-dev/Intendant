@@ -8,7 +8,7 @@
 use crate::daemon_identity::{b64u, DaemonIdentity};
 use crate::error::CallerError;
 use crate::event::{AppEvent, ControlMsg};
-use crate::types::LogLevel;
+use crate::types::{truncate_str, LogLevel};
 use base64::Engine as _;
 use bytes::BytesMut;
 use rtc::peer_connection::configuration::setting_engine::SettingEngine;
@@ -4001,7 +4001,7 @@ fn dashboard_preview_text(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        format!("{}...", truncate_str(s, max))
     }
 }
 
@@ -9357,6 +9357,9 @@ fn dashboard_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::SetCodexWritableRoots { .. }
             | ControlMsg::SetCodexManagedContext { .. }
             | ControlMsg::SetCodexContextArchive { .. }
+            | ControlMsg::SetClaudeModel { .. }
+            | ControlMsg::SetClaudePermissionMode { .. }
+            | ControlMsg::SetClaudeAllowedTools { .. }
             | ControlMsg::SetVerbosity { .. }
     )
 }
@@ -9437,6 +9440,9 @@ fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::StopSession { .. } => "stop_session",
         ControlMsg::RestartSession { .. } => "restart_session",
         ControlMsg::ResumeSession { .. } => "resume_session",
+        ControlMsg::SetClaudeModel { .. } => "set_claude_model",
+        ControlMsg::SetClaudePermissionMode { .. } => "set_claude_permission_mode",
+        ControlMsg::SetClaudeAllowedTools { .. } => "set_claude_allowed_tools",
         ControlMsg::SetVerbosity { .. } => "set_verbosity",
         ControlMsg::ScheduleControllerRestart { .. } => "schedule_controller_restart",
         ControlMsg::ControllerTurnComplete { .. } => "controller_turn_complete",
@@ -10314,6 +10320,15 @@ fn sha256_b64u(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashboard_preview_text_truncates_on_char_boundary() {
+        let text = format!("{}{}", "a".repeat(199), "\u{00e9}");
+        assert_eq!(
+            dashboard_preview_text(&text, 200),
+            format!("{}...", "a".repeat(199))
+        );
+    }
 
     fn runtime() -> ControlRuntime {
         ControlRuntime {

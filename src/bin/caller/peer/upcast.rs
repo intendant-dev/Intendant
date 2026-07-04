@@ -1074,6 +1074,35 @@ impl AppEventUpcaster {
             }
 
 
+            AppEvent::ClaudeConfigChanged {
+                model,
+                model_cleared,
+                permission_mode,
+                allowed_tools,
+            } => {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(v) = model {
+                    parts.push(format!("model={v}"));
+                } else if *model_cleared {
+                    parts.push("model=<default>".to_string());
+                }
+                if let Some(v) = permission_mode {
+                    parts.push(format!("permission_mode={v}"));
+                }
+                if let Some(v) = allowed_tools {
+                    parts.push(format!("allowed_tools=[{} entry/entries]", v.len()));
+                }
+                if parts.is_empty() {
+                    vec![]
+                } else {
+                    vec![log_event(
+                        LogLevel::Info,
+                        "config",
+                        format!("claude config: {}", parts.join(", ")),
+                    )]
+                }
+            }
+
 
             // ---- Budget / safety ----
             AppEvent::BudgetWarning { pct, remaining } => vec![log_event(
@@ -2123,6 +2152,35 @@ impl WireEventUpcaster {
                 }
             }
 
+
+            OutboundEvent::ClaudeConfigChanged {
+                model,
+                model_cleared,
+                permission_mode,
+                allowed_tools,
+            } => {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(v) = model {
+                    parts.push(format!("model={v}"));
+                } else if *model_cleared {
+                    parts.push("model=<default>".to_string());
+                }
+                if let Some(v) = permission_mode {
+                    parts.push(format!("permission_mode={v}"));
+                }
+                if let Some(v) = allowed_tools {
+                    parts.push(format!("allowed_tools=[{} entry/entries]", v.len()));
+                }
+                if parts.is_empty() {
+                    vec![]
+                } else {
+                    vec![log_event(
+                        LogLevel::Info,
+                        "config",
+                        format!("claude config: {}", parts.join(", ")),
+                    )]
+                }
+            }
 
 
             // ---- Budget / safety ----

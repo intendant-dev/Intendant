@@ -30,8 +30,25 @@ supported.
 
 ## Quickstart
 
-The supported Windows path is still a source-build bootstrap. Run the setup
-script from an elevated (Administrator) PowerShell in the repo root:
+The fastest path is the served installer — the Windows counterpart of the
+`curl | sh` one-liner, from an elevated PowerShell on a fresh box:
+
+```powershell
+& ([scriptblock]::Create((irm https://intendant.dev/install.ps1))) -Owner <your-key>
+
+# Keep it running unattended (Task Scheduler entry — at boot when elevated,
+# at logon otherwise — supervised by the built-in restart loop; the claim
+# phrase lands in the service log the installer prints):
+& ([scriptblock]::Create((irm https://intendant.dev/install.ps1))) -Owner <your-key> -Service
+```
+
+It clones the repo, runs the dependency setup below (elevated shells only),
+builds, and launches; every rendezvous — hosted or self-run — serves its own
+version-matched copy at `/install.ps1`. `intendant service
+install|uninstall|status` manages the scheduled task directly once built.
+
+Working from an existing checkout instead, run the setup script from an
+elevated (Administrator) PowerShell in the repo root:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1

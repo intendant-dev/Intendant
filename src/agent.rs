@@ -1595,7 +1595,7 @@ impl Agent {
     }
 }
 
-fn truncate_utf8_by_bytes(s: &str, max: usize) -> &str {
+pub(crate) fn truncate_utf8_by_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
@@ -1620,6 +1620,12 @@ mod tests {
 
     fn memory_file_for(tmp: &TempDir) -> std::path::PathBuf {
         tmp.path().join(".intendant").join("memory.json")
+    }
+
+    #[test]
+    fn truncate_utf8_by_bytes_stops_at_char_boundary() {
+        let text = format!("{}{}", "a".repeat(199), "\u{00e9}");
+        assert_eq!(truncate_utf8_by_bytes(&text, 200), "a".repeat(199));
     }
 
     #[tokio::test]

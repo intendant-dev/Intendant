@@ -69,10 +69,35 @@ pub fn remove(project_root: &Path, wt: &Worktree) -> Result<(), CallerError> {
     }
 
     // Clean up the branch
-    let _ = Command::new("git")
+    let branch_delete = Command::new("git")
         .args(["branch", "-D", &wt.branch_name])
         .current_dir(project_root)
         .output();
+    match branch_delete {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let branch_ref = format!("refs/heads/{}", wt.branch_name);
+            let branch_exists = Command::new("git")
+                .args(["show-ref", "--verify", "--quiet", &branch_ref])
+                .current_dir(project_root)
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(true);
+            if branch_exists {
+                eprintln!(
+                    "[worktree] git branch -D {} failed: {}",
+                    wt.branch_name,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "[worktree] failed to run git branch -D {}: {}",
+                wt.branch_name, err
+            );
+        }
+    }
 
     Ok(())
 }

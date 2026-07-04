@@ -409,7 +409,9 @@ pub struct ClaudeCodeConfig {
     /// Model to use.
     #[serde(default)]
     pub model: Option<String>,
-    /// Permission mode: "default", "acceptEdits", "plan", "auto", "bypassPermissions".
+    /// Permission mode: "default", "acceptEdits", "plan", "bypassPermissions".
+    /// The legacy value "auto" (never a real Claude Code mode) is accepted
+    /// and treated as "default".
     #[serde(default = "default_claude_code_permission_mode")]
     pub permission_mode: String,
     /// Allowed tools list (empty = all).
@@ -422,7 +424,25 @@ fn default_claude_code_command() -> String {
 }
 
 fn default_claude_code_permission_mode() -> String {
-    "auto".to_string()
+    "default".to_string()
+}
+
+/// Canonicalize a Claude Code permission mode. The CLI's real modes are
+/// `default`, `acceptEdits`, `plan`, and `bypassPermissions`; the legacy
+/// Intendant default "auto" (never a real mode — the CLI silently coerces
+/// it) maps to `default`. Unknown values pass through trimmed for forward
+/// compatibility with newer CLIs.
+pub fn normalize_claude_permission_mode(mode: &str) -> String {
+    let trimmed = mode.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "" | "default" | "auto" => "default".to_string(),
+        "acceptedits" | "accept-edits" | "accept_edits" => "acceptEdits".to_string(),
+        "plan" => "plan".to_string(),
+        "bypasspermissions" | "bypass-permissions" | "bypass_permissions" => {
+            "bypassPermissions".to_string()
+        }
+        _ => trimmed.to_string(),
+    }
 }
 
 impl Default for ClaudeCodeConfig {
@@ -1740,7 +1760,7 @@ context_window = 200000
         assert_eq!(config.agent.codex.sandbox, "workspace-write");
         assert!(config.agent.codex.model.is_none());
         assert_eq!(config.agent.claude_code.command, "claude");
-        assert_eq!(config.agent.claude_code.permission_mode, "auto");
+        assert_eq!(config.agent.claude_code.permission_mode, "default");
         assert!(config.agent.claude_code.model.is_none());
         assert!(config.agent.claude_code.allowed_tools.is_empty());
     }
@@ -1797,7 +1817,7 @@ default_backend = "codex"
         assert_eq!(config.agent.codex.context_archive, "summary");
         assert_eq!(config.agent.claude_code.command, "claude");
         assert!(config.agent.claude_code.model.is_none());
-        assert_eq!(config.agent.claude_code.permission_mode, "auto");
+        assert_eq!(config.agent.claude_code.permission_mode, "default");
         assert!(config.agent.claude_code.allowed_tools.is_empty());
     }
 

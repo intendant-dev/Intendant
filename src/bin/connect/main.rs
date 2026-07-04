@@ -94,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/app", get(app_html))
         .route("/healthz", get(healthz))
         .route("/install.sh", get(install_sh))
+        .route("/install.ps1", get(install_ps1))
         .route("/favicon.png", get(favicon_png))
         .route("/logo.svg", get(logo_svg))
         .route("/assets/landing/{name}", get(landing_asset))
@@ -930,6 +931,20 @@ async fn install_sh() -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         INSTALL_SH,
+    )
+}
+
+/// The Windows counterpart, for PowerShell:
+///   & ([scriptblock]::Create((irm <origin>/install.ps1))) -Owner <fingerprint>
+const INSTALL_PS1: &str = include_str!("../../../scripts/install.ps1");
+
+async fn install_ps1() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        INSTALL_PS1,
     )
 }
 
@@ -2241,7 +2256,9 @@ async fn presence_alert_monitor(state: Arc<AppState>) {
             store
                 .push_subscriptions
                 .retain(|record| !dead.contains(&record.endpoint));
-            let _ = persist_locked(&state, &store);
+            if let Err(err) = persist_locked(&state, &store) {
+                eprintln!("[push] failed to persist pruned subscriptions: {err:?}");
+            }
         }
     }
 }
@@ -2310,7 +2327,9 @@ async fn handle_reclaim_monitor(state: Arc<AppState>) {
             );
             eprintln!("[reclaim] freed dormant handle {freed} (account renamed to {renamed_to})");
         }
-        let _ = persist_locked(&state, &store);
+        if let Err(err) = persist_locked(&state, &store) {
+            eprintln!("[reclaim] failed to persist dormant-handle reclamation: {err:?}");
+        }
     }
 }
 
@@ -5013,8 +5032,8 @@ fn trust_ui_html(origin: &str) -> String {
 const DOCS_URL: &str = "https://lovon-spec.github.io/Intendant/";
 const REPO_URL: &str = "https://github.com/lovon-spec/intendant";
 
-/// The deployment advisor inside the landing install section: three
-/// questions -> the same one-liner (with `--service` where it belongs)
+/// The deployment advisor inside the landing install section: four
+/// questions -> one command per platform (sh or PowerShell, `--service` where it belongs)
 /// plus an honest fueling plan for after the claim. A separate const so
 /// its CSS/JS braces stay out of the page-level `format!`; it derives
 /// the command from `location.origin` at runtime, so a self-hosted
@@ -5038,8 +5057,14 @@ const LANDING_ADVISOR_HTML: &str = r##"<details class="advisor" id="advisor">
           .advout ul { margin: 0; padding-left: 20px; font-size: 14px; color: var(--muted); display: grid; gap: 6px; }
           .advout ul b { color: var(--text); }
         </style>
-        <summary>Not sure which shape fits? Answer three questions.</summary>
+        <summary>Not sure which shape fits? Answer four questions.</summary>
         <div class="advbody">
+          <div class="advq" data-q="os">
+            <span class="ql">Operating system?</span>
+            <button data-v="linux" class="on">Linux</button>
+            <button data-v="macos">macOS</button>
+            <button data-v="windows">Windows</button>
+          </div>
           <div class="advq" data-q="box">
             <span class="ql">Where will it run?</span>
             <button data-v="vps" class="on">A rented VPS</button>
@@ -5064,7 +5089,7 @@ const LANDING_ADVISOR_HTML: &str = r##"<details class="advisor" id="advisor">
                 <span class="bftitle">still one command</span>
                 <button onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('advcmd').textContent)">copy</button>
               </div>
-              <pre><span class="ps">$ </span><span id="advcmd"></span></pre>
+              <pre><span class="ps" id="advps">$ </span><span id="advcmd"></span></pre>
             </div>
             <ul id="advplan"></ul>
             <p class="installnote" id="advnote"></p>
@@ -5072,12 +5097,16 @@ const LANDING_ADVISOR_HTML: &str = r##"<details class="advisor" id="advisor">
         </div>
         <script>
         (function () {
-          var pick = { box: 'vps', fuel: 'api', solo: 'no' };
+          var pick = { os: 'linux', box: 'vps', fuel: 'api', solo: 'no' };
           function render() {
             // </> keep raw angle brackets out of the inline
             // script (the page-level invariant the tests pin).
-            var cmd = 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- --owner \u003cyour-key\u003e';
-            if (pick.box !== 'laptop') cmd += ' --service';
+            var svc = pick.box !== 'laptop';
+            var cmd = pick.os === 'windows'
+              ? '& ([scriptblock]::Create((irm ' + location.origin + "/install.ps1))) -Owner '\u003cyour-key\u003e'" + (svc ? ' -Service' : '')
+              : 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- --owner \u003cyour-key\u003e' + (svc ? ' --service' : '');
+            document.getElementById('advps').textContent = pick.os === 'windows' ? 'PS> ' : '$ ';
+
             document.getElementById('advcmd').textContent = cmd;
             var plan = [];
             if (pick.box === 'laptop') {
@@ -5100,7 +5129,12 @@ const LANDING_ADVISOR_HTML: &str = r##"<details class="advisor" id="advisor">
             var note = { vps: 'A disposable box should hold nothing durable: with egress or access-token leases, wiping it loses nothing and leaks nothing.',
                          server: 'Nothing rests on disk either way — leases only bound what a runtime compromise could spend before you revoke.',
                          laptop: 'Custody buys the least on the machine your browser already runs on.' }[pick.box];
-            if (pick.box !== 'laptop') note += ' --service installs a systemd unit so the daemon outlives the SSH session; the claim phrase lands in journalctl.';
+            if (svc) {
+              note += pick.os === 'windows'
+                ? ' -Service installs a Task Scheduler entry (at boot when elevated, at logon otherwise) supervised by a built-in restart loop; the installer prints the log file the claim phrase lands in. Run it from PowerShell.'
+                : ' --service keeps the daemon alive past this SSH session via the platform’s own supervisor — systemd where present, launchd on macOS, cron plus the built-in supervisor elsewhere — and prints where the claim phrase lands.';
+            }
+
             document.getElementById('advnote').textContent = note;
           }
           Array.prototype.forEach.call(document.querySelectorAll('#advisor .advq'), function (row) {
@@ -5478,7 +5512,8 @@ fn landing_ui_html(origin: &str) -> String {
             dashboard's Access drawer. Nothing sensitive travels in this command
             or lands on the box: the daemon boots already owned by you, you claim
             it with a twelve-word phrase, and it borrows credentials from your
-            vault only while you let it.
+            vault only while you let it. On Windows? The advisor below builds
+            the PowerShell command (<code>/install.ps1</code>).
           </p>
         </div>
         <div class="steps">
@@ -7360,15 +7395,26 @@ mod tests {
         assert!(html.contains(r#"<img src="/logo.svg""#));
         assert!(!html.contains("data:image/svg"));
         // The deployment advisor: folded shut (the one-command story stays
-        // the headline), three questions, and a runtime-origin command so
-        // self-hosted rendezvous advertise their own installer there too.
+        // the headline), four questions, and runtime-origin commands so
+        // self-hosted rendezvous advertise their own installers there too —
+        // the sh one-liner AND the PowerShell one (Windows is first-class).
         assert!(html.contains("Not sure which shape fits?"));
         assert!(!html.contains("<details class=\"advisor\" open"));
-        for question in ["Where will it run?", "What will fuel it?", "Keep working with your browser closed?"] {
+        for question in [
+            "Operating system?",
+            "Where will it run?",
+            "What will fuel it?",
+            "Keep working with your browser closed?",
+        ] {
             assert!(html.contains(question), "advisor must ask: {question}");
         }
         assert!(html.contains("location.origin + '/install.sh"));
+        assert!(html.contains("/install.ps1"));
         assert!(html.contains("--service"));
+        assert!(html.contains("-Service"));
+        // No init system is asserted as a given — the note speaks in
+        // native-supervisor terms, not systemd.
+        assert!(!html.contains("journalctl"));
         // Honest pre-alpha framing before anyone clicks Sign in.
         assert!(html.contains(r#"<span class="pill-alpha">pre-alpha</span>"#));
     }
@@ -7431,6 +7477,52 @@ mod tests {
         assert!(
             INSTALL_SH.contains("cargo build --release"),
             "installer must build release binaries"
+        );
+        // --service must delegate to the binary's cross-platform service
+        // subcommand, never hand-roll a unit (systemd is one backend of
+        // four, not a dependency).
+        assert!(INSTALL_SH.contains("service install --now --"));
+        assert!(!INSTALL_SH.contains("/etc/systemd/system"));
+
+        assert!(INSTALL_PS1.starts_with("<#"), "ps1 installer must open with comment help");
+        for needle in [
+            "param(",
+            "$Owner",
+            "$Connect",
+            "$Service",
+            "cargo build --release",
+            "\"service\", \"install\"",
+        ] {
+            assert!(INSTALL_PS1.contains(needle), "install.ps1 must contain {needle}");
+        }
+    }
+
+    /// Real parse coverage for the PowerShell installer, on the platform
+    /// that ships PowerShell — a macOS/Linux dev box cannot tokenize it.
+    #[cfg(windows)]
+    #[test]
+    fn embedded_ps1_installer_parses() {
+        let dir = std::env::temp_dir().join(format!("intendant-ps1-parse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("install.ps1");
+        std::fs::write(&script, INSTALL_PS1).unwrap();
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "$errs = $null; [System.Management.Automation.Language.Parser]::ParseFile('{}', [ref]$null, [ref]$errs) | Out-Null; if ($errs.Count) {{ $errs | ForEach-Object {{ Write-Error $_.Message }}; exit 1 }}",
+                    script.display()
+                ),
+            ])
+            .output()
+            .expect("powershell must exist on Windows");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            output.status.success(),
+            "install.ps1 has parse errors: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
