@@ -68,6 +68,7 @@ impl TileDeltaBackpressure {
         self.config
     }
 
+    #[allow(dead_code)]
     pub fn is_throttled(&self) -> bool {
         self.throttled
     }

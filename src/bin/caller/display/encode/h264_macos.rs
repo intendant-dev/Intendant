@@ -88,8 +88,8 @@ impl Encoder for VideoToolboxEncoder {
     ) -> Result<Vec<EncodedPacket>, String> {
         let w = self.width as usize;
         let h = self.height as usize;
-        let uv_w = (w + 1) / 2;
-        let uv_h = (h + 1) / 2;
+        let uv_w = w.div_ceil(2);
+        let uv_h = h.div_ceil(2);
         let y_size = w * h;
         let uv_size = uv_w * uv_h;
 
@@ -109,7 +109,6 @@ impl Encoder for VideoToolboxEncoder {
 
         let options = EncodeOptions {
             force_key_frame: force_keyframe || self.frame_count == 0,
-            ..Default::default()
         };
 
         self.inner

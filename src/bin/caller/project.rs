@@ -256,7 +256,7 @@ pub const CODEX_STANDARD_SERVICE_TIER: &str = "standard";
 /// (`workspace-write`) so a config typo can't silently escalate privileges.
 pub fn normalize_sandbox_mode(input: &str) -> String {
     let trimmed = input.trim();
-    if CODEX_SANDBOX_MODES.iter().any(|m| *m == trimmed) {
+    if CODEX_SANDBOX_MODES.contains(&trimmed) {
         trimmed.to_string()
     } else {
         default_codex_sandbox()
@@ -268,7 +268,7 @@ pub fn normalize_sandbox_mode(input: &str) -> String {
 /// (the project default) rather than silently disabling approvals.
 pub fn normalize_approval_policy(input: &str) -> String {
     let trimmed = input.trim();
-    if CODEX_APPROVAL_POLICIES.iter().any(|p| *p == trimmed) {
+    if CODEX_APPROVAL_POLICIES.contains(&trimmed) {
         trimmed.to_string()
     } else {
         default_codex_approval_policy()

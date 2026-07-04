@@ -34,11 +34,13 @@ pub struct AudioBridge {
 impl AudioBridge {
     /// Device name where model audio output should be played.
     /// Apps reading mic input will hear audio written here.
+    #[allow(dead_code)]
     pub fn model_output_device(&self) -> &str {
         self.inner.model_output_device()
     }
 
     /// Device name to capture app audio from (feed to model).
+    #[allow(dead_code)]
     pub fn app_capture_device(&self) -> &str {
         self.inner.app_capture_device()
     }
@@ -82,6 +84,7 @@ impl Drop for AudioBridge {
 }
 
 /// Check if virtual audio routing is available on this platform.
+#[allow(dead_code)]
 pub async fn is_available() -> bool {
     PlatformBridge::is_available().await
 }
@@ -123,6 +126,7 @@ pub fn create_vortex_bridge(socket_path: &str) -> AudioBridge {
 /// The host runs `bh-bridge --port <port>` which handles BlackHole
 /// capture/playback on real hardware. The VM connects over TCP and
 /// sends/receives raw PCM. No local virtual audio devices are needed.
+#[allow(dead_code)]
 pub async fn create_network_bridge(
     session_id: &str,
     host_addr: &str,
@@ -164,6 +168,7 @@ pub async fn set_as_default(bridge: &mut AudioBridge) -> Result<(), CallerError>
 }
 
 /// Route a specific app's audio through the bridge (per-app, not global).
+#[allow(dead_code)]
 pub async fn route_app(bridge: &AudioBridge, app_name: &str) -> Result<(), CallerError> {
     bridge.inner.route_app(app_name).await
 }
@@ -501,6 +506,7 @@ impl PlatformBridge {
         }
     }
 
+    #[allow(dead_code)]
     async fn is_available() -> bool {
         has_switchaudio().await && find_blackhole_devices().await.is_some()
     }
@@ -533,6 +539,7 @@ impl PlatformBridge {
         &self.mic_device_name
     }
 
+    #[allow(dead_code)]
     fn app_capture_device(&self) -> &str {
         &self.speaker_device_name
     }

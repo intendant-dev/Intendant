@@ -4,11 +4,12 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Global autonomy level controlling how much user approval is needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AutonomyLevel {
     /// Ask before every command execution
     Low,
     /// Ask before writes, network, destructive (default)
+    #[default]
     Medium,
     /// Only ask for unavoidable human input
     High,
@@ -43,12 +44,6 @@ impl AutonomyLevel {
             Self::High => Self::Medium,
             Self::Full => Self::High,
         }
-    }
-}
-
-impl Default for AutonomyLevel {
-    fn default() -> Self {
-        Self::Medium
     }
 }
 
@@ -142,16 +137,12 @@ impl fmt::Display for ActionCategory {
 /// Per-category approval rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ApprovalRule {
     Auto,
+    #[default]
     Ask,
     Deny,
-}
-
-impl Default for ApprovalRule {
-    fn default() -> Self {
-        Self::Ask
-    }
 }
 
 impl ApprovalRule {
@@ -441,7 +432,7 @@ pub fn classify_command(cmd: &serde_json::Value) -> Vec<ActionCategory> {
     let targets_user_display = cmd
         .get("display")
         .and_then(|d| d.as_i64())
-        .map_or(false, |id| id <= 0);
+        .is_some_and(|id| id <= 0);
 
     match function {
         "inspectPath" | "recallMemory" => vec![ActionCategory::FileRead],

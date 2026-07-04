@@ -78,7 +78,7 @@ struct PeerArgs {
     requester_card_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum PeerAction {
     Invite,
     Join,
@@ -89,13 +89,8 @@ enum PeerAction {
     Complete,
     Identities,
     Revoke,
+    #[default]
     Help,
-}
-
-impl Default for PeerAction {
-    fn default() -> Self {
-        Self::Help
-    }
 }
 
 #[derive(Debug)]

@@ -74,6 +74,7 @@ impl TilePolicy {
         }
     }
 
+    #[allow(dead_code)]
     pub fn mode(&self) -> TileMode {
         self.state
     }

@@ -48,6 +48,7 @@ impl std::error::Error for TileEncodeError {}
 /// Encode one tile. Partial right/bottom edge tiles are padded to a
 /// full tile with opaque black pixels so the browser compositor can
 /// treat every payload as `tile_size_px * tile_size_px`.
+#[allow(dead_code)]
 pub fn encode_tile(src: &TileSource<'_>, tile: TileId) -> Result<TileRecord, TileEncodeError> {
     validate_source(src)?;
     let raw = raw_bgra_tile(src, tile)?;

@@ -201,8 +201,9 @@ pub struct DashboardControlRegistry {
     peers: Mutex<HashMap<String, DashboardControlPeer>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum DashboardControlGrant {
+    #[default]
     TrustedLocal,
     UserClientRoot {
         principal: crate::access::iam::AccessPrincipal,
@@ -217,12 +218,6 @@ pub enum DashboardControlGrant {
         profile: String,
         filesystem: crate::peer::access_policy::FilesystemAccessPolicy,
     },
-}
-
-impl Default for DashboardControlGrant {
-    fn default() -> Self {
-        Self::TrustedLocal
-    }
 }
 
 impl DashboardControlGrant {
@@ -514,6 +509,7 @@ impl DashboardControlRegistry {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn answer_offer(
         &self,
         offer_sdp: String,
@@ -2461,18 +2457,14 @@ fn control_frame_response(
                     let ttl_ms = match params_ref {
                         Some(p) => match optional_u64_param(p, &["ttl_ms"]) {
                             Ok(value) => value,
-                            Err(error) => {
-                                return Some(dashboard_control_error_response(id, error))
-                            }
+                            Err(error) => return Some(dashboard_control_error_response(id, error)),
                         },
                         None => None,
                     };
                     let offline_ms = match params_ref {
                         Some(p) => match optional_u64_param(p, &["offline_ms"]) {
                             Ok(value) => value,
-                            Err(error) => {
-                                return Some(dashboard_control_error_response(id, error))
-                            }
+                            Err(error) => return Some(dashboard_control_error_response(id, error)),
                         },
                         None => None,
                     };
@@ -2531,8 +2523,10 @@ fn control_frame_response(
                     let selector = params
                         .as_ref()
                         .and_then(|p| optional_string_param(p, &["lease_id", "leaseId", "kind"]));
-                    let revoked =
-                        crate::credential_leases::revoke(selector.as_deref(), runtime.grant.label());
+                    let revoked = crate::credential_leases::revoke(
+                        selector.as_deref(),
+                        runtime.grant.label(),
+                    );
                     Some(serde_json::json!({
                         "t": "response",
                         "id": id,
@@ -2653,10 +2647,8 @@ fn control_frame_response(
                                 .map(str::to_string)
                                 .collect()
                         });
-                    let unregistered = crate::credential_egress::unregister(
-                        &runtime.session_id,
-                        kinds.as_deref(),
-                    );
+                    let unregistered =
+                        crate::credential_egress::unregister(&runtime.session_id, kinds.as_deref());
                     Some(serde_json::json!({
                         "t": "response",
                         "id": id,
@@ -2738,11 +2730,17 @@ fn control_frame_response(
                         })),
                     }
                 }
-                "api_access_org_trust" | "api_access_org_revoke" | "api_access_org_issue"
-                | "api_access_org_present" | "api_access_org_revoke_member"
-                | "api_access_org_issuer_init" | "api_access_org_issuer_delegate"
+                "api_access_org_trust"
+                | "api_access_org_revoke"
+                | "api_access_org_issue"
+                | "api_access_org_present"
+                | "api_access_org_revoke_member"
+                | "api_access_org_issuer_init"
+                | "api_access_org_issuer_delegate"
                 | "api_access_org_issuer_install"
-                | "api_access_org_orl" | "api_access_org_orl_apply" | "api_access_org_renew" => {
+                | "api_access_org_orl"
+                | "api_access_org_orl_apply"
+                | "api_access_org_renew" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
                     let result = match method {
                         "api_access_org_trust" => {
@@ -2766,11 +2764,9 @@ fn control_frame_response(
                         "api_access_org_issuer_install" => {
                             crate::web_gateway::access_org_issuer_install_response_value(params)
                         }
-                        "api_access_org_orl" => {
-                            crate::web_gateway::access_org_orl_response_value(
-                                params.get("handle").and_then(|v| v.as_str()).unwrap_or(""),
-                            )
-                        }
+                        "api_access_org_orl" => crate::web_gateway::access_org_orl_response_value(
+                            params.get("handle").and_then(|v| v.as_str()).unwrap_or(""),
+                        ),
                         "api_access_org_orl_apply" => {
                             crate::web_gateway::access_org_orl_apply_response_value(params)
                         }
@@ -3617,12 +3613,8 @@ fn control_tui_key_frame(
     tui_connections: &HashMap<String, DashboardTuiConnection>,
 ) -> Option<serde_json::Value> {
     let connection_id = tui_frame_connection_id(&frame);
-    let Some(conn) = tui_connections.get(&connection_id) else {
-        return None;
-    };
-    let Some(key) = crate::tui::web::parse_web_key(&frame) else {
-        return None;
-    };
+    let conn = tui_connections.get(&connection_id)?;
+    let key = crate::tui::web::parse_web_key(&frame)?;
     if let Some(web_tui_tx) = runtime.web_tui_tx.as_ref() {
         let _ = web_tui_tx.send(crate::tui::web::WebTuiCommand::Key {
             id: conn.internal_id.clone(),
@@ -3638,9 +3630,7 @@ fn control_tui_resize_frame(
     tui_connections: &HashMap<String, DashboardTuiConnection>,
 ) -> Option<serde_json::Value> {
     let connection_id = tui_frame_connection_id(&frame);
-    let Some(conn) = tui_connections.get(&connection_id) else {
-        return None;
-    };
+    let conn = tui_connections.get(&connection_id)?;
     let cols = terminal_frame_dimension(&frame, "cols", 80);
     let rows = terminal_frame_dimension(&frame, "rows", 24);
     if let Some(web_tui_tx) = runtime.web_tui_tx.as_ref() {
@@ -3659,9 +3649,7 @@ fn control_tui_unsubscribe_frame(
     tui_connections: &HashMap<String, DashboardTuiConnection>,
 ) -> Option<serde_json::Value> {
     let connection_id = tui_frame_connection_id(&frame);
-    let Some(conn) = tui_connections.get(&connection_id) else {
-        return None;
-    };
+    let conn = tui_connections.get(&connection_id)?;
     if let Some(web_tui_tx) = runtime.web_tui_tx.as_ref() {
         let _ = web_tui_tx.send(crate::tui::web::WebTuiCommand::Unsubscribe {
             id: conn.internal_id.clone(),
@@ -3676,9 +3664,7 @@ fn control_tui_close_frame(
     tui_connections: &mut HashMap<String, DashboardTuiConnection>,
 ) -> Option<serde_json::Value> {
     let connection_id = tui_frame_connection_id(&frame);
-    let Some(conn) = tui_connections.remove(&connection_id) else {
-        return None;
-    };
+    let conn = tui_connections.remove(&connection_id)?;
     let DashboardTuiConnection {
         internal_id,
         forwarder,
@@ -4884,9 +4870,7 @@ async fn api_credential_egress_probe_response(
             "ok": true,
             "result": { "text": response.content, "model": provider.model() },
         }),
-        Err(error) => {
-            dashboard_control_error_response(id, format!("egress probe failed: {error}"))
-        }
+        Err(error) => dashboard_control_error_response(id, format!("egress probe failed: {error}")),
     }
 }
 
@@ -11224,26 +11208,17 @@ mod tests {
         // inspect fueling; the trusted-local and operator lanes can.
         let mut rt = runtime();
         rt.grant = scoped_user_client_grant();
-        assert!(authorize_dashboard_control_method(
-            &rt,
-            "api_credential_lease_status",
-            None
-        )
-        .is_err());
-        assert!(authorize_dashboard_control_method(
-            &rt,
-            "api_credential_lease_grant",
-            None
-        )
-        .is_err());
+        assert!(
+            authorize_dashboard_control_method(&rt, "api_credential_lease_status", None).is_err()
+        );
+        assert!(
+            authorize_dashboard_control_method(&rt, "api_credential_lease_grant", None).is_err()
+        );
 
         rt.grant = DashboardControlGrant::TrustedLocal;
-        assert!(authorize_dashboard_control_method(
-            &rt,
-            "api_credential_lease_grant",
-            None
-        )
-        .is_ok());
+        assert!(
+            authorize_dashboard_control_method(&rt, "api_credential_lease_grant", None).is_ok()
+        );
     }
 
     #[test]

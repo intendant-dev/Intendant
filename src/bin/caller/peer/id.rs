@@ -35,6 +35,7 @@ impl PeerId {
     }
 
     /// Parse the kind prefix from the id.
+    #[allow(dead_code)]
     pub fn kind(&self) -> Option<PeerKind> {
         let prefix = self.0.split(':').next()?;
         PeerKind::from_str(prefix)
@@ -42,6 +43,7 @@ impl PeerId {
 
     /// Return the label portion (everything after the first `:`).
     /// If the id has no colon at all, the whole id is the label.
+    #[allow(dead_code)]
     pub fn label(&self) -> &str {
         match self.0.split_once(':') {
             Some((_, rest)) => rest,

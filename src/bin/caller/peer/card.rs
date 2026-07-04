@@ -373,6 +373,7 @@ impl AuthRequirements {
     /// No auth at any layer. Trust the network (loopback, tailnet,
     /// trusted LAN behind a firewall). Default for phase-1
     /// federation between Intendants on a trusted LAN.
+    #[allow(dead_code)]
     pub fn none() -> Self {
         Self {
             transport: TransportAuth::None,
@@ -384,6 +385,7 @@ impl AuthRequirements {
     /// cert. No application-layer requirement. Right for trusted-LAN
     /// federation behind native `--mtls`. Inadequate alone for WAN exposure; pair with
     /// [`AuthRequirements::mutual_tls_and_bearer`] for that.
+    #[allow(dead_code)]
     pub fn mutual_tls() -> Self {
         Self {
             transport: TransportAuth::MutualTls,
@@ -395,6 +397,7 @@ impl AuthRequirements {
     /// requirement. Use over already-secured transports like a
     /// Tailscale tailnet (where the WireGuard layer authenticates
     /// peers and bearer adds a per-app secret on top).
+    #[allow(dead_code)]
     pub fn bearer(hint: Option<String>) -> Self {
         Self {
             transport: TransportAuth::None,
@@ -409,6 +412,7 @@ impl AuthRequirements {
     /// layer plus bearer-per-request at the application layer. Even
     /// if one CVE breaks TLS verification, requests still need a
     /// valid bearer to reach the daemon's handler.
+    #[allow(dead_code)]
     pub fn mutual_tls_and_bearer(hint: Option<String>) -> Self {
         Self {
             transport: TransportAuth::MutualTls,

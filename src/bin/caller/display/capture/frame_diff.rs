@@ -62,10 +62,7 @@ impl FrameDiffDamageTracker {
             for tx in 0..grid.width_tiles {
                 let tile = TileId::new(tx, ty);
                 let hash = hash_tile(frame, &grid, tile)?;
-                let changed = self
-                    .last_hashes
-                    .get(&tile)
-                    .map_or(true, |prev| *prev != hash);
+                let changed = self.last_hashes.get(&tile).is_none_or(|prev| *prev != hash);
                 self.last_hashes.insert(tile, hash);
                 if changed {
                     dirty.push(tile_rect(&grid, tile));

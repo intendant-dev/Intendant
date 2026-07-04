@@ -131,16 +131,20 @@ pub struct TwccEvent {
     /// Time the tap observed this packet (reads from the
     /// `TaggedPacket::now` field rtc populates from the incoming
     /// transport message). Useful for windowing.
+    #[allow(dead_code)]
     pub at: Instant,
     /// SSRC the receiver claimed for itself in the RTCP header.
     /// Browsers typically use a single sender-SSRC across all TLC
     /// packets in one session.
+    #[allow(dead_code)]
     pub sender_ssrc: u32,
     /// SSRC of the media this TLC reports on. For simulcast send
     /// the browser may issue per-layer TLCs (one media_ssrc per
     /// per-RID encoding) OR a single aggregate-ssrc TLC; WKWebView
     /// emits the latter.
+    #[allow(dead_code)]
     pub media_ssrc: u32,
+    #[allow(dead_code)]
     pub base_sequence_number: u16,
     pub packet_status_count: u16,
     pub fb_pkt_count: u8,

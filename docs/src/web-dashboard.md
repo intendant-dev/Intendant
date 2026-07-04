@@ -1722,19 +1722,37 @@ Remaining design questions before production rollout:
 
 ## HTTP endpoints
 
+Routing matches the parsed `(method, path)` — exact routes or their
+`/`-nested sub-routes, query string stripped — so the dispatch chain and the
+per-route IAM/Origin gates always classify a request identically. Grouped by
+family (sub-routes elided where the family is uniform):
+
 | Endpoint | Description |
 |----------|-------------|
 | `GET /` | The dashboard SPA |
 | `GET /config` | Live-model configuration JSON (provider, model, sample rates, git SHA) |
 | `GET /debug` | Debug JSON (agent state, voice connection, active browser) |
 | `POST /session` | Mint ephemeral session tokens for Gemini Live / OpenAI Realtime |
-| `GET /wasm-web/*` | Compiled WASM + JS glue (content-hash cache-busted) |
+| `GET /wasm-web/*`, `GET /wasm-station/*` | Compiled WASM + JS glue (content-hash cache-busted) |
 | `GET /audio-processor.js` | AudioWorklet processor for mic capture |
-| `GET /api/sessions` | List past sessions |
-| `GET /api/session/{id}` | Session detail |
-| `GET /api/session/{id}/recordings/*` | Recording segments for a past session |
-| `GET /recordings/*` | Current-session recording segments |
+| `GET /.well-known/agent-card.json` | Agent card (identity + capabilities) for peers and integrations |
+| `POST /mcp` | Streamable-HTTP MCP server (per-tool IAM; see [MCP server](./mcp-server.md)) |
 | `WS /` or `WS /ws` | Main WebSocket: events, TUI terminal and fallback Shell terminal I/O, presence protocol, WebRTC signaling |
+| `GET /api/sessions` | List past sessions (`/stream` NDJSON variant, `/search` full-text) |
+| `GET /api/session/{id}/*` | Per-session detail, report, agent output, log replay, recordings, frame assets; `POST .../delete` |
+| `POST /api/session/current/*` | Current-session ops: `history`, `rollback`, `redo`, `prune`, `changes`, `agent-output`, `control-msg` |
+| `GET/POST /api/session/current/uploads[/*]` | Task attachment store (list, upload, raw fetch, delete) |
+| `GET /api/managed-context/{records,anchors,fission}` | Managed-context state: rewind records, anchors, fission groups |
+| `GET /recordings/*`, `GET /frames/*` | Current-session recording segments and captured frame assets |
+| `GET /api/fs/{stat,list,read}`, `POST /api/fs/mkdir` | Scoped filesystem browsing (fs scope enforced per grant) |
+| `GET/POST /api/settings`, `POST /api/api-keys`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key management |
+| `GET /api/displays`, `POST /api/diagnostics/visual-freshness` | Display inventory; visual-freshness probe marker |
+| `GET /api/access/{overview,iam/state}`, `GET /api/dashboard/targets` | Trust-architecture snapshots (IAM state, fleet targets) |
+| `POST /api/access/...` | Trust mutations: enrollment decide, IAM grant upsert/update, org trust/revoke, org-grant issue/renew/revoke-member, issuer init/delegate/install, revocation-list apply |
+| `GET/POST /api/peers[/*]` | Peer federation: registry reads (GET), pairing + management (POST) |
+| `POST /api/coordinator/route` | Multi-agent coordinator task routing (peer lane) |
+| `GET /api/worktrees`, `POST /api/worktrees/{inspect,scan,remove}` | Agent worktree inventory and lifecycle |
+| `GET /connect/{bootstrap,status}`, `POST /connect/dashboard/{offer,ice,close}` | Intendant Connect tunnel: bootstrap metadata and dashboard-control WebRTC signaling |
 
 The full WebSocket message protocol (inbound key/resize/presence/WebRTC frames,
 outbound term/state/log-replay/tool-response frames) and the gateway's internal

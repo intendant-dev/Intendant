@@ -88,6 +88,7 @@ impl ContextInjection {
     /// Create a user injection that originated from a queued steer. The id
     /// round-trips back out via `AppEvent::SteerDelivered` when the item is
     /// drained so frontends can correlate their pending-steer UI.
+    #[allow(dead_code)]
     pub fn text_with_steer_id(msg: String, steer_id: String) -> Self {
         Self::text_with_steer_id_for_target(msg, steer_id, None)
     }

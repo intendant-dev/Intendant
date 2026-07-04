@@ -67,16 +67,17 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{
     AclSizeInformation, CreateRestrictedToken, CreateWellKnownSid, DeleteAce, EqualSid, GetAce,
-    GetAclInformation, WinBuiltinUsersSid, WinRestrictedCodeSid, WinWorldSid,
-    ACCESS_ALLOWED_ACE,
+    GetAclInformation, WinBuiltinUsersSid, WinRestrictedCodeSid, WinWorldSid, ACCESS_ALLOWED_ACE,
     ACE_FLAGS, ACL as WIN_ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
-    DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-    DISABLE_MAX_PRIVILEGE, PSECURITY_DESCRIPTOR, PSID, SECURITY_MAX_SID_SIZE,
-    SID_AND_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
-    WRITE_RESTRICTED,
+    DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR,
+    PSID, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_QUERY, WELL_KNOWN_SID_TYPE, WRITE_RESTRICTED,
 };
 use windows::Win32::Storage::FileSystem::{
     DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+};
+use windows::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Environment::GetCommandLineW;
 use windows::Win32::System::JobObjects::{
@@ -88,9 +89,6 @@ use windows::Win32::System::Threading::{
     CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
     WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_CREATION_FLAGS,
     PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
-};
-use windows::Win32::System::Console::{
-    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 
 /// Marker env var: present in the restricted re-exec child so it does not
@@ -109,7 +107,10 @@ fn read_mask() -> u32 {
 /// Access mask for write-lane grants: the "Modify" bundle — read, write,
 /// execute, delete (self and children).
 fn write_mask() -> u32 {
-    FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0 | DELETE.0
+    FILE_GENERIC_READ.0
+        | FILE_GENERIC_WRITE.0
+        | FILE_GENERIC_EXECUTE.0
+        | DELETE.0
         | FILE_DELETE_CHILD
 }
 
@@ -134,10 +135,8 @@ impl Sid {
         let mut len = buf.len() as u32;
         // SAFETY: buf is a writable buffer of len bytes; CreateWellKnownSid
         // writes a SID of at most SECURITY_MAX_SID_SIZE into it.
-        unsafe {
-            CreateWellKnownSid(kind, None, Some(PSID(buf.as_mut_ptr() as *mut _)), &mut len)
-        }
-        .map_err(|e| format!("CreateWellKnownSid: {e}"))?;
+        unsafe { CreateWellKnownSid(kind, None, Some(PSID(buf.as_mut_ptr() as *mut _)), &mut len) }
+            .map_err(|e| format!("CreateWellKnownSid: {e}"))?;
         buf.truncate(len as usize);
         Ok(Self { buf })
     }
@@ -237,7 +236,11 @@ fn add_restricted_ace(path: &Path, mask: u32) -> Result<(), String> {
     let status = unsafe {
         SetEntriesInAclW(
             Some(&[explicit]),
-            if old_dacl.is_null() { None } else { Some(old_dacl) },
+            if old_dacl.is_null() {
+                None
+            } else {
+                Some(old_dacl)
+            },
             &mut new_dacl,
         )
     };
@@ -534,8 +537,8 @@ fn pid_alive(pid: u32) -> bool {
             let handle = OwnedHandle(handle);
             let mut code = 0u32;
             // SAFETY: live handle; code is a valid out-pointer.
-            let still_active = unsafe { GetExitCodeProcess(handle.0, &mut code) }.is_ok()
-                && code == 259; // STILL_ACTIVE
+            let still_active =
+                unsafe { GetExitCodeProcess(handle.0, &mut code) }.is_ok() && code == 259; // STILL_ACTIVE
             still_active
         }
         Err(_) => false,
@@ -698,11 +701,7 @@ fn mark_std_handles_inheritable() {
         unsafe {
             if let Ok(h) = GetStdHandle(kind) {
                 if !h.is_invalid() && h != INVALID_HANDLE_VALUE {
-                    let _ = SetHandleInformation(
-                        h,
-                        HANDLE_FLAG_INHERIT.0,
-                        HANDLE_FLAG_INHERIT,
-                    );
+                    let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
                 }
             }
         }
@@ -904,10 +903,7 @@ pub fn stamp_daemon_write_grants(write_paths: &[PathBuf]) -> Result<AceGuard, St
 /// the current console (ConPTY), wait, and return the shell's exit code.
 /// The daemon already stamped the scope-root grants and scrubbed the
 /// environment.
-pub fn run_scoped_shell(
-    shell: &str,
-    shell_args: &[String],
-) -> Result<i32, String> {
+pub fn run_scoped_shell(shell: &str, shell_args: &[String]) -> Result<i32, String> {
     // No ACE work here: the daemon stamped the scope-root grants (held by
     // the PtySession) before spawning this wrapper — per-wrapper stamping
     // would race overlapping scoped shells sharing roots.
@@ -992,7 +988,11 @@ mod tests {
         let mut change_notify = LUID::default();
         // SAFETY: out-pointer valid; the privilege name is a static wide string.
         unsafe {
-            LookupPrivilegeValueW(PCWSTR::null(), w!("SeChangeNotifyPrivilege"), &mut change_notify)
+            LookupPrivilegeValueW(
+                PCWSTR::null(),
+                w!("SeChangeNotifyPrivilege"),
+                &mut change_notify,
+            )
         }
         .expect("lookup SeChangeNotifyPrivilege");
         for i in 0..privs.PrivilegeCount as usize {
@@ -1021,9 +1021,13 @@ mod tests {
             "\"{cmd}\" /d /s /c \"({script}) > \"{}\" 2>&1\"",
             out.display()
         );
-        let (process, _job) =
-            spawn_restricted(&token, Path::new(&cmd), std::ffi::OsStr::new(&cmdline), None)
-                .expect("spawn");
+        let (process, _job) = spawn_restricted(
+            &token,
+            Path::new(&cmd),
+            std::ffi::OsStr::new(&cmdline),
+            None,
+        )
+        .expect("spawn");
         let code = wait_exit_code(&process).expect("wait");
         let text = std::fs::read_to_string(&out).unwrap_or_default();
         let _ = std::fs::remove_file(&out);
@@ -1142,5 +1146,4 @@ mod tests {
         assert!(pid_alive(std::process::id()));
         let _ = std::fs::remove_dir_all(&scope);
     }
-
 }

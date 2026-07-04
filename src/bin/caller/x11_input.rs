@@ -481,8 +481,8 @@ pub async fn hold_key_sequence(
         }
         if pressed_any {
             for code in &ups {
-                if let Err(OpError::Conn(e)) | Err(OpError::Other(e)) =
-                    keycode_for(dc, code).and_then(|kc| {
+                if let Err(OpError::Conn(e)) | Err(OpError::Other(e)) = keycode_for(dc, code)
+                    .and_then(|kc| {
                         fake_key(dc, kc, false)?;
                         dc.conn.flush()?;
                         Ok(())
@@ -759,9 +759,9 @@ fn event_loop(dc: Arc<DisplayConn>) {
                     target: req.target,
                     property,
                 };
-                let _ = dc
-                    .conn
-                    .send_event(false, req.requestor, xproto::EventMask::NO_EVENT, notify);
+                let _ =
+                    dc.conn
+                        .send_event(false, req.requestor, xproto::EventMask::NO_EVENT, notify);
                 let _ = dc.conn.flush();
             }
             Event::SelectionClear(clear) => {
@@ -800,7 +800,11 @@ pub async fn screenshot_png(display: &str) -> Result<Vec<u8>, String> {
             .reply()?;
         let data = image.data;
         let (w, h) = (w as usize, h as usize);
-        let bpp = if h > 0 && w > 0 { data.len() / (w * h) } else { 0 };
+        let bpp = if h > 0 && w > 0 {
+            data.len() / (w * h)
+        } else {
+            0
+        };
         // ZPixmap depth-24/32 on little-endian servers is BGR(X) byte order —
         // every platform intendant targets.
         let mut rgb = Vec::with_capacity(w * h * 3);
@@ -857,8 +861,11 @@ mod tests {
         let png = screenshot_png(&display).await.expect("screenshot");
         assert!(png.len() > 1000);
         move_mouse(&display, 10, 10).await.expect("move");
-        key_sequence(&display, vec![("KeyA".to_string(), true), ("KeyA".to_string(), false)])
-            .await
-            .expect("key");
+        key_sequence(
+            &display,
+            vec![("KeyA".to_string(), true), ("KeyA".to_string(), false)],
+        )
+        .await
+        .expect("key");
     }
 }

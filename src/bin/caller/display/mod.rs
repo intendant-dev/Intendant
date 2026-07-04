@@ -893,6 +893,7 @@ fn stamp_visual_marker_bgra_tile(
     }
 }
 
+#[allow(dead_code)]
 fn should_try_xdamage_for_tile_stream(backend_kind: &str) -> bool {
     backend_kind == "x11"
 }
@@ -1888,8 +1889,8 @@ impl DisplaySession {
     ///       desktop pool peer-join on Linux H.264 stays black for
     ///       many seconds waiting on the heartbeat-paced 1 push/sec
     ///       cadence.
-    ///     The PLI-driven per-peer explicit request from inbound RTCP
-    ///     lands with the simulcast work.
+    ///       The PLI-driven per-peer explicit request from inbound RTCP
+    ///       lands with the simulcast work.
     ///   - No `pool_leases` tracking on `DisplaySession`:
     ///     [`webrtc::WebRtcPeer::new`] hands the lease to
     ///     the per-peer `pool_frame_intake` task, which owns it for
@@ -2124,7 +2125,7 @@ impl DisplaySession {
                         let visual_marker_value =
                             current_visual_marker_value(&marker_flag, session_epoch);
 
-                        let resized = grid.map_or(true, |g| g != next_grid);
+                        let resized = grid != Some(next_grid);
                         if resized {
                             let epoch = tile_epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                             seq = 1;
@@ -2710,7 +2711,7 @@ impl DisplaySession {
                         let heartbeat_due =
                             last_send_at.elapsed() >= IDLE_HEARTBEAT;
                         let in_burst = burst_until
-                            .map_or(false, |u| Instant::now() < u);
+                            .is_some_and(|u| Instant::now() < u);
                         if !(changed || heartbeat_due || in_burst) {
                             continue;
                         }

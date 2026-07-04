@@ -1,9 +1,9 @@
-/// Map DOM KeyboardEvent.code to Linux evdev keycode.
-///
-/// Phase 1: physical key semantics only -- this maps physical key positions,
-/// not character output. Non-US layouts will produce incorrect characters
-/// for text entry. This is a known limitation; a future phase will use the
-/// `key` field for character-level injection where the platform supports it.
+//! Map DOM KeyboardEvent.code to Linux evdev keycode.
+//!
+//! Phase 1: physical key semantics only -- this maps physical key positions,
+//! not character output. Non-US layouts will produce incorrect characters
+//! for text entry. This is a known limitation; a future phase will use the
+//! `key` field for character-level injection where the platform supports it.
 
 /// Returns the Linux evdev keycode for the given DOM `KeyboardEvent.code` value,
 /// or `None` if the code is unrecognised.

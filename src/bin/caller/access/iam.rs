@@ -2822,7 +2822,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
-        fs_scope: None,
+            fs_scope: None,
         });
 
         save_state(tmp.path(), &state).unwrap();
@@ -2937,7 +2937,10 @@ mod tests {
                 })
                 .unwrap_or(false)
         };
-        assert!(has("role:operator"), "operator must hold credentials.manage");
+        assert!(
+            has("role:operator"),
+            "operator must hold credentials.manage"
+        );
         assert!(!has("role:observer"));
         assert!(!has("role:session-reader"));
         assert!(!has("role:terminal"));
@@ -2993,7 +2996,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
-        fs_scope: None,
+            fs_scope: None,
         });
 
         let grants = grant_overview_values(&state, "local-daemon");
@@ -3033,7 +3036,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
-        fs_scope: None,
+            fs_scope: None,
         });
         state
     }
@@ -3291,8 +3294,7 @@ mod tests {
         .unwrap();
         assert_eq!(wildcard.grant.status, "revoked");
         assert!(principal_for_agent_session(&state, "other", "http").is_none());
-        let lapsed_other =
-            principal_for_agent_session_any_status(&state, "other", "http").unwrap();
+        let lapsed_other = principal_for_agent_session_any_status(&state, "other", "http").unwrap();
         assert_eq!(lapsed_other.id, "principal:agent-session:any");
         assert!(
             !evaluate_principal_operation_with_state(
