@@ -113,7 +113,7 @@ loop.
 | Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) |
 | Reasoning trace | Yes | Yes (`thinking` blocks) |
 | Rollback turns | Yes (`thread/rollback`) | No → session reset |
-| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | `compact` + `fork` (universal `thread_actions`; fork respawns via `--resume <id> --fork-session`). No side/fast/review/goals/memory-reset — see [Dashboard and Station parity](#dashboard-and-station-parity-codex-vs-claude-code) |
+| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | `compact`, `fork` (respawns via `--resume <id> --fork-session`), the full `goal*` family (wrapper goal engine), and live `model` / `permission-mode` — all via universal `thread_actions`. No side/fast/review/memory-reset — see [Dashboard and Station parity](#dashboard-and-station-parity-codex-vs-claude-code) |
 
 Both spawn through `crate::platform::spawn_command(&cfg.command)` with the
 working dir set to the project root and stdin/stdout/stderr piped; stderr is
