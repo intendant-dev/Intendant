@@ -20056,7 +20056,11 @@ function stationSessionRow(session, indexedIds = new Set()) {
     canInterrupt: false,
     canRestart: !!rowId && !!configSource && configSource !== 'intendant',
     canOpenLog: !!rowId,
-    canFork: !!rowId && (source === 'codex' || stationSessionLooksCodex(threadActionSessionId || rowId)),
+    canFork: !!rowId && (
+      source === 'codex' ||
+      stationSessionLooksCodex(threadActionSessionId || rowId) ||
+      (sessionThreadActionOps(threadActionSessionId || rowId) || []).includes('fork')
+    ),
   };
 }
 
@@ -22578,7 +22582,7 @@ function stationBuildSessionsSummary() {
       canInterrupt: !!row.target && !!row.stopId,
       canRestart: !!row.canConfig,
       canOpenLog: true,
-      canFork: !!row.isCodex,
+      canFork: !!row.isCodex || (sessionThreadActionOps(row.id) || []).includes('fork'),
     }));
   } catch (err) {
     console.warn('Station external target snapshot failed:', err);
@@ -26335,7 +26339,7 @@ function dispatchCodexThreadAction(op, params, sessionId = '', options = {}) {
   const sid = String(sessionId || '').trim() || resolvePromptTargetSessionId();
   const normalizedOp = String(op || '').trim().toLowerCase().replace(/_/g, '-');
   if (!sid) {
-    showControlToast('error', `/${op} needs a target Codex session`);
+    showControlToast('error', `/${op} needs a target session`);
     return false;
   }
   if (sid && sessionWindowIsSide(sid) && !codexThreadActionAllowedForSide(op)) {
@@ -26361,7 +26365,9 @@ function dispatchCodexThreadAction(op, params, sessionId = '', options = {}) {
   if (sid && !options.skipDetachedAttach && sessionWindowIsDetached(sid)) {
     return queueDetachedCodexThreadAction(sid, op, params || {});
   }
-  const payload = { action: 'codex_thread_action', op, params: params || {} };
+  // Canonical backend-neutral action name; the server also accepts the
+  // legacy `codex_thread_action` alias from older frontends.
+  const payload = { action: 'thread_action', op, params: params || {} };
   if (sid) payload.session_id = sid;
   dispatchControlMsg(payload);
   stationUpsertCodexThreadActionActivity(op, sid, 'requested', '', { renderLog: false });
@@ -26606,7 +26612,7 @@ function dispatchCodexSlashCommand(parsed) {
       showControlToast('info', 'Starting a fast Codex session');
       return true;
     }
-    showControlToast('error', `/${parsed.op}: select a Codex session first`);
+    showControlToast('error', `/${parsed.op}: select a target session first`);
     return false;
   }
   if (parsed.op === 'goal-edit') {
@@ -32344,7 +32350,7 @@ function codexThreadActionSpec(op) {
 }
 
 const SESSION_WINDOW_CODEX_ACTIONS = [
-  { op: 'fork', label: 'Fork...', title: 'Fork this Codex thread', ...CODEX_THREAD_ACTION_SPECS.fork },
+  { op: 'fork', label: 'Fork...', title: 'Fork this thread into a new session', ...CODEX_THREAD_ACTION_SPECS.fork },
   { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral Codex fork', ...CODEX_THREAD_ACTION_SPECS.side },
   { op: 'fast', label: 'Fast', title: 'Toggle Codex Fast service tier for future turns' },
   {
@@ -33159,6 +33165,10 @@ function codexThreadActionAllowedForSide(op) {
 
 function normalizeSessionCapabilities(raw = null) {
   if (!raw || typeof raw !== 'object') return null;
+  const normalizeOps = (list) => Array.isArray(list)
+    ? list.map(op => String(op || '').trim().toLowerCase().replace(/_/g, '-')).filter(Boolean)
+    : null;
+  const universalActions = normalizeOps(raw.thread_actions ?? raw.threadActions);
   const actions = raw.codex_thread_actions || raw.codexThreadActions;
   const rawFastMode = raw.codex_fast_mode ?? raw.codexFastMode;
   let codexFastMode = null;
@@ -33177,9 +33187,8 @@ function normalizeSessionCapabilities(raw = null) {
     followUp: raw.follow_up ?? raw.followUp ?? true,
     steer: raw.steer ?? false,
     interrupt: raw.interrupt ?? false,
-    codexThreadActions: Array.isArray(actions)
-      ? actions.map(op => String(op || '').trim().toLowerCase().replace(/_/g, '-')).filter(Boolean)
-      : null,
+    threadActions: universalActions,
+    codexThreadActions: normalizeOps(actions),
     codexManagedContext: raw.codex_managed_context ?? raw.codexManagedContext ?? null,
     codexSandbox: raw.codex_sandbox ?? raw.codexSandbox ?? null,
     codexApprovalPolicy: raw.codex_approval_policy ?? raw.codexApprovalPolicy ?? null,
@@ -33194,7 +33203,7 @@ function mergeSessionCapabilities(existing = null, incoming = null) {
   if (!existing) return incoming;
   if (!incoming) return existing;
   const merged = { ...existing, ...incoming };
-  for (const key of ['codexThreadActions', 'codexManagedContext', 'codexSandbox', 'codexApprovalPolicy', 'codexContextArchive', 'codexCommand', 'codexFastMode', 'codexServiceTier']) {
+  for (const key of ['threadActions', 'codexThreadActions', 'codexManagedContext', 'codexSandbox', 'codexApprovalPolicy', 'codexContextArchive', 'codexCommand', 'codexFastMode', 'codexServiceTier']) {
     if (
       key === 'codexServiceTier' &&
       incoming.codexFastMode === false &&
@@ -33261,8 +33270,21 @@ function getSessionCapabilities(sessionId) {
   const meta = sessionMetadataById.get(sid) || {};
   if (meta.capabilities) return meta.capabilities;
   if (meta.relationshipKind === 'subagent') {
-    return { followUp: true, steer: false, interrupt: false, codexThreadActions: [] };
+    return { followUp: true, steer: false, interrupt: false, threadActions: [], codexThreadActions: [] };
   }
+  return null;
+}
+
+// Backend-neutral per-session thread-action vocabulary. The universal
+// `threadActions` list wins; `codexThreadActions` is the legacy alias so
+// Codex sessions and old replays keep working. `null` means unknown (a
+// legacy session that never advertised capabilities) — callers fall back
+// to the codex heuristic for those.
+function sessionThreadActionOps(sessionId) {
+  const capabilities = getSessionCapabilities(sessionId);
+  if (!capabilities) return null;
+  if (Array.isArray(capabilities.threadActions)) return capabilities.threadActions;
+  if (Array.isArray(capabilities.codexThreadActions)) return capabilities.codexThreadActions;
   return null;
 }
 
@@ -33331,22 +33353,21 @@ function codexThreadActionStateForSession(sessionId, op) {
       ? { allowed: true, reason: '' }
       : { allowed: false, reason: 'Unsupported in a /side window' };
   }
-  const capabilities = getSessionCapabilities(sessionId);
-  if (capabilities && Array.isArray(capabilities.codexThreadActions)) {
-    const allowed = capabilities.codexThreadActions.includes(normalized);
-    if (!allowed) return { allowed: false, reason: 'Unsupported for this session' };
+  const ops = sessionThreadActionOps(sessionId);
+  if (Array.isArray(ops) && !ops.includes(normalized)) {
+    return { allowed: false, reason: 'Unsupported for this session' };
   }
   if (sessionWindowIsSubagent(sessionId)) {
-    return { allowed: false, reason: 'Unsupported for Codex subagent threads' };
+    return { allowed: false, reason: 'Unsupported for subagent threads' };
   }
-  // Codex thread actions operate on the attached backend thread, not on an
-  // active turn. An attached idle Codex app-server can fork/side/compact; only
+  // Thread actions operate on the attached backend thread, not on an
+  // active turn. An attached idle backend can fork/side/compact; only
   // detached history cards need the attach-before-dispatch path.
   if (sessionWindowIsDetached(sessionId)) {
     if (canQueueDetachedCodexThreadAction(sessionId)) {
       return { allowed: true, reason: 'Attach session to run this action' };
     }
-    return { allowed: false, reason: 'Attach this Codex session before running thread actions' };
+    return { allowed: false, reason: 'Attach this session before running thread actions' };
   }
   return { allowed: true, reason: '' };
 }
@@ -33424,12 +33445,21 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
       item.setAttribute('aria-disabled', item.disabled ? 'true' : 'false');
     }
   });
+  // Thread-action items gate on the session's ADVERTISED op vocabulary
+  // (universal `thread_actions`, legacy `codexThreadActions` alias). Legacy
+  // sessions that never advertised capabilities fall back to the codex
+  // heuristic so old replays keep their menu.
+  const advertisedOps = sessionThreadActionOps(sid);
+  const opVisible = (op) => (Array.isArray(advertisedOps)
+    ? advertisedOps.includes(String(op || '').trim())
+    : isCodex);
   win.actionMenu?.querySelectorAll('[data-session-window-codex-action]').forEach(item => {
     const op = item.dataset.sessionWindowAction || '';
     const spec = sessionWindowCodexActionByOp(op);
     const state = codexThreadActionStateForSession(sid, op);
-    item.classList.toggle('hidden', !isCodex || isSide);
-    item.disabled = isCodex && !isSide ? !state.allowed : false;
+    const visible = opVisible(op) && !isSide;
+    item.classList.toggle('hidden', !visible);
+    item.disabled = visible ? !state.allowed : false;
     if (op === 'fast' && state.allowed) {
       const fastMode = sessionCodexFastMode(sid);
       item.classList.toggle('active', fastMode === true);
@@ -33444,19 +33474,23 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
     item.setAttribute('aria-disabled', item.disabled ? 'true' : 'false');
   });
   win.actionMenu?.querySelectorAll('[data-session-window-codex-submenu]').forEach(submenu => {
-    submenu.classList.toggle('hidden', !isCodex || isSide);
-    if (!isCodex || isSide) submenu.classList.remove('open');
-    const trigger = submenu.querySelector('[data-session-window-submenu-trigger]');
     const childActions = Array.from(submenu.querySelectorAll('[data-session-window-codex-action]'));
+    const anyChildVisible = childActions.some(item => !item.classList.contains('hidden'));
+    submenu.classList.toggle('hidden', !anyChildVisible || isSide);
+    if (!anyChildVisible || isSide) submenu.classList.remove('open');
+    const trigger = submenu.querySelector('[data-session-window-submenu-trigger]');
     const hasEnabledChild = childActions.some(item => !item.disabled && !item.classList.contains('hidden'));
     if (trigger) {
-      trigger.disabled = isCodex && !isSide ? !hasEnabledChild : false;
+      trigger.disabled = anyChildVisible && !isSide ? !hasEnabledChild : false;
       trigger.setAttribute('aria-disabled', trigger.disabled ? 'true' : 'false');
       trigger.setAttribute('aria-expanded', submenu.classList.contains('open') ? 'true' : 'false');
     }
   });
   win.actionMenu?.querySelectorAll('[data-session-window-codex-separator]').forEach(item => {
-    item.classList.toggle('hidden', !isCodex || isSide);
+    const anyThreadActionVisible = !!win.actionMenu.querySelector(
+      '[data-session-window-codex-action]:not(.hidden), [data-session-window-codex-submenu]:not(.hidden)'
+    );
+    item.classList.toggle('hidden', !anyThreadActionVisible || isSide);
   });
 }
 
@@ -34176,8 +34210,10 @@ async function runSessionWindowCodexAction(sessionId, op) {
   const sid = String(sessionId || '').trim();
   const spec = sessionWindowCodexActionByOp(op);
   if (!sid || !spec) return;
-  if (!sessionWindowIsCodex(sid)) {
-    showControlToast('error', 'Codex actions are only available for Codex sessions');
+  // Sessions qualify by ADVERTISED thread-action ops (universal), with the
+  // codex heuristic as the legacy fallback for capability-less replays.
+  if (!Array.isArray(sessionThreadActionOps(sid)) && !sessionWindowIsCodex(sid)) {
+    showControlToast('error', 'Thread actions are not available for this session');
     return;
   }
   const actionState = codexThreadActionStateForSession(sid, op);

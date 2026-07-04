@@ -619,6 +619,11 @@ pub struct AgentConfig {
     /// Persisted backend-native session/thread id to resume instead of
     /// starting a fresh external conversation.
     pub resume_session: Option<String>,
+    /// Fork the resumed thread into a new backend-native session instead of
+    /// continuing it in place (Claude Code `--resume <id> --fork-session`).
+    /// Only meaningful together with `resume_session`; backends whose fork
+    /// is an in-process thread action ignore it.
+    pub fork_resume: bool,
     /// Codex state directory to use for this session's app-server process.
     /// Codex-only; other backends ignore.
     pub codex_home: Option<PathBuf>,
@@ -628,6 +633,23 @@ pub struct AgentConfig {
 #[derive(Debug)]
 pub struct AgentThread {
     pub thread_id: String,
+}
+
+/// How a backend implements the `fork` thread action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkHandling {
+    /// The backend forks natively in-process via `thread_action("fork")`;
+    /// the new thread id is parsed from the action's status message
+    /// (Codex `thread/fork`).
+    Native,
+    /// The backend forks by spawning a fresh process that resumes the
+    /// current thread with a fork flag; the new native session id is only
+    /// announced once the forked process runs its first turn. The drain
+    /// translates the action into a new supervisor session with
+    /// `AgentConfig { resume_session: thread_id, fork_resume: true }`.
+    /// `thread_id` is the canonical id of the thread being forked; `None`
+    /// means no canonical id is known yet and the fork must be refused.
+    RespawnResume { thread_id: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -842,6 +864,15 @@ pub trait ExternalAgent: Send + Sync {
         Err(CallerError::ExternalAgent(
             "mid-turn steering not supported by this backend".into(),
         ))
+    }
+
+    /// How this backend implements the `fork` thread action. The default —
+    /// `Native` — routes `fork` through `thread_action` like any other op;
+    /// backends without an in-process fork return `RespawnResume` so the
+    /// drain respawns a resumed process with the backend's fork flag
+    /// instead of calling `thread_action("fork")`.
+    fn fork_handling(&self) -> ForkHandling {
+        ForkHandling::Native
     }
 
     /// Dispatch a backend-specific thread action (Codex: compact, fork, side,

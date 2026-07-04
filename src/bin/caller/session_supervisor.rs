@@ -60,6 +60,12 @@ struct SupervisorState {
     next_session_instance: u64,
     restart_dedupe: HashMap<String, std::time::Instant>,
     external_attach_dedupe: HashMap<String, std::time::Instant>,
+    /// Ids (wrapper AND native) of every external session that announced a
+    /// SessionIdentity on this bus — including sessions the supervisor does
+    /// NOT manage, like the CLI main loop's own agent. The thread-action
+    /// fallback responder stays silent for these: their owning drain
+    /// answers, and a false "not attached" here would race a real result.
+    known_external_sessions: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -592,6 +598,7 @@ impl SessionSupervisor {
                 task,
                 direct,
                 attachments,
+                fork,
                 agent_command,
                 codex_sandbox,
                 codex_approval_policy,
@@ -606,6 +613,7 @@ impl SessionSupervisor {
                     task,
                     direct,
                     attachments,
+                    fork,
                     agent_command,
                     codex_sandbox,
                     codex_approval_policy,
@@ -805,25 +813,35 @@ impl SessionSupervisor {
 
         let failure = {
             let state = self.state.lock().await;
+            let unattached = || {
+                Some(format!(
+                    "target session {} is not attached to this daemon; attach it before /{}",
+                    short_session(target_id),
+                    op
+                ))
+            };
             match state.resolve_session_id(target_id) {
                 Some(managed_id) => match state.sessions.get(&managed_id) {
-                    Some(session) if session.source == "codex" => None,
+                    // Any live external backend: the owning drain dispatches
+                    // (and answers) the action — stay silent here.
+                    Some(session)
+                        if external_agent::AgentBackend::from_str_loose(&session.source)
+                            .is_some() =>
+                    {
+                        None
+                    }
                     Some(session) => Some(format!(
-                        "target session {} is a {} session, not a live Codex session",
+                        "target session {} is a {} session — thread actions need an external-agent session",
                         short_session(target_id),
                         session.source
                     )),
-                    None => Some(format!(
-                        "target Codex session {} is not attached to this daemon; attach it before /{}",
-                        short_session(target_id),
-                        op
-                    )),
+                    None => unattached(),
                 },
-                None => Some(format!(
-                    "target Codex session {} is not attached to this daemon; attach it before /{}",
-                    short_session(target_id),
-                    op
-                )),
+                // Not supervisor-managed, but a live session on this bus
+                // announced this id (e.g. the CLI main loop's own agent):
+                // its drain answers; a failure here would race a real result.
+                None if state.known_external_sessions.contains(target_id) => None,
+                None => unattached(),
             }
         };
 
@@ -1145,6 +1163,7 @@ impl SessionSupervisor {
         task: Option<String>,
         direct: Option<bool>,
         attachments: Vec<String>,
+        fork: bool,
         agent_command: Option<String>,
         codex_sandbox: Option<String>,
         codex_approval_policy: Option<String>,
@@ -1152,6 +1171,10 @@ impl SessionSupervisor {
         codex_context_archive: Option<String>,
         force_new: bool,
     ) {
+        // A fork never attaches to (or dedupes against) the thread it forks
+        // from: it always materializes as a fresh wrapper session that keeps
+        // the requested resume token verbatim.
+        let force_new = force_new || fork;
         let source_norm = source.trim().to_lowercase();
         let resume_task = task.and_then(|task| {
             let trimmed = task.trim();
@@ -1189,7 +1212,7 @@ impl SessionSupervisor {
         } else {
             Vec::new()
         };
-        let session_agent_config = external_backend.as_ref().map(|backend| {
+        let mut session_agent_config = external_backend.as_ref().map(|backend| {
             let mut config = crate::session_config::from_wire(
                 Some(backend.as_short_str()),
                 agent_command.as_deref(),
@@ -1209,6 +1232,15 @@ impl SessionSupervisor {
             }
             config
         });
+        if fork {
+            // Record what this session forks from. While the child's own
+            // native id is unknown, spawners treat `resume == forked_from`
+            // as "add the backend's fork flag"; afterwards it documents
+            // lineage and drives the `fork` relationship emit.
+            if let Some(config) = session_agent_config.as_mut() {
+                config.forked_from = Some(resume_token.clone());
+            }
+        }
         let project_root = if external_backend.is_some() {
             match resolve_external_resume_project_root(
                 project_root,
@@ -2045,6 +2077,7 @@ impl SessionSupervisor {
                     None,
                     Some(attach.direct.unwrap_or(true)),
                     Vec::new(),
+                    false,
                     None,
                     None,
                     None,
@@ -2550,6 +2583,7 @@ impl SessionSupervisor {
             task,
             direct,
             attachments,
+            false,
             agent_command,
             codex_sandbox,
             codex_approval_policy,
@@ -3127,6 +3161,16 @@ impl SessionSupervisor {
         if !external_agent::source_session_id_is_canonical(&source, &backend_session_id) {
             return;
         }
+        {
+            // Record the identity even for sessions this supervisor does not
+            // manage (e.g. the CLI main loop's agent) so the thread-action
+            // fallback responder knows another owner will answer for them.
+            let mut state = self.state.lock().await;
+            state.known_external_sessions.insert(session_id.clone());
+            state
+                .known_external_sessions
+                .insert(backend_session_id.clone());
+        }
         if session_id == backend_session_id {
             return;
         }
@@ -3285,6 +3329,7 @@ impl SessionSupervisor {
         let mut state = self.state.lock().await;
         state.session_aliases.remove(session_id);
         state.related_sessions.remove(session_id);
+        state.known_external_sessions.remove(session_id);
     }
 
     async fn update_session_phase(&self, session_id: Option<&str>, phase: &str) {
@@ -3879,6 +3924,12 @@ fn effective_session_agent_config_from_project(
             if overrides.codex_home.is_some() {
                 config.codex_home = overrides.codex_home.clone();
             }
+        }
+    }
+    // Fork lineage is a per-session fact, never derivable from the project.
+    if let Some(overrides) = overrides {
+        if overrides.forked_from.is_some() {
+            config.forked_from = overrides.forked_from.clone();
         }
     }
     config
@@ -5146,6 +5197,7 @@ mod tests {
                 Some("continue parent".to_string()),
                 Some(true),
                 Vec::new(),
+                false,
                 None,
                 None,
                 None,
@@ -5200,6 +5252,7 @@ mod tests {
                 Some("continue after restart".to_string()),
                 Some(true),
                 Vec::new(),
+                false,
                 None,
                 None,
                 None,
@@ -5383,6 +5436,7 @@ mod tests {
                 None,
                 Some(true),
                 Vec::new(),
+                false,
                 None,
                 None,
                 None,
@@ -5476,6 +5530,7 @@ mod tests {
                 Some("read attachment".to_string()),
                 Some(true),
                 vec![format!("upload:{}", upload.id)],
+                false,
                 None,
                 None,
                 None,

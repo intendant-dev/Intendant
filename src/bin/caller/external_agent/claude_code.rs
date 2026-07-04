@@ -153,6 +153,11 @@ struct CcShared {
     /// of subtype `error_during_execution`; this flag keeps that expected
     /// outcome from being reported as a backend error.
     interrupt_pending: AtomicBool,
+    /// Set by `thread_action("compact")`. An out-of-band `/compact` ends
+    /// with a FREE result (`num_turns: 0`, all-zero usage) that is not a
+    /// conversation turn; this flag lets the reader absorb it so it cannot
+    /// prematurely complete the next real turn.
+    compact_pending: AtomicBool,
 }
 
 impl CcShared {
@@ -160,6 +165,7 @@ impl CcShared {
         Self {
             session_id: StdMutex::new(resume_session),
             interrupt_pending: AtomicBool::new(false),
+            compact_pending: AtomicBool::new(false),
         }
     }
 
@@ -291,6 +297,11 @@ fn usage_snapshot_from_api_usage(
     let cache_creation = read("cache_creation_input_tokens").unwrap_or(0);
     let prompt_tokens = input + cache_read + cache_creation;
     let tokens_used = prompt_tokens + output;
+    // All-zero snapshots carry no information (the compact free result, some
+    // synthetic results) and would stomp the dashboard meter to 0%.
+    if tokens_used == 0 {
+        return None;
+    }
     let usage_pct = if context_window > 0 {
         (tokens_used as f64 / context_window as f64) * 100.0
     } else {
@@ -438,8 +449,38 @@ impl CcReader {
     }
 
     fn handle_system(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
-        if msg.get("subtype").and_then(|s| s.as_str()) != Some("init") {
-            return;
+        match msg.get("subtype").and_then(|s| s.as_str()) {
+            Some("init") => {}
+            // General status channel (2.1.201): compaction progress and
+            // permission-mode echoes arrive here.
+            Some("status") => {
+                if msg.get("status").and_then(|s| s.as_str()) == Some("compacting") {
+                    out.log("info", "Compacting context…");
+                } else if let Some(result) = msg.get("compact_result").and_then(|s| s.as_str()) {
+                    out.log(
+                        if result == "success" { "info" } else { "warn" },
+                        format!("Context compaction {result}"),
+                    );
+                }
+                return;
+            }
+            Some("compact_boundary") => {
+                let pre_tokens = msg
+                    .get("compact_metadata")
+                    .and_then(|m| m.get("pre_tokens"))
+                    .and_then(|t| t.as_u64());
+                out.log(
+                    "info",
+                    match pre_tokens {
+                        Some(tokens) => format!(
+                            "Context compacted — {tokens} tokens summarized into a fresh window"
+                        ),
+                        None => "Context compacted".to_string(),
+                    },
+                );
+                return;
+            }
+            _ => return,
         }
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
             self.model = model.to_string();
@@ -677,6 +718,16 @@ impl CcReader {
                 self.context_window = window;
             }
         }
+        if self.shared.compact_pending.swap(false, Ordering::SeqCst)
+            && msg.get("num_turns").and_then(|v| v.as_u64()) == Some(0)
+        {
+            // The free result of an out-of-band `/compact` (dispatched via
+            // thread_action, not as a user turn). Absorb it: emitting
+            // TurnCompleted here would prematurely complete whatever real
+            // turn was queued behind the compaction.
+            out.log("info", "Compaction settled — continuing on the fresh context");
+            return;
+        }
         if let Some(usage) = msg.get("usage") {
             if let Some(snapshot) =
                 usage_snapshot_from_api_usage(usage, &self.model, self.context_window)
@@ -904,6 +955,11 @@ pub struct ClaudeCodeAgent {
     /// same id across resumed processes, so this doubles as the known
     /// native id until the stream confirms it.
     resume_session: Option<String>,
+    /// Resume with `--fork-session`: the process continues the resumed
+    /// thread's context under a NEW native session id (announced on the
+    /// first turn), leaving the parent thread untouched. The resume id is
+    /// the fork source, not this session's identity.
+    fork_resume: bool,
     /// Whether the first prompt (carrying the bootstrap addendum) was sent.
     prompt_sent: bool,
     /// Loopback MCP auth token from the daemon, baked into the injected URL.
@@ -937,6 +993,7 @@ impl ClaudeCodeAgent {
             pending_approvals: Arc::new(StdMutex::new(HashMap::new())),
             reader_handle: None,
             resume_session: None,
+            fork_resume: false,
             prompt_sent: false,
             mcp_auth_token: None,
             mcp_session_id: None,
@@ -1008,9 +1065,17 @@ impl ExternalAgent for ClaudeCodeAgent {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        self.fork_resume = config.fork_resume && self.resume_session.is_some();
         self.mcp_auth_token = config.mcp_auth_token;
         self.mcp_session_id = config.mcp_session_id;
-        self.shared = Arc::new(CcShared::new(self.resume_session.clone()));
+        // In fork mode the resume id is the PARENT thread, not this
+        // session's identity — seed nothing and let the stream announce the
+        // forked child's own id.
+        self.shared = Arc::new(CcShared::new(if self.fork_resume {
+            None
+        } else {
+            self.resume_session.clone()
+        }));
 
         // Build command args
         let mut args = vec![
@@ -1033,6 +1098,9 @@ impl ExternalAgent for ClaudeCodeAgent {
         if let Some(ref session_id) = self.resume_session {
             args.push("--resume".into());
             args.push(session_id.clone());
+            if self.fork_resume {
+                args.push("--fork-session".into());
+            }
         }
 
         if let Some(mode) = normalize_permission_mode(&self.permission_mode) {
@@ -1137,13 +1205,62 @@ impl ExternalAgent for ClaudeCodeAgent {
         // implicit, and its id first appears on the stream once the first
         // prompt is sent (announced via `AgentEvent::NativeSessionId`). On
         // resume the id is already known — and stays stable — so it can be
-        // returned as canonical immediately.
+        // returned as canonical immediately. A `--fork-session` resume is
+        // the exception: the shared state is seeded empty there, so the
+        // placeholder is returned until the forked child announces its own
+        // id.
         Ok(AgentThread {
             thread_id: self
                 .shared
                 .session_id()
                 .unwrap_or_else(|| PLACEHOLDER_THREAD_ID.into()),
         })
+    }
+
+    fn fork_handling(&self) -> super::ForkHandling {
+        // Claude Code has no in-process fork: the drain respawns a resumed
+        // process with `--fork-session` as a new supervisor session, and
+        // the child announces its own native id on its first turn.
+        super::ForkHandling::RespawnResume {
+            thread_id: self
+                .shared
+                .session_id()
+                .filter(|id| id != PLACEHOLDER_THREAD_ID),
+        }
+    }
+
+    async fn thread_action(
+        &mut self,
+        op: &str,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
+        let _ = params;
+        match op {
+            "compact" => {
+                if self.writer.is_none() {
+                    return Err(CallerError::ExternalAgent("Not initialized".into()));
+                }
+                // `/compact` sent as a user message is the native compaction
+                // trigger (verified against 2.1.201; no control_request
+                // equivalent exists). The CLI answers with
+                // `status: compacting` → `compact_boundary` → a FREE result
+                // (num_turns 0, zero usage). Flag it so the reader absorbs
+                // that result instead of letting it complete the next turn.
+                self.shared.compact_pending.store(true, Ordering::SeqCst);
+                if let Err(e) = self.write_user_message("/compact").await {
+                    self.shared.compact_pending.store(false, Ordering::SeqCst);
+                    return Err(e);
+                }
+                Ok("Compaction requested — Claude Code is summarizing the conversation in place"
+                    .into())
+            }
+            // `fork` never reaches this method: the drain sees
+            // `ForkHandling::RespawnResume` and respawns instead.
+            other => Err(CallerError::ExternalAgent(format!(
+                "thread action /{} not supported by Claude Code (supported: compact, fork)",
+                other
+            ))),
+        }
     }
 
     async fn send_message(
@@ -2003,5 +2120,161 @@ mod tests {
             CLAUDE_CODE_BOOTSTRAP_ADDENDUM.contains(CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER),
             "bootstrap addendum no longer contains its strip marker"
         );
+    }
+
+    #[test]
+    fn fork_handling_is_respawn_resume_with_canonical_id_only() {
+        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], None);
+        // No id announced yet → the drain must refuse the fork.
+        assert_eq!(
+            agent.fork_handling(),
+            super::super::ForkHandling::RespawnResume { thread_id: None }
+        );
+        // Canonical id known → fork respawns resuming that id.
+        agent.shared = Arc::new(CcShared::new(Some("f00d-1234".into())));
+        assert_eq!(
+            agent.fork_handling(),
+            super::super::ForkHandling::RespawnResume {
+                thread_id: Some("f00d-1234".into())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_action_compact_requires_writer_and_rejects_unknown_ops() {
+        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], None);
+        // compact needs a live process (writer); before initialize it errors.
+        let err = agent
+            .thread_action("compact", &serde_json::Value::Null)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Not initialized"));
+        // Unsupported ops name the supported set so frontends can hint.
+        let err = agent
+            .thread_action("side", &serde_json::Value::Null)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("compact, fork"), "got: {err}");
+    }
+
+    #[test]
+    fn out_of_band_compact_result_is_absorbed_not_turn_completed() {
+        let mut reader = test_reader();
+        reader
+            .shared
+            .compact_pending
+            .store(true, Ordering::SeqCst);
+        // The free result that follows a thread_action("compact"): no turn.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","num_turns":0,"usage":{"input_tokens":0,"output_tokens":0},"session_id":"s1"}"#,
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })),
+            "compact free result must not complete a turn: {:?}",
+            out.events
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Usage { .. })),
+            "compact free result must not emit zero usage"
+        );
+        assert!(!reader.shared.compact_pending.load(Ordering::SeqCst));
+
+        // A REAL turn result while the flag is set (compaction raced a queued
+        // user message): flag is consumed, the turn completes normally.
+        reader
+            .shared
+            .compact_pending
+            .store(true, Ordering::SeqCst);
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","num_turns":2,"result":"done","session_id":"s1"}"#,
+        );
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+        assert!(!reader.shared.compact_pending.load(Ordering::SeqCst));
+
+        // User-typed /compact (no flag): the free result stays a normal
+        // turn completion so the round closes.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","num_turns":0,"session_id":"s1"}"#,
+        );
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+    }
+
+    #[test]
+    fn all_zero_usage_snapshots_are_suppressed() {
+        assert!(usage_snapshot_from_api_usage(
+            &serde_json::json!({"input_tokens": 0, "output_tokens": 0}),
+            "claude-haiku-4-5-20251001",
+            200000,
+        )
+        .is_none());
+        assert!(usage_snapshot_from_api_usage(
+            &serde_json::json!({"input_tokens": 3, "output_tokens": 5}),
+            "claude-haiku-4-5-20251001",
+            200000,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn system_status_and_compact_boundary_surface_as_logs() {
+        // The first sighted session_id also announces NativeSessionId, so
+        // assertions filter to the Log events rather than exact shapes.
+        fn logs(out: &CcLineOutcome) -> Vec<(String, String)> {
+            out.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Log { level, message } => {
+                        Some((level.clone(), message.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s1"}"#,
+        );
+        assert!(
+            logs(&out)
+                .iter()
+                .any(|(l, m)| l == "info" && m.contains("Compacting context")),
+            "got: {:?}",
+            out.events
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"status","status":null,"compact_result":"success","session_id":"s1"}"#,
+        );
+        assert!(
+            logs(&out)
+                .iter()
+                .any(|(l, m)| l == "info" && m.contains("compaction success")),
+            "got: {:?}",
+            out.events
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"compact_boundary","session_id":"s1","compact_metadata":{"trigger":"manual","pre_tokens":2614}}"#,
+        );
+        assert!(
+            logs(&out)
+                .iter()
+                .any(|(l, m)| l == "info" && m.contains("2614 tokens")),
+            "got: {:?}",
+            out.events
+        );
+        // Permission-mode status echoes stay silent (no log spam per turn).
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"status","status":null,"permissionMode":"acceptEdits","session_id":"s1"}"#,
+        );
+        assert!(logs(&out).is_empty(), "unexpected logs: {:?}", out.events);
     }
 }
