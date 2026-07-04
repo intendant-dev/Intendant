@@ -71,8 +71,8 @@ impl TileGrid {
         let ts = tile_size_px as u32;
         // ceil-div without overflow risk for plausible screen sizes
         // (max 64K × 64K still fits in u32 with 1px tiles).
-        let width_tiles = ((screen_w_px + ts - 1) / ts) as u16;
-        let height_tiles = ((screen_h_px + ts - 1) / ts) as u16;
+        let width_tiles = screen_w_px.div_ceil(ts) as u16;
+        let height_tiles = screen_h_px.div_ceil(ts) as u16;
         Some(Self {
             tile_size_px,
             width_tiles,

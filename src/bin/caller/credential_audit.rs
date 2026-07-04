@@ -206,7 +206,10 @@ pub fn record(event: &str, kind: &str, label: &str, actor: &str, detail: String)
         actor: actor.to_string(),
         detail,
     };
-    global().lock().expect("custody trail poisoned").record(entry);
+    global()
+        .lock()
+        .expect("custody trail poisoned")
+        .record(entry);
 }
 
 /// The most recent events, newest first.
@@ -231,7 +234,11 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir()
-            .join(format!("custody-audit-test-{}-{}", std::process::id(), name))
+            .join(format!(
+                "custody-audit-test-{}-{}",
+                std::process::id(),
+                name
+            ))
             .join("custody-audit.jsonl")
     }
 

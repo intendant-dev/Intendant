@@ -20,11 +20,17 @@ const HEADER_LEN: usize = 4; // u8 version, u8 type, u16 flags
 const RECORD_OVERHEAD: usize = 2 + 2 + 1 + 4; // tile_x, tile_y, encoding, payload_len
 const SNAPSHOT_BODY_OVERHEAD: usize = 4 + 4 + 2 + 2 + 2 + 2 + 2 + 4;
 const UPDATE_BODY_OVERHEAD: usize = 4 + 4 + 2;
+#[allow(dead_code)]
 const RESIZE_BODY_LEN: usize = 4 + 2 + 2 + 2;
+#[allow(dead_code)]
 const EPOCH_BODY_LEN: usize = 4;
+#[allow(dead_code)]
 const CURSOR_BODY_LEN: usize = 4 + 4 + 4 + 4 + 1;
+#[allow(dead_code)]
 const SUBSCRIBE_BODY_LEN: usize = 4;
+#[allow(dead_code)]
 const SNAPSHOT_REQUEST_BODY_LEN: usize = 4 + 1;
+#[allow(dead_code)]
 const GAP_REPORT_BODY_LEN: usize = 4 + 4 + 4;
 
 const TYPE_SNAPSHOT_CHUNK: u8 = 0x01;

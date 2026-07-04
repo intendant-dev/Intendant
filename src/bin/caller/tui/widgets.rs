@@ -115,7 +115,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App, view: &ViewState)
                 .bg(theme::STATUS_BAR_BG),
         ));
         spans.push(Span::styled(
-            format!("{}", presence_model),
+            presence_model.to_string(),
             Style::default()
                 .fg(theme::STATUS_MODEL_FG)
                 .bg(theme::STATUS_BAR_BG),
@@ -471,6 +471,7 @@ fn format_log_entry_with_turn(
     result
 }
 
+#[allow(dead_code)]
 fn format_log_entry(entry: &LogEntry) -> Vec<Line<'static>> {
     format_log_entry_with_turn(entry, &std::collections::HashSet::new(), false, 0)
 }

@@ -14,10 +14,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::error::CallerError;
 
 use super::{
-    encode_mcp_query_value, AgentConfig, AgentContextSnapshot, AgentContextTokenCountKind,
-    AgentEvent, AgentImageAttachment, AgentThread, AgentThreadSnapshot, AgentUsageSnapshot,
-    ApprovalCategory, ApprovalDecision, AutonomousGoalPauseResult, ExternalAgent,
-    RollbackAnchorPosition, SubAgentState, ToolCompletionStatus,
+    AgentConfig, AgentContextSnapshot, AgentContextTokenCountKind, AgentEvent,
+    AgentImageAttachment, AgentThread, AgentThreadSnapshot, AgentUsageSnapshot, ApprovalCategory,
+    ApprovalDecision, AutonomousGoalPauseResult, ExternalAgent, RollbackAnchorPosition,
+    SubAgentState, ToolCompletionStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -1735,6 +1735,7 @@ impl CodexAgent {
         )
     }
 
+    #[allow(dead_code)]
     fn intendant_mcp_base_url(port: u16) -> String {
         format!("http://localhost:{port}/mcp")
     }
@@ -1853,6 +1854,7 @@ impl CodexAgent {
         args
     }
 
+    #[allow(dead_code)]
     pub fn new(
         command: String,
         model: Option<String>,
@@ -1969,7 +1971,7 @@ impl CodexAgent {
                 let result = rx
                     .await
                     .map_err(|_| CallerError::ExternalAgent("Request channel closed".into()))?;
-                result.map_err(|msg| CallerError::ExternalAgent(msg))
+                result.map_err(CallerError::ExternalAgent)
             };
 
             match timeout {
@@ -2381,6 +2383,7 @@ struct CodexTraceIndex {
     responses_by_id: HashMap<String, CodexResponsePayloadRef>,
 }
 
+#[allow(dead_code)]
 async fn read_latest_codex_request_payload(
     root: &Path,
 ) -> Result<CodexRequestPayloadSnapshot, CallerError> {
@@ -2456,7 +2459,7 @@ fn read_codex_context_payloads_sync(
 ) -> Result<Vec<CodexRequestPayloadSnapshot>, CallerError> {
     let index = read_codex_trace_index_sync(root, thread_id)?;
     let mut requests = index.requests.clone();
-    requests.sort_by(|a, b| codex_request_sort_key(a).cmp(&codex_request_sort_key(b)));
+    requests.sort_by_key(codex_request_sort_key);
 
     let mut snapshots = Vec::with_capacity(requests.len());
     for (idx, request_ref) in requests.iter().enumerate() {
@@ -2476,7 +2479,7 @@ async fn read_codex_context_payloads_excluding(
 ) -> Result<Vec<CodexRequestPayloadSnapshot>, CallerError> {
     let index = read_codex_trace_index(root, thread_id).await?;
     let mut requests = index.requests.clone();
-    requests.sort_by(|a, b| codex_request_sort_key(a).cmp(&codex_request_sort_key(b)));
+    requests.sort_by_key(codex_request_sort_key);
 
     let mut snapshots = Vec::with_capacity(requests.len());
     for (idx, request_ref) in requests.iter().enumerate() {
@@ -2856,12 +2859,14 @@ fn codex_context_summary_parts(payload: &serde_json::Value) -> Vec<serde_json::V
             if consumed.contains(key.as_str()) || value.is_null() {
                 continue;
             }
-            if value.is_string() || value.is_number() || value.is_boolean() {
-                config.insert(key.clone(), value.clone());
-            } else if matches!(
-                key.as_str(),
-                "reasoning" | "metadata" | "include" | "tool_choice"
-            ) {
+            if value.is_string()
+                || value.is_number()
+                || value.is_boolean()
+                || matches!(
+                    key.as_str(),
+                    "reasoning" | "metadata" | "include" | "tool_choice"
+                )
+            {
                 config.insert(key.clone(), value.clone());
             }
         }
@@ -3653,9 +3658,7 @@ fn codex_pressure_floor_applies(
 ) -> bool {
     usage
         .and_then(codex_usage_context_window)
-        .map_or(true, |context_window| {
-            context_window == floor.context_window
-        })
+        .is_none_or(|context_window| context_window == floor.context_window)
 }
 
 fn codex_pressure_aware_usage_fields(
@@ -4090,9 +4093,9 @@ async fn reader_task(
                 .get("tokenUsage")
                 .cloned()
                 .unwrap_or_else(|| params.clone());
-            let usage_targets_active_thread = thread_id.as_deref().map_or(true, |thread_id| {
-                active_thread_snapshot.as_deref() == Some(thread_id)
-            });
+            let usage_targets_active_thread = thread_id
+                .as_deref()
+                .is_none_or(|thread_id| active_thread_snapshot.as_deref() == Some(thread_id));
             let usage = if usage_targets_active_thread {
                 let mut latest = latest_token_usage.lock().await;
                 let usage = codex_usage_preserving_hard_context_window(usage, latest.as_ref());
@@ -5123,7 +5126,7 @@ fn codex_command_mentions_code_path(command: &str) -> bool {
                     '\'' | '"' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
                 )
             })
-            .trim_end_matches(|ch: char| matches!(ch, ':' | '|'));
+            .trim_end_matches([':', '|']);
         let lower = token.to_ascii_lowercase();
         CODE_PATH_HINTS.iter().any(|hint| lower.contains(hint))
     })

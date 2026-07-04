@@ -724,7 +724,7 @@ impl FileWatcher {
                             lines_removed: 0,
                         });
                     }
-                    Err(_) => return,
+                    Err(_) => (),
                 }
             }
             FileChangeKind::Deleted => {
@@ -811,7 +811,7 @@ impl FileWatcher {
             .join("manifest.json");
         let manifest_bytes = serde_json::to_vec_pretty(&round)
             .map_err(|e| CallerError::Config(format!("manifest serialize: {}", e)))?;
-        atomic_write(&manifest_path, &manifest_bytes).map_err(|e| CallerError::Io(e))?;
+        atomic_write(&manifest_path, &manifest_bytes).map_err(CallerError::Io)?;
 
         self.history.rounds.push(round);
         self.history.current_head_id = Some(id);
@@ -1211,7 +1211,7 @@ impl FileWatcher {
         let path = self.snapshot_dir.join("history.json");
         let bytes = serde_json::to_vec_pretty(&self.history)
             .map_err(|e| CallerError::Config(format!("history serialize: {}", e)))?;
-        atomic_write(&path, &bytes).map_err(|e| CallerError::Io(e))?;
+        atomic_write(&path, &bytes).map_err(CallerError::Io)?;
         Ok(())
     }
 
@@ -1302,7 +1302,7 @@ async fn run_watcher_loop(
 
     while let Some(notify_event) = rx.recv().await {
         let paths = notify_event.paths.clone();
-        let kind = notify_event.kind.clone();
+        let kind = notify_event.kind;
         let mut w = shared.lock().await;
         for path in &paths {
             w.process_change(path, &kind);

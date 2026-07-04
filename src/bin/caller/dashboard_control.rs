@@ -111,6 +111,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_fs_list",
     "api_fs_mkdir",
     "api_fs_read",
+    "api_fs_write",
     "api_sessions_search",
     "api_settings",
     "api_settings_save",
@@ -200,8 +201,9 @@ pub struct DashboardControlRegistry {
     peers: Mutex<HashMap<String, DashboardControlPeer>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum DashboardControlGrant {
+    #[default]
     TrustedLocal,
     UserClientRoot {
         principal: crate::access::iam::AccessPrincipal,
@@ -216,12 +218,6 @@ pub enum DashboardControlGrant {
         profile: String,
         filesystem: crate::peer::access_policy::FilesystemAccessPolicy,
     },
-}
-
-impl Default for DashboardControlGrant {
-    fn default() -> Self {
-        Self::TrustedLocal
-    }
 }
 
 impl DashboardControlGrant {
@@ -513,6 +509,7 @@ impl DashboardControlRegistry {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn answer_offer(
         &self,
         offer_sdp: String,
@@ -2169,7 +2166,8 @@ fn dashboard_control_method_operation(
         "api_transfer_job_create"
         | "api_transfer_job_delete"
         | "api_transfer_upload_commit"
-        | "api_fs_mkdir" => Some(PeerOperation::FilesystemWrite),
+        | "api_fs_mkdir"
+        | "api_fs_write" => Some(PeerOperation::FilesystemWrite),
         "api_display_bootstrap" | "api_display_webrtc_signal" | "api_displays" => {
             Some(PeerOperation::DisplayView)
         }
@@ -2236,10 +2234,78 @@ fn authorize_dashboard_control_method(
     let Some(op) = dashboard_control_method_operation(method) else {
         return Ok(());
     };
-    runtime_operation_decision(runtime, op)
+    let result = runtime_operation_decision(runtime, op)
         .ensure_allowed()
-        .map_err(|reason| format!("dashboard-control method {method} is not allowed: {reason}"))?;
-    authorize_dashboard_control_filesystem(runtime, op, params)
+        .map_err(|reason| format!("dashboard-control method {method} is not allowed: {reason}"))
+        .and_then(|()| authorize_dashboard_control_filesystem(runtime, op, params));
+    audit_dashboard_control_filesystem(runtime, op, params, &result);
+    result
+}
+
+/// Audit twin of the HTTP lane's `[peer-fs]` / `[grant-fs]` lines
+/// (`web_gateway::audit_peer_filesystem_access`) for filesystem methods that
+/// arrive over the dashboard-control tunnel, so both transports leave the
+/// same trail: peer grants log allow and deny, other grants log denials.
+fn audit_dashboard_control_filesystem(
+    runtime: &ControlRuntime,
+    op: crate::peer::access_policy::PeerOperation,
+    params: Option<&serde_json::Value>,
+    result: &Result<(), String>,
+) {
+    use crate::peer::access_policy::PeerOperation;
+    if !matches!(
+        op,
+        PeerOperation::FilesystemRead | PeerOperation::FilesystemWrite
+    ) {
+        return;
+    }
+    let path = dashboard_control_filesystem_path(params).unwrap_or_default();
+    match &runtime.grant {
+        DashboardControlGrant::Peer {
+            fingerprint,
+            label,
+            profile,
+            ..
+        } => {
+            let (allowed, detail) = match result {
+                Ok(()) => (true, "allowed".to_string()),
+                Err(e) => (false, e.clone()),
+            };
+            runtime.bus.send(AppEvent::PresenceLog {
+                message: format!(
+                    "[peer-fs] {} peer={} fingerprint={} profile={} op={:?} path={} detail={}",
+                    if allowed { "allowed" } else { "denied" },
+                    label,
+                    fingerprint,
+                    profile,
+                    op,
+                    path,
+                    detail,
+                ),
+                level: Some(if allowed {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                }),
+                turn: None,
+            });
+        }
+        grant => {
+            if let Err(e) = result {
+                runtime.bus.send(AppEvent::PresenceLog {
+                    message: format!(
+                        "[grant-fs] denied principal={} op={:?} path={} detail={}",
+                        grant.label(),
+                        op,
+                        path,
+                        e,
+                    ),
+                    level: Some(LogLevel::Warn),
+                    turn: None,
+                });
+            }
+        }
+    }
 }
 
 /// Upload frames are authorized by the method they deliver — the same
@@ -2254,7 +2320,7 @@ fn authorize_dashboard_control_upload(
     use crate::peer::access_policy::PeerOperation;
     let op = match method {
         "api_session_current_upload" => PeerOperation::SessionManage,
-        "api_transfer_upload_chunk" => PeerOperation::FilesystemWrite,
+        "api_transfer_upload_chunk" | "api_fs_write" => PeerOperation::FilesystemWrite,
         "api_media_annotation_attach"
         | "api_media_annotation_submit"
         | "api_media_clip_frame"
@@ -2388,18 +2454,14 @@ fn control_frame_response(
                     let ttl_ms = match params_ref {
                         Some(p) => match optional_u64_param(p, &["ttl_ms"]) {
                             Ok(value) => value,
-                            Err(error) => {
-                                return Some(dashboard_control_error_response(id, error))
-                            }
+                            Err(error) => return Some(dashboard_control_error_response(id, error)),
                         },
                         None => None,
                     };
                     let offline_ms = match params_ref {
                         Some(p) => match optional_u64_param(p, &["offline_ms"]) {
                             Ok(value) => value,
-                            Err(error) => {
-                                return Some(dashboard_control_error_response(id, error))
-                            }
+                            Err(error) => return Some(dashboard_control_error_response(id, error)),
                         },
                         None => None,
                     };
@@ -2458,8 +2520,10 @@ fn control_frame_response(
                     let selector = params
                         .as_ref()
                         .and_then(|p| optional_string_param(p, &["lease_id", "leaseId", "kind"]));
-                    let revoked =
-                        crate::credential_leases::revoke(selector.as_deref(), runtime.grant.label());
+                    let revoked = crate::credential_leases::revoke(
+                        selector.as_deref(),
+                        runtime.grant.label(),
+                    );
                     Some(serde_json::json!({
                         "t": "response",
                         "id": id,
@@ -2580,10 +2644,8 @@ fn control_frame_response(
                                 .map(str::to_string)
                                 .collect()
                         });
-                    let unregistered = crate::credential_egress::unregister(
-                        &runtime.session_id,
-                        kinds.as_deref(),
-                    );
+                    let unregistered =
+                        crate::credential_egress::unregister(&runtime.session_id, kinds.as_deref());
                     Some(serde_json::json!({
                         "t": "response",
                         "id": id,
@@ -2665,11 +2727,17 @@ fn control_frame_response(
                         })),
                     }
                 }
-                "api_access_org_trust" | "api_access_org_revoke" | "api_access_org_issue"
-                | "api_access_org_present" | "api_access_org_revoke_member"
-                | "api_access_org_issuer_init" | "api_access_org_issuer_delegate"
+                "api_access_org_trust"
+                | "api_access_org_revoke"
+                | "api_access_org_issue"
+                | "api_access_org_present"
+                | "api_access_org_revoke_member"
+                | "api_access_org_issuer_init"
+                | "api_access_org_issuer_delegate"
                 | "api_access_org_issuer_install"
-                | "api_access_org_orl" | "api_access_org_orl_apply" | "api_access_org_renew" => {
+                | "api_access_org_orl"
+                | "api_access_org_orl_apply"
+                | "api_access_org_renew" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
                     let result = match method {
                         "api_access_org_trust" => {
@@ -2693,11 +2761,9 @@ fn control_frame_response(
                         "api_access_org_issuer_install" => {
                             crate::web_gateway::access_org_issuer_install_response_value(params)
                         }
-                        "api_access_org_orl" => {
-                            crate::web_gateway::access_org_orl_response_value(
-                                params.get("handle").and_then(|v| v.as_str()).unwrap_or(""),
-                            )
-                        }
+                        "api_access_org_orl" => crate::web_gateway::access_org_orl_response_value(
+                            params.get("handle").and_then(|v| v.as_str()).unwrap_or(""),
+                        ),
                         "api_access_org_orl_apply" => {
                             crate::web_gateway::access_org_orl_apply_response_value(params)
                         }
@@ -2975,6 +3041,7 @@ fn control_upload_start_frame(
         method,
         "api_session_current_upload"
             | "api_transfer_upload_chunk"
+            | "api_fs_write"
             | "api_media_annotation_attach"
             | "api_media_annotation_submit"
             | "api_media_clip_frame"
@@ -3170,6 +3237,7 @@ fn control_upload_end_frame(
             "api_transfer_upload_chunk" => {
                 api_transfer_upload_chunk_task_response(id.clone(), upload, runtime).await
             }
+            "api_fs_write" => api_fs_write_upload_task_response(id.clone(), upload, runtime).await,
             "api_media_annotation_attach" => {
                 api_media_annotation_upload_task_response(id.clone(), upload, runtime, false).await
             }
@@ -3542,12 +3610,8 @@ fn control_tui_key_frame(
     tui_connections: &HashMap<String, DashboardTuiConnection>,
 ) -> Option<serde_json::Value> {
     let connection_id = tui_frame_connection_id(&frame);
-    let Some(conn) = tui_connections.get(&connection_id) else {
-        return None;
-    };
-    let Some(key) = crate::tui::web::parse_web_key(&frame) else {
-        return None;
-    };
+    let conn = tui_connections.get(&connection_id)?;
+    let key = crate::tui::web::parse_web_key(&frame)?;
     if let Some(web_tui_tx) = runtime.web_tui_tx.as_ref() {
         let _ = web_tui_tx.send(crate::tui::web::WebTuiCommand::Key {
             id: conn.internal_id.clone(),
@@ -3563,9 +3627,7 @@ fn control_tui_resize_frame(
     tui_connections: &HashMap<String, DashboardTuiConnection>,
 ) -> Option<serde_json::Value> {
     let connection_id = tui_frame_connection_id(&frame);
-    let Some(conn) = tui_connections.get(&connection_id) else {
-        return None;
-    };
+    let conn = tui_connections.get(&connection_id)?;
     let cols = terminal_frame_dimension(&frame, "cols", 80);
     let rows = terminal_frame_dimension(&frame, "rows", 24);
     if let Some(web_tui_tx) = runtime.web_tui_tx.as_ref() {
@@ -3584,9 +3646,7 @@ fn control_tui_unsubscribe_frame(
     tui_connections: &HashMap<String, DashboardTuiConnection>,
 ) -> Option<serde_json::Value> {
     let connection_id = tui_frame_connection_id(&frame);
-    let Some(conn) = tui_connections.get(&connection_id) else {
-        return None;
-    };
+    let conn = tui_connections.get(&connection_id)?;
     if let Some(web_tui_tx) = runtime.web_tui_tx.as_ref() {
         let _ = web_tui_tx.send(crate::tui::web::WebTuiCommand::Unsubscribe {
             id: conn.internal_id.clone(),
@@ -3601,9 +3661,7 @@ fn control_tui_close_frame(
     tui_connections: &mut HashMap<String, DashboardTuiConnection>,
 ) -> Option<serde_json::Value> {
     let connection_id = tui_frame_connection_id(&frame);
-    let Some(conn) = tui_connections.remove(&connection_id) else {
-        return None;
-    };
+    let conn = tui_connections.remove(&connection_id)?;
     let DashboardTuiConnection {
         internal_id,
         forwarder,
@@ -4589,6 +4647,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_fs_list_available", fs_read),
         ("api_fs_mkdir_available", fs_write),
         ("api_fs_read_available", fs_read),
+        ("api_fs_write_available", fs_write),
         ("api_sessions_search_available", session_inspect),
         ("api_settings_available", settings),
         (
@@ -4803,9 +4862,7 @@ async fn api_credential_egress_probe_response(
             "ok": true,
             "result": { "text": response.content, "model": provider.model() },
         }),
-        Err(error) => {
-            dashboard_control_error_response(id, format!("egress probe failed: {error}"))
-        }
+        Err(error) => dashboard_control_error_response(id, format!("egress probe failed: {error}")),
     }
 }
 
@@ -7315,6 +7372,65 @@ async fn api_fs_mkdir_response(
     http_body_response(id, status_line_code(&status_line), body, "filesystem mkdir")
 }
 
+/// Terminal leg of an `api_fs_write` upload: the file contents arrived via
+/// `upload_start`/`upload_chunk` frames (op-level authority checked at
+/// `upload_start`); the path scope check runs here, where the params are
+/// final, via the same `authorize_dashboard_control_method` gate a plain
+/// request would pass through.
+async fn api_fs_write_upload_task_response(
+    id: String,
+    upload: InboundUploadState,
+    runtime: ControlRuntime,
+) -> ControlTaskResponse {
+    if let Err(error) =
+        authorize_dashboard_control_method(&runtime, "api_fs_write", Some(&upload.params))
+    {
+        return ControlTaskResponse {
+            id: id.clone(),
+            frame: http_body_response(
+                id,
+                403,
+                serde_json::json!({ "error": error }).to_string(),
+                "filesystem write",
+            ),
+            byte_stream: None,
+            done: true,
+        };
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let bytes = std::fs::read(upload.tmp.path())?;
+        Ok::<_, std::io::Error>(crate::web_gateway::dashboard_fs_write_response_parts(
+            &upload.params,
+            &bytes,
+        ))
+    })
+    .await;
+    let frame = match result {
+        Ok(Ok((code, body))) => http_body_response(id.clone(), code, body, "filesystem write"),
+        Ok(Err(e)) => http_body_response(
+            id.clone(),
+            500,
+            serde_json::json!({
+                "error": format!("could not read upload tempfile: {e}")
+            })
+            .to_string(),
+            "filesystem write",
+        ),
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("filesystem write task failed: {e}"),
+        }),
+    };
+    ControlTaskResponse {
+        id,
+        frame,
+        byte_stream: None,
+        done: true,
+    }
+}
+
 async fn api_fs_read_task_response(
     id: String,
     params: Option<&serde_json::Value>,
@@ -7379,6 +7495,11 @@ async fn api_fs_read_task_response(
         }
     };
     let size = bytes.len();
+    // Full reads carry the content hash so the editor has a conflict
+    // baseline for its later write-back (mirrors the HTTP route's
+    // X-Content-Sha256 header).
+    let sha256 = (offset == 0 && bytes.len() as u64 == total_size)
+        .then(|| crate::web_gateway::fs_sha256_hex(&bytes));
     let stream_name = display_path.to_string_lossy().to_string();
     ControlTaskResponse {
         id: id.clone(),
@@ -7400,6 +7521,7 @@ async fn api_fs_read_task_response(
                 "range_start": offset,
                 "range_end": end,
                 "resumable": true,
+                "sha256": sha256,
             }),
         }),
         done: true,
@@ -10899,6 +11021,7 @@ mod tests {
         assert_eq!(status["result"]["api_fs_list_available"], true);
         assert_eq!(status["result"]["api_fs_mkdir_available"], true);
         assert_eq!(status["result"]["api_fs_read_available"], true);
+        assert_eq!(status["result"]["api_fs_write_available"], true);
         assert_eq!(status["result"]["api_sessions_search_available"], true);
         assert_eq!(status["result"]["api_settings_available"], true);
         assert_eq!(status["result"]["api_settings_save_available"], false);
@@ -11077,26 +11200,17 @@ mod tests {
         // inspect fueling; the trusted-local and operator lanes can.
         let mut rt = runtime();
         rt.grant = scoped_user_client_grant();
-        assert!(authorize_dashboard_control_method(
-            &rt,
-            "api_credential_lease_status",
-            None
-        )
-        .is_err());
-        assert!(authorize_dashboard_control_method(
-            &rt,
-            "api_credential_lease_grant",
-            None
-        )
-        .is_err());
+        assert!(
+            authorize_dashboard_control_method(&rt, "api_credential_lease_status", None).is_err()
+        );
+        assert!(
+            authorize_dashboard_control_method(&rt, "api_credential_lease_grant", None).is_err()
+        );
 
         rt.grant = DashboardControlGrant::TrustedLocal;
-        assert!(authorize_dashboard_control_method(
-            &rt,
-            "api_credential_lease_grant",
-            None
-        )
-        .is_ok());
+        assert!(
+            authorize_dashboard_control_method(&rt, "api_credential_lease_grant", None).is_ok()
+        );
     }
 
     #[test]
@@ -13045,6 +13159,295 @@ mod tests {
             Some("filesystem read fixture".len() as u64)
         );
         assert_eq!(stream.result["resumable"], true);
+    }
+
+    #[tokio::test]
+    async fn fs_read_full_reads_carry_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, b"hash me").unwrap();
+
+        let full = api_fs_read_task_response(
+            "fs-read-full".to_string(),
+            Some(&serde_json::json!({ "path": file.to_string_lossy() })),
+        )
+        .await;
+        let stream = full.byte_stream.unwrap();
+        assert_eq!(
+            stream.result["sha256"].as_str(),
+            Some(crate::web_gateway::fs_sha256_hex(b"hash me").as_str())
+        );
+
+        // Partial reads have no whole-file hash to offer.
+        let partial = api_fs_read_task_response(
+            "fs-read-partial".to_string(),
+            Some(&serde_json::json!({
+                "path": file.to_string_lossy(),
+                "offset": 1,
+                "length": 3,
+            })),
+        )
+        .await;
+        let stream = partial.byte_stream.unwrap();
+        assert!(stream.result["sha256"].is_null());
+    }
+
+    #[tokio::test]
+    async fn fs_write_upload_enforces_scope_and_preconditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let scoped_runtime = || {
+            let mut rt = runtime();
+            rt.grant = DashboardControlGrant::Peer {
+                fingerprint: "fp".into(),
+                label: "peer".into(),
+                profile: "file-operator".into(),
+                filesystem: crate::peer::access_policy::FilesystemAccessPolicy {
+                    read_roots: vec![],
+                    write_roots: vec![dir.path().to_path_buf()],
+                },
+            };
+            rt
+        };
+
+        // create_new inside the write root lands on disk.
+        let target = dir.path().join("config.toml");
+        let upload = test_upload_state(
+            "api_fs_write",
+            serde_json::json!({ "path": target.to_string_lossy(), "create_new": true }),
+            b"key = 1\n",
+        );
+        let response =
+            api_fs_write_upload_task_response("w1".to_string(), upload, scoped_runtime()).await;
+        assert_eq!(response.frame["ok"], true);
+        assert_eq!(response.frame["result"]["_httpStatus"], 200);
+        assert_eq!(response.frame["result"]["created"], true);
+        assert_eq!(
+            response.frame["result"]["sha256"].as_str(),
+            Some(crate::web_gateway::fs_sha256_hex(b"key = 1\n").as_str())
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"key = 1\n");
+
+        // A path outside the write roots is refused before any disk IO.
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("escape.txt");
+        let upload = test_upload_state(
+            "api_fs_write",
+            serde_json::json!({ "path": outside.to_string_lossy(), "create_new": true }),
+            b"nope",
+        );
+        let response =
+            api_fs_write_upload_task_response("w2".to_string(), upload, scoped_runtime()).await;
+        assert_eq!(response.frame["result"]["_httpStatus"], 403);
+        assert!(!outside.exists());
+
+        // A read-only profile is refused at the operation ceiling.
+        let mut reader = runtime();
+        reader.grant = DashboardControlGrant::Peer {
+            fingerprint: "fp".into(),
+            label: "peer".into(),
+            profile: "file-reader".into(),
+            filesystem: crate::peer::access_policy::FilesystemAccessPolicy {
+                read_roots: vec![dir.path().to_path_buf()],
+                write_roots: vec![dir.path().to_path_buf()],
+            },
+        };
+        let upload = test_upload_state(
+            "api_fs_write",
+            serde_json::json!({ "path": target.to_string_lossy(), "force": true }),
+            b"still nope",
+        );
+        let response = api_fs_write_upload_task_response("w3".to_string(), upload, reader).await;
+        assert_eq!(response.frame["result"]["_httpStatus"], 403);
+        assert_eq!(std::fs::read(&target).unwrap(), b"key = 1\n");
+
+        // Stale expected_sha256 conflicts and reports the current hash.
+        let upload = test_upload_state(
+            "api_fs_write",
+            serde_json::json!({
+                "path": target.to_string_lossy(),
+                "expected_sha256": crate::web_gateway::fs_sha256_hex(b"something else"),
+            }),
+            b"key = 2\n",
+        );
+        let response =
+            api_fs_write_upload_task_response("w4".to_string(), upload, scoped_runtime()).await;
+        assert_eq!(response.frame["result"]["_httpStatus"], 409);
+        assert_eq!(response.frame["result"]["code"], "conflict");
+        assert_eq!(
+            response.frame["result"]["current_sha256"].as_str(),
+            Some(crate::web_gateway::fs_sha256_hex(b"key = 1\n").as_str())
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"key = 1\n");
+
+        // The matching baseline saves.
+        let upload = test_upload_state(
+            "api_fs_write",
+            serde_json::json!({
+                "path": target.to_string_lossy(),
+                "expected_sha256": crate::web_gateway::fs_sha256_hex(b"key = 1\n"),
+            }),
+            b"key = 2\n",
+        );
+        let response =
+            api_fs_write_upload_task_response("w5".to_string(), upload, scoped_runtime()).await;
+        assert_eq!(response.frame["result"]["_httpStatus"], 200);
+        assert_eq!(response.frame["result"]["created"], false);
+        assert_eq!(std::fs::read(&target).unwrap(), b"key = 2\n");
+    }
+
+    #[tokio::test]
+    async fn fs_write_upload_denials_are_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime();
+        rt.grant = DashboardControlGrant::Peer {
+            fingerprint: "fp".into(),
+            label: "audit-peer".into(),
+            profile: "file-operator".into(),
+            filesystem: crate::peer::access_policy::FilesystemAccessPolicy {
+                read_roots: vec![],
+                write_roots: vec![dir.path().to_path_buf()],
+            },
+        };
+        let mut events = rt.bus.subscribe();
+
+        let outside = tempfile::tempdir().unwrap();
+        let upload = test_upload_state(
+            "api_fs_write",
+            serde_json::json!({
+                "path": outside.path().join("x.txt").to_string_lossy(),
+                "create_new": true,
+            }),
+            b"x",
+        );
+        let response = api_fs_write_upload_task_response("a1".to_string(), upload, rt).await;
+        assert_eq!(response.frame["result"]["_httpStatus"], 403);
+
+        let mut audited = false;
+        while let Ok(event) = events.try_recv() {
+            if let AppEvent::PresenceLog { message, level, .. } = event {
+                if message.contains("[peer-fs] denied")
+                    && message.contains("peer=audit-peer")
+                    && message.contains("profile=file-operator")
+                {
+                    assert_eq!(level, Some(LogLevel::Warn));
+                    audited = true;
+                }
+            }
+        }
+        assert!(audited, "expected a [peer-fs] denied audit line on the bus");
+    }
+
+    #[tokio::test]
+    async fn fs_write_upload_frames_flow_end_to_end() {
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("uploaded.txt");
+        let payload = b"written via upload frames";
+
+        let mut rt = runtime();
+        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+        let mut inbound_uploads = HashMap::new();
+        let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
+        let mut terminal_forwarders = HashMap::new();
+        let mut tui_connections: HashMap<String, DashboardTuiConnection> = HashMap::new();
+        let mut frame = |text: &str,
+                         rt: &mut ControlRuntime,
+                         pending: &mut HashMap<String, CancellationToken>,
+                         inbound: &mut HashMap<String, InboundUploadState>|
+         -> Option<serde_json::Value> {
+            control_frame_response(
+                text,
+                rt,
+                &tx,
+                pending,
+                &mut outbound,
+                inbound,
+                &terminal_tx,
+                &mut terminal_forwarders,
+                &mut tui_connections,
+            )
+        };
+
+        // Unknown upload methods are refused at upload_start.
+        let refused = frame(
+            &serde_json::json!({
+                "t": "upload_start",
+                "id": "bad1",
+                "method": "api_fs_nope",
+                "params": {},
+                "total_bytes": 1,
+                "chunks": 1,
+            })
+            .to_string(),
+            &mut rt,
+            &mut pending,
+            &mut inbound_uploads,
+        )
+        .unwrap();
+        assert_eq!(refused["result"]["_httpStatus"], 400);
+        assert_eq!(refused["result"]["ok"], false);
+        assert!(refused["result"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown upload method"));
+
+        // api_fs_write rides start -> chunk -> end and lands on disk.
+        let start = frame(
+            &serde_json::json!({
+                "t": "upload_start",
+                "id": "up1",
+                "method": "api_fs_write",
+                "params": { "path": target.to_string_lossy(), "create_new": true },
+                "encoding": "base64",
+                "total_bytes": payload.len(),
+                "chunks": 1,
+            })
+            .to_string(),
+            &mut rt,
+            &mut pending,
+            &mut inbound_uploads,
+        );
+        assert!(start.is_none());
+        assert!(inbound_uploads.contains_key("up1"));
+
+        let chunk = frame(
+            &serde_json::json!({
+                "t": "upload_chunk",
+                "id": "up1",
+                "seq": 0,
+                "data": base64::engine::general_purpose::STANDARD.encode(payload),
+            })
+            .to_string(),
+            &mut rt,
+            &mut pending,
+            &mut inbound_uploads,
+        );
+        assert!(chunk.is_none());
+
+        let end = frame(
+            &serde_json::json!({
+                "t": "upload_end",
+                "id": "up1",
+                "chunks": 1,
+            })
+            .to_string(),
+            &mut rt,
+            &mut pending,
+            &mut inbound_uploads,
+        );
+        assert!(end.is_none());
+
+        let response = rx.recv().await.unwrap();
+        assert_eq!(response.id, "up1");
+        assert!(response.done);
+        assert_eq!(response.frame["t"], "response");
+        assert_eq!(response.frame["ok"], true);
+        assert_eq!(response.frame["result"]["_httpStatus"], 200);
+        assert_eq!(response.frame["result"]["created"], true);
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
     }
 
     #[tokio::test]

@@ -56,6 +56,7 @@ pub struct TerminalKey {
 }
 
 impl TerminalKey {
+    #[allow(dead_code)]
     pub fn local(terminal_id: impl Into<String>) -> Self {
         Self {
             host_id: "local".to_string(),
@@ -251,8 +252,7 @@ fn windows_scoped_shell_env(
         .or_else(|| scope.read_roots.first())
         .map(|root| root.display().to_string())
         .unwrap_or_else(|| std::env::temp_dir().display().to_string());
-    let system_root =
-        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     let mut env = vec![
         ("SystemRoot".to_string(), system_root.clone()),
         (
@@ -268,11 +268,13 @@ fn windows_scoped_shell_env(
         ),
         (
             "PATHEXT".to_string(),
-            std::env::var("PATHEXT")
-                .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.PS1".to_string()),
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.PS1".to_string()),
         ),
         ("USERPROFILE".to_string(), profile.clone()),
-        ("APPDATA".to_string(), format!("{profile}\\AppData\\Roaming")),
+        (
+            "APPDATA".to_string(),
+            format!("{profile}\\AppData\\Roaming"),
+        ),
         (
             "LOCALAPPDATA".to_string(),
             format!("{profile}\\AppData\\Local"),
@@ -345,16 +347,20 @@ fn seatbelt_profile(
         "/private/var/select",
         "/dev",
     ] {
-        read_paths.push(crate::sandbox::seatbelt_path_literal(std::path::Path::new(path))?);
+        read_paths.push(crate::sandbox::seatbelt_path_literal(
+            std::path::Path::new(path),
+        )?);
     }
     let mut exec_paths = read_paths.clone();
     let mut write_paths: Vec<String> = Vec::new();
     for path in ["/dev", "/private/tmp", "/private/var/tmp"] {
-        write_paths.push(crate::sandbox::seatbelt_path_literal(std::path::Path::new(path))?);
+        write_paths.push(crate::sandbox::seatbelt_path_literal(
+            std::path::Path::new(path),
+        )?);
     }
     if let Ok(tmpdir) = std::env::var("TMPDIR") {
-        let canonical = std::fs::canonicalize(&tmpdir)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&tmpdir));
+        let canonical =
+            std::fs::canonicalize(&tmpdir).unwrap_or_else(|_| std::path::PathBuf::from(&tmpdir));
         write_paths.push(crate::sandbox::seatbelt_path_literal(&canonical)?);
     }
     // Seatbelt matches the REAL path of a file: a rule on a symlinked root
@@ -375,14 +381,13 @@ fn seatbelt_profile(
         write_paths.push(crate::sandbox::seatbelt_path_literal(&canonical(root))?);
     }
 
-    let subpaths =
-        |paths: &[String]| -> String {
-            paths
-                .iter()
-                .map(|literal| format!("(subpath {literal})"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
+    let subpaths = |paths: &[String]| -> String {
+        paths
+            .iter()
+            .map(|literal| format!("(subpath {literal})"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
 
     // dyld-support.sb ships with modern macOS and grants exactly the
     // cryptex/dyld-cache reads a process needs to start; without it every
@@ -598,8 +603,8 @@ impl PtySession {
             // stamped daemon-side and held by the PtySession; system
             // access comes from the Users restricting SID, not a path
             // baseline like Linux.
-            let exe = std::env::current_exe()
-                .map_err(|e| format!("resolve current executable: {e}"))?;
+            let exe =
+                std::env::current_exe().map_err(|e| format!("resolve current executable: {e}"))?;
             let (shell, _) = crate::platform::interactive_pty_shell();
             // -NoProfile: the real profile is invisible to the restricted
             // token; loading it would only spray errors.
@@ -641,11 +646,7 @@ impl PtySession {
                 let profile = seatbelt_profile(scope)?;
                 let mut args = vec!["-p".to_string(), profile, shell.clone()];
                 args.extend(shell_args);
-                (
-                    "/usr/bin/sandbox-exec".to_string(),
-                    args,
-                    None::<String>,
-                )
+                ("/usr/bin/sandbox-exec".to_string(), args, None::<String>)
             };
 
             #[cfg(target_os = "linux")]
@@ -661,11 +662,7 @@ impl PtySession {
                     .map_err(|e| format!("encode scoped shell policy: {e}"))?;
                 let mut args = vec!["--scoped-shell-exec".to_string(), shell.clone()];
                 args.extend(shell_args);
-                (
-                    exe.to_string_lossy().into_owned(),
-                    args,
-                    Some(policy),
-                )
+                (exe.to_string_lossy().into_owned(), args, Some(policy))
             };
 
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -793,6 +790,7 @@ impl PtySession {
 
     /// The owning principal id (`None` = owner/root lane), for acks and
     /// UI badges.
+    #[allow(dead_code)]
     pub fn owner(&self) -> Option<&str> {
         self.owner.as_deref()
     }
@@ -1082,7 +1080,16 @@ mod tests {
 
         // A collaborator without shell.spawn cannot create.
         let denied = registry
-            .open_or_attach(key.clone(), 80, 24, &other, ShellSpawnPolicy { may_spawn: false, ..Default::default() })
+            .open_or_attach(
+                key.clone(),
+                80,
+                24,
+                &other,
+                ShellSpawnPolicy {
+                    may_spawn: false,
+                    ..Default::default()
+                },
+            )
             .await;
         assert!(matches!(denied, Err(TerminalOpenError::SpawnNotAllowed)));
 
@@ -1110,10 +1117,22 @@ mod tests {
         // Root sees it; the owner shares it; now the collaborator attaches
         // (no spawn right needed) but still cannot manage sharing... and a
         // root close works on someone else's session.
-        assert!(registry.get_visible(&key, &TerminalActor::Root).await.is_some());
+        assert!(registry
+            .get_visible(&key, &TerminalActor::Root)
+            .await
+            .is_some());
         assert_eq!(registry.set_shared(&key, &owner, true).await, Some(true));
         let (attached, created) = registry
-            .open_or_attach(key.clone(), 80, 24, &other, ShellSpawnPolicy { may_spawn: false, ..Default::default() })
+            .open_or_attach(
+                key.clone(),
+                80,
+                24,
+                &other,
+                ShellSpawnPolicy {
+                    may_spawn: false,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(!created);
@@ -1155,7 +1174,10 @@ mod tests {
             write_roots: vec![project.clone()],
         };
         assert_eq!(
-            scoped_shell_cwd(&write_preferred, std::path::Path::new("/definitely/not/here")),
+            scoped_shell_cwd(
+                &write_preferred,
+                std::path::Path::new("/definitely/not/here")
+            ),
             project
         );
 
@@ -1187,11 +1209,7 @@ mod tests {
             write_roots: vec![std::path::PathBuf::from("/srv/work")],
         };
         let env = scoped_shell_env(&scope, "/bin/zsh");
-        let get = |key: &str| {
-            env.iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
-        };
+        let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
         assert_eq!(get("HOME"), Some("/srv/work"));
         assert_eq!(get("SHELL"), Some("/bin/zsh"));
         assert!(get("TERM").is_some());
@@ -1199,10 +1217,8 @@ mod tests {
         // Nothing beyond the fixed allowlist leaks in.
         for (key, _) in &env {
             assert!(
-                [
-                    "TERM", "PATH", "SHELL", "HOME", "LANG", "USER", "LOGNAME", "TMPDIR"
-                ]
-                .contains(&key.as_str()),
+                ["TERM", "PATH", "SHELL", "HOME", "LANG", "USER", "LOGNAME", "TMPDIR"]
+                    .contains(&key.as_str()),
                 "unexpected env var {key} in scoped shell env"
             );
         }
@@ -1297,7 +1313,10 @@ mod tests {
                 transcript.push_str(&String::from_utf8_lossy(&bytes));
             }
         }
-        assert!(!transcript.is_empty(), "scoped shell never painted a prompt");
+        assert!(
+            !transcript.is_empty(),
+            "scoped shell never painted a prompt"
+        );
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         // The completion sentinel is computed by the shell so the ZLE echo
         // of the typed command can never satisfy the completion check. The

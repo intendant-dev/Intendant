@@ -78,6 +78,7 @@ pub const LUMA_HIGH: u8 = 235;
 /// decodes as a `1` bit; below decodes as `0`. The Rust decoder
 /// [`decode_y_plane`] uses the same threshold for symmetry with the
 /// expected JS path, even though it's reading uncompressed source pixels.
+#[allow(dead_code)]
 pub const THRESHOLD: u8 = 128;
 
 /// Stamp the lower 32 bits of `value` into the top-left of `y_plane`.
@@ -126,6 +127,7 @@ pub fn stamp_y_plane(y_plane: &mut [u8], width: usize, height: usize, value: u32
 /// Mirror of [`stamp_y_plane`] for round-trip tests and for any
 /// future Rust-side replay tool that needs to read the marker out of
 /// an I420 buffer (e.g. analyzing recorded captures).
+#[allow(dead_code)]
 pub fn decode_y_plane(y_plane: &[u8], width: usize, height: usize) -> Option<u32> {
     if width < MARKER_W || height < MARKER_H {
         return None;

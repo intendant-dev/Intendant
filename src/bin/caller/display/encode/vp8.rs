@@ -57,7 +57,7 @@ impl Vp8Encoder {
     ///   4 is enough to keep up with 1080p30 on a typical multi-core box
     ///   without saturating the host.
     pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, String> {
-        if width % 2 != 0 || height % 2 != 0 {
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err("width and height must be even".to_string());
         }
 
@@ -123,7 +123,7 @@ impl Encoder for Vp8Encoder {
         force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>, String> {
         let y_size = self.width * self.height;
-        let uv_size = ((self.width + 1) / 2) * ((self.height + 1) / 2);
+        let uv_size = self.width.div_ceil(2) * self.height.div_ceil(2);
         let expected = y_size + 2 * uv_size;
         if i420.len() < expected {
             return Err(format!(
@@ -162,7 +162,7 @@ impl Encoder for Vp8Encoder {
                 &mut self.ctx,
                 &image,
                 pts,
-                duration_ms as u64,
+                duration_ms,
                 flags,
                 VPX_DL_REALTIME as u64,
             )

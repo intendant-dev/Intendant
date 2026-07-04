@@ -283,14 +283,11 @@ pub async fn fetch(
         "credit": BODY_CREDIT_WINDOW_BYTES,
     });
     let send = |frame: serde_json::Value| relay.frames_tx.send(frame).map_err(|_| ());
-    let shipped = send(head_frame).is_ok()
-        && body
-            .chunks(REQUEST_CHUNK_BYTES)
-            .all(|chunk| {
-                send(serde_json::json!({ "t": "egress_request_chunk", "id": id, "data": b64(chunk) }))
-                    .is_ok()
-            })
-        && send(serde_json::json!({ "t": "egress_request_end", "id": id })).is_ok();
+    let shipped =
+        send(head_frame).is_ok() && body.chunks(REQUEST_CHUNK_BYTES).all(|chunk| {
+            send(serde_json::json!({ "t": "egress_request_chunk", "id": id, "data": b64(chunk) }))
+                .is_ok()
+        }) && send(serde_json::json!({ "t": "egress_request_end", "id": id })).is_ok();
     if !shipped {
         pending()
             .write()
@@ -376,9 +373,7 @@ impl EgressResponse {
     }
 
     /// The body as a chunk stream — the shape the SSE parsers consume.
-    pub fn bytes_stream(
-        self,
-    ) -> impl futures_util::Stream<Item = Result<Vec<u8>, String>> + Send {
+    pub fn bytes_stream(self) -> impl futures_util::Stream<Item = Result<Vec<u8>, String>> + Send {
         futures_util::stream::unfold(self, |mut response| async move {
             response.next_chunk().await.map(|item| (item, response))
         })
@@ -390,10 +385,7 @@ impl Drop for EgressResponse {
         // Consumer went away mid-body (or the head was never consumed):
         // abort the browser-side fetch. A finished request has already
         // been removed from pending by its terminal frame.
-        if self
-            .pending_remove()
-            .is_some()
-        {
+        if self.pending_remove().is_some() {
             let _ = self.frames_tx.send(serde_json::json!({
                 "t": "egress_cancel",
                 "id": self.request_id,
@@ -423,7 +415,9 @@ pub fn handle_browser_frame(session_id: &str, t: &str, frame: &serde_json::Value
         "egress_response" => {
             let status = frame.get("status").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
             let mut pend = pending().write().expect("egress pending poisoned");
-            let Some(entry) = pend.get_mut(id) else { return };
+            let Some(entry) = pend.get_mut(id) else {
+                return;
+            };
             if entry.session_id != session_id {
                 return;
             }
@@ -507,7 +501,9 @@ mod tests {
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn reset() {
@@ -524,7 +520,13 @@ mod tests {
         let _guard = lock();
         reset();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let accepted = register("s1", "Tab A", &kinds(&[KIND_ANTHROPIC, "oauth:codex", "junk"]), tx).unwrap();
+        let accepted = register(
+            "s1",
+            "Tab A",
+            &kinds(&[KIND_ANTHROPIC, "oauth:codex", "junk"]),
+            tx,
+        )
+        .unwrap();
         assert_eq!(accepted, vec![KIND_ANTHROPIC.to_string()]);
         assert!(available(KIND_ANTHROPIC));
         assert!(!available(KIND_GEMINI));
@@ -573,7 +575,11 @@ mod tests {
         assert_eq!(end["t"], "egress_request_end");
 
         // Respond: 200 + two chunks + end.
-        handle_browser_frame("s1", "egress_response", &serde_json::json!({"id": id, "status": 200}));
+        handle_browser_frame(
+            "s1",
+            "egress_response",
+            &serde_json::json!({"id": id, "status": 200}),
+        );
         let response = fetch_task.await.unwrap().unwrap();
         assert!(response.status_success());
 
@@ -624,7 +630,11 @@ mod tests {
         let _ = relay_rx.recv().await; // request_end (empty body: no chunks)
 
         // A different session cannot answer this request.
-        handle_browser_frame("intruder", "egress_response", &serde_json::json!({"id": id, "status": 200}));
+        handle_browser_frame(
+            "intruder",
+            "egress_response",
+            &serde_json::json!({"id": id, "status": 200}),
+        );
         handle_browser_frame(
             "intruder",
             "egress_error",
@@ -653,7 +663,13 @@ mod tests {
         reset();
         let (tx, mut relay_rx) = mpsc::unbounded_channel();
         register("s1", "Tab A", &kinds(&[KIND_ANTHROPIC]), tx).unwrap();
-        let fetch_task = tokio::spawn(fetch(KIND_ANTHROPIC, "POST", "https://api.anthropic.com/v1/messages", Vec::new(), Vec::new()));
+        let fetch_task = tokio::spawn(fetch(
+            KIND_ANTHROPIC,
+            "POST",
+            "https://api.anthropic.com/v1/messages",
+            Vec::new(),
+            Vec::new(),
+        ));
         let head = relay_rx.recv().await.unwrap();
         assert_eq!(head["t"], "egress_request");
 

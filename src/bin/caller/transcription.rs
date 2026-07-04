@@ -84,11 +84,12 @@ pub struct WhisperTranscriber {
 
 impl WhisperTranscriber {
     pub fn new(config: &TranscriptionConfig) -> Result<Self, CallerError> {
-        let api_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY").ok_or_else(|| {
-            CallerError::Config(
-                "OPENAI_API_KEY not set (required for Whisper transcription)".to_string(),
-            )
-        })?;
+        let api_key =
+            crate::credential_leases::provider_api_key("OPENAI_API_KEY").ok_or_else(|| {
+                CallerError::Config(
+                    "OPENAI_API_KEY not set (required for Whisper transcription)".to_string(),
+                )
+            })?;
         let endpoint = config
             .endpoint
             .clone()

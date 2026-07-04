@@ -136,7 +136,6 @@ mod tests {
     use crate::peer::event::{PeerEvent, PeerStatus, TaggedPeerEvent};
     use crate::peer::id::{PeerId, PeerKind};
     use tempfile::TempDir;
-    use tokio::io::AsyncBufReadExt;
     use tokio::time::{timeout, Duration};
 
     fn make_event(seq: u64, status: PeerStatus) -> TaggedPeerEvent {

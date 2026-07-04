@@ -105,6 +105,7 @@ pub enum LiveAudioStatus {
 
 /// Progress update from a running live audio session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct LiveAudioProgress {
     pub id: String,
     pub state: LiveAudioState,
@@ -113,6 +114,7 @@ pub struct LiveAudioProgress {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub enum LiveAudioState {
     Connecting,
     SetupComplete,
