@@ -300,7 +300,11 @@ daemon warms the list at startup, responses are served
 stale-while-revalidate (an expired cache answers instantly and refreshes
 in the background), and the Stats tab fetches a slim `view=usage`
 variant (~a tenth of the full-row payload) for its whole-corpus fold.
-The index directory is safe to delete; it rebuilds on the next scan.
+Summaries are list-sized by design — day buckets and fingerprint
+digests, never per-request usage history or per-file stat lists — so the
+resident cache scales with session count, not transcript length, and the
+startup sweep prunes entries whose sessions have been deleted. The index
+directory is safe to delete; it rebuilds on the next scan.
 
 - **Recent** — recent sessions as calm three-line cards (title + status
   chip + source badge; task snippet; compact meta) — the long tail (ids,
