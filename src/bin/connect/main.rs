@@ -1118,6 +1118,7 @@ fn content_type_for_path(path: &Path) -> &'static str {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
+        "webmanifest" => "application/manifest+json",
         "svg" => "image/svg+xml",
         "ico" => "image/x-icon",
         _ => "application/octet-stream",
@@ -5742,8 +5743,13 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     .handle {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 700; }}
 
     @media (max-width: 700px) {{
-      .topbar {{ min-height: auto; padding: 12px 0; }}
+      /* The bar wraps instead of letting the squeezed title paint under
+         the session chip: brand keeps the first row, actions take the
+         next when space runs out. */
+      .topbar {{ min-height: auto; padding: 12px 0; flex-wrap: wrap; row-gap: 8px; }}
+      .brand h1 {{ font-size: 16px; white-space: nowrap; }}
       .brand-sub {{ display: none; }}
+      .top-actions {{ margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }}
       .feature-strip {{ grid-template-columns: 1fr; }}
       .hero-title {{ font-size: 26px; }}
       .auth-row {{ flex-direction: column; }}

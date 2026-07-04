@@ -5,7 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>Intendant</title>
 <link rel="icon" type="image/png" sizes="128x128" href="/icon-128.png" id="favicon">
-<link rel="apple-touch-icon" href="/icon-128.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#11111b">
 <style>
 :root {
   --base: #1e1e2e;
@@ -10374,7 +10376,15 @@ body.display-fullscreen-open {
 
 /* ── Mobile ── */
 @media (max-width: 600px) {
-  .status-bar { font-size: 11px; gap: 8px; padding: 4px 8px; }
+  /* One swipeable line instead of four wrapped rows — the same pattern
+     as the tab bar, reclaiming ~140px of viewport above the composer. */
+  .status-bar {
+    font-size: 11px; gap: 8px; padding: 4px 8px;
+    flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .status-bar::-webkit-scrollbar { display: none; }
+  .status-bar > span, .status-bar > div { flex-shrink: 0; }
   .status-bar .provider { max-width: 92px; }
   .status-bar .model { max-width: 150px; }
   .status-bar .session { max-width: 120px; }
