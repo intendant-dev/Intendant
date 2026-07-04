@@ -34,6 +34,13 @@ pub struct SessionAgentConfig {
     pub codex_service_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_home: Option<String>,
+    /// Canonical native id of the thread this session was FORKED from
+    /// (backend-neutral lineage record). While the fork's own native id is
+    /// still unknown, `resume == forked_from` also tells the spawner to add
+    /// the backend's fork flag; once the child id is persisted, this only
+    /// documents lineage and drives the `fork` relationship emit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
 }
 
 impl SessionAgentConfig {
@@ -47,6 +54,7 @@ impl SessionAgentConfig {
             && self.codex_context_archive.is_none()
             && self.codex_service_tier.is_none()
             && self.codex_home.is_none()
+            && self.forked_from.is_none()
     }
 
     pub fn merge_missing_from(&mut self, fallback: SessionAgentConfig) {
@@ -76,6 +84,9 @@ impl SessionAgentConfig {
         }
         if self.codex_home.is_none() {
             self.codex_home = fallback.codex_home;
+        }
+        if self.forked_from.is_none() {
+            self.forked_from = fallback.forked_from;
         }
     }
 }
@@ -193,6 +204,7 @@ pub fn from_wire(
         codex_context_archive,
         codex_service_tier,
         codex_home: None,
+        forked_from: None,
     }
 }
 
@@ -218,6 +230,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 project.config.agent.codex.service_tier.as_deref(),
             ),
             codex_home: effective_codex_home(),
+            forked_from: None,
         },
         AgentBackend::ClaudeCode => SessionAgentConfig {
             source: Some("claude-code".to_string()),
@@ -229,6 +242,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             codex_context_archive: None,
             codex_service_tier: None,
             codex_home: None,
+            forked_from: None,
         },
     }
 }
@@ -753,6 +767,30 @@ mod tests {
             normal_cfg.codex_service_tier.as_deref(),
             Some(crate::project::CODEX_STANDARD_SERVICE_TIER)
         );
+    }
+
+    #[test]
+    fn forked_from_round_trips_and_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = from_wire(
+            Some("claude-code"),
+            Some("claude"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        cfg.forked_from = Some("parent-uuid".into());
+        assert!(!cfg.is_empty());
+        write_log_dir_config(dir.path(), &cfg).unwrap();
+        let read = read_log_dir_config(dir.path()).expect("config round-trips");
+        assert_eq!(read.forked_from.as_deref(), Some("parent-uuid"));
+
+        // Rehydration on resume merges the persisted lineage in.
+        let mut fresh = from_wire(Some("claude-code"), None, None, None, None, None, None);
+        fresh.merge_missing_from(read);
+        assert_eq!(fresh.forked_from.as_deref(), Some("parent-uuid"));
     }
 
     #[test]
