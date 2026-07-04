@@ -7939,14 +7939,17 @@ body.context-focus-active {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Full session id in the meta row — wraps rather than truncates (the id is
+   the point), monospace, click-to-copy. */
 .session-card .sc-id {
   font-size: 11px;
   color: var(--overlay1);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   user-select: text;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  cursor: copy;
+}
+.session-card .sc-id:hover {
+  text-decoration: underline;
 }
 /* Status/source/role marks compose with the .ui-chip / .ui-badge
    primitives (tone classes carry the color); only card-specific layout
@@ -67623,7 +67626,7 @@ function renderSessionsList(sessions, el, options = {}) {
     const primaryText = sessionName || taskText || 'Untitled session';
     const titleKindText = sessionName ? 'name' : taskText ? 'initial' : 'untitled';
 
-    // Top row: name/task + full ID + status badges
+    // Top row: name/task + status badges
     const top = document.createElement('div');
     top.className = 'sc-top';
 
@@ -67756,13 +67759,14 @@ function renderSessionsList(sessions, el, options = {}) {
       card.appendChild(hitEl);
     }
 
-    // Meta row — compact essentials only; the long tail (id, absolute
-    // dates, provider, token breakdown, disk) moves to the row tooltip and
-    // stays visible in the session-detail overlay.
+    // Meta row — the full session id (click to copy) plus compact
+    // essentials; the long tail (absolute dates, provider, token breakdown,
+    // disk) moves to the row tooltip and stays visible in the
+    // session-detail overlay.
     const meta = document.createElement('div');
     meta.className = 'sc-meta';
     const addMetaField = (label, value, valueClass, valueTitle) => {
-      if (value === null || value === undefined || value === '') return;
+      if (value === null || value === undefined || value === '') return null;
       const span = document.createElement('span');
       const l = document.createElement('span');
       l.className = 'label';
@@ -67774,8 +67778,19 @@ function renderSessionsList(sessions, el, options = {}) {
       span.appendChild(l);
       span.appendChild(v);
       meta.appendChild(span);
+      return v;
     };
 
+    const idVal = addMetaField('id', sessionId || shortId, 'sc-id', 'Click to copy the session ID');
+    if (idVal) {
+      idVal.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const fullId = sessionId || shortId;
+        copyTextToClipboard(fullId)
+          .then(() => showControlToast('success', `Copied session ID ${shortSessionId(fullId)}`))
+          .catch(err => showControlToast('error', `Copy session ID failed: ${err?.message || err}`));
+      });
+    }
     const changedAt = s.updated_at || s.changed_at;
     if (changedAt) addMetaField('changed', sessionRelativeLabel(changedAt) || changedAt, null, changedAt);
     const projectPath = sessionProjectDirectory(s);
@@ -67800,7 +67815,6 @@ function renderSessionsList(sessions, el, options = {}) {
     }
 
     const tipParts = [];
-    if (sessionId || shortId) tipParts.push(`id: ${sessionId || shortId}`);
     if (s.created_at) tipParts.push(`created: ${s.created_at}`);
     if (changedAt) tipParts.push(`changed: ${changedAt}`);
     if (s.provider) tipParts.push(`provider: ${s.provider}`);
