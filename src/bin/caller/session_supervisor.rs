@@ -29,6 +29,12 @@ pub struct SessionSupervisorConfig {
     pub web_port: Option<u16>,
     pub flags_direct: bool,
     pub shared_session: Option<web_gateway::SharedActiveSession>,
+    /// Injection point for native-session providers: when set, in-process
+    /// sessions construct their ChatProvider from this factory instead of
+    /// `provider::select_provider()` (which needs API keys). None in
+    /// production; tests use it to run the loop against a mock provider.
+    pub provider_factory:
+        Option<Arc<dyn Fn() -> Box<dyn provider::ChatProvider> + Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -79,6 +85,87 @@ struct RelatedSessionRecord {
     parent_session_id: String,
     child_session_id: String,
     relationship: String,
+}
+
+/// Default cap on concurrently running sub-agent children per parent
+/// session when `[orchestrator] max_parallel_agents` is not set.
+const DEFAULT_MAX_PARALLEL_SUB_AGENTS: usize = 4;
+
+/// Launch parameters for a supervised sub-agent session (the
+/// `spawn_sub_agent` tool).
+pub struct SubAgentSpawnParams {
+    pub task: String,
+    /// Resolves the child's system prompt (SysPrompt role files); custom
+    /// strings fall back to the base prompt.
+    pub role: sub_agent::SubAgentRole,
+    /// Replaces the role's file-resolved system prompt wholesale.
+    pub system_prompt: Option<String>,
+    /// `None` runs the native in-process loop; `Some` supervises an
+    /// external coding agent as the worker.
+    pub backend: Option<external_agent::AgentBackend>,
+    /// Isolate the child in a fresh git worktree branched off the parent
+    /// project's HEAD.
+    pub worktree: bool,
+    /// Inject the project knowledge store into the child's conversation.
+    pub inherit_memory: bool,
+    pub name: Option<String>,
+}
+
+/// What `start_sub_agent_session` hands back to the spawning loop.
+pub struct SubAgentSpawnStarted {
+    pub child_session_id: String,
+    pub child_name: String,
+    pub worktree_path: Option<PathBuf>,
+    pub completion_rx: oneshot::Receiver<SubAgentCompletion>,
+}
+
+/// Terminal report for a sub-agent child, resolved when the child session
+/// finishes (submitted via the submit_result tool, or synthesized from the
+/// child's final state).
+#[derive(Debug)]
+pub struct SubAgentCompletion {
+    pub child_session_id: String,
+    pub name: String,
+    pub result: sub_agent::SubAgentResult,
+}
+
+/// A child spawned by a session, tracked on the parent side by the
+/// spawn_sub_agent / wait_sub_agents tool handlers.
+pub struct SubAgentChild {
+    pub name: String,
+    /// Pending completion; present until the child finishes.
+    pub rx: Option<oneshot::Receiver<SubAgentCompletion>>,
+    /// Resolved completion not yet returned through a wait call.
+    pub completed: Option<SubAgentCompletion>,
+    /// The completion was already returned by a wait call.
+    pub delivered: bool,
+}
+
+/// Orchestration handle carried by every supervised native session. Grants
+/// the in-process loop the spawn capability — any supervised internal
+/// session may delegate; orchestration is a capability, not a role — and,
+/// for sessions that are themselves sub-agents, the submit_result slot.
+#[derive(Clone)]
+pub struct SessionOrchestration {
+    pub supervisor: SessionSupervisor,
+    pub session_id: String,
+    /// `Some` when this session was spawned as a sub-agent: the structured
+    /// result the child submits via the submit_result tool.
+    pub submitted_result: Option<Arc<std::sync::Mutex<Option<sub_agent::SubAgentResult>>>>,
+    /// Children this session has spawned, keyed by child session id.
+    pub children: Arc<std::sync::Mutex<HashMap<String, SubAgentChild>>>,
+}
+
+/// Internal wiring `spawn_agent_session` needs to run a session as a
+/// sub-agent child: launch config for the native loop plus the result slot
+/// and completion channel back to the parent.
+pub(crate) struct SubAgentWiring {
+    completion_tx: oneshot::Sender<SubAgentCompletion>,
+    submitted_result: Arc<std::sync::Mutex<Option<sub_agent::SubAgentResult>>>,
+    child_name: String,
+    role: sub_agent::SubAgentRole,
+    system_prompt: Option<String>,
+    inherit_memory: bool,
 }
 
 struct ManagedSession {
@@ -1196,6 +1283,7 @@ impl SessionSupervisor {
             None,
             codex_service_tier,
             codex_home,
+            None,
         )
         .await;
     }
@@ -1408,6 +1496,7 @@ impl SessionSupervisor {
                     Some(ready_tx),
                     codex_service_tier,
                     codex_home,
+                    None,
                 )
                 .await;
                 self.clear_external_attach_request(&external_attach_keys)
@@ -1552,6 +1641,7 @@ impl SessionSupervisor {
             None,
             codex_service_tier,
             codex_home,
+            None,
         )
         .await;
     }
@@ -1586,6 +1676,199 @@ impl SessionSupervisor {
             })
     }
 
+    /// Count of still-running sub-agent children of `parent_session_id`.
+    async fn running_sub_agent_children(&self, parent_session_id: &str) -> usize {
+        let state = self.state.lock().await;
+        state
+            .related_sessions
+            .iter()
+            .filter(|(child, rel)| {
+                rel.relationship == "subagent"
+                    && rel.parent_session_id == parent_session_id
+                    && state.sessions.contains_key(child.as_str())
+            })
+            .count()
+    }
+
+    /// Spawn a supervised child session on behalf of `parent_session_id`
+    /// (the spawn_sub_agent tool). The child is a full managed session —
+    /// dashboard row, approvals, steering, lineage — linked to its parent
+    /// with the same "subagent" relationship Codex-spawned children get.
+    /// Returns the child's identity plus a receiver that resolves with the
+    /// child's terminal result.
+    ///
+    /// Returns a boxed future (not an `async fn`) to break the opaque-type
+    /// cycle: this future contains `spawn_agent_session`, whose child loop's
+    /// spawn_sub_agent handler calls back into this method.
+    pub fn start_sub_agent_session<'a>(
+        &'a self,
+        parent_session_id: &'a str,
+        parent_project: &'a Project,
+        params: SubAgentSpawnParams,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SubAgentSpawnStarted, String>> + Send + 'a>,
+    > {
+        Box::pin(self.start_sub_agent_session_inner(parent_session_id, parent_project, params))
+    }
+
+    async fn start_sub_agent_session_inner(
+        &self,
+        parent_session_id: &str,
+        parent_project: &Project,
+        params: SubAgentSpawnParams,
+    ) -> Result<SubAgentSpawnStarted, String> {
+        let cap = parent_project
+            .config
+            .orchestrator
+            .max_parallel_agents
+            .unwrap_or(DEFAULT_MAX_PARALLEL_SUB_AGENTS)
+            .max(1);
+        let running = self.running_sub_agent_children(parent_session_id).await;
+        if running >= cap {
+            return Err(format!(
+                "sub-agent cap reached: {running} of {cap} children of this session are still \
+                 running. Call wait_sub_agents to collect one before spawning more \
+                 (cap: [orchestrator] max_parallel_agents)."
+            ));
+        }
+        if params.task.trim().is_empty() {
+            return Err("sub-agent task must not be empty".to_string());
+        }
+
+        let session_name = normalize_session_name_option(params.name.as_deref())
+            .map_err(|e| format!("invalid sub-agent name: {e}"))?;
+
+        let log_dir = session_log::SessionLog::resolve_path(None);
+        let session_log = session_log::SessionLog::open(log_dir.clone())
+            .map(|log| Arc::new(std::sync::Mutex::new(log)))
+            .map_err(|e| format!("sub-agent session log failed: {e}"))?;
+        let child_session_id = session_log
+            .lock()
+            .map(|log| log.session_id().to_string())
+            .unwrap_or_else(|_| path_file_name(&log_dir));
+        let child_name = session_name.clone().unwrap_or_else(|| {
+            format!(
+                "{}-{}",
+                params.role.as_str(),
+                short_session(&child_session_id)
+            )
+        });
+
+        // Worktree isolation: branch off the parent project's HEAD, same
+        // machinery fission branches use.
+        let worktree_path = if params.worktree {
+            let wt = worktree::create(
+                &parent_project.root,
+                &format!("subagent-{}", short_session(&child_session_id)),
+                "HEAD",
+            )
+            .map_err(|e| format!("sub-agent worktree creation failed: {e}"))?;
+            Some(wt.path)
+        } else {
+            None
+        };
+        let child_root = worktree_path
+            .clone()
+            .unwrap_or_else(|| parent_project.root.clone());
+        let project = Project::from_root(child_root)
+            .map_err(|e| format!("sub-agent project load failed: {e}"))?;
+        let project = self
+            .project_with_runtime_config(project.root.clone(), params.backend.as_ref())
+            .await
+            .map_err(|e| format!("sub-agent project load failed: {e}"))?;
+        let mut codex_home = None;
+        if let Some(backend) = params.backend.as_ref() {
+            let config = crate::session_config::from_project(backend, &project);
+            if matches!(backend, external_agent::AgentBackend::Codex) {
+                codex_home = config.codex_home.clone();
+            }
+            if let Err(e) = crate::session_config::write_log_dir_config(&log_dir, &config) {
+                self.warn(&format!(
+                    "Session launch config was not persisted for sub-agent {}: {}",
+                    short_session(&child_session_id),
+                    e
+                ));
+            }
+        }
+
+        write_session_meta(
+            &session_log,
+            &project.root,
+            Some(params.task.as_str()),
+            session_name.as_deref(),
+        );
+
+        // Record the parent link before the child runs: synchronously in
+        // supervisor state (the spawn cap counts it), in the child's own
+        // session log (relationship rehydration on daemon restart reads
+        // from there), and on the bus for frontends — the same
+        // "subagent" relationship kind Codex children use, so the
+        // dashboard treats both identically.
+        {
+            let mut state = self.state.lock().await;
+            state.apply_related_session(parent_session_id, &child_session_id, "subagent");
+        }
+        slog(&session_log, |l| {
+            l.session_relationship(parent_session_id, &child_session_id, "subagent", false);
+        });
+        self.config.bus.send(AppEvent::SessionRelationship {
+            parent_session_id: parent_session_id.to_string(),
+            child_session_id: child_session_id.clone(),
+            relationship: "subagent".to_string(),
+            ephemeral: false,
+        });
+
+        let emit_session_started_after_identity = params.backend.is_some();
+        if !emit_session_started_after_identity {
+            self.config.bus.send(AppEvent::SessionStarted {
+                session_id: child_session_id.clone(),
+                task: Some(params.task.clone()),
+            });
+        }
+        emit_task_dispatched_log(&self.config.bus, &session_log, &params.task, 0);
+
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let wiring = SubAgentWiring {
+            completion_tx,
+            submitted_result: Arc::new(std::sync::Mutex::new(None)),
+            child_name: child_name.clone(),
+            role: params.role,
+            system_prompt: params.system_prompt,
+            inherit_memory: params.inherit_memory,
+        };
+        let source = params
+            .backend
+            .as_ref()
+            .map(|b| b.as_short_str().to_string())
+            .unwrap_or_else(|| "intendant".to_string());
+        self.spawn_agent_session(
+            child_session_id.clone(),
+            source,
+            params.task,
+            project,
+            session_log,
+            log_dir,
+            params.backend,
+            true,
+            UserAttachments::default(),
+            session_name,
+            None,
+            emit_session_started_after_identity,
+            None,
+            None,
+            codex_home,
+            Some(wiring),
+        )
+        .await;
+
+        Ok(SubAgentSpawnStarted {
+            child_session_id,
+            child_name,
+            worktree_path,
+            completion_rx,
+        })
+    }
+
     async fn spawn_agent_session(
         &self,
         session_id: String,
@@ -1603,6 +1886,7 @@ impl SessionSupervisor {
         ready_for_thread_actions: Option<oneshot::Sender<()>>,
         codex_service_tier: Option<String>,
         codex_home: Option<String>,
+        sub_agent_wiring: Option<SubAgentWiring>,
     ) {
         let (follow_up_tx, follow_up_rx) = mpsc::channel::<FollowUpMessage>(16);
         let (finished_tx, finished_rx) = oneshot::channel();
@@ -1656,7 +1940,13 @@ impl SessionSupervisor {
                 )
                 .await
             } else {
-                let provider = match provider::select_provider() {
+                let provider = match supervisor
+                    .config
+                    .provider_factory
+                    .as_ref()
+                    .map(|factory| Ok(factory()))
+                    .unwrap_or_else(provider::select_provider)
+                {
                     Ok(provider) => provider,
                     Err(e) => {
                         supervisor
@@ -1672,11 +1962,39 @@ impl SessionSupervisor {
                         return;
                     }
                 };
-                // Both arms run the same in-process supervised loop;
-                // `orchestrate = !use_direct` only swaps in the
-                // orchestration prompt. The old subprocess orchestrator
-                // (`run_user_mode`) is gone — orchestration is an
-                // internal session like any other.
+                // All native arms run the same in-process supervised loop;
+                // only the config differs: orchestrate swaps in the
+                // orchestration prompt, sub-agent wiring sets the child's
+                // role/prompt/identity. Every supervised native session
+                // gets an orchestration handle — the spawn capability is
+                // not tied to a role.
+                let native = NativeSessionConfig {
+                    role: match sub_agent_wiring.as_ref() {
+                        Some(w) => w.role.clone(),
+                        None if use_direct => {
+                            sub_agent::SubAgentRole::Custom("direct".to_string())
+                        }
+                        None => sub_agent::SubAgentRole::Orchestrator,
+                    },
+                    system_prompt_override: sub_agent_wiring
+                        .as_ref()
+                        .and_then(|w| w.system_prompt.clone()),
+                    inherit_memory: sub_agent_wiring
+                        .as_ref()
+                        .map(|w| w.inherit_memory)
+                        .unwrap_or(false),
+                    orchestration: Some(SessionOrchestration {
+                        supervisor: supervisor.clone(),
+                        session_id: session_id.clone(),
+                        submitted_result: sub_agent_wiring
+                            .as_ref()
+                            .map(|w| w.submitted_result.clone()),
+                        children: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    }),
+                    sub_agent_identity: sub_agent_wiring
+                        .as_ref()
+                        .map(|w| (w.child_name.clone(), w.role.clone())),
+                };
                 run_direct_mode(
                     provider,
                     task.clone(),
@@ -1693,14 +2011,78 @@ impl SessionSupervisor {
                     supervisor.config.session_registry.clone(),
                     true,
                     attachments,
-                    !use_direct,
+                    native,
                 )
                 .await
             };
 
+            // Resolve the sub-agent completion before finish_session
+            // consumes the run result: an explicitly submitted result wins;
+            // otherwise synthesize one from the loop's final state.
+            let sub_agent_completion = sub_agent_wiring.map(|w| {
+                let submitted = w
+                    .submitted_result
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take());
+                let result_payload = match (submitted, &result) {
+                    (Some(mut submitted), _) => {
+                        // The child self-reports under its session id; label
+                        // the result with the display name the parent knows.
+                        submitted.id = w.child_name.clone();
+                        submitted
+                    }
+                    (None, Ok(stats)) => {
+                        let full = stats
+                            .last_response
+                            .clone()
+                            .unwrap_or_else(|| "Task completed".to_string());
+                        let (brief, _) = parse_brief(&full);
+                        let status = match stats.terminal_outcome.as_deref() {
+                            None | Some("completed") => sub_agent::SubAgentStatus::Completed,
+                            Some(outcome) => {
+                                sub_agent::SubAgentStatus::Failed(outcome.to_string())
+                            }
+                        };
+                        sub_agent::SubAgentResult {
+                            id: w.child_name.clone(),
+                            status,
+                            summary: full,
+                            brief,
+                            findings: vec![],
+                            artifacts: vec![],
+                            usage: stats.usage.clone(),
+                        }
+                    }
+                    (None, Err(e)) => sub_agent::SubAgentResult {
+                        id: w.child_name.clone(),
+                        status: sub_agent::SubAgentStatus::Failed(e.to_string()),
+                        summary: format!("Task failed: {e}"),
+                        brief: format!("Task failed: {e}"),
+                        findings: vec![],
+                        artifacts: vec![],
+                        usage: provider::TokenUsage::default(),
+                    },
+                };
+                (
+                    w.completion_tx,
+                    SubAgentCompletion {
+                        child_session_id: session_id.clone(),
+                        name: w.child_name,
+                        result: result_payload,
+                    },
+                )
+            });
+
             supervisor
                 .finish_session(session_id, session_instance_id, session_log, task, result)
                 .await;
+            if let Some((completion_tx, completion)) = sub_agent_completion {
+                supervisor.config.bus.send(AppEvent::SubAgentResult {
+                    formatted: sub_agent::format_result_message(&completion.result),
+                });
+                let _ = completion_tx.send(completion);
+            }
             let _ = finished_tx.send(());
         });
     }
@@ -2450,10 +2832,15 @@ impl SessionSupervisor {
         };
         if let Some(requested_id) = requested_id.as_deref() {
             let state = self.state.lock().await;
+            // Related sessions that are managed sessions in their own right
+            // (native sub-agents) take interrupts directly; only related
+            // backend threads inside a parent's process (Codex subagents)
+            // cannot.
             if state
                 .related_sessions
                 .get(requested_id)
                 .is_some_and(|rel| rel.relationship == "subagent")
+                && !state.sessions.contains_key(requested_id)
             {
                 drop(state);
                 self.warn(&format!(
@@ -2499,7 +2886,13 @@ impl SessionSupervisor {
                 self.warn("Stop session dropped: no active managed session");
                 return None;
             };
-            if state.related_sessions.contains_key(&requested_id) {
+            // Related sessions that are managed sessions in their own right
+            // (native sub-agents) can be stopped directly; only related
+            // backend threads inside a parent's process (Codex threads)
+            // must be stopped via their parent.
+            if state.related_sessions.contains_key(&requested_id)
+                && !state.sessions.contains_key(&requested_id)
+            {
                 drop(state);
                 self.warn(&format!(
                     "Stop session dropped: {} is a related Codex thread; stop the parent session instead",
@@ -2629,6 +3022,10 @@ impl SessionSupervisor {
             let target_id = state
                 .resolve_session_id(&target_id)
                 .unwrap_or_else(|| target_id.clone());
+            let requested_is_managed = requested_id
+                .as_deref()
+                .map(|id| state.sessions.contains_key(id))
+                .unwrap_or(false);
             state.sessions.get(&target_id).map(|s| {
                 let relation = requested_id
                     .as_deref()
@@ -2641,19 +3038,26 @@ impl SessionSupervisor {
                     s.session_dir.clone(),
                     s.follow_up_tx.clone(),
                     relation,
+                    requested_is_managed,
                 )
             })
         };
-        let Some((managed_id, source, project_root, session_dir, tx, relation)) = entry else {
+        let Some((managed_id, source, project_root, session_dir, tx, relation, requested_is_managed)) =
+            entry
+        else {
             self.warn(&format!(
                 "Steer dropped: session {} is not managed by this daemon",
                 short_session(&target_id)
             ));
             return;
         };
+        // Related sessions that are managed sessions in their own right
+        // (native sub-agents) take steers directly; only related backend
+        // threads inside a parent's process (Codex subagents) cannot.
         if relation
             .as_ref()
             .is_some_and(|rel| rel.relationship == "subagent")
+            && !requested_is_managed
         {
             self.warn(&format!(
                 "Steer dropped: Codex subagent session {} does not support mid-turn steering; send a follow-up instead",
@@ -3518,9 +3922,22 @@ impl SessionSupervisor {
             }
         };
 
-        let ended_session_id = {
+        let (ended_session_id, orphaned_children) = {
             let mut state = self.state.lock().await;
-            if session_instance_id == 0 {
+            // Sub-agent children die with their parent, like Codex
+            // subagent threads do. Capture them before remove_session
+            // purges the relationship records.
+            let orphaned_children: Vec<String> = state
+                .related_sessions
+                .iter()
+                .filter(|(child, rel)| {
+                    rel.relationship == "subagent"
+                        && rel.parent_session_id == session_id
+                        && state.sessions.contains_key(child.as_str())
+                })
+                .map(|(child, _)| child.clone())
+                .collect();
+            let ended = if session_instance_id == 0 {
                 Some(
                     state
                         .remove_session(&session_id)
@@ -3531,7 +3948,15 @@ impl SessionSupervisor {
                 state
                     .remove_session_instance(&session_id, session_instance_id)
                     .map(|(canonical, _)| canonical)
-            }
+            };
+            // Only cascade when the parent actually ended (not when a
+            // superseded instance retired).
+            let orphaned_children = if ended.is_some() {
+                orphaned_children
+            } else {
+                Vec::new()
+            };
+            (ended, orphaned_children)
         };
 
         if let Some(ended_session_id) = ended_session_id.clone() {
@@ -3539,6 +3964,19 @@ impl SessionSupervisor {
                 session_id: ended_session_id.clone(),
                 reason,
             });
+        }
+
+        for child_id in orphaned_children {
+            self.warn(&format!(
+                "Stopping sub-agent {} because its parent session ended",
+                short_session(&child_id)
+            ));
+            if let Some(stopped) = self
+                .stop_managed_session(Some(child_id), "parent session ended")
+                .await
+            {
+                self.wait_for_stopped_session(stopped).await;
+            }
         }
 
         if let Some(ref shared_session) = self.config.shared_session {
@@ -4311,7 +4749,7 @@ fn control_msg_can_attach_unmanaged_session(msg: &event::ControlMsg) -> bool {
     }
 }
 
-fn short_session(session_id: &str) -> String {
+pub(crate) fn short_session(session_id: &str) -> String {
     session_id.chars().take(8).collect()
 }
 
@@ -4728,7 +5166,20 @@ mod tests {
             web_port: None,
             flags_direct: false,
             shared_session: None,
+            provider_factory: None,
         })
+    }
+
+    fn test_supervisor_with_mock_provider(
+        project_root: PathBuf,
+        bus: EventBus,
+    ) -> SessionSupervisor {
+        let mut config = (*test_supervisor(project_root, bus).config).clone();
+        config.provider_factory = Some(Arc::new(|| {
+            Box::new(provider::mock::MockOrchestrationProvider::new())
+                as Box<dyn provider::ChatProvider>
+        }));
+        SessionSupervisor::new(config)
     }
 
     fn slash(text: &str) -> CodexSlashCommand {
@@ -5228,6 +5679,244 @@ mod tests {
         }
         assert!(saw_stop_request, "expected SessionStopRequested");
         assert!(saw_session_ended, "expected SessionEnded");
+    }
+
+    #[tokio::test]
+    async fn stop_targets_native_sub_agent_child_directly() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        {
+            let mut state = supervisor.state.lock().await;
+            state
+                .sessions
+                .insert("parent".to_string(), managed_session("parent", "intendant"));
+            state
+                .sessions
+                .insert("child".to_string(), managed_session("child", "intendant"));
+            assert!(state.apply_related_session("parent", "child", "subagent"));
+        }
+
+        let stopped = supervisor
+            .stop_managed_session(Some("child".to_string()), "test stop")
+            .await;
+        assert_eq!(
+            stopped.map(|s| s.session_id),
+            Some("child".to_string()),
+            "a native sub-agent child is a managed session in its own right and must be stoppable"
+        );
+        let state = supervisor.state.lock().await;
+        assert!(!state.sessions.contains_key("child"));
+        assert!(state.sessions.contains_key("parent"));
+    }
+
+    #[tokio::test]
+    async fn stop_still_refuses_codex_thread_children() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        {
+            let mut state = supervisor.state.lock().await;
+            state
+                .sessions
+                .insert("parent".to_string(), managed_session("parent", "codex"));
+            // Codex subagent thread: related, but not independently managed.
+            assert!(state.apply_related_session("parent", "thread-child", "subagent"));
+        }
+        let stopped = supervisor
+            .stop_managed_session(Some("thread-child".to_string()), "test stop")
+            .await;
+        assert!(
+            stopped.is_none(),
+            "codex threads still stop via their parent"
+        );
+        let state = supervisor.state.lock().await;
+        assert!(state.sessions.contains_key("parent"));
+    }
+
+    #[tokio::test]
+    async fn running_sub_agent_children_counts_only_live_managed_children() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        {
+            let mut state = supervisor.state.lock().await;
+            state
+                .sessions
+                .insert("parent".to_string(), managed_session("parent", "intendant"));
+            state.sessions.insert(
+                "live-child".to_string(),
+                managed_session("live-child", "intendant"),
+            );
+            assert!(state.apply_related_session("parent", "live-child", "subagent"));
+            // Finished child: relationship record without a live session.
+            assert!(state.apply_related_session("parent", "gone-child", "subagent"));
+            // A side session of the same parent does not count.
+            state.sessions.insert(
+                "side-child".to_string(),
+                managed_session("side-child", "codex"),
+            );
+            assert!(state.apply_related_session("parent", "side-child", "side"));
+        }
+        assert_eq!(supervisor.running_sub_agent_children("parent").await, 1);
+        assert_eq!(supervisor.running_sub_agent_children("other").await, 0);
+    }
+
+    #[tokio::test]
+    async fn finish_session_cascades_stop_to_running_sub_agent_children() {
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        {
+            let mut state = supervisor.state.lock().await;
+            state
+                .sessions
+                .insert("parent".to_string(), managed_session("parent", "intendant"));
+            state
+                .sessions
+                .insert("child".to_string(), managed_session("child", "intendant"));
+            assert!(state.apply_related_session("parent", "child", "subagent"));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let session_log = Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(dir.path().join("session")).unwrap(),
+        ));
+        supervisor
+            .finish_session(
+                "parent".to_string(),
+                0,
+                session_log,
+                "task".to_string(),
+                Ok(LoopStats::default()),
+            )
+            .await;
+
+        {
+            let state = supervisor.state.lock().await;
+            assert!(!state.sessions.contains_key("parent"));
+            assert!(
+                !state.sessions.contains_key("child"),
+                "sub-agent children die with their parent"
+            );
+        }
+        let mut ended = Vec::new();
+        while let Ok(event) = bus_rx.try_recv() {
+            if let AppEvent::SessionEnded { session_id, .. } = event {
+                ended.push(session_id);
+            }
+        }
+        assert!(ended.contains(&"parent".to_string()));
+        assert!(ended.contains(&"child".to_string()));
+    }
+
+    /// End-to-end substrate test, keyless: a mock provider drives an
+    /// orchestrate session that spawns two supervised children (one
+    /// succeeds via submit_result, one fails), waits for both, and only
+    /// synthesizes after their results actually arrive in its context.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn orchestrator_spawns_children_and_synthesizes_results_keylessly() {
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let project_dir = tempfile::tempdir().unwrap();
+        let supervisor =
+            test_supervisor_with_mock_provider(project_dir.path().to_path_buf(), bus.clone());
+
+        let log_root = tempfile::tempdir().unwrap();
+        let parent_log_dir = log_root.path().join("parent-session");
+        let session_log = Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(parent_log_dir.clone()).unwrap(),
+        ));
+        let parent_id = session_log
+            .lock()
+            .map(|log| log.session_id().to_string())
+            .unwrap();
+        let project = Project::from_root(project_dir.path().to_path_buf()).unwrap();
+
+        supervisor
+            .spawn_agent_session(
+                parent_id.clone(),
+                "intendant".to_string(),
+                "Orchestrate the mock research and testing work".to_string(),
+                project,
+                session_log,
+                parent_log_dir,
+                None,
+                false, // orchestrate
+                UserAttachments::default(),
+                Some("mock-orchestrator".to_string()),
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        let mut sub_agent_relationships = 0usize;
+        let mut child_results: Vec<String> = Vec::new();
+        let mut synthesis: Option<String> = None;
+
+        let collected = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                match bus_rx.recv().await {
+                    Ok(AppEvent::SessionRelationship {
+                        parent_session_id,
+                        relationship,
+                        ..
+                    }) if relationship == "subagent" && parent_session_id == parent_id => {
+                        sub_agent_relationships += 1;
+                    }
+                    Ok(AppEvent::SubAgentResult { formatted }) => {
+                        child_results.push(formatted);
+                    }
+                    Ok(AppEvent::DoneSignal {
+                        session_id,
+                        message,
+                    }) if session_id.as_deref() == Some(parent_id.as_str()) => {
+                        synthesis = message;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+        .await;
+        assert!(collected.is_ok(), "orchestration flow timed out");
+
+        assert_eq!(
+            sub_agent_relationships, 2,
+            "both children should be linked to the parent"
+        );
+        assert_eq!(
+            child_results.len(),
+            2,
+            "both child completions should be announced: {child_results:?}"
+        );
+        assert!(
+            child_results
+                .iter()
+                .any(|r| r.contains("research findings ABC")),
+            "successful child result should carry its submitted summary: {child_results:?}"
+        );
+        assert!(
+            child_results
+                .iter()
+                .any(|r| r.contains("failed") && r.contains("boom")),
+            "failed child result should carry its failure: {child_results:?}"
+        );
+        assert_eq!(
+            synthesis.as_deref(),
+            Some("SYNTHESIS: research succeeded, testing failed"),
+            "the parent must see both delivered results before synthesizing"
+        );
+
+        // The parent idles for follow-ups after done; stopping it releases
+        // the managed session (children already finished, nothing cascades).
+        supervisor
+            .stop_managed_session(Some(parent_id.clone()), "test complete")
+            .await
+            .expect("parent should stop");
     }
 
     #[tokio::test]

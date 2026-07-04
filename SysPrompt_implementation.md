@@ -26,6 +26,10 @@ Use the tool names exposed by the current transport. In native-tool mode, the co
 
 Focus primarily on the file-editing, shell command, and path-inspection tools.
 
+## Reporting Back
+
+When you run as a sub-agent (spawned by another session), report your outcome with `submit_result` when the work is done: status, a full `summary` (what changed, how it was verified, branch/worktree if any), and paths to key files as `artifacts`. Then call `signal_done` — both can go in the same message.
+
 ## Final Response
 
 When your task is complete, end your final response with a spoken summary line:

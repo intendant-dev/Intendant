@@ -11981,6 +11981,7 @@ async fn run_daemon_loop(config: DaemonConfig) {
         web_port: config.web_port,
         flags_direct: config.flags_direct,
         shared_session: config.shared_session,
+        provider_factory: None,
     })
     .run()
     .await;
@@ -24825,6 +24826,398 @@ Also: {"source": "bare"}"#;
 
 const PROGRESS_INTERVAL: usize = 5;
 
+fn orchestration_unavailable() -> String {
+    "Error: sub-agent orchestration is only available in supervised sessions under the \
+     web daemon (the default mode). This session has no session supervisor, so \
+     spawn_sub_agent / wait_sub_agents cannot run here."
+        .to_string()
+}
+
+/// Handle a spawn_sub_agent tool call: spawn a supervised child session
+/// through the session supervisor and track it on this session's
+/// orchestration handle for wait_sub_agents.
+async fn handle_spawn_sub_agent_call(
+    args: &serde_json::Value,
+    orchestration: Option<&session_supervisor::SessionOrchestration>,
+    project: &Project,
+    session_log: &SharedSessionLog,
+) -> String {
+    let Some(orchestration) = orchestration else {
+        return orchestration_unavailable();
+    };
+    let task = args
+        .get("task")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if task.is_empty() {
+        return "Error: spawn_sub_agent requires a non-empty `task`.".to_string();
+    }
+    let role = sub_agent::SubAgentRole::from_str(
+        args.get("role")
+            .and_then(|r| r.as_str())
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .unwrap_or("worker"),
+    );
+    let backend = match args
+        .get("backend")
+        .and_then(|b| b.as_str())
+        .map(str::trim)
+        .unwrap_or("internal")
+    {
+        "internal" | "" => None,
+        "codex" => Some(external_agent::AgentBackend::Codex),
+        "claude-code" | "claude_code" => Some(external_agent::AgentBackend::ClaudeCode),
+        other => {
+            return format!(
+                "Error: unknown sub-agent backend `{other}`; use internal, codex, or claude-code."
+            );
+        }
+    };
+    let params = session_supervisor::SubAgentSpawnParams {
+        task,
+        role,
+        system_prompt: args
+            .get("system_prompt")
+            .and_then(|p| p.as_str())
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(String::from),
+        backend,
+        worktree: args
+            .get("worktree")
+            .and_then(|w| w.as_bool())
+            .unwrap_or(false),
+        inherit_memory: args
+            .get("inherit_memory")
+            .and_then(|i| i.as_bool())
+            .unwrap_or(false),
+        name: args
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(String::from),
+    };
+    match orchestration
+        .supervisor
+        .start_sub_agent_session(&orchestration.session_id, project, params)
+        .await
+    {
+        Ok(started) => {
+            slog(session_log, |l| {
+                l.info(&format!(
+                    "Spawned sub-agent {} (session {})",
+                    started.child_name,
+                    session_supervisor::short_session(&started.child_session_id)
+                ))
+            });
+            let mut response = format!(
+                "Sub-agent spawned.\n- name: {}\n- child_session_id: {}",
+                started.child_name, started.child_session_id
+            );
+            if let Some(path) = &started.worktree_path {
+                response.push_str(&format!("\n- worktree: {}", path.display()));
+            }
+            response.push_str(
+                "\nIt is running as its own supervised session. Collect its result with wait_sub_agents.",
+            );
+            let mut children = orchestration
+                .children
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            children.insert(
+                started.child_session_id.clone(),
+                session_supervisor::SubAgentChild {
+                    name: started.child_name,
+                    rx: Some(started.completion_rx),
+                    completed: None,
+                    delivered: false,
+                },
+            );
+            response
+        }
+        Err(e) => format!("Error: {e}"),
+    }
+}
+
+/// Handle a submit_result tool call from a sub-agent child: record the
+/// structured result in the slot the supervisor delivers to the parent
+/// when this session finishes.
+fn handle_submit_result_call(
+    args: &serde_json::Value,
+    orchestration: Option<&session_supervisor::SessionOrchestration>,
+    local_session_id: &Option<String>,
+) -> String {
+    let Some(slot) = orchestration.and_then(|o| o.submitted_result.as_ref()) else {
+        return "Error: submit_result is only available to sessions spawned as sub-agents."
+            .to_string();
+    };
+    let summary = args
+        .get("summary")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if summary.is_empty() {
+        return "Error: submit_result requires a non-empty `summary`.".to_string();
+    }
+    let status = match args
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("completed")
+    {
+        "completed" => sub_agent::SubAgentStatus::Completed,
+        "failed" => sub_agent::SubAgentStatus::Failed(
+            args.get("failure_reason")
+                .and_then(|r| r.as_str())
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .unwrap_or("unspecified failure")
+                .to_string(),
+        ),
+        other => {
+            return format!("Error: unknown status `{other}`; use `completed` or `failed`.");
+        }
+    };
+    let brief = args
+        .get("brief")
+        .and_then(|b| b.as_str())
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| parse_brief(&summary).0);
+    let findings = args
+        .get("findings")
+        .and_then(|f| f.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let artifacts = args
+        .get("artifacts")
+        .and_then(|f| f.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(PathBuf::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let result = sub_agent::SubAgentResult {
+        id: local_session_id.clone().unwrap_or_default(),
+        status,
+        summary,
+        brief,
+        findings,
+        artifacts,
+        // Usage comes from session accounting, not self-report.
+        usage: provider::TokenUsage::default(),
+    };
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+    "Result recorded. It is delivered to your parent session when you finish — call signal_done once your work is complete."
+        .to_string()
+}
+
+/// Handle a wait_sub_agents tool call: block until the requested children
+/// finish (mode `all`, default) or the first one does (mode `any`), the
+/// timeout lapses, or the user interrupts/stops this session.
+async fn handle_wait_sub_agents_call(
+    args: &serde_json::Value,
+    orchestration: Option<&session_supervisor::SessionOrchestration>,
+    bus: &EventBus,
+    local_session_id: &Option<String>,
+    session_log: &SharedSessionLog,
+) -> String {
+    let Some(orchestration) = orchestration else {
+        return orchestration_unavailable();
+    };
+    let wait_all = !matches!(args.get("mode").and_then(|m| m.as_str()), Some("any"));
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(600)
+        .clamp(5, 7200);
+    let filter: Option<std::collections::HashSet<String>> = args
+        .get("agent_ids")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .filter(|set: &std::collections::HashSet<String>| !set.is_empty());
+
+    let target_ids: Vec<String> = {
+        let children = orchestration
+            .children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        children
+            .iter()
+            .filter(|(id, child)| {
+                !child.delivered
+                    && filter
+                        .as_ref()
+                        .map(|f| f.contains(*id) || f.contains(&child.name))
+                        .unwrap_or(true)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    if target_ids.is_empty() {
+        return "No pending sub-agents to wait for: every spawned sub-agent's result was \
+                already delivered (or none match the requested agent_ids)."
+            .to_string();
+    }
+
+    slog(session_log, |l| {
+        l.info(&format!(
+            "Waiting for {} sub-agent(s) (mode: {}, timeout: {}s)",
+            target_ids.len(),
+            if wait_all { "all" } else { "any" },
+            timeout_secs
+        ))
+    });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut interrupt_rx = bus.subscribe();
+    let mut interrupted = false;
+    let mut timed_out = false;
+
+    loop {
+        let satisfied = {
+            let mut children = orchestration
+                .children
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut ready = 0usize;
+            for id in &target_ids {
+                let Some(child) = children.get_mut(id) else {
+                    ready += 1; // vanished child counts as resolved
+                    continue;
+                };
+                if child.completed.is_none() && !child.delivered {
+                    if let Some(rx) = child.rx.as_mut() {
+                        match rx.try_recv() {
+                            Ok(completion) => {
+                                child.completed = Some(completion);
+                                child.rx = None;
+                            }
+                            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                                child.rx = None;
+                                child.completed =
+                                    Some(session_supervisor::SubAgentCompletion {
+                                        child_session_id: id.clone(),
+                                        name: child.name.clone(),
+                                        result: sub_agent::SubAgentResult {
+                                            id: child.name.clone(),
+                                            status: sub_agent::SubAgentStatus::Failed(
+                                                "session ended without a result".to_string(),
+                                            ),
+                                            summary:
+                                                "Sub-agent session ended without reporting a result"
+                                                    .to_string(),
+                                            brief: "Sub-agent ended without a result.".to_string(),
+                                            findings: vec![],
+                                            artifacts: vec![],
+                                            usage: provider::TokenUsage::default(),
+                                        },
+                                    });
+                            }
+                        }
+                    }
+                }
+                if child.completed.is_some() || child.delivered {
+                    ready += 1;
+                }
+            }
+            if wait_all {
+                ready >= target_ids.len()
+            } else {
+                ready > 0
+            }
+        };
+        if satisfied {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+        while let Ok(event) = interrupt_rx.try_recv() {
+            match event {
+                AppEvent::InterruptRequested { session_id }
+                | AppEvent::SessionStopRequested { session_id, .. }
+                    if event_targets_session(&session_id, local_session_id) =>
+                {
+                    interrupted = true;
+                }
+                _ => {}
+            }
+        }
+        if interrupted {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    let mut delivered = Vec::new();
+    let mut still_running = Vec::new();
+    {
+        let mut children = orchestration
+            .children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for id in &target_ids {
+            let Some(child) = children.get_mut(id) else {
+                continue;
+            };
+            if child.delivered {
+                continue;
+            }
+            match child.completed.as_ref() {
+                Some(completion) => {
+                    child.delivered = true;
+                    delivered.push(format!(
+                        "{} (session {})\n{}",
+                        completion.name,
+                        completion.child_session_id,
+                        sub_agent::format_result_message(&completion.result)
+                    ));
+                }
+                None => still_running.push(format!("{} ({})", child.name, id)),
+            }
+        }
+    }
+
+    let mut out = String::new();
+    if interrupted {
+        out.push_str("[wait interrupted by the user]\n\n");
+    } else if timed_out && delivered.is_empty() {
+        out.push_str(&format!(
+            "[wait timed out after {timeout_secs}s with no completions]\n\n"
+        ));
+    }
+    if !delivered.is_empty() {
+        out.push_str(&delivered.join("\n\n"));
+    }
+    if !still_running.is_empty() {
+        out.push_str(&format!(
+            "\n\nStill running: {}. Call wait_sub_agents again to keep waiting, or proceed and collect them later.",
+            still_running.join(", ")
+        ));
+    }
+    if delivered.is_empty() && still_running.is_empty() {
+        out.push_str("All requested sub-agents had already delivered their results.");
+    }
+    out.trim().to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_loop(
     provider: &dyn provider::ChatProvider,
@@ -24844,6 +25237,10 @@ async fn run_agent_loop(
     // When true, askHuman is unavailable and approvals without a json_approval
     // slot are auto-denied (headless non-JSON mode).
     headless: bool,
+    // Supervised-session orchestration handle: enables the
+    // spawn_sub_agent / wait_sub_agents / submit_result tools. None outside
+    // the daemon, where those tools answer with a clear error.
+    orchestration: Option<&session_supervisor::SessionOrchestration>,
 ) -> Result<(LoopStats, LoopExitReason), CallerError> {
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
@@ -25373,6 +25770,16 @@ async fn run_agent_loop(
                 });
             }
 
+            // Record a structured sub-agent result (submit_result) before
+            // the done check: "submit_result + signal_done" in one batch is
+            // the natural final move for a child and must not lose the
+            // result to the done short-circuit.
+            for (call_id, args) in &batch.sub_agent_results {
+                handled_call_ids.insert(call_id.clone());
+                let response = handle_submit_result_call(args, orchestration, &local_session_id);
+                conversation.add_tool_result(call_id, "submit_result", &response);
+            }
+
             // Check done signal
             if batch.is_done {
                 slog(&session_log, |l| {
@@ -25472,6 +25879,29 @@ async fn run_agent_loop(
                         );
                     }
                 }
+            }
+
+            // Spawn supervised sub-agent sessions (spawn_sub_agent).
+            for (call_id, args) in &batch.sub_agent_spawns {
+                handled_call_ids.insert(call_id.clone());
+                let response =
+                    handle_spawn_sub_agent_call(args, orchestration, project, &session_log).await;
+                conversation.add_tool_result(call_id, "spawn_sub_agent", &response);
+            }
+
+            // Await sub-agent completions (wait_sub_agents). Blocking:
+            // resolves inside this tool call, honoring interrupt/stop.
+            for (call_id, args) in &batch.sub_agent_waits {
+                handled_call_ids.insert(call_id.clone());
+                let response = handle_wait_sub_agents_call(
+                    args,
+                    orchestration,
+                    bus,
+                    &local_session_id,
+                    &session_log,
+                )
+                .await;
+                conversation.add_tool_result(call_id, "wait_sub_agents", &response);
             }
 
             // Handle shared_view tool calls (dashboard coordination layer)
@@ -26388,6 +26818,7 @@ Proceed with explicit assumptions and continue without additional questions."
 /// Wraps `run_agent_loop` in a multi-round loop that waits for follow-up messages
 /// between rounds. The session continues until the user closes the channel,
 /// budget is exhausted, safety cap is reached, or a non-recoverable exit occurs.
+#[allow(clippy::too_many_arguments)]
 async fn run_round_loop(
     provider: &dyn provider::ChatProvider,
     conversation: &mut Conversation,
@@ -26404,6 +26835,7 @@ async fn run_round_loop(
     context_injection: &event::ContextInjectionQueue,
     session_registry: Option<&display::SharedSessionRegistry>,
     headless: bool,
+    orchestration: Option<&session_supervisor::SessionOrchestration>,
 ) -> Result<LoopStats, CallerError> {
     let mut round = 1usize;
     let mut cumulative_stats = LoopStats::default();
@@ -26429,6 +26861,7 @@ async fn run_round_loop(
             &mut xvfb_guard,
             session_registry,
             headless,
+            orchestration,
         )
         .await?;
 
@@ -26740,6 +27173,7 @@ All relative paths and commands execute from this directory.",
         &mut None, // sub-agents get their own display if needed
         None,      // sub-agent processes have no in-process display sessions
         true,      // headless (sub-agents have no interactive UI)
+        None,      // subprocess children have no supervisor handle
     )
     .await;
 
@@ -29206,6 +29640,7 @@ async fn run_with_presence(
                 &context_injection, // shared with presence
                 Some(&session_registry),
                 false, // not headless
+                None,  // presence mode has no session supervisor
             )
             .await;
 
@@ -29232,6 +29667,46 @@ async fn run_with_presence(
     Ok(cumulative_stats)
 }
 
+/// Configuration for a native in-process session beyond plain direct mode:
+/// which prompt the loop runs under, whether it carries the supervised
+/// orchestration handle, and whether it runs as a sub-agent child.
+///
+/// Orchestration used to be a separate subprocess mode (`run_user_mode`,
+/// which spawned the orchestrator as a child process and polled its
+/// progress/result files); it is now just a differently-configured
+/// internal session, and sub-agents are supervised child sessions.
+pub(crate) struct NativeSessionConfig {
+    /// Resolves the system prompt (SysPrompt role files). Custom roles
+    /// fall back to the base prompt.
+    pub(crate) role: sub_agent::SubAgentRole,
+    /// Replaces the role-resolved system prompt wholesale (the
+    /// INTENDANT_SYSTEM_PROMPT semantic, session-scoped).
+    pub(crate) system_prompt_override: Option<String>,
+    /// Inject the project knowledge store into fresh conversations.
+    pub(crate) inherit_memory: bool,
+    /// Present on supervised (daemon) sessions: grants the loop the
+    /// spawn_sub_agent / wait_sub_agents / submit_result capability.
+    pub(crate) orchestration: Option<session_supervisor::SessionOrchestration>,
+    /// Present when this session runs as a sub-agent child: (name, role).
+    /// Children end when their task ends instead of idling for follow-ups.
+    pub(crate) sub_agent_identity: Option<(String, sub_agent::SubAgentRole)>,
+}
+
+impl NativeSessionConfig {
+    /// Plain direct session: base prompt, no supervision extras. The shape
+    /// every non-daemon CLI path runs — orchestration (sub-agent spawning)
+    /// requires the daemon's session supervisor.
+    pub(crate) fn direct() -> Self {
+        Self {
+            role: sub_agent::SubAgentRole::Custom("direct".to_string()),
+            system_prompt_override: None,
+            inherit_memory: false,
+            orchestration: None,
+            sub_agent_identity: None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_direct_mode(
     mut provider: Box<dyn provider::ChatProvider>,
@@ -29250,28 +29725,28 @@ async fn run_direct_mode(
     session_registry: Option<display::SharedSessionRegistry>,
     headless: bool,
     attachments: UserAttachments,
-    orchestrate: bool,
+    native: NativeSessionConfig,
 ) -> Result<LoopStats, CallerError> {
-    // `orchestrate` runs the same in-process loop with the orchestration
-    // prompt instead of the direct prompt. Orchestration used to be a
-    // separate subprocess mode (`run_user_mode`, which spawned the
-    // orchestrator as a child process and polled its progress/result
-    // files); it is now just a differently-configured internal session.
-    let role = if orchestrate {
-        sub_agent::SubAgentRole::Orchestrator
-    } else {
-        sub_agent::SubAgentRole::Custom("direct".to_string())
-    };
-    let system_prompt = if provider.use_tools() {
-        prompts::resolve_system_prompt_for_tools(&role, Some(&project.root))?
-    } else {
-        prompts::resolve_system_prompt(&role, Some(&project.root))?
+    let role = native.role.clone();
+    let system_prompt = match native.system_prompt_override.clone() {
+        Some(prompt) => prompt,
+        None if provider.use_tools() => {
+            prompts::resolve_system_prompt_for_tools(&role, Some(&project.root))?
+        }
+        None => prompts::resolve_system_prompt(&role, Some(&project.root))?,
     };
 
+    let mode_label = if native.sub_agent_identity.is_some() {
+        "sub-agent"
+    } else if matches!(role, sub_agent::SubAgentRole::Orchestrator) {
+        "orchestrate"
+    } else {
+        "direct"
+    };
     slog(&session_log, |l| {
         l.info(&format!(
             "Mode: {} (provider: {}, context: {})",
-            if orchestrate { "orchestrate" } else { "direct" },
+            mode_label,
             provider.name(),
             provider.context_window()
         ));
@@ -29287,6 +29762,7 @@ async fn run_direct_mode(
     // Try to resume from saved conversation if it exists in this session dir
     let conv_path = log_dir.join("conversation.jsonl");
     let attachment_images = attachments.conversation_images();
+    let mut fresh_conversation = false;
     let mut conversation = if conv_path.exists() {
         match Conversation::load_from_file(&conv_path, provider.context_window()) {
             Ok(mut conv) => {
@@ -29314,6 +29790,7 @@ async fn run_direct_mode(
                         e
                     ))
                 });
+                fresh_conversation = true;
                 let mut conv = Conversation::new(system_prompt, provider.context_window());
                 setup_fresh_conversation_with_attachments(
                     &mut conv,
@@ -29325,6 +29802,7 @@ async fn run_direct_mode(
             }
         }
     } else {
+        fresh_conversation = true;
         let mut conv = Conversation::new(system_prompt, provider.context_window());
         setup_fresh_conversation_with_attachments(
             &mut conv,
@@ -29334,6 +29812,21 @@ async fn run_direct_mode(
         );
         conv
     };
+
+    // Inject inherited project knowledge (sub-agents spawned with
+    // inherit_memory). Resumed conversations already carry it.
+    if native.inherit_memory && fresh_conversation && project.config.memory.enabled {
+        if let Ok(kstore) = knowledge::load(&project.memory_path()) {
+            let refs: Vec<&_> = kstore.entries.iter().collect();
+            let msg = knowledge::format_for_injection(&refs);
+            if !msg.is_empty() {
+                conversation.add_user(msg);
+                conversation.add_assistant(
+                    "Acknowledged. I have loaded the project knowledge.".to_string(),
+                );
+            }
+        }
+    }
 
     // Register MCP tools so providers include them in API requests
     if let Some(ref mgr) = mcp_mgr {
@@ -29353,7 +29846,7 @@ async fn run_direct_mode(
         provider.as_ref(),
         &mut conversation,
         &project,
-        None,
+        native.sub_agent_identity.as_ref(),
         &bus,
         autonomy,
         session_log,
@@ -29365,6 +29858,7 @@ async fn run_direct_mode(
         &context_injection,
         session_registry.as_ref(),
         headless,
+        native.orchestration.as_ref(),
     )
     .await
 }
@@ -34717,6 +35211,7 @@ async fn main() -> Result<(), CallerError> {
                 web_port: web_port_for_agent,
                 flags_direct: flags.direct,
                 shared_session: Some(shared_session),
+                provider_factory: None,
             },
         )
         .spawn();
@@ -35044,16 +35539,21 @@ async fn main() -> Result<(), CallerError> {
                         return tokio::spawn(async {});
                     }
                 };
-                // Read and consume the mode override set by start_task
+                // Consume the mode override set by start_task. Orchestration
+                // (sub-agent spawning) needs the daemon's session supervisor;
+                // this standalone MCP task path runs sessions directly, so an
+                // orchestrate request degrades to a direct session.
                 let orchestrate_override = {
                     let mut s = mcp_state.write().await;
                     s.next_task_orchestrate.take()
                 };
-                let use_orchestration = match orchestrate_override {
-                    Some(true) => true,
-                    Some(false) => false,
-                    None => !is_simple_task(&task_str), // auto: same heuristic as TUI
-                };
+                if orchestrate_override == Some(true) {
+                    bus.send(AppEvent::LoopError(
+                        "orchestrate=true requires the web daemon's session supervisor; \
+                         running the task as a direct session"
+                            .to_string(),
+                    ));
+                }
 
                 // Create follow-up channel for multi-round support
                 let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<FollowUpMessage>(1);
@@ -35115,7 +35615,7 @@ async fn main() -> Result<(), CallerError> {
                             Some(session_registry),
                             false, // not headless — MCP has interactive approval
                             UserAttachments::default(),
-                            use_orchestration,
+                            NativeSessionConfig::direct(),
                         )
                         .await
                     };
@@ -35644,6 +36144,7 @@ async fn main() -> Result<(), CallerError> {
                         web_port: web_port_for_agent,
                         flags_direct: flags.direct,
                         shared_session: web_shared_session_for_supervisor.clone(),
+                        provider_factory: None,
                     },
                 )
                 .spawn_resume_listener(),
@@ -35825,7 +36326,9 @@ async fn main() -> Result<(), CallerError> {
                         }
                     };
 
-                    let orchestrate = !(force_direct || is_simple_task(&task_str));
+                    // Orchestration (sub-agent spawning) requires the
+                    // daemon's session supervisor; TUI-mode tasks run as
+                    // direct sessions.
                     run_direct_mode(
                         provider,
                         task_str,
@@ -35842,7 +36345,7 @@ async fn main() -> Result<(), CallerError> {
                         Some(session_registry_clone),
                         false, // not headless — TUI handles approval
                         UserAttachments::default(),
-                        orchestrate,
+                        NativeSessionConfig::direct(),
                     )
                     .await
                 };
@@ -36319,7 +36822,9 @@ async fn main() -> Result<(), CallerError> {
             let provider = provider.ok_or_else(|| {
                 CallerError::Config("Headless mode requires an API key".to_string())
             })?;
-            let orchestrate = !(flags.direct || is_simple_task(&task));
+            // Orchestration (sub-agent spawning) requires the daemon's
+            // session supervisor; headless non-daemon tasks run as direct
+            // sessions.
             run_direct_mode(
                 provider,
                 task.clone(),
@@ -36336,7 +36841,7 @@ async fn main() -> Result<(), CallerError> {
                 Some(session_registry.clone()),
                 true, // headless mode
                 UserAttachments::default(),
-                orchestrate,
+                NativeSessionConfig::direct(),
             )
             .await
         };
