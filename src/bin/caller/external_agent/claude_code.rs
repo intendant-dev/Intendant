@@ -153,6 +153,37 @@ struct CcShared {
     /// of subtype `error_during_execution`; this flag keeps that expected
     /// outcome from being reported as a backend error.
     interrupt_pending: AtomicBool,
+    /// Set by `thread_action("compact")`. An out-of-band `/compact` ends
+    /// with a FREE result (`num_turns: 0`, all-zero usage) that is not a
+    /// conversation turn; this flag lets the reader absorb it so it cannot
+    /// prematurely complete the next real turn.
+    compact_pending: AtomicBool,
+    /// Wrapper-level goal engine state. Claude Code has no native `/goal`,
+    /// so the adapter owns the operator goal and rides the universal
+    /// `GoalUpdated`/`GoalCleared` rails (window chip, log persistence, and
+    /// replay all come for free from the Codex-built plumbing).
+    goal: StdMutex<Option<CcGoal>>,
+    /// Fresh tokens spent by this process — uncached input + cache creation
+    /// + output, accumulated per result. The goal-budget currency: cache
+    /// reads are excluded so a budget measures real work, not re-reads.
+    cumulative_fresh_tokens: AtomicU64,
+    /// True while a turn runs (user message written, result pending). Goal
+    /// notices are written mid-turn (absorbed by the running turn) instead
+    /// of being queued as a prelude for the next message.
+    turn_active: AtomicBool,
+}
+
+/// Operator goal tracked by the wrapper-level engine.
+#[derive(Debug, Clone)]
+struct CcGoal {
+    objective: String,
+    /// Same status vocabulary as Codex goals (`normalize_goal_status`).
+    status: String,
+    token_budget: Option<u64>,
+    set_at: std::time::Instant,
+    /// `cumulative_fresh_tokens` snapshot when the goal was set; spend
+    /// against the budget is measured from here.
+    tokens_at_set: u64,
 }
 
 impl CcShared {
@@ -160,7 +191,55 @@ impl CcShared {
         Self {
             session_id: StdMutex::new(resume_session),
             interrupt_pending: AtomicBool::new(false),
+            compact_pending: AtomicBool::new(false),
+            goal: StdMutex::new(None),
+            cumulative_fresh_tokens: AtomicU64::new(0),
+            turn_active: AtomicBool::new(false),
         }
+    }
+
+    fn lock_goal(&self) -> std::sync::MutexGuard<'_, Option<CcGoal>> {
+        match self.goal.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Current goal as the wire type (elapsed + budget spend computed now).
+    fn goal_snapshot(&self) -> Option<crate::types::SessionGoal> {
+        let guard = self.lock_goal();
+        let goal = guard.as_ref()?;
+        let used = self
+            .cumulative_fresh_tokens
+            .load(Ordering::Relaxed)
+            .saturating_sub(goal.tokens_at_set);
+        Some(crate::types::SessionGoal {
+            objective: goal.objective.clone(),
+            status: Some(goal.status.clone()),
+            elapsed_seconds: Some(goal.set_at.elapsed().as_secs()),
+            tokens_used: Some(used),
+            token_budget: goal.token_budget,
+        })
+    }
+
+    /// Refresh the goal after a turn result: recompute spend, flip an
+    /// `active` goal to `budgetLimited` when the budget is exhausted, and
+    /// return the updated snapshot for a `GoalUpdated` emission.
+    fn refresh_goal_after_result(&self) -> Option<crate::types::SessionGoal> {
+        {
+            let mut guard = self.lock_goal();
+            let goal = guard.as_mut()?;
+            let used = self
+                .cumulative_fresh_tokens
+                .load(Ordering::Relaxed)
+                .saturating_sub(goal.tokens_at_set);
+            if goal.status == "active"
+                && goal.token_budget.is_some_and(|budget| used >= budget)
+            {
+                goal.status = "budgetLimited".to_string();
+            }
+        }
+        self.goal_snapshot()
     }
 
     fn session_id(&self) -> Option<String> {
@@ -291,6 +370,11 @@ fn usage_snapshot_from_api_usage(
     let cache_creation = read("cache_creation_input_tokens").unwrap_or(0);
     let prompt_tokens = input + cache_read + cache_creation;
     let tokens_used = prompt_tokens + output;
+    // All-zero snapshots carry no information (the compact free result, some
+    // synthetic results) and would stomp the dashboard meter to 0%.
+    if tokens_used == 0 {
+        return None;
+    }
     let usage_pct = if context_window > 0 {
         (tokens_used as f64 / context_window as f64) * 100.0
     } else {
@@ -438,8 +522,38 @@ impl CcReader {
     }
 
     fn handle_system(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
-        if msg.get("subtype").and_then(|s| s.as_str()) != Some("init") {
-            return;
+        match msg.get("subtype").and_then(|s| s.as_str()) {
+            Some("init") => {}
+            // General status channel (2.1.201): compaction progress and
+            // permission-mode echoes arrive here.
+            Some("status") => {
+                if msg.get("status").and_then(|s| s.as_str()) == Some("compacting") {
+                    out.log("info", "Compacting context…");
+                } else if let Some(result) = msg.get("compact_result").and_then(|s| s.as_str()) {
+                    out.log(
+                        if result == "success" { "info" } else { "warn" },
+                        format!("Context compaction {result}"),
+                    );
+                }
+                return;
+            }
+            Some("compact_boundary") => {
+                let pre_tokens = msg
+                    .get("compact_metadata")
+                    .and_then(|m| m.get("pre_tokens"))
+                    .and_then(|t| t.as_u64());
+                out.log(
+                    "info",
+                    match pre_tokens {
+                        Some(tokens) => format!(
+                            "Context compacted — {tokens} tokens summarized into a fresh window"
+                        ),
+                        None => "Context compacted".to_string(),
+                    },
+                );
+                return;
+            }
+            _ => return,
         }
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
             self.model = model.to_string();
@@ -671,18 +785,46 @@ impl CcReader {
 
     fn handle_result(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         let was_interrupt = self.shared.interrupt_pending.swap(false, Ordering::SeqCst);
+        self.shared.turn_active.store(false, Ordering::SeqCst);
 
         if let Some(model_usage) = msg.get("modelUsage") {
             if let Some(window) = context_window_from_model_usage(model_usage, &self.model) {
                 self.context_window = window;
             }
         }
+        if self.shared.compact_pending.swap(false, Ordering::SeqCst)
+            && msg.get("num_turns").and_then(|v| v.as_u64()) == Some(0)
+        {
+            // The free result of an out-of-band `/compact` (dispatched via
+            // thread_action, not as a user turn). Absorb it: emitting
+            // TurnCompleted here would prematurely complete whatever real
+            // turn was queued behind the compaction.
+            out.log("info", "Compaction settled — continuing on the fresh context");
+            return;
+        }
         if let Some(usage) = msg.get("usage") {
+            // Goal-budget currency: fresh work only (cache reads excluded).
+            let fresh: u64 = [
+                "input_tokens",
+                "cache_creation_input_tokens",
+                "output_tokens",
+            ]
+            .iter()
+            .filter_map(|key| usage.get(*key).and_then(|v| v.as_u64()))
+            .sum();
+            if fresh > 0 {
+                self.shared
+                    .cumulative_fresh_tokens
+                    .fetch_add(fresh, Ordering::Relaxed);
+            }
             if let Some(snapshot) =
                 usage_snapshot_from_api_usage(usage, &self.model, self.context_window)
             {
                 out.events.push(AgentEvent::Usage { usage: snapshot });
             }
+        }
+        if let Some(goal) = self.shared.refresh_goal_after_result() {
+            out.events.push(AgentEvent::GoalUpdated { goal });
         }
 
         // An aborted turn never reports results for in-flight tools; close
@@ -892,6 +1034,9 @@ pub struct ClaudeCodeAgent {
     command: String,
     model: Option<String>,
     permission_mode: String,
+    /// Reasoning-effort level for `--effort` (low/medium/high/xhigh/max);
+    /// `None` omits the flag.
+    effort: Option<String>,
     allowed_tools: Vec<String>,
     web_port: Option<u16>,
     working_dir: Option<PathBuf>,
@@ -904,8 +1049,17 @@ pub struct ClaudeCodeAgent {
     /// same id across resumed processes, so this doubles as the known
     /// native id until the stream confirms it.
     resume_session: Option<String>,
+    /// Resume with `--fork-session`: the process continues the resumed
+    /// thread's context under a NEW native session id (announced on the
+    /// first turn), leaving the parent thread untouched. The resume id is
+    /// the fork source, not this session's identity.
+    fork_resume: bool,
     /// Whether the first prompt (carrying the bootstrap addendum) was sent.
     prompt_sent: bool,
+    /// Goal notice queued while idle; prepended to the next user message so
+    /// an idle goal update never burns a turn of its own (a mid-turn update
+    /// is written immediately instead — the running turn absorbs it).
+    pending_goal_notice: Option<String>,
     /// Loopback MCP auth token from the daemon, baked into the injected URL.
     mcp_auth_token: Option<String>,
     /// Intendant session id scoping the injected MCP URL and ctl env.
@@ -921,6 +1075,7 @@ impl ClaudeCodeAgent {
         command: String,
         model: Option<String>,
         permission_mode: String,
+        effort: Option<String>,
         allowed_tools: Vec<String>,
         web_port: Option<u16>,
     ) -> Self {
@@ -928,6 +1083,7 @@ impl ClaudeCodeAgent {
             command,
             model,
             permission_mode,
+            effort: crate::project::normalize_claude_effort(effort.as_deref()),
             allowed_tools,
             web_port,
             working_dir: None,
@@ -937,6 +1093,8 @@ impl ClaudeCodeAgent {
             pending_approvals: Arc::new(StdMutex::new(HashMap::new())),
             reader_handle: None,
             resume_session: None,
+            fork_resume: false,
+            pending_goal_notice: None,
             prompt_sent: false,
             mcp_auth_token: None,
             mcp_session_id: None,
@@ -968,6 +1126,152 @@ impl ClaudeCodeAgent {
         w.write_all(b"\n").await?;
         w.flush().await?;
         Ok(())
+    }
+
+    fn emit_agent_event(&self, event: AgentEvent) {
+        if let Some(tx) = self.event_tx.as_ref() {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Deliver an operator-goal notice to the model: written immediately
+    /// when a turn is running (the turn absorbs it, no extra cost), queued
+    /// as a prelude on the next user message when idle (a standalone user
+    /// message would start — and pay for — a whole turn).
+    async fn deliver_goal_notice(&mut self, notice: String) -> Result<(), CallerError> {
+        if self.shared.turn_active.load(Ordering::SeqCst) && self.writer.is_some() {
+            self.write_user_message(&notice).await
+        } else {
+            self.pending_goal_notice = Some(notice);
+            Ok(())
+        }
+    }
+
+    /// Wrapper-level `/goal` engine (Claude Code has no native goals).
+    /// Wire conventions — statuses, budget shape, objective limit — are
+    /// shared with Codex via the `external_agent` helpers, so frontends see
+    /// one goal dialect regardless of backend.
+    async fn dispatch_goal_action(
+        &mut self,
+        op: &str,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
+        let clear_requested = op == "goal-clear"
+            || params
+                .get("clear")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        if clear_requested {
+            let had_goal = self.shared.lock_goal().take().is_some();
+            if !had_goal {
+                return Ok("no active goal".to_string());
+            }
+            self.emit_agent_event(AgentEvent::GoalCleared);
+            self.deliver_goal_notice(
+                "[Operator goal cleared — no standing goal is in effect.]".to_string(),
+            )
+            .await?;
+            return Ok("goal cleared".to_string());
+        }
+
+        let implied_status = match op {
+            "goal-pause" => Some("paused"),
+            "goal-resume" => Some("active"),
+            "goal-complete" => Some("complete"),
+            "goal-budget-limited" => Some("budgetLimited"),
+            _ => None,
+        };
+        let status = match params.get("status").and_then(|v| v.as_str()) {
+            Some(raw) => Some(super::normalize_goal_status(raw)?),
+            None => implied_status.map(str::to_string),
+        };
+        let objective = params
+            .get("objective")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(ref objective) = objective {
+            super::validate_goal_objective(objective)?;
+        }
+        let token_budget = super::parse_goal_token_budget(params)?;
+
+        let is_update = objective.is_some()
+            || status.is_some()
+            || token_budget.is_some()
+            || op == "goal-set";
+        if !is_update {
+            // goal / goal-get / goal-status with no fields: report.
+            return match self.shared.goal_snapshot() {
+                Some(goal) => {
+                    self.emit_agent_event(AgentEvent::GoalUpdated { goal: goal.clone() });
+                    Ok(format!(
+                        "goal {}: {}",
+                        goal.status.as_deref().unwrap_or("active"),
+                        goal.objective
+                    ))
+                }
+                None => Ok("no active goal".to_string()),
+            };
+        }
+
+        let objective_changed = objective.is_some();
+        let resumed = status.as_deref() == Some("active");
+        {
+            let mut guard = self.shared.lock_goal();
+            match guard.as_mut() {
+                Some(goal) => {
+                    if let Some(objective) = objective {
+                        goal.objective = objective;
+                    }
+                    if let Some(status) = status {
+                        goal.status = status;
+                    }
+                    if let Some(budget) = token_budget {
+                        goal.token_budget = budget;
+                    }
+                }
+                None => {
+                    let Some(objective) = objective else {
+                        return Err(CallerError::ExternalAgent(
+                            "no active goal — set an objective first".into(),
+                        ));
+                    };
+                    *guard = Some(CcGoal {
+                        objective,
+                        status: status.unwrap_or_else(|| "active".to_string()),
+                        token_budget: token_budget.flatten(),
+                        set_at: std::time::Instant::now(),
+                        tokens_at_set: self
+                            .shared
+                            .cumulative_fresh_tokens
+                            .load(Ordering::Relaxed),
+                    });
+                }
+            }
+        }
+        let goal = self
+            .shared
+            .goal_snapshot()
+            .expect("goal was just set or updated");
+        self.emit_agent_event(AgentEvent::GoalUpdated { goal: goal.clone() });
+        if objective_changed || resumed {
+            let mut notice = format!("[Operator goal] {}", goal.objective);
+            if let Some(budget) = goal.token_budget {
+                notice.push_str(&format!(" (token budget: {budget})"));
+            }
+            self.deliver_goal_notice(notice).await?;
+        } else if goal.status.as_deref() == Some("paused") {
+            self.deliver_goal_notice(
+                "[Operator goal paused — deprioritize it until resumed.]".to_string(),
+            )
+            .await?;
+        }
+        Ok(format!(
+            "goal {}: {}",
+            goal.status.as_deref().unwrap_or("active"),
+            goal.objective
+        ))
     }
 
     async fn write_user_message(&self, text: &str) -> Result<(), CallerError> {
@@ -1008,9 +1312,17 @@ impl ExternalAgent for ClaudeCodeAgent {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        self.fork_resume = config.fork_resume && self.resume_session.is_some();
         self.mcp_auth_token = config.mcp_auth_token;
         self.mcp_session_id = config.mcp_session_id;
-        self.shared = Arc::new(CcShared::new(self.resume_session.clone()));
+        // In fork mode the resume id is the PARENT thread, not this
+        // session's identity — seed nothing and let the stream announce the
+        // forked child's own id.
+        self.shared = Arc::new(CcShared::new(if self.fork_resume {
+            None
+        } else {
+            self.resume_session.clone()
+        }));
 
         // Build command args
         let mut args = vec![
@@ -1033,11 +1345,19 @@ impl ExternalAgent for ClaudeCodeAgent {
         if let Some(ref session_id) = self.resume_session {
             args.push("--resume".into());
             args.push(session_id.clone());
+            if self.fork_resume {
+                args.push("--fork-session".into());
+            }
         }
 
         if let Some(mode) = normalize_permission_mode(&self.permission_mode) {
             args.push("--permission-mode".into());
             args.push(mode);
+        }
+
+        if let Some(ref effort) = self.effort {
+            args.push("--effort".into());
+            args.push(effort.clone());
         }
 
         if !self.allowed_tools.is_empty() {
@@ -1137,7 +1457,10 @@ impl ExternalAgent for ClaudeCodeAgent {
         // implicit, and its id first appears on the stream once the first
         // prompt is sent (announced via `AgentEvent::NativeSessionId`). On
         // resume the id is already known — and stays stable — so it can be
-        // returned as canonical immediately.
+        // returned as canonical immediately. A `--fork-session` resume is
+        // the exception: the shared state is seeded empty there, so the
+        // placeholder is returned until the forked child announces its own
+        // id.
         Ok(AgentThread {
             thread_id: self
                 .shared
@@ -1146,11 +1469,66 @@ impl ExternalAgent for ClaudeCodeAgent {
         })
     }
 
+    fn fork_handling(&self) -> super::ForkHandling {
+        // Claude Code has no in-process fork: the drain respawns a resumed
+        // process with `--fork-session` as a new supervisor session, and
+        // the child announces its own native id on its first turn.
+        super::ForkHandling::RespawnResume {
+            thread_id: self
+                .shared
+                .session_id()
+                .filter(|id| id != PLACEHOLDER_THREAD_ID),
+        }
+    }
+
+    async fn thread_action(
+        &mut self,
+        op: &str,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
+        let _ = params;
+        match op {
+            "compact" => {
+                if self.writer.is_none() {
+                    return Err(CallerError::ExternalAgent("Not initialized".into()));
+                }
+                // `/compact` sent as a user message is the native compaction
+                // trigger (verified against 2.1.201; no control_request
+                // equivalent exists). The CLI answers with
+                // `status: compacting` → `compact_boundary` → a FREE result
+                // (num_turns 0, zero usage). Flag it so the reader absorbs
+                // that result instead of letting it complete the next turn.
+                self.shared.compact_pending.store(true, Ordering::SeqCst);
+                if let Err(e) = self.write_user_message("/compact").await {
+                    self.shared.compact_pending.store(false, Ordering::SeqCst);
+                    return Err(e);
+                }
+                Ok("Compaction requested — Claude Code is summarizing the conversation in place"
+                    .into())
+            }
+            op if op == "goal" || op.starts_with("goal-") => {
+                self.dispatch_goal_action(op, params).await
+            }
+            // `fork` never reaches this method: the drain sees
+            // `ForkHandling::RespawnResume` and respawns instead.
+            other => Err(CallerError::ExternalAgent(format!(
+                "thread action /{} not supported by Claude Code (supported: compact, fork, goal…)",
+                other
+            ))),
+        }
+    }
+
     async fn send_message(
         &mut self,
         _thread: &AgentThread,
         message: &str,
     ) -> Result<(), CallerError> {
+        // A goal update made while idle rides the next prompt instead of
+        // paying for its own turn.
+        let message = match self.pending_goal_notice.take() {
+            Some(notice) => format!("{notice}\n\n{message}"),
+            None => message.to_string(),
+        };
         // Claude Code has no separate developer-instructions channel here, so
         // Intendant-specific guidance rides on the first prompt (same pattern
         // as the Gemini CU addendum).
@@ -1158,8 +1536,9 @@ impl ExternalAgent for ClaudeCodeAgent {
             self.prompt_sent = true;
             format!("{}{}", message, CLAUDE_CODE_BOOTSTRAP_ADDENDUM)
         } else {
-            message.to_string()
+            message
         };
+        self.shared.turn_active.store(true, Ordering::SeqCst);
         // send_message is non-blocking. The reader task emits events
         // (MessageDelta, ToolStarted, …) as they arrive and TurnCompleted
         // when a "result" message appears. No deadlock risk because the
@@ -1290,7 +1669,12 @@ mod tests {
 
     #[test]
     fn claude_code_agent_defaults() {
-        let agent = ClaudeCodeAgent::new("claude".into(), None, "auto".into(), vec![], None);
+        let agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "auto".into(),
+            None,
+            vec![], None);
         assert_eq!(agent.command, "claude");
         assert!(agent.model.is_none());
         assert_eq!(agent.permission_mode, "auto");
@@ -1304,9 +1688,11 @@ mod tests {
             "/usr/local/bin/claude".into(),
             Some("claude-sonnet-4-6".into()),
             "acceptEdits".into(),
+            Some("XHIGH ".into()),
             vec!["Read".into(), "Edit".into(), "Bash".into()],
             Some(8765),
         );
+        assert_eq!(agent.effort.as_deref(), Some("xhigh"));
         assert_eq!(agent.command, "/usr/local/bin/claude");
         assert_eq!(agent.model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(agent.permission_mode, "acceptEdits");
@@ -1319,7 +1705,12 @@ mod tests {
         // Claude Code inherits the default `rollback_turns` from the
         // trait, which returns the "not supported" typed error the
         // outer loop keys on to fall back to a session reset.
-        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "auto".into(), vec![], None);
+        let mut agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "auto".into(),
+            None,
+            vec![], None);
         let err = agent.rollback_turns(3).await.unwrap_err();
         match err {
             CallerError::ExternalAgent(msg) => {
@@ -1335,7 +1726,12 @@ mod tests {
 
     #[tokio::test]
     async fn context_snapshot_has_no_transcript_fallback() {
-        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "auto".into(), vec![], None);
+        let mut agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "auto".into(),
+            None,
+            vec![], None);
 
         let snapshot = agent.context_snapshot().await.unwrap();
         assert!(snapshot.is_none());
@@ -1346,14 +1742,24 @@ mod tests {
         // interrupt_turn is a real protocol message now, but it still needs
         // a live child; before initialize it must fail without touching the
         // interrupt flag.
-        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], None);
+        let mut agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "default".into(),
+            None,
+            vec![], None);
         assert!(agent.interrupt_turn().await.is_err());
         assert!(!agent.shared.interrupt_pending.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
     async fn steer_before_initialize_errors() {
-        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], None);
+        let mut agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "default".into(),
+            None,
+            vec![], None);
         assert!(agent.steer_turn("more context").await.is_err());
     }
 
@@ -1942,7 +2348,12 @@ mod tests {
         // minus the managed_context mode (server defaults to vanilla). The
         // injected token is session-scoped, never the raw process token.
         let mut agent =
-            ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], Some(8765));
+            ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "default".into(),
+            None,
+            vec![], Some(8765));
         agent.mcp_session_id = Some("session with spaces".to_string());
         agent.mcp_auth_token = Some("token&symbols".to_string());
 
@@ -1958,7 +2369,12 @@ mod tests {
 
     #[test]
     fn intendant_mcp_url_without_scope_still_carries_core_profile() {
-        let agent = ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], None);
+        let agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "default".into(),
+            None,
+            vec![], None);
         assert_eq!(
             agent.intendant_mcp_url(9000),
             "http://localhost:9000/mcp?tool_profile=core"
@@ -1967,7 +2383,12 @@ mod tests {
 
     #[tokio::test]
     async fn start_thread_returns_resume_id_as_canonical() {
-        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], None);
+        let mut agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "default".into(),
+            None,
+            vec![], None);
         // Fresh start: placeholder until the stream announces the real id.
         let thread = agent.start_thread().await.unwrap();
         assert_eq!(thread.thread_id, PLACEHOLDER_THREAD_ID);
@@ -2003,5 +2424,280 @@ mod tests {
             CLAUDE_CODE_BOOTSTRAP_ADDENDUM.contains(CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER),
             "bootstrap addendum no longer contains its strip marker"
         );
+    }
+
+    #[test]
+    fn fork_handling_is_respawn_resume_with_canonical_id_only() {
+        let mut agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "default".into(),
+            None,
+            vec![], None);
+        // No id announced yet → the drain must refuse the fork.
+        assert_eq!(
+            agent.fork_handling(),
+            super::super::ForkHandling::RespawnResume { thread_id: None }
+        );
+        // Canonical id known → fork respawns resuming that id.
+        agent.shared = Arc::new(CcShared::new(Some("f00d-1234".into())));
+        assert_eq!(
+            agent.fork_handling(),
+            super::super::ForkHandling::RespawnResume {
+                thread_id: Some("f00d-1234".into())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_action_compact_requires_writer_and_rejects_unknown_ops() {
+        let mut agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "default".into(),
+            None,
+            vec![], None);
+        // compact needs a live process (writer); before initialize it errors.
+        let err = agent
+            .thread_action("compact", &serde_json::Value::Null)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Not initialized"));
+        // Unsupported ops name the supported set so frontends can hint.
+        let err = agent
+            .thread_action("side", &serde_json::Value::Null)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("compact, fork"), "got: {err}");
+    }
+
+    #[test]
+    fn out_of_band_compact_result_is_absorbed_not_turn_completed() {
+        let mut reader = test_reader();
+        reader
+            .shared
+            .compact_pending
+            .store(true, Ordering::SeqCst);
+        // The free result that follows a thread_action("compact"): no turn.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","num_turns":0,"usage":{"input_tokens":0,"output_tokens":0},"session_id":"s1"}"#,
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })),
+            "compact free result must not complete a turn: {:?}",
+            out.events
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Usage { .. })),
+            "compact free result must not emit zero usage"
+        );
+        assert!(!reader.shared.compact_pending.load(Ordering::SeqCst));
+
+        // A REAL turn result while the flag is set (compaction raced a queued
+        // user message): flag is consumed, the turn completes normally.
+        reader
+            .shared
+            .compact_pending
+            .store(true, Ordering::SeqCst);
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","num_turns":2,"result":"done","session_id":"s1"}"#,
+        );
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+        assert!(!reader.shared.compact_pending.load(Ordering::SeqCst));
+
+        // User-typed /compact (no flag): the free result stays a normal
+        // turn completion so the round closes.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","num_turns":0,"session_id":"s1"}"#,
+        );
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+    }
+
+    #[tokio::test]
+    async fn goal_engine_set_get_pause_resume_clear() {
+        let mut agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "default".into(),
+            None,
+            vec![], None);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        agent.event_tx = Some(tx);
+
+        // Set: creates an active goal, emits GoalUpdated, queues a prelude.
+        let msg = agent
+            .thread_action(
+                "goal",
+                &serde_json::json!({ "objective": "Ship the widget", "tokenBudget": 1000 }),
+            )
+            .await
+            .unwrap();
+        assert!(msg.contains("active"), "got: {msg}");
+        match rx.try_recv().unwrap() {
+            AgentEvent::GoalUpdated { goal } => {
+                assert_eq!(goal.objective, "Ship the widget");
+                assert_eq!(goal.status.as_deref(), Some("active"));
+                assert_eq!(goal.token_budget, Some(1000));
+                assert_eq!(goal.tokens_used, Some(0));
+            }
+            other => panic!("expected GoalUpdated, got {other:?}"),
+        }
+        let notice = agent.pending_goal_notice.clone().expect("idle set queues a prelude");
+        assert!(notice.contains("Ship the widget") && notice.contains("1000"));
+
+        // Get: reports without touching state.
+        let msg = agent
+            .thread_action("goal-get", &serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert!(msg.contains("Ship the widget"));
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::GoalUpdated { .. })));
+
+        // Pause → paused; resume → active again.
+        agent
+            .thread_action("goal-pause", &serde_json::Value::Null)
+            .await
+            .unwrap();
+        match rx.try_recv().unwrap() {
+            AgentEvent::GoalUpdated { goal } => assert_eq!(goal.status.as_deref(), Some("paused")),
+            other => panic!("expected GoalUpdated, got {other:?}"),
+        }
+        agent
+            .thread_action("goal-resume", &serde_json::Value::Null)
+            .await
+            .unwrap();
+        match rx.try_recv().unwrap() {
+            AgentEvent::GoalUpdated { goal } => assert_eq!(goal.status.as_deref(), Some("active")),
+            other => panic!("expected GoalUpdated, got {other:?}"),
+        }
+
+        // Clear: emits GoalCleared; a second clear is a calm no-op.
+        agent
+            .thread_action("goal-clear", &serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::GoalCleared)));
+        let msg = agent
+            .thread_action("goal-clear", &serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(msg, "no active goal");
+
+        // Status ops without a goal refuse rather than invent one.
+        let err = agent
+            .thread_action("goal-pause", &serde_json::Value::Null)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("set an objective first"));
+    }
+
+    #[test]
+    fn goal_budget_flips_to_budget_limited_from_fresh_token_spend() {
+        let mut reader = test_reader();
+        {
+            let mut guard = reader.shared.lock_goal();
+            *guard = Some(CcGoal {
+                objective: "stay cheap".into(),
+                status: "active".into(),
+                token_budget: Some(50),
+                set_at: std::time::Instant::now(),
+                tokens_at_set: 0,
+            });
+        }
+        // A result whose fresh spend (input + cache creation + output,
+        // cache reads EXCLUDED) crosses the budget.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","num_turns":1,"session_id":"s1","usage":{"input_tokens":30,"cache_creation_input_tokens":10,"cache_read_input_tokens":99999,"output_tokens":20}}"#,
+        );
+        let goal = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::GoalUpdated { goal } => Some(goal.clone()),
+                _ => None,
+            })
+            .expect("result while a goal is active refreshes it");
+        assert_eq!(goal.status.as_deref(), Some("budgetLimited"));
+        assert_eq!(goal.tokens_used, Some(60));
+        assert_eq!(goal.token_budget, Some(50));
+    }
+
+    #[test]
+    fn all_zero_usage_snapshots_are_suppressed() {
+        assert!(usage_snapshot_from_api_usage(
+            &serde_json::json!({"input_tokens": 0, "output_tokens": 0}),
+            "claude-haiku-4-5-20251001",
+            200000,
+        )
+        .is_none());
+        assert!(usage_snapshot_from_api_usage(
+            &serde_json::json!({"input_tokens": 3, "output_tokens": 5}),
+            "claude-haiku-4-5-20251001",
+            200000,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn system_status_and_compact_boundary_surface_as_logs() {
+        // The first sighted session_id also announces NativeSessionId, so
+        // assertions filter to the Log events rather than exact shapes.
+        fn logs(out: &CcLineOutcome) -> Vec<(String, String)> {
+            out.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Log { level, message } => {
+                        Some((level.clone(), message.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s1"}"#,
+        );
+        assert!(
+            logs(&out)
+                .iter()
+                .any(|(l, m)| l == "info" && m.contains("Compacting context")),
+            "got: {:?}",
+            out.events
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"status","status":null,"compact_result":"success","session_id":"s1"}"#,
+        );
+        assert!(
+            logs(&out)
+                .iter()
+                .any(|(l, m)| l == "info" && m.contains("compaction success")),
+            "got: {:?}",
+            out.events
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"compact_boundary","session_id":"s1","compact_metadata":{"trigger":"manual","pre_tokens":2614}}"#,
+        );
+        assert!(
+            logs(&out)
+                .iter()
+                .any(|(l, m)| l == "info" && m.contains("2614 tokens")),
+            "got: {:?}",
+            out.events
+        );
+        // Permission-mode status echoes stay silent (no log spam per turn).
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"status","status":null,"permissionMode":"acceptEdits","session_id":"s1"}"#,
+        );
+        assert!(logs(&out).is_empty(), "unexpected logs: {:?}", out.events);
     }
 }

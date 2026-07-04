@@ -300,7 +300,11 @@ daemon warms the list at startup, responses are served
 stale-while-revalidate (an expired cache answers instantly and refreshes
 in the background), and the Stats tab fetches a slim `view=usage`
 variant (~a tenth of the full-row payload) for its whole-corpus fold.
-The index directory is safe to delete; it rebuilds on the next scan.
+Summaries are list-sized by design — day buckets and fingerprint
+digests, never per-request usage history or per-file stat lists — so the
+resident cache scales with session count, not transcript length, and the
+startup sweep prunes entries whose sessions have been deleted. The index
+directory is safe to delete; it rebuilds on the next scan.
 
 - **Recent** — recent sessions as calm three-line cards (title + status
   chip + source badge; task snippet; compact meta) — the long tail (ids,
@@ -318,7 +322,11 @@ The index directory is safe to delete; it rebuilds on the next scan.
   External Codex sessions can choose both the binary path and the
   `managed_context` mode (`vanilla` or `managed`) for that session; the
   external-agent options sit in a fold that opens when an external
-  backend is selected.
+  backend is selected. Claude Code sessions get per-launch dropdowns for
+  the model (version-safe aliases — `fable`, `opus`, `sonnet`, `haiku` —
+  that the CLI resolves to the latest release, with a Custom-id escape
+  for full model names), the permission mode, and the reasoning effort
+  (`low` … `max`).
 
 External-agent session cards and Activity windows also expose **Launch config**
 for per-session binary and managed-context settings. Use **Save** to update the
@@ -1785,7 +1793,7 @@ family (sub-routes elided where the family is uniform):
 | `GET /recordings/*`, `GET /frames/*` | Current-session recording segments and captured frame assets |
 | `GET /api/fs/{stat,list,read}`, `POST /api/fs/mkdir` | Scoped filesystem browsing (fs scope enforced per grant) |
 | `GET/POST /api/settings`, `POST /api/api-keys`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key management |
-| `GET /api/external-agents` | External-agent backend availability (configured command, installed, last used) — drives the fueling nudge and new-session picker |
+| `GET /api/external-agents` | External-agent backend availability (configured command, installed, auth posture: active oauth lease / local login, last used) — drives the fueling nudge and new-session picker |
 | `GET /api/displays`, `POST /api/diagnostics/visual-freshness` | Display inventory; visual-freshness probe marker |
 | `GET /api/access/{overview,iam/state}`, `GET /api/dashboard/targets` | Trust-architecture snapshots (IAM state, fleet targets) |
 | `POST /api/access/...` | Trust mutations: enrollment decide, IAM grant upsert/update, org trust/revoke, org-grant issue/renew/revoke-member, issuer init/delegate/install, revocation-list apply |

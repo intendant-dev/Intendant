@@ -300,6 +300,29 @@ fn event_targets_session_or_alias(
     }
 }
 
+/// Rotate the CLI external-agent loop's primary address to a newly announced
+/// native session id: the native id becomes `session_id` (what results and
+/// scoped events carry) and the previous primary — the Intendant log id —
+/// stays reachable as the alias, so targeted controls match under either
+/// name. Without this, a backend that starts on a placeholder id (Claude
+/// Code) could never receive thread actions addressed to its upgraded id.
+fn rotate_external_identity(
+    native_id: &str,
+    live_session_id: &mut Option<String>,
+    drain_config: &mut DrainConfig<'_>,
+) {
+    let native_id = native_id.trim();
+    if native_id.is_empty() || live_session_id.as_deref() == Some(native_id) {
+        return;
+    }
+    drain_config.alias_session_id = live_session_id
+        .clone()
+        .or_else(|| drain_config.alias_session_id.clone());
+    *live_session_id = Some(native_id.to_string());
+    drain_config.session_id = live_session_id.clone();
+    drain_config.backend_thread_id = Some(native_id.to_string());
+}
+
 fn event_targets_external_session_or_side(
     target: &Option<String>,
     session_id: &Option<String>,
@@ -1303,6 +1326,22 @@ async fn create_external_agent(
     let mcp_session_id = mcp_session_id.or_else(|| session_log_id(session_log));
     let mcp_auth_token =
         web_port.map(|_| crate::web_gateway::loopback_mcp_auth_token().to_string());
+    // A spawn is the INITIAL fork of another thread exactly while the wrapper
+    // still resumes the parent id recorded as `forked_from`; once the child's
+    // own native id is persisted, resume moves to the child id and the same
+    // wrapper becomes a plain resume.
+    let fork_resume = resume_session
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|resume| {
+            session_log
+                .lock()
+                .ok()
+                .map(|log| log.dir().to_path_buf())
+                .and_then(|dir| crate::session_config::read_log_dir_config(&dir))
+                .and_then(|cfg| cfg.forked_from)
+                .is_some_and(|parent| parent.trim() == resume)
+        });
 
     let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend {
         AgentBackend::Codex => {
@@ -1357,6 +1396,7 @@ async fn create_external_agent(
                 mcp_auth_token: mcp_auth_token.clone(),
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
+                fork_resume,
                 codex_home,
             };
             (agent, config)
@@ -1367,6 +1407,7 @@ async fn create_external_agent(
                 cfg.command.clone(),
                 cfg.model.clone(),
                 cfg.permission_mode.clone(),
+                cfg.effort.clone(),
                 cfg.allowed_tools.clone(),
                 web_port,
             ));
@@ -1388,6 +1429,7 @@ async fn create_external_agent(
                 mcp_auth_token: mcp_auth_token.clone(),
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
+                fork_resume,
                 codex_home: None,
             };
             (agent, config)
@@ -6762,6 +6804,7 @@ fn codex_external_session_capabilities(
         follow_up: true,
         steer: true,
         interrupt: true,
+        thread_actions: codex_thread_action_capabilities(),
         codex_thread_actions: codex_thread_action_capabilities(),
         codex_managed_context: Some(project::normalize_codex_managed_context(
             &project.config.agent.codex.managed_context,
@@ -6814,6 +6857,7 @@ fn codex_drain_session_capabilities(
         follow_up: true,
         steer: true,
         interrupt: true,
+        thread_actions: codex_thread_action_capabilities(),
         codex_thread_actions: codex_thread_action_capabilities(),
         codex_managed_context: launch
             .as_ref()
@@ -6883,6 +6927,31 @@ fn emit_codex_session_capabilities_for_drain(
     });
 }
 
+/// Thread actions the Claude Code adapter supports: `compact` dispatches a
+/// native `/compact` user message through `ClaudeCodeAgent::thread_action`;
+/// `fork` respawns a resumed process with `--fork-session` via the drain's
+/// `ForkHandling::RespawnResume` path; the `goal*` family runs the
+/// wrapper-level goal engine (adapter-owned state riding the universal
+/// `GoalUpdated`/`GoalCleared` rails).
+fn claude_code_thread_action_capabilities() -> Vec<String> {
+    [
+        "compact",
+        "fork",
+        "goal",
+        "goal-set",
+        "goal-edit",
+        "goal-get",
+        "goal-clear",
+        "goal-pause",
+        "goal-resume",
+        "goal-complete",
+        "goal-budget-limited",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 /// Capabilities of a supervised Claude Code session: follow-up turns,
 /// native mid-turn steering (a user message written mid-turn is absorbed
 /// into the running turn), and native interrupts (stream-json
@@ -6893,6 +6962,7 @@ fn claude_code_external_session_capabilities() -> types::SessionCapabilities {
         follow_up: true,
         steer: true,
         interrupt: true,
+        thread_actions: claude_code_thread_action_capabilities(),
         codex_thread_actions: Vec::new(),
         codex_managed_context: None,
         codex_sandbox: None,
@@ -7094,6 +7164,7 @@ async fn fork_managed_context_edit_branch(
             project_root: Some(config.project_root.to_string_lossy().to_string()),
             task: Some(replacement_text),
             direct: Some(true),
+            fork: false,
             attachments: unresolved_attachment_ids,
             agent_command: launch.as_ref().and_then(|cfg| cfg.agent_command.clone()),
             codex_sandbox: launch.as_ref().and_then(|cfg| cfg.codex_sandbox.clone()),
@@ -7345,6 +7416,7 @@ async fn apply_context_rewind_backout_action(
             project_root: Some(config.project_root.to_string_lossy().to_string()),
             task: None,
             direct: Some(true),
+            fork: false,
             attachments: Vec::new(),
             agent_command: crate::session_config::read_log_dir_config(config.log_dir)
                 .and_then(|cfg| cfg.agent_command),
@@ -7830,6 +7902,7 @@ async fn spawn_single_fission_branch(
             project_root: Some(branch_project_root.to_string_lossy().to_string()),
             task: Some(kickoff),
             direct: Some(true),
+            fork: false,
             attachments: Vec::new(),
             agent_command: ctx.launch.and_then(|cfg| cfg.agent_command.clone()),
             codex_sandbox: ctx.launch.and_then(|cfg| cfg.codex_sandbox.clone()),
@@ -8163,6 +8236,63 @@ async fn handle_external_thread_action(
     let params = thread_action_params_for_target(&op, params, &target_session_id, config);
     let action_thread_id = thread_id_from_action_params(&params);
     let result_session_id = target_session_id.or_else(|| config.session_id.clone());
+    // Backends without an in-process fork (Claude Code) fork by respawning:
+    // a NEW supervisor session resumes the current thread with the backend's
+    // fork flag, and the child announces its own native id on its first turn
+    // (the `fork` relationship is emitted at that identity upgrade).
+    if op == "fork" {
+        if let external_agent::ForkHandling::RespawnResume { thread_id } = agent.fork_handling() {
+            let (success, message) = match thread_id {
+                Some(parent_thread_id) => {
+                    let launch = crate::session_config::read_log_dir_config(config.log_dir);
+                    config
+                        .bus
+                        .send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+                            source: agent.name().to_string(),
+                            session_id: parent_thread_id.clone(),
+                            resume_id: Some(parent_thread_id.clone()),
+                            project_root: Some(config.project_root.to_string_lossy().to_string()),
+                            task: None,
+                            direct: Some(true),
+                            attachments: Vec::new(),
+                            fork: true,
+                            agent_command: launch.and_then(|cfg| cfg.agent_command),
+                            codex_sandbox: None,
+                            codex_approval_policy: None,
+                            codex_managed_context: None,
+                            codex_context_archive: None,
+                        }));
+                    (
+                        true,
+                        format!(
+                            "forking thread {} — the fork announces its own session id on its first turn",
+                            short_external_session_id(&parent_thread_id)
+                        ),
+                    )
+                }
+                None => (
+                    false,
+                    "fork needs a native session id — run a turn in this session first".to_string(),
+                ),
+            };
+            slog(config.session_log, |l| {
+                l.info(&format!(
+                    "{} thread action /fork: {} — {}",
+                    agent.name(),
+                    if success { "ok" } else { "FAILED" },
+                    message
+                ))
+            });
+            config.bus.send(AppEvent::CodexThreadActionResult {
+                session_id: result_session_id.clone(),
+                action: op.clone(),
+                success,
+                message,
+                record_id: None,
+            });
+            return ExternalThreadActionEffect::None;
+        }
+    }
     let result = if is_context_rewind_anchor_list_action(&op) {
         apply_context_rewind_anchor_list_action(agent, &params).await
     } else if is_context_rewind_anchor_inspect_action(&op) {
@@ -8253,6 +8383,7 @@ async fn handle_external_thread_action(
                     project_root: Some(config.project_root.to_string_lossy().to_string()),
                     task: None,
                     direct: Some(true),
+                    fork: false,
                     attachments: Vec::new(),
                     agent_command: crate::session_config::read_log_dir_config(config.log_dir)
                         .and_then(|cfg| cfg.agent_command),
@@ -8666,6 +8797,7 @@ fn emit_codex_subagent_started(
             follow_up: true,
             steer: false,
             interrupt: false,
+            thread_actions: Vec::new(),
             codex_thread_actions: Vec::new(),
             codex_managed_context: None,
             codex_sandbox: None,
@@ -9300,6 +9432,21 @@ fn persist_native_backend_session_id(config: &DrainConfig<'_>, native_id: &str) 
         backend.as_short_str(),
         native_id,
     );
+    // The bus tee only writes into the daemon-main log; supervisor-spawned
+    // session loops never see their own identity event teed back. Record it
+    // directly in the owning log — resume resolution
+    // (`persisted_external_identity_for_session`) and the wrapper index
+    // read THIS session's log, and a forked child whose identity only
+    // exists in the main log cannot be resumed. (Main-loop sessions get a
+    // duplicate row from the tee; readers take any matching record.)
+    if let Ok(mut log) = config.session_log.lock() {
+        let wrapper_id = config
+            .session_id
+            .clone()
+            .or_else(|| config.alias_session_id.clone())
+            .unwrap_or_else(|| native_id.to_string());
+        log.session_identity(&wrapper_id, backend.as_short_str(), native_id);
+    }
     if backend == external_agent::AgentBackend::ClaudeCode {
         // Frontends may address the session by either id after the
         // identity upgrade; advertise capabilities under the native id too.
@@ -9321,6 +9468,16 @@ fn persist_native_backend_session_id(config: &DrainConfig<'_>, native_id: &str) 
                 short_external_session_id(native_id)
             ))
         });
+    }
+    // A forked child announcing its own id is the first moment both ends of
+    // the lineage edge exist — materialize the `fork` relationship now.
+    if let Some(parent) = launch
+        .forked_from
+        .as_deref()
+        .map(str::trim)
+        .filter(|parent| !parent.is_empty() && *parent != native_id)
+    {
+        emit_session_relationship(config.bus, Some(parent), native_id, "fork", false);
     }
 }
 
@@ -10429,6 +10586,7 @@ async fn drain_external_agent_events_with_prefetched(
             external_agent::AgentEvent::NativeSessionId { session_id } => {
                 if event_is_primary {
                     persist_native_backend_session_id(config, &session_id);
+                    stats.announced_native_session_id = Some(session_id.clone());
                 }
             }
             external_agent::AgentEvent::MessageDelta { text } => {
@@ -11867,6 +12025,12 @@ struct LoopStats {
         std::collections::HashMap<String, ExternalToolFailureLogLimiter>,
     /// Last model response content (for sub-agent result summaries).
     last_response: Option<String>,
+    /// Native backend session id announced during the drained turn
+    /// (`AgentEvent::NativeSessionId`). The CLI external-agent loop takes
+    /// this after each drain to rotate its primary address, so targeted
+    /// controls (thread actions, steer, stop) sent under the upgraded id
+    /// keep matching this conversation.
+    announced_native_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -12538,9 +12702,41 @@ fn build_web_tls_acceptor(
         (None, None) => match installed_access_tls_cert_source()? {
             Some(source) => source,
             None if mtls_enabled => {
-                return Err(CallerError::Config(missing_default_mtls_cert_message(
-                    &installed_access_cert_dir(),
-                )));
+                // A service-managed first boot has no human at a prompt: on
+                // a machine whose access dir has never existed, provision
+                // the same durable material `intendant access setup` would
+                // create (CA + server pair + enrollable client identity)
+                // and continue. Anything short of virgin still gets the
+                // loud error — minting a new CA over one that browsers
+                // already enrolled against would silently strand them.
+                let provisioned = access::provision_virgin_access_certs().map_err(|e| {
+                    CallerError::Config(format!(
+                        "Dashboard mTLS is enabled by default and first-boot access \
+                         certificate provisioning failed: {e}. Run `intendant access \
+                         setup`, pass `--tls` for HTTPS without client certificate \
+                         authentication, or pass `--no-tls --bind 127.0.0.1` only for \
+                         explicit local/debug plaintext."
+                    ))
+                })?;
+                match provisioned {
+                    Some(cert_dir) => {
+                        eprintln!(
+                            "[access] first boot: generated dashboard access certificates \
+                             in {} — enroll a browser via the claim flow or `intendant access`",
+                            cert_dir.display()
+                        );
+                        installed_access_tls_cert_source()?.ok_or_else(|| {
+                            CallerError::Config(missing_default_mtls_cert_message(
+                                &installed_access_cert_dir(),
+                            ))
+                        })?
+                    }
+                    None => {
+                        return Err(CallerError::Config(missing_default_mtls_cert_message(
+                            &installed_access_cert_dir(),
+                        )));
+                    }
+                }
             }
             None => web_tls::TlsCertSource::SelfSigned {
                 bind_ip: bind_addr.map(|a| a.ip()),
@@ -12614,10 +12810,11 @@ fn web_default_mtls_enabled(flags: &CliFlags, server_cfg: &project::ServerTlsCon
 fn missing_default_mtls_cert_message(cert_dir: &Path) -> String {
     format!(
         "Dashboard mTLS is enabled by default, but no installed access server certificate was \
-         found in {cert_dir} (expected server.crt and server.key). Run `intendant access setup` \
-         to create/enroll dashboard access certificates, pass `--tls` for HTTPS without client \
-         certificate authentication, or pass `--no-tls --bind 127.0.0.1` only for explicit \
-         local/debug plaintext.",
+         found in {cert_dir} (expected server.crt and server.key). The directory holds other \
+         access material, so first-boot auto-provisioning stayed hands-off rather than touch an \
+         existing CA. Run `intendant access setup` to (re)generate what's missing, pass `--tls` \
+         for HTTPS without client certificate authentication, or pass `--no-tls --bind \
+         127.0.0.1` only for explicit local/debug plaintext.",
         cert_dir = cert_dir.display()
     )
 }
@@ -12932,7 +13129,22 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
             }
             "--owner" => {
                 if i + 1 < args.len() {
-                    flags.owner = Some(args[i + 1].clone());
+                    // Fail a typo at the flag, not after it's pinned: an
+                    // install whose owner fingerprint is garbage is an
+                    // unclaimable box that believes it's owned.
+                    let value = args[i + 1].trim().to_string();
+                    if !access::client_key::is_client_key_fingerprint(&value) {
+                        let shown: String = if value.chars().count() > 48 {
+                            value.chars().take(48).chain("…".chars()).collect()
+                        } else {
+                            value.clone()
+                        };
+                        return Err(CallerError::Config(format!(
+                            "--owner: '{shown}' is not a client-key fingerprint (expected 43 \
+                             base64url characters — copy it from the dashboard's Access drawer)"
+                        )));
+                    }
+                    flags.owner = Some(value);
                     i += 2;
                 } else {
                     return Err(CallerError::Config(
@@ -13940,6 +14152,36 @@ mod tests {
                 actions.iter().any(|candidate| candidate == action),
                 "missing dashboard Codex action capability: {}",
                 action
+            );
+        }
+    }
+
+    #[test]
+    fn claude_code_capabilities_advertise_universal_thread_actions() {
+        let caps = claude_code_external_session_capabilities();
+        for op in ["compact", "fork", "goal", "goal-edit", "goal-clear"] {
+            assert!(
+                caps.thread_actions.iter().any(|candidate| candidate == op),
+                "missing advertised Claude thread action: {op}"
+            );
+        }
+        // Never advertise ops the adapter rejects.
+        for op in ["side", "fast", "review", "memory-reset", "undo"] {
+            assert!(
+                !caps.thread_actions.iter().any(|candidate| candidate == op),
+                "advertised unsupported Claude thread action: {op}"
+            );
+        }
+        // The codex-named alias stays empty so codex-only UI (tier chip,
+        // fast toggle heuristics) never lights up on Claude sessions.
+        assert!(caps.codex_thread_actions.is_empty());
+        // Claude's ops must exist in the dashboard's action registry
+        // (today the codex vocabulary) or the kebab could not render them.
+        let registry = codex_thread_action_capabilities();
+        for op in &caps.thread_actions {
+            assert!(
+                registry.contains(op),
+                "op {op} missing from the dashboard action registry"
             );
         }
     }
@@ -25290,9 +25532,15 @@ async fn run_agent_loop(
                             ))
                         });
 
-                        let result =
-                            live_audio::run_session(&spec, &api_key, &bridge, log_dir, Some(bus))
-                                .await;
+                        let result = live_audio::run_session(
+                            &spec,
+                            &api_key,
+                            &bridge,
+                            log_dir,
+                            Some(bus),
+                            &project.config.transcription,
+                        )
+                        .await;
 
                         drop(bridge);
 
@@ -27369,6 +27617,72 @@ async fn run_with_presence(
                         apply_fission_import_action(agent, &action_params, &drain_config).await
                     }
                 } else if let Some(ref mut agent) = persistent_agent {
+                    // Backends without an in-process fork (Claude Code) fork
+                    // by respawning — mirror the drain-level
+                    // `ForkHandling::RespawnResume` branch. (This inline
+                    // presence dispatcher duplicates the drain's action
+                    // handling; keep the two in sync.)
+                    if op == "fork" {
+                        if let external_agent::ForkHandling::RespawnResume { thread_id } =
+                            agent.fork_handling()
+                        {
+                            let (success, message) = match thread_id {
+                                Some(parent_thread_id) => {
+                                    bus.send(AppEvent::ControlCommand(
+                                        event::ControlMsg::ResumeSession {
+                                            source: agent.name().to_string(),
+                                            session_id: parent_thread_id.clone(),
+                                            resume_id: Some(parent_thread_id.clone()),
+                                            project_root: Some(
+                                                project.root.to_string_lossy().to_string(),
+                                            ),
+                                            task: None,
+                                            direct: Some(true),
+                                            attachments: Vec::new(),
+                                            fork: true,
+                                            agent_command:
+                                                crate::session_config::read_log_dir_config(
+                                                    &log_dir,
+                                                )
+                                                .and_then(|cfg| cfg.agent_command),
+                                            codex_sandbox: None,
+                                            codex_approval_policy: None,
+                                            codex_managed_context: None,
+                                            codex_context_archive: None,
+                                        },
+                                    ));
+                                    (
+                                        true,
+                                        format!(
+                                            "forking thread {} — the fork announces its own session id on its first turn",
+                                            short_external_session_id(&parent_thread_id)
+                                        ),
+                                    )
+                                }
+                                None => (
+                                    false,
+                                    "fork needs a native session id — run a turn in this session first"
+                                        .to_string(),
+                                ),
+                            };
+                            slog(&session_log, |l| {
+                                l.info(&format!(
+                                    "{} thread action /fork: {} — {}",
+                                    agent.name(),
+                                    if success { "ok" } else { "FAILED" },
+                                    message
+                                ))
+                            });
+                            bus.send(AppEvent::CodexThreadActionResult {
+                                session_id: session_id.or_else(|| local_session_id.clone()),
+                                action: op,
+                                success,
+                                message,
+                                record_id: None,
+                            });
+                            continue;
+                        }
+                    }
                     let target_thread_id = session_id
                         .as_deref()
                         .filter(|id| Some(*id) != local_session_id.as_deref())
@@ -27460,6 +27774,7 @@ async fn run_with_presence(
                             project_root: Some(project_root.to_string_lossy().to_string()),
                             task: None,
                             direct: Some(true),
+                            fork: false,
                             attachments: Vec::new(),
                             agent_command: Some(project.config.agent.codex.command.clone()),
                             codex_sandbox: Some(crate::project::normalize_sandbox_mode(
@@ -27997,17 +28312,26 @@ async fn run_with_presence(
 
             while let Some(active_followup) = next_persistent_turn.take() {
                 let agent = persistent_agent.as_mut().unwrap();
-                let thread = persistent_thread.as_ref().unwrap();
+                // An owned snapshot rather than a borrow: the post-drain
+                // native-id upgrade below needs `persistent_thread` mutable.
+                let thread_id_at_turn_start = persistent_thread
+                    .as_ref()
+                    .map(|thread| thread.thread_id.clone())
+                    .unwrap();
+                let thread_value = external_agent::AgentThread {
+                    thread_id: thread_id_at_turn_start.clone(),
+                };
+                let thread = &thread_value;
                 let drain_config = DrainConfig {
                     bus: &bus,
                     web_port,
                     session_id: session_log_id(&session_log),
                     alias_session_id: if matches!(backend, external_agent::AgentBackend::Codex) {
-                        Some(thread.thread_id.clone())
+                        Some(thread_id_at_turn_start.clone())
                     } else {
                         None
                     },
-                    backend_thread_id: Some(thread.thread_id.clone()),
+                    backend_thread_id: Some(thread_id_at_turn_start.clone()),
                     autonomy: autonomy.clone(),
                     session_log: &session_log,
                     project_root: &project.root,
@@ -28198,6 +28522,32 @@ async fn run_with_presence(
                     active_followup.managed_context_density_handoff_completed,
                 )
                 .await;
+
+                // A native id announced mid-turn (Claude Code's first turn)
+                // upgrades the persistent thread handle, so this loop's
+                // dynamic matchers (thread actions, follow-up cancels — they
+                // read `persistent_thread` live) accept controls addressed
+                // to the upgraded id.
+                if let Some(native) = cumulative_stats.announced_native_session_id.take() {
+                    let is_canonical = drain_config
+                        .agent_source
+                        .as_deref()
+                        .and_then(external_agent::AgentBackend::from_str_loose)
+                        .is_some_and(|backend| backend.thread_id_is_canonical(&native));
+                    if is_canonical {
+                        if let Some(thread) = persistent_thread.as_mut() {
+                            if thread.thread_id != native {
+                                slog(drain_config.session_log, |l| {
+                                    l.info(&format!(
+                                        "External session address upgraded to native id {}",
+                                        short_external_session_id(&native)
+                                    ))
+                                });
+                                thread.thread_id = native;
+                            }
+                        }
+                    }
+                }
 
                 match outcome {
                     DrainOutcome::TurnCompleted {
@@ -29370,6 +29720,13 @@ async fn run_external_agent_mode(
         session_agent_config.codex_service_tier = agent.service_tier().map(str::to_string);
         session_agent_config.codex_home = effective_codex_home;
     }
+    // The spawner (session supervisor) may already have persisted
+    // per-session facts to this log dir — fork lineage (`forked_from`),
+    // per-session overrides — before launching this loop. Project defaults
+    // must never clobber them.
+    if let Some(existing) = session_config::read_log_dir_config(&log_dir) {
+        session_agent_config.merge_missing_from(existing);
+    }
     if let Err(e) = session_config::write_log_dir_config(&log_dir, &session_agent_config) {
         slog(&session_log, |l| {
             l.debug(&format!("Persist session launch config failed: {e}"))
@@ -29387,7 +29744,7 @@ async fn run_external_agent_mode(
             });
         }
     }
-    let live_session_id = if backend.thread_id_is_canonical(&backend_session_id) {
+    let mut live_session_id = if backend.thread_id_is_canonical(&backend_session_id) {
         Some(backend_session_id.clone())
     } else {
         intendant_session_id.clone()
@@ -29482,7 +29839,7 @@ async fn run_external_agent_mode(
         Some(FollowUpMessage::with_attachments(task, attachments))
     };
 
-    let drain_config = DrainConfig {
+    let mut drain_config = DrainConfig {
         bus: &bus,
         web_port,
         session_id: live_session_id.clone(),
@@ -29582,6 +29939,13 @@ async fn run_external_agent_mode(
                                             &drain_config,
                                             &session_id,
                                         );
+                                        if backend.thread_id_is_canonical(&session_id) {
+                                            rotate_external_identity(
+                                                &session_id,
+                                                &mut live_session_id,
+                                                &mut drain_config,
+                                            );
+                                        }
                                     }
                                     external_agent::AgentEvent::GoalUpdated { goal } => {
                                         emit_external_session_goal(
@@ -29652,25 +30016,43 @@ async fn run_external_agent_mode(
                                             ),
                                         )
                                         .await;
-                                        match drain_external_agent_events_with_prefetched(
-                                            &mut agent,
-                                            &mut event_rx,
-                                            &mut external_control_rx,
-                                            &drain_config,
-                                            &mut stats,
-                                            &mut diff_tracker,
-                                            &mut pending_runtime_steers,
-                                            &mut handled_steer_ids,
-                                            &mut cancelled_follow_ups,
-                                            &mut codex_thread_action_dedupe,
-                                            &mut prefetched_events,
-                                            Some(&mut side_session_state),
-                                            false,
-                                            false,
-                                            false,
-                                        )
-                                        .await
+                                        let drain_outcome =
+                                            drain_external_agent_events_with_prefetched(
+                                                &mut agent,
+                                                &mut event_rx,
+                                                &mut external_control_rx,
+                                                &drain_config,
+                                                &mut stats,
+                                                &mut diff_tracker,
+                                                &mut pending_runtime_steers,
+                                                &mut handled_steer_ids,
+                                                &mut cancelled_follow_ups,
+                                                &mut codex_thread_action_dedupe,
+                                                &mut prefetched_events,
+                                                Some(&mut side_session_state),
+                                                false,
+                                                false,
+                                                false,
+                                            )
+                                            .await;
+                                        if let Some(native) =
+                                            stats.announced_native_session_id.take()
                                         {
+                                            if backend.thread_id_is_canonical(&native) {
+                                                slog(&session_log, |l| {
+                                                    l.info(&format!(
+                                                        "External session address upgraded to native id {}",
+                                                        short_external_session_id(&native)
+                                                    ))
+                                                });
+                                                rotate_external_identity(
+                                                    &native,
+                                                    &mut live_session_id,
+                                                    &mut drain_config,
+                                                );
+                                            }
+                                        }
+                                        match drain_outcome {
                                             DrainOutcome::TurnCompleted {
                                                 message,
                                                 turns_in_round,
@@ -30810,7 +31192,7 @@ async fn run_external_agent_mode(
                         side_rounds: &mut side_rounds,
                         side_turn_revisions: &mut side_turn_revisions,
                     };
-                    match drain_external_agent_events(
+                    let drain_outcome = drain_external_agent_events(
                         &mut agent,
                         &mut event_rx,
                         &mut external_control_rx,
@@ -30826,8 +31208,27 @@ async fn run_external_agent_mode(
                         false,
                         false,
                     )
-                    .await
-                    {
+                    .await;
+                    // A native id announced mid-turn (Claude Code's first
+                    // turn) becomes the loop's primary address before the
+                    // outcome is reported, so follow-up controls targeting
+                    // the upgraded id match this conversation.
+                    if let Some(native) = stats.announced_native_session_id.take() {
+                        if backend.thread_id_is_canonical(&native) {
+                            slog(&session_log, |l| {
+                                l.info(&format!(
+                                    "External session address upgraded to native id {}",
+                                    short_external_session_id(&native)
+                                ))
+                            });
+                            rotate_external_identity(
+                                &native,
+                                &mut live_session_id,
+                                &mut drain_config,
+                            );
+                        }
+                    }
+                    match drain_outcome {
                         DrainOutcome::TurnCompleted {
                             message,
                             turns_in_round,
@@ -31091,7 +31492,7 @@ async fn run_external_agent_mode(
             side_rounds: &mut side_rounds,
             side_turn_revisions: &mut side_turn_revisions,
         };
-        match drain_external_agent_events(
+        let drain_outcome = drain_external_agent_events(
             &mut agent,
             &mut event_rx,
             &mut external_control_rx,
@@ -31107,8 +31508,22 @@ async fn run_external_agent_mode(
             managed_context_density_handoff,
             managed_context_density_handoff_completed,
         )
-        .await
-        {
+        .await;
+        // A native id announced mid-turn (Claude Code's first turn) becomes
+        // the loop's primary address before the outcome is reported, so
+        // targeted controls sent under the upgraded id keep matching.
+        if let Some(native) = stats.announced_native_session_id.take() {
+            if backend.thread_id_is_canonical(&native) {
+                slog(&session_log, |l| {
+                    l.info(&format!(
+                        "External session address upgraded to native id {}",
+                        short_external_session_id(&native)
+                    ))
+                });
+                rotate_external_identity(&native, &mut live_session_id, &mut drain_config);
+            }
+        }
+        match drain_outcome {
             DrainOutcome::TurnCompleted {
                 message,
                 turns_in_round,
@@ -34356,7 +34771,18 @@ async fn main() -> Result<(), CallerError> {
             event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
+        {
+            // Fallback roots (no .git / intendant.toml — e.g. a service's
+            // $HOME WorkingDirectory) must never be baseline-scanned: it
+            // blocks boot for minutes and shadow-copies the whole tree.
+            eprintln!(
+                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+                 intendant.toml) — start intendant inside a project to enable rewind",
+                project.root.display()
+            );
+            (None, None, None)
+        } else {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
@@ -34581,7 +35007,18 @@ async fn main() -> Result<(), CallerError> {
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
+        {
+            // Fallback roots (no .git / intendant.toml — e.g. a service's
+            // $HOME WorkingDirectory) must never be baseline-scanned: it
+            // blocks boot for minutes and shadow-copies the whole tree.
+            eprintln!(
+                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+                 intendant.toml) — start intendant inside a project to enable rewind",
+                project.root.display()
+            );
+            (None, None, None)
+        } else {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
@@ -35055,7 +35492,18 @@ async fn main() -> Result<(), CallerError> {
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
+        {
+            // Fallback roots (no .git / intendant.toml — e.g. a service's
+            // $HOME WorkingDirectory) must never be baseline-scanned: it
+            // blocks boot for minutes and shadow-copies the whole tree.
+            eprintln!(
+                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+                 intendant.toml) — start intendant inside a project to enable rewind",
+                project.root.display()
+            );
+            (None, None, None)
+        } else {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
@@ -35721,7 +36169,18 @@ async fn main() -> Result<(), CallerError> {
         let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = if !file_watcher::root_is_snapshot_worthy(&project.root)
+        {
+            // Fallback roots (no .git / intendant.toml — e.g. a service's
+            // $HOME WorkingDirectory) must never be baseline-scanned: it
+            // blocks boot for minutes and shadow-copies the whole tree.
+            eprintln!(
+                "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
+                 intendant.toml) — start intendant inside a project to enable rewind",
+                project.root.display()
+            );
+            (None, None, None)
+        } else {
             let snapshot_dir = log_dir.join("file_snapshots");
             match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {

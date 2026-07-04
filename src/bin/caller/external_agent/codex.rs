@@ -808,59 +808,10 @@ impl CodexAgent {
     }
 }
 
-const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 4_000;
-
-fn validate_goal_objective(objective: &str) -> Result<(), CallerError> {
-    let chars = objective.chars().count();
-    if chars <= MAX_THREAD_GOAL_OBJECTIVE_CHARS {
-        return Ok(());
-    }
-    Err(CallerError::ExternalAgent(format!(
-        "goal objective is too long: {} characters; limit is {}",
-        chars, MAX_THREAD_GOAL_OBJECTIVE_CHARS
-    )))
-}
-
-fn normalize_goal_status(status: &str) -> Result<String, CallerError> {
-    let normalized = match status.trim() {
-        "active" | "resume" | "resumed" => "active",
-        "paused" | "pause" => "paused",
-        "blocked" | "block" => "blocked",
-        "usageLimited" | "usage-limited" | "usage_limited" => "usageLimited",
-        "budgetLimited" | "budget-limited" | "budget_limited" => "budgetLimited",
-        "complete" | "completed" | "done" => "complete",
-        other => {
-            return Err(CallerError::ExternalAgent(format!(
-                "unsupported Codex goal status: {}",
-                other
-            )))
-        }
-    };
-    Ok(normalized.to_string())
-}
-
-fn parse_goal_token_budget(params: &serde_json::Value) -> Result<Option<Option<u64>>, CallerError> {
-    let Some(value) = params
-        .get("tokenBudget")
-        .or_else(|| params.get("token_budget"))
-    else {
-        return Ok(None);
-    };
-    if value.is_null() {
-        return Ok(Some(None));
-    }
-    let Some(budget) = value.as_u64() else {
-        return Err(CallerError::ExternalAgent(
-            "goal token budget must be a positive integer or null".into(),
-        ));
-    };
-    if budget == 0 {
-        return Err(CallerError::ExternalAgent(
-            "goal token budget must be a positive integer".into(),
-        ));
-    }
-    Ok(Some(Some(budget)))
-}
+pub(super) use super::{
+    normalize_goal_status, parse_goal_token_budget, validate_goal_objective,
+    MAX_THREAD_GOAL_OBJECTIVE_CHARS,
+};
 
 fn rollback_anchor_item_id(params: &serde_json::Value) -> Result<String, CallerError> {
     let item_id = params
@@ -12637,6 +12588,7 @@ command = "asana-mcp"
             mcp_auth_token: None,
             mcp_session_id: Some("test-session".to_string()),
             resume_session: None,
+            fork_resume: false,
             codex_home: None,
         };
 

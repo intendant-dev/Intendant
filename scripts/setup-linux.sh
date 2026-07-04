@@ -279,7 +279,7 @@ check_wasm_pack() {
         return 0
     fi
 
-    miss "wasm-pack" "cargo install wasm-pack"
+    miss "wasm-pack" "cargo install wasm-pack --version 0.14.0 --locked"
     return 1
 }
 
@@ -290,7 +290,10 @@ install_wasm_pack() {
     fi
 
     info "installing wasm-pack (this may take a minute)..."
-    cargo install wasm-pack
+    # Pinned: `cargo install` resolves outside our Cargo.lock, so an exact
+    # version (the one the committed wasm blobs were built with) plus
+    # --locked is the only reproducibility we get for it.
+    cargo install wasm-pack --version 0.14.0 --locked
     ok "wasm-pack installed"
 }
 
@@ -596,7 +599,7 @@ build_wasm() {
 
 build_intendant() {
     info "building intendant (release)..."
-    (cd "$REPO_ROOT" && cargo build --release)
+    (cd "$REPO_ROOT" && cargo build --release --locked)
 
     local bin_dir="$REPO_ROOT/target/release"
 

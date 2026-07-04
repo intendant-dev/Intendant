@@ -116,6 +116,12 @@ pub struct SessionCapabilities {
     pub steer: bool,
     #[serde(default)]
     pub interrupt: bool,
+    /// Backend-neutral thread-action vocabulary this session supports
+    /// (e.g. "compact", "fork"). Frontends render per-session action menus
+    /// from this list; `codex_thread_actions` is the legacy Codex-named
+    /// alias and mirrors this list for Codex sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thread_actions: Vec<String>,
     #[serde(default)]
     pub codex_thread_actions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

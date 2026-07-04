@@ -417,6 +417,10 @@ pub struct ClaudeCodeConfig {
     /// Allowed tools list (empty = all).
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    /// Reasoning-effort level passed as `--effort`: "low", "medium",
+    /// "high", "xhigh", or "max". `None` omits the flag (CLI default).
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 fn default_claude_code_command() -> String {
@@ -425,6 +429,20 @@ fn default_claude_code_command() -> String {
 
 fn default_claude_code_permission_mode() -> String {
     "default".to_string()
+}
+
+/// Canonicalize a Claude Code reasoning-effort level. The CLI accepts
+/// low / medium / high / xhigh / max; empty and "default" mean "don't pass
+/// the flag". Unknown values pass through trimmed for forward
+/// compatibility with newer CLIs.
+pub fn normalize_claude_effort(effort: Option<&str>) -> Option<String> {
+    let trimmed = effort.map(str::trim).filter(|s| !s.is_empty())?;
+    let lowered = trimmed.to_ascii_lowercase();
+    match lowered.as_str() {
+        "default" | "inherit" => None,
+        "low" | "medium" | "high" | "xhigh" | "max" => Some(lowered),
+        _ => Some(trimmed.to_string()),
+    }
 }
 
 /// Canonicalize a Claude Code permission mode. The CLI's real modes are
@@ -451,6 +469,7 @@ impl Default for ClaudeCodeConfig {
             command: default_claude_code_command(),
             model: None,
             permission_mode: default_claude_code_permission_mode(),
+            effort: None,
             allowed_tools: Vec::new(),
         }
     }

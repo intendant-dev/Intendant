@@ -113,7 +113,7 @@ loop.
 | Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) |
 | Reasoning trace | Yes | Yes (`thinking` blocks) |
 | Rollback turns | Yes (`thread/rollback`) | No → session reset |
-| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | No — catch-up planned through the universal rails, see [Dashboard and Station parity](#dashboard-and-station-parity-codex-vs-claude-code) |
+| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | `compact` + `fork` (universal `thread_actions`; fork respawns via `--resume <id> --fork-session`). No side/fast/review/goals/memory-reset — see [Dashboard and Station parity](#dashboard-and-station-parity-codex-vs-claude-code) |
 
 Both spawn through `crate::platform::spawn_command(&cfg.command)` with the
 working dir set to the project root and stdin/stdout/stderr piped; stderr is
@@ -528,6 +528,19 @@ Protocol details that are load-bearing (verified against Claude Code 2.1.200):
   `thinking` blocks surface as `AgentEvent::Reasoning`. Turn `result`s with
   error subtypes (`error_max_turns`, `error_during_execution`, …) emit
   `AgentEvent::BackendError` before completing the turn.
+- **Thread actions**: `compact` writes the native `/compact` user message —
+  the CLI answers `status: compacting` → `compact_boundary` (with
+  `pre_tokens`) → a free zero-usage `result`, and the session keeps its
+  facts (no `control_request` equivalent exists). `fork` never reaches the
+  adapter: the drain sees `ForkHandling::RespawnResume` and starts a NEW
+  supervisor session with `--resume <parent> --fork-session`; the child
+  announces its own session id on its first prompt, which upgrades its
+  identity and emits the `fork` relationship from the persisted
+  `forked_from` lineage. Until that first prompt the forked window has no
+  native identity yet — expected, not a bug.
+- **Live reconfig** (probed, not yet wired): `control_request` subtypes
+  `set_model` and `set_permission_mode` exist and succeed on 2.1.201; the
+  per-session overlay slice will use them for live apply.
 - The init message's `mcp_servers` status for the injected `intendant`
   server is logged (warn on `failed`/missing) so a broken loopback MCP is
   visible from frontends instead of silently running without CU tools.
@@ -562,9 +575,9 @@ capability-gated affordances in `app.html`, and `external_wrapper_index`.
 |---|---|---|---|
 | Steer / interrupt / stop affordances | `SessionCapabilities.{follow_up,steer,interrupt}`; the UI gates on capabilities, not backend type | emits all three | **Parity** (emits all three) |
 | Usage / context meter | `AgentEvent::Usage` → `UsageSnapshot` / `ContextSnapshot` | `token_count` notifications | **Parity** (`message_delta` + `result` usage) |
-| Goal chip in the agent-window header (`/goal`) | `SessionGoal` type; `AgentEvent::GoalUpdated/GoalCleared`; `session_goal` outbound + log replay; the window chip renderer is backend-neutral | native `thread/goal/*` RPCs | **Missing.** Plan: a supervisor-side goal engine in the wrapper (objective / budget / status tracked in the drain loop, steering text injected on set/edit, budget fed from usage events) emitting the same events — works for every backend including native sessions; Codex keeps its native path |
-| Per-window action menu (fork / compact / goals / …) | `codex_thread_action` ControlMsg → `ExternalAgent::thread_action`; `SESSION_WINDOW_CODEX_ACTIONS` + the `sessionWindowIsCodex` predicate in `app.html` | full op set | **Missing.** Plan: generalize to a capability-listed `thread_actions` op vocabulary (one universal capability field + one WS action; `codex_thread_actions` stays as a compat alias) so the kebab renders from the advertised op list. Claude ops that map cleanly: `compact`, `fork` (`--fork-session` on resume). No Claude analog: side / fast / review / memory-reset |
-| Relationship wiring (parent/sub/fork header chips + SVG wires; Station edges) | `session_relationship` event + lineage ledger + `/api` serving + both renderers — all backend-neutral | side / subagent / fork / fission / rewind emitters | **Missing producers.** Plan: emit `fork` on `--fork-session` resumes; surface in-band Task sub-agents (`parent_tool_use_id` on stream messages) via `SubAgentToolCall` / relationship events |
+| Goal chip in the agent-window header (`/goal`) | `SessionGoal` type; `AgentEvent::GoalUpdated/GoalCleared`; `session_goal` outbound + log replay; the window chip renderer is backend-neutral; goal wire conventions (statuses, budget shape, objective limit) shared via `external_agent` helpers | native `thread/goal/*` RPCs | **Live — wrapper goal engine in the adapter.** The full `goal*` op family is advertised and dispatched; goal state lives in `CcShared`, notices reach the model as mid-turn steers (absorbed) or as a prelude on the next prompt (idle updates never buy a turn), and budget spend is measured in FRESH tokens (uncached input + cache creation + output — cache reads excluded), flipping `active` → `budgetLimited` at exhaustion. Engine state is per-process: after a resume the chip rehydrates from the log but the engine starts empty (re-set the goal) |
+| Per-window action menu (fork / compact / goals / …) | **Universal (landed):** `SessionCapabilities.thread_actions` op vocabulary + the `thread_action` control message (`codex_thread_action` stays a wire alias); the kebab and Station session actions render from the advertised op list, with the codex heuristic as legacy-replay fallback | full op set | **`compact` + `fork` live.** `compact` sends the native `/compact` user message (status → `compact_boundary` → free result); `fork` respawns via `ForkHandling::RespawnResume` → `ResumeSession { fork: true }` → `--resume <parent> --fork-session` (the child binds its own native id + the `fork` relationship on its first prompt). No Claude analog planned: side / fast / review / memory-reset |
+| Relationship wiring (parent/sub/fork header chips + SVG wires; Station edges) | `session_relationship` event + lineage ledger + `/api` serving + both renderers — all backend-neutral | side / subagent / fork / fission / rewind emitters | **`fork` emitted** (on the forked child's first identity announcement, from the persisted `forked_from` lineage). Still planned: surface in-band Task sub-agents (`parent_tool_use_id` on stream messages) via `SubAgentToolCall` / relationship events |
 | Per-session persisted launch overlay | `SessionAgentConfig` + `ConfigureSessionAgent` / `Resume` / `Restart` (universal `agent_command` + backend fields) | all `codex_*` fields | **`agent_command` only** (plus one-shot `CreateSession.claude_model` / `claude_permission_mode`). Plan: add `claude_model` / `claude_permission_mode` / `claude_allowed_tools` overlay fields + Launch-config modal rows; probe CC `control_request` `set_permission_mode` / `set_model` for live apply, falling back to restart-with-saved-config |
 | Global runtime config pane | `Set*` ControlMsgs + `*ConfigChanged` broadcast + Settings/Control panes | 12 knobs | **3 knobs** (model / permission mode / allowed tools) — by design; grows only when CC grows equivalent concepts |
 | Station controls-panel runtime block | the controls panel renders per-backend blocks | approval policy / managed-context / fork-binary warning | **Missing.** Plan: a Claude block (model + permission mode) riding the existing `ClaudeRuntimeConfig` + `set_claude_*` messages, gated on backend selection exactly like the Codex block |
@@ -573,13 +586,18 @@ capability-gated affordances in `app.html`, and `external_wrapper_index`.
 
 Catch-up order (each step unlocks UI in both surfaces at once):
 
-1. universal `thread_actions` capability + a Claude `thread_action`
-   implementation (`compact`, `fork`) — turns on the window kebab and the
-   Station session actions;
-2. the wrapper-level goal engine → goal chips everywhere (plus Station goal
-   rendering, which is plumbed but unrendered today);
-3. relationship producers → header chips, SVG wires, Station edges;
-4. per-session Claude overlay fields + Launch-config modal rows;
+1. ~~universal `thread_actions` capability + a Claude `thread_action`
+   implementation (`compact`, `fork`)~~ — **landed** (window kebab and
+   Station session actions render from the advertised ops; e2e phases 6–8);
+2. ~~the wrapper-level goal engine~~ — **landed for Claude Code** (adapter
+   engine; the kebab goal submenu and `/goal` slash light up from the
+   advertised ops). Still open: goals for NATIVE sessions and Station goal
+   rendering (plumbed but unrendered);
+3. remaining relationship producers (in-band Task sub-agents) — `fork`
+   already wires;
+4. per-session Claude overlay fields + Launch-config modal rows — live apply
+   is possible: CC `control_request` `set_model` / `set_permission_mode`
+   both exist and succeed (probed on 2.1.201);
 5. the Station controls Claude block.
 
 ## Approval Routing

@@ -152,7 +152,12 @@ const CODEX_SESSION_LIST_PREFIX_READ_LIMIT: u64 = 8 * 1024 * 1024;
 const CODEX_SESSION_LIST_PREFIX_LINE_LIMIT: usize = 64;
 // Exact fork baselines are a synchronous `/api/sessions` refinement. The scanner
 // below parses compact Codex token lines without materializing full JSON values.
-const CODEX_PARENT_BASELINE_MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+// Exact fork baselines come from scanning the parent's log (results
+// persist per file-state in the codex-parent-baseline namespace, so each
+// scan happens once). The per-file cap covers the largest observed
+// rollouts; parents past the per-build budget pick up their baseline on a
+// later list pass.
+const CODEX_PARENT_BASELINE_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const CODEX_PARENT_BASELINE_SCAN_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const WORKTREE_OBSERVED_SESSION_FILE_LIMIT: usize = 1_000;
 const WORKTREE_OBSERVED_HINT_LIMIT: usize = 1_000;
@@ -288,7 +293,13 @@ struct CodexSessionListSummary {
     lineage: SessionLineageMetadata,
     provider: Option<String>,
     usage: SessionUsage,
-    usage_events: Vec<CodexUsageEvent>,
+    // First usage event after the last in-file counter reset. For a forked
+    // session its cumulative reading still contains the parent's history;
+    // keeping just this event lets daily buckets be re-baselined without
+    // retaining the full per-request event history (which made the resident
+    // summary cache scale with transcript length, not session count).
+    #[serde(default)]
+    first_usage_event: Option<CodexUsageEvent>,
     daily_usage: BTreeMap<String, SessionUsage>,
     goal: Option<SessionGoal>,
     task: Option<String>,
@@ -318,17 +329,18 @@ struct CodexParentUsageBaselineCacheEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionDirFingerprint {
     path: String,
-    entries: Vec<SessionFileFingerprint>,
+    // SHA-256 over the sorted per-file stat records of the session dir
+    // (see `session_file_fingerprints_digest`). Only equality is ever
+    // needed for validation, and busy session dirs hold thousands of turn
+    // files — retaining the full record list made the resident row cache
+    // scale with turn count instead of session count.
+    digest: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug)]
 struct SessionFileFingerprint {
     rel: String,
-    // 128-bit timestamps ride as strings: serde_json's Number cannot hold
-    // them without the arbitrary_precision feature.
-    #[serde(with = "string_u128")]
     mtime_nanos: u128,
-    #[serde(with = "string_i128")]
     ctime_nanos: i128,
     len: u64,
     dev: u64,
@@ -6861,6 +6873,13 @@ fn session_list_cache_slot(key: &SessionListCacheKey) -> String {
 // race toward equivalent content, never corrupt an entry. External
 // stores (~/.codex, ~/.claude, ~/.gemini) are never written — the index
 // mirrors them under ~/.intendant/cache/session_index/.
+//
+// Entries carry a per-namespace schema stamp: when the value shape changes
+// in a way serde would accept silently (a removed or defaulted field),
+// bumping the namespace schema turns every old entry into a cache miss so
+// it is rebuilt in place under the same slot filename. Entries whose
+// source path no longer exists are pruned during the preload sweep —
+// deleted sessions otherwise accumulate dead index files forever.
 
 #[derive(Serialize, Deserialize)]
 struct PersistedSessionCacheKey {
@@ -6904,8 +6923,22 @@ impl PersistedSessionCacheKey {
 
 #[derive(Serialize, Deserialize)]
 struct PersistedSessionCacheEntry<T> {
+    #[serde(default)]
+    schema: u32,
     key: PersistedSessionCacheKey,
     value: T,
+}
+
+/// Schema stamp for a namespace's persisted entries. Old entries (schema 0
+/// predates the field) mismatch after a bump and read as cache misses.
+fn persisted_namespace_schema(namespace: &str) -> u32 {
+    match namespace {
+        // v1: summaries persist `first_usage_event` instead of the full
+        // `usage_events` history; pre-v1 entries would deserialize with a
+        // defaulted first event and mis-baseline forked sessions.
+        "codex" => 1,
+        _ => 0,
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -6958,6 +6991,9 @@ fn load_persisted_session_entry_in<T: serde::de::DeserializeOwned>(
     let path = session_index_entry_path_in(base, key.namespace, &session_list_cache_slot(key));
     let bytes = std::fs::read(path).ok()?;
     let entry: PersistedSessionCacheEntry<T> = serde_json::from_slice(&bytes).ok()?;
+    if entry.schema != persisted_namespace_schema(key.namespace) {
+        return None;
+    }
     entry.key.matches(key).then_some(entry.value)
 }
 
@@ -6973,6 +7009,7 @@ fn store_persisted_session_entry_in<T: Serialize>(
     value: &T,
 ) {
     let entry = PersistedSessionCacheEntry {
+        schema: persisted_namespace_schema(key.namespace),
         key: PersistedSessionCacheKey::of(key),
         value,
     };
@@ -7017,11 +7054,13 @@ fn remove_persisted_intendant_row(dir: &Path) {
 /// of that. Entries land exactly as `store_*` would have put them — the
 /// normal lookup path still validates every fingerprint against the live
 /// filesystem, so a stale preloaded entry can never be served.
+type PreloadApply = fn(&'static str, &[u8]) -> PreloadOutcome;
+
 fn preload_session_index() {
     static PRELOADED: std::sync::Once = std::sync::Once::new();
     PRELOADED.call_once(|| {
         let base = session_index_dir();
-        let namespaces: [(&'static str, fn(&'static str, &[u8])); 4] = [
+        let namespaces: [(&'static str, PreloadApply); 4] = [
             ("codex", preload_codex_entry),
             ("claude-code", preload_row_entry),
             ("gemini", preload_row_entry),
@@ -7040,15 +7079,47 @@ fn preload_session_index() {
     });
 }
 
-fn preload_namespace_dir(dir: &Path, namespace: &'static str, apply: fn(&'static str, &[u8])) {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PreloadOutcome {
+    /// Entry landed in the in-memory cache.
+    Loaded,
+    /// The session file/dir the entry indexes is gone — the entry is dead
+    /// weight and its index file should be deleted.
+    TargetMissing,
+    /// Not loadable by this build (schema mismatch, unreadable JSON). Keep
+    /// the file: an older or newer daemon sharing this HOME may still own
+    /// it, and refreshes overwrite the same slot anyway.
+    Skipped,
+}
+
+fn preload_namespace_dir(dir: &Path, namespace: &'static str, apply: PreloadApply) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("json"))
-        .collect();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".tmp.") {
+            // Writers rename these away within the same call; anything
+            // older than a minute is litter from a crashed daemon.
+            let aged = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|age| age > std::time::Duration::from_secs(60))
+                .unwrap_or(false);
+            if aged {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
     if paths.is_empty() {
         return;
     }
@@ -7060,7 +7131,9 @@ fn preload_namespace_dir(dir: &Path, namespace: &'static str, apply: fn(&'static
             scope.spawn(move || {
                 for path in slice {
                     if let Ok(bytes) = std::fs::read(path) {
-                        apply(namespace, &bytes);
+                        if apply(namespace, &bytes) == PreloadOutcome::TargetMissing {
+                            let _ = std::fs::remove_file(path);
+                        }
                     }
                 }
             });
@@ -7087,14 +7160,51 @@ fn runtime_session_cache_key(
     })
 }
 
-fn preload_row_entry(namespace: &'static str, bytes: &[u8]) {
+/// Lenient fallback for entries this build cannot parse (legacy or future
+/// shapes): both formats keep the indexed session's path under `key.path`
+/// (generic namespaces) or `fingerprint.path` (intendant rows), so a dead
+/// target is still detectable — and prunable — without understanding the
+/// rest of the entry. Anything else unreadable is left alone.
+fn preload_unparsed_entry_outcome(bytes: &[u8]) -> PreloadOutcome {
+    #[derive(Deserialize)]
+    struct ProbePath {
+        path: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Probe {
+        key: Option<ProbePath>,
+        fingerprint: Option<ProbePath>,
+    }
+    let Ok(probe) = serde_json::from_slice::<Probe>(bytes) else {
+        return PreloadOutcome::Skipped;
+    };
+    let path = probe
+        .key
+        .and_then(|key| key.path)
+        .or_else(|| probe.fingerprint.and_then(|fingerprint| fingerprint.path));
+    match path {
+        Some(path) if !path.is_empty() && !Path::new(&path).exists() => {
+            PreloadOutcome::TargetMissing
+        }
+        _ => PreloadOutcome::Skipped,
+    }
+}
+
+fn preload_row_entry(namespace: &'static str, bytes: &[u8]) -> PreloadOutcome {
     let Ok(entry) = serde_json::from_slice::<PersistedSessionCacheEntry<serde_json::Value>>(bytes)
     else {
-        return;
+        return preload_unparsed_entry_outcome(bytes);
     };
+    let schema_matches = entry.schema == persisted_namespace_schema(namespace);
     let Some(key) = runtime_session_cache_key(namespace, entry.key) else {
-        return;
+        return PreloadOutcome::Skipped;
     };
+    if !Path::new(&key.path).exists() {
+        return PreloadOutcome::TargetMissing;
+    }
+    if !schema_matches {
+        return PreloadOutcome::Skipped;
+    }
     let slot = session_list_cache_slot(&key);
     let mut cache = session_list_row_cache()
         .lock()
@@ -7103,17 +7213,25 @@ fn preload_row_entry(namespace: &'static str, bytes: &[u8]) {
         key,
         row: entry.value,
     });
+    PreloadOutcome::Loaded
 }
 
-fn preload_codex_entry(namespace: &'static str, bytes: &[u8]) {
+fn preload_codex_entry(namespace: &'static str, bytes: &[u8]) -> PreloadOutcome {
     let Ok(entry) =
         serde_json::from_slice::<PersistedSessionCacheEntry<CodexSessionListSummary>>(bytes)
     else {
-        return;
+        return preload_unparsed_entry_outcome(bytes);
     };
+    let schema_matches = entry.schema == persisted_namespace_schema(namespace);
     let Some(key) = runtime_session_cache_key(namespace, entry.key) else {
-        return;
+        return PreloadOutcome::Skipped;
     };
+    if !Path::new(&key.path).exists() {
+        return PreloadOutcome::TargetMissing;
+    }
+    if !schema_matches {
+        return PreloadOutcome::Skipped;
+    }
     let slot = session_list_cache_slot(&key);
     let mut cache = codex_session_list_cache()
         .lock()
@@ -7122,17 +7240,25 @@ fn preload_codex_entry(namespace: &'static str, bytes: &[u8]) {
         key,
         summary: entry.value,
     });
+    PreloadOutcome::Loaded
 }
 
-fn preload_baseline_entry(namespace: &'static str, bytes: &[u8]) {
+fn preload_baseline_entry(namespace: &'static str, bytes: &[u8]) -> PreloadOutcome {
     let Ok(entry) =
         serde_json::from_slice::<PersistedSessionCacheEntry<Option<SessionUsage>>>(bytes)
     else {
-        return;
+        return preload_unparsed_entry_outcome(bytes);
     };
+    let schema_matches = entry.schema == persisted_namespace_schema(namespace);
     let Some(key) = runtime_session_cache_key(namespace, entry.key) else {
-        return;
+        return PreloadOutcome::Skipped;
     };
+    if !Path::new(&key.path).exists() {
+        return PreloadOutcome::TargetMissing;
+    }
+    if !schema_matches {
+        return PreloadOutcome::Skipped;
+    }
     let slot = session_list_cache_slot(&key);
     let mut cache = codex_parent_usage_baseline_cache()
         .lock()
@@ -7143,12 +7269,16 @@ fn preload_baseline_entry(namespace: &'static str, bytes: &[u8]) {
             key,
             usage: entry.value,
         });
+    PreloadOutcome::Loaded
 }
 
-fn preload_intendant_entry(_namespace: &'static str, bytes: &[u8]) {
+fn preload_intendant_entry(_namespace: &'static str, bytes: &[u8]) -> PreloadOutcome {
     let Ok(entry) = serde_json::from_slice::<PersistedIntendantSessionEntry>(bytes) else {
-        return;
+        return preload_unparsed_entry_outcome(bytes);
     };
+    if !Path::new(&entry.fingerprint.path).exists() {
+        return PreloadOutcome::TargetMissing;
+    }
     let slot = entry.fingerprint.path.clone();
     let mut cache = intendant_session_list_cache()
         .lock()
@@ -7157,6 +7287,7 @@ fn preload_intendant_entry(_namespace: &'static str, bytes: &[u8]) {
         fingerprint: entry.fingerprint,
         row: entry.row,
     });
+    PreloadOutcome::Loaded
 }
 
 fn session_list_row_cache() -> &'static Mutex<HashMap<String, SessionListRowCacheEntry>> {
@@ -7955,29 +8086,6 @@ fn resolve_codex_inherited_model(
     None
 }
 
-fn codex_usage_at_or_before(
-    events: &[CodexUsageEvent],
-    timestamp: Option<&str>,
-) -> Option<SessionUsage> {
-    let cutoff = timestamp.map(timestamp_sort_secs).unwrap_or(0);
-    if cutoff <= 0 {
-        return None;
-    }
-
-    let mut selected = None;
-    for event in events {
-        let event_ts = event
-            .timestamp
-            .as_deref()
-            .map(timestamp_sort_secs)
-            .unwrap_or(0);
-        if event_ts > 0 && event_ts <= cutoff {
-            selected = Some(event.usage);
-        }
-    }
-    selected
-}
-
 fn json_compact_string_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let marker = format!("\"{key}\":\"");
     let start = line.find(&marker)? + marker.len();
@@ -8195,7 +8303,6 @@ fn codex_usage_baselines_from_file_uncached(
 
 fn codex_parent_baseline_for_summary(
     summary: &CodexSessionListSummary,
-    usage_events_by_id: &HashMap<String, Vec<CodexUsageEvent>>,
     exact_parent_baselines: &HashMap<(String, i64), Option<SessionUsage>>,
 ) -> Option<SessionUsage> {
     let parent_id = summary.lineage.parent_id.as_deref()?;
@@ -8212,26 +8319,30 @@ fn codex_parent_baseline_for_summary(
         }
     }
 
-    let parent_events = usage_events_by_id.get(parent_id)?;
-    codex_usage_at_or_before(parent_events, summary.created_at.as_deref())
+    None
 }
 
-fn codex_daily_usage_from_events(
+/// Daily usage for a forked session. The parse-time buckets counted the
+/// first usage event's cumulative reading from zero, but for a fork that
+/// reading still contains the parent's history — remove the parent
+/// baseline from the first event's day bucket.
+fn codex_daily_usage_with_baseline(
     summary: &CodexSessionListSummary,
     baseline: Option<SessionUsage>,
 ) -> BTreeMap<String, SessionUsage> {
-    let mut daily: BTreeMap<String, SessionUsage> = BTreeMap::new();
-    let mut previous = baseline.unwrap_or_default();
-    for event in &summary.usage_events {
-        let delta = event.usage.saturating_sub(previous);
-        previous = event.usage;
-        if delta.is_empty() {
-            continue;
-        }
-        let day = usage_day_from_timestamp(event.timestamp.as_deref())
-            .or_else(|| usage_day_from_timestamp(summary.file_updated_at.as_deref()));
-        if let Some(day) = day {
-            daily.entry(day).or_default().add(delta);
+    let mut daily = summary.daily_usage.clone();
+    if let (Some(first), Some(baseline)) = (summary.first_usage_event.as_ref(), baseline) {
+        if !baseline.is_empty() {
+            let day = usage_day_from_timestamp(first.timestamp.as_deref())
+                .or_else(|| usage_day_from_timestamp(summary.file_updated_at.as_deref()));
+            if let Some(day) = day {
+                if let Some(bucket) = daily.get_mut(&day) {
+                    *bucket = bucket.saturating_sub(baseline);
+                    if bucket.is_empty() {
+                        daily.remove(&day);
+                    }
+                }
+            }
         }
     }
     if daily.is_empty() && !summary.usage.is_empty() {
@@ -8260,7 +8371,11 @@ struct CodexSessionListAccumulator {
     lineage: SessionLineageMetadata,
     provider: Option<String>,
     usage: SessionUsage,
-    usage_events: Vec<CodexUsageEvent>,
+    first_usage_event: Option<CodexUsageEvent>,
+    // Deltas from events without a parseable timestamp; folded into the
+    // file-mtime day bucket at finish(), matching how the old
+    // event-replay path bucketed undated events.
+    undated_usage: SessionUsage,
     daily_usage: BTreeMap<String, SessionUsage>,
     goal: Option<SessionGoal>,
     task_started_turns: u64,
@@ -8380,7 +8495,8 @@ impl CodexSessionListAccumulator {
 
     fn clear_token_usage(&mut self) {
         self.usage = SessionUsage::default();
-        self.usage_events.clear();
+        self.first_usage_event = None;
+        self.undated_usage = SessionUsage::default();
         self.daily_usage.clear();
     }
 
@@ -8389,13 +8505,17 @@ impl CodexSessionListAccumulator {
         if !delta.is_empty() {
             if let Some(day) = usage_day_from_timestamp(timestamp.as_deref()) {
                 self.daily_usage.entry(day).or_default().add(delta);
+            } else {
+                self.undated_usage.add(delta);
             }
         }
         self.usage = parsed;
-        self.usage_events.push(CodexUsageEvent {
-            timestamp,
-            usage: parsed,
-        });
+        if self.first_usage_event.is_none() {
+            self.first_usage_event = Some(CodexUsageEvent {
+                timestamp,
+                usage: parsed,
+            });
+        }
     }
 
     fn finish(self, path: &Path) -> Option<CodexSessionListSummary> {
@@ -8418,6 +8538,13 @@ impl CodexSessionListAccumulator {
             .command_cwd
             .or(self.turn_cwd)
             .or_else(|| self.session_cwd.clone());
+        let file_updated_at = file_mtime_string(path);
+        let mut daily_usage = self.daily_usage;
+        if !self.undated_usage.is_empty() {
+            if let Some(day) = usage_day_from_timestamp(file_updated_at.as_deref()) {
+                daily_usage.entry(day).or_default().add(self.undated_usage);
+            }
+        }
         Some(CodexSessionListSummary {
             id,
             created_at: self.created_at,
@@ -8427,12 +8554,12 @@ impl CodexSessionListAccumulator {
             lineage: self.lineage,
             provider: self.provider,
             usage: self.usage,
-            usage_events: self.usage_events,
-            daily_usage: self.daily_usage,
+            first_usage_event: self.first_usage_event,
+            daily_usage,
             goal: self.goal,
             task,
             turns,
-            file_updated_at: file_mtime_string(path),
+            file_updated_at,
             bytes: file_size(path),
         })
     }
@@ -8608,7 +8735,6 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
     let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
     let mut model_by_id: HashMap<String, String> = HashMap::new();
     let mut parent_by_id: HashMap<String, String> = HashMap::new();
-    let mut usage_events_by_id: HashMap<String, Vec<CodexUsageEvent>> = HashMap::new();
     let mut path_by_id: HashMap<String, PathBuf> = HashMap::new();
     let index_path = codex.join("session_index.jsonl");
     if let Some(contents) = read_codex_session_index_for_list(&index_path) {
@@ -8662,9 +8788,8 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
             model_by_id.insert(id.clone(), model);
         }
         if let Some(parent_id) = summary.lineage.parent_id.clone() {
-            parent_by_id.insert(id.clone(), parent_id);
+            parent_by_id.insert(id, parent_id);
         }
-        usage_events_by_id.insert(id, summary.usage_events.clone());
         path_by_id.insert(summary.id.clone(), path.clone());
         summaries.push((path, summary));
     }
@@ -8674,10 +8799,7 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
         let Some(parent_id) = summary.lineage.parent_id.as_ref() else {
             continue;
         };
-        let Some(parent_path) = path_by_id.get(parent_id) else {
-            continue;
-        };
-        if file_size(parent_path) <= (EXTERNAL_SESSION_READ_LIMIT * 2) {
+        if !path_by_id.contains_key(parent_id) {
             continue;
         }
         let cutoff = summary
@@ -8761,17 +8883,14 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
             summary.bytes,
         );
         summary.lineage.apply_to_session_json(&mut session);
-        let parent_baseline = codex_parent_baseline_for_summary(
-            &summary,
-            &usage_events_by_id,
-            &exact_parent_baselines,
-        );
+        let parent_baseline =
+            codex_parent_baseline_for_summary(&summary, &exact_parent_baselines);
         let usage = parent_baseline
             .map(|baseline| summary.usage.saturating_sub(baseline))
             .unwrap_or(summary.usage);
         apply_session_usage(&mut session, usage, summary.model.as_deref());
         let daily_usage = if summary.lineage.parent_id.is_some() {
-            codex_daily_usage_from_events(&summary, parent_baseline)
+            codex_daily_usage_with_baseline(&summary, parent_baseline)
         } else {
             summary.daily_usage.clone()
         };
@@ -11714,8 +11833,32 @@ fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDirFingerprint
     entries.sort_by(|a, b| a.rel.cmp(&b.rel).then_with(|| a.is_dir.cmp(&b.is_dir)));
     Some(SessionDirFingerprint {
         path: session_list_path_key(dir),
-        entries,
+        digest: session_file_fingerprints_digest(&entries),
     })
+}
+
+/// Canonical digest over sorted per-file stat records. The byte layout is
+/// part of the persisted intendant-row format: changing it (or the record
+/// fields) invalidates every persisted row, which then rebuilds on the
+/// next list pass.
+fn session_file_fingerprints_digest(entries: &[SessionFileFingerprint]) -> String {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    for entry in entries {
+        ctx.update(entry.rel.as_bytes());
+        ctx.update(&[0]);
+        ctx.update(&entry.len.to_le_bytes());
+        ctx.update(&entry.mtime_nanos.to_le_bytes());
+        ctx.update(&entry.ctime_nanos.to_le_bytes());
+        ctx.update(&entry.dev.to_le_bytes());
+        ctx.update(&entry.ino.to_le_bytes());
+        ctx.update(&[entry.is_dir as u8]);
+    }
+    let digest = ctx.finish();
+    let mut out = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<serde_json::Value> {
@@ -22325,13 +22468,17 @@ pub fn spawn_web_gateway(
                     if request_line.starts_with("OPTIONS") {
                         use tokio::io::AsyncWriteExt;
                         let (_, opt_path, _) = parse_request_target(request_line);
-                        let response = if opt_path.starts_with("/api/")
+                        let response = if (opt_path.starts_with("/api/")
                             && !is_fleet_cors_access_path(opt_path)
-                            && !is_public_peer_access_request_path(request_line)
+                            && !is_public_peer_access_request_path(request_line))
+                            || opt_path == "/mcp"
                         {
-                            // Non-fleet APIs are same-origin (or app-scheme)
-                            // only; a cross-origin preflight gets no ACAO and
-                            // the browser stops there.
+                            // Non-fleet APIs and /mcp are same-origin (or
+                            // app-scheme) only; a cross-origin preflight gets
+                            // no ACAO and the browser stops there. (/mcp
+                            // responses use the same own/app-origin rule via
+                            // mcp_cors_header_segment — the preflight must not
+                            // be looser than the endpoint.)
                             let allowed = extract_origin_header(&header_text).filter(|origin| {
                                 is_own_or_app_origin(origin, is_tls, &header_text)
                             });
@@ -46583,5 +46730,281 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{not json").unwrap();
         assert!(load_persisted_session_entry_in::<serde_json::Value>(dir.path(), &key).is_none());
+    }
+
+    fn total_usage(total_tokens: u64) -> SessionUsage {
+        SessionUsage {
+            total_tokens,
+            ..Default::default()
+        }
+    }
+
+    /// Pre-schema "codex" entries carried the full usage_events history and
+    /// no schema stamp; they must read as misses (a defaulted
+    /// first_usage_event would mis-baseline forked sessions), while
+    /// current-schema entries round-trip.
+    #[test]
+    fn persisted_codex_entry_schema_mismatch_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut key = persisted_test_key("schema");
+        key.namespace = "codex";
+
+        let legacy = serde_json::json!({
+            "key": {
+                "namespace": key.namespace,
+                "path": key.path,
+                "len": key.len,
+                "mtime_nanos": key.mtime_nanos.to_string(),
+                "ctime_nanos": key.ctime_nanos.to_string(),
+                "dev": key.dev,
+                "ino": key.ino,
+                "extra": key.extra,
+            },
+            "value": {
+                "id": "codex-1",
+                "created_at": null,
+                "session_cwd": null,
+                "effective_cwd": null,
+                "model": null,
+                "lineage": {},
+                "provider": "Codex",
+                "usage": total_usage(10),
+                "usage_events": [{"timestamp": null, "usage": total_usage(10)}],
+                "daily_usage": {},
+                "goal": null,
+                "task": null,
+                "turns": 1,
+                "file_updated_at": null,
+                "bytes": 5,
+            },
+        });
+        let path =
+            session_index_entry_path_in(dir.path(), key.namespace, &session_list_cache_slot(&key));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(
+            load_persisted_session_entry_in::<CodexSessionListSummary>(dir.path(), &key).is_none()
+        );
+
+        // A freshly stored entry (current schema) round-trips.
+        let summary = CodexSessionListSummary {
+            id: "codex-1".to_string(),
+            created_at: None,
+            session_cwd: None,
+            effective_cwd: None,
+            model: None,
+            lineage: SessionLineageMetadata::default(),
+            provider: Some("Codex".to_string()),
+            usage: total_usage(10),
+            first_usage_event: Some(CodexUsageEvent {
+                timestamp: None,
+                usage: total_usage(10),
+            }),
+            daily_usage: BTreeMap::new(),
+            goal: None,
+            task: None,
+            turns: 1,
+            file_updated_at: None,
+            bytes: 5,
+        };
+        store_persisted_session_entry_in(dir.path(), &key, &summary);
+        let loaded = load_persisted_session_entry_in::<CodexSessionListSummary>(dir.path(), &key)
+            .expect("current-schema entry loads");
+        assert_eq!(loaded.id, "codex-1");
+        assert_eq!(
+            loaded.first_usage_event.map(|event| event.usage),
+            Some(total_usage(10))
+        );
+    }
+
+    #[test]
+    fn codex_accumulator_tracks_first_event_and_undated_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("rollout.jsonl");
+        std::fs::write(&log, b"{}\n").unwrap();
+
+        let mut acc = CodexSessionListAccumulator::new();
+        acc.id = Some("codex-acc".to_string());
+        acc.record_token_usage(Some("2026-07-01T09:00:00Z".to_string()), total_usage(100));
+        acc.record_token_usage(None, total_usage(130));
+        acc.record_token_usage(Some("2026-07-02T09:00:00Z".to_string()), total_usage(150));
+
+        let summary = acc.finish(&log).expect("summary");
+        assert_eq!(summary.usage, total_usage(150));
+        let first = summary.first_usage_event.as_ref().expect("first event");
+        assert_eq!(first.usage, total_usage(100));
+        assert_eq!(first.timestamp.as_deref(), Some("2026-07-01T09:00:00Z"));
+        // Dated deltas land on their own days; the undated delta folds into
+        // the file-mtime day.
+        assert_eq!(
+            summary.daily_usage.get("2026-07-01"),
+            Some(&total_usage(100))
+        );
+        let mtime_day = usage_day_from_timestamp(summary.file_updated_at.as_deref())
+            .expect("file mtime day");
+        let daily_total: u64 = summary
+            .daily_usage
+            .values()
+            .map(|usage| usage.total_tokens)
+            .sum();
+        assert_eq!(daily_total, 150);
+        assert!(summary.daily_usage.contains_key(&mtime_day));
+
+        // A counter reset discards prior history, including the first event.
+        let mut reset = CodexSessionListAccumulator::new();
+        reset.id = Some("codex-reset".to_string());
+        reset.record_token_usage(Some("2026-07-01T09:00:00Z".to_string()), total_usage(100));
+        reset.clear_token_usage();
+        reset.record_token_usage(Some("2026-07-03T09:00:00Z".to_string()), total_usage(40));
+        let summary = reset.finish(&log).expect("summary");
+        let first = summary.first_usage_event.as_ref().expect("first event");
+        assert_eq!(first.timestamp.as_deref(), Some("2026-07-03T09:00:00Z"));
+        assert_eq!(first.usage, total_usage(40));
+        assert_eq!(
+            summary.daily_usage.get("2026-07-03"),
+            Some(&total_usage(40))
+        );
+        assert!(!summary.daily_usage.contains_key("2026-07-01"));
+    }
+
+    #[test]
+    fn codex_daily_usage_with_baseline_rebaselines_first_day() {
+        let mut daily = BTreeMap::new();
+        daily.insert("2026-07-01".to_string(), total_usage(100));
+        daily.insert("2026-07-02".to_string(), total_usage(20));
+        let summary = CodexSessionListSummary {
+            id: "codex-fork".to_string(),
+            created_at: Some("2026-07-01T10:00:00Z".to_string()),
+            session_cwd: None,
+            effective_cwd: None,
+            model: None,
+            lineage: SessionLineageMetadata::default(),
+            provider: Some("Codex".to_string()),
+            usage: total_usage(120),
+            first_usage_event: Some(CodexUsageEvent {
+                timestamp: Some("2026-07-01T10:05:00Z".to_string()),
+                usage: total_usage(100),
+            }),
+            daily_usage: daily,
+            goal: None,
+            task: None,
+            turns: 2,
+            file_updated_at: Some("2026-07-02T09:30:00Z".to_string()),
+            bytes: 64,
+        };
+
+        // The fork baseline comes out of the first event's day only.
+        let rebased = codex_daily_usage_with_baseline(&summary, Some(total_usage(40)));
+        assert_eq!(rebased.get("2026-07-01"), Some(&total_usage(60)));
+        assert_eq!(rebased.get("2026-07-02"), Some(&total_usage(20)));
+
+        // A baseline covering the whole first day removes that bucket.
+        let rebased = codex_daily_usage_with_baseline(&summary, Some(total_usage(100)));
+        assert!(!rebased.contains_key("2026-07-01"));
+        assert_eq!(rebased.get("2026-07-02"), Some(&total_usage(20)));
+
+        // No baseline → parse-time buckets pass through untouched.
+        let rebased = codex_daily_usage_with_baseline(&summary, None);
+        assert_eq!(rebased.get("2026-07-01"), Some(&total_usage(100)));
+    }
+
+    #[test]
+    fn intendant_fingerprint_digest_tracks_dir_state() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("session.jsonl"), b"{\"a\":1}\n").unwrap();
+
+        let first = intendant_session_dir_fingerprint(dir.path()).expect("fingerprint");
+        assert_eq!(first.digest.len(), 64);
+        let second = intendant_session_dir_fingerprint(dir.path()).expect("fingerprint");
+        assert_eq!(first, second);
+
+        // Content growth (length change) must change the digest.
+        std::fs::write(dir.path().join("session.jsonl"), b"{\"a\":1,\"b\":2}\n").unwrap();
+        let third = intendant_session_dir_fingerprint(dir.path()).expect("fingerprint");
+        assert_eq!(first.path, third.path);
+        assert_ne!(first.digest, third.digest);
+    }
+
+    #[test]
+    fn preload_prunes_entries_for_deleted_targets() {
+        let base = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let live_target = target_dir.path().join("live.jsonl");
+        std::fs::write(&live_target, b"{}\n").unwrap();
+
+        let entry_for = |path: &Path, extra: &str| -> (PathBuf, Vec<u8>) {
+            let key = SessionListCacheKey {
+                namespace: "claude-code",
+                path: path.to_string_lossy().to_string(),
+                len: 2,
+                mtime_nanos: 1,
+                ctime_nanos: 1,
+                dev: 1,
+                ino: 1,
+                extra: extra.to_string(),
+            };
+            let entry = PersistedSessionCacheEntry {
+                schema: persisted_namespace_schema(key.namespace),
+                key: PersistedSessionCacheKey::of(&key),
+                value: serde_json::json!({"session_id": extra}),
+            };
+            let file = session_index_entry_path_in(
+                base.path(),
+                key.namespace,
+                &session_list_cache_slot(&key),
+            );
+            (file, serde_json::to_vec(&entry).unwrap())
+        };
+
+        let (live_file, live_bytes) = entry_for(&live_target, "live");
+        let missing_target = target_dir.path().join("deleted.jsonl");
+        let (dead_file, dead_bytes) = entry_for(&missing_target, "dead");
+        std::fs::create_dir_all(live_file.parent().unwrap()).unwrap();
+        std::fs::write(&live_file, &live_bytes).unwrap();
+        std::fs::write(&dead_file, &dead_bytes).unwrap();
+
+        preload_namespace_dir(
+            &base.path().join("claude-code"),
+            "claude-code",
+            preload_row_entry,
+        );
+
+        assert!(live_file.exists(), "entry for a live session is kept");
+        assert!(!dead_file.exists(), "entry for a deleted session is pruned");
+
+        // Outcome-level checks: schema drift is skipped (kept on disk for
+        // whichever daemon owns it), a missing target reports prunable.
+        assert_eq!(
+            preload_row_entry("claude-code", &dead_bytes),
+            PreloadOutcome::TargetMissing
+        );
+        let mut wrong_schema: serde_json::Value = serde_json::from_slice(&live_bytes).unwrap();
+        wrong_schema["schema"] = serde_json::json!(99);
+        assert_eq!(
+            preload_row_entry(
+                "claude-code",
+                &serde_json::to_vec(&wrong_schema).unwrap()
+            ),
+            PreloadOutcome::Skipped
+        );
+
+        // Legacy-shape entries no build of this daemon can parse are still
+        // prunable through the path probe once their session is gone, and
+        // kept while it is alive.
+        let legacy = |target: &Path| {
+            serde_json::to_vec(&serde_json::json!({
+                "fingerprint": {"path": target.to_string_lossy(), "entries": []},
+                "row": {"session_id": "legacy"},
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            preload_intendant_entry("intendant-row", &legacy(&missing_target)),
+            PreloadOutcome::TargetMissing
+        );
+        assert_eq!(
+            preload_intendant_entry("intendant-row", &legacy(&live_target)),
+            PreloadOutcome::Skipped
+        );
     }
 }

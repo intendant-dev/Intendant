@@ -218,6 +218,43 @@ fn is_link_local_v6(ip: &std::net::Ipv6Addr) -> bool {
     (segs[0] & 0xffc0) == 0xfe80
 }
 
+/// First-boot self-provisioning for the dashboard's default-mTLS material.
+///
+/// The dashboard refuses plaintext by default, and a service-managed boot
+/// on a fresh machine has no human at a prompt to run `intendant access
+/// setup` — without this, `install.sh --service` on a clean box installs a
+/// crash loop. A truly virgin cert dir is provisioned in place with the
+/// same durable material setup would create (CA, server pair for the
+/// machine's addresses, enrollable client identity). Returns `Ok(None)`
+/// when the dir holds any existing material: partial or foreign state
+/// keeps the loud startup error instead, because regenerating a CA
+/// strands every browser enrolled against it.
+pub fn provision_virgin_access_certs() -> AccessResult<Option<PathBuf>> {
+    let be = backend::select_backend();
+    let cert_dir = be.cert_dir();
+    if !certs::dir_is_virgin(&cert_dir) {
+        return Ok(None);
+    }
+    let primary_ip = match be.detect_primary_ip() {
+        Ok(text) => text.parse().map_err(|_| {
+            AccessError(format!("detected primary IP '{text}' is not an IP address"))
+        })?,
+        // detect_primary_ip shells out (`route` / `ip`), which a service
+        // environment's minimal PATH may not carry. Interface enumeration
+        // still works — provision for what the box has rather than fail
+        // the whole first boot on knowing which address is primary.
+        Err(err) => match routable_local_addrs(false).into_iter().next() {
+            Some(addr) => addr,
+            None => return Err(err),
+        },
+    };
+    let server_names = certs::ServerNames::new(primary_ip, routable_local_addrs(false), Vec::new())?;
+    std::fs::create_dir_all(&cert_dir)
+        .map_err(|e| AccessError(format!("create {}: {e}", cert_dir.display())))?;
+    certs::ensure_certs(&cert_dir, &server_names, &resolve_host_label(), false)?;
+    Ok(Some(cert_dir))
+}
+
 #[cfg(target_os = "linux")]
 pub mod backend_linux;
 

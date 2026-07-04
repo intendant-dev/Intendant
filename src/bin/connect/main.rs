@@ -177,6 +177,14 @@ struct ServiceConfig {
     /// Off by default so self-hosted instances stay zero-friction; the
     /// hosted instance turns it on. Existing accounts are unaffected.
     invite_required: bool,
+    /// Let daemons register and poll without the bearer token, even when
+    /// one is configured: registration is rate-limited, unclaimed records
+    /// expire after a day, and the gate moves to claim time (only
+    /// signed-in — on the hosted instance, invited — accounts can claim).
+    /// The token keeps guarding the admin surface regardless. This is
+    /// what makes the landing one-liner's claim story reachable by
+    /// someone who has never seen the operator token.
+    open_daemon_registration: bool,
 }
 
 impl ServiceConfig {
@@ -204,6 +212,10 @@ impl ServiceConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        let mut open_daemon_registration =
+            std::env::var("INTENDANT_CONNECT_OPEN_REGISTRATION")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+                .unwrap_or(false);
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -232,6 +244,9 @@ impl ServiceConfig {
                 }
                 "--invite-required" => {
                     invite_required = true;
+                }
+                "--open-registration" => {
+                    open_daemon_registration = true;
                 }
                 "--help" | "-h" => {
                     print_help();
@@ -262,6 +277,7 @@ impl ServiceConfig {
             data_file,
             daemon_token,
             invite_required,
+            open_daemon_registration,
             cookie_secure,
         })
     }
@@ -272,7 +288,8 @@ fn print_help() {
         "Usage: intendant-connect [--listen 127.0.0.1:9876] [--origin https://connect.intendant.dev] [--rp-id intendant.dev]\n\
          \n\
          Env: INTENDANT_CONNECT_LISTEN, INTENDANT_CONNECT_ORIGIN, INTENDANT_CONNECT_RP_ID,\n\
-              INTENDANT_CONNECT_STATIC_ROOT, INTENDANT_CONNECT_DATA_FILE, INTENDANT_CONNECT_TOKEN"
+              INTENDANT_CONNECT_STATIC_ROOT, INTENDANT_CONNECT_DATA_FILE, INTENDANT_CONNECT_TOKEN,\n\
+              INTENDANT_CONNECT_INVITE_REQUIRED, INTENDANT_CONNECT_OPEN_REGISTRATION"
     );
 }
 
@@ -921,29 +938,71 @@ async fn healthz() -> impl IntoResponse {
 /// at build time so the service — hosted or self-hosted — serves the
 /// installer that matches its own version:
 ///   curl -fsSL <origin>/install.sh | sh -s -- --owner <fingerprint>
+///
+/// Served with this rendezvous' public origin injected as the default
+/// `--connect` URL: fetching the installer from a rendezvous IS the opt-in,
+/// and a fresh VPS has no other way to learn where to register — without
+/// it the daemon comes up unregistered and hosted claiming dead-ends.
+/// (A compiled-in default in the daemon would instead make every install
+/// phone home to intendant.dev; serve-time injection keeps self-hosting
+/// exact.) Explicit `--connect` / `-Connect` still wins over the default.
 const INSTALL_SH: &str = include_str!("../../../scripts/install.sh");
+const INSTALL_SH_CONNECT_DEFAULT: &str = r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-}""#;
 
-async fn install_sh() -> impl IntoResponse {
+/// Only a plain URL charset may be spliced into the scripts — anything
+/// else (quotes, spaces, `$`) could change what the shell parses. A
+/// misconfigured origin falls back to serving the script verbatim.
+fn connect_default_injectable(origin: &str) -> bool {
+    !origin.is_empty()
+        && origin
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_'))
+}
+
+fn install_sh_body(public_origin: &str) -> String {
+    if !connect_default_injectable(public_origin) {
+        return INSTALL_SH.to_string();
+    }
+    INSTALL_SH.replacen(
+        INSTALL_SH_CONNECT_DEFAULT,
+        &format!(r#"CONNECT_URL="${{INTENDANT_CONNECT_RENDEZVOUS_URL:-{public_origin}}}""#),
+        1,
+    )
+}
+
+async fn install_sh(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        INSTALL_SH,
+        install_sh_body(&state.config.public_origin),
     )
 }
 
 /// The Windows counterpart, for PowerShell:
 ///   & ([scriptblock]::Create((irm <origin>/install.ps1))) -Owner <fingerprint>
 const INSTALL_PS1: &str = include_str!("../../../scripts/install.ps1");
+const INSTALL_PS1_CONNECT_DEFAULT: &str = "    [string]$Connect = \"\",";
 
-async fn install_ps1() -> impl IntoResponse {
+fn install_ps1_body(public_origin: &str) -> String {
+    if !connect_default_injectable(public_origin) {
+        return INSTALL_PS1.to_string();
+    }
+    INSTALL_PS1.replacen(
+        INSTALL_PS1_CONNECT_DEFAULT,
+        &format!("    [string]$Connect = \"{public_origin}\","),
+        1,
+    )
+}
+
+async fn install_ps1(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        INSTALL_PS1,
+        install_ps1_body(&state.config.public_origin),
     )
 }
 
@@ -2359,7 +2418,7 @@ fn require_admin_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
             "admin endpoints require the service to be started with --daemon-token",
         ));
     }
-    require_daemon_auth(state, headers)
+    require_bearer_token(state, headers)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2477,7 +2536,11 @@ async fn admin_invites_revoke(
     Ok(Json(json!({ "ok": true, "revoked": revoked })))
 }
 
-fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+/// Bearer check against the configured operator token. Admin endpoints
+/// verify through this directly (`require_admin_auth`) — never through
+/// `require_daemon_auth` — so opening daemon registration can never open
+/// the admin surface.
+fn require_bearer_token(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     let Some(token) = state.config.daemon_token.as_deref() else {
         return Ok(());
     };
@@ -2493,6 +2556,19 @@ fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
             "missing or invalid daemon bearer token",
         ))
     }
+}
+
+/// Gate for the daemon registration/polling endpoints. With
+/// `--open-registration` these are anonymous by design: registration is
+/// rate-limited, unclaimed records expire, and authorization moves to
+/// claim time (a signed-in — on the hosted instance, invited — account).
+/// Without it, the operator token (when configured) is required, which
+/// suits self-hosters who want a closed fleet.
+fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    if state.config.open_daemon_registration {
+        return Ok(());
+    }
+    require_bearer_token(state, headers)
 }
 
 fn header_string(headers: &HeaderMap, name: &'static str) -> Option<String> {
@@ -3679,7 +3755,8 @@ async fn api_status(
         "claim_code_expires_unix_ms": claim_code_expires_unix_ms,
         "queued": queued,
         "active_sessions": active_sessions,
-        "daemon_auth_required": state.config.daemon_token.is_some(),
+        "daemon_auth_required": state.config.daemon_token.is_some()
+            && !state.config.open_daemon_registration,
     }))
 }
 
@@ -3712,6 +3789,9 @@ async fn daemon_register(
         let mut claim_codes = state.claim_codes.lock().await;
         let mut store = state.store.lock().await;
         let now = now_unix_ms();
+        for stale_id in sweep_stale_unclaimed_daemons(&mut store, now) {
+            claim_codes.remove(&stale_id);
+        }
         let active_claim_hashes = active_claim_code_hashes(&store, &daemon_id, now);
         let claimed_now = if let Some(existing) =
             store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id)
@@ -3816,6 +3896,25 @@ fn generate_claim_code() -> ApiResult<String> {
     let mnemonic = Mnemonic::from_entropy(&entropy)
         .map_err(|e| ApiError::internal(format!("generate claim mnemonic: {e}")))?;
     Ok(mnemonic.to_string().replace(' ', "-"))
+}
+
+/// A day without polling: unclaimed records past this vanish on the next
+/// registration sweep, so open registration cannot grow the store without
+/// bound. Claimed daemons are never touched here — a returning unclaimed
+/// daemon simply re-registers and gets a fresh claim code.
+const UNCLAIMED_DAEMON_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+fn sweep_stale_unclaimed_daemons(store: &mut Store, now: u64) -> Vec<String> {
+    let mut removed = Vec::new();
+    store.daemons.retain(|daemon| {
+        let keep = daemon.owner_user_id.is_some()
+            || now.saturating_sub(daemon.last_seen_unix_ms) < UNCLAIMED_DAEMON_TTL_MS;
+        if !keep {
+            removed.push(daemon.daemon_id.clone());
+        }
+        keep
+    });
+    removed
 }
 
 fn active_claim_code_hashes(store: &Store, except_daemon_id: &str, now: u64) -> HashSet<String> {
@@ -4603,9 +4702,14 @@ async fn orl_fetch(
    blind: the body is ciphertext under the user's vault master key, and
    that key travels only wrapped per enrolled unlocker (passkey PRF /
    recovery phrase) — nothing here can be decrypted or forged
-   server-side. The monotonic revision check only prevents rollback (the
-   ORL `seq` trick); a malicious store can still withhold or serve stale,
-   detectably once any device has seen a newer revision. */
+   server-side. Blobs additionally carry a client-side HMAC keyed to the
+   master key (`mac`); this service cannot verify it (by design), but it
+   enforces the presence ratchet: once an account's stored vault carries
+   a MAC, a MAC-less replacement is refused so a tampering store cannot
+   quietly strip the integrity guarantee. The monotonic revision check
+   only prevents rollback (the ORL `seq` trick); a malicious store can
+   still withhold or serve stale, detectably once any device has seen a
+   newer revision. */
 
 const MAX_VAULT_BLOB_BYTES: usize = 128 * 1024;
 
@@ -4639,6 +4743,17 @@ fn validate_vault_blob(revision: u64, vault: &serde_json::Value) -> Result<(), A
     if !vault.get("body").map(|b| b.is_object()).unwrap_or(false) {
         return Err(ApiError::bad_request("vault blob has no body"));
     }
+    if let Some(mac) = vault.get("mac") {
+        // Blind shape check only — an HMAC-SHA-256 in base64url is 43
+        // chars; the service cannot (and must not be able to) verify it.
+        let plausible = mac
+            .as_str()
+            .map(|s| !s.is_empty() && s.len() <= 88)
+            .unwrap_or(false);
+        if !plausible {
+            return Err(ApiError::bad_request("vault mac is malformed"));
+        }
+    }
     Ok(())
 }
 
@@ -4656,6 +4771,18 @@ fn apply_vault_publish(
 ) -> Result<bool, ApiError> {
     validate_vault_blob(revision, &vault)?;
     if let Some(existing) = store.vault_blobs.iter_mut().find(|b| b.user_id == user_id) {
+        // Downgrade ratchet: this service is blind to the MAC's validity
+        // but not to its presence — once the stored vault is
+        // authenticated, a MAC-less replacement is refused rather than
+        // silently stripping the integrity guarantee clients rely on.
+        if existing.vault.get("mac").is_some() && vault.get("mac").is_none() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "unauthenticated vault refused: the stored vault carries an integrity MAC \
+                 (update this dashboard to one that signs vault blobs)"
+                    .to_string(),
+            ));
+        }
         if revision < existing.revision || (revision == existing.revision && existing.vault != vault)
         {
             return Err(ApiError::new(
@@ -5960,7 +6087,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
         <div class="advanced-block" id="log-block">
           <h3>Transparency log</h3>
           <div class="sub">Every name binding this service hands out (which key a computer had when claimed, handle creations, revocation lists, badges) is committed to an append-only log. Your browser pins the signed tree head and re-verifies consistency on every visit &mdash; rewriting history here is detectable, not just forbidden.</div>
-          <div class="metric-row"><span id="log-pill" class="pill">checking&hellip;</span></div>
+          <div class="metric-row"><span id="log-pill" class="pill">checking&hellip;</span><button id="log-reset-trust" class="ghost hidden" title="Discard the pinned tree head and trust the log's current signing key from now on. Only do this if you expected the operator to rotate the key.">Reset trust</button></div>
         </div>
         <div class="advanced-block" id="push-block">
           <h3>Notifications</h3>
@@ -6313,15 +6440,24 @@ async function logVerifySthSignature(sth) {{
 }}
 
 /* Pin the signed tree head; on every visit verify the log only ever
-   appended since last time. A failed check is loud and sticky. */
+   appended since last time. A failed check is loud and sticky — including a
+   changed log signing key, which would otherwise let the service swap in a
+   fresh log and dodge the consistency proof entirely (trust-on-every-use).
+   Recovering from a legitimate key rotation is an explicit user action. */
 async function transparencyCheck() {{
   const pill = $('log-pill');
+  const resetBtn = $('log-reset-trust');
+  if (resetBtn) resetBtn.classList.add('hidden');
   try {{
     const sth = await api('/api/log/sth');
     if (!(await logVerifySthSignature(sth))) throw new Error('tree head signature invalid');
     let pinned = null;
     try {{ pinned = JSON.parse(localStorage.getItem(LOG_STH_KEY) || 'null'); }} catch {{}}
-    if (pinned && pinned.public_key === sth.public_key && pinned.size > 0) {{
+    if (pinned && pinned.size > 0) {{
+      if (pinned.public_key !== sth.public_key) {{
+        if (resetBtn) resetBtn.classList.remove('hidden');
+        throw new Error('log signing key changed — history can no longer be verified against your pin');
+      }}
       if (sth.size < pinned.size) throw new Error('log shrank — history was rewritten');
       const proof = await api(`/api/log/consistency?old=${{pinned.size}}&new=${{sth.size}}`);
       const asBytes = value => new Uint8Array(b64uToBuf(value));
@@ -6725,6 +6861,10 @@ $('attest-github-btn').addEventListener('click', async () => {{
   }} catch (err) {{ setStatus('attest-status', err.message, 'err'); }}
 }});
 transparencyCheck();
+$('log-reset-trust').addEventListener('click', () => {{
+  localStorage.removeItem(LOG_STH_KEY);
+  transparencyCheck();
+}});
 $('push-enable').addEventListener('click', () => enablePushNotifications().then(renderPushBlock).catch(err => alert('Notifications: ' + err.message)));
 $('push-disable').addEventListener('click', () => disablePushNotifications().then(renderPushBlock).catch(() => renderPushBlock()));
 $('push-test').addEventListener('click', async () => {{
@@ -6866,6 +7006,25 @@ mod tests {
             updated_unix_ms: 1,
             presence_hours: Vec::new(),
         }
+    }
+
+    #[test]
+    fn open_registration_sweep_expires_only_stale_unclaimed_daemons() {
+        let now = UNCLAIMED_DAEMON_TTL_MS * 10;
+        let mut store = Store::default();
+        let mut stale = daemon_record("stale-unclaimed", None, None, None);
+        stale.last_seen_unix_ms = now - UNCLAIMED_DAEMON_TTL_MS - 1;
+        // Claimed daemons are the owner's — staleness never sweeps them.
+        let mut claimed = daemon_record("stale-claimed", Some(Uuid::new_v4()), None, None);
+        claimed.last_seen_unix_ms = 0;
+        let mut fresh = daemon_record("fresh-unclaimed", None, None, None);
+        fresh.last_seen_unix_ms = now - 1;
+        store.daemons = vec![stale, claimed, fresh];
+
+        let removed = sweep_stale_unclaimed_daemons(&mut store, now);
+        assert_eq!(removed, vec!["stale-unclaimed".to_string()]);
+        let ids: Vec<&str> = store.daemons.iter().map(|d| d.daemon_id.as_str()).collect();
+        assert_eq!(ids, vec!["stale-claimed", "fresh-unclaimed"]);
     }
 
     #[test]
@@ -7138,6 +7297,18 @@ mod tests {
     }
 
     #[test]
+    fn transparency_pin_fails_hard_on_log_key_change() {
+        // The documented pin ("rewriting history here is detectable") is only
+        // real if a swapped log signing key is a verification failure, not a
+        // silent re-pin; recovery must be the explicit user reset.
+        let html = connect_ui_html("https://intendant.dev", "Intendant Connect", "sub");
+        assert!(html.contains("pinned.public_key !== sth.public_key"));
+        assert!(html.contains("log signing key changed"));
+        assert!(html.contains(r#"id="log-reset-trust""#));
+        assert!(html.contains("localStorage.removeItem(LOG_STH_KEY)"));
+    }
+
+    #[test]
     fn active_claim_code_hashes_only_tracks_fresh_unclaimed_other_daemons() {
         let now = now_unix_ms();
         let fresh = "abandon-ability-able-about-above-absent-absorb";
@@ -7402,6 +7573,7 @@ mod tests {
             data_file: PathBuf::from("state.json"),
             daemon_token: None,
             invite_required: false,
+            open_daemon_registration: false,
             cookie_secure: true,
         };
 
@@ -7609,6 +7781,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn served_installers_default_connect_to_the_serving_rendezvous() {
+        // The embedded scripts must keep the sentinel lines the handlers
+        // splice — if either drifts, injection silently stops and a fresh
+        // VPS comes up unregistered (hosted claiming dead-ends).
+        assert!(
+            INSTALL_SH.contains(INSTALL_SH_CONNECT_DEFAULT),
+            "install.sh connect-default sentinel drifted"
+        );
+        assert!(
+            INSTALL_PS1.contains(INSTALL_PS1_CONNECT_DEFAULT),
+            "install.ps1 connect-default sentinel drifted"
+        );
+
+        let sh = install_sh_body("https://rendezvous.example");
+        assert!(sh.contains(
+            r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-https://rendezvous.example}""#
+        ));
+        assert!(!sh.contains(INSTALL_SH_CONNECT_DEFAULT));
+
+        let ps1 = install_ps1_body("https://rendezvous.example");
+        assert!(ps1.contains(r#"[string]$Connect = "https://rendezvous.example","#));
+        assert!(!ps1.contains(INSTALL_PS1_CONNECT_DEFAULT));
+        // The ANSI-decode trap applies to the served body, not just the
+        // embedded file — the injected origin must not break the pin.
+        assert!(ps1.is_ascii(), "served install.ps1 must stay pure ASCII");
+
+        // Splice guard: only a plain URL charset reaches the scripts.
+        assert!(connect_default_injectable("https://intendant.dev"));
+        assert!(connect_default_injectable("http://localhost:9891"));
+        assert!(!connect_default_injectable(r#"https://x"; rm -rf ~"#));
+        assert!(!connect_default_injectable("https://x y"));
+        assert!(!connect_default_injectable(""));
+        let verbatim = install_sh_body(r#"https://x" y"#);
+        assert_eq!(verbatim, INSTALL_SH, "unsafe origin must serve verbatim");
+    }
+
+    /// Windows PowerShell 5.1 executes setup-windows.ps1 straight from the
+    /// fresh clone, so the BOM-less ANSI-decode trap pinned for install.ps1
+    /// above applies to it identically — a non-ASCII byte that lands in
+    /// code (not a comment) can decode into a cp1252 smart quote the parser
+    /// honors. Keep every PowerShell file a fresh box runs pure ASCII.
+    #[test]
+    fn setup_windows_ps1_is_pure_ascii() {
+        const SETUP_PS1: &str = include_str!("../../../scripts/setup-windows.ps1");
+        assert!(SETUP_PS1.is_ascii(), "setup-windows.ps1 must be pure ASCII");
+    }
+
     /// Real parse coverage for the PowerShell installer, on the platform
     /// that ships PowerShell — a macOS/Linux dev box cannot tokenize it.
     #[cfg(windows)]
@@ -7702,6 +7922,50 @@ mod tests {
         assert!(apply_vault_publish(&mut store, other, 1, vault_blob(1, "c"), 40).unwrap());
         assert_eq!(store.vault_blobs.len(), 2);
         assert_eq!(store.vault_blobs[0].revision, 3);
+    }
+
+    fn vault_blob_with_mac(revision: u64, marker: &str, mac: &str) -> serde_json::Value {
+        let mut blob = vault_blob(revision, marker);
+        blob["mac"] = json!(mac);
+        blob
+    }
+
+    #[test]
+    fn vault_publish_enforces_the_mac_presence_ratchet() {
+        let mut store = Store::default();
+        let user = Uuid::new_v4();
+
+        // Legacy MAC-less vaults are accepted, and upgrading to an
+        // authenticated blob is a normal publish.
+        assert!(apply_vault_publish(&mut store, user, 1, vault_blob(1, "a"), 10).unwrap());
+        assert!(
+            apply_vault_publish(&mut store, user, 2, vault_blob_with_mac(2, "b", "bWFj"), 20)
+                .unwrap()
+        );
+
+        // Once authenticated, a MAC-less replacement is refused even at a
+        // newer revision — the store must not strip the guarantee.
+        let err =
+            apply_vault_publish(&mut store, user, 3, vault_blob(3, "c"), 30).unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(store.vault_blobs[0].revision, 2);
+
+        // Authenticated publishes keep flowing.
+        assert!(
+            apply_vault_publish(&mut store, user, 3, vault_blob_with_mac(3, "d", "bWFj"), 40)
+                .unwrap()
+        );
+
+        // A malformed mac field is rejected outright.
+        let err = apply_vault_publish(
+            &mut store,
+            user,
+            4,
+            vault_blob_with_mac(4, "e", &"x".repeat(89)),
+            50,
+        )
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]

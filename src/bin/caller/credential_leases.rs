@@ -386,7 +386,9 @@ fn retry_pending_materialization_cleanup(root: &Path, active_kinds: &HashSet<Str
     }
 }
 
-fn kind_is_active(kind: &str) -> bool {
+/// Whether an unexpired lease of `kind` is held right now. Public for
+/// availability probes (the dashboard's external-agent posture).
+pub fn kind_is_active(kind: &str) -> bool {
     let now = now_unix_ms();
     store()
         .read()

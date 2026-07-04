@@ -8047,14 +8047,17 @@ body.context-focus-active {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Full session id in the meta row — wraps rather than truncates (the id is
+   the point), monospace, click-to-copy. */
 .session-card .sc-id {
   font-size: 11px;
   color: var(--overlay1);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   user-select: text;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  cursor: copy;
+}
+.session-card .sc-id:hover {
+  text-decoration: underline;
 }
 /* Status/source/role marks compose with the .ui-chip / .ui-badge
    primitives (tone classes carry the color); only card-specific layout
@@ -12907,9 +12910,20 @@ body.display-fullscreen-open {
                           <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
                         </div>
                       </div>
-                      <label class="sessions-new-session-field" for="new-session-claude-model">
+                      <label class="sessions-new-session-field" for="new-session-claude-model-select">
                         Claude model
-                        <input id="new-session-claude-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. haiku (empty = global setting)" disabled>
+                        <select id="new-session-claude-model-select" onchange="onNewSessionClaudeModelSelectChange()" disabled>
+                          <option value="">Global setting</option>
+                          <option value="fable">fable — latest Fable</option>
+                          <option value="opus">opus — latest Opus</option>
+                          <option value="sonnet">sonnet — latest Sonnet</option>
+                          <option value="haiku">haiku — latest Haiku</option>
+                          <option value="__custom__">Custom model id…</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field hidden" for="new-session-claude-model" id="new-session-claude-model-custom-row">
+                        Custom model id
+                        <input id="new-session-claude-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. claude-haiku-4-5-20251001" disabled>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-claude-permission-mode">
                         Permissions
@@ -12919,6 +12933,17 @@ body.display-fullscreen-open {
                           <option value="acceptEdits">acceptEdits</option>
                           <option value="plan">plan</option>
                           <option value="bypassPermissions">bypassPermissions</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-claude-effort">
+                        Effort
+                        <select id="new-session-claude-effort" disabled>
+                          <option value="">Global setting</option>
+                          <option value="low">low</option>
+                          <option value="medium">medium</option>
+                          <option value="high">high</option>
+                          <option value="xhigh">xhigh</option>
+                          <option value="max">max</option>
                         </select>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-codex-sandbox">
@@ -14444,8 +14469,10 @@ function applyUnfueledEmptyState(unfueled) {
   applyUnfueledExternalAgentNote(empty);
 }
 
-/* The nudge's counterweight: name the external agents that still work.
-   Only rendered while the unfueled state is showing. */
+/* The nudge's counterweight: name the external agents that still work,
+   by actual auth posture — a leased or locally-signed-in backend needs
+   no fuel, a signed-out one needs its own login or an oauth lease from
+   the vault. Only rendered while the unfueled state is showing. */
 function applyUnfueledExternalAgentNote(empty) {
   const installed = installedExternalAgents();
   let note = document.getElementById('log-empty-external-agents');
@@ -14459,11 +14486,20 @@ function applyUnfueledExternalAgentNote(empty) {
     note.className = 'ui-empty-hint';
     empty.appendChild(note);
   }
-  const names = installed.map(agent => agent.label || agent.id).join(' and ');
-  const plural = installed.length > 1;
-  note.textContent = `${names} ${plural ? 'are' : 'is'} installed and `
-    + `${plural ? 'run on their own accounts' : 'runs on its own account'}`
-    + ' — external-agent sessions work without fuel.';
+  const parts = installed.map(agent => {
+    const name = agent.label || agent.id;
+    if (agent.leased) {
+      return `${name} is fueled with a subscription lease and ready`;
+    }
+    if (agent.local_login === true) {
+      return `${name} is signed in on the daemon and needs no fuel`;
+    }
+    if (agent.local_login === false) {
+      return `${name} is installed but signed out — sign it in on the daemon, or lease its subscription from your vault`;
+    }
+    return `${name} is installed and runs on its own login — or a subscription lease from your vault`;
+  });
+  note.textContent = parts.join('. ') + '.';
 }
 // Probe once the transport can answer; in connect mode the data channel
 // (possibly via TURN) can take a while, so keep retrying for ~40s rather
@@ -15158,10 +15194,12 @@ async function accessFleetRefreshProvenance() {
    wrapped, one envelope per enrolled unlocker: each account passkey (via
    the WebAuthn PRF secret, HKDF salt 'intendant-vault-v1' — a domain
    deliberately separate from fleet-sync) and a mandatory BIP39 recovery
-   phrase. Losing a passkey loses one envelope, not the vault. The store
-   can withhold or serve a stale revision — detectable via the local
-   high-water mark — and nothing else. Unsealing happens only here, in
-   memory, behind a passkey gesture or the phrase. */
+   phrase. Losing a passkey loses one envelope, not the vault. Every blob
+   carries an HMAC under a key derived from the master key (see "Vault
+   blob authentication" below), so the store cannot tamper, splice, or
+   relabel. What remains to the store: withholding, or serving a stale
+   revision — detectable via the local high-water mark. Unsealing happens
+   only here, in memory, behind a passkey gesture or the phrase. */
 
 const VAULT_LOCAL_KEY = 'intendant_vault_local_v1';
 const VAULT_HKDF_SALT = 'intendant-vault-v1';
@@ -15184,6 +15222,7 @@ const vaultState = {
   settings: {},        // decrypted vault-wide settings while unlocked
   kBytes: null,        // raw master key while unlocked (zeroed on lock)
   matchedEnvelopeId: null, // which prf envelope this session's passkey opened
+  macSeen: false,      // downgrade ratchet: an authenticated blob has been seen
   rollbackWarning: '',
   lastError: '',
   migratedVoiceKeys: false,
@@ -15348,6 +15387,78 @@ function vaultRandomId(prefix) {
   return `${prefix}_${dashboardBytesToBase64Url(crypto.getRandomValues(new Uint8Array(9)))}`;
 }
 
+/* ── Vault blob authentication ──
+   The body AAD binds the revision, but nothing bound the ENVELOPE SET to
+   the blob — a malicious store could splice a stale envelope set (say,
+   one still containing a revoked passkey) onto the newest body. The MAC
+   closes that: HMAC-SHA-256 under a key derived from the vault master
+   key over the whole blob. The store never holds the master key, so it
+   can neither mint nor relabel a MAC'd blob; every unlocker can verify.
+   Canonical JSON (sorted keys) because the store's serializer is free to
+   reorder object keys in transit. */
+
+function vaultCanonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(vaultCanonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map(k => `${JSON.stringify(k)}:${vaultCanonicalJson(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function vaultMacKey(kBytes) {
+  const hkdf = await crypto.subtle.importKey('raw', kBytes, 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: new TextEncoder().encode(VAULT_HKDF_SALT),
+      info: new TextEncoder().encode('vault-mac-v1'),
+    },
+    hkdf,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign', 'verify']
+  );
+}
+
+function vaultMacPayload(blob) {
+  return new TextEncoder().encode(
+    `intendant-vault-mac-v1\n${Number(blob.v) || 0}\n${String(blob.kind || '')}\n` +
+    `${Number(blob.revision) || 0}\n${vaultCanonicalJson(blob.envelopes || [])}\n` +
+    `${vaultCanonicalJson(blob.body || {})}`
+  );
+}
+
+async function vaultComputeMac(kBytes, blob) {
+  const key = await vaultMacKey(kBytes);
+  const mac = await crypto.subtle.sign('HMAC', key, vaultMacPayload(blob));
+  return dashboardBytesToBase64Url(new Uint8Array(mac));
+}
+
+async function vaultVerifyMac(kBytes, blob) {
+  const mac = String(blob?.mac || '');
+  if (!mac) return false;
+  try {
+    const key = await vaultMacKey(kBytes);
+    return await crypto.subtle.verify(
+      'HMAC', key, dashboardBase64UrlToBytes(mac), vaultMacPayload(blob)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/* Once this device has seen an authenticated blob, an unauthenticated one
+   is a downgrade attack, not a legacy vault. Ratchet state rides in
+   vaultState and persists through vaultWriteLocal. */
+function vaultMarkMacSeen() {
+  if (!vaultState.macSeen) {
+    vaultState.macSeen = true;
+    vaultWriteLocal();
+  }
+}
+
 /* ── Local cache + hosted sync ── */
 
 function vaultReadLocal() {
@@ -15364,6 +15475,7 @@ function vaultWriteLocal() {
     localStorage.setItem(VAULT_LOCAL_KEY, JSON.stringify({
       revision: vaultState.revision,
       high_water: vaultState.highWater,
+      mac_seen: Boolean(vaultState.macSeen),
       vault: vaultState.blob,
       updated_unix_ms: Date.now(),
     }));
@@ -15409,6 +15521,22 @@ async function vaultAdoptBlob(blob, { fromServer = false } = {}) {
       : '';
   }
   if (revision < vaultState.revision) return;
+  // Authenticate before adopting. Unlocked: verify the MAC outright.
+  // Locked with a MAC: adopt provisionally — unlock verifies before any
+  // use. Either way the downgrade ratchet refuses an unauthenticated
+  // blob once this device has seen an authenticated one.
+  if (blob.mac && vaultState.kBytes) {
+    if (!(await vaultVerifyMac(vaultState.kBytes, blob))) {
+      vaultState.lastError = 'The store returned a vault blob that failed its integrity check — ignoring it.';
+      renderAccessVaultSection();
+      return;
+    }
+    vaultMarkMacSeen();
+  } else if (!blob.mac && vaultState.macSeen) {
+    vaultState.lastError = 'The store served an unauthenticated vault although this device has seen an authenticated one — refusing the downgrade.';
+    renderAccessVaultSection();
+    return;
+  }
   vaultState.blob = blob;
   vaultState.revision = revision;
   vaultState.highWater = Math.max(vaultState.highWater, revision);
@@ -15444,6 +15572,7 @@ async function vaultInitInner() {
     return;
   }
   const local = vaultReadLocal();
+  vaultState.macSeen = Boolean(local?.mac_seen);
   if (local?.vault) {
     vaultState.highWater = Math.max(Number(local.high_water) || 0, Number(local.vault.revision) || 0);
     await vaultAdoptBlob(local.vault);
@@ -15487,6 +15616,22 @@ function vaultLock(notice) {
 }
 
 async function vaultFinishUnlock(kBytes, envelopeId) {
+  // Every unlock funnels through here: authenticate the whole blob before
+  // trusting any of it. A blob without a MAC is legacy — allowed only
+  // until this device has seen an authenticated one, and upgraded in
+  // place right after unlock.
+  if (vaultState.blob?.mac) {
+    if (!(await vaultVerifyMac(kBytes, vaultState.blob))) {
+      vaultState.lastError = 'Vault integrity check failed — the stored blob was tampered with or spliced. Refusing to unlock it.';
+      renderAccessVaultSection();
+      return false;
+    }
+    vaultMarkMacSeen();
+  } else if (vaultState.macSeen) {
+    vaultState.lastError = 'The store served an unauthenticated vault although this device has seen an authenticated one — refusing the downgrade.';
+    renderAccessVaultSection();
+    return false;
+  }
   const body = await vaultDecryptBody(kBytes, vaultState.blob);
   if (!body) {
     vaultState.lastError = 'The key envelope opened but the vault body did not decrypt — the blob may be corrupted.';
@@ -15500,6 +15645,21 @@ async function vaultFinishUnlock(kBytes, envelopeId) {
   vaultState.lastError = '';
   vaultSyncVoiceMirror();
   vaultMigrateVoiceKeys().catch(err => console.warn('[vault] voice key migration failed:', err?.message || err));
+  if (!vaultState.blob?.mac) {
+    // Legacy pre-MAC blob: upgrade it in place now that we hold the
+    // master key. Ride the publish chain (serialized with user edits) but
+    // fail quietly — the next save signs anyway.
+    vaultPublishChain = vaultPublishChain
+      .then(() => vaultPersist())
+      .then(() => {
+        console.info('[vault] legacy blob upgraded with an integrity MAC');
+        return true;
+      })
+      .catch(err => {
+        console.warn('[vault] MAC upgrade deferred (will retry on next save):', err?.message || err);
+        return false;
+      });
+  }
   renderAccessVaultSection();
   return true;
 }
@@ -15611,10 +15771,12 @@ async function vaultCreate(phrase) {
     envelopes,
     body: await vaultEncryptBody(kBytes, { entries: [], settings: {} }, revision),
   };
+  blob.mac = await vaultComputeMac(kBytes, blob);
   await vaultServerPublish(blob);
   vaultState.blob = blob;
   vaultState.revision = revision;
   vaultState.highWater = Math.max(vaultState.highWater, revision);
+  vaultState.macSeen = true;
   vaultWriteLocal();
   await vaultFinishUnlock(kBytes, matched);
 }
@@ -15637,10 +15799,13 @@ async function vaultPersist() {
         revision
       ),
     };
+    // Recompute — the spread carries the previous revision's MAC.
+    blob.mac = await vaultComputeMac(vaultState.kBytes, blob);
     await vaultServerPublish(blob);
     vaultState.blob = blob;
     vaultState.revision = revision;
     vaultState.highWater = Math.max(vaultState.highWater, revision);
+    vaultState.macSeen = true;
     vaultWriteLocal();
   };
   try {
@@ -15649,6 +15814,18 @@ async function vaultPersist() {
     if (!err?.vaultConflict) throw err;
     const server = await vaultServerFetch();
     if (server?.vault) {
+      // Authenticate the refetched blob before merging: adopting a spliced
+      // envelope set here and re-signing it in the retry would launder the
+      // splice into a valid MAC.
+      const remoteAuthentic = server.vault.mac
+        ? await vaultVerifyMac(vaultState.kBytes, server.vault)
+        : !vaultState.macSeen;
+      if (!remoteAuthentic) {
+        vaultState.lastError = 'The conflict refetch returned a vault blob that failed its integrity check — keeping local state.';
+        renderAccessVaultSection();
+        throw err;
+      }
+      if (server.vault.mac) vaultMarkMacSeen();
       const remoteBody = await vaultDecryptBody(vaultState.kBytes, server.vault);
       if (!remoteBody) {
         vaultLock('The vault was re-keyed on another device — unlock it again.');
@@ -20444,7 +20621,11 @@ function stationSessionRow(session, indexedIds = new Set()) {
     canInterrupt: false,
     canRestart: !!rowId && !!configSource && configSource !== 'intendant',
     canOpenLog: !!rowId,
-    canFork: !!rowId && (source === 'codex' || stationSessionLooksCodex(threadActionSessionId || rowId)),
+    canFork: !!rowId && (
+      source === 'codex' ||
+      stationSessionLooksCodex(threadActionSessionId || rowId) ||
+      (sessionThreadActionOps(threadActionSessionId || rowId) || []).includes('fork')
+    ),
   };
 }
 
@@ -22966,7 +23147,7 @@ function stationBuildSessionsSummary() {
       canInterrupt: !!row.target && !!row.stopId,
       canRestart: !!row.canConfig,
       canOpenLog: true,
-      canFork: !!row.isCodex,
+      canFork: !!row.isCodex || (sessionThreadActionOps(row.id) || []).includes('fork'),
     }));
   } catch (err) {
     console.warn('Station external target snapshot failed:', err);
@@ -26723,7 +26904,7 @@ function dispatchCodexThreadAction(op, params, sessionId = '', options = {}) {
   const sid = String(sessionId || '').trim() || resolvePromptTargetSessionId();
   const normalizedOp = String(op || '').trim().toLowerCase().replace(/_/g, '-');
   if (!sid) {
-    showControlToast('error', `/${op} needs a target Codex session`);
+    showControlToast('error', `/${op} needs a target session`);
     return false;
   }
   if (sid && sessionWindowIsSide(sid) && !codexThreadActionAllowedForSide(op)) {
@@ -26749,7 +26930,9 @@ function dispatchCodexThreadAction(op, params, sessionId = '', options = {}) {
   if (sid && !options.skipDetachedAttach && sessionWindowIsDetached(sid)) {
     return queueDetachedCodexThreadAction(sid, op, params || {});
   }
-  const payload = { action: 'codex_thread_action', op, params: params || {} };
+  // Canonical backend-neutral action name; the server also accepts the
+  // legacy `codex_thread_action` alias from older frontends.
+  const payload = { action: 'thread_action', op, params: params || {} };
   if (sid) payload.session_id = sid;
   dispatchControlMsg(payload);
   stationUpsertCodexThreadActionActivity(op, sid, 'requested', '', { renderLog: false });
@@ -26994,7 +27177,7 @@ function dispatchCodexSlashCommand(parsed) {
       showControlToast('info', 'Starting a fast Codex session');
       return true;
     }
-    showControlToast('error', `/${parsed.op}: select a Codex session first`);
+    showControlToast('error', `/${parsed.op}: select a target session first`);
     return false;
   }
   if (parsed.op === 'goal-edit') {
@@ -32732,7 +32915,7 @@ function codexThreadActionSpec(op) {
 }
 
 const SESSION_WINDOW_CODEX_ACTIONS = [
-  { op: 'fork', label: 'Fork...', title: 'Fork this Codex thread', ...CODEX_THREAD_ACTION_SPECS.fork },
+  { op: 'fork', label: 'Fork...', title: 'Fork this thread into a new session', ...CODEX_THREAD_ACTION_SPECS.fork },
   { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral Codex fork', ...CODEX_THREAD_ACTION_SPECS.side },
   { op: 'fast', label: 'Fast', title: 'Toggle Codex Fast service tier for future turns' },
   {
@@ -33547,6 +33730,10 @@ function codexThreadActionAllowedForSide(op) {
 
 function normalizeSessionCapabilities(raw = null) {
   if (!raw || typeof raw !== 'object') return null;
+  const normalizeOps = (list) => Array.isArray(list)
+    ? list.map(op => String(op || '').trim().toLowerCase().replace(/_/g, '-')).filter(Boolean)
+    : null;
+  const universalActions = normalizeOps(raw.thread_actions ?? raw.threadActions);
   const actions = raw.codex_thread_actions || raw.codexThreadActions;
   const rawFastMode = raw.codex_fast_mode ?? raw.codexFastMode;
   let codexFastMode = null;
@@ -33565,9 +33752,8 @@ function normalizeSessionCapabilities(raw = null) {
     followUp: raw.follow_up ?? raw.followUp ?? true,
     steer: raw.steer ?? false,
     interrupt: raw.interrupt ?? false,
-    codexThreadActions: Array.isArray(actions)
-      ? actions.map(op => String(op || '').trim().toLowerCase().replace(/_/g, '-')).filter(Boolean)
-      : null,
+    threadActions: universalActions,
+    codexThreadActions: normalizeOps(actions),
     codexManagedContext: raw.codex_managed_context ?? raw.codexManagedContext ?? null,
     codexSandbox: raw.codex_sandbox ?? raw.codexSandbox ?? null,
     codexApprovalPolicy: raw.codex_approval_policy ?? raw.codexApprovalPolicy ?? null,
@@ -33582,7 +33768,7 @@ function mergeSessionCapabilities(existing = null, incoming = null) {
   if (!existing) return incoming;
   if (!incoming) return existing;
   const merged = { ...existing, ...incoming };
-  for (const key of ['codexThreadActions', 'codexManagedContext', 'codexSandbox', 'codexApprovalPolicy', 'codexContextArchive', 'codexCommand', 'codexFastMode', 'codexServiceTier']) {
+  for (const key of ['threadActions', 'codexThreadActions', 'codexManagedContext', 'codexSandbox', 'codexApprovalPolicy', 'codexContextArchive', 'codexCommand', 'codexFastMode', 'codexServiceTier']) {
     if (
       key === 'codexServiceTier' &&
       incoming.codexFastMode === false &&
@@ -33649,8 +33835,21 @@ function getSessionCapabilities(sessionId) {
   const meta = sessionMetadataById.get(sid) || {};
   if (meta.capabilities) return meta.capabilities;
   if (meta.relationshipKind === 'subagent') {
-    return { followUp: true, steer: false, interrupt: false, codexThreadActions: [] };
+    return { followUp: true, steer: false, interrupt: false, threadActions: [], codexThreadActions: [] };
   }
+  return null;
+}
+
+// Backend-neutral per-session thread-action vocabulary. The universal
+// `threadActions` list wins; `codexThreadActions` is the legacy alias so
+// Codex sessions and old replays keep working. `null` means unknown (a
+// legacy session that never advertised capabilities) — callers fall back
+// to the codex heuristic for those.
+function sessionThreadActionOps(sessionId) {
+  const capabilities = getSessionCapabilities(sessionId);
+  if (!capabilities) return null;
+  if (Array.isArray(capabilities.threadActions)) return capabilities.threadActions;
+  if (Array.isArray(capabilities.codexThreadActions)) return capabilities.codexThreadActions;
   return null;
 }
 
@@ -33719,22 +33918,21 @@ function codexThreadActionStateForSession(sessionId, op) {
       ? { allowed: true, reason: '' }
       : { allowed: false, reason: 'Unsupported in a /side window' };
   }
-  const capabilities = getSessionCapabilities(sessionId);
-  if (capabilities && Array.isArray(capabilities.codexThreadActions)) {
-    const allowed = capabilities.codexThreadActions.includes(normalized);
-    if (!allowed) return { allowed: false, reason: 'Unsupported for this session' };
+  const ops = sessionThreadActionOps(sessionId);
+  if (Array.isArray(ops) && !ops.includes(normalized)) {
+    return { allowed: false, reason: 'Unsupported for this session' };
   }
   if (sessionWindowIsSubagent(sessionId)) {
-    return { allowed: false, reason: 'Unsupported for Codex subagent threads' };
+    return { allowed: false, reason: 'Unsupported for subagent threads' };
   }
-  // Codex thread actions operate on the attached backend thread, not on an
-  // active turn. An attached idle Codex app-server can fork/side/compact; only
+  // Thread actions operate on the attached backend thread, not on an
+  // active turn. An attached idle backend can fork/side/compact; only
   // detached history cards need the attach-before-dispatch path.
   if (sessionWindowIsDetached(sessionId)) {
     if (canQueueDetachedCodexThreadAction(sessionId)) {
       return { allowed: true, reason: 'Attach session to run this action' };
     }
-    return { allowed: false, reason: 'Attach this Codex session before running thread actions' };
+    return { allowed: false, reason: 'Attach this session before running thread actions' };
   }
   return { allowed: true, reason: '' };
 }
@@ -33812,12 +34010,21 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
       item.setAttribute('aria-disabled', item.disabled ? 'true' : 'false');
     }
   });
+  // Thread-action items gate on the session's ADVERTISED op vocabulary
+  // (universal `thread_actions`, legacy `codexThreadActions` alias). Legacy
+  // sessions that never advertised capabilities fall back to the codex
+  // heuristic so old replays keep their menu.
+  const advertisedOps = sessionThreadActionOps(sid);
+  const opVisible = (op) => (Array.isArray(advertisedOps)
+    ? advertisedOps.includes(String(op || '').trim())
+    : isCodex);
   win.actionMenu?.querySelectorAll('[data-session-window-codex-action]').forEach(item => {
     const op = item.dataset.sessionWindowAction || '';
     const spec = sessionWindowCodexActionByOp(op);
     const state = codexThreadActionStateForSession(sid, op);
-    item.classList.toggle('hidden', !isCodex || isSide);
-    item.disabled = isCodex && !isSide ? !state.allowed : false;
+    const visible = opVisible(op) && !isSide;
+    item.classList.toggle('hidden', !visible);
+    item.disabled = visible ? !state.allowed : false;
     if (op === 'fast' && state.allowed) {
       const fastMode = sessionCodexFastMode(sid);
       item.classList.toggle('active', fastMode === true);
@@ -33832,19 +34039,23 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
     item.setAttribute('aria-disabled', item.disabled ? 'true' : 'false');
   });
   win.actionMenu?.querySelectorAll('[data-session-window-codex-submenu]').forEach(submenu => {
-    submenu.classList.toggle('hidden', !isCodex || isSide);
-    if (!isCodex || isSide) submenu.classList.remove('open');
-    const trigger = submenu.querySelector('[data-session-window-submenu-trigger]');
     const childActions = Array.from(submenu.querySelectorAll('[data-session-window-codex-action]'));
+    const anyChildVisible = childActions.some(item => !item.classList.contains('hidden'));
+    submenu.classList.toggle('hidden', !anyChildVisible || isSide);
+    if (!anyChildVisible || isSide) submenu.classList.remove('open');
+    const trigger = submenu.querySelector('[data-session-window-submenu-trigger]');
     const hasEnabledChild = childActions.some(item => !item.disabled && !item.classList.contains('hidden'));
     if (trigger) {
-      trigger.disabled = isCodex && !isSide ? !hasEnabledChild : false;
+      trigger.disabled = anyChildVisible && !isSide ? !hasEnabledChild : false;
       trigger.setAttribute('aria-disabled', trigger.disabled ? 'true' : 'false');
       trigger.setAttribute('aria-expanded', submenu.classList.contains('open') ? 'true' : 'false');
     }
   });
   win.actionMenu?.querySelectorAll('[data-session-window-codex-separator]').forEach(item => {
-    item.classList.toggle('hidden', !isCodex || isSide);
+    const anyThreadActionVisible = !!win.actionMenu.querySelector(
+      '[data-session-window-codex-action]:not(.hidden), [data-session-window-codex-submenu]:not(.hidden)'
+    );
+    item.classList.toggle('hidden', !anyThreadActionVisible || isSide);
   });
 }
 
@@ -34564,8 +34775,10 @@ async function runSessionWindowCodexAction(sessionId, op) {
   const sid = String(sessionId || '').trim();
   const spec = sessionWindowCodexActionByOp(op);
   if (!sid || !spec) return;
-  if (!sessionWindowIsCodex(sid)) {
-    showControlToast('error', 'Codex actions are only available for Codex sessions');
+  // Sessions qualify by ADVERTISED thread-action ops (universal), with the
+  // codex heuristic as the legacy fallback for capability-less replays.
+  if (!Array.isArray(sessionThreadActionOps(sid)) && !sessionWindowIsCodex(sid)) {
+    showControlToast('error', 'Thread actions are not available for this session');
     return;
   }
   const actionState = codexThreadActionStateForSession(sid, op);
@@ -65315,6 +65528,21 @@ window.closeFsPicker = closeFsPicker;
 window.loadFsPickerPath = loadFsPickerPath;
 window.useFsPickerSelection = useFsPickerSelection;
 window.openAgentBinaryPicker = openAgentBinaryPicker;
+
+// The Claude model picker offers version-safe aliases (the CLI resolves
+// them to the latest model); the free-text id input only appears behind
+// the explicit "Custom model id…" choice.
+function updateNewSessionClaudeCustomModelRow() {
+  const select = document.getElementById('new-session-claude-model-select');
+  const row = document.getElementById('new-session-claude-model-custom-row');
+  if (!select || !row) return;
+  const custom = select.value === '__custom__' && !select.disabled;
+  row.classList.toggle('hidden', !custom);
+}
+function onNewSessionClaudeModelSelectChange() {
+  updateNewSessionClaudeCustomModelRow();
+}
+window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange;
 	window.openDownloadFilePicker = openDownloadFilePicker;
 	window.openFilesDownloadPicker = openFilesDownloadPicker;
 	window.onFilesDownloadHostChanged = onFilesDownloadHostChanged;
@@ -65915,20 +66143,27 @@ function renderNewSessionAgentControls(options = {}) {
   if (!hasExternalAgent || options.replaceCommand) {
     commandInput.value = '';
   }
+  const claudeModelSel = document.getElementById('new-session-claude-model-select');
   const claudeModelInp = document.getElementById('new-session-claude-model');
   const claudeModeSel = document.getElementById('new-session-claude-permission-mode');
+  const claudeEffortSel = document.getElementById('new-session-claude-effort');
+  const appliesToClaude = effectiveAgent === 'claude-code';
+  if (claudeModelSel) {
+    claudeModelSel.disabled = !appliesToClaude;
+    if (!appliesToClaude) claudeModelSel.value = '';
+  }
   if (claudeModelInp) {
-    const appliesToClaude = effectiveAgent === 'claude-code';
     claudeModelInp.disabled = !appliesToClaude;
     if (!appliesToClaude) claudeModelInp.value = '';
-    claudeModelInp.placeholder = appliesToClaude
-      ? 'e.g. haiku (empty = global setting)'
-      : 'Applies to Claude Code sessions';
   }
+  updateNewSessionClaudeCustomModelRow();
   if (claudeModeSel) {
-    const appliesToClaude = effectiveAgent === 'claude-code';
     claudeModeSel.disabled = !appliesToClaude;
     if (!appliesToClaude) claudeModeSel.value = '';
+  }
+  if (claudeEffortSel) {
+    claudeEffortSel.disabled = !appliesToClaude;
+    if (!appliesToClaude) claudeEffortSel.value = '';
   }
   if (managedContextSel) {
     const appliesToCodex = effectiveAgent === 'codex';
@@ -66195,10 +66430,15 @@ async function startNewSession() {
     if (agentCommand) msg.agent_command = agentCommand;
   }
   if (effectiveNewSessionAgentId() === 'claude-code') {
-    const model = document.getElementById('new-session-claude-model')?.value.trim() || '';
+    const modelChoice = document.getElementById('new-session-claude-model-select')?.value || '';
+    const model = modelChoice === '__custom__'
+      ? (document.getElementById('new-session-claude-model')?.value.trim() || '')
+      : modelChoice;
     if (model) msg.claude_model = model;
     const mode = document.getElementById('new-session-claude-permission-mode')?.value || '';
     if (mode) msg.claude_permission_mode = mode;
+    const effort = document.getElementById('new-session-claude-effort')?.value || '';
+    if (effort) msg.claude_effort = effort;
   }
   if (effectiveNewSessionAgentId() === 'codex') {
     if (newSessionCodexLaunchDefaultsLoaded) {
@@ -67996,7 +68236,7 @@ function renderSessionsList(sessions, el, options = {}) {
     const primaryText = sessionName || taskText || 'Untitled session';
     const titleKindText = sessionName ? 'name' : taskText ? 'initial' : 'untitled';
 
-    // Top row: name/task + full ID + status badges
+    // Top row: name/task + status badges
     const top = document.createElement('div');
     top.className = 'sc-top';
 
@@ -68129,13 +68369,14 @@ function renderSessionsList(sessions, el, options = {}) {
       card.appendChild(hitEl);
     }
 
-    // Meta row — compact essentials only; the long tail (id, absolute
-    // dates, provider, token breakdown, disk) moves to the row tooltip and
-    // stays visible in the session-detail overlay.
+    // Meta row — the full session id (click to copy) plus compact
+    // essentials; the long tail (absolute dates, provider, token breakdown,
+    // disk) moves to the row tooltip and stays visible in the
+    // session-detail overlay.
     const meta = document.createElement('div');
     meta.className = 'sc-meta';
     const addMetaField = (label, value, valueClass, valueTitle) => {
-      if (value === null || value === undefined || value === '') return;
+      if (value === null || value === undefined || value === '') return null;
       const span = document.createElement('span');
       const l = document.createElement('span');
       l.className = 'label';
@@ -68147,8 +68388,19 @@ function renderSessionsList(sessions, el, options = {}) {
       span.appendChild(l);
       span.appendChild(v);
       meta.appendChild(span);
+      return v;
     };
 
+    const idVal = addMetaField('id', sessionId || shortId, 'sc-id', 'Click to copy the session ID');
+    if (idVal) {
+      idVal.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const fullId = sessionId || shortId;
+        copyTextToClipboard(fullId)
+          .then(() => showControlToast('success', `Copied session ID ${shortSessionId(fullId)}`))
+          .catch(err => showControlToast('error', `Copy session ID failed: ${err?.message || err}`));
+      });
+    }
     const changedAt = s.updated_at || s.changed_at;
     if (changedAt) addMetaField('changed', sessionRelativeLabel(changedAt) || changedAt, null, changedAt);
     const projectPath = sessionProjectDirectory(s);
@@ -68173,7 +68425,6 @@ function renderSessionsList(sessions, el, options = {}) {
     }
 
     const tipParts = [];
-    if (sessionId || shortId) tipParts.push(`id: ${sessionId || shortId}`);
     if (s.created_at) tipParts.push(`created: ${s.created_at}`);
     if (changedAt) tipParts.push(`changed: ${changedAt}`);
     if (s.provider) tipParts.push(`provider: ${s.provider}`);

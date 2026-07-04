@@ -182,6 +182,20 @@ WebGPU renderer, microphone/camera features, browser screen capture, and other
 privileged browser APIs; see
 [Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).
 
+**Dashboard on demand.** The app starts the daemon immediately but defers the
+dashboard SPA behind a lightweight placeholder with an **Activate Dashboard**
+button — the SPA's web-content process is the expensive part (it grows past a
+gigabyte during long streaming sessions), and a Mac used as a remote daemon
+never needs it locally. Closing the window frees the WKWebView entirely while
+the daemon keeps running; reopen it from the Dock (the placeholder returns).
+Quitting the app (Cmd+Q or the Dock menu) is what stops the daemon. An
+activated dashboard whose window stays hidden or minimized for 3 hours unloads
+back to the placeholder automatically. Two environment variables tune this:
+`INTENDANT_AUTO_DASHBOARD=1` loads the SPA at launch without the placeholder
+(implied by `INTENDANT_DIAG=1`, which smoke harnesses rely on), and
+`INTENDANT_DASHBOARD_IDLE_UNLOAD_SECS` overrides the idle-unload threshold
+(`0` disables it).
+
 ```bash
 ./scripts/bundle-macos.sh           # release build + install to /Applications
 ./scripts/bundle-macos.sh debug     # debug build + install

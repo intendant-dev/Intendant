@@ -195,6 +195,66 @@ pub(crate) fn spawn_stderr_forwarder(
     });
 }
 
+/// Shared `/goal` protocol conventions. Codex implements goals natively
+/// (`thread/goal/*` RPCs); other backends run the wrapper-level goal engine
+/// — both must accept the same statuses, budget shapes, and objective
+/// limits so frontends never see backend-specific goal dialects.
+pub(crate) const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 4_000;
+
+pub(crate) fn validate_goal_objective(objective: &str) -> Result<(), CallerError> {
+    let chars = objective.chars().count();
+    if chars <= MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+        return Ok(());
+    }
+    Err(CallerError::ExternalAgent(format!(
+        "goal objective is too long: {} characters; limit is {}",
+        chars, MAX_THREAD_GOAL_OBJECTIVE_CHARS
+    )))
+}
+
+pub(crate) fn normalize_goal_status(status: &str) -> Result<String, CallerError> {
+    let normalized = match status.trim() {
+        "active" | "resume" | "resumed" => "active",
+        "paused" | "pause" => "paused",
+        "blocked" | "block" => "blocked",
+        "usageLimited" | "usage-limited" | "usage_limited" => "usageLimited",
+        "budgetLimited" | "budget-limited" | "budget_limited" => "budgetLimited",
+        "complete" | "completed" | "done" => "complete",
+        other => {
+            return Err(CallerError::ExternalAgent(format!(
+                "unsupported goal status: {}",
+                other
+            )))
+        }
+    };
+    Ok(normalized.to_string())
+}
+
+pub(crate) fn parse_goal_token_budget(
+    params: &serde_json::Value,
+) -> Result<Option<Option<u64>>, CallerError> {
+    let Some(value) = params
+        .get("tokenBudget")
+        .or_else(|| params.get("token_budget"))
+    else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(None));
+    }
+    let Some(budget) = value.as_u64() else {
+        return Err(CallerError::ExternalAgent(
+            "goal token budget must be a positive integer or null".into(),
+        ));
+    };
+    if budget == 0 {
+        return Err(CallerError::ExternalAgent(
+            "goal token budget must be a positive integer".into(),
+        ));
+    }
+    Ok(Some(Some(budget)))
+}
+
 /// One image attachment passed alongside a user message.
 ///
 /// Some backends (Codex) prefer file paths to keep base64 out of the JSON-RPC
@@ -410,6 +470,38 @@ pub struct BackendAvailability {
     /// Unix seconds of the most recent session this daemon recorded for
     /// the backend — evidence it not only exists but has worked here.
     pub last_used_secs: Option<u64>,
+    /// An active `oauth:<backend>` vault lease: sessions run on the
+    /// leased identity regardless of any on-disk login.
+    pub leased: bool,
+    /// Whether the CLI's own on-disk login artifact exists. `None` when
+    /// the platform stores credentials out of stat's reach (Claude Code
+    /// keeps them in the keychain on macOS), so absence proves nothing.
+    pub local_login: Option<bool>,
+}
+
+fn codex_local_login(home: &Path) -> Option<bool> {
+    codex_local_login_in(std::env::var_os("CODEX_HOME"), home)
+}
+
+/// `CODEX_HOME` injected for testability.
+fn codex_local_login_in(env_codex_home: Option<std::ffi::OsString>, home: &Path) -> Option<bool> {
+    let codex_home = env_codex_home
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    Some(codex_home.join("auth.json").is_file())
+}
+
+fn claude_code_local_login(home: &Path) -> Option<bool> {
+    if home.join(".claude").join(".credentials.json").is_file() {
+        return Some(true);
+    }
+    // On macOS the default store is the keychain, so an absent file
+    // proves nothing; elsewhere the file IS the store.
+    if cfg!(target_os = "macos") {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 /// Probe every supported backend. Stat-based (never executes the CLIs),
@@ -443,11 +535,21 @@ pub fn backend_availability(
                     .map(|record| record.updated_at_secs)
                     .max()
                     .filter(|secs| *secs > 0);
+            let leased = crate::credential_leases::kind_is_active(&format!(
+                "oauth:{}",
+                backend.as_short_str()
+            ));
+            let local_login = match backend {
+                AgentBackend::Codex => codex_local_login(home),
+                AgentBackend::ClaudeCode => claude_code_local_login(home),
+            };
             BackendAvailability {
                 backend,
                 command,
                 installed,
                 last_used_secs,
+                leased,
+                local_login,
             }
         })
         .collect()
@@ -469,6 +571,8 @@ pub fn backend_availability_json(
                     "command": info.command,
                     "installed": info.installed,
                     "last_used_secs": info.last_used_secs,
+                    "leased": info.leased,
+                    "local_login": info.local_login,
                 })
             })
             .collect(),
@@ -701,6 +805,11 @@ pub struct AgentConfig {
     /// Persisted backend-native session/thread id to resume instead of
     /// starting a fresh external conversation.
     pub resume_session: Option<String>,
+    /// Fork the resumed thread into a new backend-native session instead of
+    /// continuing it in place (Claude Code `--resume <id> --fork-session`).
+    /// Only meaningful together with `resume_session`; backends whose fork
+    /// is an in-process thread action ignore it.
+    pub fork_resume: bool,
     /// Codex state directory to use for this session's app-server process.
     /// Codex-only; other backends ignore.
     pub codex_home: Option<PathBuf>,
@@ -710,6 +819,23 @@ pub struct AgentConfig {
 #[derive(Debug)]
 pub struct AgentThread {
     pub thread_id: String,
+}
+
+/// How a backend implements the `fork` thread action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkHandling {
+    /// The backend forks natively in-process via `thread_action("fork")`;
+    /// the new thread id is parsed from the action's status message
+    /// (Codex `thread/fork`).
+    Native,
+    /// The backend forks by spawning a fresh process that resumes the
+    /// current thread with a fork flag; the new native session id is only
+    /// announced once the forked process runs its first turn. The drain
+    /// translates the action into a new supervisor session with
+    /// `AgentConfig { resume_session: thread_id, fork_resume: true }`.
+    /// `thread_id` is the canonical id of the thread being forked; `None`
+    /// means no canonical id is known yet and the fork must be refused.
+    RespawnResume { thread_id: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -926,6 +1052,15 @@ pub trait ExternalAgent: Send + Sync {
         ))
     }
 
+    /// How this backend implements the `fork` thread action. The default —
+    /// `Native` — routes `fork` through `thread_action` like any other op;
+    /// backends without an in-process fork return `RespawnResume` so the
+    /// drain respawns a resumed process with the backend's fork flag
+    /// instead of calling `thread_action("fork")`.
+    fn fork_handling(&self) -> ForkHandling {
+        ForkHandling::Native
+    }
+
     /// Dispatch a backend-specific thread action (Codex: compact, fork, side,
     /// side-close, rollback, review, memory-reset; other backends currently reject).
     /// Returns a short human-readable status message on success.
@@ -1133,6 +1268,38 @@ mod tests {
         assert_eq!(availability[1].backend, AgentBackend::ClaudeCode);
         assert!(!availability[1].installed);
         assert_eq!(availability[1].last_used_secs, None);
+        // A unit-test process holds no vault leases.
+        assert!(!availability[0].leased);
+        assert!(!availability[1].leased);
+    }
+
+    #[test]
+    fn local_login_detection_reads_auth_artifacts() {
+        let home = tempfile::tempdir().unwrap();
+
+        // Empty home: codex is definitively signed out; Claude Code is
+        // unknowable on macOS (keychain) and signed out elsewhere.
+        assert_eq!(codex_local_login_in(None, home.path()), Some(false));
+        if cfg!(target_os = "macos") {
+            assert_eq!(claude_code_local_login(home.path()), None);
+        } else {
+            assert_eq!(claude_code_local_login(home.path()), Some(false));
+        }
+
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(home.path().join(".codex/auth.json"), b"{}").unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(home.path().join(".claude/.credentials.json"), b"{}").unwrap();
+
+        assert_eq!(codex_local_login_in(None, home.path()), Some(true));
+        assert_eq!(claude_code_local_login(home.path()), Some(true));
+
+        // CODEX_HOME redirects the codex probe wholesale.
+        let alt = tempfile::tempdir().unwrap();
+        assert_eq!(
+            codex_local_login_in(Some(alt.path().as_os_str().to_os_string()), home.path()),
+            Some(false)
+        );
     }
 
     #[test]
@@ -1179,6 +1346,11 @@ mod tests {
             assert!(entry.get("installed").is_some_and(serde_json::Value::is_boolean));
             assert!(entry.get("command").is_some_and(serde_json::Value::is_string));
             assert!(entry.get("label").is_some_and(serde_json::Value::is_string));
+            assert!(entry.get("leased").is_some_and(serde_json::Value::is_boolean));
+            assert!(
+                entry.get("local_login").is_some(),
+                "local_login must be present (bool or null)"
+            );
         }
     }
 
