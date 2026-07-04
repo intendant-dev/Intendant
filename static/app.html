@@ -9901,7 +9901,10 @@ body.display-fullscreen-open {
 .display-toolbar .release-control-btn,
 .display-toolbar .stream-btn,
 .display-toolbar .annotate-btn,
+.display-toolbar .ann-attach-btn,
+.display-toolbar .record-btn,
 .display-toolbar .display-fullscreen-btn,
+.display-toolbar .display-close-btn,
 .peer-display-controls .take-control-btn,
 .peer-display-controls .release-control-btn {
   padding: 3px 10px;
@@ -9911,6 +9914,17 @@ body.display-fullscreen-open {
   color: var(--text);
   cursor: pointer;
   font-size: 12px;
+  font-weight: 400;
+}
+.display-toolbar .ann-attach-btn:hover {
+  background: var(--peach);
+  color: var(--base);
+  border-color: var(--peach);
+}
+.display-toolbar .display-close-btn:hover {
+  background: var(--surface1);
+  color: var(--red);
+  border-color: var(--red);
 }
 .display-toolbar .take-control-btn {
   margin-left: auto;
@@ -9931,10 +9945,9 @@ body.display-fullscreen-open {
   color: var(--base);
   border-color: var(--blue);
 }
-.display-toolbar .record-btn {
-  border-color: var(--red);
-  color: var(--red);
-}
+/* Record rests quiet like its neighbours; red is reserved for intent
+   (hover) and the live recording state — a danger accent idling in the
+   toolbar reads as a warning that isn't there. */
 .display-toolbar .record-btn:hover,
 .display-toolbar .record-btn.active {
   background: var(--red);
@@ -43168,15 +43181,15 @@ class DisplaySlot {
         <span class="display-status" id="ds-status-${displayId}">Connecting...</span>
         <span class="display-input-authority" id="ds-authority-${displayId}" style="display:none" title="Input authority for this display: who can drive keyboard/mouse. Phase 5c."></span>
         <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
-        <button class="stream-btn" id="ds-stream-${displayId}" title="Continuously send screenshots of this display to the live presence (voice) model. Main agents are not affected.">&#x1F441; Stream</button>
-        <button class="ann-attach-btn" id="ds-attach-${displayId}" title="Capture current frame and attach to next task">&#x1F4CE; Attach</button>
+        <button class="stream-btn" id="ds-stream-${displayId}" title="Continuously send screenshots of this display to the live presence (voice) model. Main agents are not affected.">Stream</button>
+        <button class="ann-attach-btn" id="ds-attach-${displayId}" title="Capture current frame and attach to next task">Attach</button>
         <button class="annotate-btn" id="ds-annotate-${displayId}" title="Freeze current frame and annotate it">&#9998; Annotate</button>
-        <button class="record-btn" id="ds-record-${displayId}" title="Record this display (ffmpeg)">&#x23FA; Record</button>
+        <button class="record-btn" id="ds-record-${displayId}" title="Record this display (ffmpeg)">Record</button>
         <button class="display-fullscreen-btn" id="ds-fullscreen-${displayId}" title="Full screen">&#x26F6;</button>
         <button class="display-close-btn" id="ds-close-${displayId}" title="Close this display stream">&times;</button>
         <button class="take-control-btn" id="ds-take-${displayId}" title="Take interactive control of this display (keyboard and mouse)">Take Control</button>
         <button class="release-control-btn" id="ds-release-${displayId}" style="display:none" title="Release control and return display to view-only mode">Release</button>
-        <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" style="display:none" title="Delete recording files for this display">&#x1F5D1; Delete</button>
+        <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" style="display:none" title="Delete recording files for this display">Delete</button>
         <span class="stream-frame-id" id="ds-frame-${displayId}" style="display:none;font-size:10px;color:var(--overlay0);margin-left:auto"></span>
       </div>
       <div class="display-canvas" id="display-canvas-${displayId}"></div>`;
