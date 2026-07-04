@@ -4,6 +4,31 @@ This chapter takes you from a clean checkout to a running agent: prerequisites,
 per-OS setup, building, API keys, your first run, and the full CLI flag
 reference.
 
+## Fresh box in one command
+
+Standing up a **new machine** end to end (clone, dependencies, build, launch,
+claimable from your browser) is one served command — see
+[Credential Custody](./credential-custody.md#the-bootstrap-this-unlocks) for
+the trust story behind it:
+
+```bash
+# macOS / Linux
+curl -fsSL https://intendant.dev/install.sh | sh -s -- --owner <your-key>
+```
+
+```powershell
+# Windows (PowerShell)
+& ([scriptblock]::Create((irm https://intendant.dev/install.ps1))) -Owner <your-key>
+```
+
+Add `--service` / `-Service` on an unattended box: `intendant service install`
+registers the daemon with the platform's native supervisor (systemd where
+present, launchd on macOS, Task Scheduler on Windows, cron `@reboot` plus a
+built-in restart supervisor on systemd-less Linux — no init system is a
+dependency) and prints where the claim phrase lands. `intendant service
+uninstall|status` manage it afterwards. The rest of this chapter is the
+from-checkout path the installer automates.
+
 ## Prerequisites
 
 Intendant is a Rust workspace. At minimum you need:

@@ -53,6 +53,7 @@ mod quarantine;
 mod recording;
 mod sandbox;
 mod schema_validator;
+mod service_mode;
 mod session_config;
 mod session_log;
 mod session_names;
@@ -33634,6 +33635,16 @@ async fn main() -> Result<(), CallerError> {
                 std::process::exit(1);
             }
         };
+    }
+
+    // Intercept `intendant service <action>` — install/remove/inspect the
+    // boot service for this binary (native supervisor per platform:
+    // systemd / launchd / Task Scheduler / cron @reboot). Local path, no
+    // project or provider setup. `service run` is the built-in
+    // supervisor loop the Task Scheduler and cron backends point at.
+    if env::args().nth(1).as_deref() == Some("service") {
+        let args: Vec<String> = env::args().skip(2).collect();
+        std::process::exit(service_mode::run_service_cli(&args));
     }
 
     // Intercept `intendant access <action>` before the main runtime setup.
