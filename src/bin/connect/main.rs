@@ -5334,6 +5334,9 @@ fn landing_ui_html(origin: &str) -> String {
     }}
     .step b {{ display: block; color: var(--text); margin-bottom: 4px; font-size: 14.5px; }}
     .step .n {{ color: var(--accent); font-weight: 700; margin-right: 6px; }}
+    .whyname {{ padding: 78px 0 0; }}
+    .whyname p {{ max-width: 65ch; margin: 0; font-size: 15.5px; color: var(--muted); line-height: 1.65; }}
+    .whyname p strong {{ color: var(--text); font-weight: 600; }}
     .trustrow {{ padding: 78px 0 20px; }}
     .trustrow .card {{ background: rgba(166, 227, 161, .05); border-color: rgba(166, 227, 161, .18); }}
     footer {{
@@ -5350,7 +5353,7 @@ fn landing_ui_html(origin: &str) -> String {
       .trow.rev .txt {{ order: 0; }}
       .tour {{ padding-top: 60px; }}
       .igrid {{ grid-template-columns: minmax(0, 1fr); }}
-      section.features, .trustrow {{ padding-top: 56px; }}
+      section.features, .whyname, .trustrow {{ padding-top: 56px; }}
       .install-section {{ padding-top: 36px; }}
       .heroshot {{ margin-top: 64px; }}
     }}
@@ -5565,6 +5568,17 @@ fn landing_ui_html(origin: &str) -> String {
           own IAM, never by this service.</p>
         </div>
       </div>
+    </section>
+
+    <section class="whyname">
+      <h2>Why “Intendant”</h2>
+      <p>In a theater, performers play and conductors orchestrate — the
+      <strong>Intendant</strong> runs the house: who gets the stage, which
+      productions run, on whose authority, with the books open. Here agents
+      perform, orchestrators conduct (Codex and Claude Code as guest
+      conductors), and the Intendant runs the house and answers to you —
+      houses federate, companies tour on signed contracts, house rules always
+      win: a network of agentic networks.</p>
     </section>
 
     <section class="trustrow">
@@ -7460,6 +7474,9 @@ mod tests {
             install_at < heroshot_at && heroshot_at < tour_at,
             "install must lead, then the product tour"
         );
+        // The name is the thesis, stated once, quietly, before the trust row.
+        assert!(html.contains("Why “Intendant”"));
+        assert!(html.contains("a network of agentic networks"));
         // Custody names the two fueling modes by what travels: the key
         // (lease) vs the calls (client egress — the disposable-box mode).
         assert!(html.contains(r#"class="fuelmap""#));
