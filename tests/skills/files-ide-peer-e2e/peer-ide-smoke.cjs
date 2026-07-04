@@ -23,7 +23,13 @@ function assert(cond, why) { if (!cond) throw new Error('assert failed: ' + why)
     await page.goto((process.env.DASH_URL || 'http://127.0.0.1:18800') + '/app', { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => window.intendantDashboardFilesIde && document.querySelector('.tab-btn[data-tab="files"]'), null, { timeout: 30000 });
     await page.click('.tab-btn[data-tab="files"]');
-    await page.waitForSelector('.files-ide-card', { timeout: 10000 });
+    await page.waitForSelector('#files-pane-editor .files-ide-body', { timeout: 10000 });
+    const layout = await page.evaluate(() => {
+      const body = document.querySelector('.files-ide-body').getBoundingClientRect();
+      return { w: body.width / window.innerWidth, h: body.height / window.innerHeight };
+    });
+    assert(layout.w >= 0.9, 'editor uses the full pane width, got ' + layout.w.toFixed(2));
+    assert(layout.h >= 0.5, 'editor fills most of the pane height, got ' + layout.h.toFixed(2));
     step('dashboard loaded, Files tab open');
 
     // Peer appears in the editor host select once A's registry syncs.

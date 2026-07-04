@@ -16,7 +16,9 @@
       try {
         document.querySelector('.tab-btn[data-tab="files"]').click();
         await sleep(300);
-        assert(document.querySelector('.files-ide-card'), 'editor card rendered');
+        assert(document.querySelector('#files-pane-editor .files-ide-body'), 'editor workbench rendered');
+        const bodyRect = document.querySelector('.files-ide-body').getBoundingClientRect();
+        assert(bodyRect.width >= window.innerWidth * 0.9, 'editor uses full pane width, got ' + bodyRect.width + '/' + window.innerWidth);
         step('files tab + editor card');
 
         let snap = await ide._debugSetRoot(SMOKE);
