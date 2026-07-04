@@ -922,29 +922,71 @@ async fn healthz() -> impl IntoResponse {
 /// at build time so the service — hosted or self-hosted — serves the
 /// installer that matches its own version:
 ///   curl -fsSL <origin>/install.sh | sh -s -- --owner <fingerprint>
+///
+/// Served with this rendezvous' public origin injected as the default
+/// `--connect` URL: fetching the installer from a rendezvous IS the opt-in,
+/// and a fresh VPS has no other way to learn where to register — without
+/// it the daemon comes up unregistered and hosted claiming dead-ends.
+/// (A compiled-in default in the daemon would instead make every install
+/// phone home to intendant.dev; serve-time injection keeps self-hosting
+/// exact.) Explicit `--connect` / `-Connect` still wins over the default.
 const INSTALL_SH: &str = include_str!("../../../scripts/install.sh");
+const INSTALL_SH_CONNECT_DEFAULT: &str = r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-}""#;
 
-async fn install_sh() -> impl IntoResponse {
+/// Only a plain URL charset may be spliced into the scripts — anything
+/// else (quotes, spaces, `$`) could change what the shell parses. A
+/// misconfigured origin falls back to serving the script verbatim.
+fn connect_default_injectable(origin: &str) -> bool {
+    !origin.is_empty()
+        && origin
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_'))
+}
+
+fn install_sh_body(public_origin: &str) -> String {
+    if !connect_default_injectable(public_origin) {
+        return INSTALL_SH.to_string();
+    }
+    INSTALL_SH.replacen(
+        INSTALL_SH_CONNECT_DEFAULT,
+        &format!(r#"CONNECT_URL="${{INTENDANT_CONNECT_RENDEZVOUS_URL:-{public_origin}}}""#),
+        1,
+    )
+}
+
+async fn install_sh(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        INSTALL_SH,
+        install_sh_body(&state.config.public_origin),
     )
 }
 
 /// The Windows counterpart, for PowerShell:
 ///   & ([scriptblock]::Create((irm <origin>/install.ps1))) -Owner <fingerprint>
 const INSTALL_PS1: &str = include_str!("../../../scripts/install.ps1");
+const INSTALL_PS1_CONNECT_DEFAULT: &str = "    [string]$Connect = \"\",";
 
-async fn install_ps1() -> impl IntoResponse {
+fn install_ps1_body(public_origin: &str) -> String {
+    if !connect_default_injectable(public_origin) {
+        return INSTALL_PS1.to_string();
+    }
+    INSTALL_PS1.replacen(
+        INSTALL_PS1_CONNECT_DEFAULT,
+        &format!("    [string]$Connect = \"{public_origin}\","),
+        1,
+    )
+}
+
+async fn install_ps1(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        INSTALL_PS1,
+        install_ps1_body(&state.config.public_origin),
     )
 }
 
@@ -7500,6 +7542,54 @@ mod tests {
         ] {
             assert!(INSTALL_PS1.contains(needle), "install.ps1 must contain {needle}");
         }
+    }
+
+    #[test]
+    fn served_installers_default_connect_to_the_serving_rendezvous() {
+        // The embedded scripts must keep the sentinel lines the handlers
+        // splice — if either drifts, injection silently stops and a fresh
+        // VPS comes up unregistered (hosted claiming dead-ends).
+        assert!(
+            INSTALL_SH.contains(INSTALL_SH_CONNECT_DEFAULT),
+            "install.sh connect-default sentinel drifted"
+        );
+        assert!(
+            INSTALL_PS1.contains(INSTALL_PS1_CONNECT_DEFAULT),
+            "install.ps1 connect-default sentinel drifted"
+        );
+
+        let sh = install_sh_body("https://rendezvous.example");
+        assert!(sh.contains(
+            r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-https://rendezvous.example}""#
+        ));
+        assert!(!sh.contains(INSTALL_SH_CONNECT_DEFAULT));
+
+        let ps1 = install_ps1_body("https://rendezvous.example");
+        assert!(ps1.contains(r#"[string]$Connect = "https://rendezvous.example","#));
+        assert!(!ps1.contains(INSTALL_PS1_CONNECT_DEFAULT));
+        // The ANSI-decode trap applies to the served body, not just the
+        // embedded file — the injected origin must not break the pin.
+        assert!(ps1.is_ascii(), "served install.ps1 must stay pure ASCII");
+
+        // Splice guard: only a plain URL charset reaches the scripts.
+        assert!(connect_default_injectable("https://intendant.dev"));
+        assert!(connect_default_injectable("http://localhost:9891"));
+        assert!(!connect_default_injectable(r#"https://x"; rm -rf ~"#));
+        assert!(!connect_default_injectable("https://x y"));
+        assert!(!connect_default_injectable(""));
+        let verbatim = install_sh_body(r#"https://x" y"#);
+        assert_eq!(verbatim, INSTALL_SH, "unsafe origin must serve verbatim");
+    }
+
+    /// Windows PowerShell 5.1 executes setup-windows.ps1 straight from the
+    /// fresh clone, so the BOM-less ANSI-decode trap pinned for install.ps1
+    /// above applies to it identically — a non-ASCII byte that lands in
+    /// code (not a comment) can decode into a cp1252 smart quote the parser
+    /// honors. Keep every PowerShell file a fresh box runs pure ASCII.
+    #[test]
+    fn setup_windows_ps1_is_pure_ascii() {
+        const SETUP_PS1: &str = include_str!("../../../scripts/setup-windows.ps1");
+        assert!(SETUP_PS1.is_ascii(), "setup-windows.ps1 must be pure ASCII");
     }
 
     /// Real parse coverage for the PowerShell installer, on the platform
