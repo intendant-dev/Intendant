@@ -389,6 +389,8 @@ impl SessionSupervisor {
                 project_root,
                 agent,
                 agent_command,
+                claude_model,
+                claude_permission_mode,
                 codex_sandbox,
                 codex_approval_policy,
                 codex_managed_context,
@@ -424,6 +426,8 @@ impl SessionSupervisor {
                                 project_root,
                                 agent,
                                 agent_command,
+                                None,
+                                None,
                                 codex_sandbox,
                                 codex_approval_policy,
                                 codex_managed_context,
@@ -447,6 +451,8 @@ impl SessionSupervisor {
                         || display_target.is_some()
                         || agent.is_some()
                         || agent_command.is_some()
+                        || claude_model.is_some()
+                        || claude_permission_mode.is_some()
                         || codex_sandbox.is_some()
                         || codex_approval_policy.is_some()
                         || codex_managed_context.is_some()
@@ -468,6 +474,8 @@ impl SessionSupervisor {
                     project_root,
                     agent,
                     agent_command,
+                    claude_model,
+                    claude_permission_mode,
                     codex_sandbox,
                     codex_approval_policy,
                     codex_managed_context,
@@ -531,6 +539,8 @@ impl SessionSupervisor {
                                 None,
                                 None,
                                 None,
+                                None,
+                                None,
                                 orchestrate,
                                 direct,
                                 Vec::new(),
@@ -557,6 +567,8 @@ impl SessionSupervisor {
                 }
                 self.start_new_session(
                     task,
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -835,6 +847,8 @@ impl SessionSupervisor {
         project_root: Option<String>,
         agent: Option<String>,
         agent_command: Option<String>,
+        claude_model: Option<String>,
+        claude_permission_mode: Option<String>,
         codex_sandbox: Option<String>,
         codex_approval_policy: Option<String>,
         codex_managed_context: Option<String>,
@@ -953,6 +967,41 @@ impl SessionSupervisor {
                 return;
             };
             apply_session_agent_command(&mut project, backend, command);
+        }
+        if let Some(model) = claude_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error(
+                    "Session create failed: claude_model requires Claude Code".to_string(),
+                );
+                return;
+            };
+            if let Err(e) = apply_session_claude_model(&mut project, backend, model.to_string()) {
+                self.loop_error(format!("Session create failed: {}", e));
+                return;
+            }
+        }
+        if let Some(mode) = claude_permission_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error(
+                    "Session create failed: claude_permission_mode requires Claude Code"
+                        .to_string(),
+                );
+                return;
+            };
+            if let Err(e) =
+                apply_session_claude_permission_mode(&mut project, backend, mode.to_string())
+            {
+                self.loop_error(format!("Session create failed: {}", e));
+                return;
+            }
         }
         if let Some(mode) = normalize_session_codex_sandbox(codex_sandbox.as_deref()) {
             let Some(ref backend) = backend else {
@@ -3743,6 +3792,35 @@ fn apply_session_codex_managed_context(
             Ok(())
         }
         _ => Err("codex_managed_context requires Codex".to_string()),
+    }
+}
+
+fn apply_session_claude_model(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    model: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::ClaudeCode => {
+            project.config.agent.claude_code.model = Some(model);
+            Ok(())
+        }
+        _ => Err("claude_model requires Claude Code".to_string()),
+    }
+}
+
+fn apply_session_claude_permission_mode(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    mode: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::ClaudeCode => {
+            project.config.agent.claude_code.permission_mode =
+                crate::project::normalize_claude_permission_mode(&mode);
+            Ok(())
+        }
+        _ => Err("claude_permission_mode requires Claude Code".to_string()),
     }
 }
 

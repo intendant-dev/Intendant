@@ -12222,6 +12222,20 @@ body.display-fullscreen-open {
                           <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
                         </div>
                       </div>
+                      <label class="sessions-new-session-field" for="new-session-claude-model">
+                        Claude model
+                        <input id="new-session-claude-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. haiku (empty = global setting)" disabled>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-claude-permission-mode">
+                        Permissions
+                        <select id="new-session-claude-permission-mode" disabled>
+                          <option value="">Global setting</option>
+                          <option value="default">default</option>
+                          <option value="acceptEdits">acceptEdits</option>
+                          <option value="plan">plan</option>
+                          <option value="bypassPermissions">bypassPermissions</option>
+                        </select>
+                      </label>
                       <label class="sessions-new-session-field" for="new-session-codex-sandbox">
                         Sandbox
                         <select id="new-session-codex-sandbox" disabled>
@@ -28493,8 +28507,14 @@ function setDaemonSessionId(sessionId) {
 
 function applySessionIdentity(meta = {}) {
   const sid = String(meta.session_id || meta.intendant_session_id || '').trim();
-  const backendSessionId = String(meta.backend_session_id || meta.backendSessionId || '').trim();
+  let backendSessionId = String(meta.backend_session_id || meta.backendSessionId || '').trim();
   const backendSource = String(meta.backend_source || meta.backendSource || meta.source || '').trim();
+  // Placeholder thread ids (Claude Code before its stream announces the
+  // real session id) must never become a backend alias: status routing
+  // would retarget at a window that never materializes, and the ghost
+  // window it conjures can steal the prompt target. Old session logs and
+  // scraped debug lines still carry the placeholder, so filter centrally.
+  if (backendSessionId === 'claude-code-session') backendSessionId = '';
   if (!sid || (!backendSessionId && !backendSource)) return;
   const wrapperMeta = sessionMetadataById.get(sid) || {};
   const next = {
@@ -35679,8 +35699,20 @@ function cacheSessionUsage(c) {
 
 function usageForForegroundSession() {
   const sid = resolvePromptTargetSessionId();
-  if (sid && sessionUsageById.has(sid)) return sessionUsageById.get(sid);
-  if (sid && sessionUsageById.size > 0) return null;
+  if (sid) {
+    if (sessionUsageById.has(sid)) return sessionUsageById.get(sid);
+    // External sessions re-key the foreground to the backend-native id
+    // while usage commands keep riding the Intendant log id; look the
+    // usage up across the identity group before concluding "no data" —
+    // returning null here stomps the header meter to '--' on every
+    // usage batch.
+    for (const related of relatedSessionIdsForSession(sid)) {
+      if (related !== sid && sessionUsageById.has(related)) {
+        return sessionUsageById.get(related);
+      }
+    }
+    if (sessionUsageById.size > 0) return null;
+  }
   return latestGlobalUsage;
 }
 
@@ -63513,6 +63545,21 @@ function renderNewSessionAgentControls(options = {}) {
   if (!hasExternalAgent || options.replaceCommand) {
     commandInput.value = '';
   }
+  const claudeModelInp = document.getElementById('new-session-claude-model');
+  const claudeModeSel = document.getElementById('new-session-claude-permission-mode');
+  if (claudeModelInp) {
+    const appliesToClaude = effectiveAgent === 'claude-code';
+    claudeModelInp.disabled = !appliesToClaude;
+    if (!appliesToClaude) claudeModelInp.value = '';
+    claudeModelInp.placeholder = appliesToClaude
+      ? 'e.g. haiku (empty = global setting)'
+      : 'Applies to Claude Code sessions';
+  }
+  if (claudeModeSel) {
+    const appliesToClaude = effectiveAgent === 'claude-code';
+    claudeModeSel.disabled = !appliesToClaude;
+    if (!appliesToClaude) claudeModeSel.value = '';
+  }
   if (managedContextSel) {
     const appliesToCodex = effectiveAgent === 'codex';
     managedContextSel.disabled = !appliesToCodex;
@@ -63776,6 +63823,12 @@ async function startNewSession() {
     msg.agent = selectedAgent;
     const agentCommand = document.getElementById('new-session-agent-command')?.value.trim() || '';
     if (agentCommand) msg.agent_command = agentCommand;
+  }
+  if (effectiveNewSessionAgentId() === 'claude-code') {
+    const model = document.getElementById('new-session-claude-model')?.value.trim() || '';
+    if (model) msg.claude_model = model;
+    const mode = document.getElementById('new-session-claude-permission-mode')?.value || '';
+    if (mode) msg.claude_permission_mode = mode;
   }
   if (effectiveNewSessionAgentId() === 'codex') {
     if (newSessionCodexLaunchDefaultsLoaded) {
