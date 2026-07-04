@@ -90,6 +90,24 @@ impl WebRtcConfig {
     }
 }
 
+/// `[experimental]` in intendant.toml: vaulted features, all off by
+/// default. A vaulted feature's code stays in the tree and runnable so it
+/// can be picked back up, but production behavior must not depend on it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExperimentalConfig {
+    /// CU-first routing (vaulted 2026-07-04): intercept every dispatched
+    /// task with a fast vision model that either completes it on the
+    /// display or escalates to the main agent. Vaulted because the extra
+    /// hop adds latency to every task, and under subscription-based
+    /// external agents (Codex, Claude Code) it drags in an API-key model
+    /// the deployment otherwise doesn't need. Frame-grounded dashboard
+    /// dispatches (the user points at a display and issues a task) are
+    /// NOT behind this flag — they are an explicit CU request, and the
+    /// CU task path is the only machinery that can act on frames.
+    #[serde(default)]
+    pub cu_first_routing: bool,
+}
+
 /// Computer use configuration: provider/model overrides for tasks that involve
 /// visual grounding (reference frames). Configured via `[computer_use]` in
 /// intendant.toml or `CU_PROVIDER`/`CU_MODEL` env vars.
@@ -490,6 +508,10 @@ pub struct ProjectConfig {
     /// Disabled by default; see [`ConnectConfig`].
     #[serde(default)]
     pub connect: ConnectConfig,
+    /// `[experimental]` section — vaulted features that stay runnable
+    /// but must not shape production behavior. See [`ExperimentalConfig`].
+    #[serde(default)]
+    pub experimental: ExperimentalConfig,
     /// `[server]` section in intendant.toml — daemon-level settings
     /// for what this Intendant advertises to peers. See [`ServerConfig`].
     #[serde(default)]

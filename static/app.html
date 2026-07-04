@@ -13413,10 +13413,16 @@ body.display-fullscreen-open {
                 <h3 class="ui-section-title" id="settings-cu-heading">Computer Use</h3>
                 <div class="ui-section-sub">The model and display backend that drive screen control.</div>
               </div>
+              <!-- CU-first routing is vaulted ([experimental] cu_first_routing
+                   in intendant.toml); the separate provider/model selection
+                   only applies when it is on, so the rows stay hidden
+                   otherwise. Elements remain in the DOM — Station and the
+                   settings save path read them either way. -->
+              <div id="cu-routing-rows" style="display:none">
               <div class="settings-row">
                 <label>Provider</label>
                 <select id="set-cu-provider">
-                  <option value="">Auto (gemini-3-flash-preview)</option>
+                  <option value="">Auto</option>
                   <option value="gemini">Gemini</option>
                   <option value="openai">OpenAI</option>
                   <option value="anthropic">Anthropic</option>
@@ -13441,6 +13447,7 @@ body.display-fullscreen-open {
                     <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
                   </optgroup>
                 </select>
+              </div>
               </div>
               <div class="settings-row">
                 <label>Backend</label>
@@ -59284,6 +59291,9 @@ async function loadSettings() {
     document.getElementById('set-cu-provider').value = d.cu_provider || '';
     document.getElementById('set-cu-model').value = d.cu_model || '';
     document.getElementById('set-cu-backend').value = d.cu_backend || 'auto';
+    // Separate CU provider/model selection only means something while the
+    // vaulted CU-first routing is enabled (file-only experimental flag).
+    document.getElementById('cu-routing-rows').style.display = d.cu_first_routing ? '' : 'none';
     document.getElementById('set-presence-enabled').checked = d.presence_enabled;
     document.getElementById('set-presence-provider').value = d.presence_provider || '';
     document.getElementById('set-presence-model').value = d.presence_model || '';

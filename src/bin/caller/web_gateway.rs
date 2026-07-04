@@ -3662,7 +3662,7 @@ fn session_agent_output_response_for_ids(
 ) -> String {
     let source = crate::session_names::normalize_source(source);
     if source == "intendant" {
-        let Some(session_dir) = resolve_session_dir_from_home(home, session_id) else {
+        let Some(session_dir) = resolve_bare_session_dir_from_home(home, session_id) else {
             return upload_error_response("404 Not Found", "session not found");
         };
         return current_agent_output_response_for_ids(ids, &session_dir);
@@ -3690,7 +3690,13 @@ pub(crate) fn session_agent_output_post_response(
     }
 }
 
-fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+/// The PASTE-FRIENDLY policy, used by replay only: accepts a bare session
+/// directory name (like everything else) or a full pasted log-dir path,
+/// which must canonicalize under `~/.intendant/logs` (anchored by
+/// `session_names::intendant_session_dir_from_slash_path`). Every other
+/// dashboard endpoint holds the bare-id line — see
+/// `session_lookup_id_is_safe` for the policy split.
+fn intendant_session_dir_from_id_or_path(home: &Path, session_id: &str) -> Option<PathBuf> {
     if crate::session_names::session_id_looks_like_path(session_id) {
         return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
     }
@@ -4076,7 +4082,7 @@ fn resume_session_activity_replay_from_home(
 
     let source_norm = source.trim().to_lowercase();
     if source_norm == "intendant" {
-        let log_dir = intendant_session_dir_from_home(home, session_id)?;
+        let log_dir = intendant_session_dir_from_id_or_path(home, session_id)?;
         return session_log_replay_payload_from_dir_with_limit(&log_dir, Some(limit))
             .map(|(payload, _)| payload);
     }
@@ -4085,7 +4091,7 @@ fn resume_session_activity_replay_from_home(
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .unwrap_or(session_id);
-    if let Some(log_dir) = intendant_session_dir_from_home(home, session_id) {
+    if let Some(log_dir) = intendant_session_dir_from_id_or_path(home, session_id) {
         if let Some((payload, external_id)) =
             session_log_replay_payload_from_dir_with_limit(&log_dir, Some(limit))
         {
@@ -4841,10 +4847,12 @@ mod host_header_tests {
     }
 }
 
-/// List session directories from `~/.intendant/logs/`, returning JSON metadata
-/// for each session (newest first, capped at 100).
-/// Return session detail: replayed log entries + metadata for a single session.
-/// Resolve a session directory by exact ID or prefix match.
+/// The BARE-ID policy: dashboard session APIs take a plain directory name
+/// (or id prefix) — anything path-shaped is invalid input, full stop.
+/// The one deliberate exception is replay's paste-friendly resolver,
+/// `intendant_session_dir_from_id_or_path`, which additionally accepts a
+/// full log-dir path anchored under `~/.intendant/logs`. Pick one policy
+/// per endpoint on purpose; never mix them in one lookup.
 pub(crate) fn session_lookup_id_is_safe(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id.trim() == session_id
@@ -4854,7 +4862,10 @@ pub(crate) fn session_lookup_id_is_safe(session_id: &str) -> bool {
         && !session_id.contains('\\')
 }
 
-fn resolve_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+/// Resolve a session directory under `~/.intendant/logs` from a bare id:
+/// exact directory, then id-prefix match, then the listed-external-row
+/// fallback. Enforces the bare-id policy (`session_lookup_id_is_safe`).
+fn resolve_bare_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
     if !session_lookup_id_is_safe(session_id) {
         return None;
     }
@@ -4905,7 +4916,7 @@ fn resolve_session_dir_from_listed_external_row(home: &Path, session_id: &str) -
 }
 
 pub(crate) fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
-    resolve_session_dir_from_home(&crate::platform::home_dir(), session_id)
+    resolve_bare_session_dir_from_home(&crate::platform::home_dir(), session_id)
 }
 
 fn deleted_external_sessions_path(home: &Path) -> PathBuf {
@@ -5241,7 +5252,7 @@ fn get_session_detail_from_home_with_page(
     limit: Option<usize>,
     before: Option<usize>,
 ) -> String {
-    let session_dir = match resolve_session_dir_from_home(home, session_id) {
+    let session_dir = match resolve_bare_session_dir_from_home(home, session_id) {
         Some(d) => d,
         None => return serde_json::json!({"error": "session not found"}).to_string(),
     };
@@ -5371,7 +5382,7 @@ fn context_snapshot_candidate_log_dirs(
         }
     };
 
-    if let Some(dir) = resolve_session_dir_from_home(home, session_id) {
+    if let Some(dir) = resolve_bare_session_dir_from_home(home, session_id) {
         push(&mut dirs, &mut seen, dir);
     }
     let source = crate::session_names::normalize_source(source);
@@ -5830,7 +5841,7 @@ fn session_log_search_file_path(
     }
 
     match source {
-        "intendant" => Some(resolve_session_dir_from_home(home, session_id)?.join("session.jsonl")),
+        "intendant" => Some(resolve_bare_session_dir_from_home(home, session_id)?.join("session.jsonl")),
         "codex" => find_codex_session_file(home, session_id),
         "claude-code" => find_claude_session_file(home, session_id),
         "gemini" => find_gemini_session_file(home, session_id),
@@ -17382,6 +17393,11 @@ pub struct SettingsPayload {
     pub cu_provider: Option<String>,
     pub cu_model: Option<String>,
     pub cu_backend: String,
+    /// Read-only: `[experimental] cu_first_routing` from intendant.toml.
+    /// The dashboard shows the CU provider/model rows only when the
+    /// vaulted routing is enabled; the flag itself is file-only.
+    #[serde(default)]
+    pub cu_first_routing: bool,
     // Presence
     pub presence_enabled: bool,
     pub presence_provider: Option<String>,
@@ -17513,6 +17529,7 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         cu_provider: config.computer_use.provider.clone(),
         cu_model: config.computer_use.model.clone(),
         cu_backend: config.computer_use.backend.clone(),
+        cu_first_routing: config.experimental.cu_first_routing,
         presence_enabled: config.presence.enabled,
         presence_provider: config.presence.provider.clone(),
         presence_model: config.presence.model.clone(),
@@ -22052,9 +22069,9 @@ pub fn spawn_web_gateway(
                     // origins (and the write-side gate below enforces the same
                     // list on the actual requests, so a non-preflighted
                     // cross-site POST is refused too).
-                    if request_line.starts_with("OPTIONS") {
+                    if req_method == "OPTIONS" {
                         use tokio::io::AsyncWriteExt;
-                        let (_, opt_path, _) = parse_request_target(request_line);
+                        let opt_path = req_path;
                         let response = if (opt_path.starts_with("/api/")
                             && !is_fleet_cors_access_path(opt_path)
                             && !is_public_peer_access_request_path(request_line))
@@ -23466,7 +23483,9 @@ pub fn spawn_web_gateway(
                             ),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET" && req_path == "/api/session/current/changes" {
+                    } else if req_method == "GET"
+                        && path_is_or_under(req_path, "/api/session/current/changes")
+                    {
                         // File change tracking endpoints:
                         //   GET /api/session/current/changes        — list all changed files
                         //   GET /api/session/current/changes/{path} — unified diff for one file
@@ -24070,7 +24089,7 @@ pub fn spawn_web_gateway(
                         let segments: Vec<&str> =
                             subpath.split('/').filter(|s| !s.is_empty()).collect();
                         let (status, body) =
-                            if segments.is_empty() && request_line.starts_with("POST") {
+                            if segments.is_empty() && req_method == "POST" {
                                 match read_request_body_capped(
                                     &mut stream,
                                     &header_text,
@@ -24089,7 +24108,7 @@ pub fn spawn_web_gateway(
                                     ),
                                     Err((status, body)) => (status, body),
                                 }
-                            } else if segments.len() == 1 && request_line.starts_with("GET") {
+                            } else if segments.len() == 1 && req_method == "GET" {
                                 peer_access_request_status(segments[0])
                             } else {
                                 (
@@ -24426,17 +24445,17 @@ pub fn spawn_web_gateway(
                             subpath.split('/').filter(|s| !s.is_empty()).collect();
 
                         let (status, body) = if segments == ["pairing", "invite"]
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_invite(&body_text)
                         } else if segments == ["pairing", "request-access"]
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_request_access(&body_text).await
                         } else if segments == ["pairing", "request-access", "poll"]
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_request_access_poll(
@@ -24446,22 +24465,22 @@ pub fn spawn_web_gateway(
                             )
                             .await
                         } else if segments == ["pairing", "requests"]
-                            && request_line.starts_with("GET")
+                            && req_method == "GET"
                         {
                             peers_pairing_requests_list()
                         } else if segments == ["pairing", "identities"]
-                            && request_line.starts_with("GET")
+                            && req_method == "GET"
                         {
                             peers_pairing_identities_list()
                         } else if segments == ["pairing", "identities", "revoke"]
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_identity_revoke(&body_text)
                         } else if segments.len() == 4
                             && segments[0] == "pairing"
                             && segments[1] == "requests"
-                            && request_line.starts_with("POST")
+                            && req_method == "POST"
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_request_decision(segments[2], segments[3], &body_text)
@@ -24475,18 +24494,18 @@ pub fn spawn_web_gateway(
                                     .to_string(),
                                 ),
                                 Some(registry)
-                                    if segments.is_empty() && request_line.starts_with("GET") =>
+                                    if segments.is_empty() && req_method == "GET" =>
                                 {
                                     (200, peers_list_response_body(registry))
                                 }
                                 Some(registry)
                                     if segments.is_empty()
-                                        && (request_line.starts_with("POST")
-                                            || request_line.starts_with("DELETE")) =>
+                                        && (req_method == "POST"
+                                            || req_method == "DELETE") =>
                                 {
                                     let body_text =
                                         read_request_body(&mut stream, &header_text).await;
-                                    if request_line.starts_with("POST") {
+                                    if req_method == "POST" {
                                         peers_add(registry, project_root.as_deref(), &body_text)
                                             .await
                                     } else {
@@ -24495,7 +24514,7 @@ pub fn spawn_web_gateway(
                                 }
                                 Some(registry)
                                     if segments == ["eligible"]
-                                        && request_line.starts_with("GET") =>
+                                        && req_method == "GET" =>
                                 {
                                     // GET /api/peers/eligible?capability=display
                                     // — list peers that satisfy all listed
@@ -24509,7 +24528,7 @@ pub fn spawn_web_gateway(
                                 }
                                 Some(registry)
                                     if segments == ["pairing", "join"]
-                                        && request_line.starts_with("POST") =>
+                                        && req_method == "POST" =>
                                 {
                                     let body_text =
                                         read_request_body(&mut stream, &header_text).await;
@@ -24521,7 +24540,7 @@ pub fn spawn_web_gateway(
                                     .await
                                 }
                                 Some(registry)
-                                    if segments.len() == 2 && request_line.starts_with("POST") =>
+                                    if segments.len() == 2 && req_method == "POST" =>
                                 {
                                     let id = url_path_decode(segments[0]);
                                     let op = segments[1];
@@ -24614,7 +24633,7 @@ pub fn spawn_web_gateway(
                                 })
                                 .to_string(),
                             ),
-                            Some(_) if !request_line.starts_with("POST") => (
+                            Some(_) if req_method != "POST" => (
                                 405,
                                 serde_json::json!({
                                     "error": "method not allowed"
@@ -29252,33 +29271,37 @@ fn dashboard_http_operation(
         _ => {}
     }
 
-    if req_path.starts_with("/api/managed-context/") {
+    // Boundary rule matches dispatch: exact path or a real `/` segment
+    // under it — a look-alike longer path (`/api/sessionsfoo`,
+    // `/api/worktrees/inspect-old`) is not a route there and must not be
+    // classified as one here.
+    if path_is_or_under(req_path, "/api/managed-context") {
         return Some(PeerOperation::SessionInspect);
     }
-    if req_path.starts_with("/api/session/current/") {
+    if path_is_or_under(req_path, "/api/session/current") {
         return Some(PeerOperation::SessionManage);
     }
-    if req_path.starts_with("/api/session/") {
+    if path_is_or_under(req_path, "/api/session") {
         return match req_method {
             "GET" => Some(PeerOperation::SessionInspect),
             "POST" | "DELETE" => Some(PeerOperation::SessionManage),
             _ => None,
         };
     }
-    if req_path.starts_with("/api/worktrees/inspect") {
+    // Worktree and session-list routes are exact in dispatch.
+    if req_path == "/api/worktrees/inspect" {
         return Some(PeerOperation::SessionInspect);
     }
-    if req_path.starts_with("/api/worktrees/scan") || req_path.starts_with("/api/worktrees/remove")
-    {
+    if req_path == "/api/worktrees/scan" || req_path == "/api/worktrees/remove" {
         return Some(PeerOperation::SessionManage);
     }
-    if req_path.starts_with("/api/worktrees") {
+    if req_path == "/api/worktrees" {
         return Some(PeerOperation::SessionInspect);
     }
-    if req_path.starts_with("/api/sessions") {
+    if req_path == "/api/sessions" {
         return Some(PeerOperation::SessionInspect);
     }
-    if req_path.starts_with("/api/peers") {
+    if path_is_or_under(req_path, "/api/peers") {
         return crate::peer::access_policy::federation_http_operation(req_method, req_path);
     }
 
@@ -36080,7 +36103,7 @@ mod tests {
             "",
         ] {
             assert!(
-                intendant_session_dir_from_home(home.path(), id).is_none(),
+                intendant_session_dir_from_id_or_path(home.path(), id).is_none(),
                 "path-shaped session id {id:?} must be refused"
             );
         }
@@ -38051,7 +38074,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            resolve_session_dir_from_home(home.path(), backend_id).as_deref(),
+            resolve_bare_session_dir_from_home(home.path(), backend_id).as_deref(),
             Some(wrapper_dir.as_path())
         );
     }
@@ -38071,14 +38094,14 @@ mod tests {
             " safe",
         ] {
             assert!(
-                resolve_session_dir_from_home(home.path(), session_id).is_none(),
+                resolve_bare_session_dir_from_home(home.path(), session_id).is_none(),
                 "unsafe session id resolved: {session_id:?}"
             );
         }
 
         let expected = home.path().join(".intendant/logs/safe-session");
         assert_eq!(
-            resolve_session_dir_from_home(home.path(), "safe").as_deref(),
+            resolve_bare_session_dir_from_home(home.path(), "safe").as_deref(),
             Some(expected.as_path())
         );
     }
@@ -41118,6 +41141,27 @@ mod tests {
         assert_eq!(dashboard_http_operation("POST", "/api/fs/writeable"), None);
         assert_eq!(dashboard_http_operation("POST", "/api/coordinator/route"), None);
         assert_eq!(dashboard_http_operation("GET", "/config"), None);
+        // The prefix families use the same boundary rule as dispatch:
+        // exact or a real `/` segment — dispatch's look-alike non-routes
+        // must be non-routes for the classifier too.
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/sessions"),
+            Some(PeerOperation::SessionInspect)
+        );
+        assert_eq!(dashboard_http_operation("GET", "/api/sessionsfoo"), None);
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/worktrees/inspect"),
+            Some(PeerOperation::SessionInspect)
+        );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/worktrees/inspect-old"),
+            None
+        );
+        assert_eq!(dashboard_http_operation("GET", "/api/peersfoo"), None);
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/session/current/changes/src/main.rs"),
+            Some(PeerOperation::SessionManage)
+        );
     }
 
     #[test]
@@ -42183,6 +42227,20 @@ mod tests {
             resp.contains("Content-Type: text/html"),
             "look-alike path must fall through, got: {}",
             &resp.chars().take(120).collect::<String>()
+        );
+
+        // Per-file diff subpaths ARE the route (regression: the parsed-path
+        // refactor briefly matched only the exact list endpoint, dropping
+        // /api/session/current/changes/{path}).
+        let resp = http_request(
+            port,
+            "GET /api/session/current/changes/src/main.rs HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(
+            !resp.contains("Content-Type: text/html"),
+            "per-file changes subpath must hit the changes handler, got: {}",
+            &resp.chars().take(200).collect::<String>()
         );
 
         handle.abort();

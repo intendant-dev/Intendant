@@ -3168,6 +3168,14 @@ pub fn select_provider_with_overrides(
 /// Select a provider for computer-use tasks (tasks with reference frames).
 ///
 /// Priority: explicit config > CU_PROVIDER/CU_MODEL env > default select_provider.
+/// Select the dedicated computer-use provider/model.
+///
+/// Reached from two places: the all-tasks CU-first interception, which is
+/// VAULTED behind `[experimental] cu_first_routing` (off by default), and
+/// the frame-grounded dashboard dispatch (explicit CU request — always
+/// available). Priority: `[computer_use]` config > `CU_PROVIDER`/`CU_MODEL`
+/// env > auto-detect by available key (OpenAI, Anthropic, then Gemini —
+/// the Gemini CU arm is kept runnable but unmaintained).
 pub fn select_cu_provider(
     cu_config: &crate::project::ComputerUseConfig,
 ) -> Result<Box<dyn ChatProvider>, CallerError> {
@@ -3238,19 +3246,11 @@ pub fn select_cu_provider(
             other
         ))),
         None => {
-            // No CU-specific override — auto-detect best CU provider with CU enabled.
-            // Default to gemini-3-flash-preview (fast, cheap CU model).
-            if let Some(key) = gemini_key {
-                let model = model_str.unwrap_or_else(|| "gemini-3-flash-preview".to_string());
-                let display = crate::vision::display_config_for_provider("gemini");
-                let ctx = resolve_context_window(&model);
-                let max_out = resolve_max_output_tokens(&model);
-                let mut p =
-                    GeminiProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
-                p.cu_enabled = true;
-                p.cu_display = Some((display.width, display.height));
-                Ok(Box::new(p))
-            } else if let Some(key) = openai_key {
+            // No CU-specific override — auto-detect a CU-capable provider.
+            // Gemini goes LAST: its CU arm is de-facto unmaintained (kept
+            // runnable, not preferred), so keyed deployments land on the
+            // maintained OpenAI/Anthropic paths first.
+            if let Some(key) = openai_key {
                 let model = model_str.unwrap_or_else(|| "gpt-5.4-mini".to_string());
                 let display = crate::vision::display_config_for_provider("openai");
                 let ctx = resolve_context_window(&model);
@@ -3270,9 +3270,19 @@ pub fn select_cu_provider(
                 p.cu_enabled = true;
                 p.cu_display = Some((display.width, display.height));
                 Ok(Box::new(p))
+            } else if let Some(key) = gemini_key {
+                let model = model_str.unwrap_or_else(|| "gemini-3-flash-preview".to_string());
+                let display = crate::vision::display_config_for_provider("gemini");
+                let ctx = resolve_context_window(&model);
+                let max_out = resolve_max_output_tokens(&model);
+                let mut p =
+                    GeminiProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
+                p.cu_enabled = true;
+                p.cu_display = Some((display.width, display.height));
+                Ok(Box::new(p))
             } else {
                 Err(CallerError::Config(
-                    "No API key found for CU provider. Set GEMINI_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY.".into(),
+                    "No API key found for CU provider. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY.".into(),
                 ))
             }
         }

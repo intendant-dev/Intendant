@@ -121,15 +121,23 @@ can produce screenshots while leaving keyboard/mouse injection unavailable. See
 
 ### CU-First Routing
 
-> **Status note:** CU-first routing exists and is wired as described below,
-> but it has not been validated to perform well with current models and the
-> current runtime — treat it as experimental. The fast paths and observation
-> layer above are designed for the heavy agents (native, Codex, Claude Code)
-> as primary consumers and do not depend on this router.
+> **Status note (vaulted 2026-07-04):** the all-tasks CU-first interception —
+> where every non-direct task in the agent loop is first offered to a fast CU
+> model (`try_cu_first` in `main.rs`) — is **off by default**, behind
+> `[experimental] cu_first_routing = true`. In practice it added a model hop
+> (latency) to every task and, under subscription-based external agents
+> (Codex, Claude Code), reintroduced an API-key model the deployment
+> otherwise didn't need. The code stays runnable for a future pickup. What
+> remains always-on is the *frame-grounded* dispatch described below: when
+> the user issues a task while pointing at a display, that is an explicit
+> computer-use request, and the CU task path is the only machinery that can
+> act on the referenced frames. The fast paths and observation layer above
+> are designed for the heavy agents (native, Codex, Claude Code) as primary
+> consumers and do not depend on either router.
 
-Display-oriented work is routed to a fast CU model first, with escalation to the
-heavy agent for anything that turns out to need code changes. The routing
-decision lives in the session supervisor (`session_supervisor.rs`,
+Frame-grounded work goes to a fast CU model, with escalation to the heavy
+agent for anything that turns out to need code changes. The routing decision
+lives in the session supervisor (`session_supervisor.rs`,
 `start_new_session` → `spawn_cu_task`):
 
 ```
