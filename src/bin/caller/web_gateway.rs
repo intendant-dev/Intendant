@@ -3650,7 +3650,7 @@ pub(crate) fn session_agent_output_post_response(
 }
 
 fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
-    if session_id.contains('/') {
+    if crate::session_names::session_id_looks_like_path(session_id) {
         return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
     }
 

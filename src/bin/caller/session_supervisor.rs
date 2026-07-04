@@ -4115,8 +4115,12 @@ fn emit_follow_up_status(
 }
 
 fn external_resume_log_dir(session_id: &str, force_new: bool) -> PathBuf {
+    external_resume_log_dir_in_home(&crate::platform::home_dir(), session_id, force_new)
+}
+
+fn external_resume_log_dir_in_home(home: &Path, session_id: &str, force_new: bool) -> PathBuf {
     if !force_new {
-        if let Some(dir) = session_log::SessionLog::find_session_by_id(session_id) {
+        if let Some(dir) = session_log::SessionLog::find_session_by_id_in_home(home, session_id) {
             return dir;
         }
     }
@@ -4267,19 +4271,16 @@ fn session_log_dir_for_id_in_home(home: &Path, session_id: &str) -> Option<PathB
     if session_id.is_empty() {
         return None;
     }
+    // Path-form ids resolve through the anchored helper (inside the logs
+    // root only), and BEFORE the direct join below — joining an absolute
+    // path would silently replace the logs dir as the base.
+    if crate::session_names::session_id_looks_like_path(session_id) {
+        return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
+    }
     let logs_dir = home.join(".intendant").join("logs");
     let direct = logs_dir.join(session_id);
     if direct.is_dir() && direct.join("session_meta.json").exists() {
         return Some(direct);
-    }
-
-    let path = Path::new(session_id);
-    let looks_like_path = path.is_absolute()
-        || session_id.contains('/')
-        || session_id.contains(std::path::MAIN_SEPARATOR);
-    if looks_like_path {
-        let dir = PathBuf::from(session_id);
-        return dir.is_dir().then_some(dir);
     }
 
     let entries = std::fs::read_dir(logs_dir).ok()?;
@@ -4894,13 +4895,20 @@ mod tests {
 
     #[test]
     fn external_resume_log_dir_reuses_requested_wrapper_log() {
-        let dir = tempfile::tempdir().unwrap();
-        let wrapper_dir = dir.path().join("wrapper-session");
+        let home = tempfile::tempdir().unwrap();
+        let wrapper_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-session");
         let log = session_log::SessionLog::open(wrapper_dir.clone()).unwrap();
-        log.write_meta(Some(dir.path()), Some("previous external task"));
+        log.write_meta(Some(home.path()), Some("previous external task"));
 
-        let resolved = external_resume_log_dir(wrapper_dir.to_str().unwrap(), false);
-        assert_eq!(resolved, wrapper_dir);
+        // Path-form resume ids resolve only inside the logs root (the
+        // resolver canonicalizes, so compare canonicalized).
+        let resolved =
+            external_resume_log_dir_in_home(home.path(), wrapper_dir.to_str().unwrap(), false);
+        assert_eq!(resolved, std::fs::canonicalize(&wrapper_dir).unwrap());
     }
 
     #[test]
