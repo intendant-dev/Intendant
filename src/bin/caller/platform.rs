@@ -1067,6 +1067,14 @@ pub fn unix_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// Non-Unix twin so cross-platform callers compile (the launchd service
+/// backend that consumes this is only ever *detected* on macOS, but its
+/// match arm exists everywhere).
+#[cfg(not(unix))]
+pub fn unix_uid() -> u32 {
+    0
+}
+
 /// Prepare this process to run as the unattended service supervisor
 /// (`intendant service run`): ignore SIGHUP so the terminal or SSH
 /// session that spawned it can go away, and become our own process-group
