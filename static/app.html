@@ -14349,8 +14349,10 @@ function applyUnfueledEmptyState(unfueled) {
   applyUnfueledExternalAgentNote(empty);
 }
 
-/* The nudge's counterweight: name the external agents that still work.
-   Only rendered while the unfueled state is showing. */
+/* The nudge's counterweight: name the external agents that still work,
+   by actual auth posture — a leased or locally-signed-in backend needs
+   no fuel, a signed-out one needs its own login or an oauth lease from
+   the vault. Only rendered while the unfueled state is showing. */
 function applyUnfueledExternalAgentNote(empty) {
   const installed = installedExternalAgents();
   let note = document.getElementById('log-empty-external-agents');
@@ -14364,11 +14366,20 @@ function applyUnfueledExternalAgentNote(empty) {
     note.className = 'ui-empty-hint';
     empty.appendChild(note);
   }
-  const names = installed.map(agent => agent.label || agent.id).join(' and ');
-  const plural = installed.length > 1;
-  note.textContent = `${names} ${plural ? 'are' : 'is'} installed and `
-    + `${plural ? 'run on their own accounts' : 'runs on its own account'}`
-    + ' — external-agent sessions work without fuel.';
+  const parts = installed.map(agent => {
+    const name = agent.label || agent.id;
+    if (agent.leased) {
+      return `${name} is fueled with a subscription lease and ready`;
+    }
+    if (agent.local_login === true) {
+      return `${name} is signed in on the daemon and needs no fuel`;
+    }
+    if (agent.local_login === false) {
+      return `${name} is installed but signed out — sign it in on the daemon, or lease its subscription from your vault`;
+    }
+    return `${name} is installed and runs on its own login — or a subscription lease from your vault`;
+  });
+  note.textContent = parts.join('. ') + '.';
 }
 // Probe once the transport can answer; in connect mode the data channel
 // (possibly via TURN) can take a while, so keep retrying for ~40s rather
@@ -15063,10 +15074,12 @@ async function accessFleetRefreshProvenance() {
    wrapped, one envelope per enrolled unlocker: each account passkey (via
    the WebAuthn PRF secret, HKDF salt 'intendant-vault-v1' — a domain
    deliberately separate from fleet-sync) and a mandatory BIP39 recovery
-   phrase. Losing a passkey loses one envelope, not the vault. The store
-   can withhold or serve a stale revision — detectable via the local
-   high-water mark — and nothing else. Unsealing happens only here, in
-   memory, behind a passkey gesture or the phrase. */
+   phrase. Losing a passkey loses one envelope, not the vault. Every blob
+   carries an HMAC under a key derived from the master key (see "Vault
+   blob authentication" below), so the store cannot tamper, splice, or
+   relabel. What remains to the store: withholding, or serving a stale
+   revision — detectable via the local high-water mark. Unsealing happens
+   only here, in memory, behind a passkey gesture or the phrase. */
 
 const VAULT_LOCAL_KEY = 'intendant_vault_local_v1';
 const VAULT_HKDF_SALT = 'intendant-vault-v1';
@@ -15089,6 +15102,7 @@ const vaultState = {
   settings: {},        // decrypted vault-wide settings while unlocked
   kBytes: null,        // raw master key while unlocked (zeroed on lock)
   matchedEnvelopeId: null, // which prf envelope this session's passkey opened
+  macSeen: false,      // downgrade ratchet: an authenticated blob has been seen
   rollbackWarning: '',
   lastError: '',
   migratedVoiceKeys: false,
@@ -15253,6 +15267,78 @@ function vaultRandomId(prefix) {
   return `${prefix}_${dashboardBytesToBase64Url(crypto.getRandomValues(new Uint8Array(9)))}`;
 }
 
+/* ── Vault blob authentication ──
+   The body AAD binds the revision, but nothing bound the ENVELOPE SET to
+   the blob — a malicious store could splice a stale envelope set (say,
+   one still containing a revoked passkey) onto the newest body. The MAC
+   closes that: HMAC-SHA-256 under a key derived from the vault master
+   key over the whole blob. The store never holds the master key, so it
+   can neither mint nor relabel a MAC'd blob; every unlocker can verify.
+   Canonical JSON (sorted keys) because the store's serializer is free to
+   reorder object keys in transit. */
+
+function vaultCanonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(vaultCanonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map(k => `${JSON.stringify(k)}:${vaultCanonicalJson(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function vaultMacKey(kBytes) {
+  const hkdf = await crypto.subtle.importKey('raw', kBytes, 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: new TextEncoder().encode(VAULT_HKDF_SALT),
+      info: new TextEncoder().encode('vault-mac-v1'),
+    },
+    hkdf,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign', 'verify']
+  );
+}
+
+function vaultMacPayload(blob) {
+  return new TextEncoder().encode(
+    `intendant-vault-mac-v1\n${Number(blob.v) || 0}\n${String(blob.kind || '')}\n` +
+    `${Number(blob.revision) || 0}\n${vaultCanonicalJson(blob.envelopes || [])}\n` +
+    `${vaultCanonicalJson(blob.body || {})}`
+  );
+}
+
+async function vaultComputeMac(kBytes, blob) {
+  const key = await vaultMacKey(kBytes);
+  const mac = await crypto.subtle.sign('HMAC', key, vaultMacPayload(blob));
+  return dashboardBytesToBase64Url(new Uint8Array(mac));
+}
+
+async function vaultVerifyMac(kBytes, blob) {
+  const mac = String(blob?.mac || '');
+  if (!mac) return false;
+  try {
+    const key = await vaultMacKey(kBytes);
+    return await crypto.subtle.verify(
+      'HMAC', key, dashboardBase64UrlToBytes(mac), vaultMacPayload(blob)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/* Once this device has seen an authenticated blob, an unauthenticated one
+   is a downgrade attack, not a legacy vault. Ratchet state rides in
+   vaultState and persists through vaultWriteLocal. */
+function vaultMarkMacSeen() {
+  if (!vaultState.macSeen) {
+    vaultState.macSeen = true;
+    vaultWriteLocal();
+  }
+}
+
 /* ── Local cache + hosted sync ── */
 
 function vaultReadLocal() {
@@ -15269,6 +15355,7 @@ function vaultWriteLocal() {
     localStorage.setItem(VAULT_LOCAL_KEY, JSON.stringify({
       revision: vaultState.revision,
       high_water: vaultState.highWater,
+      mac_seen: Boolean(vaultState.macSeen),
       vault: vaultState.blob,
       updated_unix_ms: Date.now(),
     }));
@@ -15314,6 +15401,22 @@ async function vaultAdoptBlob(blob, { fromServer = false } = {}) {
       : '';
   }
   if (revision < vaultState.revision) return;
+  // Authenticate before adopting. Unlocked: verify the MAC outright.
+  // Locked with a MAC: adopt provisionally — unlock verifies before any
+  // use. Either way the downgrade ratchet refuses an unauthenticated
+  // blob once this device has seen an authenticated one.
+  if (blob.mac && vaultState.kBytes) {
+    if (!(await vaultVerifyMac(vaultState.kBytes, blob))) {
+      vaultState.lastError = 'The store returned a vault blob that failed its integrity check — ignoring it.';
+      renderAccessVaultSection();
+      return;
+    }
+    vaultMarkMacSeen();
+  } else if (!blob.mac && vaultState.macSeen) {
+    vaultState.lastError = 'The store served an unauthenticated vault although this device has seen an authenticated one — refusing the downgrade.';
+    renderAccessVaultSection();
+    return;
+  }
   vaultState.blob = blob;
   vaultState.revision = revision;
   vaultState.highWater = Math.max(vaultState.highWater, revision);
@@ -15349,6 +15452,7 @@ async function vaultInitInner() {
     return;
   }
   const local = vaultReadLocal();
+  vaultState.macSeen = Boolean(local?.mac_seen);
   if (local?.vault) {
     vaultState.highWater = Math.max(Number(local.high_water) || 0, Number(local.vault.revision) || 0);
     await vaultAdoptBlob(local.vault);
@@ -15392,6 +15496,22 @@ function vaultLock(notice) {
 }
 
 async function vaultFinishUnlock(kBytes, envelopeId) {
+  // Every unlock funnels through here: authenticate the whole blob before
+  // trusting any of it. A blob without a MAC is legacy — allowed only
+  // until this device has seen an authenticated one, and upgraded in
+  // place right after unlock.
+  if (vaultState.blob?.mac) {
+    if (!(await vaultVerifyMac(kBytes, vaultState.blob))) {
+      vaultState.lastError = 'Vault integrity check failed — the stored blob was tampered with or spliced. Refusing to unlock it.';
+      renderAccessVaultSection();
+      return false;
+    }
+    vaultMarkMacSeen();
+  } else if (vaultState.macSeen) {
+    vaultState.lastError = 'The store served an unauthenticated vault although this device has seen an authenticated one — refusing the downgrade.';
+    renderAccessVaultSection();
+    return false;
+  }
   const body = await vaultDecryptBody(kBytes, vaultState.blob);
   if (!body) {
     vaultState.lastError = 'The key envelope opened but the vault body did not decrypt — the blob may be corrupted.';
@@ -15405,6 +15525,21 @@ async function vaultFinishUnlock(kBytes, envelopeId) {
   vaultState.lastError = '';
   vaultSyncVoiceMirror();
   vaultMigrateVoiceKeys().catch(err => console.warn('[vault] voice key migration failed:', err?.message || err));
+  if (!vaultState.blob?.mac) {
+    // Legacy pre-MAC blob: upgrade it in place now that we hold the
+    // master key. Ride the publish chain (serialized with user edits) but
+    // fail quietly — the next save signs anyway.
+    vaultPublishChain = vaultPublishChain
+      .then(() => vaultPersist())
+      .then(() => {
+        console.info('[vault] legacy blob upgraded with an integrity MAC');
+        return true;
+      })
+      .catch(err => {
+        console.warn('[vault] MAC upgrade deferred (will retry on next save):', err?.message || err);
+        return false;
+      });
+  }
   renderAccessVaultSection();
   return true;
 }
@@ -15516,10 +15651,12 @@ async function vaultCreate(phrase) {
     envelopes,
     body: await vaultEncryptBody(kBytes, { entries: [], settings: {} }, revision),
   };
+  blob.mac = await vaultComputeMac(kBytes, blob);
   await vaultServerPublish(blob);
   vaultState.blob = blob;
   vaultState.revision = revision;
   vaultState.highWater = Math.max(vaultState.highWater, revision);
+  vaultState.macSeen = true;
   vaultWriteLocal();
   await vaultFinishUnlock(kBytes, matched);
 }
@@ -15542,10 +15679,13 @@ async function vaultPersist() {
         revision
       ),
     };
+    // Recompute — the spread carries the previous revision's MAC.
+    blob.mac = await vaultComputeMac(vaultState.kBytes, blob);
     await vaultServerPublish(blob);
     vaultState.blob = blob;
     vaultState.revision = revision;
     vaultState.highWater = Math.max(vaultState.highWater, revision);
+    vaultState.macSeen = true;
     vaultWriteLocal();
   };
   try {
@@ -15554,6 +15694,18 @@ async function vaultPersist() {
     if (!err?.vaultConflict) throw err;
     const server = await vaultServerFetch();
     if (server?.vault) {
+      // Authenticate the refetched blob before merging: adopting a spliced
+      // envelope set here and re-signing it in the retry would launder the
+      // splice into a valid MAC.
+      const remoteAuthentic = server.vault.mac
+        ? await vaultVerifyMac(vaultState.kBytes, server.vault)
+        : !vaultState.macSeen;
+      if (!remoteAuthentic) {
+        vaultState.lastError = 'The conflict refetch returned a vault blob that failed its integrity check — keeping local state.';
+        renderAccessVaultSection();
+        throw err;
+      }
+      if (server.vault.mac) vaultMarkMacSeen();
       const remoteBody = await vaultDecryptBody(vaultState.kBytes, server.vault);
       if (!remoteBody) {
         vaultLock('The vault was re-keyed on another device — unlock it again.');

@@ -1770,7 +1770,7 @@ family (sub-routes elided where the family is uniform):
 | `GET /recordings/*`, `GET /frames/*` | Current-session recording segments and captured frame assets |
 | `GET /api/fs/{stat,list,read}`, `POST /api/fs/mkdir` | Scoped filesystem browsing (fs scope enforced per grant) |
 | `GET/POST /api/settings`, `POST /api/api-keys`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key management |
-| `GET /api/external-agents` | External-agent backend availability (configured command, installed, last used) — drives the fueling nudge and new-session picker |
+| `GET /api/external-agents` | External-agent backend availability (configured command, installed, auth posture: active oauth lease / local login, last used) — drives the fueling nudge and new-session picker |
 | `GET /api/displays`, `POST /api/diagnostics/visual-freshness` | Display inventory; visual-freshness probe marker |
 | `GET /api/access/{overview,iam/state}`, `GET /api/dashboard/targets` | Trust-architecture snapshots (IAM state, fleet targets) |
 | `POST /api/access/...` | Trust mutations: enrollment decide, IAM grant upsert/update, org trust/revoke, org-grant issue/renew/revoke-member, issuer init/delegate/install, revocation-list apply |

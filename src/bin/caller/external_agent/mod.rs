@@ -470,6 +470,38 @@ pub struct BackendAvailability {
     /// Unix seconds of the most recent session this daemon recorded for
     /// the backend — evidence it not only exists but has worked here.
     pub last_used_secs: Option<u64>,
+    /// An active `oauth:<backend>` vault lease: sessions run on the
+    /// leased identity regardless of any on-disk login.
+    pub leased: bool,
+    /// Whether the CLI's own on-disk login artifact exists. `None` when
+    /// the platform stores credentials out of stat's reach (Claude Code
+    /// keeps them in the keychain on macOS), so absence proves nothing.
+    pub local_login: Option<bool>,
+}
+
+fn codex_local_login(home: &Path) -> Option<bool> {
+    codex_local_login_in(std::env::var_os("CODEX_HOME"), home)
+}
+
+/// `CODEX_HOME` injected for testability.
+fn codex_local_login_in(env_codex_home: Option<std::ffi::OsString>, home: &Path) -> Option<bool> {
+    let codex_home = env_codex_home
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    Some(codex_home.join("auth.json").is_file())
+}
+
+fn claude_code_local_login(home: &Path) -> Option<bool> {
+    if home.join(".claude").join(".credentials.json").is_file() {
+        return Some(true);
+    }
+    // On macOS the default store is the keychain, so an absent file
+    // proves nothing; elsewhere the file IS the store.
+    if cfg!(target_os = "macos") {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 /// Probe every supported backend. Stat-based (never executes the CLIs),
@@ -503,11 +535,21 @@ pub fn backend_availability(
                     .map(|record| record.updated_at_secs)
                     .max()
                     .filter(|secs| *secs > 0);
+            let leased = crate::credential_leases::kind_is_active(&format!(
+                "oauth:{}",
+                backend.as_short_str()
+            ));
+            let local_login = match backend {
+                AgentBackend::Codex => codex_local_login(home),
+                AgentBackend::ClaudeCode => claude_code_local_login(home),
+            };
             BackendAvailability {
                 backend,
                 command,
                 installed,
                 last_used_secs,
+                leased,
+                local_login,
             }
         })
         .collect()
@@ -529,6 +571,8 @@ pub fn backend_availability_json(
                     "command": info.command,
                     "installed": info.installed,
                     "last_used_secs": info.last_used_secs,
+                    "leased": info.leased,
+                    "local_login": info.local_login,
                 })
             })
             .collect(),
@@ -1224,6 +1268,38 @@ mod tests {
         assert_eq!(availability[1].backend, AgentBackend::ClaudeCode);
         assert!(!availability[1].installed);
         assert_eq!(availability[1].last_used_secs, None);
+        // A unit-test process holds no vault leases.
+        assert!(!availability[0].leased);
+        assert!(!availability[1].leased);
+    }
+
+    #[test]
+    fn local_login_detection_reads_auth_artifacts() {
+        let home = tempfile::tempdir().unwrap();
+
+        // Empty home: codex is definitively signed out; Claude Code is
+        // unknowable on macOS (keychain) and signed out elsewhere.
+        assert_eq!(codex_local_login_in(None, home.path()), Some(false));
+        if cfg!(target_os = "macos") {
+            assert_eq!(claude_code_local_login(home.path()), None);
+        } else {
+            assert_eq!(claude_code_local_login(home.path()), Some(false));
+        }
+
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(home.path().join(".codex/auth.json"), b"{}").unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(home.path().join(".claude/.credentials.json"), b"{}").unwrap();
+
+        assert_eq!(codex_local_login_in(None, home.path()), Some(true));
+        assert_eq!(claude_code_local_login(home.path()), Some(true));
+
+        // CODEX_HOME redirects the codex probe wholesale.
+        let alt = tempfile::tempdir().unwrap();
+        assert_eq!(
+            codex_local_login_in(Some(alt.path().as_os_str().to_os_string()), home.path()),
+            Some(false)
+        );
     }
 
     #[test]
@@ -1270,6 +1346,11 @@ mod tests {
             assert!(entry.get("installed").is_some_and(serde_json::Value::is_boolean));
             assert!(entry.get("command").is_some_and(serde_json::Value::is_string));
             assert!(entry.get("label").is_some_and(serde_json::Value::is_string));
+            assert!(entry.get("leased").is_some_and(serde_json::Value::is_boolean));
+            assert!(
+                entry.get("local_login").is_some(),
+                "local_login must be present (bool or null)"
+            );
         }
     }
 

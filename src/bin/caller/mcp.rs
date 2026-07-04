@@ -10938,8 +10938,24 @@ impl IntendantServer {
             turn: None,
         });
 
-        let result =
-            live_audio::run_session(&spec, &api_key, &bridge, &log_dir, Some(&self.bus)).await;
+        // Live-call transcription follows the same project opt-in as every
+        // other transcription surface; unreachable config stays fail-closed
+        // (TranscriptionConfig::default() is disabled).
+        let transcription = project_root
+            .clone()
+            .and_then(|root| crate::project::Project::from_root(root).ok())
+            .map(|p| p.config.transcription)
+            .unwrap_or_default();
+
+        let result = live_audio::run_session(
+            &spec,
+            &api_key,
+            &bridge,
+            &log_dir,
+            Some(&self.bus),
+            &transcription,
+        )
+        .await;
 
         drop(bridge);
 

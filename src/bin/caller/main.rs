@@ -25532,9 +25532,15 @@ async fn run_agent_loop(
                             ))
                         });
 
-                        let result =
-                            live_audio::run_session(&spec, &api_key, &bridge, log_dir, Some(bus))
-                                .await;
+                        let result = live_audio::run_session(
+                            &spec,
+                            &api_key,
+                            &bridge,
+                            log_dir,
+                            Some(bus),
+                            &project.config.transcription,
+                        )
+                        .await;
 
                         drop(bridge);
 

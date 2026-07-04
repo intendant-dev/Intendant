@@ -4702,9 +4702,14 @@ async fn orl_fetch(
    blind: the body is ciphertext under the user's vault master key, and
    that key travels only wrapped per enrolled unlocker (passkey PRF /
    recovery phrase) — nothing here can be decrypted or forged
-   server-side. The monotonic revision check only prevents rollback (the
-   ORL `seq` trick); a malicious store can still withhold or serve stale,
-   detectably once any device has seen a newer revision. */
+   server-side. Blobs additionally carry a client-side HMAC keyed to the
+   master key (`mac`); this service cannot verify it (by design), but it
+   enforces the presence ratchet: once an account's stored vault carries
+   a MAC, a MAC-less replacement is refused so a tampering store cannot
+   quietly strip the integrity guarantee. The monotonic revision check
+   only prevents rollback (the ORL `seq` trick); a malicious store can
+   still withhold or serve stale, detectably once any device has seen a
+   newer revision. */
 
 const MAX_VAULT_BLOB_BYTES: usize = 128 * 1024;
 
@@ -4738,6 +4743,17 @@ fn validate_vault_blob(revision: u64, vault: &serde_json::Value) -> Result<(), A
     if !vault.get("body").map(|b| b.is_object()).unwrap_or(false) {
         return Err(ApiError::bad_request("vault blob has no body"));
     }
+    if let Some(mac) = vault.get("mac") {
+        // Blind shape check only — an HMAC-SHA-256 in base64url is 43
+        // chars; the service cannot (and must not be able to) verify it.
+        let plausible = mac
+            .as_str()
+            .map(|s| !s.is_empty() && s.len() <= 88)
+            .unwrap_or(false);
+        if !plausible {
+            return Err(ApiError::bad_request("vault mac is malformed"));
+        }
+    }
     Ok(())
 }
 
@@ -4755,6 +4771,18 @@ fn apply_vault_publish(
 ) -> Result<bool, ApiError> {
     validate_vault_blob(revision, &vault)?;
     if let Some(existing) = store.vault_blobs.iter_mut().find(|b| b.user_id == user_id) {
+        // Downgrade ratchet: this service is blind to the MAC's validity
+        // but not to its presence — once the stored vault is
+        // authenticated, a MAC-less replacement is refused rather than
+        // silently stripping the integrity guarantee clients rely on.
+        if existing.vault.get("mac").is_some() && vault.get("mac").is_none() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "unauthenticated vault refused: the stored vault carries an integrity MAC \
+                 (update this dashboard to one that signs vault blobs)"
+                    .to_string(),
+            ));
+        }
         if revision < existing.revision || (revision == existing.revision && existing.vault != vault)
         {
             return Err(ApiError::new(
@@ -6059,7 +6087,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
         <div class="advanced-block" id="log-block">
           <h3>Transparency log</h3>
           <div class="sub">Every name binding this service hands out (which key a computer had when claimed, handle creations, revocation lists, badges) is committed to an append-only log. Your browser pins the signed tree head and re-verifies consistency on every visit &mdash; rewriting history here is detectable, not just forbidden.</div>
-          <div class="metric-row"><span id="log-pill" class="pill">checking&hellip;</span></div>
+          <div class="metric-row"><span id="log-pill" class="pill">checking&hellip;</span><button id="log-reset-trust" class="ghost hidden" title="Discard the pinned tree head and trust the log's current signing key from now on. Only do this if you expected the operator to rotate the key.">Reset trust</button></div>
         </div>
         <div class="advanced-block" id="push-block">
           <h3>Notifications</h3>
@@ -6412,15 +6440,24 @@ async function logVerifySthSignature(sth) {{
 }}
 
 /* Pin the signed tree head; on every visit verify the log only ever
-   appended since last time. A failed check is loud and sticky. */
+   appended since last time. A failed check is loud and sticky — including a
+   changed log signing key, which would otherwise let the service swap in a
+   fresh log and dodge the consistency proof entirely (trust-on-every-use).
+   Recovering from a legitimate key rotation is an explicit user action. */
 async function transparencyCheck() {{
   const pill = $('log-pill');
+  const resetBtn = $('log-reset-trust');
+  if (resetBtn) resetBtn.classList.add('hidden');
   try {{
     const sth = await api('/api/log/sth');
     if (!(await logVerifySthSignature(sth))) throw new Error('tree head signature invalid');
     let pinned = null;
     try {{ pinned = JSON.parse(localStorage.getItem(LOG_STH_KEY) || 'null'); }} catch {{}}
-    if (pinned && pinned.public_key === sth.public_key && pinned.size > 0) {{
+    if (pinned && pinned.size > 0) {{
+      if (pinned.public_key !== sth.public_key) {{
+        if (resetBtn) resetBtn.classList.remove('hidden');
+        throw new Error('log signing key changed — history can no longer be verified against your pin');
+      }}
       if (sth.size < pinned.size) throw new Error('log shrank — history was rewritten');
       const proof = await api(`/api/log/consistency?old=${{pinned.size}}&new=${{sth.size}}`);
       const asBytes = value => new Uint8Array(b64uToBuf(value));
@@ -6824,6 +6861,10 @@ $('attest-github-btn').addEventListener('click', async () => {{
   }} catch (err) {{ setStatus('attest-status', err.message, 'err'); }}
 }});
 transparencyCheck();
+$('log-reset-trust').addEventListener('click', () => {{
+  localStorage.removeItem(LOG_STH_KEY);
+  transparencyCheck();
+}});
 $('push-enable').addEventListener('click', () => enablePushNotifications().then(renderPushBlock).catch(err => alert('Notifications: ' + err.message)));
 $('push-disable').addEventListener('click', () => disablePushNotifications().then(renderPushBlock).catch(() => renderPushBlock()));
 $('push-test').addEventListener('click', async () => {{
@@ -7253,6 +7294,18 @@ mod tests {
         assert!(html.contains("<h1>Intendant Access</h1>"));
         assert!(html.contains(">Rendezvous and fleet navigation</div>"));
         assert!(html.contains("target daemons enforce local IAM"));
+    }
+
+    #[test]
+    fn transparency_pin_fails_hard_on_log_key_change() {
+        // The documented pin ("rewriting history here is detectable") is only
+        // real if a swapped log signing key is a verification failure, not a
+        // silent re-pin; recovery must be the explicit user reset.
+        let html = connect_ui_html("https://intendant.dev", "Intendant Connect", "sub");
+        assert!(html.contains("pinned.public_key !== sth.public_key"));
+        assert!(html.contains("log signing key changed"));
+        assert!(html.contains(r#"id="log-reset-trust""#));
+        assert!(html.contains("localStorage.removeItem(LOG_STH_KEY)"));
     }
 
     #[test]
@@ -7869,6 +7922,50 @@ mod tests {
         assert!(apply_vault_publish(&mut store, other, 1, vault_blob(1, "c"), 40).unwrap());
         assert_eq!(store.vault_blobs.len(), 2);
         assert_eq!(store.vault_blobs[0].revision, 3);
+    }
+
+    fn vault_blob_with_mac(revision: u64, marker: &str, mac: &str) -> serde_json::Value {
+        let mut blob = vault_blob(revision, marker);
+        blob["mac"] = json!(mac);
+        blob
+    }
+
+    #[test]
+    fn vault_publish_enforces_the_mac_presence_ratchet() {
+        let mut store = Store::default();
+        let user = Uuid::new_v4();
+
+        // Legacy MAC-less vaults are accepted, and upgrading to an
+        // authenticated blob is a normal publish.
+        assert!(apply_vault_publish(&mut store, user, 1, vault_blob(1, "a"), 10).unwrap());
+        assert!(
+            apply_vault_publish(&mut store, user, 2, vault_blob_with_mac(2, "b", "bWFj"), 20)
+                .unwrap()
+        );
+
+        // Once authenticated, a MAC-less replacement is refused even at a
+        // newer revision — the store must not strip the guarantee.
+        let err =
+            apply_vault_publish(&mut store, user, 3, vault_blob(3, "c"), 30).unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(store.vault_blobs[0].revision, 2);
+
+        // Authenticated publishes keep flowing.
+        assert!(
+            apply_vault_publish(&mut store, user, 3, vault_blob_with_mac(3, "d", "bWFj"), 40)
+                .unwrap()
+        );
+
+        // A malformed mac field is rejected outright.
+        let err = apply_vault_publish(
+            &mut store,
+            user,
+            4,
+            vault_blob_with_mac(4, "e", &"x".repeat(89)),
+            50,
+        )
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]

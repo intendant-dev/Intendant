@@ -77,11 +77,22 @@ surviving unlocker recovers `K`, and enrolling a new device is adding an
 envelope (one small re-wrap), not re-encrypting anything. This dissolves
 the "lost passkey = lost vault" objection that parked the vault idea.
 
-**Sync.** The encrypted vault blob syncs through the rendezvous exactly
-like fleet records and the revocation bulletin board: blind, signed by
-the browser identity key, size-capped, with **rollback protection** via a
-signed monotonic revision counter (the ORL `seq` trick). The trust-ledger
-entry is the usual one: a malicious store can withhold or serve a stale
+**Sync.** The encrypted vault blob syncs through the rendezvous blind
+and size-capped, and every blob is **authenticated end-to-end**: the
+revision number is bound into the body ciphertext (AES-GCM AAD), and the
+whole blob — version, revision, envelope set, body — carries an
+HMAC-SHA-256 under a key HKDF-derived from the vault master key
+(`vault-mac-v1`). The store never holds the master key, so it can
+neither mint a MAC nor splice parts of old blobs together (e.g. re-attach
+an envelope set that still contains a revoked passkey); it also enforces
+a presence ratchet — once an account's stored vault carries a MAC, a
+MAC-less replacement is refused — and clients keep the same ratchet
+per-device. (An earlier draft called for browser-identity-key signatures
+here; a store can strip or re-sign those with a key of its own, whereas
+it can never produce a master-key MAC, so the MAC is what shipped.)
+**Rollback protection** is the monotonic revision counter (the ORL `seq`
+trick) plus each device's local high-water mark. The trust-ledger entry
+is the usual one: a malicious store can withhold or serve a stale
 revision — detectably, once any device has seen a newer one — and
 nothing else. Local copies in origin storage keep the vault usable when
 the rendezvous is down.
