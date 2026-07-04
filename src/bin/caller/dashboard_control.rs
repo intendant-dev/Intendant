@@ -121,6 +121,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_diagnostics_visual_freshness",
     "api_key_status",
     "api_api_keys_save",
+    "api_external_agents",
     "api_voice_session",
     "api_project_root",
     "api_displays",
@@ -2196,7 +2197,8 @@ fn dashboard_control_method_operation(
         | "api_dashboard_bootstrap"
         | "api_managed_context_records"
         | "api_managed_context_anchors"
-        | "api_managed_context_fission" => Some(PeerOperation::SessionInspect),
+        | "api_managed_context_fission"
+        | "api_external_agents" => Some(PeerOperation::SessionInspect),
         _ => None,
     }
 }
@@ -2914,6 +2916,7 @@ fn control_frame_response(
                 | "api_diagnostics_visual_freshness"
                 | "api_key_status"
                 | "api_api_keys_save"
+                | "api_external_agents"
                 | "api_voice_session"
                 | "api_project_root"
                 | "api_displays"
@@ -4940,6 +4943,11 @@ async fn control_request_response(
             id,
             crate::web_gateway::api_key_status_response_body(),
             "api key status",
+        ),
+        "api_external_agents" => json_body_response(
+            id,
+            crate::web_gateway::external_agents_response_body(runtime.project_root.as_deref()),
+            "external agents",
         ),
         "api_api_keys_save" => api_api_keys_save_response(id, params.as_ref()).await,
         "api_voice_session" => api_voice_session_response(id, &runtime).await,
