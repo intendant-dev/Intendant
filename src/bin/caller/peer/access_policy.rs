@@ -161,7 +161,7 @@ pub fn normalize_profile(raw: &str) -> Result<String, CallerError> {
     Ok(profile.to_ascii_lowercase())
 }
 
-pub const ALL_OPERATIONS: [PeerOperation; 21] = [
+pub const ALL_OPERATIONS: [PeerOperation; 22] = [
     PeerOperation::PresenceRead,
     PeerOperation::StatsRead,
     PeerOperation::DisplayView,
@@ -173,6 +173,7 @@ pub const ALL_OPERATIONS: [PeerOperation; 21] = [
     PeerOperation::AccessManage,
     PeerOperation::PeerInspect,
     PeerOperation::PeerManage,
+    PeerOperation::PeerUse,
     PeerOperation::SessionInspect,
     PeerOperation::SessionManage,
     PeerOperation::TerminalView,
