@@ -57,6 +57,8 @@ const STATIC_IDENTITY_ASSETS = [
   { urlPath: '/wasm-station/station_web.js', file: path.join('static', 'wasm-station', 'station_web.js'), kind: 'text' },
   { urlPath: '/wasm-station/station_web_bg.wasm', file: path.join('static', 'wasm-station', 'station_web_bg.wasm'), kind: 'binary' },
   { urlPath: '/three.module.min.js', file: path.join('static', 'three.module.min.js'), kind: 'text' },
+  { urlPath: '/codemirror-bundle.js', file: path.join('static', 'codemirror-bundle.js'), kind: 'text' },
+  { urlPath: '/codemirror-bundle.css', file: path.join('static', 'codemirror-bundle.css'), kind: 'text' },
   { urlPath: '/audio-processor.js', file: path.join('static', 'audio-processor.js'), kind: 'text' },
   { urlPath: '/icon-128.png', file: path.join('static', 'icon-128.png'), kind: 'binary' },
 ];
@@ -66,6 +68,8 @@ const APP_HTML_CACHEBUSTED_ASSET_PATHS = [
   '/wasm-station/station_web.js',
   '/wasm-station/station_web_bg.wasm',
   '/three.module.min.js',
+  '/codemirror-bundle.js',
+  '/codemirror-bundle.css',
   '/icon-128.png',
 ];
 

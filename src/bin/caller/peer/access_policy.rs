@@ -251,8 +251,34 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
 
 #[allow(dead_code)]
 pub fn profile_allows_control_msg(profile: &str, ctrl: &ControlMsg) -> bool {
+    if matches!(ctrl, ControlMsg::PeerDashboardControlSignal { .. }) {
+        return profile_allows_dashboard_control_tunnel(profile);
+    }
     let op = control_msg_operation(ctrl);
     profile_allows_operation(profile, op)
+}
+
+/// Every capability family the dashboard-control tunnel carries. The
+/// tunnel's WebRTC signaling relay is a transport door, not a single
+/// operation: it opens for an identity that can use at least one of these,
+/// and every method/frame inside is then authorized individually against
+/// the same identity (`dashboard_control_method_operation` /
+/// `dashboard_control_frame_operation` and their `/ws` twins). Presence-
+/// and stats-only profiles have nothing reachable inside, so the door
+/// stays shut for them.
+pub const DASHBOARD_CONTROL_TUNNEL_OPERATIONS: &[PeerOperation] = &[
+    PeerOperation::SessionInspect,
+    PeerOperation::FilesystemRead,
+    PeerOperation::FilesystemWrite,
+    PeerOperation::TerminalView,
+    PeerOperation::DisplayView,
+    PeerOperation::Message,
+];
+
+pub fn profile_allows_dashboard_control_tunnel(profile: &str) -> bool {
+    DASHBOARD_CONTROL_TUNNEL_OPERATIONS
+        .iter()
+        .any(|op| profile_allows_operation(profile, *op))
 }
 
 pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
@@ -260,6 +286,9 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         ControlMsg::Status { .. } => PeerOperation::PresenceRead,
         ControlMsg::Usage => PeerOperation::StatsRead,
         ControlMsg::WebRtcSignal { .. } => PeerOperation::DisplayView,
+        // Fallback classification only: gates special-case this variant
+        // through `profile_allows_dashboard_control_tunnel` (the tunnel is
+        // multi-capability, so its door is any-of, not this single op).
         ControlMsg::PeerDashboardControlSignal { .. } => PeerOperation::SessionInspect,
         ControlMsg::PeerFileTransferSignal { .. } => PeerOperation::FilesystemRead,
         ControlMsg::RequestDisplayInputAuthority { .. }
@@ -650,6 +679,42 @@ mod tests {
         assert!(!profile_allows_control_msg("read-only-display", &input));
         assert!(!profile_allows_federated_display_input("read-only-display"));
         assert!(profile_allows_federated_display_input("operator"));
+    }
+
+    #[test]
+    fn dashboard_control_tunnel_door_opens_for_any_tunnel_capability() {
+        // Every profile that can use something inside the tunnel gets
+        // through the door; per-method authorization inside does the rest.
+        for profile in [
+            "file-operator",
+            "file-reader",
+            "session-reader",
+            "terminal-operator",
+            "read-only-display",
+            "task-runner",
+            "operator",
+            "peer-root",
+        ] {
+            assert!(
+                profile_allows_dashboard_control_tunnel(profile),
+                "{profile} should reach the dashboard-control tunnel"
+            );
+        }
+        // Nothing inside the tunnel is reachable for these; door stays shut.
+        for profile in ["presence-only", "stats"] {
+            assert!(
+                !profile_allows_dashboard_control_tunnel(profile),
+                "{profile} should not reach the dashboard-control tunnel"
+            );
+        }
+
+        let signal = ControlMsg::PeerDashboardControlSignal {
+            session_id: "s".into(),
+            signal: crate::peer::WebRtcSignal::Unknown,
+        };
+        assert!(profile_allows_control_msg("file-operator", &signal));
+        assert!(profile_allows_control_msg("file-reader", &signal));
+        assert!(!profile_allows_control_msg("stats", &signal));
     }
 
     #[test]

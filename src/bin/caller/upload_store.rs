@@ -240,7 +240,11 @@ pub(crate) fn ensure_project_uploads_ignored(project_root: &Path) -> io::Result<
     append_intendant_ignore_rule(&project_gitignore)
 }
 
-fn persist_upload_tempfile(temp_file: tempfile::NamedTempFile, dest_path: &Path) -> io::Result<()> {
+/// Persist a tempfile at `dest_path`: rename when the tempfile lives on the
+/// same filesystem (atomic), otherwise re-stage next to the destination and
+/// rename from there. Shared by the upload store and the dashboard fs-write
+/// endpoint.
+pub(crate) fn persist_tempfile(temp_file: tempfile::NamedTempFile, dest_path: &Path) -> io::Result<()> {
     match temp_file.persist(dest_path) {
         Ok(_) => Ok(()),
         Err(err) if err.error.kind() == io::ErrorKind::CrossesDevices => {
@@ -307,7 +311,7 @@ pub fn commit_upload(
     // Prefer rename (atomic on the same filesystem); fall back to copy if
     // the tempdir lives elsewhere (common on Linux when TMPDIR is tmpfs
     // and the session dir is on a regular disk).
-    persist_upload_tempfile(temp_file, &dest_path)?;
+    persist_tempfile(temp_file, &dest_path)?;
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

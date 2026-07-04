@@ -1919,6 +1919,8 @@ const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_we
 const WASM_STATION_JS: &str = include_str!("../../../static/wasm-station/station_web.js");
 const WASM_STATION_BIN: &[u8] = include_bytes!("../../../static/wasm-station/station_web_bg.wasm");
 const THREE_MODULE_JS: &str = include_str!("../../../static/three.module.min.js");
+const CODEMIRROR_BUNDLE_JS: &str = include_str!("../../../static/codemirror-bundle.js");
+const CODEMIRROR_BUNDLE_CSS: &str = include_str!("../../../static/codemirror-bundle.css");
 const SOURCE_VIEWER_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const DASHBOARD_IMAGE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 // Browser-facing external replay is a live UI bootstrap, not an archival export.
@@ -2002,6 +2004,8 @@ struct FsPathStatus {
     is_dir: bool,
     is_file: bool,
     readable: bool,
+    size: Option<u64>,
+    modified_ms: Option<u64>,
     parent: Option<String>,
     parent_exists: bool,
     parent_is_dir: bool,
@@ -2022,6 +2026,29 @@ struct FsListEntry {
 #[derive(Debug, Deserialize)]
 struct FsMkdirRequest {
     path: String,
+}
+
+/// Body of `POST /api/fs/write` — the dashboard editor's save request.
+///
+/// Exactly one of `content` (UTF-8 text) or `content_b64` (raw bytes) carries
+/// the new file contents. Every write must state its precondition: an
+/// `expected_sha256` of the bytes the client last read (optimistic
+/// concurrency), `create_new` for files that must not exist yet, or an
+/// explicit `force` to overwrite unconditionally. A write with no
+/// precondition is rejected so nothing clobbers a changed file silently.
+#[derive(Debug, Deserialize)]
+struct FsWriteRequest {
+    path: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    content_b64: Option<String>,
+    #[serde(default)]
+    expected_sha256: Option<String>,
+    #[serde(default)]
+    create_new: bool,
+    #[serde(default)]
+    force: bool,
 }
 
 /// Debug state for the voice model, tracked server-side from WebSocket messages.
@@ -4197,6 +4224,18 @@ fn embedded_static_asset(path: &str) -> Option<&'static EmbeddedStaticAsset> {
             "/three.module.min.js",
             "application/javascript",
             THREE_MODULE_JS.as_bytes(),
+            true,
+        );
+        insert(
+            "/codemirror-bundle.js",
+            "application/javascript",
+            CODEMIRROR_BUNDLE_JS.as_bytes(),
+            true,
+        );
+        insert(
+            "/codemirror-bundle.css",
+            "text/css",
+            CODEMIRROR_BUNDLE_CSS.as_bytes(),
             true,
         );
         insert(
@@ -16310,6 +16349,11 @@ fn inspect_dashboard_fs_path(raw: &str) -> Result<FsPathStatus, String> {
         is_dir,
         is_file,
         readable,
+        size: metadata.as_ref().map(|m| m.len()),
+        modified_ms: metadata
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(system_time_unix_ms),
         parent,
         parent_exists: parent_metadata.is_some(),
         parent_is_dir: parent_metadata.map(|m| m.is_dir()).unwrap_or(false),
@@ -16635,6 +16679,294 @@ pub(crate) fn dashboard_fs_mkdir_response_body(raw: &str) -> (String, String) {
         Ok(body) => ("200 OK".to_string(), body.to_string()),
         Err((status, message)) => (status, serde_json::json!({ "error": message }).to_string()),
     }
+}
+
+fn system_time_unix_ms(time: std::time::SystemTime) -> Option<u64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+pub(crate) fn fs_sha256_hex(bytes: &[u8]) -> String {
+    crate::file_watcher::hex_encode(&crate::file_watcher::sha256_hash(bytes))
+}
+
+/// The write half of the dashboard editor. What the caller must have done
+/// already: routed the raw request path through
+/// `authorize_http_filesystem_access` (HTTP) or
+/// `authorize_dashboard_control_method` (tunnel) with
+/// `FilesystemWrite`/`Write` — this function performs no IAM checks of its
+/// own.
+pub(crate) struct FsWriteArgs {
+    pub path: String,
+    pub expected_sha256: Option<String>,
+    pub create_new: bool,
+    pub force: bool,
+}
+
+/// Extract the write payload from an `FsWriteRequest`, enforcing that exactly
+/// one of `content` / `content_b64` is present.
+fn fs_write_request_bytes(req: &FsWriteRequest) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    match (&req.content, &req.content_b64) {
+        (Some(_), Some(_)) => {
+            Err("provide either content or content_b64, not both".to_string())
+        }
+        (Some(text), None) => Ok(text.clone().into_bytes()),
+        (None, Some(b64)) => base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|_| "content_b64 is not valid base64".to_string()),
+        (None, None) => Err("missing content (or content_b64)".to_string()),
+    }
+}
+
+/// Write `bytes` to `args.path` atomically (tempfile in the destination
+/// directory, fsync, rename — permissions of an existing file are preserved),
+/// honouring the request's precondition:
+///
+/// - `create_new` — the file must not exist yet (`409` `code:"exists"`).
+/// - `expected_sha256` — the file must still hash to the value the client
+///   last read; otherwise `409` `code:"conflict"` with the current hash so
+///   the editor can offer reload/overwrite. A vanished file is `409`
+///   `code:"missing"`.
+/// - `force` — write unconditionally.
+/// - none of the above — `400` `code:"precondition_required"`.
+///
+/// The hash check and the rename are not one transaction; a concurrent
+/// writer can still slip between them (the same window every editor has).
+/// The precondition exists to catch the common case — the file changed while
+/// it sat open in a dashboard buffer — not to serialize writers.
+pub(crate) fn apply_dashboard_fs_write(
+    args: &FsWriteArgs,
+    bytes: &[u8],
+) -> (String, serde_json::Value) {
+    if bytes.len() > UPLOAD_MAX_BYTES {
+        return (
+            "413 Payload Too Large".to_string(),
+            serde_json::json!({
+                "error": format!(
+                    "content too large: {} bytes (cap is {})",
+                    bytes.len(),
+                    UPLOAD_MAX_BYTES
+                )
+            }),
+        );
+    }
+    let path = match expand_dashboard_fs_path(&args.path) {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({ "error": e }),
+            )
+        }
+    };
+    let metadata = std::fs::metadata(&path).ok();
+    let (target, existed) = if let Some(metadata) = metadata {
+        if !metadata.is_file() {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({
+                    "error": format!("{} is not a regular file", path.display())
+                }),
+            );
+        }
+        match std::fs::canonicalize(&path) {
+            Ok(canonical) => (canonical, true),
+            Err(e) => {
+                return (
+                    dashboard_fs_io_status(&e).to_string(),
+                    serde_json::json!({
+                        "error": format!("{} is not accessible: {e}", path.display())
+                    }),
+                )
+            }
+        }
+    } else {
+        let Some(name) = path.file_name().map(|n| n.to_os_string()) else {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({
+                    "error": format!("{} has no file name", path.display())
+                }),
+            );
+        };
+        let Some(parent) = path.parent() else {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({
+                    "error": format!("{} has no parent directory", path.display())
+                }),
+            );
+        };
+        let canonical_parent = match std::fs::canonicalize(parent) {
+            Ok(canonical) => canonical,
+            Err(_) => {
+                return (
+                    "404 Not Found".to_string(),
+                    serde_json::json!({
+                        "error": format!(
+                            "parent directory {} does not exist — create it first",
+                            parent.display()
+                        ),
+                        "code": "missing_parent",
+                    }),
+                )
+            }
+        };
+        if !canonical_parent.is_dir() {
+            return (
+                "400 Bad Request".to_string(),
+                serde_json::json!({
+                    "error": format!("{} is not a directory", canonical_parent.display())
+                }),
+            );
+        }
+        (canonical_parent.join(name), false)
+    };
+
+    if args.create_new {
+        if existed {
+            return (
+                "409 Conflict".to_string(),
+                serde_json::json!({
+                    "error": format!("{} already exists", target.display()),
+                    "code": "exists",
+                }),
+            );
+        }
+    } else if let Some(expected) = args
+        .expected_sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !existed {
+            return (
+                "409 Conflict".to_string(),
+                serde_json::json!({
+                    "error": format!("{} no longer exists on disk", target.display()),
+                    "code": "missing",
+                }),
+            );
+        }
+        let current = match std::fs::read(&target) {
+            Ok(current) => current,
+            Err(e) => {
+                return (
+                    dashboard_fs_io_status(&e).to_string(),
+                    serde_json::json!({
+                        "error": format!("could not read {}: {e}", target.display())
+                    }),
+                )
+            }
+        };
+        let current_sha256 = fs_sha256_hex(&current);
+        if !current_sha256.eq_ignore_ascii_case(expected) {
+            let modified_ms = std::fs::metadata(&target)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(system_time_unix_ms);
+            return (
+                "409 Conflict".to_string(),
+                serde_json::json!({
+                    "error": format!("{} changed on disk since it was read", target.display()),
+                    "code": "conflict",
+                    "current_sha256": current_sha256,
+                    "size": current.len(),
+                    "modified_ms": modified_ms,
+                }),
+            );
+        }
+    } else if !args.force {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": "write requires expected_sha256, create_new, or force",
+                "code": "precondition_required",
+            }),
+        );
+    }
+
+    let Some(dir) = target.parent() else {
+        return (
+            "400 Bad Request".to_string(),
+            serde_json::json!({
+                "error": format!("{} has no parent directory", target.display())
+            }),
+        );
+    };
+    let write_result = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".intendant-fswrite-")
+            .suffix(".tmp")
+            .tempfile_in(dir)?;
+        tmp.write_all(bytes)?;
+        tmp.as_file_mut().sync_all()?;
+        if existed {
+            if let Ok(current) = std::fs::metadata(&target) {
+                let _ = std::fs::set_permissions(tmp.path(), current.permissions());
+            }
+        }
+        crate::upload_store::persist_tempfile(tmp, &target)
+    })();
+    if let Err(e) = write_result {
+        return (
+            dashboard_fs_io_status(&e).to_string(),
+            serde_json::json!({
+                "error": format!("could not write {}: {e}", target.display())
+            }),
+        );
+    }
+
+    let modified_ms = std::fs::metadata(&target)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(system_time_unix_ms);
+    (
+        "200 OK".to_string(),
+        serde_json::json!({
+            "ok": true,
+            "path": target.to_string_lossy().to_string(),
+            "size": bytes.len(),
+            "sha256": fs_sha256_hex(bytes),
+            "created": !existed,
+            "modified_ms": modified_ms,
+        }),
+    )
+}
+
+/// Tunnel-facing wrapper: apply a write whose payload arrived out-of-band
+/// (dashboard-control upload frames) with the request fields as JSON params.
+/// Returns `(http-ish status code, body)` for `http_body_response`.
+pub(crate) fn dashboard_fs_write_response_parts(
+    params: &serde_json::Value,
+    bytes: &[u8],
+) -> (u16, String) {
+    let args = FsWriteArgs {
+        path: params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        expected_sha256: params
+            .get("expected_sha256")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        create_new: params
+            .get("create_new")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        force: params.get("force").and_then(|v| v.as_bool()).unwrap_or(false),
+    };
+    let (status_line, body) = apply_dashboard_fs_write(&args, bytes);
+    let code = status_line
+        .split_whitespace()
+        .next()
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(500);
+    (code, body.to_string())
 }
 
 /// Extract the `Content-Type` request header value, or a generic default.
@@ -18552,6 +18884,8 @@ pub fn spawn_web_gateway(
             "/wasm-station/station_web.js",
             "/wasm-station/station_web_bg.wasm",
             "/three.module.min.js",
+            "/codemirror-bundle.js",
+            "/codemirror-bundle.css",
             "/icon-128.png",
         ]
         .iter()
@@ -22132,21 +22466,35 @@ pub fn spawn_web_gateway(
                                 } else {
                                     String::new()
                                 };
+                                // Full (non-range) reads carry the content
+                                // hash so the editor has a conflict baseline
+                                // for its later write-back.
+                                let sha_header = if file.partial {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "X-Content-Sha256: {}\r\n",
+                                        fs_sha256_hex(&file.bytes)
+                                    )
+                                };
                                 let header = format!(
                                     "HTTP/1.1 {}\r\n\
                                      Content-Type: {}\r\n\
                                      Content-Length: {}\r\n\
                                      Accept-Ranges: bytes\r\n\
                                      {}\
+                                     {}\
                                      Content-Disposition: attachment; filename=\"{}\"\r\n\
                                      Cache-Control: no-cache\r\n\
                                      Access-Control-Allow-Origin: *\r\n\
+                                     Access-Control-Expose-Headers: X-Content-Sha256\r\n\
                                      Connection: close\r\n\
                                      \r\n",
                                     status,
                                     file.content_type,
                                     file.bytes.len(),
                                     content_range,
+                                    sha_header,
                                     file.filename.replace('"', ""),
                                 );
                                 let _ = stream.write_all(header.as_bytes()).await;
@@ -22197,6 +22545,72 @@ pub fn spawn_web_gateway(
                                 Err(message) => json_error("403 Forbidden", message),
                             },
                             Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "POST" && req_path == "/api/fs/write" {
+                        use tokio::io::AsyncWriteExt;
+                        // read_post_body has no cap of its own; bound the
+                        // body before reading it. The JSON envelope adds
+                        // base64/escaping overhead on top of the content
+                        // cap that apply_dashboard_fs_write enforces, so
+                        // allow half again as much envelope.
+                        let content_length: usize = header_text
+                            .lines()
+                            .find(|l| l.to_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        let response = if content_length > UPLOAD_MAX_BYTES + UPLOAD_MAX_BYTES / 2 {
+                            json_error(
+                                "413 Payload Too Large",
+                                format!(
+                                    "body too large: {content_length} bytes (cap is {})",
+                                    UPLOAD_MAX_BYTES + UPLOAD_MAX_BYTES / 2
+                                ),
+                            )
+                        } else {
+                            let body_text = read_post_body(&header_text, &mut stream).await;
+                            match serde_json::from_str::<FsWriteRequest>(&body_text) {
+                                Ok(req) => match authorize_http_filesystem_access(
+                                    &http_access_context,
+                                    peer_connection_identity.as_ref(),
+                                    crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                    crate::peer::access_policy::FilesystemAccessKind::Write,
+                                    &req.path,
+                                    &bus,
+                                ) {
+                                    Ok(()) => match fs_write_request_bytes(&req) {
+                                        Ok(bytes) => {
+                                            let args = FsWriteArgs {
+                                                path: req.path.clone(),
+                                                expected_sha256: req.expected_sha256.clone(),
+                                                create_new: req.create_new,
+                                                force: req.force,
+                                            };
+                                            let (status, body) = tokio::task::spawn_blocking(
+                                                move || apply_dashboard_fs_write(&args, &bytes),
+                                            )
+                                            .await
+                                            .unwrap_or_else(|e| {
+                                                (
+                                                    "500 Internal Server Error".to_string(),
+                                                    serde_json::json!({
+                                                        "error": format!(
+                                                            "filesystem write task failed: {e}"
+                                                        )
+                                                    }),
+                                                )
+                                            });
+                                            json_response(&status, body.to_string())
+                                        }
+                                        Err(message) => json_error("400 Bad Request", message),
+                                    },
+                                    Err(message) => json_error("403 Forbidden", message),
+                                },
+                                Err(e) => {
+                                    json_error("400 Bad Request", format!("invalid JSON: {e}"))
+                                }
+                            }
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/api/settings" {
@@ -24586,6 +25000,8 @@ pub fn spawn_web_gateway(
                             "/wasm-web/presence_web.js",
                             "/wasm-station/station_web.js",
                             "/three.module.min.js",
+                            "/codemirror-bundle.js",
+                            "/codemirror-bundle.css",
                             "/audio-processor.js",
                             "/icon-128.png",
                             "/favicon.ico",
@@ -28787,7 +29203,9 @@ fn dashboard_http_operation(
         ("GET", "/api/fs/stat") | ("GET", "/api/fs/list") | ("GET", "/api/fs/read") => {
             return Some(PeerOperation::FilesystemRead);
         }
-        ("POST", "/api/fs/mkdir") => return Some(PeerOperation::FilesystemWrite),
+        ("POST", "/api/fs/mkdir") | ("POST", "/api/fs/write") => {
+            return Some(PeerOperation::FilesystemWrite)
+        }
         ("POST", "/api/diagnostics/visual-freshness") => {
             return Some(PeerOperation::DisplayInput);
         }
@@ -29421,6 +29839,24 @@ fn peer_identity_allows_ws_control(
     let Some(identity) = identity else {
         return true;
     };
+    // The dashboard-control tunnel is multi-capability; its signaling relay
+    // opens for any profile that can use something inside it, and every
+    // method/frame is then individually authorized on this same identity.
+    if matches!(ctrl, ControlMsg::PeerDashboardControlSignal { .. }) {
+        if crate::peer::access_policy::profile_allows_dashboard_control_tunnel(&identity.profile)
+        {
+            return true;
+        }
+        bus.send(AppEvent::PresenceLog {
+            message: format!(
+                "[ws] denied peer dashboard-control signaling from {}: profile={} allows no tunnel capability",
+                identity.label, identity.profile,
+            ),
+            level: Some(LogLevel::Warn),
+            turn: None,
+        });
+        return false;
+    }
     let op = crate::peer::access_policy::control_msg_operation(ctrl);
     let decision = crate::access::iam::evaluate_principal_operation(
         &peer_identity_access_principal(identity, "peer-ws"),
@@ -29562,6 +29998,25 @@ fn ws_grant_allows_control(
 ) -> bool {
     if peer_identity.is_some() {
         return true;
+    }
+    // Same tunnel-door rule as the peer lane: signaling relay opens for a
+    // grant that can use at least one capability the tunnel carries.
+    if matches!(ctrl, ControlMsg::PeerDashboardControlSignal { .. }) {
+        if crate::peer::access_policy::DASHBOARD_CONTROL_TUNNEL_OPERATIONS
+            .iter()
+            .any(|op| grant.access_decision(*op).allowed)
+        {
+            return true;
+        }
+        bus.send(AppEvent::PresenceLog {
+            message: format!(
+                "[ws] denied {} dashboard-control signaling: grant allows no tunnel capability",
+                grant.wire_kind(),
+            ),
+            level: Some(LogLevel::Warn),
+            turn: None,
+        });
+        return false;
     }
     let op = crate::peer::access_policy::control_msg_operation(ctrl);
     let decision = grant.access_decision(op);
@@ -37050,6 +37505,8 @@ mod tests {
             "/wasm-web/presence_web.js",
             "/wasm-station/station_web.js",
             "/three.module.min.js",
+            "/codemirror-bundle.js",
+            "/codemirror-bundle.css",
         ] {
             let asset = embedded_static_asset(path).expect(path);
             assert_eq!(asset.etag, asset_etag(asset.body));
@@ -40606,10 +41063,168 @@ mod tests {
             Some(PeerOperation::FilesystemRead)
         );
         assert_eq!(
-            dashboard_http_operation("POST", "/api/coordinator/route"),
-            None
+            dashboard_http_operation("POST", "/api/fs/write"),
+            Some(PeerOperation::FilesystemWrite)
         );
+        // GET must not inherit the write classification, and look-alike
+        // paths must not classify at all.
+        assert_eq!(dashboard_http_operation("GET", "/api/fs/write"), None);
+        assert_eq!(dashboard_http_operation("POST", "/api/fs/writeable"), None);
+        assert_eq!(dashboard_http_operation("POST", "/api/coordinator/route"), None);
         assert_eq!(dashboard_http_operation("GET", "/config"), None);
+    }
+
+    #[test]
+    fn fs_write_request_bytes_requires_exactly_one_content_field() {
+        let parse = |body: serde_json::Value| {
+            fs_write_request_bytes(&serde_json::from_value::<FsWriteRequest>(body).unwrap())
+        };
+        assert_eq!(
+            parse(serde_json::json!({ "path": "/x", "content": "hi" })).unwrap(),
+            b"hi"
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "path": "/x", "content_b64": "aGk=" })).unwrap(),
+            b"hi"
+        );
+        assert!(parse(serde_json::json!({ "path": "/x" }))
+            .unwrap_err()
+            .contains("missing content"));
+        assert!(
+            parse(serde_json::json!({ "path": "/x", "content": "a", "content_b64": "YQ==" }))
+                .unwrap_err()
+                .contains("not both")
+        );
+        assert!(
+            parse(serde_json::json!({ "path": "/x", "content_b64": "!!!" }))
+                .unwrap_err()
+                .contains("not valid base64")
+        );
+    }
+
+    #[test]
+    fn apply_dashboard_fs_write_preconditions_and_atomics() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("app.conf");
+        let write = |path: &std::path::Path,
+                     bytes: &[u8],
+                     expected: Option<String>,
+                     create_new: bool,
+                     force: bool| {
+            apply_dashboard_fs_write(
+                &FsWriteArgs {
+                    path: path.to_string_lossy().to_string(),
+                    expected_sha256: expected,
+                    create_new,
+                    force,
+                },
+                bytes,
+            )
+        };
+
+        // A write with no stated precondition is refused.
+        let (status, body) = write(&target, b"v1", None, false, false);
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(body["code"], "precondition_required");
+        assert!(!target.exists());
+
+        // create_new creates, and refuses to run twice.
+        let (status, body) = write(&target, b"v1", None, true, false);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["created"], true);
+        assert_eq!(body["sha256"].as_str(), Some(fs_sha256_hex(b"v1").as_str()));
+        assert_eq!(std::fs::read(&target).unwrap(), b"v1");
+        let (status, body) = write(&target, b"v1", None, true, false);
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body["code"], "exists");
+
+        // The matching baseline replaces content; a stale one conflicts and
+        // reports the current hash without touching the file.
+        let (status, body) = write(&target, b"v2", Some(fs_sha256_hex(b"v1")), false, false);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["created"], false);
+        assert_eq!(std::fs::read(&target).unwrap(), b"v2");
+        let (status, body) = write(&target, b"v3", Some(fs_sha256_hex(b"v1")), false, false);
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body["code"], "conflict");
+        assert_eq!(
+            body["current_sha256"].as_str(),
+            Some(fs_sha256_hex(b"v2").as_str())
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"v2");
+
+        // force overwrites unconditionally; a baseline against a vanished
+        // file reports code:"missing".
+        let (status, _) = write(&target, b"v4", None, false, true);
+        assert_eq!(status, "200 OK");
+        assert_eq!(std::fs::read(&target).unwrap(), b"v4");
+        let gone = dir.path().join("gone.conf");
+        let (status, body) = write(&gone, b"x", Some(fs_sha256_hex(b"x")), false, false);
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body["code"], "missing");
+
+        // Relative paths, directory targets, and missing parents are refused.
+        let (status, _) = apply_dashboard_fs_write(
+            &FsWriteArgs {
+                path: "relative/path".to_string(),
+                expected_sha256: None,
+                create_new: true,
+                force: false,
+            },
+            b"x",
+        );
+        assert_eq!(status, "400 Bad Request");
+        let (status, _) = write(dir.path(), b"x", None, false, true);
+        assert_eq!(status, "400 Bad Request");
+        let orphan = dir.path().join("no-such-dir").join("file.txt");
+        let (status, body) = write(&orphan, b"x", None, true, false);
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body["code"], "missing_parent");
+
+        // Oversized payloads are refused before any disk IO.
+        let huge = vec![0u8; UPLOAD_MAX_BYTES + 1];
+        let (status, _) = write(&target, &huge, None, false, true);
+        assert_eq!(status, "413 Payload Too Large");
+        assert_eq!(std::fs::read(&target).unwrap(), b"v4");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_dashboard_fs_write_preserves_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("script.sh");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (status, _) = apply_dashboard_fs_write(
+            &FsWriteArgs {
+                path: target.to_string_lossy().to_string(),
+                expected_sha256: Some(fs_sha256_hex(b"#!/bin/sh\n")),
+                create_new: false,
+                force: false,
+            },
+            b"#!/bin/sh\necho updated\n",
+        );
+        assert_eq!(status, "200 OK");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(std::fs::read(&target).unwrap(), b"#!/bin/sh\necho updated\n");
+    }
+
+    #[test]
+    fn fs_stat_reports_size_and_mtime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("sized.txt");
+        std::fs::write(&file, b"12345").unwrap();
+        let status = inspect_dashboard_fs_path(&file.to_string_lossy()).unwrap();
+        assert_eq!(status.size, Some(5));
+        assert!(status.modified_ms.unwrap_or(0) > 0);
+        let missing = inspect_dashboard_fs_path(&dir.path().join("nope").to_string_lossy())
+            .unwrap();
+        assert_eq!(missing.size, None);
+        assert_eq!(missing.modified_ms, None);
     }
 
     #[test]
