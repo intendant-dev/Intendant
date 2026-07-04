@@ -126,59 +126,47 @@ Four execution modes: *direct* (single agent), *user* (orchestrator + sub-agents
 
 ## Quick Start
 
+On a fresh box, use the [installer one-liner](#a-daemon-in-ninety-seconds) above. From a checkout:
+
 ```bash
-# Build
 cargo build --release
-
-# Set up API keys (~/.config/intendant/.env for global use)
-echo 'OPENAI_API_KEY=sk-...' > .env
-
-# Run with TUI
-./target/release/intendant "List the files in /tmp"
-
-# Headless mode
-./target/release/intendant --no-tui "echo hello"
-
-# Choose provider/model
-./target/release/intendant --provider anthropic --model claude-sonnet-4-6-20250929 "Fix the tests"
-
-# Web dashboard runs by default (port 8765); --web sets the port, --no-web disables it
-./target/release/intendant --web 9000
-
-# Supervise an external coding agent (codex | claude-code)
-./target/release/intendant --agent codex "Fix the tests"
-
-# Run as MCP server (for Claude Code, etc.)
-./target/release/intendant --mcp "Deploy the application"
-
-# JSONL structured output
-./target/release/intendant --json "echo hello"
-
-# Resume most recent session
-./target/release/intendant --continue "fix that bug"
-
-# Force single-agent mode
-./target/release/intendant --direct "simple task"
-
-# OS-sandbox the runtime (Landlock / Seatbelt / restricted token)
-./target/release/intendant --sandbox "run tests"
-
-# Install as a system service (systemd / launchd / Task Scheduler)
-./target/release/intendant service install
-
-# Create an org root key on this daemon (trust model)
-./target/release/intendant org init acme
+./target/release/intendant
 ```
+
+That starts the persistent daemon and prints the dashboard URL (port 8765 by default). The dashboard is the canonical way to drive Intendant — submit and steer tasks, watch the live desktop, approve gated actions, manage access, fuel the daemon. Fuel with credential leases from your vault, or keep keys local in `.env` (`~/.config/intendant/.env` for global use).
+
+The same binary is the ops toolbox. Each subcommand stands alone — no project, no API key:
+
+| Subcommand | What it does |
+|---|---|
+| `intendant service install \| uninstall \| status` | Register the daemon with the platform's native supervisor (systemd / launchd / Task Scheduler) so it survives reboots |
+| `intendant access setup \| list \| recert \| remove \| serve-certs` | Browser mTLS certificates and device enrollment for the dashboard |
+| `intendant peer invite \| join \| approve \| identities \| revoke \| …` | Pair daemons: peer-issued mTLS identities and access requests |
+| `intendant org init <handle>` | Mint an organization root key on this daemon |
+| `intendant ctl status \| logs \| task start \| tools call \| …` | Drive a running daemon from scripts and agents (MCP under the hood) |
+| `intendant setup browser` | Provision or repair the agent's managed browser |
+
+One-shot and headless invocations, when you want them:
+
+```bash
+./target/release/intendant "Fix the flaky CI job"        # submit a task straight from the CLI
+./target/release/intendant --continue "now the docs"     # resume the most recent session
+./target/release/intendant --agent codex "task"          # supervise an external CLI (codex | claude-code)
+./target/release/intendant --mcp                         # MCP server on stdio (for Claude Code, etc.)
+./target/release/intendant --direct --no-web --json "t"  # headless single agent, JSONL to stdout
+```
+
+The full flag reference (providers, models, sandboxing, TUI, resume) lives in [Getting Started](https://lovon-spec.github.io/Intendant/getting-started.html).
 
 ## Web Dashboard
 
-The web dashboard runs by default (port 8765; `--no-web` disables it), works from any browser — phone included — and has ten tabs:
+The web dashboard is the canonical frontend — on by default (port 8765; `--no-web` disables it), served to any browser, phone included — with ten tabs:
 
 - **Activity** — live event log with context/changes views, approval buttons, follow-up input
 - **Stats** — token usage per model with cost estimates, disk usage
 - **Terminal** — embedded xterm.js for the server-side TUI and live shells
 - **Video** — WebRTC display viewers with remote control, annotations, recording replay
-- **Station** — WebGPU mission-control canvas rendering the whole fleet live: sessions, approvals, context budgets, changes, peers, worktrees
+- **Station** — WebGPU mission-control canvas rendering the whole fleet live: sessions, approvals, context budgets, changes, peers, worktrees. Still prototype-stage, but this is the surface the dashboard is growing toward
 - **Sessions** — browse, search, resume, and fork sessions across all backends
 - **Files** — editor workbench over local and peer filesystems, IAM-scoped
 - **Access** — the trust surface: people & devices, peers, organizations, credential custody
