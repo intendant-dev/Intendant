@@ -112,6 +112,13 @@ pub enum PeerOperation {
     AccessManage,
     PeerInspect,
     PeerManage,
+    /// Open a tunnel to a connected peer through this daemon's peer
+    /// credentials (dashboard-control, file-transfer, or display
+    /// signaling relay). Deliberately distinct from `PeerManage`: using a
+    /// peer relationship delegates this daemon's peer identity — what the
+    /// tunnel may then do is decided by the *peer's* grants for this
+    /// daemon, not by the local grant that opened it.
+    PeerUse,
     SessionInspect,
     SessionManage,
     /// Attach to a visible shell session: scrollback replay + live output.
@@ -154,7 +161,7 @@ pub fn normalize_profile(raw: &str) -> Result<String, CallerError> {
     Ok(profile.to_ascii_lowercase())
 }
 
-pub const ALL_OPERATIONS: [PeerOperation; 21] = [
+pub const ALL_OPERATIONS: [PeerOperation; 22] = [
     PeerOperation::PresenceRead,
     PeerOperation::StatsRead,
     PeerOperation::DisplayView,
@@ -166,6 +173,7 @@ pub const ALL_OPERATIONS: [PeerOperation; 21] = [
     PeerOperation::AccessManage,
     PeerOperation::PeerInspect,
     PeerOperation::PeerManage,
+    PeerOperation::PeerUse,
     PeerOperation::SessionInspect,
     PeerOperation::SessionManage,
     PeerOperation::TerminalView,
@@ -453,6 +461,19 @@ pub fn federation_http_operation(method: &str, path: &str) -> Option<PeerOperati
     }
     if path.starts_with("/api/peers/pairing/") {
         return Some(PeerOperation::PeerManage);
+    }
+    // Signaling relays to a connected peer (`/api/peers/{id}/<signal-op>`)
+    // are peer *use*, not peer administration: they open a tunnel that the
+    // receiving peer authorizes against its own grants for this daemon.
+    if method == "POST" {
+        let mut segments = path.strip_prefix("/api/peers/").into_iter().flat_map(|rest| rest.split('/'));
+        if let (Some(id), Some(op), None) = (segments.next(), segments.next(), segments.next()) {
+            if !id.is_empty()
+                && matches!(op, "webrtc" | "file-transfer-webrtc" | "dashboard-control-webrtc")
+            {
+                return Some(PeerOperation::PeerUse);
+            }
+        }
     }
     if under("/api/peers") {
         if method == "GET" {
@@ -786,6 +807,41 @@ mod tests {
             "peer-operator",
             "GET /api/access/iam/state HTTP/1.1"
         ));
+    }
+
+    #[test]
+    fn peer_signal_relays_classify_as_peer_use() {
+        // The three signaling relays are peer use, not peer administration.
+        for op in ["webrtc", "file-transfer-webrtc", "dashboard-control-webrtc"] {
+            assert_eq!(
+                federation_http_operation("POST", &format!("/api/peers/intendant:peer-b/{op}")),
+                Some(PeerOperation::PeerUse),
+                "{op}"
+            );
+        }
+        // Everything else under /api/peers keeps its class: mutations are
+        // manage, pairing arms win over the id/op shape, GETs are inspect,
+        // and deeper or look-alike op segments never classify as use.
+        assert_eq!(
+            federation_http_operation("POST", "/api/peers/intendant:peer-b/message"),
+            Some(PeerOperation::PeerManage)
+        );
+        assert_eq!(
+            federation_http_operation("POST", "/api/peers/pairing/join"),
+            Some(PeerOperation::PeerManage)
+        );
+        assert_eq!(
+            federation_http_operation("GET", "/api/peers/intendant:peer-b/dashboard-control-webrtc"),
+            Some(PeerOperation::PeerInspect)
+        );
+        assert_eq!(
+            federation_http_operation("POST", "/api/peers/intendant:peer-b/webrtc/extra"),
+            Some(PeerOperation::PeerManage)
+        );
+        // Only the admin peer profile may use relays transitively.
+        assert!(profile_allows_operation("peer-root", PeerOperation::PeerUse));
+        assert!(!profile_allows_operation("file-operator", PeerOperation::PeerUse));
+        assert!(!profile_allows_operation("peer-operator", PeerOperation::PeerUse));
     }
 
     #[test]
