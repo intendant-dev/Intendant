@@ -1,9 +1,10 @@
 //! Backend task dispatcher.
 //!
-//! Listens on the EventBus for `AppEvent::ControlCommand(StartTask | FollowUp)` and
-//! routes each task to the correct output channel (`task_tx`, `follow_up_tx`, or
-//! `presence_tx`) based on which channels are wired and whether the caller
-//! requested direct dispatch (bypass presence).
+//! Listens on the EventBus for `AppEvent::ControlCommand` and handles the
+//! legacy single-session command set: task/follow-up dispatch plus interrupt,
+//! steer, and cancellation fanout. Targeted managed sessions are owned by
+//! `SessionSupervisor`; this dispatcher only routes commands for the channels
+//! it already owns.
 //!
 //! This module replaces the routing logic that previously lived in the TUI's
 //! `handle_control_command`. The TUI is now display-only — it observes phase

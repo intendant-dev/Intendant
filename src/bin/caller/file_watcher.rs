@@ -3,13 +3,14 @@
 //! events. Works for all agent types (native, Codex, Claude Code, Gemini CLI)
 //! by watching the filesystem directly rather than relying on git.
 //!
-//! Also provides per-round content-addressed snapshots of the project tree for
-//! rollback / redo / branching. On each [`AppEvent::RoundComplete`], a new
-//! [`HistoryRound`] is recorded, capturing every tracked path's sha256. Files
-//! are stored in a content-addressed `objects/` directory so repeated content
-//! across rounds costs no additional disk. Rollback moves `current_head_id`
-//! back without truncating the linear history (so redo is available). A new
-//! action after rollback branches off the abandoned path and stores it in
+//! Also provides per-round content-addressed snapshots for rollback / redo /
+//! branching. On each [`AppEvent::RoundComplete`], a new [`HistoryRound`] is
+//! recorded: supported, non-ignored text files under the size cap are stored
+//! in `objects/` for restore, while additional inspected non-restorable files
+//! contribute hashes to the display/count mirror. Rollback moves
+//! `current_head_id` back without truncating the linear history (so redo is
+//! available). A new action after rollback branches off the abandoned path and
+//! stores it in
 //! `abandoned_branches` for later pruning.
 
 use crate::error::CallerError;
@@ -17,7 +18,7 @@ use crate::event::{AppEvent, EventBus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -36,9 +37,10 @@ pub enum FileChangeKind {
     Deleted,
 }
 
-/// One recorded round in the session history. Captures the full project state
-/// at the end of the round (as a map of path → sha256 hex) plus the subset of
-/// paths that differ from the previous round.
+/// One recorded round in the session history. Captures the restorable project
+/// state at the end of the round (supported, non-ignored text files under the
+/// size cap) plus a broader display/count hash mirror and the subset of paths
+/// that differ from the previous round.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryRound {
     /// Monotonic, unique per session.
@@ -52,11 +54,14 @@ pub struct HistoryRound {
     /// Display-only list of paths whose content differs from the previous
     /// round (or baseline for the first round).
     pub files_changed: Vec<String>,
-    /// FULL project state at the end of this round: path → sha256 hex.
+    /// Full restorable state at the end of this round: supported,
+    /// non-ignored text files under `SNAPSHOT_MAX_FILE_BYTES`, path → sha256
+    /// hex. Rollback restores exactly this map.
     pub files_at_end: HashMap<String, String>,
     /// Display-state mirror that also includes non-restorable tracked files
-    /// such as binary/oversized files. Rollback still uses `files_at_end`;
-    /// this lets timeline counts match what the Changes tab reports.
+    /// that were inspected but not stored as text blobs. Rollback still uses
+    /// `files_at_end`; this lets timeline counts match what the Changes tab
+    /// reports.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub all_files_at_end: HashMap<String, String>,
     /// Number of agent turns executed in this round (from `RoundComplete.turns_in_round`).
@@ -383,15 +388,57 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Write `content` to `path` atomically via tmp + rename, so a crash mid-write
-/// can never leave a truncated/corrupt file for a reader to observe.
-pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Persist a named tempfile at `dest_path`, using an atomic rename when the
+/// tempfile is already on the destination filesystem and re-staging in the
+/// destination directory when it is not.
+pub(crate) fn persist_tempfile(
+    temp_file: tempfile::NamedTempFile,
+    dest_path: &Path,
+) -> io::Result<()> {
+    match temp_file.persist(dest_path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.error.kind() == io::ErrorKind::CrossesDevices => {
+            copy_tempfile_across_filesystems(err.file, dest_path)
+        }
+        Err(err) => Err(err.error),
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)?;
+}
+
+fn copy_tempfile_across_filesystems(
+    temp_file: tempfile::NamedTempFile,
+    dest_path: &Path,
+) -> io::Result<()> {
+    let dest_dir = path_parent_or_cwd(dest_path);
+    let mut source = temp_file.reopen()?;
+    let mut dest_temp = tempfile::Builder::new()
+        .prefix(".intendant-write-")
+        .suffix(".tmp")
+        .tempfile_in(dest_dir)?;
+    io::copy(&mut source, &mut dest_temp)?;
+    dest_temp.flush()?;
+    dest_temp.as_file_mut().sync_all()?;
+    dest_temp.persist(dest_path).map_err(|err| err.error)?;
+    Ok(())
+}
+
+fn path_parent_or_cwd(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// Write `content` to `path` through a unique tempfile in the destination
+/// directory, sync it, then atomically replace the destination.
+pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
+    let parent = path_parent_or_cwd(path);
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".intendant-write-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    tmp.write_all(content)?;
+    tmp.as_file_mut().sync_all()?;
+    persist_tempfile(tmp, path)?;
     Ok(())
 }
 
@@ -968,8 +1015,10 @@ impl FileWatcher {
 
     // ---- Internal helpers ----
 
-    /// Walk the project tree, hash every eligible file, write new content to
-    /// `objects/{hash}`, and return the path→hash map.
+    /// Walk the project tree and return `(restorable, display_mirror)`.
+    /// Supported text files under the size cap are written to `objects/{hash}`
+    /// and appear in both maps; inspected non-restorable files appear only in
+    /// the display mirror. Ignored and oversized files are skipped.
     fn scan_and_store_objects(
         &self,
     ) -> Result<(HashMap<String, String>, HashMap<String, String>), CallerError> {
@@ -1024,12 +1073,7 @@ impl FileWatcher {
                         all.insert(rel_path_key(&rel), snapshot.hash_hex.clone());
                         let obj_path = objects_dir.join(&snapshot.hash_hex);
                         if !obj_path.exists() {
-                            // Write into a tmp path first so a partial write can't
-                            // leave a corrupt blob under its hash.
-                            let tmp = obj_path.with_extension("tmp");
-                            if std::fs::write(&tmp, &snapshot.bytes).is_ok() {
-                                let _ = std::fs::rename(&tmp, &obj_path);
-                            }
+                            let _ = atomic_write(&obj_path, &snapshot.bytes);
                         }
                         out.insert(rel_path_key(&rel), snapshot.hash_hex);
                     }
@@ -1043,8 +1087,8 @@ impl FileWatcher {
     }
 
     /// Compute the list of paths whose content in `current` differs from the
-    /// previous round's `files_at_end` (or, if there is no previous round,
-    /// the baseline).
+    /// previous round's display mirror (or restorable map for older history
+    /// files), or from the baseline when there is no previous round.
     fn compute_files_changed(
         &self,
         parent_id: Option<u64>,
@@ -1746,8 +1790,9 @@ mod tests {
         assert_eq!(round.native_message_count, None);
     }
 
-    /// Snapshot creates a round, files_at_end captures every file's hash,
-    /// rollback restores content even when files have been mutated since.
+    /// Snapshot creates a round, files_at_end captures restorable text-file
+    /// hashes, and rollback restores content even when files have been
+    /// mutated since.
     #[test]
     fn snapshot_and_rollback_round_trip() {
         let tmp_proj = TempDir::new().unwrap();

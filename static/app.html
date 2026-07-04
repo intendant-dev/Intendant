@@ -12973,7 +12973,6 @@ body.display-fullscreen-open {
                           <option value="on-request">on-request</option>
                           <option value="never">never</option>
                           <option value="untrusted">untrusted</option>
-                          <option value="on-failure">on-failure</option>
                         </select>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-codex-managed-context">
@@ -13899,7 +13898,6 @@ body.display-fullscreen-open {
         <option value="on-request">on-request</option>
         <option value="never">never</option>
         <option value="untrusted">untrusted</option>
-        <option value="on-failure">on-failure</option>
       </select>
     </div>
     <div class="session-config-row" id="session-config-archive-row">
@@ -13909,6 +13907,46 @@ body.display-fullscreen-open {
         <option value="summary">summary</option>
         <option value="exact">exact</option>
         <option value="off">off</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-claude-model-row">
+      <label for="session-config-claude-model">Model</label>
+      <select id="session-config-claude-model" onchange="onSessionConfigClaudeModelChange()">
+        <option value="inherit">inherit Control default</option>
+        <option value="fable">fable — latest Fable</option>
+        <option value="opus">opus — latest Opus</option>
+        <option value="sonnet">sonnet — latest Sonnet</option>
+        <option value="haiku">haiku — latest Haiku</option>
+        <option value="__custom__">Custom model id…</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-claude-model-custom-row" style="display:none">
+      <label for="session-config-claude-model-custom">Custom id</label>
+      <input id="session-config-claude-model-custom" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. claude-haiku-4-5-20251001">
+    </div>
+    <div class="session-config-row" id="session-config-claude-permission-row">
+      <label for="session-config-claude-permission-mode">Permissions</label>
+      <select id="session-config-claude-permission-mode">
+        <option value="inherit">inherit Control default</option>
+        <option value="default">default</option>
+        <option value="acceptEdits">acceptEdits</option>
+        <option value="plan">plan</option>
+        <option value="bypassPermissions">bypassPermissions</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-claude-tools-row">
+      <label for="session-config-claude-allowed-tools">Allowed tools</label>
+      <input id="session-config-claude-allowed-tools" type="text" autocomplete="off" spellcheck="false" placeholder="inherit — or rules, comma-separated; all = unrestricted">
+    </div>
+    <div class="session-config-row" id="session-config-claude-effort-row">
+      <label for="session-config-claude-effort">Effort</label>
+      <select id="session-config-claude-effort">
+        <option value="inherit">inherit Control default</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+        <option value="xhigh">xhigh</option>
+        <option value="max">max</option>
       </select>
     </div>
     <div class="session-config-status" id="session-config-status"></div>
@@ -15212,9 +15250,11 @@ async function accessFleetRefreshProvenance() {
    synced blind through the hosted rendezvous (/api/vault). A random
    256-bit master key encrypts the vault body; that key is stored only
    wrapped, one envelope per enrolled unlocker: each account passkey (via
-   the WebAuthn PRF secret, HKDF salt 'intendant-vault-v1' — a domain
-   deliberately separate from fleet-sync) and a mandatory BIP39 recovery
-   phrase. Losing a passkey loses one envelope, not the vault. Every blob
+   the vault's OWN WebAuthn PRF salt 'intendant-vault-v1', evaluated as
+   the second salt of the login gesture — a PRF domain separate from
+   fleet-sync, so the two features never share key material; markerless
+   legacy envelopes derived from the fleet secret migrate on unlock) and
+   a mandatory BIP39 recovery phrase. Losing a passkey loses one envelope, not the vault. Every blob
    carries an HMAC under a key derived from the master key (see "Vault
    blob authentication" below), so the store cannot tamper, splice, or
    relabel. What remains to the store: withholding, or serving a stale
@@ -15223,6 +15263,13 @@ async function accessFleetRefreshProvenance() {
 
 const VAULT_LOCAL_KEY = 'intendant_vault_local_v1';
 const VAULT_HKDF_SALT = 'intendant-vault-v1';
+/* Dedicated vault PRF secret (salt 'intendant-vault-v1', evaluated as the
+   `second` PRF salt in the same passkey gesture as fleet-sync's `first`).
+   Envelopes wrapped under it carry `prf: 'vault-v1'`; markerless prf
+   envelopes are legacy (KEK derived from the FLEET secret) and are
+   re-wrapped onto the dedicated domain at first unlock. */
+const VAULT_PRF_SESSION_KEY = 'intendant_vault_prf_v1';
+const VAULT_PRF_ENVELOPE_MARK = 'vault-v1';
 /* The standard BIP39 English wordlist (2048 words). The phrase is
    generated client-side — the server never sees it. */
 const VAULT_BIP39_WORDLIST = 'abandon ability able about above absent absorb abstract absurd abuse access accident account accuse achieve acid acoustic acquire across act action actor actress actual adapt add addict address adjust admit adult advance advice aerobic affair afford afraid again age agent agree ahead aim air airport aisle alarm album alcohol alert alien all alley allow almost alone alpha already also alter always amateur amazing among amount amused analyst anchor ancient anger angle angry animal ankle announce annual another answer antenna antique anxiety any apart apology appear apple approve april arch arctic area arena argue arm armed armor army around arrange arrest arrive arrow art artefact artist artwork ask aspect assault asset assist assume asthma athlete atom attack attend attitude attract auction audit august aunt author auto autumn average avocado avoid awake aware away awesome awful awkward axis baby bachelor bacon badge bag balance balcony ball bamboo banana banner bar barely bargain barrel base basic basket battle beach bean beauty because become beef before begin behave behind believe below belt bench benefit best betray better between beyond bicycle bid bike bind biology bird birth bitter black blade blame blanket blast bleak bless blind blood blossom blouse blue blur blush board boat body boil bomb bone bonus book boost border boring borrow boss bottom bounce box boy bracket brain brand brass brave bread breeze brick bridge brief bright bring brisk broccoli broken bronze broom brother brown brush bubble buddy budget buffalo build bulb bulk bullet bundle bunker burden burger burst bus business busy butter buyer buzz cabbage cabin cable cactus cage cake call calm camera camp can canal cancel candy cannon canoe canvas canyon capable capital captain car carbon card cargo carpet carry cart case cash casino castle casual cat catalog catch category cattle caught cause caution cave ceiling celery cement census century cereal certain chair chalk champion change chaos chapter charge chase chat cheap check cheese chef cherry chest chicken chief child chimney choice choose chronic chuckle chunk churn cigar cinnamon circle citizen city civil claim clap clarify claw clay clean clerk clever click client cliff climb clinic clip clock clog close cloth cloud clown club clump cluster clutch coach coast coconut code coffee coil coin collect color column combine come comfort comic common company concert conduct confirm congress connect consider control convince cook cool copper copy coral core corn correct cost cotton couch country couple course cousin cover coyote crack cradle craft cram crane crash crater crawl crazy cream credit creek crew cricket crime crisp critic crop cross crouch crowd crucial cruel cruise crumble crunch crush cry crystal cube culture cup cupboard curious current curtain curve cushion custom cute cycle dad damage damp dance danger daring dash daughter dawn day deal debate debris decade december decide decline decorate decrease deer defense define defy degree delay deliver demand demise denial dentist deny depart depend deposit depth deputy derive describe desert design desk despair destroy detail detect develop device devote diagram dial diamond diary dice diesel diet differ digital dignity dilemma dinner dinosaur direct dirt disagree discover disease dish dismiss disorder display distance divert divide divorce dizzy doctor document dog doll dolphin domain donate donkey donor door dose double dove draft dragon drama drastic draw dream dress drift drill drink drip drive drop drum dry duck dumb dune during dust dutch duty dwarf dynamic eager eagle early earn earth easily east easy echo ecology economy edge edit educate effort egg eight either elbow elder electric elegant element elephant elevator elite else embark embody embrace emerge emotion employ empower empty enable enact end endless endorse enemy energy enforce engage engine enhance enjoy enlist enough enrich enroll ensure enter entire entry envelope episode equal equip era erase erode erosion error erupt escape essay essence estate eternal ethics evidence evil evoke evolve exact example excess exchange excite exclude excuse execute exercise exhaust exhibit exile exist exit exotic expand expect expire explain expose express extend extra eye eyebrow fabric face faculty fade faint faith fall false fame family famous fan fancy fantasy farm fashion fat fatal father fatigue fault favorite feature february federal fee feed feel female fence festival fetch fever few fiber fiction field figure file film filter final find fine finger finish fire firm first fiscal fish fit fitness fix flag flame flash flat flavor flee flight flip float flock floor flower fluid flush fly foam focus fog foil fold follow food foot force forest forget fork fortune forum forward fossil foster found fox fragile frame frequent fresh friend fringe frog front frost frown frozen fruit fuel fun funny furnace fury future gadget gain galaxy gallery game gap garage garbage garden garlic garment gas gasp gate gather gauge gaze general genius genre gentle genuine gesture ghost giant gift giggle ginger giraffe girl give glad glance glare glass glide glimpse globe gloom glory glove glow glue goat goddess gold good goose gorilla gospel gossip govern gown grab grace grain grant grape grass gravity great green grid grief grit grocery group grow grunt guard guess guide guilt guitar gun gym habit hair half hammer hamster hand happy harbor hard harsh harvest hat have hawk hazard head health heart heavy hedgehog height hello helmet help hen hero hidden high hill hint hip hire history hobby hockey hold hole holiday hollow home honey hood hope horn horror horse hospital host hotel hour hover hub huge human humble humor hundred hungry hunt hurdle hurry hurt husband hybrid ice icon idea identify idle ignore ill illegal illness image imitate immense immune impact impose improve impulse inch include income increase index indicate indoor industry infant inflict inform inhale inherit initial inject injury inmate inner innocent input inquiry insane insect inside inspire install intact interest into invest invite involve iron island isolate issue item ivory jacket jaguar jar jazz jealous jeans jelly jewel job join joke journey joy judge juice jump jungle junior junk just kangaroo keen keep ketchup key kick kid kidney kind kingdom kiss kit kitchen kite kitten kiwi knee knife knock know lab label labor ladder lady lake lamp language laptop large later latin laugh laundry lava law lawn lawsuit layer lazy leader leaf learn leave lecture left leg legal legend leisure lemon lend length lens leopard lesson letter level liar liberty library license life lift light like limb limit link lion liquid list little live lizard load loan lobster local lock logic lonely long loop lottery loud lounge love loyal lucky luggage lumber lunar lunch luxury lyrics machine mad magic magnet maid mail main major make mammal man manage mandate mango mansion manual maple marble march margin marine market marriage mask mass master match material math matrix matter maximum maze meadow mean measure meat mechanic medal media melody melt member memory mention menu mercy merge merit merry mesh message metal method middle midnight milk million mimic mind minimum minor minute miracle mirror misery miss mistake mix mixed mixture mobile model modify mom moment monitor monkey monster month moon moral more morning mosquito mother motion motor mountain mouse move movie much muffin mule multiply muscle museum mushroom music must mutual myself mystery myth naive name napkin narrow nasty nation nature near neck need negative neglect neither nephew nerve nest net network neutral never news next nice night noble noise nominee noodle normal north nose notable note nothing notice novel now nuclear number nurse nut oak obey object oblige obscure observe obtain obvious occur ocean october odor off offer office often oil okay old olive olympic omit once one onion online only open opera opinion oppose option orange orbit orchard order ordinary organ orient original orphan ostrich other outdoor outer output outside oval oven over own owner oxygen oyster ozone pact paddle page pair palace palm panda panel panic panther paper parade parent park parrot party pass patch path patient patrol pattern pause pave payment peace peanut pear peasant pelican pen penalty pencil people pepper perfect permit person pet phone photo phrase physical piano picnic picture piece pig pigeon pill pilot pink pioneer pipe pistol pitch pizza place planet plastic plate play please pledge pluck plug plunge poem poet point polar pole police pond pony pool popular portion position possible post potato pottery poverty powder power practice praise predict prefer prepare present pretty prevent price pride primary print priority prison private prize problem process produce profit program project promote proof property prosper protect proud provide public pudding pull pulp pulse pumpkin punch pupil puppy purchase purity purpose purse push put puzzle pyramid quality quantum quarter question quick quit quiz quote rabbit raccoon race rack radar radio rail rain raise rally ramp ranch random range rapid rare rate rather raven raw razor ready real reason rebel rebuild recall receive recipe record recycle reduce reflect reform refuse region regret regular reject relax release relief rely remain remember remind remove render renew rent reopen repair repeat replace report require rescue resemble resist resource response result retire retreat return reunion reveal review reward rhythm rib ribbon rice rich ride ridge rifle right rigid ring riot ripple risk ritual rival river road roast robot robust rocket romance roof rookie room rose rotate rough round route royal rubber rude rug rule run runway rural sad saddle sadness safe sail salad salmon salon salt salute same sample sand satisfy satoshi sauce sausage save say scale scan scare scatter scene scheme school science scissors scorpion scout scrap screen script scrub sea search season seat second secret section security seed seek segment select sell seminar senior sense sentence series service session settle setup seven shadow shaft shallow share shed shell sheriff shield shift shine ship shiver shock shoe shoot shop short shoulder shove shrimp shrug shuffle shy sibling sick side siege sight sign silent silk silly silver similar simple since sing siren sister situate six size skate sketch ski skill skin skirt skull slab slam sleep slender slice slide slight slim slogan slot slow slush small smart smile smoke smooth snack snake snap sniff snow soap soccer social sock soda soft solar soldier solid solution solve someone song soon sorry sort soul sound soup source south space spare spatial spawn speak special speed spell spend sphere spice spider spike spin spirit split spoil sponsor spoon sport spot spray spread spring spy square squeeze squirrel stable stadium staff stage stairs stamp stand start state stay steak steel stem step stereo stick still sting stock stomach stone stool story stove strategy street strike strong struggle student stuff stumble style subject submit subway success such sudden suffer sugar suggest suit summer sun sunny sunset super supply supreme sure surface surge surprise surround survey suspect sustain swallow swamp swap swarm swear sweet swift swim swing switch sword symbol symptom syrup system table tackle tag tail talent talk tank tape target task taste tattoo taxi teach team tell ten tenant tennis tent term test text thank that theme then theory there they thing this thought three thrive throw thumb thunder ticket tide tiger tilt timber time tiny tip tired tissue title toast tobacco today toddler toe together toilet token tomato tomorrow tone tongue tonight tool tooth top topic topple torch tornado tortoise toss total tourist toward tower town toy track trade traffic tragic train transfer trap trash travel tray treat tree trend trial tribe trick trigger trim trip trophy trouble truck true truly trumpet trust truth try tube tuition tumble tuna tunnel turkey turn turtle twelve twenty twice twin twist two type typical ugly umbrella unable unaware uncle uncover under undo unfair unfold unhappy uniform unique unit universe unknown unlock until unusual unveil update upgrade uphold upon upper upset urban urge usage use used useful useless usual utility vacant vacuum vague valid valley valve van vanish vapor various vast vault vehicle velvet vendor venture venue verb verify version very vessel veteran viable vibrant vicious victory video view village vintage violin virtual virus visa visit visual vital vivid vocal voice void volcano volume vote voyage wage wagon wait walk wall walnut want warfare warm warrior wash wasp waste water wave way wealth weapon wear weasel weather web wedding weekend weird welcome west wet whale what wheat wheel when where whip whisper wide width wife wild will win window wine wing wink winner winter wire wisdom wise wish witness wolf woman wonder wood wool word work world worry worth wrap wreck wrestle wrist write wrong yard year yellow you young youth zebra zero zone zoo';
@@ -15273,7 +15320,22 @@ async function vaultHkdfAesKey(secretBytes, info) {
   );
 }
 
-async function vaultPrfKek() {
+/* KEK from the dedicated vault PRF domain — what new envelopes use. */
+async function vaultPrfKekDedicated() {
+  const prfB64u = sessionStorage.getItem(VAULT_PRF_SESSION_KEY) || '';
+  if (!prfB64u) return null;
+  try {
+    return await vaultHkdfAesKey(dashboardBase64UrlToBytes(prfB64u), 'vault-kek');
+  } catch (err) {
+    console.warn('[vault] vault-PRF key derivation failed:', err?.message || err);
+    return null;
+  }
+}
+
+/* KEK from the fleet PRF secret — legacy: pre-two-salt envelopes were
+   wrapped under this. Kept for unlocking them (and as the wrap fallback
+   for authenticators that only evaluate one PRF salt). */
+async function vaultPrfKekLegacy() {
   const prfB64u = sessionStorage.getItem(FLEET_PRF_SESSION_KEY) || '';
   if (!prfB64u) return null;
   try {
@@ -15282,6 +15344,21 @@ async function vaultPrfKek() {
     console.warn('[vault] PRF key derivation failed:', err?.message || err);
     return null;
   }
+}
+
+/* KEK for wrapping a NEW envelope: [kek, marker]. Dedicated domain when
+   the authenticator evaluated both salts, legacy (markerless) otherwise. */
+async function vaultPrfKekForWrap() {
+  const dedicated = await vaultPrfKekDedicated();
+  if (dedicated) return [dedicated, VAULT_PRF_ENVELOPE_MARK];
+  return [await vaultPrfKekLegacy(), null];
+}
+
+/* KEK for OPENING an existing envelope, chosen by its marker. */
+async function vaultPrfKekForEnvelope(envelope) {
+  return envelope?.prf === VAULT_PRF_ENVELOPE_MARK
+    ? vaultPrfKekDedicated()
+    : vaultPrfKekLegacy();
 }
 
 /* Standard BIP39 seed stretch (PBKDF2-HMAC-SHA512, salt 'mnemonic',
@@ -15686,34 +15763,97 @@ async function vaultFinishUnlock(kBytes, envelopeId) {
 
 async function vaultTryPrfUnlock({ silent = false } = {}) {
   if (!vaultState.blob) return false;
-  const kek = await vaultPrfKek();
-  if (!kek) {
-    if (!silent) vaultState.lastError = 'No passkey secret in this session — sign in with the account passkey, or use the recovery phrase.';
-    return false;
-  }
+  let sawKek = false;
   for (const envelope of vaultState.blob.envelopes || []) {
     if (envelope.kind !== 'prf') continue;
+    // Each envelope names its PRF domain: marked = dedicated vault salt,
+    // markerless = legacy fleet-secret derivation.
+    const kek = await vaultPrfKekForEnvelope(envelope);
+    if (!kek) continue;
+    sawKek = true;
     const kBytes = await vaultUnwrapMasterKey(kek, envelope);
-    if (kBytes) return vaultFinishUnlock(kBytes, envelope.id);
+    if (kBytes) {
+      const unlocked = await vaultFinishUnlock(kBytes, envelope.id);
+      if (unlocked && envelope.prf !== VAULT_PRF_ENVELOPE_MARK) {
+        vaultMigratePrfEnvelope(envelope.id);
+      }
+      return unlocked;
+    }
   }
-  if (!silent) vaultState.lastError = 'This passkey is not enrolled in the vault yet — unlock with the recovery phrase, then enroll it.';
+  if (!silent) {
+    vaultState.lastError = sawKek
+      ? 'This passkey is not enrolled in the vault yet — unlock with the recovery phrase, then enroll it.'
+      : 'No passkey secret in this session — sign in with the account passkey, or use the recovery phrase.';
+  }
   return false;
 }
 
+/* Re-wrap a legacy (fleet-derived) prf envelope onto the dedicated vault
+   PRF domain after a successful unlock. Quiet best-effort: rides the
+   publish chain; a failure just means the envelope migrates on a later
+   unlock instead. */
+function vaultMigratePrfEnvelope(envelopeId) {
+  vaultPublishChain = vaultPublishChain
+    .then(async () => {
+      if (!vaultState.kBytes || !vaultState.blob) return false;
+      const [kek, mark] = await vaultPrfKekForWrap();
+      if (!kek || mark !== VAULT_PRF_ENVELOPE_MARK) return false;
+      const envelopes = [];
+      let migrated = false;
+      for (const envelope of vaultState.blob.envelopes || []) {
+        if (envelope.kind === 'prf' && envelope.id === envelopeId && !envelope.prf) {
+          envelopes.push({
+            ...envelope,
+            prf: VAULT_PRF_ENVELOPE_MARK,
+            ...(await vaultWrapMasterKey(kek, vaultState.kBytes)),
+          });
+          migrated = true;
+        } else {
+          envelopes.push(envelope);
+        }
+      }
+      if (!migrated) return false;
+      vaultState.blob = { ...vaultState.blob, envelopes };
+      await vaultPersist();
+      console.info('[vault] passkey envelope migrated to the dedicated vault PRF domain');
+      return true;
+    })
+    .catch(err => {
+      console.warn('[vault] PRF envelope migration deferred:', err?.message || err);
+      return false;
+    });
+}
+
 /* A local WebAuthn assertion purely to (re-)evaluate the PRF extension —
-   no server round-trip; the fresh secret also re-arms fleet-sync. */
+   no server round-trip; the fresh secrets also re-arm fleet-sync. Both
+   salts in one gesture: `first` = fleet-sync, `second` = the vault's own
+   domain. */
 async function vaultRequestPrfSecret() {
   const challenge = crypto.getRandomValues(new Uint8Array(32));
   const credential = await navigator.credentials.get({
     publicKey: {
       challenge,
       userVerification: 'preferred',
-      extensions: { prf: { eval: { first: new TextEncoder().encode('intendant-fleet-sync-v1') } } },
+      extensions: {
+        prf: {
+          eval: {
+            first: new TextEncoder().encode('intendant-fleet-sync-v1'),
+            second: new TextEncoder().encode(VAULT_HKDF_SALT),
+          },
+        },
+      },
     },
   });
-  const first = credential?.getClientExtensionResults?.()?.prf?.results?.first;
+  const results = credential?.getClientExtensionResults?.()?.prf?.results;
+  const first = results?.first;
   if (!first) return false;
   sessionStorage.setItem(FLEET_PRF_SESSION_KEY, dashboardBytesToBase64Url(new Uint8Array(first)));
+  if (results?.second) {
+    sessionStorage.setItem(
+      VAULT_PRF_SESSION_KEY,
+      dashboardBytesToBase64Url(new Uint8Array(results.second))
+    );
+  }
   accessFleetAesKey = null;
   return true;
 }
@@ -15769,13 +15909,14 @@ async function vaultCreate(phrase) {
     ...(await vaultWrapMasterKey(await vaultPhraseKek(phrase), kBytes)),
   });
   let matched = null;
-  const prfKek = await vaultPrfKek();
+  const [prfKek, prfMark] = await vaultPrfKekForWrap();
   if (prfKek) {
     const envelope = {
       kind: 'prf',
       id: vaultRandomId('env'),
       label: `Passkey enrolled ${new Date(now).toISOString().slice(0, 10)}`,
       created_unix_ms: now,
+      ...(prfMark ? { prf: prfMark } : {}),
       ...(await vaultWrapMasterKey(prfKek, kBytes)),
     };
     envelopes.push(envelope);
@@ -15923,14 +16064,16 @@ async function vaultEnrollThisPasskey() {
   if (!vaultState.kBytes) return;
   vaultState.lastError = '';
   try {
-    let kek = await vaultPrfKek();
+    let [kek, mark] = await vaultPrfKekForWrap();
     if (!kek) {
       if (!(await vaultRequestPrfSecret())) throw new Error('this authenticator did not return a PRF secret');
-      kek = await vaultPrfKek();
+      [kek, mark] = await vaultPrfKekForWrap();
     }
     if (!kek) throw new Error('no PRF secret available');
     for (const envelope of vaultState.blob.envelopes || []) {
-      if (envelope.kind === 'prf' && (await vaultUnwrapMasterKey(kek, envelope))) {
+      if (envelope.kind !== 'prf') continue;
+      const envelopeKek = await vaultPrfKekForEnvelope(envelope);
+      if (envelopeKek && (await vaultUnwrapMasterKey(envelopeKek, envelope))) {
         vaultState.matchedEnvelopeId = envelope.id;
         renderAccessVaultSection();
         return;
@@ -15942,6 +16085,7 @@ async function vaultEnrollThisPasskey() {
       id: vaultRandomId('env'),
       label: `Passkey enrolled ${new Date(now).toISOString().slice(0, 10)}`,
       created_unix_ms: now,
+      ...(mark ? { prf: mark } : {}),
       ...(await vaultWrapMasterKey(kek, vaultState.kBytes)),
     };
     vaultState.blob = { ...vaultState.blob, envelopes: [...(vaultState.blob.envelopes || []), envelope] };
@@ -16236,7 +16380,17 @@ function vaultLeaseTransportReady() {
   if (!DASHBOARD_CONNECT_MODE) return false;
   try {
     const status = window.intendantDashboardControl?.status?.();
-    return Boolean(status?.connected && status?.verifiedBinding?.ok);
+    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
+    // Leases need the credential RPC family. A daemon that advertises its
+    // control surface but not these methods is too old — report
+    // unsupported instead of firing calls that fail one by one. An empty
+    // list means the hello_ack hasn't landed yet: fall through and let
+    // the RPCs answer.
+    const features = status.controlFeatures;
+    if (Array.isArray(features) && features.length) {
+      return features.includes('api_credential_lease_status');
+    }
+    return true;
   } catch {
     return false;
   }
@@ -32428,7 +32582,7 @@ function normalizeOptionalCodexSandbox(mode) {
 
 function normalizeOptionalCodexApprovalPolicy(policy) {
   const v = String(policy || '').trim();
-  return ['on-request', 'never', 'untrusted', 'on-failure'].includes(v) ? v : '';
+  return ['on-request', 'never', 'untrusted'].includes(v) ? v : '';
 }
 
 function sessionConfigExplicitSandboxMode(meta = {}) {
@@ -32629,12 +32783,51 @@ function openSessionConfigModal(sessionOrId) {
   if (approvalSel) approvalSel.value = sessionConfigExplicitApprovalPolicy(meta);
   if (archiveRow) archiveRow.style.display = source === 'codex' ? '' : 'none';
   if (archiveSel) archiveSel.value = sessionConfigExplicitArchiveMode(meta);
+  const isClaude = source === 'claude-code';
+  for (const rowId of ['session-config-claude-model-row', 'session-config-claude-permission-row',
+    'session-config-claude-tools-row', 'session-config-claude-effort-row']) {
+    const row = document.getElementById(rowId);
+    if (row) row.style.display = isClaude ? '' : 'none';
+  }
+  if (isClaude) {
+    // Pins prefill; missing pin = inherit. A pinned model that isn't one
+    // of the aliases lands in the Custom row.
+    const aliases = ['fable', 'opus', 'sonnet', 'haiku'];
+    const pinnedModel = String(meta.claude_model || meta.claudeModel || '').trim();
+    const modelSel = document.getElementById('session-config-claude-model');
+    const customInput = document.getElementById('session-config-claude-model-custom');
+    if (modelSel) {
+      modelSel.value = !pinnedModel ? 'inherit'
+        : (aliases.includes(pinnedModel) ? pinnedModel : '__custom__');
+    }
+    if (customInput) {
+      customInput.value = pinnedModel && !aliases.includes(pinnedModel) ? pinnedModel : '';
+    }
+    const modeSel = document.getElementById('session-config-claude-permission-mode');
+    if (modeSel) {
+      modeSel.value = String(meta.claude_permission_mode || meta.claudePermissionMode || '').trim() || 'inherit';
+    }
+    const toolsInput = document.getElementById('session-config-claude-allowed-tools');
+    if (toolsInput) {
+      const tools = meta.claude_allowed_tools ?? meta.claudeAllowedTools;
+      toolsInput.value = Array.isArray(tools)
+        ? (tools.length ? tools.join(', ') : 'all')
+        : '';
+    }
+    const effortSel = document.getElementById('session-config-claude-effort');
+    if (effortSel) {
+      effortSel.value = String(meta.claude_effort || meta.claudeEffort || '').trim() || 'inherit';
+    }
+  }
+  updateSessionConfigClaudeCustomRow();
   const status = document.getElementById('session-config-status');
   if (status) {
     status.className = 'session-config-status';
     status.textContent = source === 'codex'
       ? 'Managed requires a patched Codex binary. Save & restart applies changes now.'
-      : 'Save & restart applies changes now.';
+      : (isClaude
+        ? 'Save applies model & permissions to the live session; tools & effort apply at the next launch (or Save & restart).'
+        : 'Save & restart applies changes now.');
   }
   const modal = document.getElementById('session-config-modal');
   if (modal) modal.style.display = 'flex';
@@ -32721,7 +32914,8 @@ function handleSessionConfigResult(result) {
     pending.sandboxMode,
     pending.approvalPolicy,
     pending.mode,
-    pending.archiveMode
+    pending.archiveMode,
+    pending.claudeForm
   );
   scheduleSessionsMetadataRefresh(200);
   showControlToast('success', pending.restart ? 'Launch config saved; restarting session' : 'Launch config saved');
@@ -32738,7 +32932,31 @@ function handleSessionConfigResult(result) {
   if (pending.restart) restartSessionWindowAction(restartSessionId);
 }
 
-function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mode, archiveMode) {
+// Mirror the just-saved claude pins onto a cached row / live meta with the
+// wire's sentinel semantics ('inherit' clears; tools 'all' pins []).
+function applyClaudePinsLocal(target, claudeForm, { snake }) {
+  if (!claudeForm) return;
+  const keys = snake
+    ? { model: 'claude_model', mode: 'claude_permission_mode', tools: 'claude_allowed_tools', effort: 'claude_effort' }
+    : { model: 'claudeModel', mode: 'claudePermissionMode', tools: 'claudeAllowedTools', effort: 'claudeEffort' };
+  const setOrClear = (key, value) => {
+    if (value === 'inherit' || value === '') delete target[key];
+    else target[key] = value;
+  };
+  setOrClear(keys.model, claudeForm.model);
+  setOrClear(keys.mode, claudeForm.permissionMode);
+  setOrClear(keys.effort, claudeForm.effort);
+  if (claudeForm.allowedTools === 'inherit' || claudeForm.allowedTools === '') {
+    delete target[keys.tools];
+  } else if (claudeForm.allowedTools === 'all' || claudeForm.allowedTools === '*') {
+    target[keys.tools] = [];
+  } else {
+    target[keys.tools] = claudeForm.allowedTools
+      .split(',').map(rule => rule.trim()).filter(Boolean);
+  }
+}
+
+function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mode, archiveMode, claudeForm) {
   const ids = Array.from(new Set([
     meta.sessionId,
     meta.backendSessionId,
@@ -32760,6 +32978,9 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
         codexContextArchive: archiveMode || '',
       } : {}),
     };
+    if (meta.source === 'claude-code') {
+      applyClaudePinsLocal(next, claudeForm, { snake: false });
+    }
     sessionMetadataById.set(id, next);
     if (sessionWindows.has(id)) updateSessionWindow(id, next);
   }
@@ -32801,9 +33022,36 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
         delete session.codex_context_archive;
       }
     }
+    if (meta.source === 'claude-code') {
+      applyClaudePinsLocal(session, claudeForm, { snake: true });
+    }
   }
   persistSessionWindowState();
 }
+
+// The Claude launch-config form, read with the wire's sentinel semantics.
+function sessionConfigClaudeFormValues() {
+  const modelChoice = document.getElementById('session-config-claude-model')?.value || 'inherit';
+  const custom = document.getElementById('session-config-claude-model-custom')?.value.trim() || '';
+  const model = modelChoice === '__custom__' ? (custom || 'inherit') : modelChoice;
+  const permissionMode = document.getElementById('session-config-claude-permission-mode')?.value || 'inherit';
+  const toolsRaw = document.getElementById('session-config-claude-allowed-tools')?.value.trim() || '';
+  const allowedTools = toolsRaw === '' ? 'inherit' : toolsRaw;
+  const effort = document.getElementById('session-config-claude-effort')?.value || 'inherit';
+  return { model, permissionMode, allowedTools, effort };
+}
+
+function updateSessionConfigClaudeCustomRow() {
+  const sel = document.getElementById('session-config-claude-model');
+  const row = document.getElementById('session-config-claude-model-custom-row');
+  if (!sel || !row) return;
+  const claudeVisible = document.getElementById('session-config-claude-model-row')?.style.display !== 'none';
+  row.style.display = claudeVisible && sel.value === '__custom__' ? '' : 'none';
+}
+function onSessionConfigClaudeModelChange() {
+  updateSessionConfigClaudeCustomRow();
+}
+window.onSessionConfigClaudeModelChange = onSessionConfigClaudeModelChange;
 
 function saveSessionConfigModal(options = {}) {
   if (!sessionConfigEditing || !app) return;
@@ -32821,6 +33069,10 @@ function saveSessionConfigModal(options = {}) {
   const archiveMode = normalizeContextArchiveModeOptional(
     document.getElementById('session-config-context-archive')?.value || ''
   );
+  // Claude pins reflect the form exactly: every field is sent as a value or
+  // the explicit 'inherit' clear sentinel (a missing field would silently
+  // KEEP an existing pin — see the supervisor's clear-before-merge dance).
+  const claudeForm = sessionConfigClaudeFormValues();
   const payload = {
     action: 'configure_session_agent',
     session_id: sessionConfigEditing.sessionId,
@@ -32833,6 +33085,12 @@ function saveSessionConfigModal(options = {}) {
       codex_approval_policy: approvalPolicy || 'inherit',
       codex_managed_context: mode || 'inherit',
       codex_context_archive: archiveMode || 'inherit',
+    } : {}),
+    ...(sessionConfigEditing.source === 'claude-code' ? {
+      claude_model: claudeForm.model,
+      claude_permission_mode: claudeForm.permissionMode,
+      claude_allowed_tools: claudeForm.allowedTools,
+      claude_effort: claudeForm.effort,
     } : {}),
   };
   try {
@@ -32855,6 +33113,7 @@ function saveSessionConfigModal(options = {}) {
       approvalPolicy,
       mode,
       archiveMode,
+      claudeForm: sessionConfigEditing.source === 'claude-code' ? claudeForm : null,
       restart: options.restart === true,
       timeoutHandle: setTimeout(() => {
         const pending = sessionConfigSavePending;
@@ -32876,6 +33135,25 @@ function saveSessionConfigModal(options = {}) {
       status.textContent = options.restart === true ? 'Saving launch config before restart...' : 'Saving launch config...';
     }
     dispatchControlMsg(payload);
+    // Model & permission pins also apply LIVE to an attached claude session
+    // (verified set_model / set_permission_mode control requests) — unless a
+    // restart is coming anyway, which respawns with the saved pins.
+    if (
+      sessionConfigEditing.source === 'claude-code' &&
+      options.restart !== true &&
+      !sessionWindowIsDetached(sessionConfigEditing.sessionId)
+    ) {
+      if (claudeForm.model !== 'inherit') {
+        dispatchCodexThreadAction('model', { model: claudeForm.model }, sessionConfigEditing.sessionId);
+      }
+      if (claudeForm.permissionMode !== 'inherit') {
+        dispatchCodexThreadAction(
+          'permission-mode',
+          { mode: claudeForm.permissionMode },
+          sessionConfigEditing.sessionId,
+        );
+      }
+    }
   } catch (e) {
     if (sessionConfigSavePending?.timeoutHandle) {
       clearTimeout(sessionConfigSavePending.timeoutHandle);
@@ -38609,7 +38887,7 @@ function accessIamEnforcementReason(iam) {
 }
 
 function accessFallbackIamRoles() {
-  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'];
+  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'credentials.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'];
   return [{
     id: 'role:root',
     label: 'Root',
@@ -38667,11 +38945,18 @@ function accessFallbackIamRoles() {
     permissions: ['presence.read', 'stats.read', 'access.inspect', 'filesystem.read', 'filesystem.write'],
     source: 'builtin',
   }, {
+    id: 'role:peer-user',
+    label: 'Peer user',
+    status: 'enforced',
+    summary: "Reach connected peers through this daemon (peer files, terminal, display tunnels); what each tunnel may do is decided by that peer's grants for this daemon. Combine with local roles as needed.",
+    permissions: ['presence.read', 'stats.read', 'access.inspect', 'peer.inspect', 'peer.use'],
+    source: 'builtin',
+  }, {
     id: 'role:operator',
     label: 'Operator',
     status: 'enforced',
-    summary: 'Operate sessions, display, shell, files, and approvals without access/settings administration.',
-    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'filesystem.read', 'filesystem.write'],
+    summary: 'Operate sessions, display, shell, files, peers, and approvals without access/settings administration.',
+    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'credentials.manage', 'filesystem.read', 'filesystem.write'],
     source: 'builtin',
   }];
 }
@@ -38686,6 +38971,7 @@ function accessFallbackPolicyIdForRole(roleId) {
     'role:terminal': 'policy:terminal',
     'role:files-read': 'policy:files-read',
     'role:files-write': 'policy:files-write',
+    'role:peer-user': 'policy:peer-user',
     'role:operator': 'policy:operator',
   }[roleId] || `policy:${String(roleId || 'role').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase()}`;
 }
@@ -38723,7 +39009,8 @@ function accessFallbackPermissions() {
     'access.inspect': ['Access inspect', 'access', 'Read targets, principals, grants, policies, transports, and access architecture notes.'],
     'access.manage': ['Access manage', 'access', 'Approve, revoke, or change access grants.'],
     'peer.inspect': ['Peer inspect', 'peer', 'Read configured peer routes and peer eligibility.'],
-    'peer.manage': ['Peer manage', 'peer', 'Create, remove, pair, and use daemon peer routes.'],
+    'peer.manage': ['Peer manage', 'peer', 'Administer peer relationships: create, remove, and pair daemon peer routes.'],
+    'peer.use': ['Peer use', 'peer', "Act through connected peers (files, terminal, display tunnels, quick controls); the receiving peer's own grants bound each tunnel."],
     'session.inspect': ['Session inspect', 'session', 'Read session lists, logs, reports, recordings, and replay metadata.'],
     'session.manage': ['Session manage', 'session', 'Delete, rewind, prune, upload to, or otherwise mutate sessions.'],
     'terminal.use': ['Terminal (legacy)', 'terminal', 'Legacy aggregate: implies terminal.view, terminal.write, and shell.spawn.'],
@@ -38731,6 +39018,7 @@ function accessFallbackPermissions() {
     'terminal.write': ['Terminal write', 'terminal', 'Type into, resize, and close shell sessions you can see.'],
     'shell.spawn': ['Shell spawn', 'terminal', 'Create new shell sessions on this daemon.'],
     'settings.manage': ['Settings manage', 'settings', 'Read or write daemon settings and API keys.'],
+    'credentials.manage': ['Credentials manage', 'credentials', 'Grant, renew, revoke, and inspect credential leases; register client egress.'],
     'runtime.control': ['Runtime control', 'runtime', 'Use runtime-control surfaces such as TUI, media, and recording controls.'],
     'filesystem.read': ['Filesystem read', 'filesystem', 'Stat, list, and read files through dashboard APIs.'],
     'filesystem.write': ['Filesystem write', 'filesystem', 'Create directories or write uploaded file content.'],
@@ -39492,7 +39780,7 @@ const ACCESS_GRANT_KIND_CHOICES = [{
 
 const ACCESS_ROLE_PICKER_ORDER = [
   'role:scoped-human', 'role:observer', 'role:session-reader', 'role:files-read',
-  'role:files-write', 'role:terminal', 'role:operator', 'role:root',
+  'role:files-write', 'role:terminal', 'role:peer-user', 'role:operator', 'role:root',
 ];
 
 /* Grant fanout: the daemons this page can apply a grant to, each with the
@@ -40243,6 +40531,7 @@ const ACCESS_ROLE_META = {
   'role:files-write': { cls: 'role-files', short: 'Browse, download, and upload files.' },
   'role:files-read': { cls: 'role-files', short: 'Browse and download files, read-only.' },
   'role:session-reader': { cls: 'role-sessions', short: 'Read sessions, logs, and status.' },
+  'role:peer-user': { cls: 'role-peer', short: 'Act through connected peers; each peer\'s own grants bound the reach.' },
   'role:observer': { cls: 'role-observer', short: 'Watch read-only, including live displays.' },
   'role:scoped-human': { cls: 'role-scoped', short: 'Inspect the access model only. A safe first grant.' },
   'role:peer-profile': { cls: 'role-peer', short: 'Daemon-to-daemon authority bounded by the peer profile.' },
@@ -52388,6 +52677,10 @@ class DashboardControlTransport {
   handleFrame(msg) {
     if (msg.t === 'hello_ack') {
       console.info('[dashboard-control] hello_ack', msg.session_id || '');
+      // The daemon advertises its control-RPC surface here; readiness
+      // checks (vault leases, egress) consult it to distinguish
+      // "daemon too old to support this" from "denied for this session".
+      this.controlFeatures = Array.isArray(msg.features) ? msg.features : [];
       return;
     }
     if (msg.t === 'egress_request' || msg.t === 'egress_request_chunk' ||
@@ -53247,6 +53540,7 @@ class DashboardControlTransport {
       connected,
       pcState: this.pc?.connectionState || '',
       channelState: this.channel?.readyState || '',
+      controlFeatures: this.controlFeatures || [],
       sessionId: this.sessionId,
       verifiedBinding: this.verifiedBinding,
       claimedDaemonPublicKey: this.claimedDaemonPublicKey,
@@ -54384,13 +54678,11 @@ function isLoopbackUrl(url) {
 const DISPLAY_SIMULCAST_RIDS = ['f'];
 
 // Inject `a=rid:<rid> recv` lines + `a=simulcast:recv <rids>` into
-// the m=video section of an Offer SDP. Mirrors the server-side
-// answer-side simulcast advertisement so the browser→server WebRTC
-// negotiation surfaces our 3-layer simulcast track. Called by both
-// `DisplaySlot.connect()` (local display) and
-// `PeerDisplayConnection.connect()` (federated peer display) BEFORE
-// `setLocalDescription` so the local description matches the wire
-// payload exactly.
+// the m=video section of a local DisplaySlot Offer SDP. The default
+// `DISPLAY_SIMULCAST_RIDS` is `['f']`; switching it to `['f','h','q']`
+// opts into the experimental multi-RID path. Federated
+// `PeerDisplayConnection` offers intentionally omit recv-simulcast so the
+// peer answers with a single floor RID.
 //
 // **Mirror of**: `inject_recv_simulcast_into_video_offer` in
 // `src/bin/caller/display/forward.rs`. The Rust impl is the
@@ -57086,22 +57378,21 @@ class PeerDisplayConnection {
     // packet and survive better; this A/B confirms whether the block is
     // H.264-specific or lower in RTP/media.
     //
-    // **Flag gate (`[webrtc].federation_allow_h264`)**: the IDR-reassembly
-    // math above assumed periodic fat IDRs. The peer's H.264 encoder now
-    // uses *intra refresh* (no post-seed IDRs — recovery spread across the
-    // GOP via small slices + recovery-point SEI), which removes the
-    // un-reassemblable access unit that motivated the pin. When the
-    // operator opts in via `federation_allow_h264=true`, PREFER H.264 by
-    // reordering the receiver's codec list so every `video/H264` variant
-    // comes FIRST (then VP8 and the rest, preserved in their original
-    // relative order as a fallback) and applying it via
-    // `setCodecPreferences`. Simply skipping the pin is not enough: the
-    // browser default order is not uniform across platforms — a Linux
-    // Chrome happened to put VP8 first, so federation kept landing on VP8
-    // and never exercised the peer's intra-refresh H.264 (libx264/NVENC)
-    // path. Putting H.264 first in the offer makes the peer answer with
-    // H.264 whenever it can encode it. Default false keeps VP8 the
-    // federation default (explicit VP8 pin, unchanged below).
+    // **Flag gate (`[webrtc].federation_allow_h264`)**: opt-in H.264 is
+    // viable only through the current loss-resilience policy: federated
+    // H.264 uses a quarter-resolution / capped-bitrate layer, periodic
+    // IDRs with same-SSRC NACK retransmit, and small slices to keep
+    // recovery bounded under relay loss. When the operator opts in via
+    // `federation_allow_h264=true`, PREFER H.264 by reordering the
+    // receiver's codec list so every `video/H264` variant comes FIRST
+    // (then VP8 and the rest, preserved in their original relative order
+    // as a fallback) and applying it via `setCodecPreferences`. Simply
+    // skipping the pin is not enough: the browser default order is not
+    // uniform across platforms — a Linux Chrome happened to put VP8 first,
+    // so federation kept landing on VP8 and never exercised the peer's
+    // federated H.264 layer. Putting H.264 first in the offer makes the
+    // peer answer with H.264 whenever it can encode it. Default false
+    // keeps VP8 the federation default (explicit VP8 pin, unchanged below).
     //
     // `RTCRtpReceiver.getCapabilities('video')` returns null on browsers
     // that don't implement it (rare in 2026 — Safari/WebKit, Chrome,
@@ -57390,9 +57681,9 @@ class PeerDisplayConnection {
       // Same diagnostic confirmed video renders end-to-end as soon
       // as the offer requests a single-encoding track.
       //
-      // Local DisplaySlot.connect (static/app.html:7808) STILL
-      // injects simulcast — its codec path (VP8 first) supports
-      // the multi-RID layout cleanly. This skip is federated-only.
+      // Local DisplaySlot.connect still injects recv-simulcast through
+      // `injectRecvSimulcastIntoVideoOffer`: default `f`, opt-in `f;h;q`.
+      // This skip is federated-only.
       //
       // Long-term: patch rtc 0.9 SDP generator to emit per-RID
       // SSRCs (or upgrade rtc), then restore the injection here.
@@ -58457,6 +58748,26 @@ const PEER_PROFILE_OPTIONS = [
     summary: 'Presence, stats, messages, and task delegation.',
   },
   {
+    profile: 'session-reader',
+    label: 'Session reader',
+    summary: 'Presence, stats, and session inspection (lists, logs, reports). Read-only.',
+  },
+  {
+    profile: 'file-reader',
+    label: 'File reader',
+    summary: 'Presence, stats, and read-only filesystem access.',
+  },
+  {
+    profile: 'file-operator',
+    label: 'File operator',
+    summary: 'Presence, stats, and filesystem read/write.',
+  },
+  {
+    profile: 'terminal-operator',
+    label: 'Terminal operator',
+    summary: 'Presence, stats, session inspection, and shared shells (view, type, spawn).',
+  },
+  {
     profile: 'stats',
     label: 'Stats',
     summary: 'Presence and usage statistics only.',
@@ -58480,6 +58791,16 @@ function peerProfileMeta(profile) {
     'stats-only': 'stats',
     'display-read-only': 'read-only-display',
     spectator: 'shared-session-spectator',
+    'sessions-read': 'session-reader',
+    'session-inspect': 'session-reader',
+    'logs-read': 'session-reader',
+    'files-read': 'file-reader',
+    'filesystem-read-only': 'file-reader',
+    files: 'file-operator',
+    'filesystem-operator': 'file-operator',
+    'peer-terminal-operator': 'terminal-operator',
+    terminal: 'terminal-operator',
+    shell: 'terminal-operator',
     operator: 'peer-operator',
     admin: 'peer-root',
     'admin-peer': 'peer-root',
@@ -66061,12 +66382,12 @@ function normalizeCodexSandboxOptional(mode) {
 
 function normalizeCodexApprovalPolicy(policy) {
   const v = String(policy || '').trim();
-  return ['on-request', 'never', 'untrusted', 'on-failure'].includes(v) ? v : 'on-request';
+  return ['on-request', 'never', 'untrusted'].includes(v) ? v : 'on-request';
 }
 
 function normalizeCodexApprovalPolicyOptional(policy) {
   const v = String(policy || '').trim();
-  return ['on-request', 'never', 'untrusted', 'on-failure'].includes(v) ? v : '';
+  return ['on-request', 'never', 'untrusted'].includes(v) ? v : '';
 }
 
 function normalizeCodexServiceTier(tier) {

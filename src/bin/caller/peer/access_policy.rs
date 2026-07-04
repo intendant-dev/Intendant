@@ -472,7 +472,10 @@ pub fn federation_http_operation(method: &str, path: &str) -> Option<PeerOperati
     // effects through the dashboard-control tunnel it may already open.
     // Registry and pairing mutations stay peer.manage.
     if method == "POST" {
-        let mut segments = path.strip_prefix("/api/peers/").into_iter().flat_map(|rest| rest.split('/'));
+        let mut segments = path
+            .strip_prefix("/api/peers/")
+            .into_iter()
+            .flat_map(|rest| rest.split('/'));
         if let (Some(id), Some(op), None) = (segments.next(), segments.next(), segments.next()) {
             if !id.is_empty()
                 && matches!(
@@ -850,7 +853,10 @@ mod tests {
             Some(PeerOperation::PeerManage)
         );
         assert_eq!(
-            federation_http_operation("GET", "/api/peers/intendant:peer-b/dashboard-control-webrtc"),
+            federation_http_operation(
+                "GET",
+                "/api/peers/intendant:peer-b/dashboard-control-webrtc"
+            ),
             Some(PeerOperation::PeerInspect)
         );
         assert_eq!(
@@ -858,9 +864,18 @@ mod tests {
             Some(PeerOperation::PeerManage)
         );
         // Only the admin peer profile may use relays transitively.
-        assert!(profile_allows_operation("peer-root", PeerOperation::PeerUse));
-        assert!(!profile_allows_operation("file-operator", PeerOperation::PeerUse));
-        assert!(!profile_allows_operation("peer-operator", PeerOperation::PeerUse));
+        assert!(profile_allows_operation(
+            "peer-root",
+            PeerOperation::PeerUse
+        ));
+        assert!(!profile_allows_operation(
+            "file-operator",
+            PeerOperation::PeerUse
+        ));
+        assert!(!profile_allows_operation(
+            "peer-operator",
+            PeerOperation::PeerUse
+        ));
     }
 
     #[test]

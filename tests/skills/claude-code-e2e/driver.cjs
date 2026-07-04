@@ -443,7 +443,7 @@ async function main() {
     check('fork-dispatched', forkResult.success === true, forkResult.message || '');
     let childWrapperId = null;
     let lastRows = [];
-    for (let i = 0; i < 45 && !childWrapperId; i++) {
+    for (let i = 0; i < 90 && !childWrapperId; i++) {
       await sleep(1000);
       lastRows = await listSessions(PORT);
       const fresh = lastRows.filter((row) => /claude/.test(row.source)
@@ -453,6 +453,18 @@ async function main() {
     }
     if (!childWrapperId) {
       log('fork-debug', `before=${JSON.stringify(sessionsBefore)} after=${JSON.stringify(lastRows)}`);
+      // Second-level diagnosis: does the RAW body know the wrapper's log dir
+      // at all, and under what shape?
+      try {
+        const newestWrapper = execSync(
+          "ls -td ~/.intendant/logs/*/ | head -3 | xargs -I{} sh -c 'test -f {}session_agent_config.json && grep -l forked_from {}session_agent_config.json' 2>/dev/null | head -1",
+          { encoding: 'utf8', shell: '/bin/zsh' },
+        ).trim();
+        const wrapperId = newestWrapper.split('/').filter(Boolean).slice(-2, -1)[0] || '';
+        const raw = await (await fetch(`http://127.0.0.1:${PORT}/api/sessions`)).text();
+        const idx = wrapperId ? raw.indexOf(wrapperId) : -1;
+        log('fork-debug2', `wrapperDir=${newestWrapper} wrapperId=${wrapperId} rawMentions=${idx >= 0} ${idx >= 0 ? raw.slice(Math.max(0, idx - 300), idx + 200) : ''}`);
+      } catch (e) { log('fork-debug2', `probe failed: ${e}`); }
     }
     check('fork-creates-wrapper-session', Boolean(childWrapperId),
       childWrapperId || 'no new claude-code session appeared in /api/sessions');

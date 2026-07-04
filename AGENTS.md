@@ -128,14 +128,19 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
 - TLS/cert code is **pure-Rust `ring`/`rcgen`/`rustls`** (`web_tls.rs`, `access/certs.rs`) — no OpenSSL; prefer that path when touching crypto/cert code
 - Tests live in inline `#[cfg(test)]` modules only
 - WASM boundary: `serde_wasm_bindgen` with `serialize_maps_as_objects(true)`
-- Pure-safe Rust by default. The Unix (macOS / Linux) code paths contain no
-  `unsafe` beyond a handful of well-documented libc existence/identity probes
-  in `platform.rs` and the macOS Accessibility bindings in `ax.rs` (raw
-  `accessibility-sys` FFI wrapped once there — no safe wrapper crate exists
-  without dragging in a duplicate `core-graphics`/legacy `objc` stack; every
-  block is type-checked, `// SAFETY:`-commented, and RAII-managed via
-  `core-foundation` `TCFType` wrappers — do not add AX `unsafe` outside that
-  module). The Windows backends are the other deliberate exception: capture,
+- Pure-safe Rust by default. The Unix (macOS / Linux) code paths keep `unsafe`
+  confined to documented islands: small platform probes/signals and display or
+  identity queries in `platform.rs`; macOS Accessibility bindings in `ax.rs`
+  (raw `accessibility-sys` FFI wrapped once there — no safe wrapper crate exists
+  without dragging in a duplicate `core-graphics`/legacy `objc` stack); and the
+  Vortex direct POSIX shared-memory bridge in `live_audio.rs` (`shm_open`,
+  `mmap`, and raw ring-buffer access to the Vortex HAL plugin's shared state).
+  Every unsafe block must be type-checked, `// SAFETY:`-commented, and kept as
+  small as the FFI call or raw-pointer access it wraps; AX object lifetimes are
+  RAII-managed via `core-foundation` `TCFType` wrappers. Do not add AX `unsafe`
+  outside `ax.rs`, Vortex-shm `unsafe` outside `live_audio.rs`, or small OS
+  probes/signals outside `platform.rs`. The Windows backends are the other
+  deliberate exception: capture,
   input injection, and H.264 encoding necessarily go through Win32/COM/Media
   Foundation FFI (`display/windows.rs`, `display/encode/h264_windows.rs`,
   `platform.rs`), which has no safe alternative. Confine that `unsafe` to those

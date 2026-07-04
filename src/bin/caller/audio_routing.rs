@@ -4,17 +4,19 @@
 //! - Model audio output → virtual mic → app reads as mic input
 //! - App audio output → virtual speaker → captured and sent to model
 //!
-//! On Linux, uses PulseAudio null sinks. On macOS, uses BlackHole virtual
-//! audio driver with SwitchAudioSource for device management.
+//! Prefers the Vortex Audio direct POSIX shared-memory bridge on Unix hosts
+//! when the Vortex segment is present. Otherwise Linux uses PulseAudio null
+//! sinks, and macOS uses the legacy BlackHole virtual audio driver with
+//! SwitchAudioSource for fallback device management.
 
 use crate::error::CallerError;
 use std::process::Stdio;
 
 /// Platform-agnostic handle to a virtual audio bridge.
 ///
-/// The bridge creates two virtual audio devices and is cleaned up on drop.
-/// Use `model_output_device()` and `app_capture_device()` to get the device
-/// names for piping audio to/from the live model.
+/// Fallback bridges create or select virtual audio devices and clean up on
+/// drop. The direct Vortex shm bridge uses the existing Vortex device and
+/// bypasses local capture/playback commands.
 pub struct AudioBridge {
     inner: PlatformBridge,
     /// Previous default source, saved for restore on drop.
@@ -25,10 +27,9 @@ pub struct AudioBridge {
     /// When set, capture/playback bypass local audio devices and connect
     /// to a bh-bridge instance on the host over TCP.
     network_host: Option<String>,
-    /// Unix socket path for Vortex guest audio daemon.
-    /// When set, audio routes through the Vortex HAL plugin + daemon
-    /// locally inside the VM, with no host involvement.
-    vortex_socket_path: Option<String>,
+    /// Direct Vortex HAL shared-memory bridge marker.
+    /// When set, audio routes through the Vortex HAL plugin's POSIX shm rings.
+    vortex_shm: bool,
 }
 
 impl AudioBridge {
@@ -63,10 +64,9 @@ impl AudioBridge {
         self.network_host.as_deref()
     }
 
-    /// If set, audio is routed via the Vortex guest audio daemon over a Unix
-    /// socket. The daemon bridges shared memory (HAL plugin) ↔ this socket.
-    pub fn vortex_socket_path(&self) -> Option<&str> {
-        self.vortex_socket_path.as_deref()
+    /// Whether audio is routed directly through the Vortex HAL POSIX shm rings.
+    pub fn uses_vortex_shm(&self) -> bool {
+        self.vortex_shm
     }
 }
 
@@ -100,24 +100,24 @@ pub async fn create_bridge(session_id: &str) -> Result<AudioBridge, CallerError>
         prev_default_source: None,
         prev_default_sink: None,
         network_host: None,
-        vortex_socket_path: None,
+        vortex_shm: false,
     })
 }
 
-/// Create an audio bridge that routes through the Vortex guest audio daemon.
+/// Create an audio bridge that routes directly through Vortex HAL shared memory.
 ///
 /// The Vortex HAL plugin provides a "Vortex Audio" device visible to all apps.
-/// The daemon bridges the plugin's shared memory ring buffer to a Unix socket.
-/// intendant listens on the socket and exchanges PCM with the model.
+/// Intendant reads and writes the plugin's POSIX shared-memory ring buffers
+/// directly; no daemon or Unix socket is involved.
 ///
 /// No host involvement — all audio stays inside the VM.
-pub fn create_vortex_bridge(socket_path: &str) -> AudioBridge {
+pub fn create_vortex_bridge() -> AudioBridge {
     AudioBridge {
         inner: PlatformBridge::stub(),
         prev_default_source: None,
         prev_default_sink: None,
         network_host: None,
-        vortex_socket_path: Some(socket_path.to_string()),
+        vortex_shm: true,
     }
 }
 
@@ -154,7 +154,7 @@ pub async fn create_network_bridge(
         prev_default_source: None,
         prev_default_sink: None,
         network_host: Some(host_addr.to_string()),
-        vortex_socket_path: None,
+        vortex_shm: false,
     })
 }
 

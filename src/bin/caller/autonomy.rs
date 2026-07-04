@@ -6,14 +6,15 @@ use tokio::sync::RwLock;
 /// Global autonomy level controlling how much user approval is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AutonomyLevel {
-    /// Ask before every command execution
+    /// Ask for every category except file reads; Deny rules still gate.
     Low,
-    /// Ask before writes, network, destructive (default)
+    /// Default. Apply category rules; default Ask rules cover writes,
+    /// deletes, and destructive actions.
     #[default]
     Medium,
-    /// Only ask for unavoidable human input
+    /// Auto-approve ordinary Ask rules; Deny rules and hard gates still gate.
     High,
-    /// Never ask (fully autonomous)
+    /// Auto-approve everything except HumanInput and LiveAudioSpawn.
     Full,
 }
 
@@ -286,10 +287,37 @@ impl AutonomyState {
     /// Generate a dedup key for a command. Strips nonce and display params
     /// so retries of the same command with different display/nonce are recognized.
     pub fn command_dedup_key(command: &str) -> String {
-        // Remove nonce references like $NONCE[N] and display-like params
-        let mut key = command.to_string();
-        // Strip --display=N, display:N patterns
-        key = key.replace(char::is_whitespace, " ");
+        let normalized = command.replace(char::is_whitespace, " ");
+        let bytes = normalized.as_bytes();
+        let mut key = String::with_capacity(normalized.len());
+        let mut skip_next = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b' ' {
+                key.push(' ');
+                i += 1;
+                continue;
+            }
+
+            let start = i;
+            while i < bytes.len() && bytes[i] != b' ' {
+                i += 1;
+            }
+            let part = &normalized[start..i];
+
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if part == "--display" || part == "display:" {
+                skip_next = true;
+                continue;
+            }
+            if part.starts_with("--display=") || part.starts_with("display:") {
+                continue;
+            }
+            key.push_str(part);
+        }
         // Remove nonce references
         while let Some(start) = key.find("$NONCE[") {
             if let Some(end) = key[start..].find(']') {
@@ -321,7 +349,7 @@ impl AutonomyState {
             return true;
         }
 
-        // Full autonomy auto-approves everything except HumanInput
+        // Full autonomy auto-approves everything except the hard gates above.
         if self.level == AutonomyLevel::Full {
             return false;
         }
@@ -665,7 +693,13 @@ destructive = "deny"
     }
 
     #[test]
-    fn full_autonomy_approves_everything_except_human() {
+    fn live_audio_always_needs_approval() {
+        let state = AutonomyState::new(AutonomyLevel::Full, ApprovalConfig::default());
+        assert!(state.needs_approval(ActionCategory::LiveAudioSpawn));
+    }
+
+    #[test]
+    fn full_autonomy_approves_everything_except_hard_gates() {
         let state = AutonomyState::new(AutonomyLevel::Full, ApprovalConfig::default());
         assert!(!state.needs_approval(ActionCategory::FileRead));
         assert!(!state.needs_approval(ActionCategory::FileWrite));
@@ -674,6 +708,7 @@ destructive = "deny"
         assert!(!state.needs_approval(ActionCategory::Destructive));
         assert!(!state.needs_approval(ActionCategory::NetworkRequest));
         assert!(state.needs_approval(ActionCategory::HumanInput));
+        assert!(state.needs_approval(ActionCategory::LiveAudioSpawn));
     }
 
     #[test]
@@ -694,13 +729,22 @@ destructive = "deny"
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
         assert!(!state.needs_approval(ActionCategory::FileRead));
         assert!(!state.needs_approval(ActionCategory::CommandExec));
+        assert!(!state.needs_approval(ActionCategory::NetworkRequest));
         assert!(state.needs_approval(ActionCategory::FileWrite));
         assert!(state.needs_approval(ActionCategory::FileDelete));
         assert!(state.needs_approval(ActionCategory::Destructive));
     }
 
     #[test]
-    fn high_autonomy_only_asks_human() {
+    fn medium_autonomy_asks_for_network_when_rule_asks() {
+        let mut rules = ApprovalConfig::default();
+        rules.network = ApprovalRule::Ask;
+        let state = AutonomyState::new(AutonomyLevel::Medium, rules);
+        assert!(state.needs_approval(ActionCategory::NetworkRequest));
+    }
+
+    #[test]
+    fn high_autonomy_auto_approves_ordinary_categories() {
         let state = AutonomyState::new(AutonomyLevel::High, ApprovalConfig::default());
         assert!(!state.needs_approval(ActionCategory::FileRead));
         assert!(!state.needs_approval(ActionCategory::FileWrite));
@@ -708,6 +752,37 @@ destructive = "deny"
         assert!(!state.needs_approval(ActionCategory::CommandExec));
         assert!(!state.needs_approval(ActionCategory::Destructive));
         assert!(state.needs_approval(ActionCategory::HumanInput));
+        assert!(state.needs_approval(ActionCategory::LiveAudioSpawn));
+    }
+
+    #[test]
+    fn high_autonomy_asks_for_destructive_when_rule_denies() {
+        let mut rules = ApprovalConfig::default();
+        rules.destructive = ApprovalRule::Deny;
+        let state = AutonomyState::new(AutonomyLevel::High, rules);
+        assert!(state.needs_approval(ActionCategory::Destructive));
+    }
+
+    #[test]
+    fn command_dedup_key_strips_display_params() {
+        assert_eq!(
+            AutonomyState::command_dedup_key("xdotool --display=1 key Return"),
+            AutonomyState::command_dedup_key("xdotool --display=99 key Return")
+        );
+        assert_eq!(
+            AutonomyState::command_dedup_key("xdotool display:1 key Return"),
+            AutonomyState::command_dedup_key("xdotool display:99 key Return")
+        );
+    }
+
+    #[test]
+    fn approved_command_dedups_display_param_variants() {
+        let mut state = AutonomyState::default();
+        state.record_approved_command("xdotool --display=1 key Return");
+        assert!(state.was_command_approved("xdotool --display=99 key Return"));
+
+        state.record_approved_command("xdotool display:1 key Escape");
+        assert!(state.was_command_approved("xdotool display:99 key Escape"));
     }
 
     #[test]

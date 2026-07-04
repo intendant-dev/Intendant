@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -121,17 +122,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/status", get(api_status))
         .route("/api/attest/dns", post(attest_dns))
         .route("/api/attest/github", post(attest_github))
-        .route("/api/directory/{handle}", get(directory_lookup).options(orl_preflight))
+        .route(
+            "/api/directory/{handle}",
+            get(directory_lookup).options(orl_preflight),
+        )
         .route("/api/log/sth", get(log_sth).options(orl_preflight))
         .route("/api/log/entries", get(log_entries).options(orl_preflight))
         .route("/api/log/proof", get(log_proof).options(orl_preflight))
-        .route("/api/log/consistency", get(log_consistency).options(orl_preflight))
+        .route(
+            "/api/log/consistency",
+            get(log_consistency).options(orl_preflight),
+        )
         .route("/api/log/find", get(log_find).options(orl_preflight))
         .route("/api/push/vapid-public-key", get(push_vapid_public_key))
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/unsubscribe", post(push_unsubscribe))
         .route("/api/push/test", post(push_test))
-        .route("/api/admin/invites", post(admin_invites_mint).get(admin_invites_list))
+        .route(
+            "/api/admin/invites",
+            post(admin_invites_mint).get(admin_invites_list),
+        )
         .route("/api/admin/invites/revoke", post(admin_invites_revoke))
         .route("/trust", get(trust_ui))
         .route(
@@ -212,10 +222,9 @@ impl ServiceConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        let mut open_daemon_registration =
-            std::env::var("INTENDANT_CONNECT_OPEN_REGISTRATION")
-                .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
-                .unwrap_or(false);
+        let mut open_daemon_registration = std::env::var("INTENDANT_CONNECT_OPEN_REGISTRATION")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false);
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -440,14 +449,63 @@ fn invite_usable(invite: &InviteRecord) -> bool {
 /// brands, and anything that reads as official. Short handles (< 3
 /// chars) are reserved wholesale by the length rule.
 const RESERVED_HANDLES: &[&str] = &[
-    "admin", "administrator", "root", "system", "staff", "official", "support",
-    "help", "security", "abuse", "moderator", "mod", "team", "info", "contact",
-    "billing", "payments", "postmaster", "webmaster", "hostmaster", "noreply",
-    "no-reply", "mail", "email", "api", "www", "app", "web", "dashboard",
-    "status", "blog", "docs", "news", "dev", "test", "demo", "example",
-    "intendant", "connect", "rendezvous", "daemon", "trust", "access",
-    "google", "github", "apple", "microsoft", "amazon", "meta", "facebook",
-    "openai", "anthropic", "claude", "gemini", "codex", "twitter", "x",
+    "admin",
+    "administrator",
+    "root",
+    "system",
+    "staff",
+    "official",
+    "support",
+    "help",
+    "security",
+    "abuse",
+    "moderator",
+    "mod",
+    "team",
+    "info",
+    "contact",
+    "billing",
+    "payments",
+    "postmaster",
+    "webmaster",
+    "hostmaster",
+    "noreply",
+    "no-reply",
+    "mail",
+    "email",
+    "api",
+    "www",
+    "app",
+    "web",
+    "dashboard",
+    "status",
+    "blog",
+    "docs",
+    "news",
+    "dev",
+    "test",
+    "demo",
+    "example",
+    "intendant",
+    "connect",
+    "rendezvous",
+    "daemon",
+    "trust",
+    "access",
+    "google",
+    "github",
+    "apple",
+    "microsoft",
+    "amazon",
+    "meta",
+    "facebook",
+    "openai",
+    "anthropic",
+    "claude",
+    "gemini",
+    "codex",
+    "twitter",
+    "x",
 ];
 
 /// Account handles: 3-32 chars of a-z, 0-9, and '-' (no leading/trailing
@@ -752,16 +810,25 @@ fn load_store(path: &Path) -> Result<Store, String> {
 }
 
 fn save_store(path: &Path, store: &Store) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create Connect state dir {}: {e}", parent.display()))?;
-    }
     let bytes = serde_json::to_vec_pretty(store).map_err(|e| format!("serialize state: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, bytes)
-        .map_err(|e| format!("write Connect state {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("replace Connect state {}: {e}", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("create Connect state dir {}: {e}", parent.display()))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".intendant-connect-state-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|e| format!("create Connect state tempfile in {}: {e}", parent.display()))?;
+    tmp.write_all(&bytes)
+        .map_err(|e| format!("write Connect state tempfile {}: {e}", tmp.path().display()))?;
+    tmp.as_file_mut()
+        .sync_all()
+        .map_err(|e| format!("sync Connect state tempfile {}: {e}", tmp.path().display()))?;
+    tmp.persist(path)
+        .map_err(|e| format!("replace Connect state {}: {}", path.display(), e.error))?;
     Ok(())
 }
 
@@ -1510,15 +1577,18 @@ fn webpush_encrypt(
     let eph_public = eph_private
         .compute_public_key()
         .map_err(|_| "ephemeral public key computation failed".to_string())?;
-    let peer = ring::agreement::UnparsedPublicKey::new(&ring::agreement::ECDH_P256, ua_public.clone());
-    let ecdh_secret = ring::agreement::agree_ephemeral(eph_private, &peer, |secret| secret.to_vec())
-        .map_err(|_| "ECDH agreement failed (bad subscription key?)".to_string())?;
+    let peer =
+        ring::agreement::UnparsedPublicKey::new(&ring::agreement::ECDH_P256, ua_public.clone());
+    let ecdh_secret =
+        ring::agreement::agree_ephemeral(eph_private, &peer, |secret| secret.to_vec())
+            .map_err(|_| "ECDH agreement failed (bad subscription key?)".to_string())?;
 
     // IKM = HKDF(salt=auth_secret, ikm=ecdh_secret, info="WebPush: info"||0||ua_pub||as_pub, 32)
     let mut info = b"WebPush: info\x00".to_vec();
     info.extend_from_slice(&ua_public);
     info.extend_from_slice(eph_public.as_ref());
-    let prk_key = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &auth_secret).extract(&ecdh_secret);
+    let prk_key =
+        ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &auth_secret).extract(&ecdh_secret);
     let ikm = hkdf_expand(&prk_key, &info, 32);
 
     let mut salt = [0u8; 16];
@@ -1730,7 +1800,11 @@ async fn attest_dns(
     let user = require_user(&state, &headers).await?;
     require_csrf(&state, &headers).await?;
     check_rate_limit(&state, &headers, "attest", 10, 600_000).await?;
-    let domain = body.domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let domain = body
+        .domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     if domain.is_empty()
         || domain.len() > 253
         || !domain.contains('.')
@@ -1746,7 +1820,10 @@ async fn attest_dns(
     let response = state
         .push_http
         .get(&doh_base)
-        .query(&[("name", format!("_intendant.{domain}")), ("type", "TXT".to_string())])
+        .query(&[
+            ("name", format!("_intendant.{domain}")),
+            ("type", "TXT".to_string()),
+        ])
         .header("accept", "application/dns-json")
         .send()
         .await
@@ -1774,8 +1851,14 @@ async fn attest_dns(
         )));
     }
     Ok(Json(
-        record_verified_attestation(&state, user.id, "dns", &domain, &format!("_intendant.{domain}"))
-            .await?,
+        record_verified_attestation(
+            &state,
+            user.id,
+            "dns",
+            &domain,
+            &format!("_intendant.{domain}"),
+        )
+        .await?,
     ))
 }
 
@@ -1808,10 +1891,7 @@ async fn attest_github(
         .and_then(|mut segments| segments.next())
         .map(|owner| owner.to_ascii_lowercase())
         .filter(|owner| {
-            !owner.is_empty()
-                && owner
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            !owner.is_empty() && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         })
         .ok_or_else(|| ApiError::bad_request("could not read the gist owner from the URL"))?;
     let expected = attestation_claim_string(&state.config, &user.account_name);
@@ -1914,7 +1994,9 @@ fn signed_tree_head(state: &AppState, store: &Store) -> serde_json::Value {
 async fn log_sth(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
     check_rate_limit(&state, &headers, "log_read", 240, 60_000).await?;
     let store = state.store.lock().await;
-    Ok(orl_cors(Json(signed_tree_head(&state, &store)).into_response()))
+    Ok(orl_cors(
+        Json(signed_tree_head(&state, &store)).into_response(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1969,7 +2051,11 @@ async fn log_proof(
     check_rate_limit(&state, &headers, "log_read", 240, 60_000).await?;
     let store = state.store.lock().await;
     let leaves = log_leaves(&store);
-    let size = if query.size == 0 { leaves.len() } else { query.size };
+    let size = if query.size == 0 {
+        leaves.len()
+    } else {
+        query.size
+    };
     if size > leaves.len() || query.index >= size {
         return Err(ApiError::bad_request("index/size out of range"));
     }
@@ -2004,7 +2090,11 @@ async fn log_consistency(
     check_rate_limit(&state, &headers, "log_read", 240, 60_000).await?;
     let store = state.store.lock().await;
     let leaves = log_leaves(&store);
-    let new_size = if query.new == 0 { leaves.len() } else { query.new };
+    let new_size = if query.new == 0 {
+        leaves.len()
+    } else {
+        query.new
+    };
     if new_size > leaves.len() || query.old == 0 || query.old > new_size {
         return Err(ApiError::bad_request("old/new out of range"));
     }
@@ -2059,8 +2149,8 @@ async fn log_find(
             let daemon_match = !daemon_id.is_empty()
                 && entry.kind == "daemon_claimed"
                 && data.get("daemon_id").and_then(|v| v.as_str()) == Some(daemon_id);
-            let handle_match = !handle.is_empty()
-                && data.get("handle").and_then(|v| v.as_str()) == Some(handle);
+            let handle_match =
+                !handle.is_empty() && data.get("handle").and_then(|v| v.as_str()) == Some(handle);
             daemon_match || (daemon_id.is_empty() && handle_match)
         });
     let Some((index, entry)) = found else {
@@ -2133,7 +2223,9 @@ async fn push_subscribe(
             .filter(|record| record.user_id == user.id)
             .count();
         if per_user >= 10 {
-            return Err(ApiError::bad_request("too many subscriptions on this account"));
+            return Err(ApiError::bad_request(
+                "too many subscriptions on this account",
+            ));
         }
         store.push_subscriptions.push(PushSubscriptionRecord {
             user_id: user.id,
@@ -2144,7 +2236,13 @@ async fn push_subscribe(
             created_unix_ms: now_unix_ms(),
             notify_presence: true,
         });
-        audit(&mut store, "push_subscribed", Some(user.id), None, json!({}));
+        audit(
+            &mut store,
+            "push_subscribed",
+            Some(user.id),
+            None,
+            json!({}),
+        );
         persist_locked(&state, &store)?;
     }
     Ok(Json(json!({ "ok": true })))
@@ -2196,7 +2294,9 @@ async fn push_test(
             .collect()
     };
     if subscriptions.is_empty() {
-        return Err(ApiError::bad_request("no push subscriptions on this account"));
+        return Err(ApiError::bad_request(
+            "no push subscriptions on this account",
+        ));
     }
     let payload = json!({
         "title": "Intendant Connect",
@@ -2227,7 +2327,9 @@ async fn push_test(
             .retain(|record| !dead.contains(&record.endpoint));
         persist_locked(&state, &store)?;
     }
-    Ok(Json(json!({ "ok": true, "sent": sent, "pruned": dead.len() })))
+    Ok(Json(
+        json!({ "ok": true, "sent": sent, "pruned": dead.len() }),
+    ))
 }
 
 /// Watch claimed daemons for presence transitions and notify their
@@ -2465,7 +2567,9 @@ async fn admin_invites_mint(
         );
         persist_locked(&state, &store)?;
     }
-    Ok(Json(json!({ "ok": true, "codes": codes, "max_uses": max_uses })))
+    Ok(Json(
+        json!({ "ok": true, "codes": codes, "max_uses": max_uses }),
+    ))
 }
 
 async fn admin_invites_list(
@@ -2489,7 +2593,9 @@ async fn admin_invites_list(
             })
         })
         .collect();
-    Ok(Json(json!({ "ok": true, "invite_required": state.config.invite_required, "invites": invites })))
+    Ok(Json(
+        json!({ "ok": true, "invite_required": state.config.invite_required, "invites": invites }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2845,7 +2951,9 @@ async fn auth_register_finish(
                 .iter()
                 .any(|u| u.account_name == pending.account_name)
         {
-            return Err(ApiError::conflict("that handle was taken while you registered"));
+            return Err(ApiError::conflict(
+                "that handle was taken while you registered",
+            ));
         }
         // Consume the invite now, inside the store lock, so a code's uses
         // can't be overspent by concurrent registrations.
@@ -2861,7 +2969,9 @@ async fn auth_register_finish(
                 return Err(ApiError::forbidden("that invite code no longer exists"));
             };
             if !invite_usable(invite) {
-                return Err(ApiError::forbidden("that invite code has been used up or revoked"));
+                return Err(ApiError::forbidden(
+                    "that invite code has been used up or revoked",
+                ));
             }
             invite.used_count += 1;
         }
@@ -3824,7 +3934,7 @@ async fn daemon_register(
                 registered_unix_ms: now,
                 last_seen_unix_ms: now,
                 updated_unix_ms: now,
-            presence_hours: Vec::new(),
+                presence_hours: Vec::new(),
             };
             claim_code = Some(ensure_claim_code(
                 &mut claim_codes,
@@ -4582,7 +4692,10 @@ async fn orl_publish(
     Json(list): Json<serde_json::Value>,
 ) -> ApiResult<Response> {
     check_rate_limit(&state, &headers, "orl_publish", 30, 60_000).await?;
-    if serde_json::to_string(&list).map(|s| s.len()).unwrap_or(usize::MAX) > MAX_ORL_BULLETIN_BYTES
+    if serde_json::to_string(&list)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
+        > MAX_ORL_BULLETIN_BYTES
     {
         return Err(ApiError::bad_request("revocation list is too large"));
     }
@@ -4610,8 +4723,13 @@ async fn orl_publish(
     let payload = orl_signing_payload(&list)
         .ok_or_else(|| ApiError::bad_request("malformed revocation list"))?;
     let key = b64u_decode(&root_key).map_err(|_| ApiError::bad_request("invalid root key"))?;
-    let sig = b64u_decode(list.get("sig").and_then(|v| v.as_str()).unwrap_or("").trim())
-        .map_err(|_| ApiError::bad_request("invalid signature encoding"))?;
+    let sig = b64u_decode(
+        list.get("sig")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim(),
+    )
+    .map_err(|_| ApiError::bad_request("invalid signature encoding"))?;
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key)
         .verify(&payload, &sig)
         .map_err(|_| ApiError::bad_request("signature verification failed"))?;
@@ -4626,7 +4744,10 @@ async fn orl_publish(
         if seq < existing.seq {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
-                format!("stale list: seq {seq} was already superseded by {}", existing.seq),
+                format!(
+                    "stale list: seq {seq} was already superseded by {}",
+                    existing.seq
+                ),
             ));
         }
         let changed = seq > existing.seq;
@@ -4684,7 +4805,9 @@ async fn orl_fetch(
         .iter()
         .find(|b| b.handle == handle && b.root_key == root_key)
     else {
-        return Err(ApiError::not_found("no revocation list published for that org"));
+        return Err(ApiError::not_found(
+            "no revocation list published for that org",
+        ));
     };
     Ok(orl_cors(
         Json(json!({
@@ -4698,18 +4821,18 @@ async fn orl_fetch(
 }
 
 /* ── Credential vault sync (credential custody) ──
-   One end-to-end encrypted vault blob per account. The service stores it
-   blind: the body is ciphertext under the user's vault master key, and
-   that key travels only wrapped per enrolled unlocker (passkey PRF /
-   recovery phrase) — nothing here can be decrypted or forged
-   server-side. Blobs additionally carry a client-side HMAC keyed to the
-   master key (`mac`); this service cannot verify it (by design), but it
-   enforces the presence ratchet: once an account's stored vault carries
-   a MAC, a MAC-less replacement is refused so a tampering store cannot
-   quietly strip the integrity guarantee. The monotonic revision check
-   only prevents rollback (the ORL `seq` trick); a malicious store can
-   still withhold or serve stale, detectably once any device has seen a
-   newer revision. */
+One end-to-end encrypted vault blob per account. The service stores it
+blind: the body is ciphertext under the user's vault master key, and
+that key travels only wrapped per enrolled unlocker (passkey PRF /
+recovery phrase) — nothing here can be decrypted or forged
+server-side. Blobs additionally carry a client-side HMAC keyed to the
+master key (`mac`); this service cannot verify it (by design), but it
+enforces the presence ratchet: once an account's stored vault carries
+a MAC, a MAC-less replacement is refused so a tampering store cannot
+quietly strip the integrity guarantee. The monotonic revision check
+only prevents rollback (the ORL `seq` trick); a malicious store can
+still withhold or serve stale, detectably once any device has seen a
+newer revision. */
 
 const MAX_VAULT_BLOB_BYTES: usize = 128 * 1024;
 
@@ -4783,7 +4906,8 @@ fn apply_vault_publish(
                     .to_string(),
             ));
         }
-        if revision < existing.revision || (revision == existing.revision && existing.vault != vault)
+        if revision < existing.revision
+            || (revision == existing.revision && existing.vault != vault)
         {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
@@ -4846,7 +4970,13 @@ async fn api_vault_publish(
     require_csrf(&state, &headers).await?;
     check_rate_limit(&state, &headers, "vault_publish", 60, 60_000).await?;
     let mut store = state.store.lock().await;
-    let stored = apply_vault_publish(&mut store, user.id, body.revision, body.vault, now_unix_ms())?;
+    let stored = apply_vault_publish(
+        &mut store,
+        user.id,
+        body.revision,
+        body.vault,
+        now_unix_ms(),
+    )?;
     if stored {
         persist_locked(&state, &store)?;
     }
@@ -4923,7 +5053,9 @@ async fn browser_offer(
             // to firehose daemons; the daemon re-verifies and rate-limits.
             org_grant: body.org_grant.filter(|doc| {
                 !doc.is_null()
-                    && serde_json::to_string(doc).map(|s| s.len()).unwrap_or(usize::MAX)
+                    && serde_json::to_string(doc)
+                        .map(|s| s.len())
+                        .unwrap_or(usize::MAX)
                         <= MAX_ORG_GRANT_RELAY_BYTES
             }),
             ..RendezvousEvent::default()
@@ -5268,8 +5400,7 @@ const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advisor">
 /// advertises its own installer.
 fn landing_ui_html(origin: &str) -> String {
     // The placeholder must be entity-escaped or the browser eats it as a tag.
-    let install_cmd =
-        format!("curl -fsSL {origin}/install.sh | sh -s -- --owner &lt;your-key&gt;");
+    let install_cmd = format!("curl -fsSL {origin}/install.sh | sh -s -- --owner &lt;your-key&gt;");
     // r## because the page contains fragment links (`href="#install"`),
     // whose `"#` would terminate a plain r#-string.
     format!(
@@ -5745,8 +5876,10 @@ fn landing_ui_html(origin: &str) -> String {
         // Server-render the default answers' command (Linux VPS ⇒ --service)
         // so the terminal shows a real, origin-aware one-liner before any
         // JS runs; render() redraws the same text on load.
-        advisor = LANDING_ADVISOR_HTML
-            .replace("__ADVISOR_DEFAULT_CMD__", &format!("{install_cmd} --service")),
+        advisor = LANDING_ADVISOR_HTML.replace(
+            "__ADVISOR_DEFAULT_CMD__",
+            &format!("{install_cmd} --service")
+        ),
     )
 }
 
@@ -6190,26 +6323,34 @@ function authenticationCredentialJSON(credential) {{
 
 // Fleet-sync encryption (trust architecture phase 5 follow-on): evaluate
 // the WebAuthn PRF extension during the passkey ceremony and stash the
-// per-tab secret; /app derives an AES key from it so private fleet fields
-// sync end-to-end encrypted. The server never sees the PRF output.
+// per-tab secrets; /app derives AES keys from them so private fleet fields
+// and the credential vault sync end-to-end encrypted. Two salts, one
+// gesture: `first` feeds fleet-sync, `second` feeds the vault — separate
+// PRF domains, so the two features never share key material. The server
+// never sees either output.
 const FLEET_PRF_SALT = new TextEncoder().encode('intendant-fleet-sync-v1');
+const VAULT_PRF_SALT = new TextEncoder().encode('intendant-vault-v1');
 
 function prfExtensions() {{
-  return {{ prf: {{ eval: {{ first: FLEET_PRF_SALT }} }} }};
+  return {{ prf: {{ eval: {{ first: FLEET_PRF_SALT, second: VAULT_PRF_SALT }} }} }};
 }}
 
 function stashPrfSecret(credential) {{
   try {{
     const results = credential.getClientExtensionResults?.();
+    const toB64u = buf => {{
+      const bytes = new Uint8Array(buf);
+      let bin = '';
+      for (const b of bytes) bin += String.fromCharCode(b);
+      return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }};
     const first = results?.prf?.results?.first;
     if (!first) return;
-    const bytes = new Uint8Array(first);
-    let bin = '';
-    for (const b of bytes) bin += String.fromCharCode(b);
-    sessionStorage.setItem(
-      'intendant_fleet_prf_v1',
-      btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-    );
+    sessionStorage.setItem('intendant_fleet_prf_v1', toB64u(first));
+    // Older authenticators may evaluate only one salt; the vault then
+    // falls back to its legacy fleet-secret derivation client-side.
+    const second = results?.prf?.results?.second;
+    if (second) sessionStorage.setItem('intendant_vault_prf_v1', toB64u(second));
   }} catch (err) {{
     console.warn('PRF secret unavailable:', err?.message || err);
   }}
@@ -7038,7 +7179,10 @@ mod tests {
         assert!(validate_account_name("Upper").is_err(), "uppercase");
         assert!(validate_account_name("a b").is_err(), "space");
         for reserved in ["admin", "google", "intendant", "support"] {
-            assert!(validate_account_name(reserved).is_err(), "{reserved} must be reserved");
+            assert!(
+                validate_account_name(reserved).is_err(),
+                "{reserved} must be reserved"
+            );
         }
     }
 
@@ -7149,7 +7293,10 @@ mod tests {
         .expect("STH signature must verify");
         // Key is stable across reloads.
         let reloaded = load_or_create_log_keypair(&mut store).unwrap();
-        assert_eq!(keypair.public_key().as_ref(), reloaded.public_key().as_ref());
+        assert_eq!(
+            keypair.public_key().as_ref(),
+            reloaded.public_key().as_ref()
+        );
     }
 
     #[test]
@@ -7459,7 +7606,7 @@ mod tests {
                 registered_unix_ms: 10,
                 last_seen_unix_ms: now_unix_ms(),
                 updated_unix_ms: 20,
-            presence_hours: Vec::new(),
+                presence_hours: Vec::new(),
             }],
             fleet_targets: vec![
                 FleetTargetRecord {
@@ -7716,10 +7863,17 @@ mod tests {
             "logo.svg must stay the margin-cropped view of the macOS icon"
         );
         assert_eq!(&BRAND_ICON_PNG[0..8], b"\x89PNG\r\n\x1a\n");
-        assert!(BRAND_ICON_PNG.len() > 2_048, "brand icon suspiciously small");
+        assert!(
+            BRAND_ICON_PNG.len() > 2_048,
+            "brand icon suspiciously small"
+        );
         let svg_link = r#"<link rel="icon" type="image/svg+xml" href="/logo.svg">"#;
         let png_link = r#"<link rel="icon" type="image/png" href="/favicon.png">"#;
-        let connect = connect_ui_html("https://x.example", "Intendant Connect", "Rendezvous account");
+        let connect = connect_ui_html(
+            "https://x.example",
+            "Intendant Connect",
+            "Rendezvous account",
+        );
         assert!(connect.contains(svg_link) && connect.contains(png_link));
         assert!(connect.contains(r#"class="brand-mark" src="/logo.svg""#));
         assert!(!connect.contains(">IC</div>"));
@@ -7751,8 +7905,14 @@ mod tests {
 
     #[test]
     fn embedded_installer_is_the_bootstrap_script() {
-        assert!(INSTALL_SH.starts_with("#!/bin/sh"), "installer must be a sh script");
-        assert!(INSTALL_SH.contains("--owner"), "installer must support the owner bootstrap");
+        assert!(
+            INSTALL_SH.starts_with("#!/bin/sh"),
+            "installer must be a sh script"
+        );
+        assert!(
+            INSTALL_SH.contains("--owner"),
+            "installer must support the owner bootstrap"
+        );
         assert!(
             INSTALL_SH.contains("cargo build --release"),
             "installer must build release binaries"
@@ -7763,7 +7923,10 @@ mod tests {
         assert!(INSTALL_SH.contains("service install --now --"));
         assert!(!INSTALL_SH.contains("/etc/systemd/system"));
 
-        assert!(INSTALL_PS1.starts_with("<#"), "ps1 installer must open with comment help");
+        assert!(
+            INSTALL_PS1.starts_with("<#"),
+            "ps1 installer must open with comment help"
+        );
         // Windows PowerShell 5.1 decodes BOM-less files as ANSI, and a
         // UTF-8 em-dash misdecodes into a cp1252 smart QUOTE — which the
         // parser honors, unbalancing every string after it. The bootstrap
@@ -7777,7 +7940,10 @@ mod tests {
             "cargo build --release",
             "\"service\", \"install\"",
         ] {
-            assert!(INSTALL_PS1.contains(needle), "install.ps1 must contain {needle}");
+            assert!(
+                INSTALL_PS1.contains(needle),
+                "install.ps1 must contain {needle}"
+            );
         }
     }
 
@@ -7868,10 +8034,7 @@ mod tests {
                 json!({ "kind": "oauth:codex" }),
             ],
         );
-        assert_eq!(
-            payload["title"].as_str(),
-            Some("Workshop box is unfueled")
-        );
+        assert_eq!(payload["title"].as_str(), Some("Workshop box is unfueled"));
         let body = payload["body"].as_str().unwrap();
         assert!(body.contains("Personal Anthropic"), "{body}");
         assert!(body.contains("oauth:codex"), "{body}");
@@ -7945,8 +8108,7 @@ mod tests {
 
         // Once authenticated, a MAC-less replacement is refused even at a
         // newer revision — the store must not strip the guarantee.
-        let err =
-            apply_vault_publish(&mut store, user, 3, vault_blob(3, "c"), 30).unwrap_err();
+        let err = apply_vault_publish(&mut store, user, 3, vault_blob(3, "c"), 30).unwrap_err();
         assert_eq!(err.status, StatusCode::CONFLICT);
         assert_eq!(store.vault_blobs[0].revision, 2);
 

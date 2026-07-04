@@ -53,7 +53,12 @@ pub fn create(project_root: &Path, branch: &str, base: &str) -> Result<Worktree,
     })
 }
 
-pub fn remove(project_root: &Path, wt: &Worktree) -> Result<(), CallerError> {
+/// Remove a fission-created worktree checkout and force-delete its branch.
+///
+/// Dashboard cleanup uses `worktree_inventory::remove_worktree_if_safe`,
+/// which removes only the checkout after merge/dirty-state checks and leaves
+/// the branch ref intact.
+pub fn remove_worktree_and_branch(project_root: &Path, wt: &Worktree) -> Result<(), CallerError> {
     let output = Command::new("git")
         .args(["worktree", "remove", &wt.path.to_string_lossy()])
         .current_dir(project_root)
@@ -103,7 +108,15 @@ pub fn remove(project_root: &Path, wt: &Worktree) -> Result<(), CallerError> {
 }
 
 #[allow(dead_code)]
-pub fn merge(project_root: &Path, wt: &Worktree, target: &str) -> Result<MergeResult, CallerError> {
+/// Merge the worktree branch into the current checkout at `project_root`.
+///
+/// `current_checkout_label` is used only for diagnostics; this helper does
+/// not check out or verify that label before running `git merge`.
+pub fn merge(
+    project_root: &Path,
+    wt: &Worktree,
+    current_checkout_label: &str,
+) -> Result<MergeResult, CallerError> {
     let output = Command::new("git")
         .args(["merge", &wt.branch_name, "--no-edit"])
         .current_dir(project_root)
@@ -126,7 +139,7 @@ pub fn merge(project_root: &Path, wt: &Worktree, target: &str) -> Result<MergeRe
         Ok(MergeResult::Conflict(format!(
             "Merge conflict merging {} into {}: {} {}",
             wt.branch_name,
-            target,
+            current_checkout_label,
             stdout.trim(),
             stderr.trim()
         )))
@@ -271,14 +284,14 @@ mod tests {
     }
 
     #[test]
-    fn remove_worktree() {
+    fn remove_worktree_and_branch_removes_checkout() {
         let dir = init_test_repo();
         let repo = dir.path();
 
         let wt = create(repo, "to-remove", "HEAD").unwrap();
         assert!(wt.path.exists());
 
-        remove(repo, &wt).unwrap();
+        remove_worktree_and_branch(repo, &wt).unwrap();
         assert!(!wt.path.exists());
     }
 
@@ -385,7 +398,7 @@ mod tests {
         assert_eq!(result, MergeResult::Clean);
 
         // Remove
-        remove(repo, &wt).unwrap();
+        remove_worktree_and_branch(repo, &wt).unwrap();
         assert!(!wt.path.exists());
 
         // Verify merged content

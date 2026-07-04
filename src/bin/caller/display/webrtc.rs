@@ -2102,8 +2102,8 @@ fn select_single_rid_for_federated_offer(pool_rids: &[SimulcastRid]) -> Simulcas
 ///   diagnostic landed at `e815bac`, and any offerer that hasn't munged
 ///   simulcast:recv into its track shape).
 /// - `Some(vec)` of `SimulcastRid`s, in offer order, when the directive is
-///   present (the local `DisplaySlot` path at `static/app.html:7808`,
-///   which injects `a=simulcast:recv full;half;quarter` before
+///   present (the local `DisplaySlot` path in `static/app.html`, which
+///   defaults to `a=simulcast:recv f` and can opt into `f;h;q` before
 ///   `setLocalDescription`).
 ///
 /// The caller in [`WebRtcPeer::new`] uses this to **intersect** the
@@ -2172,11 +2172,11 @@ fn parse_offer_simulcast_recv_rids(sdp: &str) -> Option<Vec<SimulcastRid>> {
 /// a local `DisplaySlot`.
 ///
 /// The discriminator is the same one [`WebRtcPeer::new`] already uses to
-/// decide between the single-RID and multi-RID answer paths: the local
-/// `DisplaySlot` injects `a=simulcast:recv full;half;quarter` into its
-/// offer before `setLocalDescription`, whereas the federated
+/// decide between the local recv-simulcast and federated single-encoding answer
+/// paths: the local `DisplaySlot` injects recv-simulcast (default `f`, opt-in
+/// `f;h;q`) before `setLocalDescription`, whereas the federated
 /// `PeerDisplayConnection` offer carries no `a=simulcast:recv` directive.
-/// So "no recv-simulcast line" ≡ "federated single-encoding peer".
+/// So "no recv-simulcast line" means "federated single-encoding peer".
 ///
 /// `handle_offer_pool_mode` consults this to mark the peer's
 /// [`PeerCodecPreferences`] federated, which makes the pool spawn the
@@ -2203,9 +2203,9 @@ mod parse_offer_simulcast_recv_rids_tests {
         assert_eq!(parse_offer_simulcast_recv_rids(sdp), None);
     }
 
-    /// Local `DisplaySlot` path: offer contains `a=simulcast:recv f;h;q`.
-    /// Returns the three RIDs in offer order — the fix-site keeps all
-    /// three because the browser explicitly asked for them.
+    /// Opt-in multi-RID `DisplaySlot` path: offer contains
+    /// `a=simulcast:recv f;h;q`. Returns the three RIDs in offer order — the
+    /// fix-site keeps all three because the browser explicitly asked for them.
     #[test]
     fn local_offer_with_full_simulcast_returns_all_three() {
         let sdp = "v=0\r\n\
@@ -2355,10 +2355,10 @@ impl WebRtcPeer {
     /// its own SSRC), and the answer SDP carries
     /// `a=simulcast:send full;half;quarter` plus `a=rid:* send`
     /// lines automatically as a consequence of the multi-encoding
-    /// track shape. For single-codec / single-layer paths (H.264,
-    /// or VP8 with only one surviving layer post-MIN_LAYER_DIM
-    /// filter) `active_rids.len() == 1` and the answer is plain
-    /// sendonly.
+    /// track shape. For single-codec / single-layer paths (default local
+    /// DisplaySlot `f`, federated floor RID, H.264, or VP8 with only one
+    /// surviving layer post-MIN_LAYER_DIM filter) `active_rids.len() == 1`
+    /// and the answer is plain sendonly.
     ///
     /// Empty / no-overlap cases are surfaced to `handle_offer` as
     /// [`CallerError::WebRtc`] errors rather than producing a silent
@@ -3013,23 +3013,22 @@ impl WebRtcPeer {
             )));
         }
         // #46 fix: intersect the pool's RIDs with what the offer
-        // actually requested via `a=simulcast:recv`. The pool's
-        // always-on VP8 simulcast advertises 3 RIDs (f/h/q), but a
-        // federated [`PeerDisplayConnection`] offer post-`e815bac` no
-        // longer includes `a=simulcast:recv` — sending an answer
+        // actually requested via `a=simulcast:recv`. The pool can expose
+        // multiple RIDs (f/h/q), but a federated [`PeerDisplayConnection`]
+        // offer post-`e815bac` does not include `a=simulcast:recv` — sending an answer
         // declaring 3 RIDs against such an offer produces an
         // `a=simulcast:send f;h;q` answer with no `a=ssrc` declarations
         // (rtc 0.9 SDP-writer bug), which Chrome / WebKit silently
         // refuse to decode. Empirical signature: `framesDecoded == 0`
         // forever, `packetsReceived > 0`, `pliCount > 0`. The local
-        // [`DisplaySlot`] path injects `a=simulcast:recv f;h;q` before
-        // setLocalDescription so its offer keeps the multi-RID send
-        // path; the federated path narrows to `[full]`.
+        // [`DisplaySlot`] path injects recv-simulcast before
+        // setLocalDescription. Its default `f` request stays single-RID;
+        // opt-in `f;h;q` keeps the multi-RID send path. The federated
+        // path narrows to the floor RID.
         //
         // Three branches:
         //  - Offer has no `a=simulcast:recv` → narrow to a single
-        //    layer (the highest-priority one, layer order from
-        //    `vp8_simulcast`: full first).
+        //    layer (the floor one selected by `select_single_rid_for_federated_offer`).
         //  - Offer has `a=simulcast:recv [...]` → intersect pool_rids
         //    with the offer's recv list, preserving pool order. Empty
         //    intersection is a hard error (no overlap = no codec).
@@ -3062,10 +3061,10 @@ impl WebRtcPeer {
                 // (~0.4 fps decoded at 8 % loss before this
                 // tuning).
                 //
-                // The local `DisplaySlot` path is unaffected: it
-                // injects `a=simulcast:recv f;h;q` into its offer,
-                // so it hits the `Some(offer_rids)` branch below
-                // and gets the full multi-RID set as before.
+                // The local `DisplaySlot` path is unaffected: it injects
+                // recv-simulcast into its offer, so it hits the
+                // `Some(offer_rids)` branch below. The default request is
+                // `f`; the opt-in adaptive path requests `f;h;q`.
                 //
                 // Robust against partial-layer pools: if pool
                 // dropped the quarter layer because the source is
@@ -6572,8 +6571,8 @@ mod tests {
 
     /// `offer_is_federated` is the discriminator that flips
     /// `PeerCodecPreferences::federated`. A local `DisplaySlot` offer
-    /// carries `a=simulcast:recv f;h;q` → not federated; a
-    /// `PeerDisplayConnection` offer omits it → federated.
+    /// carries `a=simulcast:recv` (default `f`, opt-in `f;h;q`) → not
+    /// federated; a `PeerDisplayConnection` offer omits it → federated.
     #[test]
     fn offer_is_federated_distinguishes_local_from_federated() {
         let local_offer = "v=0\r\n\
@@ -7357,12 +7356,11 @@ mod tests {
     /// tests below to drive `RTCPeerConnection::create_answer`
     /// without standing up a real browser.
     ///
-    /// **Phase 4c follow-up (b)**: includes the recv-side simulcast
+    /// **Phase 4c follow-up (b)**: includes the opt-in recv-side simulcast
     /// hint (`a=rid:f/h/q recv` + `a=simulcast:recv f;h;q`) plus the
-    /// repaired-rtp-stream-id extmap so the answer-side simulcast
-    /// path is exercised by the test the same way the production
-    /// browser side now exercises it (via the
-    /// `injectRecvSimulcastIntoVideoOffer` helper in static/app.html).
+    /// repaired-rtp-stream-id extmap so the answer-side multi-RID path is
+    /// exercised by the test the same way the browser side exercises it when
+    /// `DISPLAY_SIMULCAST_RIDS` is switched to `['f','h','q']`.
     /// Without the offer's `recv` advertisement, rtc 0.9 omits
     /// `a=simulcast:send` from the answer regardless of how many
     /// encodings the track has — see the test's panic message for

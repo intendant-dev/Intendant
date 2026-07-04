@@ -257,14 +257,14 @@ pub(crate) fn parse_goal_token_budget(
 
 /// One image attachment passed alongside a user message.
 ///
-/// Some backends (Codex) prefer file paths to keep base64 out of the JSON-RPC
-/// stream; others (Gemini ACP) embed base64 inline in `ContentBlock::Image`.
-/// We pass both so each backend can pick the form it supports best.
+/// Codex prefers file paths to keep base64 out of the JSON-RPC stream. We keep
+/// base64 alongside the path for callers that construct attachments from
+/// in-memory screenshots and for future backends that may need inline content.
 #[derive(Debug, Clone)]
 pub struct AgentImageAttachment {
     /// Path on disk where the image is stored (used by Codex `LocalImage`).
     pub local_path: Option<PathBuf>,
-    /// Base64-encoded image data (used by Gemini ACP `Image` content block).
+    /// Base64-encoded image data for in-memory screenshot attachments.
     pub base64: String,
     /// MIME type, e.g. `image/jpeg`.
     pub mime_type: String,
@@ -292,8 +292,8 @@ impl AgentImageAttachment {
 
 /// One non-image file attached to a user message.
 ///
-/// None of the three backends (Codex, Gemini, Claude Code) expose a native
-/// "document" content block as of now, so we stage the file at a stable
+/// The current external backends (Codex and Claude Code) do not expose a
+/// native "document" content block, so we stage the file at a stable
 /// path inside (or near) the workspace and lean on the agent's existing
 /// file-read tools. The accompanying user message gets a short prelude
 /// pointing at the path — see `format_file_attachments_prelude`.
@@ -602,8 +602,8 @@ pub enum AgentEvent {
     /// thread start. Claude Code only stamps a session id on stdout messages
     /// once the first turn begins, so `start_thread` returns a placeholder
     /// and this event upgrades Intendant's identity and resume records to
-    /// the real id when it appears. Codex and Gemini return canonical ids
-    /// from `start_thread` and never emit this.
+    /// the real id when it appears. Codex returns a canonical id from
+    /// `start_thread` and never emits this.
     NativeSessionId { session_id: String },
     /// Incremental text from the agent's message.
     MessageDelta { text: String },
@@ -1163,7 +1163,7 @@ pub trait ExternalAgent: Send + Sync {
     /// Ask the backend to drop the last `turns_to_drop` conversational
     /// turns from the active thread. Backends that implement this
     /// (Codex, via `thread/rollback`) override it; backends that don't
-    /// (Claude Code, Gemini) return the default error and the caller
+    /// (Claude Code) return the default error and the caller
     /// falls back to a session reset — shut down, re-initialize, start
     /// a new thread.
     ///
@@ -1348,10 +1348,16 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["codex", "claude-code"]);
         for entry in entries {
-            assert!(entry.get("installed").is_some_and(serde_json::Value::is_boolean));
-            assert!(entry.get("command").is_some_and(serde_json::Value::is_string));
+            assert!(entry
+                .get("installed")
+                .is_some_and(serde_json::Value::is_boolean));
+            assert!(entry
+                .get("command")
+                .is_some_and(serde_json::Value::is_string));
             assert!(entry.get("label").is_some_and(serde_json::Value::is_string));
-            assert!(entry.get("leased").is_some_and(serde_json::Value::is_boolean));
+            assert!(entry
+                .get("leased")
+                .is_some_and(serde_json::Value::is_boolean));
             assert!(
                 entry.get("local_login").is_some(),
                 "local_login must be present (bool or null)"

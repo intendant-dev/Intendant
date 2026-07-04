@@ -34,6 +34,19 @@ pub struct SessionAgentConfig {
     pub codex_service_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_home: Option<String>,
+    /// Claude Code launch pins (claude-code sessions only; same
+    /// inherit-vs-pin semantics as the codex_* fields: `None` = inherit the
+    /// global/Control default at spawn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_permission_mode: Option<String>,
+    /// `None` = inherit; `Some(vec![])` = explicitly unrestricted (all
+    /// tools), so a session can opt out of a restrictive global list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_allowed_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_effort: Option<String>,
     /// Canonical native id of the thread this session was FORKED from
     /// (backend-neutral lineage record). While the fork's own native id is
     /// still unknown, `resume == forked_from` also tells the spawner to add
@@ -54,6 +67,10 @@ impl SessionAgentConfig {
             && self.codex_context_archive.is_none()
             && self.codex_service_tier.is_none()
             && self.codex_home.is_none()
+            && self.claude_model.is_none()
+            && self.claude_permission_mode.is_none()
+            && self.claude_allowed_tools.is_none()
+            && self.claude_effort.is_none()
             && self.forked_from.is_none()
     }
 
@@ -84,6 +101,18 @@ impl SessionAgentConfig {
         }
         if self.codex_home.is_none() {
             self.codex_home = fallback.codex_home;
+        }
+        if self.claude_model.is_none() {
+            self.claude_model = fallback.claude_model;
+        }
+        if self.claude_permission_mode.is_none() {
+            self.claude_permission_mode = fallback.claude_permission_mode;
+        }
+        if self.claude_allowed_tools.is_none() {
+            self.claude_allowed_tools = fallback.claude_allowed_tools;
+        }
+        if self.claude_effort.is_none() {
+            self.claude_effort = fallback.claude_effort;
         }
         if self.forked_from.is_none() {
             self.forked_from = fallback.forked_from;
@@ -154,12 +183,86 @@ pub fn normalize_codex_context_archive(mode: Option<&str>) -> Option<String> {
     Some(crate::project::normalize_codex_context_archive(trimmed))
 }
 
+/// Per-session Claude model pin. `None` clears (inherit); "default" is safe
+/// as a clear sentinel here because it is never a model id or alias.
+pub fn normalize_claude_model(model: Option<&str>) -> Option<String> {
+    let trimmed = model.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(trimmed, "inherit" | "default" | "global") {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Per-session permission-mode pin. Unlike the other fields, "default" is a
+/// REAL Claude Code mode and must stay pinnable (a session can pin `default`
+/// under a stricter global mode) — only "inherit"/"global"/empty clear.
+pub fn normalize_claude_permission_mode(mode: Option<&str>) -> Option<String> {
+    let trimmed = mode.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(trimmed, "inherit" | "global") {
+        return None;
+    }
+    Some(crate::project::normalize_claude_permission_mode(trimmed))
+}
+
+/// Per-session allowed-tools pin, comma-separated on the wire (rules can
+/// contain spaces — `Bash(cargo test *)` — but never commas: the spawner
+/// joins the list with commas for `--allowedTools`). "all"/"*" pins the
+/// explicitly-unrestricted empty list so a session can escape a restrictive
+/// global list; "inherit"/"default"/"global"/empty clear the pin.
+pub fn normalize_claude_allowed_tools(tools: Option<&str>) -> Option<Vec<String>> {
+    let trimmed = tools.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(trimmed, "inherit" | "default" | "global") {
+        return None;
+    }
+    if matches!(trimmed, "all" | "*") {
+        return Some(Vec::new());
+    }
+    Some(
+        trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|rule| !rule.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Per-session reasoning-effort pin. "default" is not a real effort level,
+/// so it clears alongside "inherit"/"global" (matching the project-level
+/// normalizer, which also treats "default" as unset).
+pub fn normalize_claude_effort(effort: Option<&str>) -> Option<String> {
+    let trimmed = effort.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(trimmed, "inherit" | "default" | "global") {
+        return None;
+    }
+    crate::project::normalize_claude_effort(Some(trimmed))
+}
+
 pub fn effective_codex_home() -> Option<String> {
     let from_env = std::env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
     let home = from_env.unwrap_or_else(|| crate::platform::home_dir().join(".codex"));
     normalize_codex_home(Some(&home.to_string_lossy()))
+}
+
+/// Raw wire values for a per-session launch config, named so call sites can
+/// set only the fields their backend carries (everything else defaults to
+/// "not supplied"). Backend gating and normalization happen in
+/// [`from_wire_fields`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WireSessionAgentFields<'a> {
+    pub source: Option<&'a str>,
+    pub agent_command: Option<&'a str>,
+    pub codex_sandbox: Option<&'a str>,
+    pub codex_approval_policy: Option<&'a str>,
+    pub codex_managed_context: Option<&'a str>,
+    pub codex_context_archive: Option<&'a str>,
+    pub codex_service_tier: Option<&'a str>,
+    pub claude_model: Option<&'a str>,
+    pub claude_permission_mode: Option<&'a str>,
+    pub claude_allowed_tools: Option<&'a str>,
+    pub claude_effort: Option<&'a str>,
 }
 
 pub fn from_wire(
@@ -171,39 +274,57 @@ pub fn from_wire(
     codex_context_archive: Option<&str>,
     codex_service_tier: Option<&str>,
 ) -> SessionAgentConfig {
-    let source = source
-        .map(crate::session_names::normalize_source)
-        .filter(|value| !value.is_empty());
-    let codex_managed_context = match source.as_deref() {
-        Some("codex") => normalize_codex_managed_context(codex_managed_context),
-        _ => None,
-    };
-    let codex_sandbox = match source.as_deref() {
-        Some("codex") => normalize_codex_sandbox(codex_sandbox),
-        _ => None,
-    };
-    let codex_approval_policy = match source.as_deref() {
-        Some("codex") => normalize_codex_approval_policy(codex_approval_policy),
-        _ => None,
-    };
-    let codex_context_archive = match source.as_deref() {
-        Some("codex") => normalize_codex_context_archive(codex_context_archive),
-        _ => None,
-    };
-    let codex_service_tier = match source.as_deref() {
-        Some("codex") => normalize_codex_service_tier(codex_service_tier),
-        _ => None,
-    };
-    SessionAgentConfig {
+    from_wire_fields(WireSessionAgentFields {
         source,
-        project_root: None,
-        agent_command: normalize_agent_command(agent_command),
+        agent_command,
         codex_sandbox,
         codex_approval_policy,
         codex_managed_context,
         codex_context_archive,
         codex_service_tier,
+        ..Default::default()
+    })
+}
+
+pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
+    let source = fields
+        .source
+        .map(crate::session_names::normalize_source)
+        .filter(|value| !value.is_empty());
+    let is_codex = source.as_deref() == Some("codex");
+    let is_claude = source.as_deref() == Some("claude-code");
+    SessionAgentConfig {
+        source,
+        project_root: None,
+        agent_command: normalize_agent_command(fields.agent_command),
+        codex_sandbox: is_codex
+            .then(|| normalize_codex_sandbox(fields.codex_sandbox))
+            .flatten(),
+        codex_approval_policy: is_codex
+            .then(|| normalize_codex_approval_policy(fields.codex_approval_policy))
+            .flatten(),
+        codex_managed_context: is_codex
+            .then(|| normalize_codex_managed_context(fields.codex_managed_context))
+            .flatten(),
+        codex_context_archive: is_codex
+            .then(|| normalize_codex_context_archive(fields.codex_context_archive))
+            .flatten(),
+        codex_service_tier: is_codex
+            .then(|| normalize_codex_service_tier(fields.codex_service_tier))
+            .flatten(),
         codex_home: None,
+        claude_model: is_claude
+            .then(|| normalize_claude_model(fields.claude_model))
+            .flatten(),
+        claude_permission_mode: is_claude
+            .then(|| normalize_claude_permission_mode(fields.claude_permission_mode))
+            .flatten(),
+        claude_allowed_tools: is_claude
+            .then(|| normalize_claude_allowed_tools(fields.claude_allowed_tools))
+            .flatten(),
+        claude_effort: is_claude
+            .then(|| normalize_claude_effort(fields.claude_effort))
+            .flatten(),
         forked_from: None,
     }
 }
@@ -230,20 +351,36 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 project.config.agent.codex.service_tier.as_deref(),
             ),
             codex_home: effective_codex_home(),
+            claude_model: None,
+            claude_permission_mode: None,
+            claude_allowed_tools: None,
+            claude_effort: None,
             forked_from: None,
         },
-        AgentBackend::ClaudeCode => SessionAgentConfig {
-            source: Some("claude-code".to_string()),
-            project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
-            agent_command: Some(project.config.agent.claude_code.command.clone()),
-            codex_sandbox: None,
-            codex_approval_policy: None,
-            codex_managed_context: None,
-            codex_context_archive: None,
-            codex_service_tier: None,
-            codex_home: None,
-            forked_from: None,
-        },
+        AgentBackend::ClaudeCode => {
+            let claude = &project.config.agent.claude_code;
+            SessionAgentConfig {
+                source: Some("claude-code".to_string()),
+                project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
+                agent_command: Some(claude.command.clone()),
+                codex_sandbox: None,
+                codex_approval_policy: None,
+                codex_managed_context: None,
+                codex_context_archive: None,
+                codex_service_tier: None,
+                codex_home: None,
+                // Pin the launch-time settings (same as the codex arm pins
+                // sandbox/approval): a resume reproduces what this session
+                // was actually launched with, not the current global config.
+                claude_model: normalize_claude_model(claude.model.as_deref()),
+                claude_permission_mode: Some(crate::project::normalize_claude_permission_mode(
+                    &claude.permission_mode,
+                )),
+                claude_allowed_tools: Some(claude.allowed_tools.clone()),
+                claude_effort: crate::project::normalize_claude_effort(claude.effort.as_deref()),
+                forked_from: None,
+            }
+        }
     }
 }
 
@@ -274,8 +411,21 @@ pub fn apply_to_project(
             }
         }
         AgentBackend::ClaudeCode => {
+            let claude = &mut project.config.agent.claude_code;
             if let Some(command) = config.agent_command.clone() {
-                project.config.agent.claude_code.command = command;
+                claude.command = command;
+            }
+            if let Some(model) = config.claude_model.clone() {
+                claude.model = Some(model);
+            }
+            if let Some(mode) = config.claude_permission_mode.as_deref() {
+                claude.permission_mode = crate::project::normalize_claude_permission_mode(mode);
+            }
+            if let Some(tools) = config.claude_allowed_tools.clone() {
+                claude.allowed_tools = tools;
+            }
+            if let Some(effort) = config.claude_effort.as_deref() {
+                claude.effort = crate::project::normalize_claude_effort(Some(effort));
             }
         }
     }
@@ -343,6 +493,25 @@ fn normalize_session_agent_config(
     }
     if let Some(home) = config.codex_home.take() {
         config.codex_home = normalize_codex_home(Some(&home));
+    }
+    if let Some(model) = config.claude_model.take() {
+        config.claude_model = normalize_claude_model(Some(&model));
+    }
+    if let Some(mode) = config.claude_permission_mode.take() {
+        config.claude_permission_mode = normalize_claude_permission_mode(Some(&mode));
+    }
+    if let Some(tools) = config.claude_allowed_tools.take() {
+        // Keep Some(vec![]) — that's the explicit "all tools" pin.
+        config.claude_allowed_tools = Some(
+            tools
+                .into_iter()
+                .map(|rule| rule.trim().to_string())
+                .filter(|rule| !rule.is_empty())
+                .collect(),
+        );
+    }
+    if let Some(effort) = config.claude_effort.take() {
+        config.claude_effort = normalize_claude_effort(Some(&effort));
     }
     config
 }
@@ -596,6 +765,32 @@ pub fn apply_config_to_session_json(session: &mut Value, config: &SessionAgentCo
     }
     if let Some(home) = config.codex_home.as_deref() {
         obj.insert("codex_home".to_string(), Value::String(home.to_string()));
+    }
+    if let Some(model) = config.claude_model.as_deref() {
+        obj.insert("claude_model".to_string(), Value::String(model.to_string()));
+    }
+    if let Some(mode) = config.claude_permission_mode.as_deref() {
+        obj.insert(
+            "claude_permission_mode".to_string(),
+            Value::String(mode.to_string()),
+        );
+    }
+    if let Some(tools) = config.claude_allowed_tools.as_ref() {
+        obj.insert(
+            "claude_allowed_tools".to_string(),
+            Value::Array(
+                tools
+                    .iter()
+                    .map(|rule| Value::String(rule.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(effort) = config.claude_effort.as_deref() {
+        obj.insert(
+            "claude_effort".to_string(),
+            Value::String(effort.to_string()),
+        );
     }
 }
 
@@ -1167,6 +1362,186 @@ mod tests {
         assert_eq!(
             loaded.codex_home.as_deref(),
             Some("/home/user/.codex-managed")
+        );
+    }
+
+    #[test]
+    fn claude_wire_fields_normalize_and_gate_on_source() {
+        let cfg = from_wire_fields(WireSessionAgentFields {
+            source: Some("claude-code"),
+            agent_command: Some(" claude "),
+            claude_model: Some("  opus  "),
+            claude_permission_mode: Some("acceptEdits"),
+            claude_allowed_tools: Some("Read, Edit, Bash(cargo test *)"),
+            claude_effort: Some(" XHIGH "),
+            ..Default::default()
+        });
+        assert_eq!(cfg.source.as_deref(), Some("claude-code"));
+        assert_eq!(cfg.agent_command.as_deref(), Some("claude"));
+        assert_eq!(cfg.claude_model.as_deref(), Some("opus"));
+        assert_eq!(cfg.claude_permission_mode.as_deref(), Some("acceptEdits"));
+        assert_eq!(
+            cfg.claude_allowed_tools.as_deref(),
+            Some(&["Read".to_string(), "Edit".into(), "Bash(cargo test *)".into()][..]),
+            "comma-split must preserve spaces inside a rule"
+        );
+        assert_eq!(cfg.claude_effort.as_deref(), Some("xhigh"));
+
+        // Codex sessions never absorb claude fields (and vice versa).
+        let cross = from_wire_fields(WireSessionAgentFields {
+            source: Some("codex"),
+            claude_model: Some("opus"),
+            claude_effort: Some("max"),
+            ..Default::default()
+        });
+        assert!(cross.claude_model.is_none());
+        assert!(cross.claude_effort.is_none());
+    }
+
+    #[test]
+    fn claude_inherit_sentinels_clear_but_default_mode_pins() {
+        for sentinel in ["inherit", "global", "", "  "] {
+            let cfg = from_wire_fields(WireSessionAgentFields {
+                source: Some("claude-code"),
+                claude_model: Some(sentinel),
+                claude_permission_mode: Some(sentinel),
+                claude_allowed_tools: Some(sentinel),
+                claude_effort: Some(sentinel),
+                ..Default::default()
+            });
+            assert!(cfg.claude_model.is_none(), "model {sentinel:?} should clear");
+            assert!(
+                cfg.claude_permission_mode.is_none(),
+                "mode {sentinel:?} should clear"
+            );
+            assert!(
+                cfg.claude_allowed_tools.is_none(),
+                "tools {sentinel:?} should clear"
+            );
+            assert!(cfg.claude_effort.is_none(), "effort {sentinel:?} should clear");
+        }
+        // "default" is a REAL permission mode and must pin, while it clears
+        // the other three fields (never a valid model/tool/effort value).
+        let cfg = from_wire_fields(WireSessionAgentFields {
+            source: Some("claude-code"),
+            claude_model: Some("default"),
+            claude_permission_mode: Some("default"),
+            claude_allowed_tools: Some("default"),
+            claude_effort: Some("default"),
+            ..Default::default()
+        });
+        assert!(cfg.claude_model.is_none());
+        assert_eq!(cfg.claude_permission_mode.as_deref(), Some("default"));
+        assert!(cfg.claude_allowed_tools.is_none());
+        assert!(cfg.claude_effort.is_none());
+        // "all" pins the explicitly-unrestricted empty list.
+        let cfg = from_wire_fields(WireSessionAgentFields {
+            source: Some("claude-code"),
+            claude_allowed_tools: Some("all"),
+            ..Default::default()
+        });
+        assert_eq!(cfg.claude_allowed_tools.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn claude_overlay_round_trips_and_partial_write_preserves_pins() {
+        let home = tempfile::tempdir().unwrap();
+        let full = from_wire_fields(WireSessionAgentFields {
+            source: Some("claude-code"),
+            agent_command: Some("/tmp/claude"),
+            claude_model: Some("sonnet"),
+            claude_permission_mode: Some("plan"),
+            claude_allowed_tools: Some("all"),
+            claude_effort: Some("low"),
+            ..Default::default()
+        });
+        write_external_overlay(home.path(), "claude-code", "sess-1", &full).unwrap();
+        let loaded = lookup_external_overlay(home.path(), "claude-code", "sess-1").unwrap();
+        assert_eq!(loaded, full);
+        assert_eq!(
+            loaded.claude_allowed_tools.as_deref(),
+            Some(&[][..]),
+            "the explicit all-tools pin survives the JSON round-trip"
+        );
+
+        // A later partial write (only the model) keeps the other pins.
+        let partial = from_wire_fields(WireSessionAgentFields {
+            source: Some("claude-code"),
+            claude_model: Some("haiku"),
+            ..Default::default()
+        });
+        write_external_overlay(home.path(), "claude-code", "sess-1", &partial).unwrap();
+        let loaded = lookup_external_overlay(home.path(), "claude-code", "sess-1").unwrap();
+        assert_eq!(loaded.claude_model.as_deref(), Some("haiku"));
+        assert_eq!(loaded.claude_permission_mode.as_deref(), Some("plan"));
+        assert_eq!(loaded.claude_effort.as_deref(), Some("low"));
+        assert_eq!(loaded.agent_command.as_deref(), Some("/tmp/claude"));
+
+        // A replace with inherit-derived values un-pins.
+        let inherit = from_wire_fields(WireSessionAgentFields {
+            source: Some("claude-code"),
+            agent_command: Some("/tmp/claude"),
+            claude_model: Some("inherit"),
+            claude_permission_mode: Some("inherit"),
+            claude_allowed_tools: Some("inherit"),
+            claude_effort: Some("inherit"),
+            ..Default::default()
+        });
+        replace_external_overlay(home.path(), "claude-code", "sess-1", &inherit).unwrap();
+        let loaded = lookup_external_overlay(home.path(), "claude-code", "sess-1").unwrap();
+        assert!(loaded.claude_model.is_none());
+        assert!(loaded.claude_permission_mode.is_none());
+        assert!(loaded.claude_allowed_tools.is_none());
+        assert!(loaded.claude_effort.is_none());
+    }
+
+    #[test]
+    fn claude_config_applies_to_project_and_session_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("intendant.toml"), "").unwrap();
+        let mut project = Project::from_root(dir.path().to_path_buf()).unwrap();
+        project.config.agent.claude_code.allowed_tools = vec!["Read".to_string()];
+
+        let cfg = from_wire_fields(WireSessionAgentFields {
+            source: Some("claude-code"),
+            claude_model: Some("opus"),
+            claude_permission_mode: Some("acceptEdits"),
+            claude_allowed_tools: Some("all"),
+            claude_effort: Some("max"),
+            ..Default::default()
+        });
+        apply_to_project(&mut project, &AgentBackend::ClaudeCode, &cfg);
+        let claude = &project.config.agent.claude_code;
+        assert_eq!(claude.model.as_deref(), Some("opus"));
+        assert_eq!(claude.permission_mode, "acceptEdits");
+        assert!(
+            claude.allowed_tools.is_empty(),
+            "the all-tools pin overrides a restrictive global list"
+        );
+        assert_eq!(claude.effort.as_deref(), Some("max"));
+
+        let mut session = serde_json::json!({"source": "claude-code", "session_id": "sess-1"});
+        apply_config_to_session_json(&mut session, &cfg);
+        assert_eq!(
+            session.get("claude_model").and_then(|v| v.as_str()),
+            Some("opus")
+        );
+        assert_eq!(
+            session
+                .get("claude_permission_mode")
+                .and_then(|v| v.as_str()),
+            Some("acceptEdits")
+        );
+        assert_eq!(
+            session
+                .get("claude_allowed_tools")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            session.get("claude_effort").and_then(|v| v.as_str()),
+            Some("max")
         );
     }
 

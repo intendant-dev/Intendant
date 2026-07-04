@@ -26,6 +26,8 @@ see [Getting Started](./getting-started.md#api-keys-env) for the search order).
 | `GEMINI_API_KEY` | `GEMINI` | — | Google AI (Gemini) key |
 | `PROVIDER` | — | auto-detect | `openai`, `anthropic`, or `gemini` — which provider to use when multiple keys are set |
 | `MODEL_NAME` | — | per-provider | Main model name |
+| `ANTHROPIC_ENDPOINT` | — | `https://api.anthropic.com` | Anthropic API base URL override for self-hosted API-compatible gateways and proxies |
+| `GEMINI_ENDPOINT` | — | `https://generativelanguage.googleapis.com` | Gemini API base URL override for self-hosted API-compatible gateways and proxies |
 
 **Auto-detection** (when `PROVIDER` is unset): if an OpenAI key is present it is
 used first, then Anthropic, then Gemini. Setting `PROVIDER` explicitly forces
@@ -79,8 +81,9 @@ attributing Google Chrome updater/app-bundle activity to Intendant on macOS. Set
 the explicit executable variable when a managed browser lives in a custom path,
 or choose `provider=system_cdp` for a deliberate one-off system-browser launch.
 Run `intendant setup browsers` to download Chrome for Testing into Intendant's
-managed cache, or `intendant setup browsers --check` to verify the cache without
-network access.
+managed cache. The helper accepts `--check`, `--force`,
+`--channel stable|beta|dev|canary`, `--json`, and `--print-path`; use
+`--check` to verify the cache without network access.
 
 ### Sub-agent variables (set automatically)
 
@@ -245,6 +248,9 @@ Routes coding tasks to an external CLI agent instead of the native loop (see
 | `writable_roots` | array | `[]` | Extra writable roots, each passed as `--add-dir` (absolute, or resolved against project root) |
 | `managed_context` | string | `vanilla` | `vanilla` for upstream/original-fork Codex; `managed` enables proactive Intendant context densification, rewind/backout tools, disables Codex auto-compaction, and requires the patched Codex app-server protocol with lineage prompt-cache-key support |
 | `context_archive` | string | `summary` | Context snapshot archive mode ("Context replay" in the UI): `summary` records compact per-request visualization data with temporary provider traces, `exact` persists full provider request payloads for raw replay, `off` disables capture |
+
+`context_recovery` is accepted as a deprecated TOML alias for
+`managed_context`. New configs must use `managed_context`.
 
 Codex `app-server` launches in `managed_context = "managed"` suppress inherited
 user-global Codex MCP/plugin/app servers by default and inject Intendant's MCP
@@ -438,16 +444,30 @@ After a restore, existing browser sessions are gone because sessions are
 memory-only. Claimed daemons continue to be owned by the restored account state,
 but currently connected dashboards must reconnect.
 
-The service accepts equivalent environment variables:
+The service accepts these deployment flags and equivalent environment variables:
 
-| Env | Equivalent flag |
-|-----|-----------------|
-| `INTENDANT_CONNECT_LISTEN` | `--listen` |
-| `INTENDANT_CONNECT_ORIGIN` | `--origin` |
-| `INTENDANT_CONNECT_RP_ID` | `--rp-id` |
-| `INTENDANT_CONNECT_STATIC_ROOT` | `--static-root` |
-| `INTENDANT_CONNECT_DATA_FILE` | `--data-file` |
-| `INTENDANT_CONNECT_TOKEN` | `--daemon-token` |
+| Env | Equivalent flag | Default | Description |
+|-----|-----------------|---------|-------------|
+| `INTENDANT_CONNECT_LISTEN` | `--listen` | `127.0.0.1:9876` | HTTP listen address |
+| `INTENDANT_CONNECT_ORIGIN` | `--origin` | `http://localhost:<port>` | Public browser origin for redirects, install snippets, and WebAuthn origin checks |
+| `INTENDANT_CONNECT_RP_ID` | `--rp-id` | origin host, or `intendant.dev` for `*.intendant.dev` | WebAuthn relying-party id |
+| `INTENDANT_CONNECT_STATIC_ROOT` | `--static-root` | `static` | Static asset root |
+| `INTENDANT_CONNECT_DATA_FILE` | `--data-file` | platform data dir `intendant/connect/state.json` | JSON state file |
+| `INTENDANT_CONNECT_TOKEN` | `--daemon-token` | unset | Bearer token for daemon registration/polling unless open registration is enabled; still guards admin surfaces |
+| `INTENDANT_CONNECT_INVITE_REQUIRED` | `--invite-required` | `false` | Require a valid invite code for new account registration |
+| `INTENDANT_CONNECT_OPEN_REGISTRATION` | `--open-registration` | `false` | Let daemons register and poll without the bearer token; claim-time account authorization remains enforced |
+
+The service also accepts environment-only operational overrides for
+self-hosting and tests:
+
+| Env | Default | Description |
+|-----|---------|-------------|
+| `INTENDANT_CONNECT_DOH_URL` | `https://cloudflare-dns.com/dns-query` | DNS-over-HTTPS endpoint used for `_intendant.<domain>` TXT attestation |
+| `INTENDANT_CONNECT_GIST_BASE` | `https://gist.githubusercontent.com/` | Allowed raw gist URL prefix for GitHub handle attestation |
+| `INTENDANT_CONNECT_PRESENCE_OFFLINE_MS` | `180000` | Claimed daemon polling gap that counts as offline for presence alerts |
+| `INTENDANT_CONNECT_PRESENCE_POLL_MS` | `30000` | Presence-alert monitor poll interval |
+| `INTENDANT_CONNECT_RECLAIM_AFTER_MS` | `0` (off) | Dormant-handle reclamation threshold for accounts with no claimed daemons and no recent sign-in |
+| `INTENDANT_CONNECT_RECLAIM_POLL_MS` | `21600000` | Dormant-handle reclamation poll interval |
 
 For local E2E without editing `intendant.toml`, the daemon also accepts
 environment overrides:
@@ -491,7 +511,7 @@ deployments only ever touch `[server.tls]`.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `bind` | string/IP | wildcard dual-stack, then `0.0.0.0` fallback | IP address the dashboard listens on. Use `127.0.0.1` or a specific interface for local/plaintext automation |
-| `advertise` | array | `[]` (auto-detect) | WebSocket URLs to advertise in this daemon's Agent Card, preference order. The CLI `--advertise-url` is additive over this |
+| `advertise` | array | `[]` (auto-detect) | WebSocket URLs to advertise in this daemon's Agent Card, preference order. Repeatable CLI `--advertise-url` replaces this list entirely. The selected CLI or config list is prepended to auto-detected fallback URLs |
 
 `[server.tls]` — native TLS-only HTTPS/WSS for the dashboard (pure-Rust
 `rustls` + `rcgen`, all platforms; ORed with the `--tls` flag). The dashboard

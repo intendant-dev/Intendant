@@ -9,14 +9,16 @@
 //!
 //! ## Unsafe policy
 //!
-//! This module is the deliberate, documented exception to the repo's
-//! no-`unsafe`-on-Unix-paths rule (see CLAUDE.md): the AX API has no safe
+//! This module is the deliberate, documented AX exception to the repo's
+//! default safe-Rust Unix policy (see CLAUDE.md): the AX API has no safe
 //! wrapper crate that doesn't drag in a duplicate `core-graphics`/legacy
 //! `objc` stack, so raw `accessibility-sys` bindings are wrapped here.
 //! Every `unsafe` block is as small as the FFI call it wraps, carries a
 //! `// SAFETY:` comment, and object lifetimes are RAII-managed through
-//! `core-foundation`'s `TCFType` wrappers (release-on-drop). Do not add
-//! `unsafe` outside this module.
+//! `core-foundation`'s `TCFType` wrappers (release-on-drop). Do not add AX
+//! `unsafe` outside this module; other Unix `unsafe` sites are limited to the
+//! documented platform probes/signals in `platform.rs` and the Vortex shared
+//! memory bridge in `live_audio.rs`.
 
 use std::ffi::c_void;
 
