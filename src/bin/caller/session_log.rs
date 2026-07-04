@@ -359,22 +359,22 @@ impl SessionLog {
 
     /// Resolve the session log directory.
     /// If `override_path` is set (via --log-file), use that as the directory.
-    /// Otherwise, create a fresh session directory with a UUID name.
+    /// Otherwise, pick a fresh UUID-named directory under `~/.intendant/logs`.
+    ///
+    /// Pure path computation — nothing is created on disk until `open()`,
+    /// so a caller that bails before opening can't strand an empty session
+    /// directory in the logs tree.
     pub fn resolve_path(override_path: Option<&str>) -> PathBuf {
         if let Some(path) = override_path {
-            let dir = PathBuf::from(path);
-            let _ = fs::create_dir_all(&dir);
-            return dir;
+            return PathBuf::from(path);
         }
 
-        // Create a new session directory with UUID for each top-level caller invocation.
+        // A fresh UUID-named directory for each top-level caller invocation.
         let session_id = Uuid::new_v4().to_string();
-        let dir = crate::platform::home_dir()
+        crate::platform::home_dir()
             .join(".intendant")
             .join("logs")
-            .join(&session_id);
-        let _ = fs::create_dir_all(&dir);
-        dir
+            .join(&session_id)
     }
 
     /// Find the most recent session for a given project root.

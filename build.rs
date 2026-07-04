@@ -1,10 +1,17 @@
 //! Build script for the intendant binary.
 //!
-//! Checks whether the compiled WASM artifacts of each browser WASM crate
-//! (`crates/presence-web` → `static/wasm-web/`, `crates/station-web` →
-//! `static/wasm-station/`) are older than their Rust sources. If stale,
-//! auto-rebuilds via `wasm-pack build` using a separate target directory to
-//! avoid deadlocking with the parent cargo process.
+//! Two generated-into-`static/` jobs, both feeding `include_str!`/
+//! `include_bytes!` embeds in the gateway:
+//!
+//! - Assembles `static/app.html` from the ordered fragments in `static/app/`
+//!   (via `crates/app-html-assembler` — the same crate CI runs as the regen
+//!   gate). Write-if-different, so unchanged fragments never dirty the
+//!   artifact's mtime.
+//! - Checks whether the compiled WASM artifacts of each browser WASM crate
+//!   (`crates/presence-web` → `static/wasm-web/`, `crates/station-web` →
+//!   `static/wasm-station/`) are older than their Rust sources. If stale,
+//!   auto-rebuilds via `wasm-pack build` using a separate target directory to
+//!   avoid deadlocking with the parent cargo process.
 
 use std::path::Path;
 use std::process::Command;
@@ -212,6 +219,19 @@ impl WasmCrate {
 }
 
 fn main() {
+    // Assemble static/app.html from the static/app/ fragments (see
+    // crates/app-html-assembler) before anything compiles, so the
+    // `include_str!` embed in web_gateway.rs always matches the fragment
+    // sources. Watching the artifact itself means a stray hand-edit to the
+    // generated file is reverted to fragment truth on the next build rather
+    // than silently shipping. Fail loudly on manifest ↔ directory mismatch:
+    // a silently dropped fragment would embed a broken dashboard.
+    println!("cargo:rerun-if-changed={}/", app_html_assembler::FRAGMENT_DIR);
+    println!("cargo:rerun-if-changed={}", app_html_assembler::OUTPUT);
+    if let Err(err) = app_html_assembler::assemble(Path::new(".")) {
+        panic!("app.html assembly failed: {err}");
+    }
+
     // Re-run if any WASM crate source or artifact changes.
     for krate in WASM_CRATES {
         krate.emit_rerun_directives();

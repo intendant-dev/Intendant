@@ -226,6 +226,9 @@ async fn accept_loop(
                     return;
                 };
                 eprintln!("[access/cert-server] accept failed: {e} (rebinding listener)");
+                // The dead socket still owns the port until it is dropped —
+                // rebinding while it lives self-inflicts EADDRINUSE forever.
+                drop(listener);
                 let mut delay = std::time::Duration::from_millis(250);
                 listener = loop {
                     tokio::time::sleep(delay).await;

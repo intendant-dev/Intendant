@@ -1,0 +1,50 @@
+name: app.html assembly
+
+# static/app.html is a generated artifact: build.rs assembles it from the
+# static/app/ fragments via crates/app-html-assembler. windows.yml's paths
+# filter deliberately skips static-asset pushes (they can't break a compile),
+# so this small job is the regen gate for exactly those pushes: rerun the
+# real assembler and fail if the committed artifact doesn't match the
+# committed fragments — a hand-edit to the generated file, a forgotten
+# regeneration, or manifest ↔ directory drift (the assembler itself fails
+# closed on that). The assembler is std-only, so this compiles and runs in
+# seconds; no cache needed.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "static/app/**"
+      - "static/app.html"
+      - "crates/app-html-assembler/**"
+      - "build.rs"
+      - ".github/workflows/app-html.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "static/app/**"
+      - "static/app.html"
+      - "crates/app-html-assembler/**"
+      - "build.rs"
+      - ".github/workflows/app-html.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-html-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regen-check:
+    name: fragments match artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Assemble static/app.html from fragments
+        run: cargo run -p app-html-assembler --locked
+
+      - name: Committed artifact matches committed fragments
+        run: git diff --exit-code static/app.html

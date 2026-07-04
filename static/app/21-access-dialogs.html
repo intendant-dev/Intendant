@@ -1,0 +1,861 @@
+        <!-- ── Overview: who you are, your fleet, how the model works ── -->
+        <div class="subtab-pane active" id="access-pane-overview">
+          <div class="access-pane-body">
+            <div id="access-attention" class="acc-attention"></div>
+            <div id="access-identity-hero" class="acc-hero-grid"></div>
+            <div class="acc-section-head">
+              <div class="acc-section-title">Fleet</div>
+              <div class="acc-section-sub">Every daemon you can reach from here. Each one still decides locally what you may do.</div>
+            </div>
+            <div id="access-fleet-strip" class="acc-fleet-strip"></div>
+            <div id="access-model-explainer" class="acc-explainer"></div>
+          </div>
+        </div>
+
+        <!-- ── Daemons: the machines you operate ── -->
+        <div class="subtab-pane" id="access-pane-daemons">
+          <div class="access-pane-body">
+            <div class="acc-section-head">
+              <div class="acc-section-title">Daemons</div>
+              <div class="acc-section-sub">Machines this dashboard can operate. The route is how you reach one; your role there is decided by that daemon.</div>
+              <div class="acc-section-actions">
+                <button type="button" class="acc-btn primary" id="access-link-daemon-btn">Link a daemon</button>
+              </div>
+            </div>
+            <div id="access-target-overview" class="access-target-surface"></div>
+            <details class="acc-fold" id="access-peer-controls-fold">
+              <summary>Peer messaging &amp; quick controls</summary>
+              <div class="acc-fold-body">
+                <p class="acc-fold-hint">Talk to the agent on a connected peer directly: send messages, delegate tasks, resolve approvals, and open live displays.</p>
+                <div id="daemons-list" class="daemons-list"></div>
+              </div>
+            </details>
+            <details class="acc-fold" id="access-capability-routing-fold">
+              <summary>Capability routing</summary>
+              <div class="acc-fold-body">
+                <p class="acc-fold-hint">
+                  Capability-based discovery and task routing across all connected peers. Capabilities are kebab-case
+                  (<code>display</code>, <code>computer-use</code>, <code>task-delegation</code>, …) plus <code>custom:&lt;name&gt;</code>.
+                  Separate multiple with commas or spaces.
+                </p>
+                <div class="coord-section">
+                  <div class="coord-section-label">Find eligible peers</div>
+                  <div class="coord-row">
+                    <input id="coord-eligible-caps" type="text" placeholder="display, computer-use" autocomplete="off">
+                    <button id="coord-eligible-btn" type="button">Find</button>
+                  </div>
+                  <div id="coord-eligible-result" class="coord-result"></div>
+                </div>
+                <div class="coord-section">
+                  <div class="coord-section-label">Route a task</div>
+                  <div class="coord-row">
+                    <input id="coord-route-caps" type="text" placeholder="display, computer-use" autocomplete="off">
+                  </div>
+                  <textarea id="coord-route-instructions" class="coord-textarea" placeholder="Instructions for the chosen peer…" rows="3"></textarea>
+                  <div class="coord-row">
+                    <button id="coord-route-btn" type="button">Route</button>
+                    <span class="coord-route-hint">Routes to the lexicographically-first peer that satisfies all required capabilities. Cmd/Ctrl+Enter in the textarea also fires.</span>
+                  </div>
+                  <div id="coord-route-result" class="coord-result"></div>
+                </div>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <!-- ── People & Devices: user/client access to this daemon ── -->
+        <div class="subtab-pane" id="access-pane-people">
+          <div class="access-pane-body">
+            <div class="acc-section-head">
+              <div class="acc-section-title">People &amp; Devices</div>
+              <div class="acc-section-sub">Humans and their browsers, certificates, and Connect accounts — everyone who may operate <em>this</em> daemon. Daemon-to-daemon trust lives under Peers.</div>
+            </div>
+            <div id="access-people-current" class="acc-hero-grid"></div>
+            <div id="access-enrollment-requests"></div>
+            <div id="access-user-client-grant-form"></div>
+            <details class="acc-fold" id="access-org-join-fold">
+              <summary>Join with an org grant</summary>
+              <div class="acc-fold-body">
+                <p class="acc-fold-hint">Paste the signed document an organization issued for this browser's key. This daemon verifies it against its trusted org keys and writes a normal, expiring IAM grant — nothing changes if verification fails. The document is also kept in this browser and presented automatically whenever you connect to a daemon that trusts the org, so you only do this once.</p>
+                <textarea id="access-org-join-doc" class="daemon-pairing-textarea" rows="6" placeholder='{"v":1,"kind":"org-grant", …}'></textarea>
+                <div class="acc-grant-flow-actions">
+                  <button id="access-org-join-btn" class="acc-btn primary" type="button">Present grant</button>
+                  <span id="access-org-join-status" class="acc-grant-flow-msg"></span>
+                </div>
+              </div>
+            </details>
+            <div class="acc-section-head">
+              <div class="acc-section-title">Who has access</div>
+              <div class="acc-section-sub">Every user/client principal this daemon knows, with its grants. Draft and revoked grants stay visible for review.</div>
+            </div>
+            <div id="access-people-grants" class="acc-principal-list"></div>
+          </div>
+        </div>
+
+        <!-- ── Peers: daemon-to-daemon federation ── -->
+        <div class="subtab-pane" id="access-pane-peers">
+          <div class="access-pane-body">
+            <div class="acc-section-head">
+              <div class="acc-section-title">Peer daemons</div>
+              <div class="acc-section-sub">Daemon-to-daemon federation over mutual TLS. A peer profile bounds what a remote daemon may do here — it never grants a human's browser anything.</div>
+            </div>
+            <div id="access-peer-summary" class="acc-hero-grid"></div>
+
+            <div class="daemon-pairing-grid">
+              <div class="daemon-pairing-panel daemon-add-wizard">
+                <div class="daemon-pairing-title">Link daemons</div>
+                <div class="daemon-pairing-mode-tabs" role="tablist" aria-label="Peer access mode">
+                  <button type="button" class="active" data-daemon-pairing-mode="request">Request Peer Access</button>
+                  <button type="button" data-daemon-pairing-mode="join">Join Invite</button>
+                  <button type="button" data-daemon-pairing-mode="invite">Grant Peer Invite</button>
+                  <button type="button" data-daemon-pairing-mode="manual">Manual Add</button>
+                </div>
+
+                <div class="daemon-pairing-pane active" data-daemon-pairing-pane="request">
+                  <p class="acc-fold-hint">Ask another daemon to let this one in. The other side approves the request and picks the profile.</p>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-request-target-url" type="text" placeholder="target URL" autocomplete="off">
+                    <input id="daemon-request-label" type="text" placeholder="this daemon label" autocomplete="off">
+                  </div>
+                  <div class="daemon-pairing-row">
+                    <select id="daemon-request-profile">
+                      <option value="peer-operator" title="Daemon-to-daemon display input, messages, tasks, and approvals. No settings or runtime control.">Peer operator</option>
+                      <option value="terminal-operator" title="Session reading plus interactive shell access.">Terminal operator</option>
+                      <option value="session-reader" title="Presence, stats, and session history. No shell, task, settings, or display input.">Session reader</option>
+                      <option value="read-only-display" title="Presence, stats, and display viewing. No input control.">Read-only display</option>
+                      <option value="shared-session-spectator" title="Presence, stats, and display viewing. No input control.">Spectator</option>
+                      <option value="task-runner" title="Presence, stats, messages, and task delegation.">Task runner</option>
+                      <option value="stats" title="Presence and usage statistics only.">Stats</option>
+                      <option value="presence-only" title="Basic presence only.">Presence only</option>
+                      <option value="peer-root" title="All daemon-to-daemon peer operations, including settings, sessions, files, shell, and runtime control.">Peer root</option>
+                    </select>
+                    <button id="daemon-request-btn" type="button">Request</button>
+                  </div>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-request-id" type="text" placeholder="request id" autocomplete="off">
+                    <button id="daemon-request-complete-btn" type="button">Check</button>
+                  </div>
+                  <div id="daemon-request-code" class="daemon-pairing-secret"></div>
+                  <span id="daemon-request-status" class="daemon-pairing-status"></span>
+                </div>
+
+                <div class="daemon-pairing-pane" data-daemon-pairing-pane="join">
+                  <p class="acc-fold-hint">Paste an invite another daemon created for you. It contains everything needed to connect.</p>
+                  <textarea id="daemon-join-invite" class="daemon-pairing-textarea" rows="6" placeholder="Paste invite"></textarea>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-join-label" type="text" placeholder="label override" autocomplete="off">
+                    <button id="daemon-join-btn" type="button">Join</button>
+                  </div>
+                  <span id="daemon-join-status" class="daemon-pairing-status"></span>
+                </div>
+
+                <div class="daemon-pairing-pane" data-daemon-pairing-pane="invite">
+                  <p class="acc-fold-hint">Create an invite that lets another daemon connect to this one.</p>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-invite-card-url" type="text" placeholder="advertised URL" autocomplete="off">
+                    <input id="daemon-invite-label" type="text" placeholder="label" autocomplete="off">
+                  </div>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-invite-client-name" type="text" placeholder="client name" autocomplete="off">
+                    <button id="daemon-invite-create-btn" type="button">Create</button>
+                  </div>
+                  <textarea id="daemon-invite-output" class="daemon-pairing-textarea" rows="4" readonly placeholder="Invite appears here"></textarea>
+                  <div class="daemon-pairing-actions">
+                    <button id="daemon-invite-copy-btn" type="button" disabled>Copy</button>
+                    <span id="daemon-invite-status" class="daemon-pairing-status"></span>
+                  </div>
+                  <div class="daemon-pairing-secret">Inbound grant: contains a client private key.</div>
+                </div>
+
+                <div class="daemon-pairing-pane" data-daemon-pairing-pane="manual">
+                  <p class="acc-fold-hint">Add a daemon you already hold client certificates for.</p>
+                  <div class="daemon-add-row">
+                    <input id="daemon-add-url" type="text" placeholder="https://mac-work:8765" autocomplete="off">
+                    <input id="daemon-add-label" type="text" placeholder="label" autocomplete="off">
+                    <button id="daemon-add-btn" type="button">Add</button>
+                  </div>
+                  <div class="daemon-add-row daemon-add-row-via">
+                    <input id="daemon-add-via" type="text" placeholder="via URL(s)" autocomplete="off">
+                  </div>
+                  <div class="daemon-add-row daemon-add-row-via">
+                    <input id="daemon-add-browser-tcp-via" type="text" placeholder="browser TCP URL" autocomplete="off">
+                  </div>
+                  <label class="daemon-add-persist">
+                    <input id="daemon-add-persist" type="checkbox">
+                    <span>Save to intendant.toml</span>
+                  </label>
+                  <span id="daemons-status" class="daemons-status"></span>
+                </div>
+              </div>
+
+              <div class="daemon-pairing-panel">
+                <div class="daemon-pairing-title">Inbound Peer Access Requests</div>
+                <div id="daemon-access-requests-list" class="daemons-list"></div>
+                <div class="daemon-pairing-actions">
+                  <button id="daemon-access-requests-refresh-btn" type="button">Refresh</button>
+                  <span id="daemon-access-requests-status" class="daemon-pairing-status"></span>
+                </div>
+              </div>
+            </div>
+
+            <div class="daemon-pairing-panel daemon-relationships-panel">
+              <div class="daemon-pairing-title">Inbound Peer Grants</div>
+              <div id="daemon-peer-identities-list" class="daemons-list"></div>
+              <div class="daemon-pairing-actions">
+                <button id="daemon-peer-identities-refresh-btn" type="button">Refresh</button>
+                <span id="daemon-peer-identities-status" class="daemon-pairing-status"></span>
+              </div>
+            </div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">Peer grants</div>
+              <div class="acc-section-sub">Every daemon-to-daemon grant this daemon knows about, in both directions.</div>
+            </div>
+            <div id="access-peer-details" class="access-detail-grid"></div>
+          </div>
+        </div>
+
+        <!-- ── Diagnostics: route health & self-tests ── -->
+        <div class="subtab-pane" id="access-pane-diagnostics">
+          <div class="access-pane-body">
+            <div id="access-diagnostics-overview" class="access-overview-grid"></div>
+            <fieldset class="settings-group" id="connect-health-panel">
+              <legend>Connection Diagnostics</legend>
+              <div id="connect-health-summary" class="connect-health-badges"></div>
+              <div id="connect-health-grid" class="connect-health-grid"></div>
+              <div class="connect-self-test-actions">
+                <button id="connect-self-test-btn" type="button">Run self-test</button>
+                <span id="connect-self-test-status" aria-live="polite"></span>
+              </div>
+              <div id="connect-self-test-results" class="connect-self-test-results"></div>
+            </fieldset>
+          </div>
+        </div>
+
+        <!-- ── Advanced: the full model for powerusers ── -->
+        <div class="subtab-pane" id="access-pane-advanced">
+          <div class="access-pane-body">
+            <div class="acc-section-head">
+              <div class="acc-section-title">Credential vault</div>
+              <div class="acc-section-sub">Provider credentials, end-to-end encrypted under your passkeys and a recovery phrase. The hosted store holds only ciphertext; daemons only ever borrow time-boxed leases.</div>
+            </div>
+            <div id="access-vault-section"></div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">Custody trail</div>
+              <div class="acc-section-sub">Every lease grant, expiry, revocation, and browser-relay change this daemon has seen — who, what, and when. Recorded by the daemon itself, kept on its disk, never sent anywhere.</div>
+            </div>
+            <div id="access-custody-section"></div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">Roles &amp; permissions</div>
+              <div class="acc-section-sub">The exact permission matrix this daemon enforces. Roles bundle permissions; peer profiles live in the daemon-to-daemon domain.</div>
+            </div>
+            <div id="access-role-catalog" class="acc-role-catalog"></div>
+            <div id="access-permission-matrix" class="access-detail-grid"></div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">All grants</div>
+              <div class="acc-section-sub">Every grant with its principal, target, policy, transport, and the reason it exists.</div>
+            </div>
+            <div id="access-grant-details" class="access-detail-grid"></div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">Organizations</div>
+              <div class="acc-section-sub">Orgs whose signed grant documents this daemon accepts, each under a local role cap. Trust is a per-daemon decision — use the grant flow's Apply-to to trust an org across the fleet.</div>
+            </div>
+            <div id="access-organizations"></div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">Model inspector</div>
+              <div class="acc-section-sub">The raw access model this daemon reports: principals, grants, policies, permissions, IAM roles, audit events, and transports.</div>
+            </div>
+            <div id="access-iam-state-card" class="acc-hero-grid"></div>
+            <div id="access-model-details" class="access-model-details"></div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">Public sharing</div>
+              <div class="acc-section-sub" id="access-public-shares">Nothing is shared publicly. Explicit public or hosted-service shares remain a design target — nothing is exposed unless you grant it.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Tab -->
+    <div id="tab-settings" class="tab-pane">
+      <div class="subtabs">
+        <button class="subtab-btn active" data-settings-tab="account">Account</button>
+        <button class="subtab-btn" data-settings-tab="agent">Agent</button>
+        <button class="subtab-btn" data-settings-tab="debug">Debug</button>
+      </div>
+
+      <div class="subtab-panes">
+
+        <!-- Account pane: API keys + anything else that identifies the user -->
+        <div class="subtab-pane active" id="settings-pane-account">
+          <div class="settings-pane-body">
+            <section class="ui-card" aria-labelledby="settings-keys-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-keys-heading">API Keys</h3>
+                <div class="ui-section-sub">Provider credentials, saved to <code>~/.config/intendant/.env</code>.</div>
+              </div>
+              <div class="settings-row">
+                <label>OpenAI</label>
+                <input type="password" id="settings-key-openai" placeholder="sk-..." autocomplete="off">
+                <span class="key-status" id="key-status-openai"></span>
+              </div>
+              <div class="settings-row">
+                <label>Anthropic</label>
+                <input type="password" id="settings-key-anthropic" placeholder="sk-ant-..." autocomplete="off">
+                <span class="key-status" id="key-status-anthropic"></span>
+              </div>
+              <div class="settings-row">
+                <label>Gemini</label>
+                <input type="password" id="settings-key-gemini" placeholder="AI..." autocomplete="off">
+                <span class="key-status" id="key-status-gemini"></span>
+              </div>
+              <div class="settings-keys-actions">
+                <button id="settings-save-keys" class="ui-btn primary">Save Keys</button>
+                <span id="settings-keys-status"></span>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <!-- Agent pane: everything that configures how the agent behaves -->
+        <div class="subtab-pane" id="settings-pane-agent">
+          <div class="settings-pane-body">
+            <p class="settings-note">
+              Settings are saved to <code>intendant.toml</code> and take effect on the next task.
+            </p>
+
+            <section class="ui-card" aria-labelledby="settings-external-agent-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-external-agent-heading">External Agent</h3>
+                <div class="ui-section-sub">Route tasks to an external coding agent instead of the internal loop.</div>
+              </div>
+              <div class="settings-row">
+                <label>Backend</label>
+                <select id="set-external-agent">
+                  <option value="">None (internal agent)</option>
+                  <option value="codex">Codex (OpenAI)</option>
+                  <option value="claude-code">Claude Code (Anthropic)</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label>Codex binary</label>
+                <input id="set-codex-command" type="text" placeholder="codex or /usr/local/bin/codex" autocomplete="off">
+              </div>
+              <div class="settings-row">
+                <label title="The Intendant-aware Codex fork. Managed-context sessions spawn this binary instead of the vanilla Codex binary above — managed mode only works with the fork. Leave empty to use the Codex binary for both modes.">Codex managed fork</label>
+                <input id="set-codex-managed-command" type="text" placeholder="path to the Intendant-aware codex fork (managed mode)" autocomplete="off">
+              </div>
+              <div class="settings-row">
+                <label>Claude binary</label>
+                <input id="set-claude-command" type="text" placeholder="claude or /usr/local/bin/claude" autocomplete="off">
+              </div>
+              <div class="settings-row">
+                <label>Codex tier</label>
+                <select id="set-codex-service-tier">
+                  <option value="">Inherit Codex config</option>
+                  <option value="standard">Normal</option>
+                  <option value="priority">Fast</option>
+                  <option value="flex">Flex</option>
+                </select>
+              </div>
+            </section>
+
+            <section class="ui-card" aria-labelledby="settings-cu-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-cu-heading">Computer Use</h3>
+                <div class="ui-section-sub">The model and display backend that drive screen control.</div>
+              </div>
+              <!-- CU-first routing is vaulted ([experimental] cu_first_routing
+                   in intendant.toml); the separate provider/model selection
+                   only applies when it is on, so the rows stay hidden
+                   otherwise. Elements remain in the DOM — Station and the
+                   settings save path read them either way. -->
+              <div id="cu-routing-rows" style="display:none">
+              <div class="settings-row">
+                <label>Provider</label>
+                <select id="set-cu-provider">
+                  <option value="">Auto</option>
+                  <option value="gemini">Gemini</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="anthropic">Anthropic</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label>Model</label>
+                <select id="set-cu-model">
+                  <option value="">Default</option>
+                  <optgroup label="Gemini">
+                    <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
+                    <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
+                    <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                  </optgroup>
+                  <optgroup label="OpenAI">
+                    <option value="gpt-5.4-mini">gpt-5.4-mini</option>
+                    <option value="gpt-5.4">gpt-5.4</option>
+                    <option value="computer-use-preview">computer-use-preview</option>
+                  </optgroup>
+                  <optgroup label="Anthropic">
+                    <option value="claude-haiku-4-5-20251001">claude-haiku-4-5</option>
+                    <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+                  </optgroup>
+                </select>
+              </div>
+              </div>
+              <div class="settings-row">
+                <label>Backend</label>
+                <select id="set-cu-backend">
+                  <option value="auto">Auto-detect</option>
+                  <option value="x11">X11</option>
+                  <option value="wayland">Wayland</option>
+                  <option value="macos">macOS</option>
+                </select>
+              </div>
+            </section>
+
+            <section class="ui-card" aria-labelledby="settings-presence-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-presence-heading">Presence</h3>
+                <div class="ui-section-sub">Text and live-voice models for the companion that mediates between you and the worker.</div>
+              </div>
+              <div class="settings-row">
+                <label>Enabled</label>
+                <input id="set-presence-enabled" type="checkbox">
+              </div>
+              <div class="settings-row">
+                <label>Text Provider</label>
+                <select id="set-presence-provider">
+                  <option value="">Auto</option>
+                  <option value="gemini">Gemini</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="anthropic">Anthropic</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label>Text Model</label>
+                <select id="set-presence-model">
+                  <option value="">Default</option>
+                  <optgroup label="Gemini">
+                    <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
+                    <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                    <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                  </optgroup>
+                  <optgroup label="OpenAI">
+                    <option value="gpt-5.4-mini">gpt-5.4-mini</option>
+                    <option value="gpt-5.4">gpt-5.4</option>
+                    <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+                  </optgroup>
+                  <optgroup label="Anthropic">
+                    <option value="claude-haiku-4-5-20251001">claude-haiku-4-5</option>
+                    <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+                    <option value="claude-opus-4-6">claude-opus-4-6</option>
+                  </optgroup>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label>Live Provider</label>
+                <select id="set-presence-live-provider">
+                  <option value="">Auto</option>
+                  <option value="gemini">Gemini</option>
+                  <option value="openai">OpenAI</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label>Live Model</label>
+                <select id="set-presence-live-model">
+                  <option value="">Default</option>
+                  <optgroup label="Gemini">
+                    <option value="gemini-3.1-flash-live-preview">gemini-3.1-flash-live-preview</option>
+                    <option value="gemini-2.5-flash-native-audio-preview-12-2025">gemini-2.5-flash-native-audio</option>
+                  </optgroup>
+                  <optgroup label="OpenAI">
+                    <option value="gpt-realtime-1.5">gpt-realtime-1.5</option>
+                    <option value="gpt-realtime">gpt-realtime</option>
+                    <option value="gpt-realtime-mini">gpt-realtime-mini</option>
+                  </optgroup>
+                </select>
+              </div>
+            </section>
+
+            <section class="ui-card" aria-labelledby="settings-transcription-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-transcription-heading">Transcription</h3>
+                <div class="ui-section-sub">Speech-to-text for voice input and call audio.</div>
+              </div>
+              <div class="settings-row">
+                <label>Enabled</label>
+                <input id="set-transcription-enabled" type="checkbox">
+              </div>
+              <div class="settings-row">
+                <label>Provider</label>
+                <input id="set-transcription-provider" type="text" placeholder="openai">
+              </div>
+              <div class="settings-row">
+                <label>Model</label>
+                <select id="set-transcription-model">
+                  <option value="whisper-1">whisper-1</option>
+                  <option value="gpt-4o-transcribe">gpt-4o-transcribe</option>
+                  <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label>Endpoint</label>
+                <input id="set-transcription-endpoint" type="text" placeholder="Default (OpenAI)">
+              </div>
+              <div class="settings-row">
+                <label>Language</label>
+                <input id="set-transcription-language" type="text" placeholder="Auto-detect">
+              </div>
+            </section>
+
+            <section class="ui-card" aria-labelledby="settings-recording-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-recording-heading">Recording</h3>
+                <div class="ui-section-sub">Framerate and quality for display recordings.</div>
+              </div>
+              <div class="settings-row">
+                <label>Enabled</label>
+                <input id="set-recording-enabled" type="checkbox">
+              </div>
+              <div class="settings-row">
+                <label>Framerate</label>
+                <input id="set-recording-framerate" type="number" min="1" max="60" placeholder="15">
+                <span id="framerate-warning" class="hidden settings-row-warning">screencapture backend caps at 15 fps</span>
+              </div>
+              <div class="settings-row">
+                <label>Quality</label>
+                <select id="set-recording-quality">
+                  <option value="low">Low</option>
+                  <option value="medium" selected>Medium</option>
+                  <option value="high">High</option>
+                </select>
+              </div>
+            </section>
+
+            <section class="ui-card" aria-labelledby="settings-live-audio-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-live-audio-heading">Live Audio</h3>
+                <div class="ui-section-sub">Live voice sessions with the agent and their idle timeout.</div>
+              </div>
+              <div class="settings-row">
+                <label>Enabled</label>
+                <input id="set-live-audio-enabled" type="checkbox">
+              </div>
+              <div class="settings-row">
+                <label>Timeout (s)</label>
+                <input id="set-live-audio-timeout" type="number" min="30" max="3600" placeholder="300">
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <!-- Network pane: anything about how this daemon talks to others -->
+        <!-- Debug pane: read-only diagnostics -->
+        <div class="subtab-pane" id="settings-pane-debug">
+          <div class="settings-pane-body">
+            <section class="ui-card" aria-labelledby="settings-report-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-report-heading">Session Report</h3>
+                <div class="ui-section-sub">A zip of this session's logs (session.jsonl, turn files, daemon stderr/stdout) for sharing with the dev.</div>
+              </div>
+              <a id="download-session-report-btn"
+                 class="ui-btn primary settings-report-btn"
+                 href="/api/session/current/report"
+                 download>
+                Download session report
+              </a>
+            </section>
+            <p class="settings-note">
+              Connection diagnostics and self-tests live under
+              <a href="#access/diagnostics">Access &rarr; Diagnostics</a>.
+            </p>
+            <div id="settings-env-overrides" class="hidden settings-env-overrides">
+              <h4>Environment Variable Overrides</h4>
+              <div id="settings-env-list"></div>
+            </div>
+            <p id="debug-empty" class="settings-note">
+              No debug overrides active. Set environment variables before launching <code>intendant --web</code> to see them here.
+            </p>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Save / Reset — outside subtab-panes so it's always visible. -->
+      <div class="settings-save-row">
+        <button id="settings-save-btn" class="ui-btn primary">Save</button>
+        <button id="settings-reset-btn" class="ui-btn">Reset</button>
+        <span id="settings-status"></span>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Video Preview -->
+<div class="video-preview-wrap" id="videoPreviewWrap">
+  <video id="videoPreviewEl" class="video-preview" autoplay muted playsinline></video>
+  <canvas id="videoCanvas" style="display:none;"></canvas>
+  <div class="video-preview-info">
+    <span class="frame-id" id="videoFrameId">--</span>
+    <span id="videoFps">0 fps</span>
+  </div>
+</div>
+
+<!-- Rollback confirmation modal.
+     Opened by the timeline strip (Changes sub-tab) with two checkboxes
+     so the user can pick whether to revert files, the conversation, or
+     both. Wired up in the Timeline section below. -->
+<div id="rollback-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog">
+    <h3>Roll back to round <span id="rollback-round-label"></span></h3>
+    <p class="modal-description">
+      Choose what to revert:
+    </p>
+    <label class="modal-checkbox">
+      <input type="checkbox" id="rollback-files" checked>
+      <span>Revert files</span>
+      <small>Restore all changed files to their state at this round</small>
+    </label>
+    <label class="modal-checkbox">
+      <input type="checkbox" id="rollback-conversation">
+      <span>Revert conversation</span>
+      <small>Truncate the agent's memory to this round. For Claude Code, this resets the session (loses all context).</small>
+    </label>
+    <div class="modal-warning" id="rollback-warning" style="display:none"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" onclick="closeRollbackModal()">Cancel</button>
+      <button class="modal-confirm danger" id="rollback-confirm-btn" onclick="confirmRollback()">Roll back</button>
+    </div>
+  </div>
+</div>
+
+<div id="fs-picker-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog fs-picker-dialog">
+    <div class="fs-picker-header">
+      <h3 id="fs-picker-title">Choose project directory</h3>
+      <button type="button" class="fs-picker-close" onclick="closeFsPicker()" title="Close">X</button>
+    </div>
+    <div class="fs-picker-path-row">
+      <input id="fs-picker-path" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/project">
+      <button type="button" onclick="loadFsPickerPath()">Go</button>
+    </div>
+    <div id="fs-picker-status" class="fs-picker-status"></div>
+    <div id="fs-picker-list" class="fs-picker-list"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" type="button" onclick="closeFsPicker()">Cancel</button>
+      <button class="modal-cancel" id="fs-picker-create-btn" type="button" onclick="createPickerDirectory()">Create directory</button>
+      <button class="modal-cancel hidden" id="fs-picker-download-cancel-btn" type="button" onclick="cancelFsPickerDownload()">Stop</button>
+      <button class="modal-confirm" id="fs-picker-use-btn" type="button" onclick="useFsPickerSelection()">Use directory</button>
+    </div>
+  </div>
+</div>
+
+<div id="session-config-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog session-config-dialog">
+    <button class="modal-close" type="button" title="Close" onclick="closeSessionConfigModal()">x</button>
+    <h3 id="session-config-title">Session launch config</h3>
+    <p class="modal-description" id="session-config-description">
+      These settings are stored on this session and are used when it is next attached or resumed.
+    </p>
+    <div class="session-config-row">
+      <label>Session</label>
+      <input id="session-config-session" type="text" readonly>
+    </div>
+    <div class="session-config-row">
+      <label>Agent</label>
+      <input id="session-config-source" type="text" readonly>
+    </div>
+    <div class="session-config-row">
+      <label for="session-config-command">Binary path</label>
+      <div class="session-config-command-row">
+        <input id="session-config-command" type="text" autocomplete="off" spellcheck="false" placeholder="Use global setting">
+        <button type="button" class="session-config-browse" onclick="openSessionConfigBinaryPicker()">Browse</button>
+      </div>
+    </div>
+    <div class="session-config-row" id="session-config-managed-row">
+      <label for="session-config-managed-context">Managed context</label>
+      <select id="session-config-managed-context">
+        <option value="">inherit Control default</option>
+        <option value="vanilla">vanilla</option>
+        <option value="managed">managed</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-sandbox-row">
+      <label for="session-config-sandbox">Sandbox</label>
+      <select id="session-config-sandbox">
+        <option value="">inherit Control default</option>
+        <option value="workspace-write">workspace-write</option>
+        <option value="danger-full-access">danger-full-access</option>
+        <option value="read-only">read-only</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-approval-row">
+      <label for="session-config-approval-policy">Approval</label>
+      <select id="session-config-approval-policy">
+        <option value="">inherit Control default</option>
+        <option value="on-request">on-request</option>
+        <option value="never">never</option>
+        <option value="untrusted">untrusted</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-archive-row">
+      <label for="session-config-context-archive">Context replay</label>
+      <select id="session-config-context-archive">
+        <option value="">inherit Control default</option>
+        <option value="summary">summary</option>
+        <option value="exact">exact</option>
+        <option value="off">off</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-claude-model-row">
+      <label for="session-config-claude-model">Model</label>
+      <select id="session-config-claude-model" onchange="onSessionConfigClaudeModelChange()">
+        <option value="inherit">inherit Control default</option>
+        <option value="fable">fable — latest Fable</option>
+        <option value="opus">opus — latest Opus</option>
+        <option value="sonnet">sonnet — latest Sonnet</option>
+        <option value="haiku">haiku — latest Haiku</option>
+        <option value="__custom__">Custom model id…</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-claude-model-custom-row" style="display:none">
+      <label for="session-config-claude-model-custom">Custom id</label>
+      <input id="session-config-claude-model-custom" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. claude-haiku-4-5-20251001">
+    </div>
+    <div class="session-config-row" id="session-config-claude-permission-row">
+      <label for="session-config-claude-permission-mode">Permissions</label>
+      <select id="session-config-claude-permission-mode">
+        <option value="inherit">inherit Control default</option>
+        <option value="default">default</option>
+        <option value="acceptEdits">acceptEdits</option>
+        <option value="plan">plan</option>
+        <option value="bypassPermissions">bypassPermissions</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-claude-tools-row">
+      <label for="session-config-claude-allowed-tools">Allowed tools</label>
+      <input id="session-config-claude-allowed-tools" type="text" autocomplete="off" spellcheck="false" placeholder="inherit — or rules, comma-separated; all = unrestricted">
+    </div>
+    <div class="session-config-row" id="session-config-claude-effort-row">
+      <label for="session-config-claude-effort">Effort</label>
+      <select id="session-config-claude-effort">
+        <option value="inherit">inherit Control default</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+        <option value="xhigh">xhigh</option>
+        <option value="max">max</option>
+      </select>
+    </div>
+    <div class="session-config-status" id="session-config-status"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" type="button" onclick="closeSessionConfigModal()">Cancel</button>
+      <button class="modal-confirm secondary" type="button" id="session-config-save-restart" onclick="saveSessionConfigModal({ restart: true })">Save & restart</button>
+      <button class="modal-confirm" type="button" id="session-config-save" onclick="saveSessionConfigModal()">Save</button>
+    </div>
+  </div>
+</div>
+
+<div id="session-rename-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog session-rename-dialog">
+    <h3>Rename session</h3>
+    <div class="session-config-row">
+      <label>Session</label>
+      <input id="session-rename-session" type="text" readonly>
+    </div>
+    <div class="session-config-row">
+      <label for="session-rename-name">Name</label>
+      <input id="session-rename-name" type="text" maxlength="180" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="session-config-status" id="session-rename-status"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" type="button" onclick="closeSessionRenameModal()">Cancel</button>
+      <button class="modal-confirm" type="button" id="session-rename-save" onclick="saveSessionRenameModal()">Save name</button>
+    </div>
+  </div>
+</div>
+
+<div id="session-delete-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog session-delete-dialog">
+    <h3>Delete session data</h3>
+    <p class="modal-description" id="session-delete-message"></p>
+    <div class="modal-warning">This cannot be undone.</div>
+    <div class="session-config-status" id="session-delete-status"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" type="button" onclick="closeSessionDeleteModal()">Cancel</button>
+      <button class="modal-confirm danger" type="button" id="session-delete-confirm" onclick="confirmSessionDeleteModal()">Delete</button>
+    </div>
+  </div>
+</div>
+
+<div id="worktree-inspect-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog worktree-inspect-dialog">
+    <button class="modal-close" type="button" onclick="closeWorktreeInspectModal()" aria-label="Close">&times;</button>
+    <h3 id="worktree-inspect-title">Inspect worktree</h3>
+    <div class="worktree-inspect-summary">
+      <div class="worktree-inspect-path" id="worktree-inspect-path"></div>
+      <div id="worktree-inspect-subtitle"></div>
+    </div>
+    <div class="worktree-inspect-grid" id="worktree-inspect-metrics"></div>
+    <div class="worktree-inspect-section">
+      <h4>Review reasons</h4>
+      <div class="worktree-inspect-reasons" id="worktree-inspect-reasons"></div>
+    </div>
+    <div class="worktree-inspect-section">
+      <h4>Dirty files</h4>
+      <div class="worktree-inspect-files" id="worktree-inspect-files"></div>
+    </div>
+    <div class="worktree-inspect-section">
+      <h4>Actions</h4>
+      <div class="worktree-inspect-commands" id="worktree-inspect-commands"></div>
+    </div>
+    <div class="session-config-status worktree-inspect-status" id="worktree-inspect-status"></div>
+    <div class="modal-actions">
+      <button class="modal-confirm secondary" type="button" onclick="worktreeInspectOpenShell()">Open shell</button>
+      <button class="modal-confirm secondary" type="button" onclick="worktreeInspectOpenFiles()">Open files</button>
+      <button class="modal-cancel" type="button" onclick="closeWorktreeInspectModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="dashboard-confirm-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog dashboard-confirm-dialog">
+    <h3 id="dashboard-confirm-title">Confirm action</h3>
+    <p class="dashboard-confirm-message" id="dashboard-confirm-message"></p>
+    <div class="modal-warning" id="dashboard-confirm-warning" style="display:none"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" type="button" id="dashboard-confirm-cancel">Cancel</button>
+      <button class="modal-confirm danger" type="button" id="dashboard-confirm-accept">Continue</button>
+      <button class="modal-confirm danger hidden" type="button" id="dashboard-confirm-alternate">Stop session</button>
+    </div>
+  </div>
+</div>
+
+<div id="dashboard-prompt-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog dashboard-prompt-dialog">
+    <h3 id="dashboard-prompt-title">Enter value</h3>
+    <label class="dashboard-prompt-field" for="dashboard-prompt-input">
+      <span id="dashboard-prompt-label">Value</span>
+      <textarea id="dashboard-prompt-input" rows="3" autocomplete="off" spellcheck="false"></textarea>
+    </label>
+    <div class="modal-actions">
+      <button class="modal-cancel" type="button" id="dashboard-prompt-cancel">Cancel</button>
+      <button class="modal-confirm" type="button" id="dashboard-prompt-submit">Continue</button>
+    </div>
+  </div>
+</div>
+
+<!-- Voice Overlay -->
+<div class="voice-overlay" id="voiceOverlay" draggable="false">
+  <div class="voice-drag-handle" id="voiceDragHandle"></div>
+  <div class="voice-status hidden" id="voiceStatus"></div>
+  <button class="make-active-btn hidden" id="makeActiveBtn" title="Request voice control — only one browser can be active at a time">Make Active</button>
+  <button class="video-btn is-disabled" id="videoBtn" title="Send your camera feed to the voice model">&#128249;</button>
+  <button class="mic-btn" id="micBtn" title="Start or stop your microphone for voice conversation">&#127908;</button>
+</div>
