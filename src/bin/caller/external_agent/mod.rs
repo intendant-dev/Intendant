@@ -195,6 +195,66 @@ pub(crate) fn spawn_stderr_forwarder(
     });
 }
 
+/// Shared `/goal` protocol conventions. Codex implements goals natively
+/// (`thread/goal/*` RPCs); other backends run the wrapper-level goal engine
+/// — both must accept the same statuses, budget shapes, and objective
+/// limits so frontends never see backend-specific goal dialects.
+pub(crate) const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 4_000;
+
+pub(crate) fn validate_goal_objective(objective: &str) -> Result<(), CallerError> {
+    let chars = objective.chars().count();
+    if chars <= MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+        return Ok(());
+    }
+    Err(CallerError::ExternalAgent(format!(
+        "goal objective is too long: {} characters; limit is {}",
+        chars, MAX_THREAD_GOAL_OBJECTIVE_CHARS
+    )))
+}
+
+pub(crate) fn normalize_goal_status(status: &str) -> Result<String, CallerError> {
+    let normalized = match status.trim() {
+        "active" | "resume" | "resumed" => "active",
+        "paused" | "pause" => "paused",
+        "blocked" | "block" => "blocked",
+        "usageLimited" | "usage-limited" | "usage_limited" => "usageLimited",
+        "budgetLimited" | "budget-limited" | "budget_limited" => "budgetLimited",
+        "complete" | "completed" | "done" => "complete",
+        other => {
+            return Err(CallerError::ExternalAgent(format!(
+                "unsupported goal status: {}",
+                other
+            )))
+        }
+    };
+    Ok(normalized.to_string())
+}
+
+pub(crate) fn parse_goal_token_budget(
+    params: &serde_json::Value,
+) -> Result<Option<Option<u64>>, CallerError> {
+    let Some(value) = params
+        .get("tokenBudget")
+        .or_else(|| params.get("token_budget"))
+    else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(None));
+    }
+    let Some(budget) = value.as_u64() else {
+        return Err(CallerError::ExternalAgent(
+            "goal token budget must be a positive integer or null".into(),
+        ));
+    };
+    if budget == 0 {
+        return Err(CallerError::ExternalAgent(
+            "goal token budget must be a positive integer".into(),
+        ));
+    }
+    Ok(Some(Some(budget)))
+}
+
 /// One image attachment passed alongside a user message.
 ///
 /// Some backends (Codex) prefer file paths to keep base64 out of the JSON-RPC

@@ -395,6 +395,7 @@ impl SessionSupervisor {
                 agent_command,
                 claude_model,
                 claude_permission_mode,
+                claude_effort,
                 codex_sandbox,
                 codex_approval_policy,
                 codex_managed_context,
@@ -432,6 +433,7 @@ impl SessionSupervisor {
                                 agent_command,
                                 None,
                                 None,
+                                None,
                                 codex_sandbox,
                                 codex_approval_policy,
                                 codex_managed_context,
@@ -457,6 +459,7 @@ impl SessionSupervisor {
                         || agent_command.is_some()
                         || claude_model.is_some()
                         || claude_permission_mode.is_some()
+                        || claude_effort.is_some()
                         || codex_sandbox.is_some()
                         || codex_approval_policy.is_some()
                         || codex_managed_context.is_some()
@@ -480,6 +483,7 @@ impl SessionSupervisor {
                     agent_command,
                     claude_model,
                     claude_permission_mode,
+                    claude_effort,
                     codex_sandbox,
                     codex_approval_policy,
                     codex_managed_context,
@@ -545,6 +549,7 @@ impl SessionSupervisor {
                                 None,
                                 None,
                                 None,
+                                None,
                                 orchestrate,
                                 direct,
                                 Vec::new(),
@@ -571,6 +576,7 @@ impl SessionSupervisor {
                 }
                 self.start_new_session(
                     task,
+                    None,
                     None,
                     None,
                     None,
@@ -865,6 +871,7 @@ impl SessionSupervisor {
         agent_command: Option<String>,
         claude_model: Option<String>,
         claude_permission_mode: Option<String>,
+        claude_effort: Option<String>,
         codex_sandbox: Option<String>,
         codex_approval_policy: Option<String>,
         codex_managed_context: Option<String>,
@@ -1013,6 +1020,23 @@ impl SessionSupervisor {
             };
             if let Err(e) =
                 apply_session_claude_permission_mode(&mut project, backend, mode.to_string())
+            {
+                self.loop_error(format!("Session create failed: {}", e));
+                return;
+            }
+        }
+        if let Some(effort) = claude_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error(
+                    "Session create failed: claude_effort requires Claude Code".to_string(),
+                );
+                return;
+            };
+            if let Err(e) = apply_session_claude_effort(&mut project, backend, effort.to_string())
             {
                 self.loop_error(format!("Session create failed: {}", e));
                 return;
@@ -3558,7 +3582,6 @@ impl SessionSupervisor {
                 cfg.managed_context = current.managed_context;
                 cfg.context_archive = current.context_archive;
             }
-            Some(external_agent::AgentBackend::ClaudeCode) | None => {}
             Some(external_agent::AgentBackend::ClaudeCode) => {
                 let current = self.config.shared_claude_config.read().await.clone();
                 let cfg = &mut project.config.agent.claude_code;
@@ -3863,6 +3886,21 @@ fn apply_session_claude_permission_mode(
             Ok(())
         }
         _ => Err("claude_permission_mode requires Claude Code".to_string()),
+    }
+}
+
+fn apply_session_claude_effort(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    effort: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::ClaudeCode => {
+            project.config.agent.claude_code.effort =
+                crate::project::normalize_claude_effort(Some(&effort));
+            Ok(())
+        }
+        _ => Err("claude_effort requires Claude Code".to_string()),
     }
 }
 
