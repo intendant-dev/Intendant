@@ -427,15 +427,22 @@ and peer federation:
   `root` is user/client authority and `peer-profile` is daemon-to-daemon
   authority. Local user/client bindings can also use enforced scoped roles:
   `scoped-human` (access model inspection only), `observer`, `session-reader`,
-  `terminal`, `files-read`, `files-write`, and `operator`. Directory-scoped file
-  access, public shares, organization groups, and external identity policy are
-  design targets, not hidden enforcement.
+  `terminal`, `files-read`, `files-write`, `peer-user`, and `operator`.
+  Directory-scoped file access, public shares, organization groups, and
+  external identity policy are design targets, not hidden enforcement.
 - A **permission** is the operation gate the daemon enforces. Access
   administration now separates `access.inspect` from `access.manage`, and peer
-  topology separates `peer.inspect` from `peer.manage`. Owner/root dashboard
-  sessions have all four. Existing peer profiles are mapped conservatively:
-  `peer-root` can inspect access and inspect/manage peer topology, but
-  `access.manage` remains reserved for trusted root user/client sessions.
+  topology separates `peer.inspect`, `peer.manage`, and `peer.use`.
+  `peer.use` is the delegation gate: opening a tunnel to a connected peer
+  (dashboard-control, file-transfer, or display signaling) presents *this
+  daemon's* peer credentials, and the receiving peer authorizes everything
+  inside the tunnel against its own grants for this daemon — so relaying is
+  never inferred from local capabilities, it is granted by name
+  (`operator` and `peer-user` carry it; `peer.manage` implies it for
+  compatibility). Owner/root dashboard sessions have all of these. Existing
+  peer profiles are mapped conservatively: `peer-root` can inspect access and
+  inspect/manage/use peer topology, but `access.manage` remains reserved for
+  trusted root user/client sessions.
 - A **transport** is only how the route is carried: browser mTLS, hosted
   Connect/WebRTC tunnel, local/debug HTTP, or daemon-to-daemon peer mTLS. The
   product UI should not make Connect a separate access system.
@@ -1608,6 +1615,11 @@ unexpected transport.
 Pairing authorization follows the access/peer split: request and identity lists
 require `access.inspect`, invite/approve/revoke require `access.manage`, and
 join/request-access/poll remain peer-topology operations gated by `peer.manage`.
+The signaling relays that open tunnels to an already-connected peer
+(`api_peer_webrtc_signal`, `api_peer_file_transfer_signal`,
+`api_peer_dashboard_control_signal`, and their
+`POST /api/peers/{id}/…-webrtc` HTTP twins) are gated by `peer.use` instead —
+using a peer relationship is not administering it.
 General peer and coordinator controls are covered by the same rule. Peer add,
 remove, eligibility discovery, per-peer message/task/approval, peer-display
 signaling, and coordinator route calls use `api_peer_add`, `api_peer_remove`,
