@@ -331,6 +331,16 @@ immediately to that external backend. These settings are stored with the
 Intendant wrapper session and, for canonical backend session IDs, in an
 external-session overlay. They are used on the next attach/resume so a daemon
 restart or page refresh does not fall back to the current global Settings pane.
+Claude Code sessions get four pinnable rows: model (the same version-safe
+aliases as New Session, plus a Custom-id escape), permission mode, allowed
+tools (comma-separated rules; `all` pins the explicitly-unrestricted empty
+list so a session can escape a restrictive global list), and reasoning
+effort. Every field saves as a pin or the explicit `inherit` clear — and
+"default" is a *real* permission mode that pins, unlike the other fields'
+clear sentinels. On a live session, **Save** additionally applies the model
+and permission pins immediately (native `set_model` / `set_permission_mode`
+control requests); tools and effort take effect at the next launch or via
+**Save & restart**.
 The separate **Restart with saved config** action is a power-user shortcut for
 reapplying settings that were already persisted elsewhere.
 The Managed activity view exposes rewind anchors, saved records, restore, and

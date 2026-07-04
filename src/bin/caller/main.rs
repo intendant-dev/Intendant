@@ -6932,7 +6932,9 @@ fn emit_codex_session_capabilities_for_drain(
 /// `fork` respawns a resumed process with `--fork-session` via the drain's
 /// `ForkHandling::RespawnResume` path; the `goal*` family runs the
 /// wrapper-level goal engine (adapter-owned state riding the universal
-/// `GoalUpdated`/`GoalCleared` rails).
+/// `GoalUpdated`/`GoalCleared` rails); `model` / `permission-mode`
+/// reconfigure the RUNNING process live via `set_model` /
+/// `set_permission_mode` control requests (verified on CC 2.1.201).
 fn claude_code_thread_action_capabilities() -> Vec<String> {
     [
         "compact",
@@ -6946,6 +6948,8 @@ fn claude_code_thread_action_capabilities() -> Vec<String> {
         "goal-resume",
         "goal-complete",
         "goal-budget-limited",
+        "model",
+        "permission-mode",
     ]
     .into_iter()
     .map(str::to_string)
@@ -14176,9 +14180,21 @@ mod tests {
         // fast toggle heuristics) never lights up on Claude sessions.
         assert!(caps.codex_thread_actions.is_empty());
         // Claude's ops must exist in the dashboard's action registry
-        // (today the codex vocabulary) or the kebab could not render them.
+        // (today the codex vocabulary) or the kebab could not render them —
+        // EXCEPT ops the dashboard deliberately drives from the Launch-config
+        // modal instead of the kebab (live apply on save).
+        let modal_driven = ["model", "permission-mode"];
+        for op in modal_driven {
+            assert!(
+                caps.thread_actions.iter().any(|candidate| candidate == op),
+                "missing advertised modal-driven Claude thread action: {op}"
+            );
+        }
         let registry = codex_thread_action_capabilities();
         for op in &caps.thread_actions {
+            if modal_driven.contains(&op.as_str()) {
+                continue;
+            }
             assert!(
                 registry.contains(op),
                 "op {op} missing from the dashboard action registry"
