@@ -80,6 +80,13 @@ Parent's wait_sub_agents call returns the structured results
 
 - **Spawning is non-blocking**: `spawn_sub_agent` returns the child's session
   id immediately. Independent sub-tasks run in parallel.
+- **Delegation is bounded two ways**: width by
+  `[orchestrator] max_parallel_agents` (concurrently running children per
+  parent, default 4), and depth by a fixed cap two levels below the root —
+  a root session can spawn workers, and those workers can delegate once
+  more; deeper spawns are refused with instructions to do the work
+  directly. Children are also told in their system prompt not to
+  re-delegate their own task.
 - **Collection is explicit**: `wait_sub_agents` blocks until the requested
   children finish (`mode: "all"`, default), the first finishes
   (`mode: "any"`), or `timeout_secs` lapses — then returns each finished

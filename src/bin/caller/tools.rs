@@ -455,7 +455,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     // 15. spawn_sub_agent (caller-handled, supervised sessions only)
     tools.push(ToolDefinition {
         name: "spawn_sub_agent".to_string(),
-        description: "Delegate a self-contained subtask to a sub-agent running as its own supervised session (visible in the dashboard, with its own approvals and steering). Returns immediately with the child's session id; collect its result with wait_sub_agents. Only available in supervised sessions under the web daemon. Spawn independent subtasks in parallel; concurrency is capped per session.".to_string(),
+        description: "Delegate a self-contained subtask to a sub-agent running as its own supervised session (visible in the dashboard, with its own approvals and steering). Returns immediately with the child's session id; collect its result with wait_sub_agents. Only available in supervised sessions under the web daemon. Spawn independent subtasks in parallel; concurrency is capped per session and delegation depth is limited to two levels — decompose into direct workers rather than chains.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
