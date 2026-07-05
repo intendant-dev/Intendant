@@ -13,7 +13,8 @@ use crate::error::CallerError;
 
 use super::{
     normalize_plan_status, AgentConfig, AgentEvent, AgentThread, AgentUsageSnapshot,
-    ApprovalCategory, ApprovalDecision, ExternalAgent, SubAgentState, ToolCompletionStatus,
+    ApprovalCategory, ApprovalDecision, ExternalAgent, GoalActionOutcome, GoalEngine,
+    SubAgentState, ToolCompletionStatus,
 };
 
 /// Appended to the first user message when an Intendant web port is
@@ -158,11 +159,12 @@ struct CcShared {
     /// conversation turn; this flag lets the reader absorb it so it cannot
     /// prematurely complete the next real turn.
     compact_pending: AtomicBool,
-    /// Wrapper-level goal engine state. Claude Code has no native `/goal`,
+    /// Wrapper-level goal engine (the shared backend-agnostic
+    /// `external_agent::GoalEngine`). Claude Code has no native `/goal`,
     /// so the adapter owns the operator goal and rides the universal
     /// `GoalUpdated`/`GoalCleared` rails (window chip, log persistence, and
     /// replay all come for free from the Codex-built plumbing).
-    goal: StdMutex<Option<CcGoal>>,
+    goal: StdMutex<GoalEngine>,
     /// Fresh tokens spent by this process — uncached input + cache creation
     /// + output, accumulated per result. The goal-budget currency: cache
     /// reads are excluded so a budget measures real work, not re-reads.
@@ -173,71 +175,41 @@ struct CcShared {
     turn_active: AtomicBool,
 }
 
-/// Operator goal tracked by the wrapper-level engine.
-#[derive(Debug, Clone)]
-struct CcGoal {
-    objective: String,
-    /// Same status vocabulary as Codex goals (`normalize_goal_status`).
-    status: String,
-    token_budget: Option<u64>,
-    set_at: std::time::Instant,
-    /// `cumulative_fresh_tokens` snapshot when the goal was set; spend
-    /// against the budget is measured from here.
-    tokens_at_set: u64,
-}
-
 impl CcShared {
     fn new(resume_session: Option<String>) -> Self {
         Self {
             session_id: StdMutex::new(resume_session),
             interrupt_pending: AtomicBool::new(false),
             compact_pending: AtomicBool::new(false),
-            goal: StdMutex::new(None),
+            goal: StdMutex::new(GoalEngine::default()),
             cumulative_fresh_tokens: AtomicU64::new(0),
             turn_active: AtomicBool::new(false),
         }
     }
 
-    fn lock_goal(&self) -> std::sync::MutexGuard<'_, Option<CcGoal>> {
+    fn lock_goal(&self) -> std::sync::MutexGuard<'_, GoalEngine> {
         match self.goal.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
     }
 
+    fn fresh_tokens(&self) -> u64 {
+        self.cumulative_fresh_tokens.load(Ordering::Relaxed)
+    }
+
     /// Current goal as the wire type (elapsed + budget spend computed now).
     fn goal_snapshot(&self) -> Option<crate::types::SessionGoal> {
-        let guard = self.lock_goal();
-        let goal = guard.as_ref()?;
-        let used = self
-            .cumulative_fresh_tokens
-            .load(Ordering::Relaxed)
-            .saturating_sub(goal.tokens_at_set);
-        Some(crate::types::SessionGoal {
-            objective: goal.objective.clone(),
-            status: Some(goal.status.clone()),
-            elapsed_seconds: Some(goal.set_at.elapsed().as_secs()),
-            tokens_used: Some(used),
-            token_budget: goal.token_budget,
-        })
+        let fresh = self.fresh_tokens();
+        self.lock_goal().snapshot(fresh)
     }
 
     /// Refresh the goal after a turn result: recompute spend, flip an
     /// `active` goal to `budgetLimited` when the budget is exhausted, and
     /// return the updated snapshot for a `GoalUpdated` emission.
     fn refresh_goal_after_result(&self) -> Option<crate::types::SessionGoal> {
-        {
-            let mut guard = self.lock_goal();
-            let goal = guard.as_mut()?;
-            let used = self
-                .cumulative_fresh_tokens
-                .load(Ordering::Relaxed)
-                .saturating_sub(goal.tokens_at_set);
-            if goal.status == "active" && goal.token_budget.is_some_and(|budget| used >= budget) {
-                goal.status = "budgetLimited".to_string();
-            }
-        }
-        self.goal_snapshot()
+        let fresh = self.fresh_tokens();
+        self.lock_goal().refresh_after_result(fresh)
     }
 
     fn session_id(&self) -> Option<String> {
@@ -1631,125 +1603,40 @@ impl ClaudeCodeAgent {
     }
 
     /// Wrapper-level `/goal` engine (Claude Code has no native goals).
-    /// Wire conventions — statuses, budget shape, objective limit — are
-    /// shared with Codex via the `external_agent` helpers, so frontends see
-    /// one goal dialect regardless of backend.
+    /// Semantics live in the shared `external_agent::GoalEngine` so every
+    /// backend speaks one goal dialect; this host emits the goal events
+    /// and delivers notices (mid-turn steer or next-prompt prelude).
     async fn dispatch_goal_action(
         &mut self,
         op: &str,
         params: &serde_json::Value,
     ) -> Result<String, CallerError> {
-        let clear_requested = op == "goal-clear"
-            || params
-                .get("clear")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-        if clear_requested {
-            let had_goal = self.shared.lock_goal().take().is_some();
-            if !had_goal {
-                return Ok("no active goal".to_string());
+        let fresh = self.shared.fresh_tokens();
+        let outcome = self.shared.lock_goal().dispatch(op, params, fresh)?;
+        match outcome {
+            GoalActionOutcome::Report { message, goal } => {
+                if let Some(goal) = goal {
+                    self.emit_agent_event(AgentEvent::GoalUpdated { goal });
+                }
+                Ok(message)
             }
-            self.emit_agent_event(AgentEvent::GoalCleared);
-            self.deliver_goal_notice(
-                "[Operator goal cleared — no standing goal is in effect.]".to_string(),
-            )
-            .await?;
-            return Ok("goal cleared".to_string());
-        }
-
-        let implied_status = match op {
-            "goal-pause" => Some("paused"),
-            "goal-resume" => Some("active"),
-            "goal-complete" => Some("complete"),
-            "goal-budget-limited" => Some("budgetLimited"),
-            _ => None,
-        };
-        let status = match params.get("status").and_then(|v| v.as_str()) {
-            Some(raw) => Some(super::normalize_goal_status(raw)?),
-            None => implied_status.map(str::to_string),
-        };
-        let objective = params
-            .get("objective")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        if let Some(ref objective) = objective {
-            super::validate_goal_objective(objective)?;
-        }
-        let token_budget = super::parse_goal_token_budget(params)?;
-
-        let is_update =
-            objective.is_some() || status.is_some() || token_budget.is_some() || op == "goal-set";
-        if !is_update {
-            // goal / goal-get / goal-status with no fields: report.
-            return match self.shared.goal_snapshot() {
-                Some(goal) => {
-                    self.emit_agent_event(AgentEvent::GoalUpdated { goal: goal.clone() });
-                    Ok(format!(
-                        "goal {}: {}",
-                        goal.status.as_deref().unwrap_or("active"),
-                        goal.objective
-                    ))
+            GoalActionOutcome::Cleared { message, notice } => {
+                self.emit_agent_event(AgentEvent::GoalCleared);
+                self.deliver_goal_notice(notice).await?;
+                Ok(message)
+            }
+            GoalActionOutcome::Updated {
+                message,
+                goal,
+                notice,
+            } => {
+                self.emit_agent_event(AgentEvent::GoalUpdated { goal });
+                if let Some(notice) = notice {
+                    self.deliver_goal_notice(notice).await?;
                 }
-                None => Ok("no active goal".to_string()),
-            };
-        }
-
-        let objective_changed = objective.is_some();
-        let resumed = status.as_deref() == Some("active");
-        {
-            let mut guard = self.shared.lock_goal();
-            match guard.as_mut() {
-                Some(goal) => {
-                    if let Some(objective) = objective {
-                        goal.objective = objective;
-                    }
-                    if let Some(status) = status {
-                        goal.status = status;
-                    }
-                    if let Some(budget) = token_budget {
-                        goal.token_budget = budget;
-                    }
-                }
-                None => {
-                    let Some(objective) = objective else {
-                        return Err(CallerError::ExternalAgent(
-                            "no active goal — set an objective first".into(),
-                        ));
-                    };
-                    *guard = Some(CcGoal {
-                        objective,
-                        status: status.unwrap_or_else(|| "active".to_string()),
-                        token_budget: token_budget.flatten(),
-                        set_at: std::time::Instant::now(),
-                        tokens_at_set: self.shared.cumulative_fresh_tokens.load(Ordering::Relaxed),
-                    });
-                }
+                Ok(message)
             }
         }
-        let goal = self
-            .shared
-            .goal_snapshot()
-            .expect("goal was just set or updated");
-        self.emit_agent_event(AgentEvent::GoalUpdated { goal: goal.clone() });
-        if objective_changed || resumed {
-            let mut notice = format!("[Operator goal] {}", goal.objective);
-            if let Some(budget) = goal.token_budget {
-                notice.push_str(&format!(" (token budget: {budget})"));
-            }
-            self.deliver_goal_notice(notice).await?;
-        } else if goal.status.as_deref() == Some("paused") {
-            self.deliver_goal_notice(
-                "[Operator goal paused — deprioritize it until resumed.]".to_string(),
-            )
-            .await?;
-        }
-        Ok(format!(
-            "goal {}: {}",
-            goal.status.as_deref().unwrap_or("active"),
-            goal.objective
-        ))
     }
 
     /// Send a live-reconfig control request (verified on CC 2.1.201:
@@ -3559,16 +3446,15 @@ mod tests {
     #[test]
     fn goal_budget_flips_to_budget_limited_from_fresh_token_spend() {
         let mut reader = test_reader();
-        {
-            let mut guard = reader.shared.lock_goal();
-            *guard = Some(CcGoal {
-                objective: "stay cheap".into(),
-                status: "active".into(),
-                token_budget: Some(50),
-                set_at: std::time::Instant::now(),
-                tokens_at_set: 0,
-            });
-        }
+        reader
+            .shared
+            .lock_goal()
+            .dispatch(
+                "goal-set",
+                &serde_json::json!({ "objective": "stay cheap", "tokenBudget": 50 }),
+                0,
+            )
+            .expect("seed goal");
         // A result whose fresh spend (input + cache creation + output,
         // cache reads EXCLUDED) crosses the budget.
         let out = reader.process_line(
