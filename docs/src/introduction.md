@@ -2,7 +2,7 @@
 
 Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop to work in — shell access, file editing, a graphical display it can see and control, voice interaction, and the ability to make phone calls — all wrapped in a layered human oversight system. Beyond running its own agent loop, Intendant also **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines** for multi-host display and task routing.
 
-It runs on **macOS, Linux, and Windows**, is **provider-agnostic** (OpenAI, Anthropic, Gemini), and is designed so that every capability is reachable from any interface — CLI, TUI, web dashboard, MCP, or voice. The client side is deliberately just a browser — nothing to install, identity held in browser keys protected by your passkeys — so the same dashboard works from a workstation or a phone.
+It runs on **macOS, Linux, and Windows**, is **provider-agnostic** (OpenAI, Anthropic, Gemini), and is designed so that every capability is reachable from any interface — CLI, web dashboard, MCP, or voice. The client side is deliberately just a browser — nothing to install, identity held in browser keys protected by your passkeys — so the same dashboard works from a workstation or a phone.
 
 Beyond the single machine, the goal is a **network of agentic networks**: daemons owned by people and organizations, where an owner grants other people — and other daemons — scoped IAM access to their machines, infrastructure, and resources ([Trust Architecture](./trust-architecture.md)). Credentials follow the same discipline: a daemon borrows time-boxed leases from a passkey-sealed vault, or relays model calls through the owner's browser, so the machine itself holds nothing durable to steal ([Credential Custody](./credential-custody.md)).
 
@@ -26,11 +26,11 @@ Intendant is built around a few core ideas:
 
 **A single-writer control plane.** Shared mutable state (autonomy level, the active agent backend, runtime config) has exactly one writer: the control plane. Frontends are *display-only* — they render state and emit intents, but never mutate state directly. See [Control Plane & Daemon](./control-plane-and-daemon.md).
 
-**Shared frontend vocabulary.** Frontends exchange state and intents through `AppEvent` and `ControlMsg`: the TUI, web dashboard, MCP server, and control socket render events and submit control messages to the single-writer control plane. The MCP surface also maps approval/input tools to `UserAction`; there is no single compile-time exhaustiveness guarantee across every frontend. See [Architecture](./architecture.md) and [TUI & Autonomy](./tui.md).
+**Shared frontend vocabulary.** Frontends exchange state and intents through `AppEvent` and `ControlMsg`: the web dashboard, MCP server, and control socket render events and submit control messages to the single-writer control plane. The MCP surface also maps approval/input tools to `UserAction`. See [Architecture](./architecture.md) and [Autonomy & Approvals](./autonomy.md).
 
 **Presence as a separate AI.** Rather than a chat wrapper, the presence layer is an independent (usually fast) model with its own conversation, tools, and state awareness. It mediates between the user and the working agent, turning intent into tasks and narrating progress back. See [Presence Layer](./presence.md).
 
-**Layered human oversight.** A three-layer autonomy system — global level, per-category rules, and per-action approval — keeps the user in control at whatever granularity they prefer, from approving every command to fully autonomous operation. See [TUI & Autonomy](./tui.md).
+**Layered human oversight.** A three-layer autonomy system — global level, per-category rules, and per-action approval — keeps the user in control at whatever granularity they prefer, from approving every command to fully autonomous operation. See [Autonomy & Approvals](./autonomy.md).
 
 ## Architecture at a Glance
 
@@ -38,7 +38,7 @@ Intendant is built around a few core ideas:
   ┌──────────────────────── intendant (controller) ─────────────────────────┐
   │                                                                          │
   │  Frontends ──intents──►  control plane (single writer) ──► EventBus      │
-  │  (TUI · Web ·            session supervisor · task dispatch              │
+  │  (Web ·                  session supervisor · task dispatch              │
   │   MCP · socket)               │                │                         │
   │      ▲                        │                │                         │
   │      │ render          ┌──────┴──────┐   ┌─────┴───────────────┐         │

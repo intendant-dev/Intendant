@@ -491,7 +491,7 @@ environment overrides:
 INTENDANT_CONNECT_RENDEZVOUS_URL=http://127.0.0.1:9876 \
 INTENDANT_CONNECT_DAEMON_ID=connect-e2e-daemon \
 INTENDANT_CONNECT_TOKEN=shared-dev-token \
-  ./target/release/intendant --no-tui --web 8876
+  ./target/release/intendant --web 8876
 ```
 
 There are two committed validators. The hosted production-alpha validator starts
@@ -871,7 +871,7 @@ GITHUB_TOKEN = "ghp_..."
 ## Autonomy and approval
 
 Approval is decided by a three-layer model (full UI details in
-[TUI & Autonomy](./tui.md)):
+[Autonomy & Approvals](./autonomy.md)):
 
 1. **Global autonomy** — `--autonomy <low|medium|high|full>` (defaults to
    `medium`). `low` asks for everything except file reads; `full` keeps the

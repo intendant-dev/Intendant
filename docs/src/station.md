@@ -168,4 +168,4 @@ the low-GPU path, and the surface most automation drives today — but new
 operational UX should land Station-first, or in both when cheap. When
 behavior is added to either surface, prefer routing it through
 control-plane messages and universal events so the other surface (and the
-TUI, MCP, and voice frontends) inherits it for free.
+MCP and voice frontends) inherits it for free.

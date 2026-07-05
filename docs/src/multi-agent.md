@@ -43,7 +43,7 @@ the orchestration handle that enables the spawn tools).
   `implement`, `build`, `refactor`, `migrate`, `deploy`, `set up`, `analyze`,
   `compare`, `design`, `create a`) runs Direct; anything else gets the
   orchestration prompt.
-- **Non-daemon CLI paths** (TUI mode, headless `--no-web --no-tui`, standalone
+- **Non-daemon CLI paths** (headless `--no-web`, standalone
   `--mcp`) always run Direct: sub-agent spawning requires the daemon's session
   supervisor, so the orchestration prompt would describe tools that cannot
   work there.

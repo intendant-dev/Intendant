@@ -13,7 +13,7 @@ disable-model-invocation: true
 
 ## Key Concepts
 
-- **No xterm needed**: `--web` uses `WebTui` (buffer-backed ratatui backend).
+- **No terminal emulator needed**: `--web` serves the dashboard SPA; sessions render in the browser.
   Intendant runs as a plain background process, not inside a terminal emulator.
 - **Firefox renders `/app`**: The tabbed web UI with Activity, Usage, Terminal,
   Displays tabs. All logic runs in WASM (presence-web), JS is a thin rendering layer.
@@ -53,7 +53,7 @@ cd /home/user/projects/intendant && source .env && \
 
 # 4. Wait for web gateway to start
 sleep 3
-cat /tmp/intendant-web-stderr.log  # Should show "Web TUI: http://0.0.0.0:8765"
+cat /tmp/intendant-web-stderr.log  # Should show "Dashboard: http://0.0.0.0:8765"
 
 # 5. Launch Firefox on display :50 pointing to /app
 rm -f ~/.mozilla/firefox/*/.parentlock ~/.mozilla/firefox/*/lock 2>/dev/null

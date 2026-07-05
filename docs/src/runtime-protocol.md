@@ -316,7 +316,7 @@ enabled = false   # default: true
 
 ## JSON Output Mode (controller, not runtime)
 
-`--json` is a **controller** flag (it implies `--no-tui`), not part of the runtime
+`--json` is a **controller** flag (headless JSONL stdio), not part of the runtime
 protocol — but it is the closest thing to a machine-readable interface for the
 whole system, so it is documented here. Each stdout line is a JSON object with
 `type` and `data`. Event types include `turn_started`, `model_response`,
@@ -337,4 +337,4 @@ In `--json` mode the controller's stdin accepts both plain-text follow-ups and
 
 Lines that don't start with `{` or don't parse as a `ControlMsg` are treated as
 follow-up text, making `--json` fully interactive — approvals, `askHuman`, and
-multi-round conversations all work without a TUI or socket.
+multi-round conversations all work without a dashboard or socket.

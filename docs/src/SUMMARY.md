@@ -15,7 +15,7 @@
 - [Trust Architecture](./trust-architecture.md)
 - [Computer Use & Live Audio](./computer-use-and-audio.md)
 - [Presence Layer](./presence.md)
-- [TUI & Autonomy](./tui.md)
+- [Autonomy & Approvals](./autonomy.md)
 - [Web Dashboard](./web-dashboard.md)
 - [Station](./station.md)
 - [MCP Server](./mcp-server.md)

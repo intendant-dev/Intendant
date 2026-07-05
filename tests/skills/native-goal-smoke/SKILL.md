@@ -31,7 +31,7 @@ Gotchas encoded in the driver:
 
 - An **initial task argument is required**: idle web startups take the daemon
   path, which does not spawn `--control-socket`; with a task the run lands in
-  the web-TUI branch whose worker loop is `run_with_presence` — the native
+  the foreground web branch whose worker loop is `run_with_presence` — the native
   goal engine's home.
 - Thread actions **must carry `session_id`** (the control plane rejects
   untargeted ones); the driver scrapes the id from the `Session ID:` startup

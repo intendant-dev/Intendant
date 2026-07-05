@@ -49,7 +49,7 @@ for (const k of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'MODEL
 
 // An initial task is required: idle web startups take the daemon path,
 // which does not spawn the control socket — with a task the run lands in
-// the web-TUI branch whose worker loop is run_with_presence (the native
+// the foreground web branch whose worker loop is run_with_presence (the native
 // goal engine's home).
 const child = spawn(BINARY, ['--no-tui', '--web', String(PORT), '--bind', '127.0.0.1', '--no-tls',
   '--control-socket', '--autonomy', 'full', 'do the initial smoke task'], {

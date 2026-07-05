@@ -113,13 +113,13 @@ CU actions operate on a `DisplayTarget` (`#[serde(tag = "kind")]`):
   autonomy system.
 
 User-session access uses a **session-grant** model: approve once (the `d` hotkey
-in the TUI, the dashboard control, MCP `grant_user_display`, or
+the dashboard control, MCP `grant_user_display`, or
 `intendant ctl display grant-user`), and the grant holds for the rest of the
 session until revoked. On Wayland, granting starts the GNOME portal flow. For
 Computer Use, the operator must enable **Allow Remote Interaction** in the
 physical portal dialog before clicking **Share**; approving screen sharing alone
 can produce screenshots while leaving keyboard/mouse injection unavailable. See
-[TUI & Autonomy](./tui.md) for the approval surface.
+[Autonomy & Approvals](./autonomy.md) for the approval surface.
 
 ### CU-First Routing
 
@@ -260,7 +260,7 @@ openai_model = "gpt-4o-realtime-preview"                        # optional
 sample_rate = 24000            # default: 24000
 ```
 
-`LiveAudioSpawn` is its own [autonomy category](./tui.md#action-classification),
+`LiveAudioSpawn` is its own [autonomy category](./autonomy.md#action-classification),
 so spawning a voice session can be gated independently of other actions.
 
 ## Phone Calls (`phone-call` skill)

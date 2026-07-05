@@ -28,7 +28,7 @@ by emitting a [`ControlMsg`](./integrations.md) onto the EventBus (see
 Presence runs in one of two modes:
 
 - **Server-side text presence** (`src/bin/caller/presence.rs`) — the default.
-  A native Rust `PresenceLayer` driving a text model. Used by the TUI and by the
+  A native Rust `PresenceLayer` driving a text model. Used by the foreground web mode and by the
   web dashboard when no browser voice session is connected.
 - **Browser-side live presence** (`crates/presence-web/`, WASM) — when a browser
   connects a live voice/realtime model (Gemini Live or OpenAI Realtime), that
@@ -167,7 +167,7 @@ time; others are passive observers:
 
 - **Active browser** — increments the pause counter, receives tool responses,
   drives the voice session.
-- **Passive browsers** — receive TUI frames and events but do not pause the
+- **Passive browsers** — receive events but do not pause the
   server presence.
 - **Handover** — a passive browser sends `{"t":"make_active"}` to take over; the
   gateway force-disconnects the previous active browser and grants the new one
@@ -252,7 +252,7 @@ tool call (text model OR browser voice model)
 
 On the native side, `presence::action_to_control_msg()` turns the
 state-mutating variants into `ControlMsg`s on the EventBus — the **same path** a
-TUI keypress or control-socket command takes:
+control-socket command takes:
 
 | `PresenceAction`     | `ControlMsg`         |
 |----------------------|----------------------|
@@ -354,7 +354,7 @@ command and then `cargo build` to re-embed the compiled WASM.
 
 ## See Also
 
-- [TUI & Autonomy](./tui.md) — how presence narration and approvals surface in
+- [Autonomy & Approvals](./autonomy.md) — how presence narration and approvals surface in
   the terminal UI.
 - [Web Dashboard](./web-dashboard.md) — the dashboard host for browser voice.
 - [Computer Use & Live Audio](./computer-use-and-audio.md) — where
