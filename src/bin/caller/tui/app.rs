@@ -2635,6 +2635,9 @@ impl App {
             AppEvent::SessionGoal { .. } => {
                 // Frontend-neutral metadata for dashboard goal indicators.
             }
+            AppEvent::SessionVitals { .. } => {
+                // Frontend-neutral metadata for dashboard vitals chips.
+            }
             AppEvent::SessionAttached {
                 ref session_id,
                 ref source,

@@ -656,6 +656,7 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'session_relationship',
   'session_capabilities',
   'session_goal',
+  'session_vitals',
   'session_attached',
   'session_ended',
   'status',

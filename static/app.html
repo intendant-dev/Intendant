@@ -5192,6 +5192,35 @@ body.context-focus-active {
     display: none;
   }
 }
+.session-window-vitals {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 280px;
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border: 1px solid rgba(148, 226, 213, 0.22);
+  border-radius: 999px;
+  background: rgba(148, 226, 213, 0.06);
+  color: var(--subtext0);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+.session-window-vitals.conflict {
+  border-color: rgba(243, 139, 168, 0.38);
+  background: rgba(243, 139, 168, 0.08);
+  color: var(--red);
+}
+@container (max-width: 560px) {
+  .session-window-vitals {
+    display: none;
+  }
+}
 .session-window-action-cluster {
   flex-shrink: 0;
   display: inline-flex;
@@ -14822,6 +14851,7 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'session_relationship',
   'session_capabilities',
   'session_goal',
+  'session_vitals',
   'session_attached',
   'session_ended',
   'status',
@@ -25152,6 +25182,7 @@ async function main() {
         applySessionIdentitiesFromReplayEntries(filtered.entries);
         applyExternalIdentitiesFromLogEntries(filtered.entries);
         applySessionGoalsFromReplayEntries(filtered.entries);
+        applySessionVitalsFromReplayEntries(filtered.entries);
         resetSessionWindowsForReplay(filtered.entries);
         const wasProcessingLogReplay = processingLogReplay;
         processingLogReplay = true;
@@ -25208,6 +25239,9 @@ async function main() {
       }
       if (d.event === 'session_goal') {
         applySessionGoal(d);
+      }
+      if (d.event === 'session_vitals') {
+        applySessionVitals(d);
       }
       if (d.event === 'session_agent_config_result') {
         handleSessionConfigResult(d);
@@ -25940,6 +25974,7 @@ function processCommands(cmds) {
         break;
       case 'session_capabilities': applySessionCapabilities(c); break;
       case 'session_goal': applySessionGoal(c); break;
+      case 'session_vitals': applySessionVitals(c); break;
       case 'session_attached':
         onSessionAttached(c.session_id, c.source);
         stationScheduleUpdate();
@@ -31167,6 +31202,96 @@ function applySessionGoalsFromReplayEntries(entries) {
   }
 }
 
+// ── Session vitals (git / cache / limits chips — the statusline port) ──
+
+function renderSessionWindowVitals(win, vitals) {
+  if (!win?.vitals) return;
+  const git = vitals && typeof vitals === 'object' ? vitals.git : null;
+  if (!git || typeof git !== 'object') {
+    win.vitals.className = 'session-window-vitals hidden';
+    win.vitals.textContent = '';
+    win.vitals.title = '';
+    return;
+  }
+  const parts = [];
+  const titleLines = [];
+  const branch = String(git.branch || '').trim();
+  if (branch) {
+    parts.push(`⎇ ${branch}`);
+    titleLines.push(`Branch: ${branch}`);
+  }
+  const dirty = Number(git.dirtyFiles) || 0;
+  if (dirty > 0) {
+    parts.push(`●${dirty}`);
+    titleLines.push(`Dirty files: ${dirty}`);
+  }
+  const primaryRef = String(git.primaryRef || '').trim();
+  if (primaryRef) {
+    const ahead = Number(git.ahead) || 0;
+    const behind = Number(git.behind) || 0;
+    parts.push(`+${ahead}/−${behind}`);
+    titleLines.push(`vs ${primaryRef}: ${ahead} ahead, ${behind} behind`);
+  }
+  const parity = String(git.mergeParity || '').trim();
+  if (parity === 'clean') {
+    parts.push('✓');
+    titleLines.push(`Merge with ${primaryRef || 'primary'}: clean`);
+  } else if (parity === 'conflict') {
+    parts.push('⚠');
+    titleLines.push(`Merge with ${primaryRef || 'primary'}: WOULD CONFLICT`);
+  }
+  if (git.unpushed !== null && git.unpushed !== undefined) {
+    parts.push(`⇡${git.unpushed}`);
+    titleLines.push(`Unpushed on ${branch || 'branch'}: ${git.unpushed}`);
+  }
+  if (git.primaryUnpushed !== null && git.primaryUnpushed !== undefined && primaryRef) {
+    const primaryName = primaryRef.replace(/^origin\//, '');
+    parts.push(`${primaryName}⇡${git.primaryUnpushed}`);
+    titleLines.push(`Unpushed on ${primaryName}: ${git.primaryUnpushed}`);
+  }
+  if (!parts.length) {
+    win.vitals.className = 'session-window-vitals hidden';
+    win.vitals.textContent = '';
+    win.vitals.title = '';
+    return;
+  }
+  win.vitals.className = `session-window-vitals${parity === 'conflict' ? ' conflict' : ''}`;
+  win.vitals.textContent = parts.join(' ');
+  win.vitals.title = titleLines.join('\n');
+}
+
+function normalizeSessionVitals(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const src = raw.vitals && typeof raw.vitals === 'object' ? raw.vitals : raw;
+  const git = src.git && typeof src.git === 'object' ? src.git : null;
+  const cache = src.cache && typeof src.cache === 'object' ? src.cache : null;
+  const limits = Array.isArray(src.limits) ? src.limits : [];
+  if (!git && !cache && !limits.length) return null;
+  return { git, cache, limits };
+}
+
+function applySessionVitals(raw = {}) {
+  const data = raw?.data && typeof raw.data === 'object' ? raw.data : raw;
+  const sid = String(data?.session_id || data?.sessionId || '').trim();
+  if (!sid) return;
+  const vitals = normalizeSessionVitals(data);
+  for (const id of sessionGoalUpdateIds(sid)) {
+    const meta = { ...(sessionMetadataById.get(id) || {}), vitals };
+    sessionMetadataById.set(id, meta);
+    if (sessionWindows.has(id)) {
+      renderSessionWindowVitals(sessionWindows.get(id), vitals);
+    }
+  }
+}
+
+function applySessionVitalsFromReplayEntries(entries) {
+  if (!Array.isArray(entries)) return;
+  for (const entry of entries) {
+    if (entry?.event !== 'session_vitals') continue;
+    applySessionVitals(entry);
+  }
+}
+
 function sessionWindowMetaFromSession(session) {
   if (!session || typeof session !== 'object') return {};
   const meta = {
@@ -35460,6 +35585,8 @@ function ensureSessionWindow(sessionId, meta = {}) {
   goal.appendChild(goalText);
   const tier = document.createElement('span');
   tier.className = 'session-window-tier hidden';
+  const vitals = document.createElement('span');
+  vitals.className = 'session-window-vitals hidden';
   header.title = 'Click header to collapse or expand';
   const menuControls = document.createElement('div');
   menuControls.className = 'session-window-action-cluster session-window-menu-cluster';
@@ -35515,6 +35642,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   header.appendChild(title);
   header.appendChild(goal);
   header.appendChild(tier);
+  header.appendChild(vitals);
   header.appendChild(status);
   header.appendChild(menuControls);
   header.appendChild(windowControls);
@@ -35613,6 +35741,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     goal,
     goalText,
     tier,
+    vitals,
     source: meta.source || '',
     actionMenuButton: actions,
     actionMenu,
@@ -35718,6 +35847,7 @@ function updateSessionWindow(sessionId, meta = {}) {
   }
   renderSessionWindowGoal(win, meta.goal || null);
   renderSessionWindowTier(win);
+  renderSessionWindowVitals(win, (sessionMetadataById.get(sid) || {}).vitals || meta.vitals || null);
   refreshSessionGoalTicker();
   updateSessionWindowActionMenuVisibility(sid);
   updateControlFastButtonState();

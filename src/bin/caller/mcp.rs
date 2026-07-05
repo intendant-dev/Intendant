@@ -5363,6 +5363,7 @@ pub fn spawn_event_listener(
                     | AppEvent::SessionStopRequested { .. }
                     | AppEvent::SessionRelationship { .. }
                     | AppEvent::SessionGoal { .. }
+                    | AppEvent::SessionVitals { .. }
                     | AppEvent::SessionRenameResult { .. }
                     | AppEvent::SessionAgentConfigResult { .. }
                     | AppEvent::ClaudeConfigChanged { .. }

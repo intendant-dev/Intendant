@@ -168,6 +168,8 @@ function ensureSessionWindow(sessionId, meta = {}) {
   goal.appendChild(goalText);
   const tier = document.createElement('span');
   tier.className = 'session-window-tier hidden';
+  const vitals = document.createElement('span');
+  vitals.className = 'session-window-vitals hidden';
   header.title = 'Click header to collapse or expand';
   const menuControls = document.createElement('div');
   menuControls.className = 'session-window-action-cluster session-window-menu-cluster';
@@ -223,6 +225,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   header.appendChild(title);
   header.appendChild(goal);
   header.appendChild(tier);
+  header.appendChild(vitals);
   header.appendChild(status);
   header.appendChild(menuControls);
   header.appendChild(windowControls);
@@ -321,6 +324,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     goal,
     goalText,
     tier,
+    vitals,
     source: meta.source || '',
     actionMenuButton: actions,
     actionMenu,
@@ -426,6 +430,7 @@ function updateSessionWindow(sessionId, meta = {}) {
   }
   renderSessionWindowGoal(win, meta.goal || null);
   renderSessionWindowTier(win);
+  renderSessionWindowVitals(win, (sessionMetadataById.get(sid) || {}).vitals || meta.vitals || null);
   refreshSessionGoalTicker();
   updateSessionWindowActionMenuVisibility(sid);
   updateControlFastButtonState();

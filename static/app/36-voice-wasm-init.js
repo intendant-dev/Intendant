@@ -404,6 +404,7 @@ async function main() {
         applySessionIdentitiesFromReplayEntries(filtered.entries);
         applyExternalIdentitiesFromLogEntries(filtered.entries);
         applySessionGoalsFromReplayEntries(filtered.entries);
+        applySessionVitalsFromReplayEntries(filtered.entries);
         resetSessionWindowsForReplay(filtered.entries);
         const wasProcessingLogReplay = processingLogReplay;
         processingLogReplay = true;
@@ -460,6 +461,9 @@ async function main() {
       }
       if (d.event === 'session_goal') {
         applySessionGoal(d);
+      }
+      if (d.event === 'session_vitals') {
+        applySessionVitals(d);
       }
       if (d.event === 'session_agent_config_result') {
         handleSessionConfigResult(d);

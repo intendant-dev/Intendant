@@ -332,6 +332,12 @@ pub enum AppEvent {
         session_id: String,
         goal: Option<SessionGoal>,
     },
+    /// Per-session vitals (git / prompt-cache / rate limits) from the
+    /// daemon-side producers; frontends render chips from the latest value.
+    SessionVitals {
+        session_id: String,
+        vitals: crate::types::SessionVitals,
+    },
     SessionAttached {
         session_id: String,
         source: String,
@@ -1965,6 +1971,10 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             goal: goal.clone(),
         }),
+        AppEvent::SessionVitals { session_id, vitals } => Some(OutboundEvent::SessionVitals {
+            session_id: session_id.clone(),
+            vitals: vitals.clone(),
+        }),
         AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {
             session_id: session_id.clone(),
             source: source.clone(),
@@ -2548,6 +2558,7 @@ fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
             | AppEvent::SessionRelationship { .. }
             | AppEvent::SessionCapabilities { .. }
             | AppEvent::SessionGoal { .. }
+            | AppEvent::SessionVitals { .. }
             | AppEvent::SessionAttached { .. }
             | AppEvent::SessionEnded { .. }
             | AppEvent::SafetyCapReached
@@ -2700,6 +2711,9 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         }
         AppEvent::SessionGoal { session_id, goal } => {
             log.session_goal(session_id, goal.as_ref());
+        }
+        AppEvent::SessionVitals { session_id, vitals } => {
+            log.session_vitals(session_id, vitals);
         }
         AppEvent::SessionAttached { session_id, source } => {
             log.session_attached(session_id, source);

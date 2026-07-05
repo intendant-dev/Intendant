@@ -103,6 +103,7 @@ function processCommands(cmds) {
         break;
       case 'session_capabilities': applySessionCapabilities(c); break;
       case 'session_goal': applySessionGoal(c); break;
+      case 'session_vitals': applySessionVitals(c); break;
       case 'session_attached':
         onSessionAttached(c.session_id, c.source);
         stationScheduleUpdate();

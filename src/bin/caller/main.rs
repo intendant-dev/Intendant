@@ -59,6 +59,7 @@ mod session_identity;
 mod session_log;
 mod session_names;
 mod session_supervisor;
+mod session_vitals;
 mod setup;
 mod skills;
 mod sub_agent;
@@ -14900,6 +14901,17 @@ async fn main() -> Result<(), CallerError> {
             },
         );
 
+        // Vitals chips for the daemon's primary session: git state of the
+        // project root (statusline port).
+        let _vitals_producer = if let Some(session_id) = session_log_id(&session_log) {
+            Some(session_vitals::spawn_session_vitals_producer(
+                bus.clone(),
+                vec![(session_id, project.root.clone())],
+            ))
+        } else {
+            None
+        };
+
         let startup_bus = bus.clone();
         let supervisor_handle = session_supervisor::SessionSupervisor::new(
             session_supervisor::SessionSupervisorConfig {
@@ -15908,6 +15920,17 @@ async fn main() -> Result<(), CallerError> {
                     }
                 }
             });
+
+            // Vitals chips for the primary session: git state of the
+            // project root (statusline port).
+            let _vitals_producer = if let Some(session_id) = session_log_id(&session_log) {
+                Some(session_vitals::spawn_session_vitals_producer(
+                    bus.clone(),
+                    vec![(session_id, project.root.clone())],
+                ))
+            } else {
+                None
+            };
 
             let agent_backend_for_presence = agent_backend.clone();
             let shared_external_agent_for_presence = shared_external_agent.clone();
