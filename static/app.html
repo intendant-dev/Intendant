@@ -64268,7 +64268,10 @@ function filesIdeHostLabel(hostId) {
 }
 
 function filesIdeBufferKey(hostId, path) {
-  return `${hostId || ''} ${path}`;
+  // The separator must never occur in a host id and must survive the
+  // innerHTML → dataset.key round-trip in filesIdeRenderTabs — an HTML
+  // attribute value cannot hold a NUL (the parser substitutes U+FFFD).
+  return `${hostId || ''}\uFFFD${path}`;
 }
 
 function filesIdeTreeState(hostId) {
