@@ -33,6 +33,11 @@ see [Getting Started](./getting-started.md#api-keys-env) for the search order).
 used first, then Anthropic, then Gemini. Setting `PROVIDER` explicitly forces
 that provider (and errors if its key is missing).
 
+`PROVIDER=mock` selects the keyless scripted provider (no network calls; built
+for the headless `tests/e2e/` suite and demos) and requires
+`INTENDANT_MOCK_SCRIPT=<path>` — the script format is documented in
+`src/bin/caller/provider_mock.rs`. It is never auto-detected.
+
 **Per-provider default models** (used when `MODEL_NAME` is unset):
 
 | Provider | Default model |

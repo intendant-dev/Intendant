@@ -47,6 +47,7 @@ mod presence;
 mod project;
 mod prompts;
 mod provider;
+mod provider_mock;
 mod quarantine;
 mod recording;
 mod sandbox;

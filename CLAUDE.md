@@ -80,7 +80,7 @@ Common invocations (full flag reference in `docs/src/getting-started.md`):
 
 Requires an API key in `.env` (searched: cwd + parents → project root → `~/.config/intendant/.env`). `.env` and `intendant.toml` are git-ignored.
 
-**Tests:** unit tests are inline `#[cfg(test)]` modules. `tests/e2e/main.rs` is an empty stub; end-to-end scenarios now live as SKILL.md files under `tests/skills/` and are **not** in CI (they make real API calls / need a display). `scripts/validate-dashboard.cjs` is the dashboard/Station QA harness (drives a real browser over CDP; also not in CI). Run `cargo test --bins` and `cargo clippy` locally before committing.
+**Tests:** unit tests are inline `#[cfg(test)]` modules. `tests/e2e/` is the headless end-to-end suite (in CI on all three platforms): it spawns the real binaries against the scripted mock provider (`PROVIDER=mock` + `INTENDANT_MOCK_SCRIPT`, `src/bin/caller/provider_mock.rs`) — keyless, no network, no display; run it with `cargo test --test e2e`. Real-LLM scenarios live as SKILL.md files under `tests/skills/` and are **not** in CI (real API calls / need a display). `scripts/validate-dashboard.cjs` is the dashboard/Station QA harness (drives a real browser over CDP; also not in CI). Run `cargo test --bins` and `cargo clippy` locally before committing.
 
 ## Repository Layout
 
