@@ -323,6 +323,11 @@ directory is safe to delete; it rebuilds on the next scan.
 - **Worktrees** — the git worktrees in use by sub-agents (same card +
   Show-more treatment).
 - **New Session** — start a fresh session from the dashboard.
+  Internal-agent launches get an **Execution** control — *Auto* (the
+  task-size heuristic decides), *Orchestrate* (delegates to supervised
+  sub-agents), or *Direct* (single agent); an explicit choice beats the
+  global *Direct* header toggle, and the control disables when an
+  external backend is selected.
   External Codex sessions can choose both the binary path and the
   `managed_context` mode (`vanilla` or `managed`) for that session; the
   external-agent options sit in a fold that opens when an external
@@ -331,6 +336,12 @@ directory is safe to delete; it rebuilds on the next scan.
   that the CLI resolves to the latest release, with a Custom-id escape
   for full model names), the permission mode, and the reasoning effort
   (`low` … `max`).
+
+Internal sessions' window menus additionally expose **Delegate…** — spawn a
+supervised sub-agent (task, optional name, role, backend, worktree isolation)
+under that session on the model's behalf. The parent is notified with a
+follow-up and collects the result with its `wait_sub_agents` tool; see
+[Native Multi-Agent Orchestration](./multi-agent.md#delegating-from-the-dashboard).
 
 External-agent session cards and Activity windows also expose **Launch config**
 for per-session binary and managed-context settings. Use **Save** to update the

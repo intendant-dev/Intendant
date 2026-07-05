@@ -321,6 +321,11 @@ document.addEventListener('keydown', (e) => {
     closeSessionDeleteModal();
     return;
   }
+  const sessionDelegateModal = document.getElementById('session-delegate-modal');
+  if (sessionDelegateModal && sessionDelegateModal.style.display !== 'none') {
+    closeSessionDelegateModal();
+    return;
+  }
   const worktreeInspectModal = document.getElementById('worktree-inspect-modal');
   if (worktreeInspectModal && worktreeInspectModal.style.display !== 'none') {
     closeWorktreeInspectModal();
@@ -356,6 +361,9 @@ document.getElementById('session-config-modal')?.addEventListener('click', (e) =
 });
 document.getElementById('session-delete-modal')?.addEventListener('click', (e) => {
   if (e.target && e.target.id === 'session-delete-modal') closeSessionDeleteModal();
+});
+document.getElementById('session-delegate-modal')?.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'session-delegate-modal') closeSessionDelegateModal();
 });
 document.getElementById('worktree-inspect-modal')?.addEventListener('click', (e) => {
   if (e.target && e.target.id === 'worktree-inspect-modal') closeWorktreeInspectModal();

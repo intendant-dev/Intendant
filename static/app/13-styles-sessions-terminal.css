@@ -2268,7 +2268,8 @@
   min-width: 0;
 }
 .session-config-row input,
-.session-config-row select {
+.session-config-row select,
+.session-config-row textarea {
   min-width: 0;
   width: 100%;
   padding: 7px 8px;
@@ -2279,8 +2280,23 @@
   font-family: inherit;
   font-size: 12px;
 }
+.session-config-row textarea {
+  resize: vertical;
+}
 .session-config-row input:focus,
-.session-config-row select:focus { outline: none; border-color: var(--blue); }
+.session-config-row select:focus,
+.session-config-row textarea:focus { outline: none; border-color: var(--blue); }
+/* The delegate worktree checkbox rides a nested label; keep it compact. */
+.session-delegate-worktree {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 12px;
+}
+.session-delegate-worktree input {
+  width: auto;
+}
 .session-config-browse {
   flex: 0 0 auto;
   padding: 7px 12px;
