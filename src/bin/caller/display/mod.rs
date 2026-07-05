@@ -331,6 +331,31 @@ pub type PeerId = u64;
 /// All counters are updated with `Relaxed` ordering -- they are advisory
 /// telemetry, not synchronisation primitives.  Rate computation happens in
 /// `DisplayMetricsSnapshot::from_counters()`, never on the hot path.
+/// Lifecycle/telemetry events a display session emits to its host.
+///
+/// The display pipeline is deliberately decoupled from the daemon's
+/// EventBus: hosts pass an [`DisplayEventSender`] and adapt these onto
+/// their own event vocabulary (the caller's `display_event_forwarder`
+/// maps them to `AppEvent`s), so this module has no dependency on the
+/// event layer.
+#[derive(Debug, Clone)]
+pub enum DisplayEvent {
+    /// The capture backend stopped without a clean shutdown.
+    CaptureLost { display_id: u32, reason: String },
+    /// Periodic metrics snapshot from `spawn_metrics_logger`.
+    Metrics { snapshot: DisplayMetricsSnapshot },
+    /// The source changed resolution; encoders were recreated.
+    Resize {
+        display_id: u32,
+        width: u32,
+        height: u32,
+    },
+}
+
+/// Sender half hosts pass into [`DisplaySession::start`] and
+/// [`DisplaySession::spawn_metrics_logger`].
+pub type DisplayEventSender = tokio::sync::mpsc::UnboundedSender<DisplayEvent>;
+
 pub struct DisplayMetricsCounters {
     /// Total raw frames received from the capture backend.
     pub capture_frames: AtomicU64,
@@ -1116,15 +1141,15 @@ impl DisplaySession {
     /// 3. **FrameRegistry sampler** (if provided) -- 1 Hz JPEG capture for
     ///    model sampling and presence tools.
     ///
-    /// If `event_bus` is provided, `DisplayResize` events are emitted when
+    /// If `events` is provided, `DisplayEvent::Resize` is emitted when
     /// the capture backend delivers frames at a different resolution than the
     /// current encoder expects.  The encoder is transparently recreated with
     /// the new dimensions.
     pub async fn start(
         &self,
         fps: u32,
-        frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
-        event_bus: Option<crate::event::EventBus>,
+        frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<intendant_core::frames::FrameRegistry>>>,
+        events: Option<DisplayEventSender>,
     ) -> Result<(), CallerError> {
         let mut capture_rx = self.backend.start_capture(fps).await?;
 
@@ -1179,7 +1204,7 @@ impl DisplaySession {
         let shutdown = self.shutdown.clone();
         let cap_counters = Arc::clone(&self.counters);
         let cap_display_id = self.display_id;
-        let event_bus_for_encoder = event_bus.clone();
+        let events_for_encoder = events.clone();
 
         let capture_handle = tokio::spawn(async move {
             let mut clean_shutdown = false;
@@ -1210,8 +1235,8 @@ impl DisplaySession {
             // If the backend stopped unexpectedly (not a clean shutdown),
             // emit DisplayCaptureLost so the session can be cleaned up.
             if !clean_shutdown {
-                if let Some(ref bus) = event_bus {
-                    bus.send(crate::event::AppEvent::DisplayCaptureLost {
+                if let Some(ref events) = events {
+                    let _ = events.send(DisplayEvent::CaptureLost {
                         display_id: cap_display_id,
                         reason: "capture backend stopped".to_string(),
                     });
@@ -1295,7 +1320,7 @@ impl DisplaySession {
         // previous lazy spawn from `handle_offer_pool_mode` (then
         // `ensure_pool_feed_bridge_started`) — see
         // [`Self::spawn_pool_feed_bridge`] for the rationale.
-        self.spawn_pool_feed_bridge(Arc::clone(&pool_arc), fps, event_bus_for_encoder)
+        self.spawn_pool_feed_bridge(Arc::clone(&pool_arc), fps, events_for_encoder)
             .await;
         self.spawn_tile_stream_bridge(fps).await;
 
@@ -1486,7 +1511,7 @@ impl DisplaySession {
     /// typically the shutdown token handles cleanup.
     pub fn spawn_metrics_logger(
         self: &Arc<Self>,
-        event_bus: Option<crate::event::EventBus>,
+        events: Option<DisplayEventSender>,
     ) -> JoinHandle<()> {
         let session = Arc::clone(self);
         let shutdown = self.shutdown.clone();
@@ -1525,10 +1550,8 @@ impl DisplaySession {
                             m.tile_snapshot_kbps,
                             m.tile_snapshot_records,
                         );
-                        if let Some(ref bus) = event_bus {
-                            bus.send(crate::event::AppEvent::DisplayMetrics {
-                                snapshot: m,
-                            });
+                        if let Some(ref events) = events {
+                            let _ = events.send(DisplayEvent::Metrics { snapshot: m });
                         }
                     }
                 }
@@ -2403,7 +2426,7 @@ impl DisplaySession {
     /// present — it just feeds the pool. Lazy spawn coupled the bridge
     /// lifecycle to `handle_offer_pool_mode`, requiring an
     /// idempotency check, a `pool.get()` defensive read, and reaching
-    /// into `Mutex<Option<_>>` storage for `fps` and `event_bus` that
+    /// into `Mutex<Option<_>>` storage for `fps` and `events` that
     /// `start` had set moments earlier. Eager spawn from `start`
     /// removes all of that machinery and gives the bridge the same
     /// lifetime as the capture loop.
@@ -2432,7 +2455,7 @@ impl DisplaySession {
     /// encoder at tick rate so its `-g 30` natural cadence lands a
     /// keyframe inside the window.
     ///
-    /// **`AppEvent::DisplayResize` emission.** The bridge emits the
+    /// **`DisplayEvent::Resize` emission.** The bridge emits the
     /// resize event when the capture backend hands over a frame at a
     /// new resolution. Required so presence / MCP / outbound
     /// listeners learn about display size changes (no other code path
@@ -2448,7 +2471,7 @@ impl DisplaySession {
         &self,
         pool: Arc<encode::pool::EncoderPool>,
         fps: u32,
-        event_bus: Option<crate::event::EventBus>,
+        events: Option<DisplayEventSender>,
     ) {
         let mut broadcast_rx = self.frame_tx.subscribe();
         let (initial_w, initial_h) = self.backend.resolution();
@@ -2556,7 +2579,7 @@ impl DisplaySession {
                     // receiving new-dim I420 — silent black-screen
                     // class. Mirrors the in-loop resize branch below
                     // (on_resize + DisplayResize event in one beat),
-                    // emitting via `event_bus` so presence / MCP /
+                    // emitting via `events` so presence / MCP /
                     // outbound listeners learn about the seed-time
                     // dimension change.
                     if (frame_w, frame_h) != pool.dimensions() {
@@ -2569,8 +2592,8 @@ impl DisplaySession {
                             frame_h,
                         );
                         pool.on_resize(frame_w, frame_h);
-                        if let Some(ref bus) = event_bus {
-                            bus.send(crate::event::AppEvent::DisplayResize {
+                        if let Some(ref events) = events {
+                            let _ = events.send(DisplayEvent::Resize {
                                 display_id,
                                 width: frame_w,
                                 height: frame_h,
@@ -2642,7 +2665,7 @@ impl DisplaySession {
 
                         // Resize handling. The bridge owns BOTH
                         // `pool.on_resize` AND the
-                        // `AppEvent::DisplayResize` emission. Without
+                        // `DisplayEvent::Resize` emission. Without
                         // the event emit here, presence / MCP /
                         // outbound listeners wouldn't learn about
                         // display size changes (the bridge is the
@@ -2654,8 +2677,8 @@ impl DisplaySession {
                                 display_id, enc_w, enc_h, frame_w, frame_h,
                             );
                             pool.on_resize(frame_w, frame_h);
-                            if let Some(ref bus) = event_bus {
-                                bus.send(crate::event::AppEvent::DisplayResize {
+                            if let Some(ref events) = events {
+                                let _ = events.send(DisplayEvent::Resize {
                                     display_id,
                                     width: frame_w,
                                     height: frame_h,
@@ -4136,7 +4159,7 @@ mod tests {
     }
 
     /// **3c.3b.3b finding 2 regression test.** Pool-only sessions
-    /// must emit `AppEvent::DisplayResize` on dimension changes.
+    /// must emit `DisplayEvent::Resize` on dimension changes.
     /// Pre-fix the pool-feed bridge called `pool.on_resize` but
     /// dropped the event-bus emission entirely — presence / MCP /
     /// outbound listeners learned about resizes only when the
@@ -4148,10 +4171,9 @@ mod tests {
             height: 64,
         });
         let session = DisplaySession::new(7, backend);
-        let bus = crate::event::EventBus::new();
-        let mut bus_rx = bus.subscribe();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         session
-            .start(30, None, Some(bus))
+            .start(30, None, Some(events_tx))
             .await
             .expect("start must succeed");
 
@@ -4162,7 +4184,7 @@ mod tests {
 
         // Push a frame at a NEW size. This must trigger both
         // `pool.on_resize` (covered by the existing pool tests) AND
-        // the AppEvent::DisplayResize emission (the regression
+        // the DisplayEvent::Resize emission (the regression
         // surface this test pins).
         let _ = session.frame_tx.send(Arc::new(make_test_bgra(128, 96)));
 
@@ -4172,14 +4194,14 @@ mod tests {
         // conversion + tick time to fire.
         let saw_resize = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                match bus_rx.recv().await {
-                    Ok(crate::event::AppEvent::DisplayResize {
+                match events_rx.recv().await {
+                    Some(DisplayEvent::Resize {
                         display_id: 7,
                         width: 128,
                         height: 96,
                     }) => return true,
-                    Ok(_) => continue,
-                    Err(_) => return false,
+                    Some(_) => continue,
+                    None => return false,
                 }
             }
         })
@@ -4188,7 +4210,7 @@ mod tests {
 
         assert!(
             saw_resize,
-            "pool-feed bridge MUST emit AppEvent::DisplayResize on \
+            "pool-feed bridge MUST emit DisplayEvent::Resize on \
              dimension change — without it, presence/MCP/outbound \
              listeners never learn about resolution changes in \
              pool-only sessions"
@@ -4364,7 +4386,7 @@ mod tests {
     /// `pool_feed_bridge_seeds_latest_i420_from_capture_snapshot`
     /// regression test uses 64x64 backend AND 64x64 cached frame so
     /// it does NOT cover this mismatch — this test does. Asserts
-    /// BOTH the pool resize AND the `DisplayResize` event parity
+    /// BOTH the pool resize AND the `DisplayEvent::Resize` parity
     /// (mirroring the in-loop resize branch's two-effect contract).
     #[tokio::test]
     async fn pool_feed_bridge_seed_resizes_pool_when_snapshot_dims_differ() {
@@ -4373,8 +4395,7 @@ mod tests {
             height: 64,
         });
         let session = DisplaySession::new(11, backend);
-        let bus = crate::event::EventBus::new();
-        let mut bus_rx = bus.subscribe();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Pre-seed `latest_frame` at 128x96 BEFORE `start()` so the
         // bridge's eager-spawn snapshot reliably reads it. Models the
@@ -4387,7 +4408,7 @@ mod tests {
         *session.latest_frame.write().await = Some(Arc::new(make_test_bgra(128, 96)));
 
         session
-            .start(30, None, Some(bus))
+            .start(30, None, Some(events_tx))
             .await
             .expect("start must succeed");
 
@@ -4420,14 +4441,14 @@ mod tests {
         // (capture-side, etc.) might land first.
         let saw_resize = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                match bus_rx.recv().await {
-                    Ok(crate::event::AppEvent::DisplayResize {
+                match events_rx.recv().await {
+                    Some(DisplayEvent::Resize {
                         display_id: 11,
                         width: 128,
                         height: 96,
                     }) => return true,
-                    Ok(_) => continue,
-                    Err(_) => return false,
+                    Some(_) => continue,
+                    None => return false,
                 }
             }
         })
@@ -4436,7 +4457,7 @@ mod tests {
 
         assert!(
             saw_resize,
-            "seed branch must emit AppEvent::DisplayResize when \
+            "seed branch must emit DisplayEvent::Resize when \
              snapshot dims differ from pool dims; got timeout. \
              Pre-3c.3b.3e: enc_w/enc_h get updated locally but pool \
              and listeners never learn — black-screen class bug.",
