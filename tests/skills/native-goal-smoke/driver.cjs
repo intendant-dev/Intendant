@@ -126,9 +126,32 @@ const resultEvent = (e) => e.event === 'codex_thread_action_result';
 (async () => {
   await connect();
 
-  // The mock's initial task completes in milliseconds — before the socket
-  // client subscribes — so its events are unobservable here; the goal ops
-  // below exercise the idle path and are request/response (can't race).
+  // Wait for the INITIAL task's round to land in the session log before
+  // dispatching. Two races this kills: (a) the mock task usually finishes
+  // before the socket client subscribes, so its events are unobservable
+  // here; (b) under machine load the control socket can accept before the
+  // control plane subscribes to the bus — a ControlCommand sent that early
+  // is lost (broadcast reaches only existing subscribers). The log file is
+  // race-free evidence the daemon is fully up and idle.
+  {
+    const logsDir = path.join(HOME, '.intendant', 'logs');
+    const deadline = Date.now() + 60000;
+    let ready = false;
+    while (!ready && Date.now() < deadline) {
+      try {
+        for (const entry of fs.readdirSync(logsDir)) {
+          const p = path.join(logsDir, entry, 'session.jsonl');
+          if (fs.existsSync(p) && fs.readFileSync(p, 'utf8').includes('"round_complete"')) {
+            ready = true;
+            break;
+          }
+        }
+      } catch (_) {}
+      if (!ready) await sleep(250);
+    }
+    if (!ready) throw new Error('initial task never completed');
+    log('driver', 'initial round complete; daemon idle');
+  }
 
   // 1. Set a goal while idle.
   send({ action: 'codex_thread_action', op: 'goal-set', session_id: sessionId, params: { objective: 'smoke goal', tokenBudget: 5000 } });

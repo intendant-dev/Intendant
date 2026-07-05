@@ -36,6 +36,10 @@ Gotchas encoded in the driver:
 - Thread actions **must carry `session_id`** (the control plane rejects
   untargeted ones); the driver scrapes the id from the `Session ID:` startup
   banner.
-- The initial mock task completes before the socket client subscribes, so its
-  events are unobservable — all assertions ride request/response pairs or the
-  second task.
+- The driver waits for the initial task's `round_complete` in the session
+  log (file-based, race-free) before dispatching anything: the mock task
+  usually finishes before the socket client subscribes (its events are
+  unobservable), and under machine load the control socket can accept
+  before the control plane subscribes to the bus — a ControlCommand sent
+  that early is silently lost (broadcast reaches only existing
+  subscribers).
