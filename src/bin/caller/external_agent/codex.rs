@@ -3775,6 +3775,15 @@ fn codex_usage_snapshot(value: &serde_json::Value, model: &str) -> Option<AgentU
         0.0
     };
 
+    // Latest-request cache sample from the `last` bucket, for the vitals
+    // hit receipt. OpenAI has no cache-write concept and an undocumented
+    // TTL, so creation stays 0 and no flavor is stated.
+    let last_cache_read_tokens = last.and_then(codex_usage_cached_tokens).unwrap_or(0);
+    let last_uncached_input_tokens = last
+        .and_then(codex_usage_input_tokens)
+        .unwrap_or(0)
+        .saturating_sub(last_cache_read_tokens);
+
     Some(AgentUsageSnapshot {
         provider: "openai".to_string(),
         model: model.to_string(),
@@ -3785,6 +3794,10 @@ fn codex_usage_snapshot(value: &serde_json::Value, model: &str) -> Option<AgentU
         prompt_tokens,
         completion_tokens,
         cached_tokens,
+        last_cache_read_tokens,
+        last_cache_creation_tokens: 0,
+        last_uncached_input_tokens,
+        cache_ttl_seconds: None,
     })
 }
 
@@ -8104,7 +8117,7 @@ mod tests {
                 "outputTokens": 200,
                 "totalTokens": 1200
             },
-            "last": {"inputTokens": 100, "outputTokens": 25, "totalTokens": 125},
+            "last": {"inputTokens": 100, "cachedInputTokens": 60, "outputTokens": 25, "totalTokens": 125},
             "modelContextWindow": 128000,
             "modelHardContextWindow": 272000
         });
@@ -8125,6 +8138,12 @@ mod tests {
         assert_eq!(snapshot.completion_tokens, 200);
         assert_eq!(snapshot.cached_tokens, 300);
         assert!((snapshot.usage_pct - (125.0 / 128000.0 * 100.0)).abs() < 1e-12);
+        // Cache-vitals sample comes from the `last` bucket; OpenAI states
+        // no TTL flavor.
+        assert_eq!(snapshot.last_cache_read_tokens, 60);
+        assert_eq!(snapshot.last_uncached_input_tokens, 40);
+        assert_eq!(snapshot.last_cache_creation_tokens, 0);
+        assert_eq!(snapshot.cache_ttl_seconds, None);
     }
 
     #[test]
@@ -10120,6 +10139,7 @@ error: build failed
                 prompt_tokens: 97_000,
                 completion_tokens: 3_000,
                 cached_tokens: 0,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -10175,6 +10195,7 @@ error: build failed
                 prompt_tokens: 83_000,
                 completion_tokens: 3_000,
                 cached_tokens: 0,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -10218,6 +10239,7 @@ error: build failed
                 prompt_tokens: 18_000,
                 completion_tokens: 2_000,
                 cached_tokens: 0,
+                ..Default::default()
             }),
             ..Default::default()
         };

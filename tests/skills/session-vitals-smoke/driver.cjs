@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Session-vitals smoke: mock daemon in a dirty git repo; expect a
-// session_vitals event carrying the git segment on the control socket.
+// session_vitals event carrying the git segment AND the cache segment
+// (the mock provider emits cache-bearing usage, the native derivation
+// forwards it, the hub merges both sections) on the control socket.
 const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const net = require('net');
@@ -81,10 +83,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   });
   const e = await done;
   const git = e.vitals && e.vitals.git;
-  const ok = git && git.branch === 'feature' && git.dirtyFiles === 2
+  const gitOk = git && git.branch === 'feature' && git.dirtyFiles === 2
     && git.primaryRef === 'main' && git.ahead === 1 && git.behind === 0
     && git.mergeParity === 'clean';
-  console.log(`vitals event: ${JSON.stringify(e).slice(0, 300)}`);
+  // The startup task already ran (mock is instant), so its cache sample
+  // (first request: writes only, TTL hint 300) merged into the hub before
+  // this git-change emission — the snapshot carries both sections.
+  const cache = e.vitals && e.vitals.cache;
+  const cacheOk = cache && cache.hitPct === 0 && cache.ttlSeconds === 300
+    && Number(cache.lastActivityEpoch) > 0;
+  const ok = gitOk && cacheOk;
+  console.log(`vitals event: ${JSON.stringify(e).slice(0, 400)}`);
+  if (!gitOk) console.log('git segment mismatch');
+  if (!cacheOk) console.log('cache segment mismatch');
   console.log(ok ? 'VITALS SMOKE PASS' : 'VITALS SMOKE FAIL');
   child.kill('SIGTERM');
   process.exit(ok ? 0 : 1);

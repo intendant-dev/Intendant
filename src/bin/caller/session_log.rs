@@ -3005,6 +3005,7 @@ pub fn session_log_entry_to_app_event(
                     .and_then(|t| t.get("cached"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
+                ..Default::default()
             };
             let source = data
                 .and_then(|d| d.get("source"))

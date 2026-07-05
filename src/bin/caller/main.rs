@@ -7698,17 +7698,7 @@ async fn run_with_presence(
                     external_agent::AgentEvent::Usage { usage } => {
                         bus.send(AppEvent::UsageSnapshot {
                             session_id: session_log_id(&session_log),
-                            main: frontend::ModelUsageSnapshot {
-                                provider: usage.provider,
-                                model: usage.model,
-                                tokens_used: usage.tokens_used,
-                                context_window: usage.context_window,
-                                hard_context_window: usage.hard_context_window,
-                                usage_pct: usage.usage_pct,
-                                prompt_tokens: usage.prompt_tokens,
-                                completion_tokens: usage.completion_tokens,
-                                cached_tokens: usage.cached_tokens,
-                            },
+                            main: usage.into_model_snapshot(),
                             presence: None,
                         });
                     }
@@ -9869,20 +9859,9 @@ async fn run_external_agent_mode(
                                         });
                                     }
                                     external_agent::AgentEvent::Usage { usage } => {
-                                        let main = frontend::ModelUsageSnapshot {
-                                            provider: usage.provider,
-                                            model: usage.model,
-                                            tokens_used: usage.tokens_used,
-                                            context_window: usage.context_window,
-                                            hard_context_window: usage.hard_context_window,
-                                            usage_pct: usage.usage_pct,
-                                            prompt_tokens: usage.prompt_tokens,
-                                            completion_tokens: usage.completion_tokens,
-                                            cached_tokens: usage.cached_tokens,
-                                        };
                                         bus.send(AppEvent::UsageSnapshot {
                                             session_id: drain_config.session_id.clone(),
-                                            main,
+                                            main: usage.into_model_snapshot(),
                                             presence: None,
                                         });
                                     }

@@ -952,7 +952,7 @@ pub struct SubAgentState {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AgentUsageSnapshot {
     pub provider: String,
     pub model: String,
@@ -965,6 +965,38 @@ pub struct AgentUsageSnapshot {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cached_tokens: u64,
+    /// Latest request's prompt-cache sample (reads / writes / uncached) —
+    /// the cache-vitals hit-receipt inputs. Zero-all when the backend
+    /// reports no per-request split.
+    pub last_cache_read_tokens: u64,
+    pub last_cache_creation_tokens: u64,
+    pub last_uncached_input_tokens: u64,
+    /// Prompt-cache TTL implied by the latest cache write (see
+    /// [`crate::provider::TokenUsage::cache_ttl_seconds`]).
+    pub cache_ttl_seconds: Option<u32>,
+}
+
+impl AgentUsageSnapshot {
+    /// The outbound [`crate::frontend::ModelUsageSnapshot`] twin — the one
+    /// place the field-by-field bridge lives (the drain sites all call
+    /// this).
+    pub fn into_model_snapshot(self) -> crate::frontend::ModelUsageSnapshot {
+        crate::frontend::ModelUsageSnapshot {
+            provider: self.provider,
+            model: self.model,
+            tokens_used: self.tokens_used,
+            context_window: self.context_window,
+            hard_context_window: self.hard_context_window,
+            usage_pct: self.usage_pct,
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            cached_tokens: self.cached_tokens,
+            last_cache_read_tokens: self.last_cache_read_tokens,
+            last_cache_creation_tokens: self.last_cache_creation_tokens,
+            last_uncached_input_tokens: self.last_uncached_input_tokens,
+            cache_ttl_seconds: self.cache_ttl_seconds,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -73,6 +73,11 @@ struct MockStep {
     content: String,
     #[serde(default)]
     tool_calls: Vec<MockScriptToolCall>,
+    /// Prompt-cache TTL stated by this step's usage (default 300). Smokes
+    /// use short TTLs to walk the cache countdown → expiry-alert → cold
+    /// pipeline on real timing.
+    #[serde(default)]
+    cache_ttl_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,15 +205,20 @@ impl ChatProvider for MockProvider {
         *cursor = Some((profile_index, step_index + 1));
 
         // Plausible non-zero usage so budget and usage accounting run.
+        // Cache counters emulate a warm prompt cache (first request writes,
+        // later requests read half) so cache-vitals plumbing runs keyless.
         let prompt_tokens = (transcript.len() as u64 / 4).max(1);
         let completion_tokens = (step.content.len() as u64 / 4).max(1);
+        let cached_tokens = if step_index == 0 { 0 } else { prompt_tokens / 2 };
         Ok(ChatResponse {
             content: step.content.clone(),
             usage: TokenUsage {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
-                cached_tokens: 0,
+                cached_tokens,
+                cache_creation_tokens: prompt_tokens / 4,
+                cache_ttl_seconds: Some(step.cache_ttl_seconds.unwrap_or(300)),
             },
             reasoning_summary: None,
             reasoning_content: None,

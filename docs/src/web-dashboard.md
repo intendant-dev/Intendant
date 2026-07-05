@@ -148,6 +148,20 @@ Five subtabs:
   badge when new changes land).
 - **Control** — direct controls for steering the run.
 
+Session-window headers carry a **vitals chip** (the operator-statusline
+port, backend-neutral): a git segment for the session's working tree
+(`⎇ branch ●dirty +ahead/−behind ✓|⚠ merge-parity ⇡unpushed`, fetch-free,
+conflict-tinted when a merge with the primary would conflict) and a
+prompt-cache segment — `⚡NN%` hit share of the latest request (green ≥90,
+yellow ≥50) plus a live `⏳m:ss` TTL countdown where the provider's cache
+TTL is known (Anthropic 5m/1h; hidden for OpenAI whose TTL is
+undocumented), dimming to `✗` once cold. When a countdown enters its final
+minute the dashboard raises one toast per idle period (plus a browser
+notification if permission was already granted and the tab is hidden) —
+early enough that a follow-up still reuses the warm cache, never after the
+fact. Sections appear as producers fill them; the chip hides in narrow
+windows.
+
 #### Managed (Activity → Managed)
 
 The manual counterpart to the model-driven managed-context tools. A session

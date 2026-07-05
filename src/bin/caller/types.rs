@@ -194,8 +194,10 @@ pub struct SessionCacheVitals {
     pub hit_pct: Option<u8>,
     /// Unix seconds of the last usage-bearing provider activity.
     pub last_activity_epoch: u64,
-    /// Provider prompt-cache TTL in seconds (0 = unknown; hide countdown).
-    pub ttl_seconds: u32,
+    /// Provider prompt-cache TTL in seconds; `None` when the provider's TTL
+    /// is unknown (the countdown is hidden, the hit receipt still shows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u32>,
 }
 
 /// One provider rate-limit window (subscription 5h/7d, per-minute API

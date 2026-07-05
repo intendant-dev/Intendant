@@ -1162,20 +1162,9 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         managed_context_density_allowed_tool_items.clear();
                     }
                 }
-                let main = frontend::ModelUsageSnapshot {
-                    provider: usage.provider,
-                    model: usage.model,
-                    tokens_used: usage.tokens_used,
-                    context_window: usage.context_window,
-                    hard_context_window: usage.hard_context_window,
-                    usage_pct: usage.usage_pct,
-                    prompt_tokens: usage.prompt_tokens,
-                    completion_tokens: usage.completion_tokens,
-                    cached_tokens: usage.cached_tokens,
-                };
                 config.bus.send(AppEvent::UsageSnapshot {
                     session_id: config.session_id.clone(),
-                    main,
+                    main: usage.into_model_snapshot(),
                     presence: None,
                 });
             }
@@ -2306,6 +2295,7 @@ mod tests {
                     prompt_tokens: 260_000,
                     completion_tokens: 1_000,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
             })
             .unwrap();
@@ -2611,6 +2601,7 @@ mod tests {
                     prompt_tokens: 226_000,
                     completion_tokens: 956,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
             })
             .unwrap();
@@ -2755,6 +2746,7 @@ mod tests {
                     prompt_tokens: 227_000,
                     completion_tokens: 1_000,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
             })
             .unwrap();
@@ -2958,6 +2950,7 @@ mod tests {
                     prompt_tokens: 223_000,
                     completion_tokens: 607,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
             })
             .unwrap();
@@ -2973,6 +2966,7 @@ mod tests {
                     prompt_tokens: 214_500,
                     completion_tokens: 516,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
             })
             .unwrap();
@@ -3111,6 +3105,7 @@ mod tests {
                     prompt_tokens: 226_000,
                     completion_tokens: 1_000,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
             })
             .unwrap();

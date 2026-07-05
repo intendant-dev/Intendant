@@ -344,6 +344,23 @@ fn usage_snapshot_from_api_usage(
     } else {
         0.0
     };
+    // TTL flavor for the cache-vitals countdown: only cache writes make a
+    // flavor statement (the per-TTL split rides a `cache_creation` object
+    // when the extended-TTL beta is active; a flat write defaults to 5 min).
+    let ephemeral = |key: &str| {
+        usage
+            .get("cache_creation")
+            .and_then(|c| c.get(key))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+    let cache_ttl_seconds = if ephemeral("ephemeral_1h_input_tokens") > 0 {
+        Some(3600)
+    } else if ephemeral("ephemeral_5m_input_tokens") > 0 || cache_creation > 0 {
+        Some(300)
+    } else {
+        None
+    };
     Some(AgentUsageSnapshot {
         provider: "anthropic".to_string(),
         model: model.to_string(),
@@ -354,6 +371,10 @@ fn usage_snapshot_from_api_usage(
         prompt_tokens,
         completion_tokens: output,
         cached_tokens: cache_read,
+        last_cache_read_tokens: cache_read,
+        last_cache_creation_tokens: cache_creation,
+        last_uncached_input_tokens: input,
+        cache_ttl_seconds,
     })
 }
 
@@ -3520,6 +3541,57 @@ mod tests {
             200000,
         )
         .is_some());
+    }
+
+    #[test]
+    fn usage_snapshot_carries_cache_sample_and_ttl_flavor() {
+        let snapshot = usage_snapshot_from_api_usage(
+            &serde_json::json!({
+                "input_tokens": 10,
+                "output_tokens": 37,
+                "cache_read_input_tokens": 25028,
+                "cache_creation_input_tokens": 62,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 62
+                }
+            }),
+            "claude-haiku-4-5-20251001",
+            200000,
+        )
+        .expect("usage present");
+        assert_eq!(snapshot.prompt_tokens, 25100);
+        assert_eq!(snapshot.cached_tokens, 25028);
+        assert_eq!(snapshot.last_cache_read_tokens, 25028);
+        assert_eq!(snapshot.last_cache_creation_tokens, 62);
+        assert_eq!(snapshot.last_uncached_input_tokens, 10);
+        assert_eq!(snapshot.cache_ttl_seconds, Some(3600), "1h split wins");
+
+        // Flat creation without the split object → the 5-minute default.
+        let flat = usage_snapshot_from_api_usage(
+            &serde_json::json!({
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 40
+            }),
+            "claude-haiku-4-5-20251001",
+            200000,
+        )
+        .expect("usage present");
+        assert_eq!(flat.cache_ttl_seconds, Some(300));
+
+        // Read-only responses make no flavor statement.
+        let read_only = usage_snapshot_from_api_usage(
+            &serde_json::json!({
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 900
+            }),
+            "claude-haiku-4-5-20251001",
+            200000,
+        )
+        .expect("usage present");
+        assert_eq!(read_only.cache_ttl_seconds, None);
     }
 
     #[test]

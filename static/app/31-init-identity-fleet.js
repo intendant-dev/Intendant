@@ -442,6 +442,10 @@ let dashboardProjectRoot = '';
 let sessionRelationshipRenderHandle = 0;
 let sessionWindowGridFitRenderHandle = 0;
 let sessionGoalTicker = null;
+let sessionVitalsTicker = null;
+// Cache-expiry alert dedupe: session id → the lastActivityEpoch already
+// alerted for (one alert per idle period).
+const sessionCacheExpiryAlerts = new Map();
 const SESSION_WINDOW_RENDER_LIMIT = 600;
 const SESSION_WINDOW_PREPEND_CHUNK = 300;
 // In-memory history behind the render window. Long-running sessions used

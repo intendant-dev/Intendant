@@ -1363,9 +1363,10 @@ body.context-focus-active {
 .session-window-vitals {
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 280px;
+  max-width: 320px;
   display: inline-flex;
   align-items: center;
+  gap: 7px;
   padding: 2px 7px;
   border: 1px solid rgba(148, 226, 213, 0.22);
   border-radius: 999px;
@@ -1382,7 +1383,30 @@ body.context-focus-active {
 .session-window-vitals.conflict {
   border-color: rgba(243, 139, 168, 0.38);
   background: rgba(243, 139, 168, 0.08);
+}
+.session-window-vitals.conflict .vit-git {
   color: var(--red);
+}
+.session-window-vitals .vit-git,
+.session-window-vitals .vit-cache {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-window-vitals .vit-cache.cache-ok {
+  color: var(--green);
+}
+.session-window-vitals .vit-cache.cache-warn {
+  color: var(--yellow);
+}
+.session-window-vitals .vit-cache.cache-crit {
+  color: var(--peach);
+}
+.session-window-vitals .vit-cache.cache-expiring {
+  color: var(--red);
+}
+.session-window-vitals .vit-cache.cache-cold {
+  opacity: 0.55;
 }
 @container (max-width: 560px) {
   .session-window-vitals {

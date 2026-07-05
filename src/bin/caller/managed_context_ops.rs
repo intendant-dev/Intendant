@@ -3411,8 +3411,7 @@ pub(crate) fn external_context_snapshot_usage(
         hard_context_window: snapshot.hard_context_window,
         usage_pct: tokens_used as f64 / context_window as f64 * 100.0,
         prompt_tokens: tokens_used,
-        completion_tokens: 0,
-        cached_tokens: 0,
+        ..Default::default()
     })
 }
 
@@ -4756,6 +4755,7 @@ mod tests {
             prompt_tokens: 258_000,
             completion_tokens: 399,
             cached_tokens: 0,
+            ..Default::default()
         };
         assert_eq!(
             managed_context_rewind_only_pressure_from_usage(&below_soft),
