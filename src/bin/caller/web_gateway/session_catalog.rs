@@ -5532,20 +5532,30 @@ pub(crate) fn codex_parent_baseline_for_summary(
         .as_deref()
         .map(timestamp_sort_secs)
         .unwrap_or(0);
-    if cutoff > 0 {
-        let exact_key = (parent_id.to_string(), cutoff);
-        if let Some(exact_baseline) = exact_parent_baselines.get(&exact_key) {
-            return Some(exact_baseline.unwrap_or_default());
-        }
+    if cutoff <= 0 {
+        return None;
     }
-
-    None
+    let exact_key = (parent_id.to_string(), cutoff);
+    let baseline = exact_parent_baselines.get(&exact_key)?.unwrap_or_default();
+    // Rollouts written by current Codex restart the cumulative token counters
+    // at fork, so the parent's history never appears in the child's readings
+    // and subtracting it would delete real usage. Only rebaseline when the
+    // child's first reading is large enough to actually contain the parent
+    // baseline (legacy carryover forks).
+    let first = summary.first_usage_event.as_ref()?;
+    if first.usage.total_tokens < baseline.total_tokens {
+        return None;
+    }
+    Some(baseline)
 }
 
 /// Daily usage for a forked session. The parse-time buckets counted the
-/// first usage event's cumulative reading from zero, but for a fork that
-/// reading still contains the parent's history — remove the parent
-/// baseline from the first event's day bucket.
+/// first usage event's cumulative reading from zero; for a carryover fork
+/// that reading still contains the parent's history — remove the parent
+/// baseline from the first event's day bucket. Callers pass `baseline`
+/// from `codex_parent_baseline_for_summary`, which returns `None` for
+/// fresh-counter forks (the child restarted at zero, so there is nothing
+/// to remove and subtracting would delete real usage).
 pub(crate) fn codex_daily_usage_with_baseline(
     summary: &CodexSessionListSummary,
     baseline: Option<SessionUsage>,
@@ -11516,6 +11526,140 @@ mod tests {
         );
     }
 
+    /// A fork whose rollout restarts the cumulative counters at zero (what
+    /// current Codex writes) must keep its full usage: the parent baseline
+    /// was never part of the child's readings, so nothing is subtracted.
+    #[test]
+    fn list_codex_sessions_keeps_fresh_counter_fork_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let parent_id = "019e37c5-parent-fresh-thread";
+        let child_id = "019e37c5-child-fresh-thread";
+        let parent_lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:09:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": parent_id,
+                    "timestamp": "2026-05-17T21:09:00Z",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:11:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 2000,
+                            "cached_input_tokens": 600,
+                            "output_tokens": 400,
+                            "total_tokens": 2400
+                        }
+                    }
+                }
+            }),
+        ];
+        // The child forks after the parent's 2400-token reading but its own
+        // counters restart: first reading 100, final reading 400.
+        let child_lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:12:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": child_id,
+                    "forked_from_id": parent_id,
+                    "timestamp": "2026-05-17T21:12:00Z",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:12:10Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 80,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 20,
+                            "total_tokens": 100
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:12:40Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 300,
+                            "cached_input_tokens": 120,
+                            "output_tokens": 100,
+                            "total_tokens": 400
+                        }
+                    }
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-09-00-{parent_id}.jsonl")),
+            parent_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-12-00-{child_id}.jsonl")),
+            child_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let parent = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(parent_id))
+            .expect("parent codex session should be listed");
+        let child = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(child_id))
+            .expect("child codex session should be listed");
+
+        assert_eq!(parent["total_tokens"].as_u64(), Some(2400));
+        // Full child usage survives — no parent baseline subtraction.
+        assert_eq!(child["total_tokens"].as_u64(), Some(400));
+        assert_eq!(child["prompt_tokens"].as_u64(), Some(300));
+        assert_eq!(child["cached_tokens"].as_u64(), Some(120));
+        assert_eq!(child["completion_tokens"].as_u64(), Some(100));
+        let daily = child["daily_usage"]
+            .as_array()
+            .expect("child daily usage buckets");
+        let daily_total: u64 = daily
+            .iter()
+            .filter_map(|entry| entry.get("total_tokens").and_then(|v| v.as_u64()))
+            .sum();
+        assert_eq!(daily_total, 400);
+    }
+
     #[test]
     fn list_codex_sessions_full_scans_large_parent_for_fork_baseline() {
         let home = tempfile::tempdir().unwrap();
@@ -15249,6 +15393,66 @@ mod tests {
         // No baseline → parse-time buckets pass through untouched.
         let rebased = codex_daily_usage_with_baseline(&summary, None);
         assert_eq!(rebased.get("2026-07-01"), Some(&total_usage(100)));
+    }
+
+    /// The parent baseline only applies when the child's counters actually
+    /// carried the parent's history over. Current Codex restarts the
+    /// cumulative counters at fork, so the child's first reading is tiny;
+    /// subtracting the parent baseline there deletes real usage (the July
+    /// 2026 Stats-tab halving: a 4.15B-token fork served as 1.25M).
+    #[test]
+    fn codex_parent_baseline_skips_fresh_counter_forks() {
+        let created_at = "2026-07-01T10:00:00Z";
+        let cutoff = timestamp_sort_secs(created_at);
+        let summary_with_first_event = |first: Option<u64>| CodexSessionListSummary {
+            id: "codex-fork".to_string(),
+            created_at: Some(created_at.to_string()),
+            session_cwd: None,
+            effective_cwd: None,
+            model: None,
+            lineage: SessionLineageMetadata {
+                parent_id: Some("codex-parent".to_string()),
+                ..Default::default()
+            },
+            provider: Some("Codex".to_string()),
+            usage: total_usage(4_000_000),
+            first_usage_event: first.map(|total| CodexUsageEvent {
+                timestamp: Some(created_at.to_string()),
+                usage: total_usage(total),
+            }),
+            daily_usage: BTreeMap::new(),
+            goal: None,
+            task: None,
+            turns: 2,
+            file_updated_at: None,
+            bytes: 64,
+        };
+        let mut baselines: HashMap<(String, i64), Option<SessionUsage>> = HashMap::new();
+        baselines.insert(
+            ("codex-parent".to_string(), cutoff),
+            Some(total_usage(3_000_000)),
+        );
+
+        // Fresh-counter fork: first reading far below the baseline.
+        let fresh = summary_with_first_event(Some(30));
+        assert_eq!(
+            codex_parent_baseline_for_summary(&fresh, &baselines),
+            None
+        );
+
+        // Carryover fork: first reading contains the parent history.
+        let carryover = summary_with_first_event(Some(3_000_050));
+        assert_eq!(
+            codex_parent_baseline_for_summary(&carryover, &baselines),
+            Some(total_usage(3_000_000))
+        );
+
+        // No first reading at all → nothing proves carryover; don't subtract.
+        let missing = summary_with_first_event(None);
+        assert_eq!(
+            codex_parent_baseline_for_summary(&missing, &baselines),
+            None
+        );
     }
 
     #[test]

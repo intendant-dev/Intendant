@@ -60928,7 +60928,7 @@ function renderStatsKpiRow(sessions) {
     .filter(bucket => bucket.total > 0).length;
   row.innerHTML = [
     statsKpiTileHtml('Today cost', formatUsdCompact(totals.todayCost)),
-    statsKpiTileHtml('Week cost', formatUsdCompact(totals.weekCost)),
+    statsKpiTileHtml('7-day cost', formatUsdCompact(totals.weekCost)),
     statsKpiTileHtml('All-time cost', formatUsdCompact(totals.allCost)),
     statsKpiTileHtml('Lifetime tokens', formatCompactNumber(totals.allTokens)),
     statsKpiTileHtml('Active days', activeDays.toLocaleString()),
@@ -61132,9 +61132,13 @@ function sessionUsageEntries(session) {
   }];
 }
 
-function usageEntryInCalendarWeek(day, todayIso) {
+// Rolling window: today plus the six preceding days, in local time.
+// (Was a Sunday-anchored calendar week, which made the "week" numbers
+// equal the "today" numbers every Sunday.)
+function usageEntryInLast7Days(day, todayIso) {
   if (!day || !todayIso || day > todayIso) return false;
-  return day >= startOfWeekIso(todayIso);
+  const start = addIsoDays(todayIso, -6);
+  return !!start && day >= start;
 }
 
 function summarizeSessionUsage(sessions) {
@@ -61159,7 +61163,7 @@ function summarizeSessionUsage(sessions) {
       totals.allTokens += entry.total;
       totals.allCost += entry.cost;
       if (entry.day === todayIso) totals.todayCost += entry.cost;
-      if (usageEntryInCalendarWeek(entry.day, todayIso)) totals.weekCost += entry.cost;
+      if (usageEntryInLast7Days(entry.day, todayIso)) totals.weekCost += entry.cost;
     }
   }
   return totals;
@@ -61222,7 +61226,7 @@ function summarizeUsageByAgent(sessions) {
   const order = ['codex', 'claude', 'intendant', 'other'];
   const periods = [
     { key: 'today', label: 'Today' },
-    { key: 'week', label: 'This Week' },
+    { key: 'week', label: 'Last 7 Days' },
     { key: 'all', label: 'All Time' },
   ];
   const buckets = new Map();
@@ -61244,7 +61248,7 @@ function summarizeUsageByAgent(sessions) {
         if (
           period.key === 'all' ||
           (period.key === 'today' && entry.day === todayIso) ||
-          (period.key === 'week' && usageEntryInCalendarWeek(entry.day, todayIso))
+          (period.key === 'week' && usageEntryInLast7Days(entry.day, todayIso))
         ) {
           addEntryToAgentUsageBucket(bucketFor(key, period), sessionId, entry);
         }
@@ -61702,7 +61706,7 @@ function renderSessionStatsFallback(sessions) {
       grid.style.gridTemplateColumns = 'auto 1fr';
       grid.innerHTML = `
         <span class="label">Today</span><span class="value">${formatUsd(totals.todayCost, 2)}</span>
-        <span class="label">This Week</span><span class="value">${formatUsd(totals.weekCost, 2)}</span>
+        <span class="label">Last 7 Days</span><span class="value">${formatUsd(totals.weekCost, 2)}</span>
         <span class="label strong">All Time</span><span class="value">${formatUsd(totals.allCost, 2)}</span>
       `;
     }
@@ -61738,10 +61742,19 @@ function loadAllSessionsUsage(hostId, options = {}) {
     })
     .catch(err => {
       const currentHost = activeStatsHost || selfPeerId;
-      if (currentHost === hostId) {
-        setStatsSessionLoading(hostId, false);
-        renderAllSessionsUsageError(err.message || 'Failed to load session usage');
+      if (currentHost !== hostId) return;
+      setStatsSessionLoading(hostId, false);
+      // A failed refresh must not tear down a view the user already has:
+      // keep rendering the cached corpus and surface the failure as a
+      // toast. Only fall back to the destructive error card when there
+      // was never anything to show.
+      const cached = cachedStatsSessions(hostId);
+      if (Array.isArray(cached)) {
+        renderStatsSessionSections(cached);
+        showControlToast('error', 'Session usage refresh failed: ' + (err.message || 'network error'));
+        return;
       }
+      renderAllSessionsUsageError(err.message || 'Failed to load session usage');
     });
 }
 
@@ -61793,7 +61806,7 @@ function renderAllSessionsUsage(sessions) {
         todayCached += entry.cached;
         todayCost += entry.cost;
       }
-      if (usageEntryInCalendarWeek(entry.day, todayIso)) {
+      if (usageEntryInLast7Days(entry.day, todayIso)) {
         weekTotal += entry.total;
         weekInput += entry.input;
         weekOutput += entry.output;
@@ -61808,7 +61821,7 @@ function renderAllSessionsUsage(sessions) {
 
   const rows = [
     ['Today', todayTotal, todayInput, todayCached, todayOutput, todayCost],
-    ['This Week', weekTotal, weekInput, weekCached, weekOutput, weekCost],
+    ['Last 7 Days', weekTotal, weekInput, weekCached, weekOutput, weekCost],
     ['All Time', allTotal, allInput, allCached, allOutput, allCost],
   ];
 
@@ -61965,26 +61978,37 @@ function renderDiskUsage(sessions) {
   grid.innerHTML = cells.join('');
 }
 
+// Re-render the stats sections after an in-section interaction (view or
+// agent toggle, heatmap day select). If the session cache has no entry
+// for the current host — a reload or transport reconnect raced the click
+// — refetch instead of letting the cache-miss path blank the whole
+// section stack under the user's cursor.
+function rerenderStatsSectionsOrReload() {
+  const hostKey = currentStatsHostKey();
+  if (renderCachedStatsSessionSections(hostKey)) return;
+  loadAllSessionsUsage(hostKey);
+}
+
 function selectTokenActivityDayFromCell(cell) {
   if (!cell || cell.classList.contains('future')) return;
   const day = cell.dataset.day;
   if (!day) return;
   tokenActivitySelectedDay = day;
-  renderCachedStatsSessionSections(currentStatsHostKey());
+  rerenderStatsSectionsOrReload();
 }
 
 document.getElementById('token-activity-agent')?.addEventListener('click', (event) => {
   const btn = event.target.closest('button[data-agent]');
   if (!btn || btn.disabled) return;
   tokenActivityAgent = btn.dataset.agent || 'codex';
-  renderCachedStatsSessionSections(currentStatsHostKey());
+  rerenderStatsSectionsOrReload();
 });
 
 document.getElementById('token-activity-view')?.addEventListener('click', (event) => {
   const btn = event.target.closest('button[data-view]');
   if (!btn || btn.disabled) return;
   tokenActivityView = btn.dataset.view || 'daily';
-  renderCachedStatsSessionSections(currentStatsHostKey());
+  rerenderStatsSectionsOrReload();
 });
 
 document.getElementById('token-activity-heatmap')?.addEventListener('click', (event) => {
