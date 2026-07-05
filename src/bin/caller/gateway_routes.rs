@@ -47,7 +47,11 @@ pub(crate) enum SegmentSpec {
     /// This exact segment.
     Literal(&'static str),
     /// One of these exact segments; the matched value is also captured.
-    #[allow(dead_code)] // constructed from phase 2 (peer quick-control routes)
+    /// Vocabulary reserved for future multi-leaf declarations. The peers
+    /// and doorbell sub-routers deliberately did NOT adopt it (phase 4d):
+    /// their `Any` catch-all rows preserve handler-owned JSON 404s for
+    /// garbage subpaths that per-leaf rows would drop to the SPA shell.
+    #[allow(dead_code)]
     OneOf(&'static [&'static str]),
 }
 
