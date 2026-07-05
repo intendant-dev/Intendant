@@ -80,7 +80,7 @@ Common invocations (full flag reference in `docs/src/getting-started.md`):
 
 Requires an API key in `.env` (searched: cwd + parents → project root → `~/.config/intendant/.env`). `.env` and `intendant.toml` are git-ignored.
 
-**Tests:** unit tests are inline `#[cfg(test)]` modules. `tests/e2e/main.rs` is an empty stub; end-to-end scenarios now live as SKILL.md files under `tests/skills/` and are **not** in CI (they make real API calls / need a display). `scripts/validate-dashboard.cjs` is the dashboard/Station QA harness (drives a real browser over CDP; also not in CI). Run `cargo test --bins` and `cargo clippy` locally before committing.
+**Tests:** unit tests are inline `#[cfg(test)]` modules. `tests/e2e/` is the headless end-to-end suite (in CI on all three platforms): it spawns the real binaries against the scripted mock provider (`PROVIDER=mock` + `INTENDANT_MOCK_SCRIPT`, `src/bin/caller/provider_mock.rs`) — keyless, no network, no display; run it with `cargo test --test e2e`. Real-LLM scenarios live as SKILL.md files under `tests/skills/` and are **not** in CI (real API calls / need a display). `scripts/validate-dashboard.cjs` is the dashboard/Station QA harness (drives a real browser over CDP; also not in CI). Run `cargo test --bins` and `cargo clippy` locally before committing.
 
 ## Repository Layout
 
@@ -128,7 +128,8 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
 - tokio (full features), `Arc<RwLock/Mutex<T>>` for shared state, `mpsc` for channels
 - TLS/cert code is **pure-Rust `ring`/`rcgen`/`rustls`** (`web_tls.rs`, `access/certs.rs`) — no OpenSSL; prefer that path when touching crypto/cert code
 - Tests live in inline `#[cfg(test)]` modules only
-- **File size budget:** keep a source file under ~3k lines (4k absolute ceiling;
+- **File size budget:** keep a source file under ~3k lines of non-test code
+  (4k absolute ceiling; inline `#[cfg(test)]` modules don't count against it;
   the remaining god-files are legacy being carved down, not precedents). When a
   file outgrows its seams, split along domain boundaries as **pure-move
   commits**: relocate code *and its tests* verbatim into a new module, add

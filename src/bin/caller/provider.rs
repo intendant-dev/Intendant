@@ -3034,6 +3034,13 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
 
     let preferred = env::var("PROVIDER").ok();
 
+    // Keyless scripted provider for headless E2E and demos. Never
+    // auto-selected — only an explicit PROVIDER=mock opts in, and the
+    // script path must be supplied via INTENDANT_MOCK_SCRIPT.
+    if preferred.as_deref() == Some("mock") {
+        return Ok(Box::new(crate::provider_mock::MockProvider::from_env()?));
+    }
+
     // Explicit Gemini selection
     if preferred.as_deref() == Some("gemini") {
         let key = gemini_key.ok_or_else(|| {
@@ -3156,6 +3163,9 @@ pub fn select_provider_with_overrides(
             let max_out = resolve_max_output_tokens(&model);
             Ok(Box::new(OpenAIProvider::new(key, model, ctx, max_out)))
         }
+        // Keyless scripted provider (headless E2E/demos); explicit opt-in
+        // only — see `select_provider`.
+        Some("mock") => Ok(Box::new(crate::provider_mock::MockProvider::from_env()?)),
         Some(other) => Err(CallerError::Config(format!(
             "Unknown presence provider: '{}'. Expected 'openai', 'anthropic', or 'gemini'.",
             other

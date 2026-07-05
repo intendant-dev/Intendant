@@ -18,8 +18,12 @@ name: Cross-platform tests
 # that class of debt from re-accumulating, since Windows dev boxes only
 # exist transiently in this project.
 #
-# Unit tests need no API keys and no display (inline #[cfg(test)] modules
-# only — the tests/skills/ E2E scenarios stay out of CI by design).
+# Unit tests need no API keys and no display (inline #[cfg(test)] modules —
+# the tests/skills/ real-LLM scenarios stay out of CI by design). The
+# tests/e2e suite runs here too: it spawns the real binaries against the
+# scripted mock provider (PROVIDER=mock), so it is equally keyless and
+# headless while covering the CLI → loop → sandboxed-runtime path end to
+# end on every platform.
 
 on:
   push:
@@ -140,3 +144,11 @@ jobs:
       # the dependency set main pins, never a silent re-resolution of it.
       - name: cargo test
         run: cargo test -p intendant --bins --locked --target ${{ matrix.target }}
+
+      # Headless end-to-end: the real `intendant` + `intendant-runtime`
+      # binaries driven by the scripted mock provider (see tests/e2e/main.rs).
+      # No keys, no network, no display — exercises the production stack the
+      # unit suite can't reach (process spawn, sandbox, tool round-trips,
+      # session logging).
+      - name: cargo test e2e (mock provider, headless)
+        run: cargo test -p intendant --test e2e --locked --target ${{ matrix.target }}
