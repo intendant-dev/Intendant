@@ -7,7 +7,7 @@
 //!
 //! Key identity matches the session backends: chord/key actions arrive as DOM
 //! physical-key codes (produced by `key_action_events`) and map through
-//! [`crate::display::keymap::dom_code_to_x11_keycode`] (evdev + 8, the
+//! [`crate::keymap::dom_code_to_x11_keycode`] (evdev + 8, the
 //! universal offset on evdev-based Xorg/Xvfb). `type_text` is
 //! layout-independent: each character resolves to its keysym through the
 //! server's *actual* keyboard mapping when present, else through a temporarily
@@ -28,7 +28,7 @@ use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-use crate::display::keymap::{char_to_x11_keysym, dom_code_to_x11_keycode};
+use crate::keymap::{char_to_x11_keysym, dom_code_to_x11_keycode};
 
 /// Delay between the events of a key chord / repeated clicks, matching the
 /// session-backend pacing so apps see human-plausible sequences.

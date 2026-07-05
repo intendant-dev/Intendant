@@ -1,0 +1,79 @@
+[package]
+name = "intendant-display"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+# Exposes test-only constructors (WebRtcPeer::new_for_test) to dependent
+# crates' test suites.
+test-util = []
+
+[dependencies]
+intendant-core = { path = "../intendant-core" }
+presence-core = { path = "../presence-core" }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = "0.4"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+async-trait = "0.1"
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["rt"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+rtc = { version = "=0.9.0" }
+bytes = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.11", features = ["tokio"] }
+pipewire = "0.8"
+x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "xtest"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = "1.5"
+core-graphics = { version = "0.25", features = ["highsierra"] }
+shiguredo_video_toolbox = "2026.1"
+
+# The VP8/libvpx encoder has no Windows backend (Tier-0 Windows port
+# defers it); gated off MSVC so the FFI crate never builds there.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+env-libvpx-sys = { version = "5.1", features = ["generate"] }
+
+[target.'cfg(windows)'.dependencies]
+# Windows clipboard backend (clipboard.rs) — Win32 clipboard via arboard.
+arboard = "3"
+# DXGI Desktop Duplication capture, D3D11 staging copy, GDI metrics,
+# SendInput injection, and the Media Foundation H.264 encoder. Feature
+# list mirrors the caller's `windows` entry so workspace feature
+# unification stays a no-op.
+windows = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_UI_Accessibility",
+    "Win32_System_StationsAndDesktops",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Variant",
+    "Win32_System_Ole",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Environment",
+] }
+
+[dev-dependencies]
+# Paused-time tests (#[tokio::test(start_paused = true)] + time::advance).
+tokio = { version = "1.0", features = ["test-util"] }
+# One webrtc test installs the process-default ring crypto provider.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }

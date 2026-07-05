@@ -83,7 +83,7 @@
 //! lives inside each peer's `WebRtcPeer` driver task
 //! (`display/webrtc.rs`), which owns the peer's RTC connection and therefore
 //! the only path that can write RTP. Each frame carries a
-//! [`crate::display::encode::PayloadSpec`]; the driver checks it against the
+//! [`crate::encode::PayloadSpec`]; the driver checks it against the
 //! negotiated sender codec before packetizing. An earlier design sketch had a
 //! separate `PerPeerForwarder` task doing this work, but a separate task can't
 //! reach the driver's RTC state; merging the forwarder into the driver
@@ -143,7 +143,7 @@
 //! rebuilds the always-on bank from the layer factory, and demand/capacity
 //! state decides which spawned layers actually encode frames.
 
-use crate::display::{visual_marker, EncodedFrame};
+use crate::{visual_marker, EncodedFrame};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -362,7 +362,7 @@ impl SimulcastRid {
     ///
     /// Forward-compat: callers parsing offerer-supplied RID lists
     /// (notably `parse_offer_simulcast_recv_rids` in
-    /// [`crate::display::webrtc`]) `filter_map` through this so unknown
+    /// [`crate::webrtc`]) `filter_map` through this so unknown
     /// future RID names silently drop while known ones pass through.
     /// Strict variants that need to surface unknowns can match on the
     /// raw `&str` directly before calling this.
@@ -621,7 +621,7 @@ pub struct EncoderHandle {
     /// Per-encoder force-keyframe flag. [`EncoderPool::request_keyframe`]
     /// stores `true` here; the encoder thread `swap`s it back to false
     /// when consumed on the next frame and passes the bool to
-    /// [`crate::display::encode::Encoder::encode`]. AtomicBool keeps the
+    /// [`crate::encode::Encoder::encode`]. AtomicBool keeps the
     /// signaling lock-free between the async pool API and the std::thread
     /// encoder loop.
     pub force_keyframe: Arc<AtomicBool>,
@@ -1041,7 +1041,7 @@ impl Default for KeyframeCoalescer {
 // EncoderPool
 // ---------------------------------------------------------------------------
 
-/// The orchestrator. One pool per [`crate::display::DisplaySession`].
+/// The orchestrator. One pool per [`crate::DisplaySession`].
 ///
 /// The pool owns the always-on baseline encoder bank, on-demand codec
 /// slots, subscription refcounts, resize rebuilds, and keyframe coalescing.
@@ -1134,9 +1134,9 @@ struct EncoderPoolInner {
     /// `encode_freshness_us_sum` per encoded packet, plus
     /// `encode_drops` on broadcast lag. The pool is the sole
     /// producer of these counters since 3c.4b deleted the legacy
-    /// fan-out, so [`crate::display::DisplayMetricsSnapshot`]
+    /// fan-out, so [`crate::DisplayMetricsSnapshot`]
     /// reflects total session throughput.
-    counters: Arc<crate::display::DisplayMetricsCounters>,
+    counters: Arc<crate::DisplayMetricsCounters>,
 
     /// Factory closure invoked at construction *and on every resize*
     /// to derive the canonical always-on layer set for the current
@@ -1271,7 +1271,7 @@ impl EncoderPool {
         source_height: u32,
         framerate: u32,
         layer_factory: impl Fn(u32, u32) -> Vec<LayerSpec> + Send + Sync + 'static,
-        counters: Option<Arc<crate::display::DisplayMetricsCounters>>,
+        counters: Option<Arc<crate::DisplayMetricsCounters>>,
     ) -> Self {
         // Every pool encoder thread bumps these counters on each
         // encoded packet (encode_frames, encode_freshness_us_sum) and
@@ -1280,7 +1280,7 @@ impl EncoderPool {
         // care about metrics pass `None`; production passes
         // `Some(Arc::clone(&self.counters))` from DisplaySession::start.
         let counters =
-            counters.unwrap_or_else(|| Arc::new(crate::display::DisplayMetricsCounters::new()));
+            counters.unwrap_or_else(|| Arc::new(crate::DisplayMetricsCounters::new()));
         let duration_ms = if framerate > 0 {
             1000 / framerate as u64
         } else {
@@ -1979,7 +1979,7 @@ impl EncoderPool {
     /// for tests; production callers can ignore.
     ///
     /// **Call site: peer-join.** Called by
-    /// [`crate::display::DisplaySession::handle_offer_pool_mode`]
+    /// [`crate::DisplaySession::handle_offer_pool_mode`]
     /// after the new peer's pool subscription is in place. Without
     /// this, a peer joining during an idle desktop would wait up to
     /// one GOP boundary (and for VP8 on static content, potentially
@@ -2283,7 +2283,7 @@ fn try_spawn_encoder_thread(
     source_h: u32,
     i420_tx: &broadcast::Sender<I420Frame>,
     duration_ms: u64,
-    counters: &Arc<crate::display::DisplayMetricsCounters>,
+    counters: &Arc<crate::DisplayMetricsCounters>,
 ) -> Result<EncoderHandle, String> {
     // The construction parameters captured for the driver thread. The
     // thread runs `select_codec_for_mime` so any per-thread codec state
@@ -2449,7 +2449,7 @@ fn spawn_encoder_thread_with(
     construct: impl FnOnce() -> Result<Box<dyn super::Encoder>, String> + Send + 'static,
     i420_tx: &broadcast::Sender<I420Frame>,
     duration_ms: u64,
-    counters: &Arc<crate::display::DisplayMetricsCounters>,
+    counters: &Arc<crate::DisplayMetricsCounters>,
 ) -> Result<EncoderHandle, String> {
     let (frames_tx, _) = broadcast::channel::<Arc<EncodedFrame>>(ENCODER_FRAME_BROADCAST_CAPACITY);
     let force_keyframe = Arc::new(AtomicBool::new(false));
@@ -4292,7 +4292,7 @@ mod tests {
 
         // Construct pool with an EXPLICIT counters Arc (production
         // path) and hold a clone so the test can read post-encode.
-        let counters = Arc::new(crate::display::DisplayMetricsCounters::new());
+        let counters = Arc::new(crate::DisplayMetricsCounters::new());
         let pool = EncoderPool::new(
             W as u32,
             H as u32,
@@ -4364,7 +4364,7 @@ mod tests {
         }
         let frame_arc = Arc::new(frame_data);
 
-        let counters = Arc::new(crate::display::DisplayMetricsCounters::new());
+        let counters = Arc::new(crate::DisplayMetricsCounters::new());
         let pool = EncoderPool::new(
             W as u32,
             H as u32,

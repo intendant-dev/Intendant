@@ -49,7 +49,7 @@ use super::encode::pool::{
 use super::tile::backpressure::{TileDeltaBackpressure, TileDeltaSendDecision};
 use super::tile::transport as tile_transport;
 use super::{EncodedFrame, IceConfig, InputEvent, PeerId};
-use crate::error::CallerError;
+use intendant_core::error::CallerError;
 use bytes::{Bytes, BytesMut};
 use rtc::data_channel::{RTCDataChannelId, RTCDataChannelMessage};
 use rtc::media_stream::MediaStreamTrack;
@@ -544,7 +544,7 @@ pub fn inject_relay_tcp_candidate(sdp: &str, primary_addr: SocketAddr) -> String
 /// Generic over the read source so we can reuse it for a `TcpStream`
 /// (during dispatcher probe) and an `OwnedReadHalf` (inside the per-peer
 /// reader task after `into_split`).
-pub(crate) async fn read_rfc4571_frame<R>(r: &mut R) -> std::io::Result<Vec<u8>>
+pub async fn read_rfc4571_frame<R>(r: &mut R) -> std::io::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -575,7 +575,7 @@ pub async fn read_rfc4571_frame_pub(stream: &mut TcpStream) -> std::io::Result<V
 
 /// Write one RFC 4571 framed payload: prepend a 2-byte BE length header,
 /// then the payload bytes.
-pub(crate) async fn write_rfc4571_frame<W: AsyncWriteExt + Unpin>(
+pub async fn write_rfc4571_frame<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     payload: &[u8],
 ) -> std::io::Result<()> {
@@ -681,7 +681,7 @@ pub struct WebRtcPeer {
     /// aggregator to react.
     remote_inbound_health_rx: watch::Receiver<HashMap<SimulcastRid, PeerLayerHealth>>,
     /// **Phase 4d.3b**: per-peer aggregate TWCC health, published
-    /// once per second by [`crate::display::twcc_tap::spawn_twcc_health_aggregator`].
+    /// once per second by [`crate::twcc_tap::spawn_twcc_health_aggregator`].
     /// `None` initially (no window has fired yet), and `None` for
     /// any window in which no TWCC events arrived (silence is not
     /// recovery — see the aggregator's module docs). The channel
@@ -701,10 +701,10 @@ pub struct WebRtcPeer {
     /// simulcast layers in cascade (full → half → floor-only) under
     /// sustained loss. Per-layer adaptation is a 4d.3c concern,
     /// dependent on receivers that emit per-RID TLC.
-    twcc_health_rx: watch::Receiver<Option<crate::display::twcc_tap::TwccHealth>>,
+    twcc_health_rx: watch::Receiver<Option<crate::twcc_tap::TwccHealth>>,
     /// **#57**: the negotiated active RID set for this peer, frozen at
     /// construction time. The layer-policy coordinator
-    /// ([`crate::display::aggregator::spawn_layer_policy_coordinator`])
+    /// ([`crate::aggregator::spawn_layer_policy_coordinator`])
     /// reads this each tick to compute the per-display "pinned"
     /// layer set: a peer with `active_rids.len() == 1` MUST keep its
     /// only RID active or it gets no frames at all (its WebRTC track
@@ -889,7 +889,7 @@ impl WebRtcPeer {
 
     /// **#57**: this peer's negotiated active RID set, frozen at
     /// construction. The layer-policy coordinator
-    /// ([`crate::display::aggregator::spawn_layer_policy_coordinator`])
+    /// ([`crate::aggregator::spawn_layer_policy_coordinator`])
     /// reads this each tick to compute the per-display "pinned" layer
     /// set: a peer with `active_rids().len() == 1` MUST keep its only
     /// RID active or it gets no frames at all (its WebRTC track only
@@ -916,15 +916,15 @@ impl WebRtcPeer {
     /// immediately, which is correct production behavior but
     /// breaks tests that exercise the bridge → encoder → consumer
     /// pipeline directly.
-    #[cfg(test)]
-    pub(crate) fn new_for_test(peer_id: PeerId, active_rids: Vec<SimulcastRid>) -> Self {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn new_for_test(peer_id: PeerId, active_rids: Vec<SimulcastRid>) -> Self {
         use std::collections::HashMap;
         let (command_tx, _command_rx) = mpsc::channel(1);
         let (_obs_tx, observed_send_bitrate_rx) = watch::channel(None);
         let (_ri_tx, remote_inbound_health_rx) =
             watch::channel(HashMap::<SimulcastRid, PeerLayerHealth>::new());
         let (_twcc_tx, twcc_health_rx) =
-            watch::channel::<Option<crate::display::twcc_tap::TwccHealth>>(None);
+            watch::channel::<Option<crate::twcc_tap::TwccHealth>>(None);
         Self {
             peer_id,
             command_tx,
@@ -938,16 +938,16 @@ impl WebRtcPeer {
 
     /// **Phase 4d.3b**: subscribe to this peer's aggregate TWCC
     /// health signal. Published once per second by the
-    /// [`crate::display::twcc_tap::spawn_twcc_health_aggregator`]
-    /// task that drains the [`crate::display::twcc_tap::TwccTapInterceptor`]
+    /// [`crate::twcc_tap::spawn_twcc_health_aggregator`]
+    /// task that drains the [`crate::twcc_tap::TwccTapInterceptor`]
     /// event stream.
     ///
     /// `None` means either "no window has fired yet" or "the most
     /// recent window had zero TWCC events." Silence is not
-    /// recovery — see [`crate::display::twcc_tap`] module docs.
+    /// recovery — see [`crate::twcc_tap`] module docs.
     /// The channel transitions `None → Some(_) → None → Some(_)`
     /// as feedback arrives and goes silent across windows. The
-    /// capacity policy in [`crate::display::aggregator`] treats
+    /// capacity policy in [`crate::aggregator`] treats
     /// `None` and `Some(empty_health)` alike via its short-circuit
     /// arms and gates upper simulcast layers based only on
     /// sustained, non-empty loss readings.
@@ -957,7 +957,7 @@ impl WebRtcPeer {
     /// `subscribe_twcc_health` and read independently.
     pub fn subscribe_twcc_health(
         &self,
-    ) -> watch::Receiver<Option<crate::display::twcc_tap::TwccHealth>> {
+    ) -> watch::Receiver<Option<crate::twcc_tap::TwccHealth>> {
         self.twcc_health_rx.clone()
     }
 
@@ -965,9 +965,9 @@ impl WebRtcPeer {
     /// without subscribing. Returns `None` if no window has fired
     /// yet OR if the most recent window had zero TWCC events
     /// (silence is not recovery — see the module docs at
-    /// [`crate::display::twcc_tap`]). For change-driven consumers,
+    /// [`crate::twcc_tap`]). For change-driven consumers,
     /// prefer [`Self::subscribe_twcc_health`].
-    pub fn current_twcc_health(&self) -> Option<crate::display::twcc_tap::TwccHealth> {
+    pub fn current_twcc_health(&self) -> Option<crate::twcc_tap::TwccHealth> {
         *self.twcc_health_rx.borrow()
     }
 }
@@ -1167,7 +1167,7 @@ struct RtpSendConfig {
 /// `(codec, rid)` slot, and an encoder doesn't know which subscriber's
 /// RID it's serving (it just knows its own slot's rid). The pool
 /// forwarder reads the rid off its [`EncoderSubscription`] (which
-/// carries the [`crate::display::encode::pool::EncoderId`] containing
+/// carries the [`crate::encode::pool::EncoderId`] containing
 /// `(codec, rid)`) and wraps each frame here at hand-off.
 ///
 /// The driver uses the rid to look up the matching encoding's SSRC +
@@ -2080,7 +2080,7 @@ fn first_video_mid_from_offer(sdp: &str) -> Option<String> {
 ///
 /// **Federated H.264.** When the active codec is H.264 the pool produces a
 /// single on-demand layer at the `fed` RID
-/// ([`crate::display::encode::pool::SimulcastRid::federated`]), already at
+/// ([`crate::encode::pool::SimulcastRid::federated`]), already at
 /// quarter resolution + a capped bitrate via `LayerSpec::single_federated`
 /// — so `pool_rids` is `[fed]` and `last()` returns it. The loss math
 /// above (small IDR survives the relay) is achieved at the encoder for
@@ -2181,7 +2181,7 @@ fn parse_offer_simulcast_recv_rids(sdp: &str) -> Option<Vec<SimulcastRid>> {
 /// `handle_offer_pool_mode` consults this to mark the peer's
 /// [`PeerCodecPreferences`] federated, which makes the pool spawn the
 /// loss-resilient quarter-resolution / capped-bitrate on-demand H.264
-/// layer ([`crate::display::encode::pool::LayerSpec::single_federated`]).
+/// layer ([`crate::encode::pool::LayerSpec::single_federated`]).
 pub(crate) fn offer_is_federated(offer_sdp: &str) -> bool {
     parse_offer_simulcast_recv_rids(offer_sdp).is_none()
 }
@@ -2509,7 +2509,7 @@ impl WebRtcPeer {
         // zero defaults regardless of which interceptors are wired.
         // Tapping the interceptor chain is the only place we can
         // observe TWCC without patching rtc 0.9. See
-        // [`crate::display::twcc_tap`] module docs for the full
+        // [`crate::twcc_tap`] module docs for the full
         // background.
         //
         // **Chain order:** `Registry::with(...)` puts the supplied
@@ -2558,7 +2558,7 @@ impl WebRtcPeer {
         // below, after `shutdown` is created, so it shares the
         // peer's cancellation token.
         let (twcc_tap_tx, twcc_tap_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::display::twcc_tap::TwccEvent>();
+            tokio::sync::mpsc::unbounded_channel::<crate::twcc_tap::TwccEvent>();
         let registry = rtc::interceptor::Registry::new();
         let registry =
             rtc::peer_connection::configuration::interceptor_registry::configure_rtcp_reports(
@@ -2576,7 +2576,7 @@ impl WebRtcPeer {
                 .build(),
         );
         let registry = registry.with(|inner| {
-            crate::display::twcc_tap::TwccTapInterceptor::new(inner, twcc_tap_tx.clone())
+            crate::twcc_tap::TwccTapInterceptor::new(inner, twcc_tap_tx.clone())
         });
 
         let mut rtc = RTCPeerConnectionBuilder::new()
@@ -2605,7 +2605,7 @@ impl WebRtcPeer {
         // read it back via `local_addr()` when gathering the srflx
         // candidate off the critical path (audit F8), so we don't need to
         // carry the bases separately here.
-        let local_addrs = crate::access::routable_local_addrs(true);
+        let local_addrs = intendant_core::net::routable_local_addrs(true);
         for iface_addr in &local_addrs {
             let bind_addr = SocketAddr::new(*iface_addr, 0);
             let socket = match UdpSocket::bind(bind_addr).await {
@@ -2825,22 +2825,22 @@ impl WebRtcPeer {
             watch::channel::<HashMap<SimulcastRid, PeerLayerHealth>>(HashMap::new());
         // **Phase 4d.3b**: per-peer aggregate TWCC health, derived
         // from inbound `TransportLayerCC` packets observed by the
-        // [`crate::display::twcc_tap::TwccTapInterceptor`] wired
+        // [`crate::twcc_tap::TwccTapInterceptor`] wired
         // into the rtc interceptor chain above. Initial value
         // `None`: the aggregator hasn't published its first
         // 1-second window yet. After the first publish the channel
         // stays `Some(_)`, replaced once per window. The capacity
-        // policy in [`crate::display::aggregator`] subscribes via
+        // policy in [`crate::aggregator`] subscribes via
         // [`WebRtcPeer::subscribe_twcc_health`].
         let (twcc_health_tx, twcc_health_rx) =
-            watch::channel::<Option<crate::display::twcc_tap::TwccHealth>>(None);
+            watch::channel::<Option<crate::twcc_tap::TwccHealth>>(None);
         let shutdown = CancellationToken::new();
         // Aggregator task drains `twcc_tap_rx` and publishes one
         // `TwccHealth` per second. Exits on `shutdown.cancelled()`,
         // on the tap channel closing (rtc dropped → tap dropped →
         // sender dropped → recv returns None), or on all watch
         // receivers dropping.
-        crate::display::twcc_tap::spawn_twcc_health_aggregator(
+        crate::twcc_tap::spawn_twcc_health_aggregator(
             twcc_tap_rx,
             twcc_health_tx,
             shutdown.clone(),
@@ -3282,7 +3282,7 @@ impl WebRtcPeer {
 // Driver task
 // ---------------------------------------------------------------------------
 
-/// Per-[`crate::display::encode::PayloadSpec`] negotiation + readiness
+/// Per-[`crate::encode::PayloadSpec`] negotiation + readiness
 /// state. Keyed off the full `PayloadSpec` in [`DriverState::video_specs`]
 /// so H.264 fmtp variants (profile-level-id + packetization-mode) stay
 /// distinct — browser negotiation treats those independently and caching by
@@ -3326,7 +3326,7 @@ struct DriverState {
     /// commit 2 lights up multi-encoding), the map has exactly one
     /// entry per active spec — same shape as the previous keying,
     /// just with the RID dimension along for the ride.
-    video_specs: HashMap<(crate::display::encode::PayloadSpec, SimulcastRid), SpecState>,
+    video_specs: HashMap<(crate::encode::PayloadSpec, SimulcastRid), SpecState>,
     /// Map of channel label → DataChannelId for routing channel data and clipboard sends.
     channels: HashMap<String, RTCDataChannelId>,
     /// F-1.2: queued `display_input_authority_state` messages awaiting
@@ -4543,7 +4543,7 @@ fn rid_for_ssrc(ssrc_table: &[(SimulcastRid, u32)], ssrc: u32) -> Option<Simulca
 /// every PLI / FIR whose target SSRC matches one of this peer's
 /// outbound encoding SSRCs. Output goes onto a bounded mpsc; the pool
 /// intake side reads it and calls
-/// [`crate::display::encode::pool::EncoderPool::request_keyframe`]
+/// [`crate::encode::pool::EncoderPool::request_keyframe`]
 /// with the active codec + the routed RID, hitting only that layer's
 /// encoder.
 ///
@@ -4826,18 +4826,18 @@ fn write_video_frame<I: rtc::interceptor::Interceptor>(
 }
 
 fn payload_spec_matches_codec(
-    spec: &crate::display::encode::PayloadSpec,
+    spec: &crate::encode::PayloadSpec,
     codec: &RTCRtpCodec,
 ) -> bool {
     if spec
         .codec_mime
-        .eq_ignore_ascii_case(crate::display::encode::MIME_TYPE_VP8)
+        .eq_ignore_ascii_case(crate::encode::MIME_TYPE_VP8)
     {
         return codec.mime_type.eq_ignore_ascii_case(RTC_MIME_TYPE_VP8);
     }
     if spec
         .codec_mime
-        .eq_ignore_ascii_case(crate::display::encode::MIME_TYPE_H264)
+        .eq_ignore_ascii_case(crate::encode::MIME_TYPE_H264)
     {
         return codec.mime_type.eq_ignore_ascii_case(RTC_MIME_TYPE_H264)
             && spec.h264_packetization_mode == Some(1)
@@ -5117,7 +5117,7 @@ fn serialize_clipboard(content: &ClipboardContent) -> String {
     }
 }
 
-// `routable_local_addrs` and `is_link_local_v6` moved to `crate::access`
+// `routable_local_addrs` and `is_link_local_v6` live in `intendant_core::net`
 // so the federation advertise side can share them — same set of
 // "addresses we can be reached at" applies to both WebRTC host
 // candidates and Agent Card transport URLs.
@@ -5130,7 +5130,7 @@ fn serialize_clipboard(content: &ClipboardContent) -> String {
 ///   `candidate:<foundation> <component> <proto> <priority> <addr> <port> typ <kind> ...`
 /// We split on whitespace, the connection-address is field index 4 (counting
 /// from the `candidate:` prefix as 0).
-pub(crate) async fn resolve_mdns_in_candidate(candidate: &str) -> Result<String, String> {
+pub async fn resolve_mdns_in_candidate(candidate: &str) -> Result<String, String> {
     let mut fields: Vec<&str> = candidate.split_whitespace().collect();
     if fields.len() < 6 {
         return Ok(candidate.to_string());
@@ -5832,7 +5832,7 @@ mod tests {
         // be ignored (srflx only needs STUN). Using a literal IP avoids a
         // DNS dependency in the unit test.
         let ice_config = IceConfig {
-            ice_servers: vec![crate::display::IceServer {
+            ice_servers: vec![crate::IceServer {
                 urls: vec![
                     "stun:127.0.0.1:19302".to_string(),
                     "turn:127.0.0.1:3478".to_string(),
@@ -5912,7 +5912,7 @@ mod tests {
         // (kept). Different ports prove we pick the plain-UDP 3478 entry, not
         // the TLS 5349 one. Literal IP avoids a DNS dependency.
         let ice_config = IceConfig {
-            ice_servers: vec![crate::display::IceServer {
+            ice_servers: vec![crate::IceServer {
                 urls: vec![
                     "turns:127.0.0.1:5349?transport=tcp".to_string(),
                     "stun:127.0.0.1:19302".to_string(),
@@ -5942,7 +5942,7 @@ mod tests {
         // A turn server with no username/credential is unusable (the Allocate
         // would draw a 401), so it's skipped rather than wasting the timeout.
         let ice_config = IceConfig {
-            ice_servers: vec![crate::display::IceServer {
+            ice_servers: vec![crate::IceServer {
                 urls: vec!["turn:127.0.0.1:3478".to_string()],
                 username: None,
                 credential: None,
@@ -5967,7 +5967,7 @@ mod tests {
         // RFC 7065 `?transport=tcp` query must be stripped before host:port
         // parsing — we always allocate over UDP regardless of the hint.
         let ice_config = IceConfig {
-            ice_servers: vec![crate::display::IceServer {
+            ice_servers: vec![crate::IceServer {
                 urls: vec!["turn:127.0.0.1:3478?transport=tcp".to_string()],
                 username: Some("u".to_string()),
                 credential: Some("p".to_string()),
@@ -6190,7 +6190,7 @@ mod tests {
         let silent_addr = silent.local_addr().unwrap();
         // Literal-IP STUN URL (no DNS on the path either).
         let ice_config = IceConfig {
-            ice_servers: vec![crate::display::IceServer {
+            ice_servers: vec![crate::IceServer {
                 urls: vec![format!("stun:{}:{}", silent_addr.ip(), silent_addr.port())],
                 username: None,
                 credential: None,
@@ -6418,7 +6418,7 @@ mod tests {
     /// (simulcast-style) subscription sets.
     #[test]
     fn codec_set_from_subscriptions_dedups_multi_layer() {
-        use crate::display::encode::pool::{EncoderId, LayerSpec, SimulcastRid};
+        use crate::encode::pool::{EncoderId, LayerSpec, SimulcastRid};
         let (s, _r) = broadcast::channel::<Arc<EncodedFrame>>(4);
         let make = |codec: CodecKind, rid: SimulcastRid| EncoderSubscription {
             id: EncoderId::new(codec, rid),
@@ -6440,7 +6440,7 @@ mod tests {
 
     #[test]
     fn active_codec_from_subscriptions_respects_peer_pref_order() {
-        use crate::display::encode::pool::{EncoderId, LayerSpec, SimulcastRid};
+        use crate::encode::pool::{EncoderId, LayerSpec, SimulcastRid};
         let (s, _r) = broadcast::channel::<Arc<EncodedFrame>>(4);
         let make = |codec: CodecKind| EncoderSubscription {
             id: EncoderId::new(codec, SimulcastRid::full()),
@@ -6457,7 +6457,7 @@ mod tests {
 
     #[test]
     fn active_codec_from_subscriptions_returns_none_on_no_pref_overlap() {
-        use crate::display::encode::pool::{EncoderId, LayerSpec, SimulcastRid};
+        use crate::encode::pool::{EncoderId, LayerSpec, SimulcastRid};
         let (s, _r) = broadcast::channel::<Arc<EncodedFrame>>(4);
         let subs = vec![EncoderSubscription {
             id: EncoderId::new(CodecKind::Vp8, SimulcastRid::full()),
@@ -6614,7 +6614,7 @@ mod tests {
         codec: CodecKind,
         rid: SimulcastRid,
     ) -> EncoderSubscription {
-        use crate::display::encode::pool::LayerSpec;
+        use crate::encode::pool::LayerSpec;
         let (s, r) = broadcast::channel::<Arc<EncodedFrame>>(4);
         std::mem::forget(s);
         EncoderSubscription {
@@ -6765,7 +6765,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_intake_resubscribes_when_initial_subs_already_closed() {
-        use crate::display::encode::pool::{EncoderPool, LayerSpec};
+        use crate::encode::pool::{EncoderPool, LayerSpec};
 
         let pool = Arc::new(EncoderPool::new(
             64,
@@ -6850,7 +6850,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_intake_shuts_down_peer_when_resubscribe_finds_no_codec() {
-        use crate::display::encode::pool::EncoderPool;
+        use crate::encode::pool::EncoderPool;
 
         // Pool with NO always-on encoders; on-demand only. Subscribe
         // for VP8 (spawns on-demand VP8 slot) to get initial_subs.
@@ -6951,7 +6951,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_intake_forwards_all_active_codec_layers() {
-        use crate::display::encode::pool::{EncoderPool, LayerSpec};
+        use crate::encode::pool::{EncoderPool, LayerSpec};
 
         let pool = Arc::new(EncoderPool::new(
             64,
@@ -7074,7 +7074,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_intake_drops_lossily_when_driver_mpsc_full() {
-        use crate::display::encode::pool::{EncoderPool, LayerSpec};
+        use crate::encode::pool::{EncoderPool, LayerSpec};
 
         let pool = Arc::new(EncoderPool::new(
             64,
@@ -7183,7 +7183,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_intake_wraps_forwarded_frames_with_per_subscription_rid() {
-        use crate::display::encode::pool::{EncoderPool, LayerSpec};
+        use crate::encode::pool::{EncoderPool, LayerSpec};
 
         let pool = Arc::new(EncoderPool::new(
             64,
@@ -7295,7 +7295,7 @@ mod tests {
     /// three layers and this test would compile-fail (or assert).
     #[test]
     fn driver_state_video_specs_keys_by_spec_and_rid() {
-        use crate::display::encode::PayloadSpec;
+        use crate::encode::PayloadSpec;
         let spec = PayloadSpec::vp8();
         let mut specs: HashMap<(PayloadSpec, SimulcastRid), SpecState> = HashMap::new();
         // Insert under three distinct rids with the same spec. They
@@ -7452,7 +7452,7 @@ mod tests {
             SimulcastRid::half(),
             SimulcastRid::quarter(),
         ];
-        let ice_config = crate::display::IceConfig::default();
+        let ice_config = crate::IceConfig::default();
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
         let authority_handler = noop_authority_handler();
@@ -7569,7 +7569,7 @@ mod tests {
         ensure_rustls_crypto_provider();
         let offer_sdp = synth_recvonly_video_offer_for_rtc();
         let active_rids = vec![SimulcastRid::full()];
-        let ice_config = crate::display::IceConfig::default();
+        let ice_config = crate::IceConfig::default();
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
         let authority_handler = noop_authority_handler();
@@ -7626,7 +7626,7 @@ mod tests {
         let offer_sdp = synth_recvonly_h264_video_offer_for_rtc();
         // Single rid → no simulcast in answer.
         let active_rids = vec![SimulcastRid::full()];
-        let ice_config = crate::display::IceConfig::default();
+        let ice_config = crate::IceConfig::default();
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
         let authority_handler = noop_authority_handler();

@@ -23,7 +23,7 @@ mod daemon_log_tee;
 mod dashboard_control;
 mod debug;
 mod diagnostics;
-mod display;
+pub(crate) use intendant_display as display;
 pub(crate) use intendant_core::error;
 mod event;
 mod external_agent;
@@ -81,7 +81,7 @@ mod windows_uia;
 mod worktree;
 mod worktree_inventory;
 #[cfg(target_os = "linux")]
-mod x11_input;
+pub(crate) use intendant_display::x11_input;
 
 // God-file split (see CLAUDE.md "File size budget"): regions extracted from
 // this file live in the modules below; the glob re-exports keep existing

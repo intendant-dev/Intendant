@@ -78,7 +78,7 @@
 //! 0" desktop) -- see the crate-level Windows-port notes.
 
 use super::{DisplayBackend, Frame, FrameFormat, InputEvent};
-use crate::error::CallerError;
+use intendant_core::error::CallerError;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;

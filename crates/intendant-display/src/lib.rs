@@ -34,7 +34,7 @@ use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::CallerError;
+use intendant_core::error::CallerError;
 
 pub mod aggregator;
 pub mod capture;
@@ -59,6 +59,8 @@ pub mod windows;
 pub mod windows_keymap;
 #[cfg(target_os = "linux")]
 pub mod x11;
+#[cfg(target_os = "linux")]
+pub mod x11_input;
 
 // ---------------------------------------------------------------------------
 // Display enumeration
@@ -638,7 +640,7 @@ pub struct DisplaySession {
     /// [`Self::start`] since 3c.4d).
     ///
     /// **Why a burst is needed even though the pool also sets
-    /// `force_keyframe`:** [`crate::display::encode::pool::EncoderPool::request_keyframe_all`]
+    /// `force_keyframe`:** [`crate::encode::pool::EncoderPool::request_keyframe_all`]
     /// sets a per-encoder atomic flag that VP8 and macOS H.264 honor
     /// on their next encode. Linux H.264 (ffmpeg-pipe) explicitly
     /// ignores the flag (see `h264_linux.rs::encode`'s `_force_keyframe`
@@ -726,16 +728,16 @@ pub struct DisplaySession {
     /// - **Aggregate-TWCC policy** (per-peer cascaded loss):
     ///   votes floor + cascade-projected upper layers. Active on
     ///   the rtc 0.9 / WKWebView stack via
-    ///   [`crate::display::twcc_tap`].
+    ///   [`crate::twcc_tap`].
     /// - **Per-RID RR policy** (per-(peer, RID) `fraction_lost`):
     ///   votes floor + per-RID Wanted-state-projection. Currently
     ///   inert on the rtc 0.9 stack (RR stats never populate),
     ///   stays warm so future stacks that surface fresh RR
     ///   activate it without code changes.
     ///
-    /// See [`crate::display::aggregator::spawn_layer_policy_coordinator`]
+    /// See [`crate::aggregator::spawn_layer_policy_coordinator`]
     /// for the composition machinery and
-    /// [`crate::display::aggregator::compose_effective_wanted`]
+    /// [`crate::aggregator::compose_effective_wanted`]
     /// for the intersection rule. `None` before `start()` / after
     /// `stop()`.
     layer_policy_handle: Mutex<Option<JoinHandle<()>>>,
@@ -1905,7 +1907,7 @@ impl DisplaySession {
     ///     driven by the active codec selected from the pool's initial
     ///     subscribe result. No first-peer codec lock.
     ///   - Peer-join keyframe is wired in two parts at the tail:
-    ///     * [`crate::display::encode::pool::EncoderPool::request_keyframe_all`]
+    ///     * [`crate::encode::pool::EncoderPool::request_keyframe_all`]
     ///       (3c.3b.4a) fires a coalesced PLI-equivalent across
     ///       every active encoder. Honored by VP8 and macOS H.264.
     ///     * Burst signal via [`Self::signal_peer_join_burst`]
@@ -2450,7 +2452,7 @@ impl DisplaySession {
     /// `pool_feed_keyframe_tx` and opens a 1.5s burst window when
     /// signaled. Required because `force_keyframe` on a long-running
     /// ffmpeg-pipe encoder (Linux H.264) is a no-op, so
-    /// [`EncoderPool::request_keyframe_all`](crate::display::encode::pool::EncoderPool::request_keyframe_all)
+    /// [`EncoderPool::request_keyframe_all`](crate::encode::pool::EncoderPool::request_keyframe_all)
     /// alone can't reach those encoders — the burst clocks the
     /// encoder at tick rate so its `-g 30` natural cadence lands a
     /// keyframe inside the window.
@@ -3622,8 +3624,8 @@ mod tests {
     /// Windows; gate the helper too so it isn't dead code there.
     #[cfg(not(target_os = "windows"))]
     async fn register_test_peer_demanding_all_layers(session: &DisplaySession) {
-        use crate::display::encode::pool::SimulcastRid;
-        use crate::display::webrtc::WebRtcPeer;
+        use crate::encode::pool::SimulcastRid;
+        use crate::webrtc::WebRtcPeer;
         let peer = Arc::new(WebRtcPeer::new_for_test(
             1u64,
             vec![

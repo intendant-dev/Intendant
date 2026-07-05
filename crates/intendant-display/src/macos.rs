@@ -13,7 +13,7 @@
 use super::{
     capture::damage::Rect, DisplayBackend, DisplayInfoKind, Frame, FrameFormat, InputEvent,
 };
-use crate::error::CallerError;
+use intendant_core::error::CallerError;
 use async_trait::async_trait;
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{

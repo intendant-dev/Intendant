@@ -2444,6 +2444,7 @@ dependencies = [
  "if-addrs",
  "image",
  "intendant-core",
+ "intendant-display",
  "landlock",
  "libc",
  "notify",
@@ -2504,6 +2505,36 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "intendant-display"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "ashpd",
+ "async-trait",
+ "base64",
+ "bytes",
+ "chrono",
+ "core-graphics",
+ "env-libvpx-sys",
+ "futures-util",
+ "image",
+ "intendant-core",
+ "pipewire",
+ "presence-core",
+ "rtc",
+ "rustls",
+ "screencapturekit",
+ "serde",
+ "serde_json",
+ "shiguredo_video_toolbox",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "windows 0.59.0",
+ "x11rb",
 ]
 
 [[package]]

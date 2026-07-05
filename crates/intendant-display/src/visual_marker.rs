@@ -35,7 +35,7 @@
 //! The capture pipeline owns BGRA frames behind `Arc<Frame>` (shared with
 //! the FrameRegistry and the broadcast subscribers); mutating in place
 //! would require a clone or a refactor. The I420 buffer is freshly
-//! produced by [`crate::display::encode::bgra_to_i420`] and immediately
+//! produced by [`crate::encode::bgra_to_i420`] and immediately
 //! moved into the bridge's `latest_i420` cache — modifying it before the
 //! `Arc::new` is the cheapest correct hook point.
 //!

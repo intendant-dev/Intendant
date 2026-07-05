@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/app-html-assembler",
     "crates/intendant-core",
+    "crates/intendant-display",
     "crates/presence-core",
     "crates/presence-web",
     "crates/station-web",
@@ -56,6 +57,7 @@ dirs = "6"
 # Rust, so no setup-script changes are needed.
 which = "8"
 intendant-core = { path = "crates/intendant-core" }
+intendant-display = { path = "crates/intendant-display" }
 rmcp = { version = ">=1.4.0, <1.5.0", features = ["server", "transport-io", "client", "transport-child-process"] }
 schemars = "1"
 base64 = "0.22"
@@ -253,6 +255,8 @@ split-debuginfo = "unpacked"
 incremental = true
 
 [dev-dependencies]
+# The gateway's dashboard-control tests drive WebRtcPeer::new_for_test.
+intendant-display = { path = "crates/intendant-display", features = ["test-util"] }
 # Enable tokio's `test-util` feature in test builds so `#[tokio::test(start_paused = true)]`
 # and `tokio::time::advance` are available. Cargo merges features additively between
 # [dependencies] and [dev-dependencies] for test/example builds — release builds still
