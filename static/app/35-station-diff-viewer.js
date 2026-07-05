@@ -1426,6 +1426,7 @@ function buildStationSnapshot() {
   for (const d of daemons) {
     const usage = stationUsageForHost(d.host_id);
     agents.push(stationAgentForPeer(d, usage));
+    agents.push(...stationPeerSessionAgents(d));
     const pending = peerPendingApprovals.get(d.host_id);
     if (pending) {
       for (const [approvalId, approval] of pending.entries()) {
@@ -1573,13 +1574,26 @@ function stationAgentForPeer(d, usage) {
   const status = d.server_status || (d.connected ? 'idle' : 'error');
   const needsApproval = status === 'needs_approval';
   const phase = needsApproval ? 'waiting' : status === 'working' ? 'running' : d.connected ? 'idle' : 'waiting';
+  // The peer daemon's own primary session (is_primary in the folded
+  // sessions list) enriches this node — its vitals, goal, and label —
+  // mirroring how stationAgentForSelf reads the local daemon session.
+  // Non-primary peer sessions become their own orbiting nodes via
+  // stationPeerSessionAgents.
+  let primarySession = null;
+  try {
+    primarySession = (Array.isArray(d.sessions) ? d.sessions : []).find(s => s && s.is_primary) || null;
+  } catch (_) {}
+  const goal = primarySession ? normalizeSessionGoal(primarySession.goal || null) : null;
   return {
+    ...stationVitalsFields(primarySession && primarySession.vitals || null),
     id: 'peer-' + sanitizeStationId(d.host_id),
     hostId: d.host_id,
     role: 'orchestrator',
     phase,
     status: status === 'working' ? 'in_progress' : status,
-    task: needsApproval ? 'waiting for approval' : 'peer daemon',
+    task: needsApproval
+      ? 'waiting for approval'
+      : (primarySession && compactSessionText(primarySession.label || '') || 'peer daemon'),
     provider: usage.provider || '',
     model: usage.model || '',
     tokens: usage.tokens,
@@ -1597,7 +1611,102 @@ function stationAgentForPeer(d, usage) {
     approvalId: null,
     approvalCommand: '',
     approvalCategory: '',
+    goalStatus: goal ? String(goal.status || '') : '',
+    goalObjective: goal ? String(goal.objective || '') : '',
+    goalTokens: goal && goal.tokensUsed !== null && goal.tokensUsed !== undefined
+      ? String(goal.tokensUsed)
+      : '',
   };
+}
+
+// Wire phase vocabulary (status_from_phase's input set: working /
+// waiting_approval / done / idle / …) → the scene's phase set. The
+// local normalizeStationPhase expects dashboard status labels and
+// maps "working" to idle — wrong for remote sessions, hence this
+// peer-specific mapper.
+function stationPhaseFromPeerSession(phase) {
+  const p = String(phase || '').toLowerCase();
+  if (p.includes('thinking')) return 'thinking';
+  if (p.includes('working') || p.includes('acting') || p.includes('executing') || p.includes('running')) return 'running';
+  if (p.includes('approval') || p.includes('waiting')) return 'waiting';
+  if (p.includes('done') || p.includes('complete')) return 'done';
+  return 'idle';
+}
+
+// A peer's non-primary sessions as display-only scene nodes orbiting
+// that peer's host (v1: no action pills — the SessionAction handlers
+// assume local session ids). Newest first, capped: the scene is a
+// bounded constellation by design (same doctrine as the recent-session
+// nodes); the peer's own dashboard remains the exhaustive list.
+const PEER_SESSION_SCENE_NODES = 12;
+function stationPeerSessionAgents(d) {
+  try {
+    const sessions = (Array.isArray(d.sessions) ? d.sessions : [])
+      .filter(s => s && s.session_id && !s.is_primary && !s.ephemeral)
+      .sort((a, b) => String(b.started_at || '').localeCompare(String(a.started_at || '')))
+      .slice(0, PEER_SESSION_SCENE_NODES);
+    const hostKey = sanitizeStationId(d.host_id);
+    const peerNodeId = 'peer-' + hostKey;
+    const ids = new Set(sessions.map(s => String(s.session_id)));
+    const out = [];
+    for (const s of sessions) {
+      const id = String(s.session_id);
+      const source = normalizeAgentId(s.source || '') || '';
+      const kind = String(s.relationship || '').trim();
+      const goal = normalizeSessionGoal(s.goal || null);
+      const phase = stationPhaseFromPeerSession(s.phase);
+      const parentSid = String(s.parent_session_id || '').trim();
+      const parentNodeId = parentSid && ids.has(parentSid)
+        ? 'peer-session-' + hostKey + '-' + sanitizeStationId(parentSid)
+        : peerNodeId;
+      out.push({
+        ...stationVitalsFields(s.vitals || null),
+        id: 'peer-session-' + hostKey + '-' + sanitizeStationId(id),
+        hostId: d.host_id,
+        role: kind === 'subagent'
+          ? 'sub-agent'
+          : (source && source !== 'intendant' ? 'external' : 'session'),
+        phase,
+        status: phase === 'running' || phase === 'thinking'
+          ? 'in_progress'
+          : (phase === 'done' ? 'done' : phase),
+        task: compactSessionText(s.label || '') || shortSessionId(id),
+        provider: '',
+        model: '',
+        tokens: stationNum(s.tokens_used),
+        tokenCap: 0,
+        prompt: 0,
+        completion: 0,
+        cached: 0,
+        cost: 0,
+        turns: 0,
+        turnCap: 0,
+        autonomy: '',
+        worktree: '',
+        parentId: parentNodeId,
+        needsApproval: !!s.needs_approval,
+        approvalId: null,
+        approvalCommand: '',
+        approvalCategory: '',
+        sessionId: id,
+        source,
+        relationshipKind: kind,
+        goalStatus: goal ? String(goal.status || '') : '',
+        goalObjective: goal ? String(goal.objective || '') : '',
+        goalTokens: goal && goal.tokensUsed !== null && goal.tokensUsed !== undefined
+          ? String(goal.tokensUsed)
+          : '',
+        threadActions: [],
+        canInterrupt: false,
+      });
+    }
+    return out;
+  } catch (err) {
+    // Same degradation contract as stationSessionAgents: a bad peer
+    // row must not freeze the whole Station update loop.
+    console.warn('Station peer-session feed failed:', err);
+    return [];
+  }
 }
 
 function stationApprovalAgent(hostId, approvalId, approval) {

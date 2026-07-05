@@ -85,9 +85,16 @@ Known seams — the honest gap between the vision and the pixels:
   context-pressure rings, approval glow, and per-node action pills on the
   focus panel. *Recent* (closed-window) sessions join as dim, inert nodes —
   a deliberately bounded tail (the freshest few; the sessions panel remains
-  the exhaustive list) whose focus panel offers log + resume. Still outside
-  the scene: peer daemons' sessions — peers render as one node each because
-  they publish no per-session data into the snapshot yet.
+  the exhaustive list) whose focus panel offers log + resume.
+- **Peer daemons' sessions are in the scene too**: each folded
+  `SessionInfo` snapshot from a peer's event stream (see
+  [Per-peer sessions](./peer-federation.md#per-peer-sessions--the-folded-sessioninfo-rail))
+  becomes a display-only node orbiting that peer's host — phase, parent
+  edges, goal ring, approval glow, and vitals, newest-first and capped per
+  peer (a bounded constellation; the peer's own dashboard is the
+  exhaustive list). The peer's primary session enriches the peer node
+  itself (label, goal, vitals) instead of duplicating it. No action pills
+  in v1 — the session-action handlers assume local session ids.
 - **Goals render on the focus panel, the command deck, and the node
   itself** (a thin status-tinted ring between the pressure ring and the
   running pulse).
@@ -134,9 +141,12 @@ the session's advertised thread-action ops (compact, fork) — all
 dispatching through the dashboard's real session-action handler. Recent
 (closed-window) sessions render as dim, inert nodes with log + resume
 pills, capped to the freshest few by design (a bounded constellation, not
-the whole archive), and goal state also rings the node itself. Still open
-in this phase: session nodes for peer daemons' sessions (peers publish no
-per-session data into the snapshot yet).
+the whole archive), and goal state also rings the node itself. Peer
+daemons' sessions joined last: the primary folds each peer's per-session
+event stream into `SessionInfo` snapshots (`peer_session_updated` →
+`d.sessions` → `peer-session-<host>-<id>` nodes orbiting the peer host,
+display-only in v1), and the peer's primary session enriches the peer's
+own node — closing the phase.
 
 ### Phase C — panes move into the scene
 

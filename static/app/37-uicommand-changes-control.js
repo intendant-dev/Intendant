@@ -236,6 +236,16 @@ function processCommands(cmds) {
         removePendingApproval(c.host_id, c.id);
         stationScheduleUpdate();
         break;
+      // Folded per-session snapshots from a peer's event stream —
+      // upsert/retire on the peer's daemon row (d.sessions); the
+      // Station scene renders them as nodes orbiting the peer host.
+      // Both helpers schedule the Station refresh themselves.
+      case 'peer_session_updated':
+        upsertPeerSession(c.host_id, c.session);
+        break;
+      case 'peer_session_ended':
+        removePeerSession(c.host_id, c.session_id);
+        break;
       case 'peer_webrtc_signal':
         // Per-peer WebRTC signaling: route to the matching
         // RTCPeerConnection (keyed by host_id|display_id|session_id)

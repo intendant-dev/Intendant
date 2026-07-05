@@ -162,6 +162,43 @@ cross-machine display (see below).
   required capability — in lexicographic `PeerId` order (deterministic, so
   idempotent retries route to the same peer) and delegates via the handle.
 
+### Per-peer sessions — the folded `SessionInfo` rail
+
+A peer's `/ws` stream already narrates its sessions event by event
+(`session_started`, `session_identity`, `session_relationship`, per-session
+`status`, `session_goal`, `session_vitals`, session-scoped `usage` and
+approvals). The consuming side folds that stream instead of extending the wire:
+`PeerSessionFold` (`peer/upcast.rs`, shared by both upcasters) merges the
+events into per-session [`SessionInfo`] snapshots — label, source, phase,
+parent/relationship, tokens, `needs_approval` (derived from the pending-
+approval set), goal, and vitals, every enrichment field optional — and emits a
+`PeerEvent::SessionUpdated` carrying the full merged snapshot whenever
+something actually changes. `SessionStarted` announces, `SessionUpdated`
+evolves, `SessionEnded` retires; consumers fold the first two identically by
+`session_id`, so the stream is idempotent and loss-tolerant.
+
+Because fold updates **upsert**, a primary that connects (or reconnects) while
+the peer's sessions are already running learns them from their next live event
+— no replay protocol needed. The transport also peeks the `/ws` bootstrap
+`state_snapshot` frame to learn the peer daemon's own primary session id and
+stamps that session `is_primary`; renderers merge it into the peer's daemon
+node instead of drawing it twice. The fold is bounded
+(`MAX_TRACKED_PEER_SESSIONS`, oldest-started evicted) since a peer could
+announce sessions forever without ending them.
+
+The per-peer actor mirrors the folded stream into a watch-published sessions
+view (cleared on disconnect — the fold is connection-scoped, and stale entries
+would ghost if the peer restarted), and `PeerSnapshot` carries it as
+`sessions`, so `GET /api/peers` seeds a late-joining dashboard and every
+pushed `peer_state_changed` snapshot replaces the row's list losslessly (same
+source of truth as the live events). The dashboard renders them as
+display-only nodes orbiting the peer's host in the Station scene (capped per
+peer — the scene is a bounded constellation; the peer's own dashboard is the
+exhaustive list). Action pills stay off peer session nodes in v1: the
+session-action handlers assume local session ids. None of this changes what a
+peer exposes — the sessions rail is derived entirely from the event stream the
+peer already sends under its access profile.
+
 ## Transports
 
 Phase 1 ships the native Intendant↔Intendant transport. A2A, OpenClaw, and

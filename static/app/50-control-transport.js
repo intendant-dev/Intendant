@@ -2388,7 +2388,38 @@ function snapshotToDaemonEntry(p) {
     capabilities: p.capabilities || [],
     server_connection_state: p.connection_state,
     server_status: p.status,
+    // The peer's sessions as folded server-side from its event stream
+    // (SessionInfo shape: session_id, label, phase, source, is_primary,
+    // parent_session_id, tokens_used, needs_approval, goal, vitals).
+    // Snapshots are authoritative — the same actor fold that feeds the
+    // live peer_session_updated events produced this list, so wholesale
+    // row replacement never loses session state.
+    sessions: Array.isArray(p.sessions) ? p.sessions : [],
   };
+}
+
+// Upsert one folded session snapshot into a peer row's session list
+// (live peer_session_updated push). Unknown hosts are ignored — same
+// stale-push reasoning as updateDaemonSnapshot.
+function upsertPeerSession(hostId, session) {
+  if (!hostId || !session || !session.session_id) return;
+  const d = daemons.find(x => x.host_id === hostId);
+  if (!d) return;
+  if (!Array.isArray(d.sessions)) d.sessions = [];
+  const idx = d.sessions.findIndex(s => s.session_id === session.session_id);
+  if (idx >= 0) d.sessions[idx] = session;
+  else d.sessions.push(session);
+  stationScheduleUpdate();
+}
+
+function removePeerSession(hostId, sessionId) {
+  if (!hostId || !sessionId) return;
+  const d = daemons.find(x => x.host_id === hostId);
+  if (!d || !Array.isArray(d.sessions)) return;
+  const idx = d.sessions.findIndex(s => s.session_id === sessionId);
+  if (idx < 0) return;
+  d.sessions.splice(idx, 1);
+  stationScheduleUpdate();
 }
 
 // Apply a pushed PeerSnapshot to the local daemons list — replace the
