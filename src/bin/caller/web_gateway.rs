@@ -23153,314 +23153,89 @@ pub fn spawn_web_gateway(
                                 return handle_displays(stream, session_registry).await;
                             }
                             RouteHandlerId::Doorbell => {
-                                use tokio::io::AsyncWriteExt;
-                                let path_token = request_line.split_whitespace().nth(1).unwrap_or("");
-                                let path = path_token.split('?').next().unwrap_or(path_token);
-                                let subpath = path
-                                    .strip_prefix(crate::peer::access_request::PUBLIC_REQUEST_PATH)
-                                    .unwrap_or("")
-                                    .trim_start_matches('/');
-                                let segments: Vec<&str> =
-                                    subpath.split('/').filter(|s| !s.is_empty()).collect();
-                                let (status, body) = if segments.is_empty() && req_method == "POST" {
-                                    match read_request_body_capped(
-                                        &mut stream,
-                                        &header_text,
-                                        crate::peer::access_request::effective_body_limit_bytes(
-                                            &peer_access_request_config,
-                                        ),
-                                    )
-                                    .await
-                                    {
-                                        Ok(body_text) => peer_access_request_create(
-                                            &body_text,
-                                            &header_text,
-                                            is_tls,
-                                            Some(source_hint.clone()),
-                                            &peer_access_request_config,
-                                        ),
-                                        Err((status, body)) => (status, body),
-                                    }
-                                } else if segments.len() == 1 && req_method == "GET" {
-                                    peer_access_request_status(segments[0])
-                                } else {
-                                    (
-                                        404,
-                                        serde_json::json!({"error": "unknown peer access request endpoint"})
-                                            .to_string(),
-                                    )
-                                };
-                                let response = with_public_cors(json_response(status_reason(status), body));
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_doorbell(
+                                    stream,
+                                    &header_text,
+                                    request_line,
+                                    req_method,
+                                    peer_access_request_config,
+                                    source_hint,
+                                    is_tls,
+                                )
+                                .await;
                             }
                             RouteHandlerId::AccessOrgGrantPresent => {
-                                use tokio::io::AsyncWriteExt;
-                                let response = if req_method != "POST" {
-                                    json_response(
-                                        "405 Method Not Allowed",
-                                        serde_json::json!({"error": "method not allowed"}).to_string(),
-                                    )
-                                } else {
-                                    match read_request_body_capped(&mut stream, &header_text, 16 * 1024)
-                                        .await
-                                    {
-                                        Ok(body_text) => {
-                                            let (status, body) =
-                                                match serde_json::from_str::<serde_json::Value>(&body_text)
-                                                    .map_err(|e| format!("invalid JSON: {e}"))
-                                                    .and_then(|params| {
-                                                        access_org_present_response_value(
-                                                            params,
-                                                            &agent_card_value_for_targets,
-                                                        )
-                                                    }) {
-                                                    Ok(value) => (200, value.to_string()),
-                                                    Err(error) => (
-                                                        400,
-                                                        serde_json::json!({"error": error}).to_string(),
-                                                    ),
-                                                };
-                                            with_public_cors(json_response(status_reason(status), body))
-                                        }
-                                        Err((status, body)) => json_response(status_reason(status), body),
-                                    }
-                                };
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_access_org_grant_present(
+                                    stream,
+                                    &header_text,
+                                    req_method,
+                                    agent_card_value_for_targets,
+                                )
+                                .await;
                             }
                             RouteHandlerId::AccessOrgRevocations => {
-                                use tokio::io::AsyncWriteExt;
-                                let handle = req_path
-                                    .strip_prefix("/api/access/orgs/")
-                                    .and_then(|rest| rest.strip_suffix("/revocations"))
-                                    .unwrap_or("");
-                                let (status, body) = match access_org_orl_response_value(handle) {
-                                    Ok(value) => (200, value.to_string()),
-                                    Err(error) => (404, serde_json::json!({"error": error}).to_string()),
-                                };
-                                let response = with_public_cors(json_response(status_reason(status), body));
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_access_org_revocations(stream, req_path).await;
                             }
                             RouteHandlerId::AccessOrgApplyRenew => {
-                                use tokio::io::AsyncWriteExt;
-                                let response = if req_method != "POST" {
-                                    json_response(
-                                        "405 Method Not Allowed",
-                                        serde_json::json!({"error": "method not allowed"}).to_string(),
-                                    )
-                                } else {
-                                    let cap = if req_path == "/api/access/orgs/revocations/apply" {
-                                        crate::access::org::MAX_ORG_ORL_BYTES
-                                    } else {
-                                        crate::access::org::MAX_ORG_GRANT_DOC_BYTES
-                                    };
-                                    match read_request_body_capped(&mut stream, &header_text, cap).await {
-                                        Ok(body_text) => {
-                                            let handler =
-                                                if req_path == "/api/access/orgs/revocations/apply" {
-                                                    access_org_orl_apply_response_value
-                                                        as fn(
-                                                            serde_json::Value,
-                                                        )
-                                                            -> Result<serde_json::Value, String>
-                                                } else {
-                                                    access_org_renew_response_value
-                                                };
-                                            let (status, body) =
-                                                match serde_json::from_str::<serde_json::Value>(&body_text)
-                                                    .map_err(|e| format!("invalid JSON: {e}"))
-                                                    .and_then(handler)
-                                                {
-                                                    Ok(value) => (200, value.to_string()),
-                                                    Err(error) => (
-                                                        400,
-                                                        serde_json::json!({"error": error}).to_string(),
-                                                    ),
-                                                };
-                                            with_public_cors(json_response(status_reason(status), body))
-                                        }
-                                        Err((status, body)) => json_response(status_reason(status), body),
-                                    }
-                                };
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_access_org_apply_renew(
+                                    stream,
+                                    &header_text,
+                                    req_method,
+                                    req_path,
+                                )
+                                .await;
                             }
                             RouteHandlerId::AccessIamGrants => {
-                                use tokio::io::AsyncWriteExt;
-                                if req_method != "POST" {
-                                    let response = json_response(
-                                        "405 Method Not Allowed",
-                                        serde_json::json!({"error": "method not allowed"}).to_string(),
-                                    );
-                                    let _ = stream.write_all(response.as_bytes()).await;
-                                } else {
-                                    let decision = http_access_context
-                                        .decision(crate::peer::access_policy::PeerOperation::AccessManage);
-                                    if !decision.allowed {
-                                        let response = json_response(
-                                            "403 Forbidden",
-                                            serde_json::json!({
-                                                "error": "principal does not allow this operation",
-                                                "principal": http_access_context.principal.as_value(),
-                                                "permission": decision.permission,
-                                                "reason": decision.reason,
-                                            })
-                                            .to_string(),
-                                        );
-                                        let _ = stream.write_all(response.as_bytes()).await;
-                                    } else {
-                                        let body_text = read_request_body(&mut stream, &header_text).await;
-                                        let (status, body) = if req_path == "/api/access/iam/grants/update"
-                                        {
-                                            access_iam_update_grant_response_body(
-                                                &body_text,
-                                                &http_access_context.principal,
-                                            )
-                                        } else {
-                                            access_iam_upsert_user_client_grant_response_body(
-                                                &body_text,
-                                                &http_access_context.principal,
-                                            )
-                                        };
-                                        let response = with_fleet_cors(
-                                            json_response(status_reason(status), body),
-                                            fleet_cors_origin.as_deref(),
-                                        );
-                                        let _ = stream.write_all(response.as_bytes()).await;
-                                    }
-                                }
+                                return handle_access_iam_grants(
+                                    stream,
+                                    &header_text,
+                                    req_method,
+                                    req_path,
+                                    http_access_context,
+                                    fleet_cors_origin,
+                                )
+                                .await;
                             }
                             RouteHandlerId::AccessOrgManage => {
-                                use tokio::io::AsyncWriteExt;
-                                if req_method != "POST" {
-                                    let response = json_response(
-                                        "405 Method Not Allowed",
-                                        serde_json::json!({"error": "method not allowed"}).to_string(),
-                                    );
-                                    let _ = stream.write_all(response.as_bytes()).await;
-                                } else {
-                                    let decision = http_access_context
-                                        .decision(crate::peer::access_policy::PeerOperation::AccessManage);
-                                    if !decision.allowed {
-                                        let response = json_response(
-                                            "403 Forbidden",
-                                            serde_json::json!({
-                                                "error": "principal does not allow this operation",
-                                                "principal": http_access_context.principal.as_value(),
-                                                "permission": decision.permission,
-                                                "reason": decision.reason,
-                                            })
-                                            .to_string(),
-                                        );
-                                        let _ = stream.write_all(response.as_bytes()).await;
-                                    } else {
-                                        let body_text = read_request_body(&mut stream, &header_text).await;
-                                        let handler = match req_path {
-                                            "/api/access/orgs/trust" => {
-                                                access_org_trust_response_value
-                                                    as fn(
-                                                        serde_json::Value,
-                                                    )
-                                                        -> Result<serde_json::Value, String>
-                                            }
-                                            "/api/access/orgs/revoke" => access_org_revoke_response_value,
-                                            "/api/access/org-grants/revoke-member" => {
-                                                access_org_revoke_member_response_value
-                                            }
-                                            "/api/access/org-grants/issuers/init" => {
-                                                access_org_issuer_init_response_value
-                                            }
-                                            "/api/access/org-grants/issuers/delegate" => {
-                                                access_org_issuer_delegate_response_value
-                                            }
-                                            "/api/access/org-grants/issuers/install" => {
-                                                access_org_issuer_install_response_value
-                                            }
-                                            _ => access_org_issue_response_value,
-                                        };
-                                        let (status, body) =
-                                            match serde_json::from_str::<serde_json::Value>(&body_text)
-                                                .map_err(|e| format!("invalid request body: {e}"))
-                                                .and_then(handler)
-                                            {
-                                                Ok(value) => (200, value.to_string()),
-                                                Err(error) => {
-                                                    (400, serde_json::json!({"error": error}).to_string())
-                                                }
-                                            };
-                                        let response = with_fleet_cors(
-                                            json_response(status_reason(status), body),
-                                            fleet_cors_origin.as_deref(),
-                                        );
-                                        let _ = stream.write_all(response.as_bytes()).await;
-                                    }
-                                }
+                                return handle_access_org_manage(
+                                    stream,
+                                    &header_text,
+                                    req_method,
+                                    req_path,
+                                    http_access_context,
+                                    fleet_cors_origin,
+                                )
+                                .await;
                             }
                             RouteHandlerId::AccessEnrollmentDecide => {
-                                use tokio::io::AsyncWriteExt;
-                                if req_method != "POST" {
-                                    let response = json_response(
-                                        "405 Method Not Allowed",
-                                        serde_json::json!({"error": "method not allowed"}).to_string(),
-                                    );
-                                    let _ = stream.write_all(response.as_bytes()).await;
-                                } else {
-                                    let decision = http_access_context
-                                        .decision(crate::peer::access_policy::PeerOperation::AccessManage);
-                                    if !decision.allowed {
-                                        let response = json_response(
-                                            "403 Forbidden",
-                                            serde_json::json!({
-                                                "error": "principal does not allow this operation",
-                                                "principal": http_access_context.principal.as_value(),
-                                                "permission": decision.permission,
-                                                "reason": decision.reason,
-                                            })
-                                            .to_string(),
-                                        );
-                                        let _ = stream.write_all(response.as_bytes()).await;
-                                    } else {
-                                        let body_text = read_request_body(&mut stream, &header_text).await;
-                                        let (status, body) = access_enrollment_decide_response_body(
-                                            &body_text,
-                                            &http_access_context.principal,
-                                        );
-                                        let response = with_fleet_cors(
-                                            json_response(status_reason(status), body),
-                                            fleet_cors_origin.as_deref(),
-                                        );
-                                        let _ = stream.write_all(response.as_bytes()).await;
-                                    }
-                                }
+                                return handle_access_enrollment_decide(
+                                    stream,
+                                    &header_text,
+                                    req_method,
+                                    http_access_context,
+                                    fleet_cors_origin,
+                                )
+                                .await;
                             }
                             RouteHandlerId::AccessEnrollmentRequests => {
-                                use tokio::io::AsyncWriteExt;
-                                let body = access_enrollment_requests_response_body();
-                                let response = with_fleet_cors(
-                                    json_response("200 OK", body),
-                                    fleet_cors_origin.as_deref(),
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_access_enrollment_requests(
+                                    stream,
+                                    fleet_cors_origin,
+                                )
+                                .await;
                             }
                             RouteHandlerId::AccessIamState => {
-                                use tokio::io::AsyncWriteExt;
-                                let body = access_iam_state_response_body();
-                                let response = with_fleet_cors(
-                                    json_response("200 OK", body),
-                                    fleet_cors_origin.as_deref(),
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_access_iam_state(stream, fleet_cors_origin).await;
                             }
                             RouteHandlerId::AccessOverview => {
-                                use tokio::io::AsyncWriteExt;
-                                let body = access_overview_response_body_for_principal(
-                                    &agent_card_value_for_targets,
-                                    peer_registry.as_ref(),
-                                    &http_access_context.principal,
-                                );
-                                let response = with_fleet_cors(
-                                    json_response("200 OK", body),
-                                    fleet_cors_origin.as_deref(),
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_access_overview(
+                                    stream,
+                                    http_access_context,
+                                    fleet_cors_origin,
+                                    peer_registry,
+                                    agent_card_value_for_targets,
+                                )
+                                .await;
                             }
                             RouteHandlerId::DashboardTargets => {
                                 return handle_dashboard_targets(
@@ -26258,6 +26033,383 @@ async fn handle_dashboard_targets(
         peer_registry.as_ref(),
     );
     let response = json_response("200 OK", body);
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_doorbell(
+    mut stream: DemuxStream,
+    header_text: &str,
+    request_line: &str,
+    req_method: &str,
+    peer_access_request_config: crate::project::PeerAccessRequestConfig,
+    source_hint: String,
+    is_tls: bool,
+) {
+    use tokio::io::AsyncWriteExt;
+    let path_token = request_line.split_whitespace().nth(1).unwrap_or("");
+    let path = path_token.split('?').next().unwrap_or(path_token);
+    let subpath = path
+        .strip_prefix(crate::peer::access_request::PUBLIC_REQUEST_PATH)
+        .unwrap_or("")
+        .trim_start_matches('/');
+    let segments: Vec<&str> =
+        subpath.split('/').filter(|s| !s.is_empty()).collect();
+    let (status, body) = if segments.is_empty() && req_method == "POST" {
+        match read_request_body_capped(
+            &mut stream,
+            header_text,
+            crate::peer::access_request::effective_body_limit_bytes(
+                &peer_access_request_config,
+            ),
+        )
+        .await
+        {
+            Ok(body_text) => peer_access_request_create(
+                &body_text,
+                header_text,
+                is_tls,
+                Some(source_hint.clone()),
+                &peer_access_request_config,
+            ),
+            Err((status, body)) => (status, body),
+        }
+    } else if segments.len() == 1 && req_method == "GET" {
+        peer_access_request_status(segments[0])
+    } else {
+        (
+            404,
+            serde_json::json!({"error": "unknown peer access request endpoint"})
+                .to_string(),
+        )
+    };
+    let response = with_public_cors(json_response(status_reason(status), body));
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_access_org_grant_present(
+    mut stream: DemuxStream,
+    header_text: &str,
+    req_method: &str,
+    agent_card_value_for_targets: serde_json::Value,
+) {
+    use tokio::io::AsyncWriteExt;
+    let response = if req_method != "POST" {
+        json_response(
+            "405 Method Not Allowed",
+            serde_json::json!({"error": "method not allowed"}).to_string(),
+        )
+    } else {
+        match read_request_body_capped(&mut stream, header_text, 16 * 1024)
+            .await
+        {
+            Ok(body_text) => {
+                let (status, body) =
+                    match serde_json::from_str::<serde_json::Value>(&body_text)
+                        .map_err(|e| format!("invalid JSON: {e}"))
+                        .and_then(|params| {
+                            access_org_present_response_value(
+                                params,
+                                &agent_card_value_for_targets,
+                            )
+                        }) {
+                        Ok(value) => (200, value.to_string()),
+                        Err(error) => (
+                            400,
+                            serde_json::json!({"error": error}).to_string(),
+                        ),
+                    };
+                with_public_cors(json_response(status_reason(status), body))
+            }
+            Err((status, body)) => json_response(status_reason(status), body),
+        }
+    };
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_access_org_revocations(mut stream: DemuxStream, req_path: &str) {
+    use tokio::io::AsyncWriteExt;
+    let handle = req_path
+        .strip_prefix("/api/access/orgs/")
+        .and_then(|rest| rest.strip_suffix("/revocations"))
+        .unwrap_or("");
+    let (status, body) = match access_org_orl_response_value(handle) {
+        Ok(value) => (200, value.to_string()),
+        Err(error) => (404, serde_json::json!({"error": error}).to_string()),
+    };
+    let response = with_public_cors(json_response(status_reason(status), body));
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_access_org_apply_renew(
+    mut stream: DemuxStream,
+    header_text: &str,
+    req_method: &str,
+    req_path: &str,
+) {
+    use tokio::io::AsyncWriteExt;
+    let response = if req_method != "POST" {
+        json_response(
+            "405 Method Not Allowed",
+            serde_json::json!({"error": "method not allowed"}).to_string(),
+        )
+    } else {
+        let cap = if req_path == "/api/access/orgs/revocations/apply" {
+            crate::access::org::MAX_ORG_ORL_BYTES
+        } else {
+            crate::access::org::MAX_ORG_GRANT_DOC_BYTES
+        };
+        match read_request_body_capped(&mut stream, header_text, cap).await {
+            Ok(body_text) => {
+                let handler =
+                    if req_path == "/api/access/orgs/revocations/apply" {
+                        access_org_orl_apply_response_value
+                            as fn(
+                                serde_json::Value,
+                            )
+                                -> Result<serde_json::Value, String>
+                    } else {
+                        access_org_renew_response_value
+                    };
+                let (status, body) =
+                    match serde_json::from_str::<serde_json::Value>(&body_text)
+                        .map_err(|e| format!("invalid JSON: {e}"))
+                        .and_then(handler)
+                    {
+                        Ok(value) => (200, value.to_string()),
+                        Err(error) => (
+                            400,
+                            serde_json::json!({"error": error}).to_string(),
+                        ),
+                    };
+                with_public_cors(json_response(status_reason(status), body))
+            }
+            Err((status, body)) => json_response(status_reason(status), body),
+        }
+    };
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_access_iam_grants(
+    mut stream: DemuxStream,
+    header_text: &str,
+    req_method: &str,
+    req_path: &str,
+    http_access_context: HttpAccessContext,
+    fleet_cors_origin: Option<String>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if req_method != "POST" {
+        let response = json_response(
+            "405 Method Not Allowed",
+            serde_json::json!({"error": "method not allowed"}).to_string(),
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    } else {
+        let decision = http_access_context
+            .decision(crate::peer::access_policy::PeerOperation::AccessManage);
+        if !decision.allowed {
+            let response = json_response(
+                "403 Forbidden",
+                serde_json::json!({
+                    "error": "principal does not allow this operation",
+                    "principal": http_access_context.principal.as_value(),
+                    "permission": decision.permission,
+                    "reason": decision.reason,
+                })
+                .to_string(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        } else {
+            let body_text = read_request_body(&mut stream, header_text).await;
+            let (status, body) = if req_path == "/api/access/iam/grants/update"
+            {
+                access_iam_update_grant_response_body(
+                    &body_text,
+                    &http_access_context.principal,
+                )
+            } else {
+                access_iam_upsert_user_client_grant_response_body(
+                    &body_text,
+                    &http_access_context.principal,
+                )
+            };
+            let response = with_fleet_cors(
+                json_response(status_reason(status), body),
+                fleet_cors_origin.as_deref(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    }
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_access_org_manage(
+    mut stream: DemuxStream,
+    header_text: &str,
+    req_method: &str,
+    req_path: &str,
+    http_access_context: HttpAccessContext,
+    fleet_cors_origin: Option<String>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if req_method != "POST" {
+        let response = json_response(
+            "405 Method Not Allowed",
+            serde_json::json!({"error": "method not allowed"}).to_string(),
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    } else {
+        let decision = http_access_context
+            .decision(crate::peer::access_policy::PeerOperation::AccessManage);
+        if !decision.allowed {
+            let response = json_response(
+                "403 Forbidden",
+                serde_json::json!({
+                    "error": "principal does not allow this operation",
+                    "principal": http_access_context.principal.as_value(),
+                    "permission": decision.permission,
+                    "reason": decision.reason,
+                })
+                .to_string(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        } else {
+            let body_text = read_request_body(&mut stream, header_text).await;
+            let handler = match req_path {
+                "/api/access/orgs/trust" => {
+                    access_org_trust_response_value
+                        as fn(
+                            serde_json::Value,
+                        )
+                            -> Result<serde_json::Value, String>
+                }
+                "/api/access/orgs/revoke" => access_org_revoke_response_value,
+                "/api/access/org-grants/revoke-member" => {
+                    access_org_revoke_member_response_value
+                }
+                "/api/access/org-grants/issuers/init" => {
+                    access_org_issuer_init_response_value
+                }
+                "/api/access/org-grants/issuers/delegate" => {
+                    access_org_issuer_delegate_response_value
+                }
+                "/api/access/org-grants/issuers/install" => {
+                    access_org_issuer_install_response_value
+                }
+                _ => access_org_issue_response_value,
+            };
+            let (status, body) =
+                match serde_json::from_str::<serde_json::Value>(&body_text)
+                    .map_err(|e| format!("invalid request body: {e}"))
+                    .and_then(handler)
+                {
+                    Ok(value) => (200, value.to_string()),
+                    Err(error) => {
+                        (400, serde_json::json!({"error": error}).to_string())
+                    }
+                };
+            let response = with_fleet_cors(
+                json_response(status_reason(status), body),
+                fleet_cors_origin.as_deref(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    }
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_access_enrollment_decide(
+    mut stream: DemuxStream,
+    header_text: &str,
+    req_method: &str,
+    http_access_context: HttpAccessContext,
+    fleet_cors_origin: Option<String>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if req_method != "POST" {
+        let response = json_response(
+            "405 Method Not Allowed",
+            serde_json::json!({"error": "method not allowed"}).to_string(),
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    } else {
+        let decision = http_access_context
+            .decision(crate::peer::access_policy::PeerOperation::AccessManage);
+        if !decision.allowed {
+            let response = json_response(
+                "403 Forbidden",
+                serde_json::json!({
+                    "error": "principal does not allow this operation",
+                    "principal": http_access_context.principal.as_value(),
+                    "permission": decision.permission,
+                    "reason": decision.reason,
+                })
+                .to_string(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        } else {
+            let body_text = read_request_body(&mut stream, header_text).await;
+            let (status, body) = access_enrollment_decide_response_body(
+                &body_text,
+                &http_access_context.principal,
+            );
+            let response = with_fleet_cors(
+                json_response(status_reason(status), body),
+                fleet_cors_origin.as_deref(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    }
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_access_enrollment_requests(
+    mut stream: DemuxStream,
+    fleet_cors_origin: Option<String>,
+) {
+    use tokio::io::AsyncWriteExt;
+    let body = access_enrollment_requests_response_body();
+    let response = with_fleet_cors(
+        json_response("200 OK", body),
+        fleet_cors_origin.as_deref(),
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_access_iam_state(mut stream: DemuxStream, fleet_cors_origin: Option<String>) {
+    use tokio::io::AsyncWriteExt;
+    let body = access_iam_state_response_body();
+    let response = with_fleet_cors(
+        json_response("200 OK", body),
+        fleet_cors_origin.as_deref(),
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_access_overview(
+    mut stream: DemuxStream,
+    http_access_context: HttpAccessContext,
+    fleet_cors_origin: Option<String>,
+    peer_registry: Option<crate::peer::PeerRegistry>,
+    agent_card_value_for_targets: serde_json::Value,
+) {
+    use tokio::io::AsyncWriteExt;
+    let body = access_overview_response_body_for_principal(
+        &agent_card_value_for_targets,
+        peer_registry.as_ref(),
+        &http_access_context.principal,
+    );
+    let response = with_fleet_cors(
+        json_response("200 OK", body),
+        fleet_cors_origin.as_deref(),
+    );
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
