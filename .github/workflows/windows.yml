@@ -63,7 +63,12 @@ concurrency:
 jobs:
   test:
     name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
+    # Self-hosted hardening: never run pull_request code from a fork on our
+    # own hardware — only same-repo branches (every agent landing) and the
+    # merge queue's own refs. Fork PRs are the rare external-contribution
+    # case and get handled manually behind the Actions fork-approval gate.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # Full test builds are much heavier than the old `cargo check`; a cold
     # Windows runner can take a while, but a hung run shouldn't burn hours.
     timeout-minutes: 90
@@ -72,13 +77,29 @@ jobs:
       # target's result on a regression.
       fail-fast: false
       matrix:
+        # `os` is the check-name key ("test (ubuntu-latest)" is pinned as a
+        # required context in the main ruleset — renaming it means a
+        # coordinated ruleset edit); `runner` is where the job actually
+        # runs. The Linux and macOS legs live on the self-hosted fleet
+        # (dell-206, macbook-vm): persistent target/ dirs make warm runs
+        # minutes instead of half-hours. Windows stays hosted until the
+        # third box is up. `hosted` gates the runner-provisioning steps —
+        # the self-hosted boxes are pre-provisioned (deps, toolchains) and
+        # keep their build state, so cache actions and dep installs are
+        # hosted-only.
         include:
           - os: windows-latest
+            runner: windows-latest
             target: x86_64-pc-windows-msvc
+            hosted: true
           - os: macos-latest
+            runner: [self-hosted, intendant-macos]
             target: aarch64-apple-darwin
+            hosted: false
           - os: ubuntu-latest
+            runner: [self-hosted, intendant-linux]
             target: x86_64-unknown-linux-gnu
+            hosted: false
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -108,9 +129,10 @@ jobs:
       # env-libvpx-sys + pipewire-sys, libvpx + libpipewire + libxcb headers
       # for those crates' link/pkg-config steps. (No libssl-dev / libpng-dev:
       # the tree is on pure-Rust ring + the `png` crate, not openssl-sys /
-      # libpng.)
+      # libpng.) Hosted-only: the self-hosted boxes are pre-provisioned and
+      # the runner user deliberately has no sudo.
       - name: Install Linux build deps
-        if: runner.os == 'Linux'
+        if: matrix.hosted && runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -124,9 +146,10 @@ jobs:
       # pulls both in transitively via `brew install ffmpeg`. Install them
       # directly here (leaner than all of ffmpeg). The other macOS FFI deps
       # (ScreenCaptureKit, VideoToolbox, CoreFoundation) are system frameworks
-      # already present on the runner image.
+      # already present on the runner image. Hosted-only: the self-hosted Mac
+      # is a provisioned dev box.
       - name: Install macOS build deps
-        if: runner.os == 'macOS'
+        if: matrix.hosted && runner.os == 'macOS'
         run: brew install pkg-config libvpx
 
       # Restore the cargo cache on every run, but only *save* it on pushes to
@@ -134,7 +157,11 @@ jobs:
       # saving them buys nothing — and the Windows tar/zstd save step is flaky
       # enough to fail an otherwise-green job. `save-if` keeps the speed-up on
       # restore while removing the unreliable post-run save from PR checks.
+      # Hosted-only: the self-hosted runners keep a persistent target/ between
+      # runs — that persistence IS the cache, and shipping it to GitHub's
+      # cache store would only add minutes.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: matrix.hosted
         with:
           key: ${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}

@@ -55,16 +55,26 @@ concurrency:
 jobs:
   smokes:
     name: smokes (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
+    # Self-hosted hardening — same rule as windows.yml: fork PR code never
+    # runs on our own hardware.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
+        # `os` is the pinned check-name key; `runner` is the self-hosted
+        # fleet placement; `hosted` gates provisioning steps. See
+        # windows.yml for the full rationale.
         include:
           - os: ubuntu-latest
+            runner: [self-hosted, intendant-linux]
             target: x86_64-unknown-linux-gnu
+            hosted: false
           - os: macos-latest
+            runner: [self-hosted, intendant-macos]
             target: aarch64-apple-darwin
+            hosted: false
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -73,9 +83,11 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       # Same native build deps as windows.yml's test job — the release
-      # build compiles the identical dependency set.
+      # build compiles the identical dependency set. Hosted-only: the
+      # self-hosted boxes are pre-provisioned, and the runner user has
+      # no sudo.
       - name: Install Linux build deps
-        if: runner.os == 'Linux'
+        if: matrix.hosted && runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -83,20 +95,23 @@ jobs:
             libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
 
       - name: Install macOS build deps
-        if: runner.os == 'macOS'
+        if: matrix.hosted && runner.os == 'macOS'
         run: brew install pkg-config libvpx
 
       # peer-rig.py drives stop_session over a raw WebSocket. A venv
-      # sidesteps PEP 668 (the macos runner's python is
-      # externally-managed and rejects bare pip installs); prepending
-      # its bin to GITHUB_PATH makes it the `python3` later steps get.
+      # sidesteps PEP 668 (externally-managed pythons reject bare pip
+      # installs); prepending its bin to GITHUB_PATH makes it the
+      # `python3` later steps get. Cheap and idempotent, so it runs on
+      # every runner class.
       - name: Install python websockets
         run: |
           python3 -m venv "$RUNNER_TEMP/pyws"
           "$RUNNER_TEMP/pyws/bin/pip" install --quiet websockets
           echo "$RUNNER_TEMP/pyws/bin" >> "$GITHUB_PATH"
 
+      # Hosted-only: self-hosted runners keep a persistent target/.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: matrix.hosted
         with:
           key: smokes-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}

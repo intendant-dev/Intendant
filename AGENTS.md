@@ -279,7 +279,16 @@ GitHub Actions on push / PR to `main`, and — for the required checks — on ev
 and `merge_group`**: GitHub only lets a PR enter the merge queue after its own
 required checks pass, so a paths-skipped required check blocks queue entry
 (and on the group side wedges the entry at "Expected"). Only the push-to-main
-triggers keep paths filters — they exist for cache warming, not gating:
+triggers keep paths filters — they exist for cache warming, not gating.
+
+The Linux and macOS legs run on the **self-hosted fleet** (`dell-206` =
+`intendant-linux`, `macbook-vm` = `intendant-macos`) with persistent
+incremental `target/` dirs — warm gate runs are minutes, not half-hours;
+Windows stays on hosted runners until its box joins. Self-hosted jobs carry a
+same-repo guard (fork-PR code never executes on our hardware), the Dell
+runner runs as a sudo-less dedicated `ci` user, and the check *names* stay
+pinned to the `test (ubuntu-latest)`-style contexts the ruleset requires
+(matrix `os` is the name key, `runner` is the placement):
 - **`windows.yml`** — cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Headless-safe: needs no display or API keys. **Required check.**
 - **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real release binaries on Linux + macOS. **Required check.**
 - **`app-html.yml`** — the `static/app/` fragments ↔ generated `static/app.html` regen gate. **Required check.**
