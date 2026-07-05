@@ -544,9 +544,6 @@ pub enum OutboundEvent {
     SubAgentResult {
         summary: String,
     },
-    OrchestratorProgress {
-        status: String,
-    },
     ModelResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,

@@ -5646,24 +5646,6 @@ pub fn spawn_event_listener(
                         resource_changed = Some("intendant://logs");
                     }
 
-                    AppEvent::OrchestratorProgress {
-                        turn,
-                        status,
-                        last_action,
-                    } => {
-                        s.set_phase(Phase::Orchestrating);
-                        s.push_log(
-                            LogLevel::SubAgent,
-                            format!("[T{}] {} — {}", turn, status, last_action),
-                        );
-                        resource_changed = Some("intendant://status");
-                    }
-
-                    AppEvent::OrchestratorLog { message, level } => {
-                        s.push_log(level, message);
-                        resource_changed = Some("intendant://logs");
-                    }
-
                     AppEvent::ContextManagement { turn } => {
                         s.push_log(LogLevel::Detail, format!("[T{}] Context management", turn));
                     }

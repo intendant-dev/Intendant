@@ -178,16 +178,6 @@ pub enum AppEvent {
     SubAgentResult {
         formatted: String,
     },
-    OrchestratorProgress {
-        turn: usize,
-        status: String,
-        last_action: String,
-    },
-    /// Detailed log entry from the orchestrator's session log (tailed by parent).
-    OrchestratorLog {
-        message: String,
-        level: crate::types::LogLevel,
-    },
     ContextManagement {
         turn: usize,
     },
@@ -2074,11 +2064,6 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::SubAgentResult { formatted } => Some(OutboundEvent::SubAgentResult {
             summary: formatted.clone(),
         }),
-        AppEvent::OrchestratorProgress { status, .. } => {
-            Some(OutboundEvent::OrchestratorProgress {
-                status: status.clone(),
-            })
-        }
         AppEvent::UserTranscript { text, seq } => Some(OutboundEvent::UserTranscript {
             text: text.clone(),
             seq: *seq,
@@ -2485,7 +2470,6 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         | AppEvent::Tick
         | AppEvent::Quit
         | AppEvent::JsonExtracted { .. }
-        | AppEvent::OrchestratorLog { .. }
         | AppEvent::SessionDirChanged { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::PresenceReady
@@ -2568,7 +2552,6 @@ fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
             | AppEvent::SessionEnded { .. }
             | AppEvent::SafetyCapReached
             | AppEvent::SubAgentResult { .. }
-            | AppEvent::OrchestratorProgress { .. }
             | AppEvent::RoundComplete { .. }
             | AppEvent::AutoApproved { .. }
             | AppEvent::ApprovalResolved { .. }
@@ -2729,9 +2712,6 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         }
         AppEvent::SubAgentResult { formatted } => {
             log.sub_agent_result(formatted);
-        }
-        AppEvent::OrchestratorProgress { status, .. } => {
-            log.orchestrator_progress(status);
         }
         AppEvent::RoundComplete {
             round,

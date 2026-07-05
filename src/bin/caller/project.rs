@@ -28,10 +28,10 @@ pub struct ModelConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
-#[allow(dead_code)]
 pub struct OrchestratorConfig {
+    /// Cap on concurrently running sub-agent children per parent session
+    /// (spawn_sub_agent refuses beyond it). Unset = 4.
     pub max_parallel_agents: Option<usize>,
-    pub sub_agent_dir: Option<String>,
 }
 
 /// Configuration for an external MCP server to connect to as a client.
@@ -1234,13 +1234,6 @@ impl Project {
     pub fn agent_dir(&self) -> PathBuf {
         self.root.join(".intendant")
     }
-
-    pub fn sub_agent_dir(&self) -> PathBuf {
-        match &self.config.orchestrator.sub_agent_dir {
-            Some(dir) => self.root.join(dir),
-            None => self.root.join(".intendant").join("subagents"),
-        }
-    }
 }
 
 fn detect_project_root() -> Result<PathBuf, CallerError> {
@@ -1287,7 +1280,6 @@ mod tests {
         assert!(config.model.context_window.is_none());
         assert!(config.model.max_output_tokens.is_none());
         assert!(config.orchestrator.max_parallel_agents.is_none());
-        assert!(config.orchestrator.sub_agent_dir.is_none());
         assert!(config.server.bind.is_none());
         assert!(config.peers.is_empty());
     }
@@ -1414,17 +1406,12 @@ max_output_tokens = 16384
 
 [orchestrator]
 max_parallel_agents = 4
-sub_agent_dir = ".custom/agents"
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert!(config.memory.enabled);
         assert_eq!(config.model.context_window, Some(200_000));
         assert_eq!(config.model.max_output_tokens, Some(16_384));
         assert_eq!(config.orchestrator.max_parallel_agents, Some(4));
-        assert_eq!(
-            config.orchestrator.sub_agent_dir.as_deref(),
-            Some(".custom/agents")
-        );
     }
 
     #[test]
@@ -1471,27 +1458,6 @@ context_window = 128000
             project.agent_dir(),
             PathBuf::from("/tmp/myproject/.intendant")
         );
-        assert_eq!(
-            project.sub_agent_dir(),
-            PathBuf::from("/tmp/myproject/.intendant/subagents")
-        );
-    }
-
-    #[test]
-    fn sub_agent_dir_custom() {
-        let toml_str = r#"
-[orchestrator]
-sub_agent_dir = ".custom/agents"
-"#;
-        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
-        let project = Project {
-            root: PathBuf::from("/tmp/myproject"),
-            config,
-        };
-        assert_eq!(
-            project.sub_agent_dir(),
-            PathBuf::from("/tmp/myproject/.custom/agents")
-        );
     }
 
     #[test]
@@ -1502,7 +1468,6 @@ max_parallel_agents = 8
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.orchestrator.max_parallel_agents, Some(8));
-        assert!(config.orchestrator.sub_agent_dir.is_none());
     }
 
     #[test]

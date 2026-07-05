@@ -33,6 +33,11 @@ see [Getting Started](./getting-started.md#api-keys-env) for the search order).
 used first, then Anthropic, then Gemini. Setting `PROVIDER` explicitly forces
 that provider (and errors if its key is missing).
 
+`PROVIDER=mock` selects the keyless scripted provider (no network calls; built
+for the headless `tests/e2e/` suite and demos) and requires
+`INTENDANT_MOCK_SCRIPT=<path>` — the script format is documented in
+`src/bin/caller/provider_mock.rs`. It is never auto-detected.
+
 **Per-provider default models** (used when `MODEL_NAME` is unset):
 
 | Provider | Default model |
@@ -85,23 +90,19 @@ managed cache. The helper accepts `--check`, `--force`,
 `--channel stable|beta|dev|canary`, `--json`, and `--print-path`; use
 `--check` to verify the cache without network access.
 
-### Sub-agent variables (set automatically)
+### Process-plumbing variables
 
-When the orchestrator spawns sub-agents it sets these in the child environment;
-you normally never set them by hand (see
-[Multi-Agent Orchestration](./multi-agent.md)):
+Sub-agents no longer travel through the environment — they are supervised
+sessions spawned in-process via the `spawn_sub_agent` tool (see
+[Multi-Agent Orchestration](./multi-agent.md)), so the old
+`INTENDANT_ROLE` / `INTENDANT_ID` / `INTENDANT_RESULT_FILE` /
+`INTENDANT_PROGRESS_FILE` family is gone. What remains:
 
 | Variable | Description |
 |----------|-------------|
-| `INTENDANT_ROLE` | Sub-agent role (`orchestrator`, `research`, `implementation`, `testing`) |
-| `INTENDANT_ID` | Unique sub-agent identifier |
-| `INTENDANT_TASK` | Task description |
-| `INTENDANT_RESULT_FILE` | Where the sub-agent writes its final result |
-| `INTENDANT_PROGRESS_FILE` | Where the sub-agent writes periodic progress |
-| `INTENDANT_PARENT_KNOWLEDGE` | Path to the parent's knowledge store for inheritance |
-| `INTENDANT_INHERIT_MEMORY` | `1` to inherit project memory |
+| `INTENDANT_TASK` | Task description fallback when no CLI task argument is given |
+| `INTENDANT_SYSTEM_PROMPT` | Replaces the resolved system prompt wholesale for a direct CLI invocation (escape hatch; per-session overrides use `spawn_sub_agent`'s `system_prompt`) |
 | `INTENDANT_SANDBOX_WRITE_PATHS` | Sandbox write paths (set by the caller when sandboxing; enforced by Landlock on Linux, Seatbelt on macOS, restricted tokens on Windows) |
-| `INTENDANT_MAX_PARALLEL_AGENTS` | Max concurrent sub-agents (from `[orchestrator]`) |
 | `INTENDANT_LOG_DIR` | Session log directory (set by the caller for the runtime) |
 
 ## `intendant.toml`
@@ -127,8 +128,7 @@ below are taken directly from `src/bin/caller/project.rs`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `max_parallel_agents` | int | unset | Cap on concurrent sub-agents |
-| `sub_agent_dir` | string | `.intendant/subagents` | Directory (relative to project root) for sub-agent workspaces |
+| `max_parallel_agents` | int | `4` | Cap on concurrently *running* sub-agent children per parent session; `spawn_sub_agent` refuses beyond it |
 
 ### `[approval]`
 
@@ -738,7 +738,6 @@ max_output_tokens = 8192
 
 [orchestrator]
 max_parallel_agents = 4
-sub_agent_dir = ".intendant/subagents"
 
 [approval]
 file_read = "auto"

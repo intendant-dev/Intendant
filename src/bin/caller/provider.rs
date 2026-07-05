@@ -3034,6 +3034,13 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
 
     let preferred = env::var("PROVIDER").ok();
 
+    // Keyless scripted provider for headless E2E and demos. Never
+    // auto-selected — only an explicit PROVIDER=mock opts in, and the
+    // script path must be supplied via INTENDANT_MOCK_SCRIPT.
+    if preferred.as_deref() == Some("mock") {
+        return Ok(Box::new(crate::provider_mock::MockProvider::from_env()?));
+    }
+
     // Explicit Gemini selection
     if preferred.as_deref() == Some("gemini") {
         let key = gemini_key.ok_or_else(|| {
@@ -3156,6 +3163,9 @@ pub fn select_provider_with_overrides(
             let max_out = resolve_max_output_tokens(&model);
             Ok(Box::new(OpenAIProvider::new(key, model, ctx, max_out)))
         }
+        // Keyless scripted provider (headless E2E/demos); explicit opt-in
+        // only — see `select_provider`.
+        Some("mock") => Ok(Box::new(crate::provider_mock::MockProvider::from_env()?)),
         Some(other) => Err(CallerError::Config(format!(
             "Unknown presence provider: '{}'. Expected 'openai', 'anthropic', or 'gemini'.",
             other
@@ -3390,6 +3400,176 @@ pub fn select_presence_provider(
                     "No API key found for presence layer. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY.".into(),
                 ))
             }
+        }
+    }
+}
+
+/// Deterministic scripted provider for keyless integration tests of the
+/// native loop and the sub-agent substrate: an orchestrator parent spawns
+/// two children (one succeeds, one fails), waits for both, and synthesizes.
+#[cfg(test)]
+pub mod mock {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub struct MockOrchestrationProvider {
+        calls: AtomicUsize,
+    }
+
+    impl Default for MockOrchestrationProvider {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl MockOrchestrationProvider {
+        pub fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn tool_call(name: &str, args: serde_json::Value) -> ToolCall {
+            static NEXT_CALL: AtomicUsize = AtomicUsize::new(1);
+            let n = NEXT_CALL.fetch_add(1, Ordering::Relaxed);
+            ToolCall {
+                id: format!("mock_call_{n}"),
+                call_id: format!("mock_call_{n}"),
+                name: name.to_string(),
+                arguments: args.to_string(),
+            }
+        }
+
+        fn response(content: &str, tool_calls: Vec<ToolCall>) -> ChatResponse {
+            ChatResponse {
+                content: content.to_string(),
+                usage: TokenUsage::default(),
+                reasoning_summary: None,
+                reasoning_content: None,
+                tool_calls,
+                cu_calls: Vec::new(),
+                raw_output: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChatProvider for MockOrchestrationProvider {
+        async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            let system = messages
+                .first()
+                .map(|m| m.content.as_str())
+                .unwrap_or_default();
+            let transcript: String = messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            if system.contains("You are an autonomous AI orchestrator") {
+                return Ok(match call_index {
+                    0 => Self::response(
+                        "Delegating to two sub-agents.",
+                        vec![
+                            Self::tool_call(
+                                "spawn_sub_agent",
+                                serde_json::json!({
+                                    "task": "MOCK-RESEARCH: inspect the schema",
+                                    "role": "research",
+                                    "name": "mock-researcher",
+                                }),
+                            ),
+                            Self::tool_call(
+                                "spawn_sub_agent",
+                                serde_json::json!({
+                                    "task": "MOCK-FAILING: run the suite",
+                                    "role": "testing",
+                                    "name": "mock-tester",
+                                }),
+                            ),
+                        ],
+                    ),
+                    1 => Self::response(
+                        "Waiting for both sub-agents.",
+                        vec![Self::tool_call(
+                            "wait_sub_agents",
+                            serde_json::json!({ "mode": "all", "timeout_secs": 60 }),
+                        )],
+                    ),
+                    _ => {
+                        // Synthesize only when both child results actually
+                        // arrived in context; otherwise surface the failure.
+                        let saw_success = transcript.contains("research findings ABC");
+                        let saw_failure = transcript.contains("boom");
+                        let message = if saw_success && saw_failure {
+                            "SYNTHESIS: research succeeded, testing failed"
+                        } else {
+                            "RESULTS-MISSING"
+                        };
+                        Self::response(
+                            message,
+                            vec![Self::tool_call(
+                                "signal_done",
+                                serde_json::json!({ "message": message }),
+                            )],
+                        )
+                    }
+                });
+            }
+
+            if transcript.contains("MOCK-RESEARCH") {
+                return Ok(Self::response(
+                    "Submitting research result.",
+                    vec![
+                        Self::tool_call(
+                            "submit_result",
+                            serde_json::json!({
+                                "status": "completed",
+                                "summary": "research findings ABC",
+                                "findings": ["schema has 3 tables"],
+                            }),
+                        ),
+                        Self::tool_call("signal_done", serde_json::json!({})),
+                    ],
+                ));
+            }
+            if transcript.contains("MOCK-FAILING") {
+                return Ok(Self::response(
+                    "Reporting failure.",
+                    vec![
+                        Self::tool_call(
+                            "submit_result",
+                            serde_json::json!({
+                                "status": "failed",
+                                "summary": "suite could not run",
+                                "failure_reason": "boom",
+                            }),
+                        ),
+                        Self::tool_call("signal_done", serde_json::json!({})),
+                    ],
+                ));
+            }
+            Ok(Self::response(
+                "Nothing to do.",
+                vec![Self::tool_call("signal_done", serde_json::json!({}))],
+            ))
+        }
+
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn model(&self) -> &str {
+            "mock-orchestration"
+        }
+        fn context_window(&self) -> u64 {
+            1_000_000
+        }
+        fn max_output_tokens(&self) -> u64 {
+            100_000
+        }
+        fn use_tools(&self) -> bool {
+            true
         }
     }
 }
