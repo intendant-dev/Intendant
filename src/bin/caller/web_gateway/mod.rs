@@ -47,8 +47,6 @@ mod mcp_gate;
 pub(crate) use mcp_gate::*;
 
 
-
-
 /// Monotonically increasing counter for assigning unique peer IDs to WebSocket
 /// connections.  Used for WebRTC signaling so that each browser tab gets a
 /// stable identity within a display session.
@@ -123,21 +121,6 @@ fn log_tls_failure_rate_limited(state: &TlsFailureLogState, peer: &str, kind: &s
 // scan happens once). The per-file cap covers the largest observed
 // rollouts; parents past the per-build budget pick up their baseline on a
 // later list pass.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 /// Tracks which WebSocket connection currently owns the voice model (is "active").
@@ -1756,11 +1739,6 @@ pub struct WebQueryCtx {
 }
 
 
-
-
-
-
-
 /// Debug state for the voice model, tracked server-side from WebSocket messages.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct VoiceDebugState {
@@ -1840,222 +1818,12 @@ impl Default for WebGatewayConfig {
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // Deliberately no Access-Control-Allow-Origin here: API responses are
 // same-origin by default. Cross-origin readability is opt-in — the fleet
 // Access APIs echo allowlisted origins (`with_fleet_cors`) and the public
 // bootstrap surfaces use `with_public_cors`. A blanket wildcard would let
 // any website read cert-authenticated responses through a visitor's
 // browser (see docs/src/trust-architecture.md).
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 // ── Persistent session-list index ──
@@ -2077,264 +1845,10 @@ impl Default for WebGatewayConfig {
 // deleted sessions otherwise accumulate dead index files forever.
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // Stale-while-revalidate: within the TTL a cached list is fresh; past it
 // (up to the stale ceiling) the cached body is served IMMEDIATELY and one
 // background refresh is kicked, so an interactive dashboard never blocks
 // on a rescan. Only a very stale (or absent) entry rebuilds inline.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 // ---------------------------------------------------------------------------
@@ -2347,14 +1861,7 @@ impl Default for WebGatewayConfig {
 // ---------------------------------------------------------------------------
 
 
-
-
-
-
-
 // Same-origin by default; see `json_response_body` for the CORS rationale.
-
-
 
 
 async fn connect_dashboard_offer_response(
@@ -3211,90 +2718,6 @@ fn connect_bootstrap_html() -> String {
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /// Check whether it is safe to mutate the project tree (rollback/redo) right
 /// now. Returns `Ok(())` if idle, or an `(status_code, body_json)` pair to
 /// send back as-is.
@@ -3314,10 +2737,6 @@ fn ensure_idle(
     }
     Ok(())
 }
-
-
-
-
 
 
 /// Settings payload for GET/POST /api/settings.
@@ -3895,12 +3314,6 @@ pub(crate) fn handle_set_api_keys(body: &str) -> String {
 // body as ServerJsonRpcMessage, which fails because there's no valid `id`.
 
 
-
-
-
-
-
-
 /// Consecutive "fatal-class" accept failures tolerated on the same socket
 /// before it is dropped and rebound. EINVAL has been observed twice on
 /// macOS (2026-07-04, both times within ~1s of an external-agent spawn)
@@ -3969,9 +3382,6 @@ pub(crate) fn rebind_dead_tcp_listener(
     let std_listener: std::net::TcpListener = socket.into();
     TcpListener::from_std(std_listener)
 }
-
-
-
 
 
 pub fn spawn_web_gateway(
@@ -9004,36 +8414,6 @@ pub fn spawn_web_gateway(
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-// Parameter count rides until the GatewayRequestCtx bundle planned for the
-// serializer step of phase 4 collapses the shared request context.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 async fn handle_project_root(mut stream: DemuxStream, project_root: Option<PathBuf>) {
     use tokio::io::AsyncWriteExt;
     let body = project_root_response_body(project_root.as_deref());
@@ -9170,23 +8550,6 @@ async fn handle_diagnostics_visual_freshness(
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-// Parameter count rides until the GatewayRequestCtx bundle planned for the
-// serializer step of phase 4 collapses the shared request context.
-
-
 /// Build a `WebGatewayConfig` from the presence config's live fields,
 /// falling back to environment variable detection.
 ///
@@ -9261,60 +8624,10 @@ struct AddPeerRequest {
 }
 
 
-
-
-
-
-
 #[derive(Deserialize)]
 struct RemovePeerRequest {
     peer_id: String,
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 fn trimmed_nonempty(value: Option<String>) -> Option<String> {
@@ -9362,9 +8675,6 @@ fn persist_manual_peer(
 }
 
 
-
-
-
 fn target_card_url_from_request(header_text: &str, is_tls: bool) -> Option<String> {
     let host = header_text
         .lines()
@@ -9381,14 +8691,6 @@ fn target_card_url_from_request(header_text: &str, is_tls: bool) -> Option<Strin
         crate::peer::pairing::AGENT_CARD_PATH
     ))
 }
-
-
-
-
-
-
-
-
 
 
 fn identity_summary_json(
@@ -9417,10 +8719,6 @@ fn identity_summary_json(
         "issued_via": record.issued_via,
     })
 }
-
-
-
-
 
 
 // ---------------------------------------------------------------------------
@@ -9500,13 +8798,6 @@ struct ResolveApprovalRequest {
     request_id: String,
     decision: crate::peer::ApprovalDecision,
 }
-
-
-
-
-
-
-
 
 
 /// Slice 3b: rewrite an outgoing federated `WebRtcSignal::Answer` to
@@ -9716,11 +9007,6 @@ async fn resolve_url_to_socket_addr(url: &str) -> Option<std::net::SocketAddr> {
 }
 
 
-
-
-
-
-
 // ---------------------------------------------------------------------------
 // Coordinator endpoints — capability-based discovery + delegation
 // ---------------------------------------------------------------------------
@@ -9747,9 +9033,6 @@ fn parse_capability_query(query: &str) -> (Vec<crate::peer::Capability>, Vec<Str
     }
     (caps, unknown)
 }
-
-
-
 
 
 /// True for HTTP requests that hit the federation REST surface:
@@ -9801,18 +9084,6 @@ fn http_access_forbidden_response(
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 fn is_public_connect_bootstrap_path(request_line: &str) -> bool {
     let Some(path) = request_line.split_whitespace().nth(1) else {
         return false;
@@ -9827,8 +9098,6 @@ fn is_public_connect_bootstrap_path(request_line: &str) -> bool {
             | "/connect/dashboard/close"
     )
 }
-
-
 
 
 fn peer_identity_allows_ws_control(
@@ -10503,39 +9772,6 @@ mod tests {
     }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     #[test]
     fn list_sessions_joins_external_context_from_debug_thread_log() {
         let _codex_home = EnvVarGuard::unset("CODEX_HOME");
@@ -10707,17 +9943,6 @@ mod tests {
             Some("/tmp/codex-managed")
         );
     }
-
-
-
-
-
-
-
-
-
-
-
 
 
     #[test]
@@ -11274,11 +10499,6 @@ mod tests {
     }
 
 
-
-
-
-
-
     #[test]
     fn list_codex_sessions_parses_large_prefix_and_daily_usage() {
         let _codex_home = EnvVarGuard::unset("CODEX_HOME");
@@ -11381,22 +10601,6 @@ mod tests {
         assert_eq!(by_day.get("2026-05-17"), Some(&100));
         assert_eq!(by_day.get("2026-05-18"), Some(&150));
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
     #[test]
@@ -11599,29 +10803,6 @@ mod tests {
                 && entry["item_id"] == "msg-agent-refresh"
         }));
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
     #[test]
@@ -11895,15 +11076,6 @@ mod tests {
             }
         }
     }
-
-
-
-
-
-
-
-
-
 
 
     /// A specific bind address is preserved verbatim in the
@@ -12199,9 +11371,6 @@ mod tests {
     }
 
 
-
-
-
     #[test]
     fn is_federation_path_uses_parsed_routes() {
         assert!(is_federation_path("GET /api/peers HTTP/1.1"));
@@ -12213,33 +11382,6 @@ mod tests {
             "GET /api/fs/stat?path=/api/sessions HTTP/1.1"
         ));
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
     #[test]
@@ -12311,20 +11453,6 @@ mod tests {
         // Either gemini or openai depending on env, but it shouldn't panic
         assert!(!config.provider.is_empty());
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
     #[test]
@@ -12429,15 +11557,6 @@ mod tests {
         assert!(oversized_summary.ends_with("..."));
         assert!(oversized_summary.len() < WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + 16);
     }
-
-
-
-
-
-
-
-
-
 
 
     #[test]
@@ -12781,8 +11900,6 @@ mod tests {
     }
 
 
-
-
     #[tokio::test]
     async fn test_api_origin_gate_refuses_foreign_pages() {
         let (port, handle) = spawn_test_gateway_with_registry(None).await;
@@ -12908,7 +12025,6 @@ mod tests {
 
         handle.abort();
     }
-
 
 
     /// End-to-end exercise of the static-asset arms through a real
@@ -13376,9 +12492,6 @@ mod tests {
     }
 
 
-
-
-
     #[test]
     fn dashboard_http_operation_maps_access_and_dashboard_routes() {
         use crate::peer::access_policy::PeerOperation;
@@ -13539,16 +12652,6 @@ mod tests {
     }
 
 
-
-
-
-
-
-
-
-
-
-
     // -----------------------------------------------------------------
     // End-to-end: federation REST auth enforcement
     // -----------------------------------------------------------------
@@ -13659,9 +12762,6 @@ mod tests {
     // -----------------------------------------------------------------
     // /ws bearer enforcement (slice 2d)
     // -----------------------------------------------------------------
-
-
-
 
 
     #[test]
@@ -14193,7 +13293,6 @@ mod tests {
         assert!(resp.contains("peer registry not configured"));
         handle.abort();
     }
-
 
 
     #[test]
@@ -17830,17 +16929,6 @@ mod tests {
         let snaps = compute_bootstrap_authority_snapshots([] as [u32; 0], &auth, "conn-A");
         assert!(snaps.is_empty());
     }
-
-
-
-
-
-
-
-
-
-
-
 
 
     /// The gateway must be able to re-establish its listener on the exact

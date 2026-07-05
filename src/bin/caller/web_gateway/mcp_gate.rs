@@ -363,6 +363,8 @@ pub(crate) async fn handle_mcp_http_request(
     })
 }
 
+// Parameter count rides until a request-context bundle collapses the
+// shared per-connection arguments (open cleanup; not load-bearing).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_mcp_post(
     mut stream: DemuxStream,
