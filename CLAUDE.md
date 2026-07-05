@@ -102,7 +102,8 @@ src/
 │   ├── display/                # WebRTC: encode/{pool,vp8,h264_*}, tile/, capture/, webrtc, {x11,wayland,macos,windows}
 │   ├── computer_use.rs, ax.rs, vision.rs, recording.rs, frames.rs
 │   ├── presence.rs, live_audio.rs, audio_routing.rs, transcription.rs, quarantine.rs, schema_validator.rs
-│   ├── web_gateway.rs, dashboard_control.rs, terminal.rs, browser_workspace.rs   # HTTP/WS gateway; dashboard tunnel; PTY registry; agent browser
+│   ├── web_gateway/                # HTTP/WS gateway: mod (listener/WS/dispatch), http, session_catalog, routes_{sessions,files,peers,access}, mcp_gate, static_assets
+│   ├── dashboard_control.rs, terminal.rs, browser_workspace.rs   # dashboard tunnel; PTY registry; agent browser
 │   ├── mcp.rs, mcp_client.rs, control.rs
 │   ├── transfer_store.rs, upload_store.rs, peer_file_transfer.rs   # transfer jobs; upload/attachment stores
 │   ├── session_log.rs, session_names.rs, knowledge.rs, project.rs, app_state_pricing.rs
