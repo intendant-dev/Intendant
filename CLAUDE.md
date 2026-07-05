@@ -110,7 +110,8 @@ src/
 │   └── tui/                    # ratatui TUI (display-only client of the control plane)
 └── bin/connect/                # intendant-connect: hosted rendezvous (accounts, daemon claims, fleet sync, vault blobs, push, transparency log)
 crates/{presence-core, presence-web, station-web}   # WASM: shared presence types/tools/dispatch, browser presence client, Station renderer
-static/         # app.html dashboard SPA + compiled wasm-web/ + wasm-station/
+crates/app-html-assembler   # assembles static/app.html from static/app/ (build.rs + the CI regen gate)
+static/         # dashboard SPA: app/ fragments (source) → generated app.html; compiled wasm-web/ + wasm-station/
 macos-app/      # native macOS WKWebView wrapper (built by scripts/bundle-macos.sh)
 vendor/         # vortex-guest-tools (macOS Vortex Audio HAL plugin)
 scripts/        # setup-{linux,macos,windows}, setup-lan*, bundle-macos, validate-dashboard.cjs (dashboard/Station QA), …
@@ -137,7 +138,22 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   reformatting, or logic changes ride in a move commit; review with
   `git diff --color-moved=dimmed-zebra`, where any non-dimmed red/green is a
   violation.
+- **Derive, don't mirror.** Daemon truth a frontend needs — permission
+  catalogs, feature lists, availability booleans, option vocabularies — is
+  declared once and derived everywhere else (exemplar: `CONTROL_METHODS` in
+  `dashboard_control.rs` drives the authorizer, the `features` list, and the
+  per-method availability booleans). When a static frontend fallback copy is
+  unavoidable (app.html's IAM catalog, the peer-profile picker), a
+  daemon-side parity test pins its ID sets to the source, so a catalog
+  change that forgets the mirror fails the suite instead of shipping as
+  drift.
 - WASM boundary: `serde_wasm_bindgen` with `serialize_maps_as_objects(true)`
+- `static/app.html` is **generated** from the `static/app/` fragments (order =
+  `static/app/manifest.txt`; assembled by `build.rs` via
+  `crates/app-html-assembler`; CI enforces the match). Edit the fragments,
+  never the artifact. Merge conflicts: resolve them in the fragments, run
+  `cargo run -p app-html-assembler`, then `git add static/app.html` — never
+  hand-reconcile the generated file.
 - Pure-safe Rust by default. The Unix (macOS / Linux) code paths keep `unsafe`
   confined to documented islands: small platform probes/signals and display or
   identity queries in `platform.rs`; macOS Accessibility bindings in `ax.rs`

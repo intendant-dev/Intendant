@@ -146,6 +146,16 @@ pub(crate) fn strip_ansi_escapes(input: &str) -> String {
 /// noise stays at detail verbosity.
 pub(crate) fn stderr_line_level(line: &str) -> &'static str {
     let lowered = line.to_ascii_lowercase();
+    // codex-cli 0.142+ built-in MCP connectors (linear, notion, slack, …)
+    // eagerly connect at every app-server spawn and log one fatal rmcp
+    // transport-worker line per connector that isn't logged in. That's
+    // ambient churn, not a session-affecting failure — keep it visible at
+    // warn instead of painting every codex spawn red. Model-API auth
+    // failures (e.g. the revoked-token websocket 401s) don't go through
+    // rmcp transport workers and still classify as errors below.
+    if lowered.contains("rmcp::transport::worker") && lowered.contains("worker quit") {
+        return "warn";
+    }
     if lowered.contains("error")
         || lowered.contains("panic")
         || lowered.contains("unauthorized")
@@ -1243,6 +1253,22 @@ mod tests {
         assert_eq!(
             AgentBackend::from_str_loose("codex"),
             Some(AgentBackend::Codex)
+        );
+    }
+
+    #[test]
+    fn stderr_line_level_demotes_rmcp_connector_churn_to_warn() {
+        assert_eq!(
+            stderr_line_level(
+                "2026-07-04T19:11:21Z ERROR rmcp::transport::worker: worker quit with fatal: \
+                 Transport channel closed, when AuthRequired(AuthRequiredError { .. })"
+            ),
+            "warn"
+        );
+        // Non-rmcp transport/auth failures stay errors.
+        assert_eq!(
+            stderr_line_level("websocket handshake failed: 401 Unauthorized"),
+            "error"
         );
     }
 
