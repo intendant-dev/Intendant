@@ -1439,6 +1439,21 @@ function stationHandleControlsAction(action) {
     showControlToast?.('success', `Codex managed context: ${mode}`);
     return;
   }
+  if (op.startsWith('claude-model:')) {
+    const alias = op.slice('claude-model:'.length).trim();
+    if (!['default', 'fable', 'opus', 'sonnet', 'haiku'].includes(alias)) return;
+    const model = alias === 'default' ? null : alias;
+    dispatchControlMsg({ action: 'set_claude_model', model });
+    showControlToast?.('success', `Claude model: ${alias}`);
+    return;
+  }
+  if (op.startsWith('claude-permission:')) {
+    const mode = op.slice('claude-permission:'.length).trim();
+    if (!['default', 'acceptEdits', 'plan', 'bypassPermissions'].includes(mode)) return;
+    dispatchControlMsg({ action: 'set_claude_permission_mode', mode });
+    showControlToast?.('success', `Claude permissions: ${mode}`);
+    return;
+  }
   if (op.startsWith('launch-agent:')) {
     stationLaunchDraft.agent = op.slice('launch-agent:'.length).trim();
     stationScheduleUpdate({ immediate: true });
