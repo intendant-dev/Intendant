@@ -5,6 +5,6 @@ language = "en"
 src = "src"
 
 [output.html]
-git-repository-url = "https://github.com/lovon-spec/intendant"
+git-repository-url = "https://github.com/intendant-dev/Intendant"
 default-theme = "navy"
 preferred-dark-theme = "navy"

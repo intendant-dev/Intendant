@@ -263,7 +263,7 @@ the frame is unchanged, which fails the visual-freshness bar at full resolution
 regardless of bitrate. Tile streaming inverts the model — **encode only what
 changed** — the way VNC/RFB and its derivatives (Spice, RDP, Citrix HDX) have for
 decades. The implementation lives in `display/tile/`; the full design rationale
-is in [`docs/design-tile-streaming.md`](https://github.com/lovon-spec/intendant/blob/main/docs/design-tile-streaming.md).
+is in [`docs/design-tile-streaming.md`](https://github.com/intendant-dev/Intendant/blob/main/docs/design-tile-streaming.md).
 
 ### Data channels
 

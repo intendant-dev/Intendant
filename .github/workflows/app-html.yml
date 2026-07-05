@@ -27,6 +27,9 @@ on:
       - "crates/app-html-assembler/**"
       - "build.rs"
       - ".github/workflows/app-html.yml"
+  # Merge-queue gate — unconditional (see windows.yml: a paths-skipped
+  # required check wedges the queue). The assembler runs in seconds.
+  merge_group:
 
 permissions:
   contents: read

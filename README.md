@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://intendant.dev"><b>intendant.dev</b></a> ·
-  <a href="https://lovon-spec.github.io/Intendant/">Docs</a> ·
+  <a href="https://intendant-dev.github.io/Intendant/">Docs</a> ·
   <a href="https://intendant.dev/trust">How trust works</a>
 </p>
 
@@ -60,7 +60,7 @@ Provider credentials are something a daemon **borrows, never owns**:
 - **Leases** — a connected dashboard session grants credentials that live in daemon memory only: auto-renewed while you're attached, expiring on their own after you leave (the offline window is per-daemon and *is* the autonomy/security dial — `0` means fueled only while you watch). Revocation is one click from any signed-in device, and every grant, expiry, and revocation lands in a custody audit trail the daemon cannot forge.
 - **Client egress** — the strictest mode routes model calls through your browser: the daemon ships the request over the verified tunnel, your browser attaches the key (against a fixed per-provider host allowlist) and streams the response back. The credential never touches the machine at all.
 
-So a disposable VPS can run a fully capable agent while its disk holds nothing worth stealing: snapshots, backups, and idle-box compromises come up empty, and even a compromise during an active lease is bounded by TTLs and per-daemon scoping instead of costing you a durable key. [How custody works →](https://lovon-spec.github.io/Intendant/credential-custody.html)
+So a disposable VPS can run a fully capable agent while its disk holds nothing worth stealing: snapshots, backups, and idle-box compromises come up empty, and even a compromise during an active lease is bounded by TTLs and per-daemon scoping instead of costing you a durable key. [How custody works →](https://intendant-dev.github.io/Intendant/credential-custody.html)
 
 <p align="center">
   <img src="src/bin/connect/assets/landing-vault.webp" alt="The credential vault panel: three credentials with masked secrets, two active leases expiring in 15 minutes, re-fuel buttons, and a client-egress relay option." />
@@ -68,9 +68,9 @@ So a disposable VPS can run a fully capable agent while its disk holds nothing w
 
 ## A network of agentic networks
 
-Every daemon is its own authority island. Access — human or agent — is enforced by that machine's local IAM: principals (browser keys, peer daemons, org members), grants, and roles over a fine-grained permission catalog, carried over mTLS and end-to-end-verified tunnels. The hosted rendezvous is deliberately powerless: it introduces browsers to daemons, relays ciphertext, and stores client-signed metadata — it can deny service, but it cannot impersonate a daemon, read a tunnel, or mint authority. It is open source and [self-hostable](https://lovon-spec.github.io/Intendant/self-hosted-rendezvous.html), and an append-only transparency log makes its name directory tamper-evident.
+Every daemon is its own authority island. Access — human or agent — is enforced by that machine's local IAM: principals (browser keys, peer daemons, org members), grants, and roles over a fine-grained permission catalog, carried over mTLS and end-to-end-verified tunnels. The hosted rendezvous is deliberately powerless: it introduces browsers to daemons, relays ciphertext, and stores client-signed metadata — it can deny service, but it cannot impersonate a daemon, read a tunnel, or mint authority. It is open source and [self-hostable](https://intendant-dev.github.io/Intendant/self-hosted-rendezvous.html), and an append-only transparency log makes its name directory tamper-evident.
 
-Organizations are a root keypair, not a row in someone's database. The org signs grant documents; members present them to any daemon that trusts the org key, where they materialize into ordinary local grants — capped by the role ceiling that daemon's owner set, expiring by default, revocable by signed revocation lists, always overridable locally. An org grants a person (scoped browser sessions) or that person's daemon (agent-to-agent peer profiles) as separate, separately-auditable decisions. That is how an organization runs a network of agents over its own infrastructure without surrendering it: scoped, auditable, key-first — with passkeys and one-phrase claiming keeping the ergonomics human. [The full trust model →](https://lovon-spec.github.io/Intendant/trust-architecture.html)
+Organizations are a root keypair, not a row in someone's database. The org signs grant documents; members present them to any daemon that trusts the org key, where they materialize into ordinary local grants — capped by the role ceiling that daemon's owner set, expiring by default, revocable by signed revocation lists, always overridable locally. An org grants a person (scoped browser sessions) or that person's daemon (agent-to-agent peer profiles) as separate, separately-auditable decisions. That is how an organization runs a network of agents over its own infrastructure without surrendering it: scoped, auditable, key-first — with passkeys and one-phrase claiming keeping the ergonomics human. [The full trust model →](https://intendant-dev.github.io/Intendant/trust-architecture.html)
 
 ## Why "Intendant"
 
@@ -122,7 +122,7 @@ Four execution modes: *direct* (single agent), *user* (orchestrator + sub-agents
 - **ffmpeg** — display recording and H264 encoding
 - **macOS**: `./scripts/setup-macos.sh` installs everything (cliclick, ffmpeg, Vortex Audio, wasm-pack, app bundle)
 - **Linux**: `./scripts/setup-linux.sh` installs everything (build-essential/binutils, libvpx, libxcb, xdotool, PipeWire, ffmpeg, PulseAudio, Xvfb)
-- **Windows**: `./scripts/setup-windows.ps1` (`x86_64-pc-windows-msvc`) — see the [Windows support](https://lovon-spec.github.io/Intendant/windows-support.html) docs
+- **Windows**: `./scripts/setup-windows.ps1` (`x86_64-pc-windows-msvc`) — see the [Windows support](https://intendant-dev.github.io/Intendant/windows-support.html) docs
 
 ## Quick Start
 
@@ -156,7 +156,7 @@ One-shot and headless invocations, when you want them:
 ./target/release/intendant --direct --no-web --json "t"  # headless single agent, JSONL to stdout
 ```
 
-The full flag reference (providers, models, sandboxing, resume) lives in [Getting Started](https://lovon-spec.github.io/Intendant/getting-started.html).
+The full flag reference (providers, models, sandboxing, resume) lives in [Getting Started](https://intendant-dev.github.io/Intendant/getting-started.html).
 
 ## Web Dashboard
 
@@ -186,7 +186,7 @@ cargo test -- --list      # List all test names
 
 ## Documentation
 
-**[Read the full documentation](https://lovon-spec.github.io/Intendant/)** — covers the architecture, the trust architecture and credential custody, peer federation and the self-hosted rendezvous, multi-agent and external-agent orchestration, the display pipeline, computer use and live audio, the web dashboard and Station, autonomy & approvals, MCP, configuration, session logging, and Windows support.
+**[Read the full documentation](https://intendant-dev.github.io/Intendant/)** — covers the architecture, the trust architecture and credential custody, peer federation and the self-hosted rendezvous, multi-agent and external-agent orchestration, the display pipeline, computer use and live audio, the web dashboard and Station, autonomy & approvals, MCP, configuration, session logging, and Windows support.
 
 Or build locally with [mdBook](https://rust-lang.github.io/mdBook/):
 

@@ -250,15 +250,41 @@ other agents.
 
 Never rewrite git history unless the user explicitly asks for it. This includes
 `git rebase`, `git commit --amend`, force-pushes, and rewriting already reported
-commits on a feature branch. When moving work from an agent worktree into `main`, use a
-fast-forward merge if possible; if not, create a normal merge commit or ask the user how
-to proceed.
+commits on a feature branch.
+
+**Landing goes through the merge queue.** `main` is ruleset-protected on
+`github.com/intendant-dev/Intendant`: direct pushes are rejected for everyone, and
+every landing is a PR that GitHub's merge queue validates (speculatively, against
+`main` + everything queued ahead) and merges in order. The ritual from an agent
+worktree:
+
+```bash
+git push origin <worktree-branch>
+gh pr create --fill --head <worktree-branch>
+gh pr merge --merge --auto        # enters the merge queue; merges when checks pass
+```
+
+Do not merge `main` into your branch just to "keep up" before landing — the queue
+validates your PR against the future main for you; merge main into your worktree
+only when you actually need newer code to build on. Still run the local battery
+(`cargo test --bins`, `cargo clippy`, the relevant `tests/skills/` smokes) before
+queueing: the queue gate is the deterministic subset, not the full battery, and a
+red queue entry wastes everyone's cycle time. Never bypass the ruleset; if the
+queue itself is wedged, that is an operator (org-owner) decision.
 
 ## CI/CD
 
-GitHub Actions on push / PR to `main`:
-- **`windows.yml`** — cross-platform `cargo test -p intendant --bins` on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Headless-safe: the unit suite needs no display or API keys.
-- **`audit.yml`** — `cargo audit` on push/PR plus a weekly cron (Mondays 08:00 UTC).
-- **`docs.yml`** — mdBook (`docs/`) deploy to GitHub Pages.
+GitHub Actions on push / PR to `main`, and — for the required checks — on every
+`merge_group` (the merge-queue gate; those triggers are deliberately
+unconditional because a paths-skipped required check wedges the queue):
+- **`windows.yml`** — cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Headless-safe: needs no display or API keys. **Required check.**
+- **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real release binaries on Linux + macOS. **Required check.**
+- **`app-html.yml`** — the `static/app/` fragments ↔ generated `static/app.html` regen gate. **Required check.**
+- **`agents-md-sync.yml`** — CLAUDE.md ↔ AGENTS.md byte-parity. **Required check.**
+- **`audit.yml`** — `cargo audit` on push/PR plus a weekly cron (Mondays 08:00 UTC). Advisory only — new upstream advisories must not block unrelated landings.
+- **`docs.yml`** — mdBook (`docs/`) deploy to GitHub Pages on push to `main`.
 
-The `tests/skills/` end-to-end scenarios are not in CI (real API calls / need a display). Run `cargo test --bins` and `cargo clippy` locally before committing.
+The `tests/skills/` scenarios that need real API calls or a display (the live
+haiku claude-code-e2e, browser/Station probes, the peer smoke's `--browser` leg)
+stay out of CI and run on operator hardware as the post-landing battery. Run
+`cargo test --bins` and `cargo clippy` locally before committing.

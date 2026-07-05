@@ -373,7 +373,7 @@ events reuse the existing `control` / `pointer` channels with raw `InputEvent` J
 The **peer-side gate is the security boundary** — input arriving without authority
 is dropped silently at the peer regardless of what the browser believes; the
 browser-side check is UX only. The full protocol is in
-[`docs/design-federated-input-authority.md`](https://github.com/lovon-spec/intendant/blob/main/docs/design-federated-input-authority.md).
+[`docs/design-federated-input-authority.md`](https://github.com/intendant-dev/Intendant/blob/main/docs/design-federated-input-authority.md).
 
 ## Dashboard Access and TLS
 
@@ -630,5 +630,5 @@ dashboard or daemon-to-daemon UX.
   pipeline that federated displays plug into, and the `[webrtc]` config
 - [Windows Support](./windows-support.md) — why `intendant access` is gated off
   Windows and what to use instead
-- [`docs/design-federated-input-authority.md`](https://github.com/lovon-spec/intendant/blob/main/docs/design-federated-input-authority.md)
+- [`docs/design-federated-input-authority.md`](https://github.com/intendant-dev/Intendant/blob/main/docs/design-federated-input-authority.md)
   — the full federated input-authority protocol

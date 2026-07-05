@@ -1,0 +1,117 @@
+name: Keyless smokes
+
+# The live-fire subset of the landing battery that needs NO API keys and NO
+# display: real release binaries driven end to end by the scripted mock
+# provider (PROVIDER=mock). These drivers were written keyless by design so
+# they could one day gate landings — this workflow is that day. Coverage the
+# unit suite structurally can't reach:
+#
+#   - session-vitals-smoke: daemon in a dirty git repo; asserts the vitals
+#     event carries git + cache + limits sections end to end (this exact
+#     smoke caught the usage-rail regression the TUI removal shipped —
+#     2026-07-05 — a textually clean merge the unit suite waved through).
+#   - native-goal-smoke: the /goal engine over the control socket (set,
+#     steer notice, budget, honest failure on pause-without-goal).
+#   - peer-sessions-smoke: two federated daemons; task delegated through the
+#     primary; folded per-session state (label, phase lifecycle, is_primary
+#     git vitals via the connect-time state replay) on /api/peers; retire on
+#     stop. API mode only — the --browser leg needs real Chrome and stays a
+#     local/canary check.
+#
+# The remaining battery legs (claude-code-e2e on live haiku, browser/Station
+# probes) need keys or a display and deliberately stay OUT of the merge gate;
+# they run as post-landing checks on operator hardware.
+#
+# Linux + macOS only: the drivers manage daemons via Unix control sockets and
+# POSIX signals. Windows unit/e2e coverage lives in windows.yml.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/Cargo.toml"
+      - "tests/skills/session-vitals-smoke/**"
+      - "tests/skills/native-goal-smoke/**"
+      - "tests/skills/peer-sessions-smoke/**"
+      - ".github/workflows/smokes.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/Cargo.toml"
+      - "tests/skills/session-vitals-smoke/**"
+      - "tests/skills/native-goal-smoke/**"
+      - "tests/skills/peer-sessions-smoke/**"
+      - ".github/workflows/smokes.yml"
+  # Merge-queue gate — unconditional (see windows.yml: a paths-skipped
+  # required check wedges the queue).
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keyless-smokes-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smokes:
+    name: smokes (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      # Same native build deps as windows.yml's test job — the release
+      # build compiles the identical dependency set.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libclang-dev libvpx-dev libpipewire-0.3-dev \
+            libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
+
+      - name: Install macOS build deps
+        if: runner.os == 'macOS'
+        run: brew install pkg-config libvpx
+
+      # peer-rig.py drives stop_session over a raw WebSocket.
+      - name: Install python websockets
+        run: python3 -m pip install --user websockets
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: smokes-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The smokes run the real release binaries — the same artifacts a
+      # dev box's landing lap exercises. `--locked` mirrors windows.yml.
+      - name: cargo build --release
+        run: cargo build --release -p intendant --bins --locked
+
+      - name: session-vitals smoke
+        run: node tests/skills/session-vitals-smoke/driver.cjs "$GITHUB_WORKSPACE/target/release/intendant"
+
+      - name: native-goal smoke
+        run: node tests/skills/native-goal-smoke/driver.cjs "$GITHUB_WORKSPACE/target/release/intendant"
+
+      - name: peer-sessions smoke
+        run: python3 tests/skills/peer-sessions-smoke/peer-rig.py

@@ -5262,7 +5262,7 @@ fn trust_ui_html(origin: &str) -> String {
     <p class="dim">Org membership is a document signed by the organization&rsquo;s own key, verified by each of its computers directly. This service stores at most the org&rsquo;s <em>revocation list</em> &mdash; also root-signed and rollback-protected, so the worst a malicious board can do is withhold it, never forge it.</p>
 
     <h2>Verify all of this</h2>
-    <p class="dim">The component is open and self-hostable: <a href="https://lovon-spec.github.io/Intendant/self-hosted-rendezvous.html" target="_blank" rel="noopener">run your own rendezvous</a>, read the <a href="https://lovon-spec.github.io/Intendant/trust-architecture.html" target="_blank" rel="noopener">full trust architecture</a>, or audit the <a href="https://github.com/lovon-spec/Intendant" target="_blank" rel="noopener">source</a>.</p>
+    <p class="dim">The component is open and self-hostable: <a href="https://intendant-dev.github.io/Intendant/self-hosted-rendezvous.html" target="_blank" rel="noopener">run your own rendezvous</a>, read the <a href="https://intendant-dev.github.io/Intendant/trust-architecture.html" target="_blank" rel="noopener">full trust architecture</a>, or audit the <a href="https://github.com/intendant-dev/Intendant" target="_blank" rel="noopener">source</a>.</p>
 
     <div class="foot">This instance: <code>{origin}</code> &mdash; one deployment of an open component, not a chokepoint.</div>
   </main>
@@ -5271,8 +5271,8 @@ fn trust_ui_html(origin: &str) -> String {
     )
 }
 
-const DOCS_URL: &str = "https://lovon-spec.github.io/Intendant/";
-const REPO_URL: &str = "https://github.com/lovon-spec/intendant";
+const DOCS_URL: &str = "https://intendant-dev.github.io/Intendant/";
+const REPO_URL: &str = "https://github.com/intendant-dev/Intendant";
 
 /// The deployment advisor — the lead of the landing install section: four
 /// questions -> one command per platform (sh or PowerShell, `--service` where it belongs)
@@ -6135,7 +6135,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
       <ul class="feature-strip">
         <li><strong>Passkeys only</strong><span>No passwords. Your devices already sync the key.</span></li>
         <li><strong>Holds no power</strong><span>An introducer and relay. Your computers check your identity themselves &mdash; <a href="/trust">how trust works here</a>.</span></li>
-        <li><strong>Self-hostable</strong><span>Run your own rendezvous &mdash; <a href="https://lovon-spec.github.io/Intendant/self-hosted-rendezvous.html" target="_blank" rel="noopener">read how</a>.</span></li>
+        <li><strong>Self-hostable</strong><span>Run your own rendezvous &mdash; <a href="https://intendant-dev.github.io/Intendant/self-hosted-rendezvous.html" target="_blank" rel="noopener">read how</a>.</span></li>
       </ul>
     </section>
 
@@ -6239,7 +6239,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
         </div>
         <div class="advanced-block">
           <h3>Self-host</h3>
-          <div class="sub">This origin (<code>{origin}</code>) is one instance of an open component. <a href="https://lovon-spec.github.io/Intendant/self-hosted-rendezvous.html" target="_blank" rel="noopener">Run your own</a> and point your daemons at it.</div>
+          <div class="sub">This origin (<code>{origin}</code>) is one instance of an open component. <a href="https://intendant-dev.github.io/Intendant/self-hosted-rendezvous.html" target="_blank" rel="noopener">Run your own</a> and point your daemons at it.</div>
         </div>
       </div>
     </details>
