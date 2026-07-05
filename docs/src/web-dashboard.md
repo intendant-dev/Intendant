@@ -8,7 +8,10 @@ self-contained file, `static/app.html` — a **generated artifact**: `build.rs`
 assembles it from the ordered fragments in `static/app/` (`manifest.txt` fixes
 the order) via `crates/app-html-assembler`, and CI rejects any drift between
 fragments and artifact. Edit the fragments, never the artifact; see
-`static/app/README.md`.
+`static/app/README.md`. For iteration, `INTENDANT_APP_HTML_PATH=<file>` makes
+the gateway re-read a disk copy of app.html on every request instead of
+serving the embedded one (see [Configuration](./configuration.md)) — edit a
+fragment, run the assembler, refresh.
 
 ## On by default
 

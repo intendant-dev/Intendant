@@ -90,6 +90,21 @@ managed cache. The helper accepts `--check`, `--force`,
 `--channel stable|beta|dev|canary`, `--json`, and `--print-path`; use
 `--check` to verify the cache without network access.
 
+### Dashboard dev override
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INTENDANT_APP_HTML_PATH` | unset | Serve the dashboard entry point from this file, re-read on every request, instead of the embedded copy |
+
+Development-only: point it at a checkout's `static/app.html`, then iterate
+with `cargo run -p app-html-assembler` after each fragment edit — the next
+browser refresh picks up the change with no daemon rebuild or restart. The
+disk copy gets the same `?v=` asset-URL rewriting as the embedded one;
+everything else (WASM, vendored JS/CSS, icons) stays embedded and still
+needs a normal build. A read failure serves a loud 500 naming the override
+rather than silently falling back to the embedded copy, and the gateway
+logs the active override at startup.
+
 ### Process-plumbing variables
 
 Sub-agents no longer travel through the environment — they are supervised
