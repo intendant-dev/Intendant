@@ -243,9 +243,12 @@ async fn mock_provider_without_a_script_fails_closed() {
     ]);
     let output = rig.run(cmd).await;
     assert!(!output.status.success(), "{}", text_of(&output));
-    let text = text_of(&output);
+    // The configuration error surfaces on stderr on some platforms and in
+    // the session log on others (the loop's error sink) — accept either,
+    // but it must name the missing variable.
+    let evidence = format!("{}\n{}", text_of(&output), rig.session_logs());
     assert!(
-        text.contains("INTENDANT_MOCK_SCRIPT"),
-        "expected the mock-script configuration error, got:\n{text}"
+        evidence.contains("INTENDANT_MOCK_SCRIPT"),
+        "expected the mock-script configuration error, got:\n{evidence}"
     );
 }
