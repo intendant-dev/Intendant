@@ -4015,7 +4015,7 @@ pub fn spawn_web_gateway(
                                 // event variants pass through verbatim.
                                 let rewritten_event = maybe_rewrite_federated_answer(
                                     &peer,
-                                    event,
+                                    *event,
                                     &reg_for_task,
                                     &relay_registry_for_task,
                                     relay_url_for_task.as_deref(),

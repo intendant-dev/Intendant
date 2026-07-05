@@ -380,6 +380,23 @@ async fn drain_ws(
     let disconnect_reason = loop {
         match read.next().await {
             Some(Ok(Message::Text(text))) => {
+                // The gateway's connect-time bootstrap (`{"t":"state_snapshot",
+                // "session_id":…}`) is not an OutboundEvent, but it names the
+                // peer daemon's own primary session — feed that to the
+                // upcaster so folded session snapshots can stamp
+                // `is_primary` (renderers merge that session into the peer
+                // node instead of drawing it twice). Other `t`-tagged
+                // frames (log_replay, cached usage/status) stay dropped.
+                if text.contains("\"t\":\"state_snapshot\"") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if value["t"] == "state_snapshot" {
+                            if let Some(sid) = value["session_id"].as_str() {
+                                upcaster.set_primary_session_id(sid);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // Forward-compat via OutboundEvent::Unknown: unknown
                 // event variants deserialize silently and the upcaster
                 // drops them. Non-JSON frames (unlikely on this
@@ -678,6 +695,125 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Full inbound chain: OutboundEvents broadcast by a peer's gateway
+    /// arrive through the attached WebSocket, and the drain's
+    /// `WireEventUpcaster` folds the per-session enrichment stream
+    /// (started → vitals → status) into `SessionStarted`/`SessionUpdated`
+    /// peer events with the merged snapshot.
+    #[tokio::test]
+    async fn ws_stream_folds_session_enrichment_into_peer_events() {
+        let bus = EventBus::new();
+        let (broadcast_tx, _keep) = broadcast::channel::<String>(64);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let gateway = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx.clone(),
+            WebGatewayConfig::default(),
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+            false,
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let (tx, mut rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let mut transport = IntendantWsTransport::new(url, tx);
+        let _card = transport.connect().await.expect("connect succeeds");
+        // Give the gateway's per-connection outbound loop a beat to
+        // subscribe before broadcasting, so the events aren't dropped
+        // as pre-subscription traffic.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        for event in [
+            crate::types::OutboundEvent::SessionStarted {
+                session_id: "sess-fold".into(),
+                task: Some("federated task".into()),
+            },
+            crate::types::OutboundEvent::SessionVitals {
+                session_id: "sess-fold".into(),
+                vitals: crate::types::SessionVitals {
+                    git: Some(crate::types::SessionGitVitals {
+                        branch: "main".into(),
+                        dirty_files: 3,
+                        ahead: 0,
+                        behind: 0,
+                        primary_ref: String::new(),
+                        merge_parity: String::new(),
+                        unpushed: None,
+                        primary_unpushed: None,
+                    }),
+                    cache: None,
+                    limits: Vec::new(),
+                },
+            },
+            crate::types::OutboundEvent::Status {
+                turn: 1,
+                phase: "working".into(),
+                autonomy: "full".into(),
+                session_id: "sess-fold".into(),
+                task: String::new(),
+                external_agent: None,
+            },
+        ] {
+            broadcast_tx
+                .send(serde_json::to_string(&event).unwrap())
+                .expect("gateway connection subscribed");
+        }
+
+        // Drain peer events until the fold reaches the fully-merged
+        // shape (vitals + phase). Unrelated events (logs, status) are
+        // skipped; timeout fails the test.
+        let mut started_seen = false;
+        let mut merged = None;
+        for _ in 0..40 {
+            let Ok(Some(event)) =
+                tokio::time::timeout(Duration::from_millis(250), rx.recv()).await
+            else {
+                break;
+            };
+            match event {
+                PeerEvent::SessionStarted { session } => {
+                    assert_eq!(session.session_id, "sess-fold");
+                    assert_eq!(session.label.as_deref(), Some("federated task"));
+                    started_seen = true;
+                }
+                PeerEvent::SessionUpdated { session }
+                    if session.vitals.is_some() && session.phase == "working" =>
+                {
+                    merged = Some(session);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(started_seen, "SessionStarted must arrive over the wire");
+        let merged = merged.expect("fold must reach the merged snapshot");
+        assert_eq!(
+            merged
+                .vitals
+                .as_ref()
+                .and_then(|v| v.git.as_ref())
+                .map(|g| g.dirty_files),
+            Some(3),
+            "vitals fold must survive the wire round-trip"
+        );
+        assert_eq!(merged.label.as_deref(), Some("federated task"));
+
+        transport.disconnect().await.unwrap();
+        gateway.abort();
     }
 
     /// Connect the transport to a test peer, fetch its card, verify

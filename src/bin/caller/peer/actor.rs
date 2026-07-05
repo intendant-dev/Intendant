@@ -23,11 +23,13 @@
 //! own retry policy.
 
 use crate::peer::card::AgentCard;
-use crate::peer::event::{PeerEvent, PeerStatus, TaggedPeerEvent};
+use crate::peer::event::{PeerEvent, PeerStatus, SessionInfo, TaggedPeerEvent};
 use crate::peer::handle::{ConnectionState, PeerCommand};
 use crate::peer::id::PeerId;
 use crate::peer::traits::PeerTransport;
+use crate::peer::upcast::MAX_TRACKED_PEER_SESSIONS;
 use crate::peer::PeerError;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -90,6 +92,15 @@ pub(crate) struct PeerActor {
     pub connection_tx: watch::Sender<ConnectionState>,
     pub status_tx: watch::Sender<PeerStatus>,
     pub card_tx: watch::Sender<Arc<AgentCard>>,
+    /// Published view of the peer's sessions, folded from the
+    /// `SessionStarted` / `SessionUpdated` / `SessionEnded` stream the
+    /// transport emits. Cleared on disconnect — the stream is
+    /// connection-scoped (a fresh connection re-learns live sessions
+    /// from their next events), so carrying entries across a reconnect
+    /// would leave ghosts if the peer restarted meanwhile.
+    pub sessions_tx: watch::Sender<Arc<Vec<SessionInfo>>>,
+    /// Fold backing `sessions_tx`, keyed by session id.
+    pub sessions: BTreeMap<String, SessionInfo>,
     pub seq: u64,
     /// Operator's via-URL override, preserved across card refreshes.
     ///
@@ -316,9 +327,53 @@ impl PeerActor {
                 self.apply_operator_overrides(&mut patched);
                 let _ = self.card_tx.send(Arc::new(patched));
             }
+            PeerEvent::SessionStarted { session } | PeerEvent::SessionUpdated { session } => {
+                self.sessions
+                    .insert(session.session_id.clone(), session.clone());
+                // Same bound as the upcaster fold — defense in depth for
+                // transports that construct SessionUpdated directly.
+                while self.sessions.len() > MAX_TRACKED_PEER_SESSIONS {
+                    let oldest = self
+                        .sessions
+                        .iter()
+                        .min_by(|a, b| a.1.started_at.cmp(&b.1.started_at))
+                        .map(|(id, _)| id.clone());
+                    match oldest {
+                        Some(id) => {
+                            self.sessions.remove(&id);
+                        }
+                        None => break,
+                    }
+                }
+                self.publish_sessions();
+            }
+            PeerEvent::SessionEnded { session_id, .. } => {
+                if self.sessions.remove(session_id).is_some() {
+                    self.publish_sessions();
+                }
+            }
+            PeerEvent::Disconnected { .. } => {
+                if !self.sessions.is_empty() {
+                    self.sessions.clear();
+                    self.publish_sessions();
+                }
+            }
             _ => {}
         }
         self.emit_event(event).await;
+    }
+
+    /// Publish the current sessions fold, newest first (matching how
+    /// renderers list them; `started_at` is RFC3339 so string order is
+    /// chronological).
+    fn publish_sessions(&mut self) {
+        let mut sessions: Vec<SessionInfo> = self.sessions.values().cloned().collect();
+        sessions.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        let _ = self.sessions_tx.send(Arc::new(sessions));
     }
 
     /// Durable-first fan-out: await on the log sink (must not drop),

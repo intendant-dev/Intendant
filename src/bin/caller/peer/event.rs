@@ -145,6 +145,17 @@ pub enum PeerEvent {
     SessionStarted {
         session: SessionInfo,
     },
+    /// Folded per-session snapshot: emitted whenever any enrichment
+    /// field of one of the peer's sessions changes (phase, source,
+    /// relationship, goal, vitals, tokens, pending approvals — see
+    /// [`SessionInfo`]). `SessionStarted` announces, `SessionUpdated`
+    /// carries the evolving state, `SessionEnded` retires; consumers
+    /// fold `session_started`/`session_updated` identically by
+    /// `session_id` (each carries the full current snapshot, so the
+    /// stream is idempotent and loss-tolerant).
+    SessionUpdated {
+        session: SessionInfo,
+    },
     SessionEnded {
         session_id: String,
         reason: String,
@@ -595,12 +606,57 @@ pub enum LogLevel {
     Error,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// One of a peer's sessions, as visible over the federation wire.
+///
+/// The three original fields are what `SessionStarted` announces. The
+/// rest is *enrichment* folded by the consuming side from the peer's
+/// per-session event stream (identity, status, relationship, goal,
+/// vitals, usage — see `upcast::PeerSessionFold`): every enrichment
+/// field is optional with a serde default, so pre-enrichment logs and
+/// peers parse unchanged and producers fill only what they know —
+/// the same sections-are-independent doctrine as
+/// [`crate::types::SessionVitals`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: String,
     pub label: Option<String>,
     /// RFC3339 timestamp string.
     pub started_at: String,
+    /// Session source/backend (`"intendant"`, `"codex"`, `"claude"`, …)
+    /// from the peer's `session_identity` events.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// Latest raw phase string from the peer's per-session status
+    /// events (`"working"`, `"waiting_approval"`, `"done"`, …). Kept
+    /// verbatim so renderers apply the same phase vocabulary they use
+    /// for local sessions.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phase: String,
+    /// The peer daemon's own primary session. Renderers typically merge
+    /// it into the peer's host/daemon node instead of drawing a
+    /// duplicate session node next to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_primary: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Relationship to the parent (`"subagent"`, `"side"`, `"fork"`, …)
+    /// — same stringly-typed vocabulary as the local session wire.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub relationship: String,
+    /// Transient utility child (summarizer etc.); renderers may skip.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
+    /// Cumulative prompt+completion tokens from the peer's per-session
+    /// usage events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_used: Option<u64>,
+    /// At least one pending approval names this session.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_approval: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::types::SessionGoal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vitals: Option<crate::types::SessionVitals>,
 }
 
 /// `PeerEvent` tagged with the originating `PeerId` and a per-peer
@@ -790,6 +846,93 @@ mod tests {
                 assert!(matches!(content, MessageContent::Unknown));
             }
             _ => panic!("expected Message"),
+        }
+    }
+
+    /// `SessionInfo` enrichment is a backward-compatible wire addition:
+    /// the pre-enrichment three-field shape still parses (old peers,
+    /// old peers.jsonl logs), and empty enrichment serializes away so
+    /// pre-enrichment consumers never see unexpected fields on
+    /// unenriched sessions.
+    #[test]
+    fn session_info_enrichment_is_backward_compatible() {
+        let old = r#"{"session_id":"s1","label":"t","started_at":"2026-07-05T00:00:00Z"}"#;
+        let parsed: SessionInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.session_id, "s1");
+        assert!(!parsed.is_primary);
+        assert!(!parsed.needs_approval);
+        assert!(parsed.vitals.is_none());
+        assert!(parsed.goal.is_none());
+        assert!(parsed.phase.is_empty());
+
+        let unenriched = SessionInfo {
+            session_id: "s1".into(),
+            label: None,
+            started_at: "2026-07-05T00:00:00Z".into(),
+            ..SessionInfo::default()
+        };
+        let json = serde_json::to_string(&unenriched).unwrap();
+        for absent in [
+            "is_primary",
+            "needs_approval",
+            "vitals",
+            "goal",
+            "phase",
+            "source",
+            "relationship",
+            "ephemeral",
+            "tokens_used",
+            "parent_session_id",
+        ] {
+            assert!(
+                !json.contains(absent),
+                "empty enrichment field `{absent}` must be skipped: {json}"
+            );
+        }
+    }
+
+    /// `SessionUpdated` round-trips the full enriched snapshot.
+    #[test]
+    fn session_updated_round_trips_enrichment() {
+        let evt = PeerEvent::SessionUpdated {
+            session: SessionInfo {
+                session_id: "s1".into(),
+                label: Some("review PR".into()),
+                started_at: "2026-07-05T00:00:00Z".into(),
+                source: "claude".into(),
+                phase: "working".into(),
+                is_primary: false,
+                parent_session_id: Some("s0".into()),
+                relationship: "subagent".into(),
+                ephemeral: false,
+                tokens_used: Some(1234),
+                needs_approval: true,
+                goal: Some(crate::types::SessionGoal {
+                    objective: "land it".into(),
+                    status: Some("active".into()),
+                    elapsed_seconds: None,
+                    tokens_used: None,
+                    token_budget: Some(50_000),
+                }),
+                vitals: None,
+            },
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"event\":\"session_updated\""));
+        let parsed: PeerEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PeerEvent::SessionUpdated { session } => {
+                assert_eq!(session.source, "claude");
+                assert_eq!(session.phase, "working");
+                assert_eq!(session.parent_session_id.as_deref(), Some("s0"));
+                assert_eq!(session.tokens_used, Some(1234));
+                assert!(session.needs_approval);
+                assert_eq!(
+                    session.goal.as_ref().and_then(|g| g.token_budget),
+                    Some(50_000)
+                );
+            }
+            other => panic!("expected SessionUpdated, got {other:?}"),
         }
     }
 

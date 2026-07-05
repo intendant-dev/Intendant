@@ -91,7 +91,11 @@ pub enum RegistryEvent {
     /// those events out to dashboard clients through the existing
     /// push pipe is cheap and removes the browser's per-secondary
     /// WebSocket plumbing once the UI side migrates.
-    PeerEventForwarded { peer: PeerId, event: PeerEvent },
+    ///
+    /// Boxed: `PeerEvent` carries folded [`crate::peer::SessionInfo`]
+    /// snapshots (goal + vitals inline), which would otherwise inflate
+    /// every `RegistryEvent` clone on the broadcast fan-out.
+    PeerEventForwarded { peer: PeerId, event: Box<PeerEvent> },
 }
 
 /// Server-side peer registry.
@@ -598,7 +602,7 @@ fn spawn_event_forwarder(handle: PeerHandle, events: broadcast::Sender<RegistryE
                 Ok(event) => {
                     let _ = events.send(RegistryEvent::PeerEventForwarded {
                         peer: peer_id.clone(),
-                        event,
+                        event: Box::new(event),
                     });
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {

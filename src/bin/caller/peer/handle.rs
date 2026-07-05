@@ -24,8 +24,8 @@
 
 use crate::peer::card::AgentCard;
 use crate::peer::event::{
-    ApprovalDecision, MessageId, PeerEvent, PeerMessage, PeerStatus, TaggedPeerEvent, TaskId,
-    TaskUpdate, WebRtcSessionId, WebRtcSignal,
+    ApprovalDecision, MessageId, PeerEvent, PeerMessage, PeerStatus, SessionInfo, TaggedPeerEvent,
+    TaskId, TaskUpdate, WebRtcSessionId, WebRtcSignal,
 };
 use crate::peer::id::PeerId;
 use crate::peer::traits::{PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures};
@@ -119,6 +119,9 @@ struct PeerHandleInner {
     connection: watch::Receiver<ConnectionState>,
     status: watch::Receiver<PeerStatus>,
     card: watch::Receiver<Arc<AgentCard>>,
+    /// Folded view of the peer's sessions (see the actor's
+    /// `sessions_tx` docs — connection-scoped, cleared on disconnect).
+    sessions: watch::Receiver<Arc<Vec<SessionInfo>>>,
     commands: mpsc::Sender<PeerCommand>,
     events: broadcast::Sender<PeerEvent>,
     /// Browser-side TCP via URL — immutable for the lifetime of the
@@ -205,6 +208,7 @@ impl PeerHandle {
             ws_url,
             capabilities,
             browser_tcp_via_url: self.inner.browser_tcp_via_url.clone(),
+            sessions: self.inner.sessions.borrow().as_ref().clone(),
         }
     }
 
@@ -504,6 +508,14 @@ pub struct PeerSnapshot {
     /// the slice 3a.2 behavior.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_tcp_via_url: Option<String>,
+    /// The peer's sessions as folded from its live event stream
+    /// (newest first; see [`crate::peer::SessionInfo`]). Seeds the
+    /// dashboard's per-host session view at load/refetch; live
+    /// `session_updated` events keep it fresh in between. Empty when
+    /// the connection is down or nothing has been observed yet —
+    /// `serde(default)` keeps older producers parseable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<SessionInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +579,7 @@ where
     let (connection_tx, connection_rx) = watch::channel(ConnectionState::Initializing);
     let (status_tx, status_rx) = watch::channel(PeerStatus::Idle);
     let (card_tx, card_rx) = watch::channel(Arc::new(initial_card));
+    let (sessions_tx, sessions_rx) = watch::channel(Arc::new(Vec::new()));
 
     let transport = build_transport(events_in_tx);
     let features = transport.features();
@@ -581,6 +594,8 @@ where
         connection_tx,
         status_tx,
         card_tx,
+        sessions_tx,
+        sessions: std::collections::BTreeMap::new(),
         seq: 0,
         via_urls,
         label_override,
@@ -595,6 +610,7 @@ where
             connection: connection_rx,
             status: status_rx,
             card: card_rx,
+            sessions: sessions_rx,
             commands: commands_tx,
             events: events_out_tx,
             browser_tcp_via_url,
@@ -724,6 +740,143 @@ mod tests {
             ConnectionState::Disconnected,
             "actor didn't transition to Disconnected"
         );
+    }
+
+    /// Session events flowing from a live peer fold into the actor's
+    /// published sessions view and surface on `PeerSnapshot::sessions`
+    /// (the `/api/peers` seed for the dashboard's per-host session
+    /// view); `SessionEnded` retires the entry.
+    #[tokio::test]
+    async fn snapshot_carries_folded_sessions_and_ended_retires() {
+        use crate::event::EventBus;
+        use crate::peer::card::{AgentCard, AuthRequirements, TransportSpec};
+        use crate::peer::id::{PeerId, PeerKind};
+        use crate::peer::transport::IntendantWsTransport;
+        use crate::web_gateway::{spawn_web_gateway, ActiveSessionState, WebGatewayConfig};
+        use tokio::sync::{broadcast, mpsc};
+
+        let bus = EventBus::new();
+        let (broadcast_tx, _keep) = broadcast::channel::<String>(64);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let gateway = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx.clone(),
+            WebGatewayConfig::default(),
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+            false,
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let ws_url = format!("ws://127.0.0.1:{port}/ws");
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let initial_card = AgentCard {
+            id: PeerId::new(PeerKind::Intendant, "sess-peer"),
+            label: "sess-peer".into(),
+            version: "0.0.0".into(),
+            git_sha: None,
+            transports: vec![TransportSpec::IntendantWs {
+                url: ws_url.clone(),
+            }],
+            capabilities: vec![],
+            auth: AuthRequirements::none(),
+        };
+        let url_for_closure = ws_url.clone();
+        let handle = spawn_peer(
+            initial_card.id.clone(),
+            initial_card,
+            Vec::new(),
+            None,
+            None,
+            log_tx,
+            move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
+        );
+
+        let connect_deadline = Instant::now() + Duration::from_secs(3);
+        while handle.connection_state() != ConnectionState::Connected {
+            assert!(
+                Instant::now() < connect_deadline,
+                "actor never connected (state: {:?})",
+                handle.connection_state()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Let the gateway's per-connection outbound loop subscribe
+        // before broadcasting.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        for event in [
+            crate::types::OutboundEvent::SessionStarted {
+                session_id: "s-fold".into(),
+                task: Some("federated task".into()),
+            },
+            crate::types::OutboundEvent::Status {
+                turn: 1,
+                phase: "working".into(),
+                autonomy: "full".into(),
+                session_id: "s-fold".into(),
+                task: String::new(),
+                external_agent: None,
+            },
+        ] {
+            broadcast_tx
+                .send(serde_json::to_string(&event).unwrap())
+                .expect("gateway connection subscribed");
+        }
+
+        let fold_deadline = Instant::now() + Duration::from_secs(5);
+        let folded = loop {
+            let snap = handle.snapshot();
+            if let Some(s) = snap
+                .sessions
+                .iter()
+                .find(|s| s.session_id == "s-fold" && s.phase == "working")
+            {
+                break s.clone();
+            }
+            assert!(
+                Instant::now() < fold_deadline,
+                "snapshot never carried the folded session: {:?}",
+                snap.sessions
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(folded.label.as_deref(), Some("federated task"));
+
+        broadcast_tx
+            .send(
+                serde_json::to_string(&crate::types::OutboundEvent::SessionEnded {
+                    session_id: "s-fold".into(),
+                    reason: "done".into(),
+                })
+                .unwrap(),
+            )
+            .expect("gateway connection subscribed");
+        let retire_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if handle.snapshot().sessions.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < retire_deadline,
+                "SessionEnded must retire the snapshot entry"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        handle.disconnect().await.unwrap();
+        gateway.abort();
     }
 
     /// Operator-supplied `browser_tcp_via_url` round-trips through

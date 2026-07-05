@@ -164,6 +164,157 @@ pub(crate) fn status_from_phase(phase: &str) -> PeerStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Per-session fold — the consuming-side enrichment of SessionInfo
+// ---------------------------------------------------------------------------
+
+/// Cap on distinct sessions tracked per upcaster. `SessionEnded` prunes
+/// the normal flow; the cap only bounds a peer that keeps announcing
+/// sessions without ever ending them. Evicts the oldest `started_at`
+/// when exceeded.
+pub(crate) const MAX_TRACKED_PEER_SESSIONS: usize = 128;
+
+/// Folds a peer's per-session event stream (started / identity /
+/// status / relationship / goal / vitals / usage / approvals) into
+/// [`SessionInfo`] snapshots, so consumers see one idempotent
+/// `SessionUpdated` stream instead of six event shapes. Shared by both
+/// upcasters — the same drift defense as the stateless helpers above.
+///
+/// Update methods **upsert**: an event naming an unknown session
+/// creates its entry (`started_at` = now). That is what makes a
+/// primary that connected mid-flight self-healing — it learns the
+/// peer's pre-existing sessions from their first live event instead
+/// of never showing them.
+#[derive(Default)]
+pub(crate) struct PeerSessionFold {
+    sessions: std::collections::BTreeMap<String, SessionInfo>,
+    /// Pending approval id → session id, so `needs_approval` means
+    /// "at least one pending approval names this session".
+    pending_approvals: std::collections::BTreeMap<u64, String>,
+    /// The peer daemon's own primary session id, when known (the
+    /// native transport learns it from the `/ws` bootstrap
+    /// `state_snapshot` frame). Sessions matching it are stamped
+    /// `is_primary` so renderers can merge them into the peer node.
+    primary_session_id: Option<String>,
+}
+
+impl PeerSessionFold {
+    pub(crate) fn set_primary_session_id(&mut self, session_id: &str) {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return;
+        }
+        self.primary_session_id = Some(session_id.to_string());
+        // Retro-stamp in case the session was learned before the
+        // bootstrap frame was parsed (ordering is connection-dependent).
+        if let Some(entry) = self.sessions.get_mut(session_id) {
+            entry.is_primary = true;
+        }
+    }
+
+    /// Insert-or-refresh on a session-started announcement. Returns the
+    /// current snapshot to embed in the `SessionStarted` event.
+    fn started(&mut self, session_id: &str, label: Option<&str>) -> SessionInfo {
+        let entry = self.entry(session_id);
+        if let Some(label) = label {
+            if !label.is_empty() {
+                entry.label = Some(label.to_string());
+            }
+        }
+        let snapshot = entry.clone();
+        self.evict_over_cap(session_id);
+        snapshot
+    }
+
+    /// Upsert + change-detect. Returns `Some(snapshot)` only when
+    /// `apply` changed something, so chatty sources (per-tick status,
+    /// per-turn usage) emit `SessionUpdated` only on real transitions.
+    fn update(
+        &mut self,
+        session_id: &str,
+        apply: impl FnOnce(&mut SessionInfo),
+    ) -> Option<SessionInfo> {
+        if session_id.trim().is_empty() {
+            return None;
+        }
+        let created = !self.sessions.contains_key(session_id);
+        let entry = self.entry(session_id);
+        let before = entry.clone();
+        apply(entry);
+        let changed = created || *entry != before;
+        let snapshot = changed.then(|| entry.clone());
+        self.evict_over_cap(session_id);
+        snapshot
+    }
+
+    /// A pending approval was raised. When it names a session, that
+    /// session's `needs_approval` flips on; returns the snapshot if
+    /// that changed anything.
+    fn approval_requested(&mut self, id: u64, session_id: Option<&str>) -> Option<SessionInfo> {
+        let session_id = session_id.unwrap_or("").trim().to_string();
+        if session_id.is_empty() {
+            return None;
+        }
+        self.pending_approvals.insert(id, session_id.clone());
+        self.update(&session_id, |s| s.needs_approval = true)
+    }
+
+    /// A pending approval was resolved; recompute `needs_approval` for
+    /// the session it named (other approvals may still be pending).
+    fn approval_resolved(&mut self, id: u64) -> Option<SessionInfo> {
+        let session_id = self.pending_approvals.remove(&id)?;
+        let still_pending = self
+            .pending_approvals
+            .values()
+            .any(|sid| *sid == session_id);
+        self.update(&session_id, |s| s.needs_approval = still_pending)
+    }
+
+    fn ended(&mut self, session_id: &str) {
+        self.sessions.remove(session_id);
+        self.pending_approvals.retain(|_, sid| sid != session_id);
+    }
+
+    fn entry(&mut self, session_id: &str) -> &mut SessionInfo {
+        let is_primary = self.primary_session_id.as_deref() == Some(session_id);
+        self.sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| SessionInfo {
+                session_id: session_id.to_string(),
+                started_at: now_rfc3339(),
+                is_primary,
+                ..SessionInfo::default()
+            })
+    }
+
+    /// Evict the oldest-started session (never the one just touched)
+    /// when over cap. `started_at` is RFC3339, so lexicographic order
+    /// is chronological.
+    fn evict_over_cap(&mut self, just_touched: &str) {
+        while self.sessions.len() > MAX_TRACKED_PEER_SESSIONS {
+            let oldest = self
+                .sessions
+                .iter()
+                .filter(|(id, _)| id.as_str() != just_touched)
+                .min_by(|a, b| a.1.started_at.cmp(&b.1.started_at))
+                .map(|(id, _)| id.clone());
+            match oldest {
+                Some(id) => self.ended(&id),
+                None => break,
+            }
+        }
+    }
+}
+
+/// Wrap a fold change (if any) as a single-element `SessionUpdated`
+/// event vec — the common tail of every enrichment arm.
+pub(crate) fn session_updated_events(changed: Option<SessionInfo>) -> Vec<PeerEvent> {
+    changed
+        .map(|session| PeerEvent::SessionUpdated { session })
+        .into_iter()
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // AppEventUpcaster — in-process AppEvent → PeerEvent
 // ---------------------------------------------------------------------------
 
@@ -195,6 +346,8 @@ pub struct AppEventUpcaster {
     /// match the started one. Without this, agents start as
     /// `agent-{turn}` but progress as `agent-latest`.
     current_agent_turn: Option<usize>,
+    /// Per-session enrichment fold (see [`PeerSessionFold`]).
+    sessions: PeerSessionFold,
 }
 
 impl Default for AppEventUpcaster {
@@ -211,6 +364,7 @@ impl AppEventUpcaster {
             current_message_id: None,
             current_turn: None,
             current_agent_turn: None,
+            sessions: PeerSessionFold::default(),
         }
     }
 
@@ -286,11 +440,7 @@ impl AppEventUpcaster {
             | AppEvent::ExternalFollowUpRequested { .. }
             | AppEvent::FollowUpCancelRequested { .. }
             | AppEvent::SessionStopRequested { .. }
-            | AppEvent::SessionIdentity { .. }
-            | AppEvent::SessionRelationship { .. }
             | AppEvent::SessionCapabilities { .. }
-            | AppEvent::SessionGoal { .. }
-            | AppEvent::SessionVitals { .. }
             | AppEvent::FollowUpStatus { .. }
             | AppEvent::SharedView { .. }
             | AppEvent::BrowserWorkspaceChanged { .. }
@@ -575,13 +725,36 @@ impl AppEventUpcaster {
             // ---- Session lifecycle ----
             AppEvent::SessionStarted { session_id, task } => {
                 vec![PeerEvent::SessionStarted {
-                    session: SessionInfo {
-                        session_id: session_id.clone(),
-                        label: task.clone(),
-                        started_at: now_rfc3339(),
-                    },
+                    session: self.sessions.started(session_id, task.as_deref()),
                 }]
             }
+
+            AppEvent::SessionIdentity {
+                session_id, source, ..
+            } => session_updated_events(
+                self.sessions
+                    .update(session_id, |s| s.source = source.clone()),
+            ),
+
+            AppEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ephemeral,
+            } => session_updated_events(self.sessions.update(child_session_id, |s| {
+                s.parent_session_id = Some(parent_session_id.clone());
+                s.relationship = relationship.clone();
+                s.ephemeral = *ephemeral;
+            })),
+
+            AppEvent::SessionGoal { session_id, goal } => session_updated_events(
+                self.sessions.update(session_id, |s| s.goal = goal.clone()),
+            ),
+
+            AppEvent::SessionVitals { session_id, vitals } => session_updated_events(
+                self.sessions
+                    .update(session_id, |s| s.vitals = Some(vitals.clone())),
+            ),
 
             AppEvent::SessionAttached { session_id, source } => vec![log_event(
                 LogLevel::Info,
@@ -589,10 +762,13 @@ impl AppEventUpcaster {
                 format!("session attached: {} ({})", session_id, source),
             )],
 
-            AppEvent::SessionEnded { session_id, reason } => vec![PeerEvent::SessionEnded {
-                session_id: session_id.clone(),
-                reason: reason.clone(),
-            }],
+            AppEvent::SessionEnded { session_id, reason } => {
+                self.sessions.ended(session_id);
+                vec![PeerEvent::SessionEnded {
+                    session_id: session_id.clone(),
+                    reason: reason.clone(),
+                }]
+            }
 
             AppEvent::SessionDirChanged { path } => vec![log_event(
                 LogLevel::Info,
@@ -602,38 +778,58 @@ impl AppEventUpcaster {
 
             // ---- Approval flow ----
             AppEvent::ApprovalRequired {
+                session_id,
                 id,
                 command_preview,
                 category,
-                ..
-            } => vec![PeerEvent::ApprovalRequested {
-                request: ApprovalRequest {
-                    request_id: id.to_string(),
-                    category: action_category_wire(category),
-                    preview: command_preview.clone(),
-                    auto_resolvable: false,
-                },
-            }],
+            } => {
+                let mut out = vec![PeerEvent::ApprovalRequested {
+                    request: ApprovalRequest {
+                        request_id: id.to_string(),
+                        category: action_category_wire(category),
+                        preview: command_preview.clone(),
+                        auto_resolvable: false,
+                    },
+                }];
+                out.extend(session_updated_events(
+                    self.sessions.approval_requested(*id, session_id.as_deref()),
+                ));
+                out
+            }
 
             // Structured questions flatten to the approval vocabulary for
             // peers (same treatment as askHuman below): the preview names
             // the options, and a peer-side Accept/Decline maps to the
-            // question's proceed-without-answer / dismiss paths.
-            AppEvent::UserQuestionRequired { id, questions, .. } => {
-                vec![PeerEvent::ApprovalRequested {
+            // question's proceed-without-answer / dismiss paths. Questions
+            // share the approval id space and resolve via ApprovalResolved,
+            // so they feed the session fold's `needs_approval` the same way.
+            AppEvent::UserQuestionRequired {
+                session_id,
+                id,
+                questions,
+            } => {
+                let mut out = vec![PeerEvent::ApprovalRequested {
                     request: ApprovalRequest {
                         request_id: id.to_string(),
                         category: "human_question".to_string(),
                         preview: crate::external_output::user_question_preview(questions),
                         auto_resolvable: false,
                     },
-                }]
+                }];
+                out.extend(session_updated_events(
+                    self.sessions.approval_requested(*id, session_id.as_deref()),
+                ));
+                out
             }
 
-            AppEvent::ApprovalResolved { id, action, .. } => vec![PeerEvent::ApprovalResolved {
-                request_id: id.to_string(),
-                decision: approval_decision_from_action(action),
-            }],
+            AppEvent::ApprovalResolved { id, action, .. } => {
+                let mut out = vec![PeerEvent::ApprovalResolved {
+                    request_id: id.to_string(),
+                    decision: approval_decision_from_action(action),
+                }];
+                out.extend(session_updated_events(self.sessions.approval_resolved(*id)));
+                out
+            }
 
             AppEvent::AutoApproved { preview } => {
                 let seq = self.next_seq();
@@ -961,7 +1157,9 @@ impl AppEventUpcaster {
                 }]
             }
 
-            AppEvent::UsageSnapshot { main, .. } => {
+            AppEvent::UsageSnapshot {
+                session_id, main, ..
+            } => {
                 let cost_usd = estimate_session_cost(
                     &main.model,
                     main.prompt_tokens,
@@ -969,7 +1167,7 @@ impl AppEventUpcaster {
                     main.cached_tokens,
                     0,
                 );
-                vec![PeerEvent::Usage {
+                let mut out = vec![PeerEvent::Usage {
                     snapshot: UsageSnapshot {
                         tokens_in: main.prompt_tokens,
                         tokens_out: main.completion_tokens,
@@ -983,13 +1181,36 @@ impl AppEventUpcaster {
                             cost_usd,
                         }],
                     },
-                }]
+                }];
+                if let Some(sid) = session_id.as_deref() {
+                    let tokens = main.prompt_tokens + main.completion_tokens;
+                    out.extend(session_updated_events(
+                        self.sessions.update(sid, |s| s.tokens_used = Some(tokens)),
+                    ));
+                }
+                out
             }
 
             // ---- Status ----
-            AppEvent::StatusUpdate { phase, .. } => {
-                let status = status_from_phase(phase);
-                vec![PeerEvent::StatusChanged { status }]
+            AppEvent::StatusUpdate {
+                phase,
+                session_id,
+                task,
+                ..
+            } => {
+                let mut out = vec![PeerEvent::StatusChanged {
+                    status: status_from_phase(phase),
+                }];
+                out.extend(session_updated_events(self.sessions.update(
+                    session_id,
+                    |s| {
+                        s.phase = phase.clone();
+                        if s.label.as_deref().unwrap_or("").is_empty() && !task.is_empty() {
+                            s.label = Some(task.clone());
+                        }
+                    },
+                )));
+                out
             }
 
             AppEvent::ExternalAgentChanged { agent } => vec![log_event(
@@ -1300,6 +1521,8 @@ pub struct WireEventUpcaster {
     current_message_id: Option<MessageId>,
     current_turn: Option<usize>,
     current_agent_turn: Option<usize>,
+    /// Per-session enrichment fold (see [`PeerSessionFold`]).
+    sessions: PeerSessionFold,
 }
 
 impl Default for WireEventUpcaster {
@@ -1315,7 +1538,16 @@ impl WireEventUpcaster {
             current_message_id: None,
             current_turn: None,
             current_agent_turn: None,
+            sessions: PeerSessionFold::default(),
         }
+    }
+
+    /// Record the peer daemon's own primary session id (learned by the
+    /// transport from the `/ws` bootstrap `state_snapshot` frame, which
+    /// is not an `OutboundEvent` and never reaches `upcast`). Sessions
+    /// matching it are stamped `is_primary` in every emitted snapshot.
+    pub fn set_primary_session_id(&mut self, session_id: &str) {
+        self.sessions.set_primary_session_id(session_id);
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -1386,11 +1618,7 @@ impl WireEventUpcaster {
             | OutboundEvent::Redone { .. }
             | OutboundEvent::HistoryPruned { .. }
             | OutboundEvent::ConversationRolledBack { .. }
-            | OutboundEvent::SessionIdentity { .. }
-            | OutboundEvent::SessionRelationship { .. }
             | OutboundEvent::SessionCapabilities { .. }
-            | OutboundEvent::SessionGoal { .. }
-            | OutboundEvent::SessionVitals { .. }
             | OutboundEvent::FollowUpStatus { .. }
             | OutboundEvent::SharedView { .. }
             | OutboundEvent::BrowserWorkspaceChanged { .. }
@@ -1714,13 +1942,36 @@ impl WireEventUpcaster {
             // ---- Session lifecycle ----
             OutboundEvent::SessionStarted { session_id, task } => {
                 vec![PeerEvent::SessionStarted {
-                    session: SessionInfo {
-                        session_id: session_id.clone(),
-                        label: task.clone(),
-                        started_at: now_rfc3339(),
-                    },
+                    session: self.sessions.started(session_id, task.as_deref()),
                 }]
             }
+
+            OutboundEvent::SessionIdentity {
+                session_id, source, ..
+            } => session_updated_events(
+                self.sessions
+                    .update(session_id, |s| s.source = source.clone()),
+            ),
+
+            OutboundEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ephemeral,
+            } => session_updated_events(self.sessions.update(child_session_id, |s| {
+                s.parent_session_id = Some(parent_session_id.clone());
+                s.relationship = relationship.clone();
+                s.ephemeral = *ephemeral;
+            })),
+
+            OutboundEvent::SessionGoal { session_id, goal } => session_updated_events(
+                self.sessions.update(session_id, |s| s.goal = goal.clone()),
+            ),
+
+            OutboundEvent::SessionVitals { session_id, vitals } => session_updated_events(
+                self.sessions
+                    .update(session_id, |s| s.vitals = Some(vitals.clone())),
+            ),
 
             OutboundEvent::SessionAttached { session_id, source } => vec![log_event(
                 LogLevel::Info,
@@ -1729,6 +1980,7 @@ impl WireEventUpcaster {
             )],
 
             OutboundEvent::SessionEnded { session_id, reason } => {
+                self.sessions.ended(session_id);
                 vec![PeerEvent::SessionEnded {
                     session_id: session_id.clone(),
                     reason: reason.clone(),
@@ -1744,22 +1996,32 @@ impl WireEventUpcaster {
             // this as intentional loss — non-command-exec categories
             // (file_write, destructive, etc.) lose their specific
             // category name on the wire path.
-            OutboundEvent::ApprovalRequired { id, command, .. } => {
-                vec![PeerEvent::ApprovalRequested {
+            OutboundEvent::ApprovalRequired {
+                session_id,
+                id,
+                command,
+            } => {
+                let mut out = vec![PeerEvent::ApprovalRequested {
                     request: ApprovalRequest {
                         request_id: id.to_string(),
                         category: "command_exec".to_string(),
                         preview: command.clone(),
                         auto_resolvable: false,
                     },
-                }]
+                }];
+                out.extend(session_updated_events(
+                    self.sessions.approval_requested(*id, session_id.as_deref()),
+                ));
+                out
             }
 
             OutboundEvent::ApprovalResolved { id, action, .. } => {
-                vec![PeerEvent::ApprovalResolved {
+                let mut out = vec![PeerEvent::ApprovalResolved {
                     request_id: id.to_string(),
                     decision: approval_decision_from_action(action),
-                }]
+                }];
+                out.extend(session_updated_events(self.sessions.approval_resolved(*id)));
+                out
             }
 
             OutboundEvent::AutoApproved { preview } => {
@@ -1794,16 +2056,26 @@ impl WireEventUpcaster {
 
             // Structured questions flatten to the approval vocabulary the
             // same way askHuman does, but keep their real id so a peer's
-            // Accept/Decline resolves the actual prompt.
-            OutboundEvent::UserQuestion { id, questions, .. } => {
-                vec![PeerEvent::ApprovalRequested {
+            // Accept/Decline resolves the actual prompt. Questions share
+            // the approval id space and resolve via ApprovalResolved, so
+            // they feed the session fold's `needs_approval` the same way.
+            OutboundEvent::UserQuestion {
+                session_id,
+                id,
+                questions,
+            } => {
+                let mut out = vec![PeerEvent::ApprovalRequested {
                     request: ApprovalRequest {
                         request_id: id.to_string(),
                         category: "human_question".to_string(),
                         preview: crate::external_output::user_question_preview(questions),
                         auto_resolvable: false,
                     },
-                }]
+                }];
+                out.extend(session_updated_events(
+                    self.sessions.approval_requested(*id, session_id.as_deref()),
+                ));
+                out
             }
 
             OutboundEvent::HumanResponseSent => vec![log_event(
@@ -2040,7 +2312,12 @@ impl WireEventUpcaster {
                 }]
             }
 
-            OutboundEvent::Usage { main, .. } | OutboundEvent::UsageUpdate { main, .. } => {
+            OutboundEvent::Usage {
+                session_id, main, ..
+            }
+            | OutboundEvent::UsageUpdate {
+                session_id, main, ..
+            } => {
                 let cost_usd = estimate_session_cost(
                     &main.model,
                     main.prompt_tokens,
@@ -2048,7 +2325,7 @@ impl WireEventUpcaster {
                     main.cached_tokens,
                     0,
                 );
-                vec![PeerEvent::Usage {
+                let mut out = vec![PeerEvent::Usage {
                     snapshot: UsageSnapshot {
                         tokens_in: main.prompt_tokens,
                         tokens_out: main.completion_tokens,
@@ -2062,13 +2339,36 @@ impl WireEventUpcaster {
                             cost_usd,
                         }],
                     },
-                }]
+                }];
+                if let Some(sid) = session_id.as_deref() {
+                    let tokens = main.prompt_tokens + main.completion_tokens;
+                    out.extend(session_updated_events(
+                        self.sessions.update(sid, |s| s.tokens_used = Some(tokens)),
+                    ));
+                }
+                out
             }
 
             // ---- Status ----
-            OutboundEvent::Status { phase, .. } => {
-                let status = status_from_phase(phase);
-                vec![PeerEvent::StatusChanged { status }]
+            OutboundEvent::Status {
+                phase,
+                session_id,
+                task,
+                ..
+            } => {
+                let mut out = vec![PeerEvent::StatusChanged {
+                    status: status_from_phase(phase),
+                }];
+                out.extend(session_updated_events(self.sessions.update(
+                    session_id,
+                    |s| {
+                        s.phase = phase.clone();
+                        if s.label.as_deref().unwrap_or("").is_empty() && !task.is_empty() {
+                            s.label = Some(task.clone());
+                        }
+                    },
+                )));
+                out
             }
 
             OutboundEvent::ExternalAgentChanged { agent } => vec![log_event(
@@ -3588,6 +3888,368 @@ mod tests {
             !msg_b.contains("99"),
             "wire path cannot include display_id because wire variant has no fields: {msg_b}"
         );
+    }
+
+    // ===================================================================
+    // Per-session fold tests
+    // ===================================================================
+
+    fn vitals_with_git() -> crate::types::SessionVitals {
+        crate::types::SessionVitals {
+            git: Some(crate::types::SessionGitVitals {
+                branch: "main".into(),
+                dirty_files: 2,
+                ahead: 1,
+                behind: 0,
+                primary_ref: "origin/main".into(),
+                merge_parity: "clean".into(),
+                unpushed: Some(0),
+                primary_unpushed: None,
+            }),
+            cache: None,
+            limits: Vec::new(),
+        }
+    }
+
+    /// The wire fold enriches one session's snapshot across the whole
+    /// event stream — identity, relationship, goal, vitals, status,
+    /// usage, approvals — and retires it on SessionEnded.
+    #[test]
+    fn wire_session_fold_enriches_across_event_stream() {
+        let mut u = WireEventUpcaster::new();
+
+        let out = u.upcast(&OutboundEvent::SessionStarted {
+            session_id: "s1".into(),
+            task: Some("port the vitals".into()),
+        });
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            PeerEvent::SessionStarted { session } => {
+                assert_eq!(session.session_id, "s1");
+                assert_eq!(session.label.as_deref(), Some("port the vitals"));
+                assert!(!session.is_primary);
+            }
+            other => panic!("expected SessionStarted, got {other:?}"),
+        }
+
+        let out = u.upcast(&OutboundEvent::SessionIdentity {
+            session_id: "s1".into(),
+            source: "codex".into(),
+            backend_session_id: "thread-1".into(),
+        });
+        match &out[0] {
+            PeerEvent::SessionUpdated { session } => assert_eq!(session.source, "codex"),
+            other => panic!("expected SessionUpdated, got {other:?}"),
+        }
+
+        let out = u.upcast(&OutboundEvent::SessionRelationship {
+            parent_session_id: "s0".into(),
+            child_session_id: "s1".into(),
+            relationship: "subagent".into(),
+            ephemeral: false,
+        });
+        match &out[0] {
+            PeerEvent::SessionUpdated { session } => {
+                assert_eq!(session.parent_session_id.as_deref(), Some("s0"));
+                assert_eq!(session.relationship, "subagent");
+                assert!(!session.ephemeral);
+            }
+            other => panic!("expected SessionUpdated, got {other:?}"),
+        }
+
+        let out = u.upcast(&OutboundEvent::SessionGoal {
+            session_id: "s1".into(),
+            goal: Some(crate::types::SessionGoal {
+                objective: "ship it".into(),
+                status: Some("active".into()),
+                elapsed_seconds: None,
+                tokens_used: Some(5),
+                token_budget: Some(100),
+            }),
+        });
+        match &out[0] {
+            PeerEvent::SessionUpdated { session } => {
+                assert_eq!(
+                    session.goal.as_ref().and_then(|g| g.status.as_deref()),
+                    Some("active")
+                );
+            }
+            other => panic!("expected SessionUpdated, got {other:?}"),
+        }
+
+        let out = u.upcast(&OutboundEvent::SessionVitals {
+            session_id: "s1".into(),
+            vitals: vitals_with_git(),
+        });
+        match &out[0] {
+            PeerEvent::SessionUpdated { session } => {
+                assert_eq!(
+                    session
+                        .vitals
+                        .as_ref()
+                        .and_then(|v| v.git.as_ref())
+                        .map(|g| g.dirty_files),
+                    Some(2)
+                );
+            }
+            other => panic!("expected SessionUpdated, got {other:?}"),
+        }
+
+        let out = u.upcast(&OutboundEvent::Status {
+            turn: 3,
+            phase: "working".into(),
+            autonomy: "full".into(),
+            session_id: "s1".into(),
+            task: String::new(),
+            external_agent: None,
+        });
+        assert_eq!(out.len(), 2, "StatusChanged + SessionUpdated");
+        assert!(matches!(out[0], PeerEvent::StatusChanged { .. }));
+        match &out[1] {
+            PeerEvent::SessionUpdated { session } => assert_eq!(session.phase, "working"),
+            other => panic!("expected SessionUpdated, got {other:?}"),
+        }
+
+        let out = u.upcast(&OutboundEvent::Usage {
+            session_id: Some("s1".into()),
+            main: crate::frontend::ModelUsageSnapshot {
+                provider: "openai".into(),
+                model: "gpt".into(),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                ..Default::default()
+            },
+            presence: None,
+        });
+        assert_eq!(out.len(), 2, "Usage + SessionUpdated");
+        match &out[1] {
+            PeerEvent::SessionUpdated { session } => {
+                assert_eq!(session.tokens_used, Some(150));
+            }
+            other => panic!("expected SessionUpdated, got {other:?}"),
+        }
+
+        let out = u.upcast(&OutboundEvent::ApprovalRequired {
+            session_id: Some("s1".into()),
+            id: 7,
+            command: "rm -rf scratch".into(),
+        });
+        assert_eq!(out.len(), 2, "ApprovalRequested + SessionUpdated");
+        match &out[1] {
+            PeerEvent::SessionUpdated { session } => assert!(session.needs_approval),
+            other => panic!("expected SessionUpdated, got {other:?}"),
+        }
+
+        let out = u.upcast(&OutboundEvent::ApprovalResolved {
+            session_id: Some("s1".into()),
+            id: 7,
+            action: "approve".into(),
+        });
+        assert_eq!(out.len(), 2, "ApprovalResolved + SessionUpdated");
+        match &out[1] {
+            PeerEvent::SessionUpdated { session } => assert!(!session.needs_approval),
+            other => panic!("expected SessionUpdated, got {other:?}"),
+        }
+
+        let out = u.upcast(&OutboundEvent::SessionEnded {
+            session_id: "s1".into(),
+            reason: "done".into(),
+        });
+        assert_eq!(out.len(), 1, "ended retires the entry — no trailing update");
+        assert!(matches!(out[0], PeerEvent::SessionEnded { .. }));
+        assert!(u.sessions.sessions.is_empty());
+        assert!(u.sessions.pending_approvals.is_empty());
+    }
+
+    /// Chatty sources (per-tick status) must not spam SessionUpdated:
+    /// an identical repeat emits only the host-level StatusChanged.
+    #[test]
+    fn wire_session_fold_emits_only_on_change() {
+        let mut u = WireEventUpcaster::new();
+        let status = OutboundEvent::Status {
+            turn: 1,
+            phase: "working".into(),
+            autonomy: "full".into(),
+            session_id: "s1".into(),
+            task: "t".into(),
+            external_agent: None,
+        };
+        let first = u.upcast(&status);
+        assert_eq!(first.len(), 2, "first status creates the session entry");
+        let second = u.upcast(&status);
+        assert_eq!(
+            second.len(),
+            1,
+            "identical status must not re-emit SessionUpdated"
+        );
+        assert!(matches!(second[0], PeerEvent::StatusChanged { .. }));
+    }
+
+    /// An event naming a session that was never announced (a primary
+    /// that connected mid-flight) upserts the entry — the fold is
+    /// self-healing across reconnects.
+    #[test]
+    fn wire_session_fold_upserts_unknown_sessions() {
+        let mut u = WireEventUpcaster::new();
+        let out = u.upcast(&OutboundEvent::SessionVitals {
+            session_id: "ghost".into(),
+            vitals: vitals_with_git(),
+        });
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            PeerEvent::SessionUpdated { session } => {
+                assert_eq!(session.session_id, "ghost");
+                assert!(session.vitals.is_some());
+                assert!(!session.started_at.is_empty());
+            }
+            other => panic!("expected SessionUpdated, got {other:?}"),
+        }
+    }
+
+    /// `set_primary_session_id` stamps `is_primary` whether it is
+    /// learned before or after the session itself (the bootstrap
+    /// frame's ordering relative to live events is connection-dependent).
+    #[test]
+    fn wire_session_fold_stamps_primary_before_and_after_learning() {
+        let mut u = WireEventUpcaster::new();
+        u.set_primary_session_id("main-1");
+        let out = u.upcast(&OutboundEvent::SessionStarted {
+            session_id: "main-1".into(),
+            task: None,
+        });
+        match &out[0] {
+            PeerEvent::SessionStarted { session } => assert!(session.is_primary),
+            other => panic!("expected SessionStarted, got {other:?}"),
+        }
+
+        let mut u = WireEventUpcaster::new();
+        let _ = u.upcast(&OutboundEvent::SessionStarted {
+            session_id: "main-2".into(),
+            task: None,
+        });
+        u.set_primary_session_id("main-2");
+        let out = u.upcast(&OutboundEvent::SessionIdentity {
+            session_id: "main-2".into(),
+            source: "intendant".into(),
+            backend_session_id: "x".into(),
+        });
+        match &out[0] {
+            PeerEvent::SessionUpdated { session } => {
+                assert!(session.is_primary, "retro-stamp must apply");
+            }
+            other => panic!("expected SessionUpdated, got {other:?}"),
+        }
+    }
+
+    /// The fold is bounded: a peer that announces sessions without
+    /// ever ending them evicts oldest-started at the cap.
+    #[test]
+    fn wire_session_fold_evicts_oldest_over_cap() {
+        let mut u = WireEventUpcaster::new();
+        for i in 0..(MAX_TRACKED_PEER_SESSIONS + 10) {
+            let _ = u.upcast(&OutboundEvent::SessionStarted {
+                session_id: format!("s{i:04}"),
+                task: None,
+            });
+        }
+        assert_eq!(u.sessions.sessions.len(), MAX_TRACKED_PEER_SESSIONS);
+        assert!(
+            u.sessions
+                .sessions
+                .contains_key(&format!("s{:04}", MAX_TRACKED_PEER_SESSIONS + 9)),
+            "newest session survives"
+        );
+        assert!(
+            !u.sessions.sessions.contains_key("s0000"),
+            "oldest session evicted"
+        );
+    }
+
+    // ---- Parity for the fold arms ----
+
+    #[test]
+    fn parity_session_identity() {
+        assert_parity(AppEvent::SessionIdentity {
+            session_id: "s1".into(),
+            source: "codex".into(),
+            backend_session_id: "b".into(),
+        });
+    }
+
+    #[test]
+    fn parity_session_relationship() {
+        assert_parity(AppEvent::SessionRelationship {
+            parent_session_id: "s0".into(),
+            child_session_id: "s1".into(),
+            relationship: "subagent".into(),
+            ephemeral: true,
+        });
+    }
+
+    #[test]
+    fn parity_session_goal() {
+        assert_parity(AppEvent::SessionGoal {
+            session_id: "s1".into(),
+            goal: Some(crate::types::SessionGoal {
+                objective: "ship it".into(),
+                status: Some("active".into()),
+                elapsed_seconds: Some(60),
+                tokens_used: Some(5),
+                token_budget: Some(100),
+            }),
+        });
+    }
+
+    #[test]
+    fn parity_session_vitals() {
+        assert_parity(AppEvent::SessionVitals {
+            session_id: "s1".into(),
+            vitals: vitals_with_git(),
+        });
+    }
+
+    #[test]
+    fn parity_status_update_folds_session_phase() {
+        assert_parity(AppEvent::StatusUpdate {
+            turn: 2,
+            phase: "working".into(),
+            autonomy: "full".into(),
+            session_id: "s1".into(),
+            task: "t".into(),
+        });
+    }
+
+    #[test]
+    fn parity_usage_snapshot_with_session() {
+        assert_parity(AppEvent::UsageSnapshot {
+            session_id: Some("s1".into()),
+            main: crate::frontend::ModelUsageSnapshot {
+                provider: "openai".into(),
+                model: "gpt".into(),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                ..Default::default()
+            },
+            presence: None,
+        });
+    }
+
+    /// Approval parity holds for `CommandExec` (the wire path hardcodes
+    /// that category — the documented intentional loss covers the rest)
+    /// and both paths append the same SessionUpdated fold event.
+    #[test]
+    fn parity_approval_lifecycle_folds_needs_approval() {
+        assert_parity(AppEvent::ApprovalRequired {
+            session_id: Some("s1".into()),
+            id: 7,
+            command_preview: "cargo test".into(),
+            category: crate::autonomy::ActionCategory::CommandExec,
+        });
+        assert_parity(AppEvent::ApprovalResolved {
+            session_id: Some("s1".into()),
+            id: 7,
+            action: "approve".into(),
+        });
     }
 
     /// `OutboundEvent::WebRtcSignal` upcasts 1:1 to
