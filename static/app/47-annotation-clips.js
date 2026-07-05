@@ -2156,7 +2156,7 @@ document.getElementById('clip-save-btn').addEventListener('click', () => submitC
 document.getElementById('clip-attach-btn').addEventListener('click', () => submitClip('attach'));
 document.getElementById('clip-send-btn').addEventListener('click', () => submitClip('send'));
 
-// ��─ Clip toolbar event wiring ──
+// ── Clip toolbar event wiring ──
 
 document.getElementById('rec-clip-btn').addEventListener('click', enterClipMode);
 document.getElementById('clip-close').addEventListener('click', exitClipMode);
