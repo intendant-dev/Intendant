@@ -25,7 +25,7 @@ The runtime/controller split is the load-bearing security decision: a compromise
 
 ## Architecture at a Glance
 
-The controller runs a budget-aware loop in one of **four execution modes**: Direct (`--direct`), User (an orchestrator decomposes work to sub-agents in isolated git worktrees), Sub-Agent (`INTENDANT_ROLE`), and External-Agent (`--agent`, supervising a third-party coding CLI). A separate **presence** AI mediates between the user and the worker. A single-writer **control plane** owns shared state — frontends are display-only, emitting intents (`ControlMsg`) rather than mutating state. A persistent **daemon** owns long-lived sessions; the web dashboard is the default frontend (`--web` is on by default).
+The controller runs a budget-aware in-process loop in one of several **execution shapes**: Direct (`--direct`, and every non-daemon CLI path), Orchestrate (the same loop with the orchestration prompt; delegates via the `spawn_sub_agent` / `wait_sub_agents` tools), Sub-Agent (a supervised child session that reports back with `submit_result`, optionally in an isolated git worktree), and External-Agent (`--agent`, supervising a third-party coding CLI). Orchestration is a capability of every supervised native session, not a separate mode — the February-era subprocess pipeline (`run_user_mode`, `INTENDANT_ROLE` child processes, result-file polling) is gone. A separate **presence** AI mediates between the user and the worker. A single-writer **control plane** owns shared state — frontends are display-only, emitting intents (`ControlMsg`) rather than mutating state. A persistent **daemon** owns long-lived sessions; the web dashboard is the default frontend (`--web` is on by default).
 
 Read the relevant chapter before changing a subsystem:
 
@@ -93,7 +93,7 @@ src/
 │   ├── control_plane.rs, event.rs, frontend.rs   # single-writer state; EventBus; UserAction/ControlMsg
 │   ├── session_supervisor.rs, task_dispatch.rs, file_watcher.rs   # daemon: sessions, dispatch, rewind snapshots
 │   ├── provider.rs, conversation.rs, tools.rs, prompts.rs, skills.rs, autonomy.rs, approval.rs
-│   ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, user_mode.rs, agent_runner.rs   # native multi-agent
+│   ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, agent_runner.rs   # native multi-agent
 │   ├── context_rewind.rs, fission_ledger.rs, fission_lifecycle.rs, lineage_ledger.rs   # managed context: rewinds, fission, lineage
 │   ├── external_agent/         # supervise Codex / Claude Code (+ external_wrapper_index.rs)
 │   ├── access/                 # trust architecture: client keys, IAM, org roots/issuers/ORL, enrollment, platform keystores

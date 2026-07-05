@@ -152,8 +152,8 @@ pub enum PeerEvent {
 
     // ---- Structured log line ----
     /// Levelled, sourced log entry. Replaces `AppEvent::LogEntry`,
-    /// `PresenceLog`, `VoiceLog`, `OrchestratorLog`, `ContextManagement`.
-    /// `source` is a free-form tag like `"orchestrator"` / `"voice"` /
+    /// `PresenceLog`, `VoiceLog`, `ContextManagement`.
+    /// `source` is a free-form tag like `"subagent"` / `"voice"` /
     /// `"presence"` so the renderer can group/filter.
     Log {
         level: LogLevel,

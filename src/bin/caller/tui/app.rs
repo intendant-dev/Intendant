@@ -2026,25 +2026,6 @@ impl App {
                     Some(self.turn),
                 );
             }
-            AppEvent::OrchestratorProgress {
-                turn,
-                status,
-                last_action,
-            } => {
-                self.turn = turn;
-                self.current_phase = Phase::Orchestrating;
-                let summary = if last_action.is_empty() {
-                    format!("Orchestrator T{}: {}", turn, status)
-                } else {
-                    format!("Orchestrator T{}: {} — {}", turn, status, last_action)
-                };
-                // Local-only: OutboundEvent::OrchestratorProgress already
-                // reaches external consumers.
-                self.log_local_only(LogLevel::SubAgent, summary, LogSource::Agent, Some(turn));
-            }
-            AppEvent::OrchestratorLog { message, level } => {
-                self.log_sourced(level, message, LogSource::Agent, Some(self.turn));
-            }
             AppEvent::ContextManagement { turn } => {
                 // Local-only: OutboundEvent::ContextManagement already
                 // reaches external consumers.
@@ -3441,36 +3422,6 @@ mod tests {
     }
 
     #[test]
-    fn handle_event_orchestrator_progress() {
-        let mut app = test_app();
-        app.handle_event(AppEvent::OrchestratorProgress {
-            turn: 7,
-            status: "running".to_string(),
-            last_action: "Analyzing codebase".to_string(),
-        });
-        assert_eq!(app.turn, 7);
-        assert_eq!(app.current_phase, Phase::Orchestrating);
-        assert_eq!(app.log_entries.len(), 1);
-        assert_eq!(app.log_entries[0].level, LogLevel::SubAgent);
-        assert!(app.log_entries[0].content.contains("Orchestrator T7"));
-        assert!(app.log_entries[0].content.contains("Analyzing codebase"));
-    }
-
-    #[test]
-    fn handle_event_orchestrator_progress_empty_action() {
-        let mut app = test_app();
-        app.handle_event(AppEvent::OrchestratorProgress {
-            turn: 3,
-            status: "spawning".to_string(),
-            last_action: String::new(),
-        });
-        assert_eq!(app.turn, 3);
-        assert_eq!(app.current_phase, Phase::Orchestrating);
-        assert!(app.log_entries[0].content.contains("spawning"));
-        assert!(!app.log_entries[0].content.contains("—"));
-    }
-
-    #[test]
     fn handle_event_streaming_delta_accumulates() {
         let mut app = test_app();
         app.handle_event(AppEvent::ModelResponseDelta {
@@ -3900,17 +3851,6 @@ mod tests {
             count_log_entries(&derived),
             1,
             "JsonExtracted missing LogEntry"
-        );
-
-        // OrchestratorLog: no OutboundEvent → TUI log_sourced is the only path
-        let derived = app.handle_event(AppEvent::OrchestratorLog {
-            message: "hello".to_string(),
-            level: LogLevel::Info,
-        });
-        assert_eq!(
-            count_log_entries(&derived),
-            1,
-            "OrchestratorLog missing LogEntry"
         );
 
         // LiveAudioStarted: no OutboundEvent → TUI log is the only path

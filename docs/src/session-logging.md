@@ -105,7 +105,7 @@ The event vocabulary is broad and grows with the system. Grouped by area
 | Runtime | `agent_input`, `agent_output` |
 | Approvals | `approval`, `approval_resolved`, `auto_approved`, `human_question`, `human_response_sent` |
 | Context | `context_snapshot`, `snapshot_created`, `conversation_rolled_back`, `rolled_back`, `redone`, `history_pruned` |
-| Sessions/graph | `session_identity`, `session_relationship`, `session_attached`, `session_capabilities`, `sub_agent_result`, `orchestrator_progress`, `presence_checkpoint` |
+| Sessions/graph | `session_identity`, `session_relationship`, `session_attached`, `session_capabilities`, `sub_agent_result`, `presence_checkpoint` |
 | Computer use | `cu_task_start`, `cu_turn`, `cu_task_complete`, `cu_task_error` |
 | Display | `display_ready`, `display_taken`, `display_released`, `display_resize`, `debug_screen_ready`, `debug_screen_torn_down` |
 | Voice/live | `live_audio_started`, `live_audio_progress`, `live_audio_completed`, `live_usage_update`, `presence_connected`, `presence_disconnected`, `presence_log`, `presence_usage_update` |

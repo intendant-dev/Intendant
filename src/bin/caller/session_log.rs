@@ -318,16 +318,6 @@ impl SessionLog {
         self.write_meta_with_name_and_role(project_root, task, name, None);
     }
 
-    /// Write session metadata with an optional role field.
-    pub fn write_meta_with_role(
-        &self,
-        project_root: Option<&Path>,
-        task: Option<&str>,
-        role: Option<&str>,
-    ) {
-        self.write_meta_with_name_and_role(project_root, task, None, role);
-    }
-
     fn write_meta_with_name_and_role(
         &self,
         project_root: Option<&Path>,
@@ -1959,19 +1949,6 @@ impl SessionLog {
         });
     }
 
-    /// Log orchestrator progress.
-    pub fn orchestrator_progress(&mut self, status: &str) {
-        self.emit(LogEvent {
-            ts: Self::ts(),
-            turn: None,
-            event: "orchestrator_progress".to_string(),
-            level: Some("info".to_string()),
-            message: Some(status.to_string()),
-            data: None,
-            file: None,
-            file2: None,
-        });
-    }
 
     /// Log presence layer log message.
     pub fn presence_log(&mut self, message: &str, level: Option<&str>) {
@@ -3544,14 +3521,11 @@ pub fn session_log_entry_to_app_event(
             })
         }
 
-        // ── Sub-agent / orchestrator ──
+        // ── Sub-agent results ──
+        // (`orchestrator_progress` entries in pre-unification session logs
+        // are skipped like any other unknown event kind.)
         "sub_agent_result" => Some(AppEvent::SubAgentResult {
             formatted: message.to_string(),
-        }),
-        "orchestrator_progress" => Some(AppEvent::OrchestratorProgress {
-            turn: 0,
-            status: message.to_string(),
-            last_action: String::new(),
         }),
 
         // ── Presence / live usage ──

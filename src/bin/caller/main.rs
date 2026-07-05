@@ -24824,8 +24824,6 @@ Also: {"source": "bare"}"#;
     }
 }
 
-const PROGRESS_INTERVAL: usize = 5;
-
 fn orchestration_unavailable() -> String {
     "Error: sub-agent orchestration is only available in supervised sessions under the \
      web daemon (the default mode). This session has no session supervisor, so \
@@ -25246,8 +25244,6 @@ async fn run_agent_loop(
     let mut empty_command_streak = 0usize;
     let mut cu_action_counter = 0u64;
     let mut loop_stats = LoopStats::default();
-    let mut seen_sub_agent_results: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
     let mut exit_reason = LoopExitReason::TaskComplete;
 
     // Discard stale System injections from before this task started
@@ -25670,24 +25666,6 @@ async fn run_agent_loop(
             });
             bus.send(AppEvent::BudgetWarning { pct, remaining });
             budget_warning_shown = true;
-        }
-
-        // Write sub-agent progress periodically
-        if let Some((id, _role)) = sub_agent_mode {
-            if turn % PROGRESS_INTERVAL == 0 {
-                if let Ok(progress_path) = env::var("INTENDANT_PROGRESS_FILE") {
-                    let last_action = response.content.chars().take(500).collect::<String>();
-                    let progress = sub_agent::SubAgentProgress {
-                        id: id.clone(),
-                        turn,
-                        status: "running".to_string(),
-                        last_action,
-                        question: None,
-                    };
-                    let _ =
-                        sub_agent::write_progress(std::path::Path::new(&progress_path), &progress);
-                }
-            }
         }
 
         // For CU-only turns, synthesize a content summary from the actions
@@ -26766,25 +26744,6 @@ Proceed with explicit assumptions and continue without additional questions."
                 output_id: Some(output_id),
             });
 
-            // Check for completed sub-agent results
-            let sub_agent_dir = project.sub_agent_dir();
-            if sub_agent_dir.exists() {
-                let results = sub_agent::scan_completed_results(&sub_agent_dir);
-                for result in &results {
-                    let key = format!("{}::{}", result.id, result.summary);
-                    if !seen_sub_agent_results.insert(key) {
-                        continue;
-                    }
-                    let msg = sub_agent::format_result_message(result);
-                    slog(&session_log, |l| {
-                        l.info(&format!("Sub-agent result: {}", msg))
-                    });
-                    bus.send(AppEvent::SubAgentResult {
-                        formatted: msg.clone(),
-                    });
-                }
-            }
-
             // Format agent output as next user message, include budget summary
             let mut user_msg = format!("Agent output:\n{}", output.stdout);
             if !output.stderr.is_empty() {
@@ -27048,210 +27007,6 @@ fn resolve_initial_task_for_startup(
         return Err(CallerError::Config("No task provided".to_string()));
     }
     Ok(Some(task))
-}
-
-/// Legacy get_task for sub-agent mode (doesn't use CliFlags).
-fn get_task() -> Result<String, CallerError> {
-    if env::args().len() > 1 {
-        Ok(env::args().skip(1).collect::<Vec<_>>().join(" "))
-    } else if let Ok(task) = env::var("INTENDANT_TASK") {
-        Ok(task)
-    } else {
-        print!("Enter task: ");
-        io::stdout().flush()?;
-        let mut line = String::new();
-        io::stdin().lock().read_line(&mut line)?;
-        Ok(line.trim().to_string())
-    }
-}
-
-async fn run_sub_agent_mode(
-    provider: Box<dyn provider::ChatProvider>,
-    id: String,
-    role: sub_agent::SubAgentRole,
-    session_log: SharedSessionLog,
-    log_dir: PathBuf,
-) -> Result<LoopStats, CallerError> {
-    let project = Project::detect()?;
-    // A spawner may hand this sub-agent a bespoke system prompt via the
-    // INTENDANT_SYSTEM_PROMPT env var; it replaces the file-resolved
-    // prompt wholesale — the result-file and progress contracts are
-    // enforced in code, not by prompt text. Absent that, prompts resolve
-    // from the SysPrompt files by role, with project-root overrides.
-    let custom_prompt = env::var("INTENDANT_SYSTEM_PROMPT")
-        .ok()
-        .filter(|p| !p.trim().is_empty());
-    let system_prompt = match custom_prompt {
-        Some(prompt) => prompt,
-        None if provider.use_tools() => {
-            prompts::resolve_system_prompt_for_tools(&role, Some(&project.root))?
-        }
-        None => prompts::resolve_system_prompt(&role, Some(&project.root))?,
-    };
-    let task = get_task()?;
-
-    if task.is_empty() {
-        return Err(CallerError::Config("No task provided".to_string()));
-    }
-
-    slog(&session_log, |l| {
-        l.write_meta_with_role(Some(&project.root), None, Some(role.as_str()));
-        l.info(&format!("Sub-agent mode: {} (role: {})", id, role.as_str()));
-        l.info(&format!(
-            "Provider: {} (context window: {})",
-            provider.name(),
-            provider.context_window()
-        ));
-    });
-    println!("Running as sub-agent: {} (role: {})", id, role.as_str());
-    println!(
-        "Provider: {} (context window: {})",
-        provider.name(),
-        provider.context_window()
-    );
-
-    let mut conversation = Conversation::new(system_prompt, provider.context_window());
-
-    // Inject project root so the model knows which directory to work in
-    conversation.add_user(format!(
-        "Working directory: {}\nThis is the project you should examine and modify. \
-All relative paths and commands execute from this directory.",
-        project.root.display()
-    ));
-    conversation.add_assistant(
-        "Understood. I will work within the specified project directory.".to_string(),
-    );
-
-    // Inject INTENDANT.md instructions
-    if let Some(instructions) = prompts::load_project_instructions(Some(&project.root)) {
-        conversation.add_user(instructions);
-        conversation
-            .add_assistant("Acknowledged. I will follow the project instructions.".to_string());
-    }
-
-    // Inject knowledge if inherited
-    if env::var("INTENDANT_INHERIT_MEMORY").is_ok() && project.config.memory.enabled {
-        if let Ok(kstore) = knowledge::load(&project.memory_path()) {
-            let refs: Vec<&_> = kstore.entries.iter().collect();
-            let msg = knowledge::format_for_injection(&refs);
-            if !msg.is_empty() {
-                conversation.add_user(msg);
-                conversation.add_assistant(
-                    "Acknowledged. I have loaded the project knowledge.".to_string(),
-                );
-            }
-        }
-    }
-
-    conversation.add_user(task.clone());
-    slog(&session_log, |l| l.info(&format!("Task: {}", task)));
-    println!("Task: {}", task);
-    println!("---");
-
-    let autonomy = autonomy::shared_autonomy(AutonomyState::new(
-        AutonomyLevel::Full, // sub-agents run fully autonomous
-        autonomy::ApprovalConfig::default(),
-    ));
-
-    let sub_agent_info = (id.clone(), role);
-    let session_log_for_summary = session_log.clone();
-    let sub_agent_bus = EventBus::new();
-    let sub_agent_registry = event::ApprovalRegistry::default();
-    let result = run_agent_loop(
-        provider.as_ref(),
-        &mut conversation,
-        &project,
-        Some(&sub_agent_info),
-        &sub_agent_bus,
-        autonomy,
-        session_log,
-        &log_dir,
-        None, // no MCP client for sub-agents
-        None, // no JSON approval for sub-agents
-        &sub_agent_registry,
-        &event::ContextInjectionQueue::default(),
-        &mut None, // sub-agents get their own display if needed
-        None,      // sub-agent processes have no in-process display sessions
-        true,      // headless (sub-agents have no interactive UI)
-        None,      // subprocess children have no supervisor handle
-    )
-    .await;
-
-    // Map (LoopStats, LoopExitReason) → LoopStats for sub-agent callers
-    let result = result.map(|(stats, _reason)| stats);
-
-    // Update session status before writing result file
-    match &result {
-        Ok(stats) => slog(&session_log_for_summary, |l| {
-            l.write_summary_with_rounds(&task, "completed", stats.turns, Some(stats.rounds))
-        }),
-        Err(e) => slog(&session_log_for_summary, |l| {
-            l.write_summary(&task, &format!("error: {}", e), 0)
-        }),
-    }
-
-    // Write result file
-    if let Ok(result_path) = env::var("INTENDANT_RESULT_FILE") {
-        let (status, summary, brief, usage) = match &result {
-            Ok(stats) => {
-                let full = stats
-                    .last_response
-                    .clone()
-                    .unwrap_or_else(|| "Task completed successfully".to_string());
-                let (brief, was_explicit) = parse_brief(&full);
-                if was_explicit {
-                    slog(&session_log_for_summary, |l| {
-                        l.debug(&format!("Task brief (model): {}", brief))
-                    });
-                } else {
-                    slog(&session_log_for_summary, |l| {
-                        l.debug(&format!(
-                            "Task brief (fallback — model omitted BRIEF: line): {}",
-                            brief
-                        ))
-                    });
-                }
-                (
-                    sub_agent::SubAgentStatus::Completed,
-                    full,
-                    brief,
-                    stats.usage.clone(),
-                )
-            }
-            Err(e) => (
-                sub_agent::SubAgentStatus::Failed(e.to_string()),
-                format!("Task failed: {}", e),
-                format!("Task failed: {}", e),
-                provider::TokenUsage::default(),
-            ),
-        };
-
-        let agent_result = sub_agent::SubAgentResult {
-            id,
-            status,
-            summary,
-            brief,
-            findings: vec![],
-            artifacts: vec![],
-            usage,
-        };
-        if let Err(e) = sub_agent::write_result(std::path::Path::new(&result_path), &agent_result) {
-            // The parent discovers sub-agent completion ONLY through this
-            // file; a swallowed failure strands it polling until timeout.
-            slog(&session_log_for_summary, |l| {
-                l.error(&format!(
-                    "Failed to write sub-agent result file {}: {}",
-                    result_path, e
-                ))
-            });
-            eprintln!(
-                "Failed to write sub-agent result file {}: {}",
-                result_path, e
-            );
-        }
-    }
-
-    result
 }
 
 /// RAII guard that increments the presence-pause ref-count on construction
@@ -29728,7 +29483,16 @@ async fn run_direct_mode(
     native: NativeSessionConfig,
 ) -> Result<LoopStats, CallerError> {
     let role = native.role.clone();
-    let system_prompt = match native.system_prompt_override.clone() {
+    // Prompt precedence: session-scoped override (spawn_sub_agent's
+    // system_prompt) > the INTENDANT_SYSTEM_PROMPT env escape hatch for
+    // direct CLI invocations > the role-resolved SysPrompt files. An
+    // override replaces the resolved prompt wholesale.
+    let system_prompt_override = native.system_prompt_override.clone().or_else(|| {
+        env::var("INTENDANT_SYSTEM_PROMPT")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+    });
+    let system_prompt = match system_prompt_override {
         Some(prompt) => prompt,
         None if provider.use_tools() => {
             prompts::resolve_system_prompt_for_tools(&role, Some(&project.root))?
@@ -34631,10 +34395,6 @@ async fn main() -> Result<(), CallerError> {
             env::set_var("MAX_OUTPUT_TOKENS", max_out.to_string());
         }
     }
-    if let Some(max_parallel) = project.config.orchestrator.max_parallel_agents {
-        env::set_var("INTENDANT_MAX_PARALLEL_AGENTS", max_parallel.to_string());
-    }
-
     // Create or resume session log.
     //
     // Under the default-web daemon, --continue/--resume are owned by the
@@ -34968,14 +34728,6 @@ async fn main() -> Result<(), CallerError> {
         l.debug(&format!("Project root: {}", project.root.display()));
         l.debug(&format!("Autonomy: {}", flags.autonomy));
     });
-
-    // Check if running as a sub-agent (headless, no TUI)
-    if let Some((id, role)) = sub_agent::detect_sub_agent_mode() {
-        let provider = provider
-            .ok_or_else(|| CallerError::Config("Sub-agent mode requires an API key".to_string()))?;
-        run_sub_agent_mode(provider, id, role, session_log, log_dir).await?;
-        return Ok(());
-    }
 
     // Determine whether to use TUI (needed early for task resolution).
     // Idle web/dashboard startup defaults to the daemon path: no terminal TUI,

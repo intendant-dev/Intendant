@@ -54,47 +54,6 @@ pub struct SubAgentResult {
     pub usage: TokenUsage,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubAgentProgress {
-    pub id: String,
-    pub turn: usize,
-    pub status: String,
-    pub last_action: String,
-    pub question: Option<String>,
-}
-
-pub fn read_result(path: &Path) -> Result<SubAgentResult, CallerError> {
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        CallerError::SubAgent(format!("Failed to read result file {:?}: {}", path, e))
-    })?;
-    serde_json::from_str(&content).map_err(|e| {
-        CallerError::SubAgent(format!(
-            "Failed to parse result JSON from {:?}: {}",
-            path, e
-        ))
-    })
-}
-
-pub fn write_result(path: &Path, result: &SubAgentResult) -> Result<(), CallerError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let content = serde_json::to_string_pretty(result)
-        .map_err(|e| CallerError::SubAgent(format!("Failed to serialize result: {}", e)))?;
-    std::fs::write(path, content)?;
-    Ok(())
-}
-
-pub fn write_progress(path: &Path, progress: &SubAgentProgress) -> Result<(), CallerError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let content = serde_json::to_string(progress)
-        .map_err(|e| CallerError::SubAgent(format!("Failed to serialize progress: {}", e)))?;
-    std::fs::write(path, content)?;
-    Ok(())
-}
-
 pub fn format_result_message(result: &SubAgentResult) -> String {
     let status_str = match &result.status {
         SubAgentStatus::Completed => "completed".to_string(),
@@ -126,41 +85,6 @@ pub fn format_result_message(result: &SubAgentResult) -> String {
     ));
 
     msg
-}
-
-pub fn detect_sub_agent_mode() -> Option<(String, SubAgentRole)> {
-    let role = std::env::var("INTENDANT_ROLE").ok()?;
-    let id = std::env::var("INTENDANT_ID").unwrap_or_else(|_| "unnamed".to_string());
-    Some((id, SubAgentRole::from_str(&role)))
-}
-
-pub fn scan_completed_results(sub_agent_dir: &Path) -> Vec<SubAgentResult> {
-    let mut results = Vec::new();
-
-    if let Ok(entries) = std::fs::read_dir(sub_agent_dir) {
-        for entry in entries.flatten() {
-            let agent_dir = entry.path();
-            let result_file = agent_dir.join("result.json");
-            let reported_marker = agent_dir.join(".reported");
-            if reported_marker.exists() {
-                continue;
-            }
-            if result_file.exists() {
-                if let Ok(result) = read_result(&result_file) {
-                    results.push(result);
-                    if let Err(err) = std::fs::write(&reported_marker, b"reported") {
-                        eprintln!(
-                            "[sub-agent] failed to write reported marker {}: {}",
-                            reported_marker.display(),
-                            err
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    results
 }
 
 /// PARKED: disk form for orchestrator project state checkpoints.
@@ -263,84 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn read_result_valid() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("result.json");
-        let result = SubAgentResult {
-            id: "test-1".to_string(),
-            status: SubAgentStatus::Completed,
-            summary: "Found 3 tables".to_string(),
-            brief: "Found 3 database tables.".to_string(),
-            findings: vec!["users table".to_string(), "orders table".to_string()],
-            artifacts: vec![PathBuf::from("/tmp/schema.sql")],
-            usage: TokenUsage {
-                prompt_tokens: 1000,
-                completion_tokens: 500,
-                total_tokens: 1500,
-                ..Default::default()
-            },
-        };
-        std::fs::write(&path, serde_json::to_string(&result).unwrap()).unwrap();
-
-        let parsed = read_result(&path).unwrap();
-        assert_eq!(parsed.id, "test-1");
-        assert_eq!(parsed.status, SubAgentStatus::Completed);
-        assert_eq!(parsed.findings.len(), 2);
-    }
-
-    #[test]
-    fn read_result_invalid_json() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("result.json");
-        std::fs::write(&path, "not valid json").unwrap();
-
-        assert!(read_result(&path).is_err());
-    }
-
-    #[test]
-    fn read_result_missing_file() {
-        let path = PathBuf::from("/nonexistent/result.json");
-        assert!(read_result(&path).is_err());
-    }
-
-    #[test]
-    fn write_result_creates_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("subdir/nested/result.json");
-        let result = SubAgentResult {
-            id: "test-1".to_string(),
-            status: SubAgentStatus::Completed,
-            summary: "Done".to_string(),
-            brief: "Task completed.".to_string(),
-            findings: vec![],
-            artifacts: vec![],
-            usage: TokenUsage::default(),
-        };
-        write_result(&path, &result).unwrap();
-        assert!(path.exists());
-        let parsed = read_result(&path).unwrap();
-        assert_eq!(parsed.id, "test-1");
-    }
-
-    #[test]
-    fn write_progress_writes_parseable_json() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("progress.json");
-        let progress = SubAgentProgress {
-            id: "agent-2".to_string(),
-            turn: 7,
-            status: "running".to_string(),
-            last_action: "Compiling".to_string(),
-            question: None,
-        };
-        write_progress(&path, &progress).unwrap();
-        let parsed: SubAgentProgress =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(parsed.id, "agent-2");
-        assert_eq!(parsed.turn, 7);
-    }
-
-    #[test]
     fn format_result_message_completed() {
         let result = SubAgentResult {
             id: "research-1".to_string(),
@@ -398,55 +244,6 @@ mod tests {
         };
         let msg = format_result_message(&result);
         assert!(!msg.contains("Findings:"));
-    }
-
-    #[test]
-    fn scan_completed_results_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let results = scan_completed_results(dir.path());
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn scan_completed_results_finds_results() {
-        let dir = tempfile::tempdir().unwrap();
-        let agent_dir = dir.path().join("agent-1");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-
-        let result = SubAgentResult {
-            id: "agent-1".to_string(),
-            status: SubAgentStatus::Completed,
-            summary: "Done".to_string(),
-            brief: "Task completed.".to_string(),
-            findings: vec![],
-            artifacts: vec![],
-            usage: TokenUsage::default(),
-        };
-        std::fs::write(
-            agent_dir.join("result.json"),
-            serde_json::to_string(&result).unwrap(),
-        )
-        .unwrap();
-
-        let results = scan_completed_results(dir.path());
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, "agent-1");
-
-        let results_again = scan_completed_results(dir.path());
-        assert!(results_again.is_empty());
-    }
-
-    #[test]
-    fn scan_completed_results_nonexistent_dir() {
-        let results = scan_completed_results(Path::new("/nonexistent/dir"));
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn detect_sub_agent_mode_not_set() {
-        // This test is sensitive to env; in normal test runs INTENDANT_ROLE is not set
-        std::env::remove_var("INTENDANT_ROLE");
-        assert!(detect_sub_agent_mode().is_none());
     }
 
     #[test]
