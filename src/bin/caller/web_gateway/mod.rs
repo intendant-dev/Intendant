@@ -1919,20 +1919,20 @@ pub(crate) async fn mint_session_token(provider: &str, model: &str) -> Result<St
     }
 }
 
-const APP_HTML: &str = include_str!("../../../static/app.html");
-const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.js");
-const ICON_128_PNG: &[u8] = include_bytes!("../../../static/icon-128.png");
-const ICON_512_PNG: &[u8] = include_bytes!("../../../static/icon-512.png");
-const ICON_512_MASKABLE_PNG: &[u8] = include_bytes!("../../../static/icon-512-maskable.png");
-const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../../../static/apple-touch-icon.png");
-const MANIFEST_WEBMANIFEST: &str = include_str!("../../../static/manifest.webmanifest");
-const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
-const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
-const WASM_STATION_JS: &str = include_str!("../../../static/wasm-station/station_web.js");
-const WASM_STATION_BIN: &[u8] = include_bytes!("../../../static/wasm-station/station_web_bg.wasm");
-const THREE_MODULE_JS: &str = include_str!("../../../static/three.module.min.js");
-const CODEMIRROR_BUNDLE_JS: &str = include_str!("../../../static/codemirror-bundle.js");
-const CODEMIRROR_BUNDLE_CSS: &str = include_str!("../../../static/codemirror-bundle.css");
+const APP_HTML: &str = include_str!("../../../../static/app.html");
+const AUDIO_PROCESSOR_JS: &str = include_str!("../../../../static/audio-processor.js");
+const ICON_128_PNG: &[u8] = include_bytes!("../../../../static/icon-128.png");
+const ICON_512_PNG: &[u8] = include_bytes!("../../../../static/icon-512.png");
+const ICON_512_MASKABLE_PNG: &[u8] = include_bytes!("../../../../static/icon-512-maskable.png");
+const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../../../../static/apple-touch-icon.png");
+const MANIFEST_WEBMANIFEST: &str = include_str!("../../../../static/manifest.webmanifest");
+const WASM_WEB_JS: &str = include_str!("../../../../static/wasm-web/presence_web.js");
+const WASM_WEB_BIN: &[u8] = include_bytes!("../../../../static/wasm-web/presence_web_bg.wasm");
+const WASM_STATION_JS: &str = include_str!("../../../../static/wasm-station/station_web.js");
+const WASM_STATION_BIN: &[u8] = include_bytes!("../../../../static/wasm-station/station_web_bg.wasm");
+const THREE_MODULE_JS: &str = include_str!("../../../../static/three.module.min.js");
+const CODEMIRROR_BUNDLE_JS: &str = include_str!("../../../../static/codemirror-bundle.js");
+const CODEMIRROR_BUNDLE_CSS: &str = include_str!("../../../../static/codemirror-bundle.css");
 const SOURCE_VIEWER_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const DASHBOARD_IMAGE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 // Browser-facing external replay is a live UI bootstrap, not an archival export.
