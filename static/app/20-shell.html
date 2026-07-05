@@ -1,0 +1,1651 @@
+</head>
+<body>
+<div id="app">
+
+  <!-- Status Bar -->
+  <div class="status-bar" id="status-bar">
+    <span class="host-label" id="sb-host-label" title="This daemon's identity. Set it with `intendant access setup --name <label>` or it falls back to the system hostname.">local</span>
+    <span class="sep">|</span>
+    <span class="provider" id="sb-provider">--</span>
+    <span class="sep">/</span>
+    <span class="model" id="sb-model">--</span>
+    <span class="sep">|</span>
+    <span class="turn" id="sb-turn">T0</span>
+    <span class="sep">|</span>
+    <span class="field-label">ctx</span>
+    <div class="budget-bar">
+      <div class="bar-track"><div class="bar-fill" id="sb-budget-fill"></div></div>
+      <span class="budget-pct" id="sb-budget-pct">--</span>
+    </div>
+    <span class="sep">|</span>
+    <span class="field-label">autonomy</span>
+    <span class="autonomy" id="sb-autonomy" onclick="cycleAutonomy()" title="Click to cycle: Low → Medium → High → Full">Medium</span>
+    <span class="sep">|</span>
+    <span class="display-toggle-wrap">
+      <span class="field-label" id="sb-display-label" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">your display</span>
+      <span id="sb-display-access" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">off</span>
+      <div class="display-picker" id="display-picker"></div>
+    </span>
+    <span class="sep">|</span>
+    <span class="field-label">Intendant session</span>
+    <span class="session" id="sb-session"></span>
+    <span class="sep">|</span>
+    <span class="sb-dot-group" id="sb-conn-group" title="WebSocket connection to this daemon">
+      <span class="field-label" id="sb-conn-label">ws</span>
+      <span class="conn-dot err" id="sb-conn"></span>
+    </span>
+    <span class="sb-dot-group clickable" id="sb-dashboard-transport" title="Dashboard access — click for connection diagnostics">
+      <span class="field-label" id="sb-dashboard-transport-prefix">access</span>
+      <span class="conn-dot ok" id="sb-dashboard-transport-dot"></span>
+      <span id="sb-dashboard-transport-label">Ready</span>
+    </span>
+    <span class="sb-dot-group" title="Live model connection (voice + video — Gemini Live / OpenAI Realtime)">
+      <span class="field-label">live</span>
+      <span class="voice-dot" id="sb-voice"></span>
+      <span id="sb-voice-label"></span>
+    </span>
+    <span class="sb-dot-group clickable hidden" id="sb-hosts-group" title="Aggregate state of configured secondary daemons - click to open Access targets">
+      <span class="sep">|</span>
+      <span class="field-label">hosts</span>
+      <span class="hosts-aggregate-dot" id="sb-hosts-dot"></span>
+    </span>
+    <span class="sb-dot-group clickable" id="sb-access-page-link" title="Open fleet access administration">
+      <span class="sep">|</span>
+      <span class="field-label" id="sb-access-page-prefix">admin</span>
+      <span class="access-nav-link" id="sb-access-page-label">Access</span>
+    </span>
+    <span class="active-badge is-active" id="sb-active-badge" title="This browser controls voice/video — click to switch to passive (observe-only) mode">Active</span>
+  </div>
+
+  <!-- Token Ticker -->
+  <div class="ticker-bar" id="ticker-bar" onclick="toggleTicker()">
+    <span class="ticker-chevron" id="ticker-chevron">&#x25B8;</span>
+    <div class="ticker-collapsed" id="ticker-collapsed">
+      <span id="tk-tokens">-- tok</span>
+      <span class="tk-sep">|</span>
+      <span id="tk-cached">-- cached</span>
+      <span class="tk-sep">|</span>
+      <span id="tk-frames">0 frames</span>
+      <span class="tk-sep">|</span>
+      <span id="tk-cost">$0</span>
+    </div>
+    <div class="ticker-expanded hidden" id="ticker-expanded">
+      <div id="tk-detail-1">--</div>
+      <div id="tk-detail-2">--</div>
+    </div>
+  </div>
+
+  <!-- Global Task Bar — always visible across tabs -->
+  <div class="global-task-bar">
+    <div class="phase-banner phase-idle" id="phase-banner">
+      <span class="spinner" id="phase-spinner"></span>
+      <span class="phase-text" id="phase-text">Idle</span>
+    </div>
+    <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
+    <button id="task-new-session-btn" class="task-new-session-btn" onclick="openNewSessionFromPrompt()" title="Create a new session" aria-label="Create a new session">+ New</button>
+    <button id="task-target-chip" class="task-target-chip" type="button" onclick="focusForegroundSessionWindow()" title="Prompt target" style="display:none"></button>
+    <div id="edit-message-chip" class="edit-message-chip hidden" title="Editing a previous user message">
+      <span id="edit-message-label">Editing</span>
+      <button type="button" id="edit-message-cancel" title="Cancel edit">x</button>
+    </div>
+    <textarea id="activity-task-input" class="global-task-input" rows="1" placeholder="Enter task..."></textarea>
+    <!-- File upload: hidden input triggered by the Attach button. `multiple`
+         lets the user pick several at once; we fire one POST per file
+         (to /api/session/current/uploads) so progress is independent per
+         attachment. -->
+    <input type="file" id="upload-file-input" multiple style="display:none" />
+    <button id="upload-attach-btn" class="global-attach-btn" title="Attach file(s). Files are staged under the project's ignored .intendant/uploads/ store and attached to the next task.">&#x1F4CE;</button>
+    <div id="global-pending-attachments" class="global-pending-attachments hidden" aria-live="polite"></div>
+    <label class="global-direct-toggle" title="Skip the presence AI and send the task straight to the worker agent (internal or external). Use this for testing, automation, or when you don't need conversational mediation."><input type="checkbox" id="direct-mode-toggle" />Direct</label>
+    <button id="activity-submit-btn" class="global-send-btn" onclick="submitActivityOrSteer()" title="Start a new task or send a follow-up.">Send</button>
+  </div>
+
+  <!-- Tab Bar -->
+  <nav class="tab-bar">
+    <button class="tab-btn active" data-tab="activity" title="Live agent log plus context, managed-context, changes, and control sub-tabs">Activity<span class="badge" id="badge-activity"></span></button>
+    <button class="tab-btn" data-tab="stats" title="Token usage, cost, and provider statistics per host">Stats</button>
+    <button class="tab-btn" data-tab="terminal" title="Agent TUI mirror and an interactive shell">Terminal</button>
+    <button class="tab-btn" data-tab="displays" title="Live display streams — local screens and connected peers">Video</button>
+    <button class="tab-btn" data-tab="station" title="Station — the rendered control center (WebGPU canvas)">Station</button>
+    <button class="tab-btn" data-tab="sessions" title="Browse, search, resume, and launch sessions">Sessions</button>
+    <button class="tab-btn" data-tab="files" title="Browse and download files from this daemon or a peer">Files</button>
+    <button class="tab-btn" data-tab="access" title="Who can reach this daemon and its fleet — people, peers, roles, and connection diagnostics">Access</button>
+    <button class="tab-btn" data-tab="debug" title="Observer display and browser workspaces">Debug</button>
+    <button class="tab-btn" data-tab="settings" title="Account, agent, and runtime settings">Settings</button>
+  </nav>
+
+  <!-- Tab Content -->
+  <div class="tab-content">
+
+    <!-- Station Tab -->
+    <div id="tab-station" class="tab-pane">
+      <div id="station-peer-chips" class="station-peer-chips hidden" role="group" aria-label="Peer display shortcuts"></div>
+      <div class="station-pane">
+        <canvas id="station-scene-canvas" class="station-canvas"></canvas>
+        <canvas id="station-hud-canvas" class="station-canvas"></canvas>
+        <div id="station-status" class="station-status">
+          <span id="station-status-metrics" class="station-status-metrics"></span>
+          <span id="station-status-text" class="station-status-text">Station initializing</span>
+        </div>
+        <div id="station-hotspots" class="station-hotspots" aria-label="Station controls">
+          <button class="station-hotspot" type="button" data-station-hotspot="layout:orbital" title="Orbital layout" aria-label="Orbital layout"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="layout:constellation" title="Constellation layout" aria-label="Constellation layout"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:activity" title="Activity" aria-label="Activity"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:context" title="Context" aria-label="Context"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:managed" title="Managed context" aria-label="Managed context"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:changes" title="Changes" aria-label="Changes"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:sessions" title="Sessions" aria-label="Sessions"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:worktrees" title="Worktrees" aria-label="Worktrees"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:peers" title="Peers and displays" aria-label="Peers and displays"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:controls" title="Control surfaces" aria-label="Control surfaces"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:view" title="Station view" aria-label="Station view"></button>
+        </div>
+        <!-- Composer input overlay: the canvas draws the strip chrome; this
+             real textarea sits exactly over the drawn input slot so typing,
+             IME, and paste all behave natively. Positioned from
+             station.composer_state() geometry. -->
+        <textarea id="station-composer-input" class="station-composer-input" rows="1"
+          placeholder="type a task — enter sends, esc closes"
+          aria-label="Station composer" spellcheck="false" style="display:none"></textarea>
+        <div id="station-display-endpoints" aria-hidden="true" style="position:absolute;left:-10000px;top:-10000px;width:1px;height:1px;overflow:hidden"></div>
+      </div>
+    </div>
+
+    <!-- Activity Tab -->
+    <div id="tab-activity" class="tab-pane active">
+      <div class="subtabs" id="activity-subtabs">
+        <button class="subtab-btn active" data-activity-tab="log">Log</button>
+        <button class="subtab-btn" data-activity-tab="context">Context</button>
+        <button class="subtab-btn" data-activity-tab="managed">Managed</button>
+        <button class="subtab-btn" data-activity-tab="changes">
+          Changes <span class="badge" id="badge-changes" style="display:none"></span>
+        </button>
+        <button class="subtab-btn" data-activity-tab="control">Control</button>
+        <div class="activity-subtab-controls" id="activity-log-controls">
+          <label class="subtab-control-label" for="verbosity-select">Verbosity</label>
+          <select class="verbosity-select" id="verbosity-select" title="Log verbosity">
+            <option value="normal" selected>Normal</option>
+            <option value="verbose">Verbose</option>
+            <option value="debug">Debug</option>
+          </select>
+          <label class="subtab-control-label hidden" for="host-filter-select" id="host-filter-label">Host</label>
+          <select class="host-filter-select hidden" id="host-filter-select" title="Filter activity by source host">
+            <option value="">All hosts</option>
+          </select>
+        </div>
+      </div>
+      <div class="subtab-panes">
+        <div class="subtab-pane active" id="activity-log-pane">
+          <!-- Pending attachments bar (frames the user has Attached but not yet sent) -->
+          <div class="pending-attachments-bar hidden" id="pending-attachments-bar">
+            <span class="pending-attachments-label">Attachments</span>
+            <span class="pending-attachments-count" id="pending-attachments-count">0</span>
+            <div id="pending-attachments-list" style="display:flex;gap:4px;flex-wrap:wrap"></div>
+            <button class="pending-attachments-clear" id="pending-attachments-clear" data-pending-attachments-clear title="Remove all attachments">Clear</button>
+          </div>
+
+          <!-- Display Strip (shown when displays are active) -->
+          <div class="activity-display-strip hidden" id="activity-display-strip">
+            <div class="activity-display-header">
+              <span>Displays (<span id="strip-count">0</span>)</span>
+              <button class="strip-minimize-btn" id="strip-minimize" type="button" title="Minimize displays" aria-label="Minimize displays" aria-pressed="false">&minus;</button>
+              <button class="strip-toggle-btn" id="strip-toggle" title="Expand displays">&#x25BE;</button>
+            </div>
+            <div class="shared-view-banner shared-view-banner-compact hidden" id="activity-shared-view-banner" data-shared-view-banner>
+              <span class="shared-view-kicker">Shared view</span>
+              <span class="shared-view-message" data-shared-view-message></span>
+              <span class="shared-view-actions">
+                <button class="shared-view-action" type="button" style="display:none" data-shared-view-take-input title="Take input authority for the focused display">Take input</button>
+                <button class="shared-view-close" type="button" data-shared-view-close title="Hide shared view">&times;</button>
+              </span>
+            </div>
+            <div class="activity-display-row" id="activity-display-row"></div>
+          </div>
+          <div class="activity-split-handle hidden" id="activity-split-handle"></div>
+
+          <!-- Steer in-flight strip: renders pending / queued mid-turn
+               messages the user injected via the always-visible task
+               input while the agent was running. Each row is keyed by
+               the client-generated steer id; rows disappear a moment
+               after the backend reports steer_delivered. -->
+          <div class="steer-strip empty" id="steer-strip"></div>
+
+          <div class="session-window-grid hidden" id="session-window-grid"></div>
+          <div class="session-window-grid-resize-handle hidden" id="session-window-grid-resize-handle" title="Drag to resize session windows and concurrent view"></div>
+          <div class="concurrent-log-region" id="concurrent-log-region">
+            <div class="concurrent-log-label hidden" id="concurrent-log-label" title="Concurrent agent view">
+              <span>Concurrent view</span>
+              <button type="button" class="concurrent-log-action" id="concurrent-log-resize" title="Resize concurrent view around session windows" aria-label="Resize concurrent view around session windows" aria-pressed="true">&#x21F5;</button>
+              <button type="button" class="concurrent-log-action" id="concurrent-log-minimize" title="Minimize concurrent view" aria-label="Minimize concurrent view">-</button>
+              <button type="button" class="concurrent-log-action" id="concurrent-log-maximize" title="Maximize concurrent view" aria-label="Maximize concurrent view">&#x26F6;</button>
+            </div>
+            <div class="log-stream" id="log-stream"></div>
+            <div class="ui-empty log-empty-overlay" id="log-empty-state" aria-hidden="true">
+              <div class="ui-empty-glyph">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 12h4l2.5-6 4 12 2.5-6h5"/>
+                </svg>
+              </div>
+              <div class="ui-empty-title">No activity yet</div>
+              <div class="ui-empty-hint">Send a task below to start the agent, or pick a session from Sessions.</div>
+            </div>
+          </div>
+          <button class="scroll-bottom-btn" id="scroll-bottom" title="Scroll to bottom">&#x2193;</button>
+
+          <!-- Approval Panel -->
+          <div class="bottom-panel" id="approval-panel">
+            <div class="panel-body">
+              <div class="approval-card">
+                <div class="approval-icon">&#x1F510;</div>
+                <div class="approval-content">
+                  <div class="approval-title">Approval needed</div>
+                  <div class="approval-command" id="approval-command"></div>
+                  <div class="approval-category" id="approval-category"></div>
+                  <div class="approval-actions">
+                    <button class="approve" onclick="sendApproval('approve')">Approve <kbd>y</kbd></button>
+                    <button onclick="sendApproval('skip')">Skip <kbd>s</kbd></button>
+                    <button onclick="sendApproval('approve_all')">Approve all <kbd>a</kbd></button>
+                    <button class="deny" onclick="sendApproval('deny')">Deny <kbd>n</kbd></button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- AskHuman Panel -->
+          <div class="bottom-panel" id="human-panel">
+            <div class="panel-header">Question</div>
+            <div class="panel-body">
+              <div class="input-question" id="human-question"></div>
+              <div class="input-area">
+                <textarea id="human-input" rows="2" placeholder="Type your response..."></textarea>
+                <button onclick="sendHumanResponse()">Send</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Follow-up is handled by the always-visible activity-task-input
+               at the top of this pane. No separate follow-up panel needed. -->
+        </div>
+        <div class="subtab-pane" id="activity-context-pane">
+          <div class="context-pane">
+            <div class="context-toolbar">
+              <div class="context-toolbar-main">
+                <span class="context-title" id="context-title">Context</span>
+                <span class="context-meta context-meta-source"><strong>Source</strong><span id="context-source">--</span></span>
+                <span class="context-meta context-meta-turn"><strong>Request</strong><span id="context-turn">--</span></span>
+                <span class="context-meta context-meta-items"><strong>Items</strong><span id="context-items">--</span></span>
+                <span class="context-meta context-meta-tokens"><strong>Tokens</strong><span id="context-tokens">--</span></span>
+                <span class="context-meta context-meta-format"><strong>Format</strong><span id="context-format">--</span></span>
+              </div>
+              <div class="context-controls">
+                <button class="context-mode-btn active" id="context-live-btn" type="button">Live</button>
+                <button class="context-mode-btn" id="context-replay-btn" type="button">Replay</button>
+                <button class="context-focus-btn" id="context-reset-view-btn" type="button">Reset view</button>
+                <button class="context-focus-btn" id="context-open-focus-btn" type="button" title="Open context focus view" aria-label="Open context focus view">&#x26F6; Focus</button>
+                <button class="context-focus-btn" id="context-raw-toggle-btn" type="button" title="Render full raw context snapshot" aria-pressed="false">Raw</button>
+                <button class="context-focus-btn context-focus-only" id="context-close-focus-btn" type="button" title="Close context focus view">Close</button>
+              </div>
+            </div>
+            <div class="context-replay-strip">
+              <input class="context-replay-range" id="context-replay-range" type="range" min="0" max="0" value="0" step="1">
+              <span class="context-replay-label" id="context-replay-label">No snapshots</span>
+            </div>
+            <div class="context-body">
+              <div class="context-scene-wrap">
+                <canvas id="context-scene" aria-label="3D context visualization"></canvas>
+                <div class="context-scene-empty" id="context-scene-empty">No context snapshot yet</div>
+                <div class="context-scene-overlay">
+                  <div class="context-scene-caption" id="context-scene-caption">Semantic token mass by category, sequence, and replay time.</div>
+                  <div class="context-legend" id="context-legend"></div>
+                </div>
+              </div>
+              <aside class="context-inspector">
+                <div class="context-inspector-header">
+                  <div class="context-inspector-title" id="context-detail-title">No segment selected</div>
+                  <div class="context-inspector-subtitle" id="context-detail-subtitle">No context segment focused.</div>
+                </div>
+                <div class="context-detail-grid">
+                  <div class="context-detail-stat"><strong>Share</strong><span id="context-detail-share">--</span></div>
+                  <div class="context-detail-stat"><strong>Estimate</strong><span id="context-detail-estimate">--</span></div>
+                  <div class="context-detail-stat"><strong>Category</strong><span id="context-detail-category">--</span></div>
+                  <div class="context-detail-stat"><strong>Path</strong><span id="context-detail-path">--</span></div>
+                </div>
+                <pre class="context-detail-preview" id="context-detail-preview">Large context consumers appear here with a short preview.</pre>
+                <div class="context-hotspots">
+                  <div class="context-hotspots-title">Largest context consumers</div>
+                  <div class="context-hotspots-list" id="context-hotspots-list"></div>
+                </div>
+              </aside>
+            </div>
+            <pre class="context-raw" id="context-raw">No context snapshot yet</pre>
+          </div>
+        </div>
+        <div class="subtab-pane" id="activity-managed-pane">
+          <div class="managed-context-pane">
+            <div class="managed-context-shell">
+              <div class="ui-explainer">
+                <div class="ui-explainer-step">
+                  <div class="ui-explainer-kicker">Managed context</div>
+                  <div class="ui-explainer-title">Watch</div>
+                  <div class="ui-explainer-text">Density and records show how the managed context evolves as the session runs.</div>
+                </div>
+                <div class="ui-explainer-arrow" aria-hidden="true">&#x2192;</div>
+                <div class="ui-explainer-step">
+                  <div class="ui-explainer-kicker">Managed context</div>
+                  <div class="ui-explainer-title">Anchor</div>
+                  <div class="ui-explainer-text">Pick the exact conversation item to branch from — from the log or the recent-anchor list.</div>
+                </div>
+                <div class="ui-explainer-arrow" aria-hidden="true">&#x2192;</div>
+                <div class="ui-explainer-step">
+                  <div class="ui-explainer-kicker">Managed context</div>
+                  <div class="ui-explainer-title">Rewind</div>
+                  <div class="ui-explainer-text">Crystallize a clean continuation: keep the durable facts, drop the noise.</div>
+                </div>
+              </div>
+
+              <section class="ui-card">
+                <div class="ui-section-head">
+                  <h3 class="ui-section-title">Session</h3>
+                  <span class="ui-section-sub">The managed Codex session to inspect and operate on.</span>
+                </div>
+                <div class="managed-context-toolbar">
+                  <label class="managed-context-field wide" for="managed-context-session">
+                    <span>Codex session</span>
+                    <select id="managed-context-session"></select>
+                  </label>
+                  <label class="managed-context-field short" for="managed-context-position">
+                    <span>Anchor side</span>
+                    <select id="managed-context-position">
+                      <option value="after">after</option>
+                      <option value="before">before</option>
+                    </select>
+                  </label>
+                  <button type="button" class="managed-context-btn" id="managed-context-use-target">Use target</button>
+                  <button type="button" class="managed-context-btn" id="managed-context-refresh">Refresh</button>
+                </div>
+              </section>
+
+              <section class="ui-card">
+                <div class="ui-section-head">
+                  <h3 class="ui-section-title">Density</h3>
+                  <span class="ui-section-sub">How much signal the context holds and how hard compaction pressure is pushing.</span>
+                  <div class="ui-section-actions">
+                    <span class="managed-context-muted" id="managed-context-updated">--</span>
+                  </div>
+                </div>
+                <div class="managed-context-grid" id="managed-context-stats"></div>
+                <div class="managed-context-pressure-track">
+                  <div class="managed-context-pressure-fill" id="managed-context-pressure-fill"></div>
+                </div>
+                <div id="managed-context-alerts"></div>
+              </section>
+
+              <details class="ui-fold" id="managed-context-rewind-fold">
+                <summary>Rewind composer</summary>
+                <div class="ui-fold-body">
+                  <p class="ui-fold-hint">Branch the session from an exact item: name the anchor, say why, and write the primer that carries forward.</p>
+                  <div class="managed-context-card-grid">
+                <div>
+                  <div class="managed-context-card-header">
+                    <h3>Rewind</h3>
+                    <div class="managed-context-actions">
+                      <button type="button" class="managed-context-btn" id="managed-context-inspect-anchor">Inspect anchor</button>
+                      <button type="button" class="managed-context-btn primary" id="managed-context-submit-rewind">Dispatch rewind</button>
+                    </div>
+                  </div>
+                  <div class="managed-context-form-grid">
+                    <label class="managed-context-field full" for="managed-context-anchor">
+                      <span>Exact item anchor</span>
+                      <input id="managed-context-anchor" type="text" autocomplete="off" spellcheck="false" placeholder="call_id or response item id">
+                    </label>
+                    <label class="managed-context-field full" for="managed-context-reason">
+                      <span>Reason</span>
+                      <input id="managed-context-reason" type="text" autocomplete="off" spellcheck="true" placeholder="why this branch should be crystallized">
+                    </label>
+                    <label class="managed-context-field full" for="managed-context-primer">
+                      <span>Carry-forward primer</span>
+                      <textarea id="managed-context-primer" spellcheck="true" placeholder="dense facts, decisions, constraints, current state"></textarea>
+                    </label>
+                    <label class="managed-context-field" for="managed-context-preserve">
+                      <span>Preserve</span>
+                      <textarea id="managed-context-preserve" placeholder="one durable fact per line"></textarea>
+                    </label>
+                    <label class="managed-context-field" for="managed-context-discard">
+                      <span>Discard</span>
+                      <textarea id="managed-context-discard" placeholder="noise, failed branches, obsolete assumptions"></textarea>
+                    </label>
+                    <label class="managed-context-field" for="managed-context-artifacts">
+                      <span>Artifacts</span>
+                      <textarea id="managed-context-artifacts" placeholder="files, commits, outputs to keep"></textarea>
+                    </label>
+                    <label class="managed-context-field" for="managed-context-next-steps">
+                      <span>Next steps</span>
+                      <textarea id="managed-context-next-steps" placeholder="immediate continuation steps"></textarea>
+                    </label>
+                  </div>
+                </div>
+                <div>
+                  <div class="managed-context-card-header">
+                    <h3>Recent anchors</h3>
+                    <button type="button" class="managed-context-btn" id="managed-context-clear-anchor">Clear</button>
+                  </div>
+                  <div class="managed-context-anchor-list" id="managed-context-anchors"></div>
+                </div>
+                  </div>
+                </div>
+              </details>
+
+              <details class="ui-fold" id="managed-context-records-fold">
+                <summary>Records &amp; backout</summary>
+                <div class="ui-fold-body">
+                  <p class="ui-fold-hint">Every rewind leaves a record — inspect one, restore it, fork from it, or back it out.</p>
+                  <div class="managed-context-card-grid">
+                <div>
+                  <div class="managed-context-card-header">
+                    <h3>Records</h3>
+                    <button type="button" class="managed-context-btn" id="managed-context-refresh-records">Reload</button>
+                  </div>
+                  <div class="managed-context-record-list" id="managed-context-records"></div>
+                </div>
+                <div>
+                  <div class="managed-context-card-header">
+                    <h3>Backout</h3>
+                    <button type="button" class="managed-context-btn primary" id="managed-context-submit-backout">Run</button>
+                  </div>
+                  <div class="managed-context-form-grid">
+                    <label class="managed-context-field full" for="managed-context-record-id">
+                      <span>Record id</span>
+                      <input id="managed-context-record-id" type="text" autocomplete="off" spellcheck="false">
+                    </label>
+                    <label class="managed-context-field" for="managed-context-backout-mode">
+                      <span>Mode</span>
+                      <select id="managed-context-backout-mode">
+                        <option value="inspect">inspect</option>
+                        <option value="restore">restore</option>
+                        <option value="fork">fork</option>
+                        <option value="backout">backout</option>
+                      </select>
+                    </label>
+                    <label class="managed-context-field" for="managed-context-backout-name">
+                      <span>Fork name</span>
+                      <input id="managed-context-backout-name" type="text" autocomplete="off" spellcheck="false">
+                    </label>
+                  </div>
+                  <pre class="managed-context-raw" id="managed-context-action-result">No action yet</pre>
+                </div>
+                  </div>
+                </div>
+              </details>
+
+              <div class="managed-context-card">
+                <div class="managed-context-card-header">
+                  <h3>Lineage and fission</h3>
+                  <button type="button" class="managed-context-btn" id="managed-context-copy-status">Copy status JSON</button>
+                </div>
+                <div class="managed-context-fission-spawn">
+                  <div class="managed-context-inline" style="justify-content:space-between">
+                    <span class="managed-context-muted">Spawn fission branches (1-4 charters)</span>
+                    <div class="managed-context-inline">
+                      <select id="managed-context-fission-worktree" title="Worktree isolation override for spawned branches">
+                        <option value="">worktree: default</option>
+                        <option value="on">worktree: on</option>
+                        <option value="off">worktree: off</option>
+                      </select>
+                      <button type="button" class="managed-context-btn" id="managed-context-fission-add-row">Add branch</button>
+                      <button type="button" class="managed-context-btn primary" id="managed-context-fission-spawn">Spawn</button>
+                    </div>
+                  </div>
+                  <div id="managed-context-fission-rows"></div>
+                </div>
+                <div class="managed-context-ledger-list" id="managed-context-ledgers"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="subtab-pane" id="activity-changes-pane">
+          <div class="changes-timeline" id="changes-timeline" style="display:none">
+            <div class="timeline-header">
+              <span class="timeline-title">History</span>
+              <div class="timeline-controls">
+                <button id="redo-btn" class="timeline-btn" onclick="doRedo()" title="Redo the last rollback" disabled>&#x21bb; Redo</button>
+                <button id="prune-btn" class="timeline-btn" onclick="doPrune()" title="Prune abandoned branches">&#x1f5d1; Prune</button>
+              </div>
+            </div>
+            <div class="timeline-rounds" id="timeline-rounds"></div>
+            <details id="timeline-abandoned" style="display:none">
+              <summary>Abandoned branches (<span id="abandoned-count">0</span>)</summary>
+              <div id="abandoned-list"></div>
+            </details>
+          </div>
+          <div class="changes-container">
+            <div class="changes-sidebar" id="changes-file-list">
+              <div class="changes-empty">No file changes yet</div>
+            </div>
+            <div class="changes-diff-viewer" id="changes-diff-viewer">
+              <div class="changes-diff-header" id="changes-diff-header">Select a file to view changes</div>
+              <pre class="changes-diff-content" id="changes-diff-content"></pre>
+            </div>
+          </div>
+        </div>
+        <div class="subtab-pane" id="activity-control-pane">
+          <div class="control-pane-body">
+            <div class="control-header">
+              <span>Backend:</span>
+              <span class="control-backend-badge" id="control-backend-badge">none</span>
+              <span class="control-fast-status hidden" id="control-fast-status"></span>
+              <span class="control-applies-note" id="control-applies-note">changes apply on next task</span>
+            </div>
+            <section class="ui-card" id="control-approval-rules">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title">Approval rules</h3>
+                <span class="ui-section-sub">Per-category gates for the internal agent. Applied live and saved to <code>intendant.toml</code>.</span>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-file_read">File read</label>
+                <select id="control-approval-file_read" data-approval-category="file_read">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-file_write">File write</label>
+                <select id="control-approval-file_write" data-approval-category="file_write">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-file_delete">File delete</label>
+                <select id="control-approval-file_delete" data-approval-category="file_delete">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-command_exec">Command exec</label>
+                <select id="control-approval-command_exec" data-approval-category="command_exec">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-network">Network</label>
+                <select id="control-approval-network" data-approval-category="network">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-destructive">Destructive</label>
+                <select id="control-approval-destructive" data-approval-category="destructive">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-display_control">Display control</label>
+                <select id="control-approval-display_control" data-approval-category="display_control">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-tool_call">Tool calls (MCP / computer-use)</label>
+                <select id="control-approval-tool_call" data-approval-category="tool_call">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-hint">
+                Per-category gates for the internal agent. <strong>Auto</strong>: run without asking. <strong>Ask</strong>: prompt for approval. <strong>Deny</strong>: block outright. Applied live and saved to <code>intendant.toml [approval]</code>.
+              </div>
+            </section>
+            <div id="control-codex-section">
+              <fieldset class="control-group">
+                <legend>Thread actions</legend>
+                <div class="control-actions-row">
+                  <button class="control-action-btn" data-codex-action="new" title="Tear down the Codex thread so the next task starts fresh (/new)">New thread</button>
+                  <button class="control-action-btn" data-codex-action="fast" title="Toggle Codex Fast service tier for future turns (/fast)">Fast</button>
+                  <button class="control-action-btn" data-codex-action="compact" title="Compact conversation history to free context (/compact)">Compact</button>
+                  <button class="control-action-btn" data-codex-action="undo" title="Roll back the last turn (/undo)">Undo</button>
+                  <button class="control-action-btn" data-codex-action="fork" title="Fork the current thread into a new branch (/fork)">Fork…</button>
+                  <button class="control-action-btn" data-codex-action="side" title="Ask a side question in an ephemeral Codex fork (/side)">Side…</button>
+                  <button class="control-action-btn" data-codex-action="review" title="Review pending changes (/review)">Review…</button>
+                  <button class="control-action-btn" data-codex-action="rename" title="Rename the current Codex thread (/rename)">Rename…</button>
+                  <button class="control-action-btn" data-codex-action="goal" title="Create or update the persisted Codex thread goal (/goal)">Goal…</button>
+                  <button class="control-action-btn" data-codex-action="goal-get" title="Fetch the current persisted Codex thread goal (/goal)">Goal status</button>
+                  <button class="control-action-btn" data-codex-action="goal-edit" title="Edit the current Codex thread goal objective (/goal edit)">Edit goal…</button>
+                  <button class="control-action-btn" data-codex-action="goal-pause" title="Pause the current Codex thread goal (/goal pause)">Pause goal</button>
+                  <button class="control-action-btn" data-codex-action="goal-resume" title="Resume the current Codex thread goal (/goal resume)">Resume goal</button>
+                  <button class="control-action-btn" data-codex-action="goal-clear" title="Clear the current persisted Codex thread goal (/goal clear)">Clear goal</button>
+                  <button class="control-action-btn" data-codex-action="init" title="Create an AGENTS.md for this project (/init)">Init AGENTS.md</button>
+                  <button class="control-action-btn" data-codex-action="memory-reset" title="Reset Codex's thread memory (/memory reset)">Reset memory</button>
+                </div>
+                <div class="control-hint">
+                  Actions dispatch to the live Codex thread. <strong>New thread</strong> is the only button that takes effect without an active task; typing <strong>/fast</strong> with no target starts an idle fast Codex session. Goal actions use Codex's experimental persisted goal API. Errors surface as a toast + Activity log entry.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Sandbox</legend>
+                <div class="control-row">
+                  <label for="control-codex-sandbox">Mode</label>
+                  <select id="control-codex-sandbox">
+                    <option value="read-only">read-only</option>
+                    <option value="workspace-write" selected>workspace-write</option>
+                    <option value="danger-full-access">danger-full-access</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  <strong>workspace-write</strong> blocks listener sockets / pipes and outbound network. Prefer <strong>danger-full-access</strong> only when a task genuinely needs live app automation (UNO, D-Bus) or arbitrary network.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Approval policy</legend>
+                <div class="control-row">
+                  <label for="control-codex-approval">Policy</label>
+                  <select id="control-codex-approval">
+                    <option value="untrusted">untrusted</option>
+                    <option value="on-request" selected>on-request</option>
+                    <option value="never">never</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  <strong>untrusted</strong>: only run known-safe commands without approval. <strong>on-request</strong>: model asks when it wants to. <strong>never</strong>: execute without asking (only with an external sandbox).
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Model</legend>
+                <div class="control-row">
+                  <label for="control-codex-model">Override</label>
+                  <input type="text" id="control-codex-model" placeholder="e.g. gpt-5 (leave empty for Codex default)">
+                </div>
+                <div class="control-hint">Sent as <code>model</code> in <code>thread/start</code>. Empty = let Codex pick its configured default.</div>
+                <div class="control-row">
+                  <label for="control-codex-reasoning">Reasoning effort</label>
+                  <select id="control-codex-reasoning">
+                    <option value="">(default)</option>
+                    <option value="minimal">minimal</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                    <option value="xhigh">xhigh</option>
+                  </select>
+                </div>
+                <div class="control-hint">Maps to <code>-c&nbsp;model_reasoning_effort=...</code>. Only meaningful for reasoning-capable models; ignored otherwise.</div>
+                <div class="control-row">
+                  <label for="control-codex-service-tier">Default service tier</label>
+                  <select id="control-codex-service-tier">
+                    <option value="">inherit Codex config</option>
+                    <option value="standard">normal</option>
+                    <option value="priority">fast</option>
+                    <option value="flex">flex</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  Applies to new Intendant-managed Codex sessions. <strong>inherit</strong> leaves <code>~/.codex/config.toml</code> and account defaults in charge; <strong>normal</strong> explicitly clears Fast for these sessions.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Tools</legend>
+                <div class="control-row">
+                  <label for="control-codex-web-search">Web search</label>
+                  <input type="checkbox" id="control-codex-web-search">
+                  <span class="control-current" id="control-codex-web-search-status">off</span>
+                </div>
+                <div class="control-hint">
+                  Enables the Responses API <code>web_search</code> tool (matches <code>codex --search</code>). No per-call approval.
+                </div>
+                <div class="control-row">
+                  <label for="control-codex-managed-context">Managed context</label>
+                  <select id="control-codex-managed-context">
+                    <option value="vanilla" selected>vanilla</option>
+                    <option value="managed">managed</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  <strong>vanilla</strong> keeps upstream/fork Codex behavior. <strong>managed</strong> enables proactive Intendant context densification, rewind/backout tools, and suppressed Codex auto-compaction for managed long tasks.
+                </div>
+                <div class="control-row">
+                  <label for="control-codex-context-archive">Context replay</label>
+                  <select id="control-codex-context-archive">
+                    <option value="summary" selected>summary</option>
+                    <option value="exact">exact</option>
+                    <option value="off">off</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  <strong>summary</strong> keeps compact visualization snapshots. <strong>exact</strong> persists full raw provider payloads. <strong>off</strong> disables Context snapshots.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Sandbox permissions</legend>
+                <div class="control-row" id="control-codex-network-row">
+                  <label for="control-codex-network">Network inside sandbox</label>
+                  <input type="checkbox" id="control-codex-network">
+                  <span class="control-current" id="control-codex-network-status">off</span>
+                </div>
+                <div class="control-hint" id="control-codex-network-hint">
+                  Only applies when sandbox is <strong>workspace-write</strong>. Maps to
+                  <code>sandbox_workspace_write.network_access</code>. Middle ground between the default and danger-full-access when a task needs outbound HTTP but no listener binds.
+                </div>
+                <div class="control-row">
+                  <label for="control-codex-writable-roots">Extra writable paths</label>
+                  <textarea id="control-codex-writable-roots" rows="3" placeholder="/absolute/path/one&#10;/absolute/path/two" style="flex:1;padding:4px 8px;background:var(--surface0);border:1px solid var(--surface1);color:var(--text);border-radius:4px;font-size:12px;font-family:var(--font-mono);resize:vertical"></textarea>
+                </div>
+                <div class="control-hint">
+                  One absolute path per line. Each becomes an entry in
+                  <code>sandbox_workspace_write.writable_roots</code> (equivalent to <code>--add-dir</code>). Blank lines and duplicates are dropped. Press <kbd>Enter</kbd>-out or click away to save.
+                </div>
+              </fieldset>
+            </div>
+            <div id="control-claude-section" style="display:none">
+              <fieldset class="control-group">
+                <legend>Model</legend>
+                <div class="control-row">
+                  <label for="control-claude-model">Override</label>
+                  <input type="text" id="control-claude-model" placeholder="e.g. claude-haiku-4-5-20251001 or haiku (empty = claude default)">
+                </div>
+                <div class="control-hint">
+                  Sent as <code>claude --model</code>. Empty = let the claude CLI pick its configured default. Applies to the next task (the model latches when the process spawns).
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Permission mode</legend>
+                <div class="control-row">
+                  <label for="control-claude-permission-mode">Mode</label>
+                  <select id="control-claude-permission-mode">
+                    <option value="default" selected>default</option>
+                    <option value="acceptEdits">acceptEdits</option>
+                    <option value="plan">plan</option>
+                    <option value="bypassPermissions">bypassPermissions</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  <strong>default</strong>: tools outside the allowed list ask — prompts surface as Intendant approvals. <strong>acceptEdits</strong>: file edits auto-approve, commands still ask. <strong>plan</strong>: read-only planning. <strong>bypassPermissions</strong>: nothing asks — prefer an external sandbox.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Allowed tools</legend>
+                <div class="control-row">
+                  <label for="control-claude-allowed-tools">Always allowed</label>
+                  <textarea id="control-claude-allowed-tools" rows="3" placeholder="one-tool-per-line, e.g.&#10;Read&#10;Bash(cargo test *)&#10;(empty = all tools, gated by approvals)" style="flex:1;padding:4px 8px;background:var(--surface0);border:1px solid var(--surface1);color:var(--text);border-radius:4px;font-size:12px;font-family:var(--font-mono);resize:vertical"></textarea>
+                </div>
+                <div class="control-hint">
+                  Passed as <code>claude --allowedTools</code>. Listed tools (rule syntax like <code>Bash(cargo test *)</code> works) skip the permission prompt entirely; everything else follows the permission mode above. Press <kbd>Ctrl/&#8984;+Enter</kbd> or click away to save. Applies to the next task.
+                </div>
+              </fieldset>
+            </div>
+            <div id="control-no-backend" class="control-disabled-overlay" style="display:none">
+              Pick Codex in Settings &rarr; Agent to configure backend-specific knobs.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Stats Tab -->
+    <div id="tab-stats" class="tab-pane">
+      <div class="stats-host-bar" id="stats-host-bar">
+        <label class="stats-host-label" for="stats-host-select">Host</label>
+        <select class="stats-host-select" id="stats-host-select">
+          <option value="">(self)</option>
+        </select>
+      </div>
+      <div class="usage-container" id="usage-container">
+        <div class="ui-stat-row" id="stats-kpi-row"></div>
+        <div class="ui-empty" id="usage-empty">
+          <div class="ui-empty-glyph" aria-hidden="true">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 20.5h16"/>
+              <path d="M7 20.5v-6.5"/>
+              <path d="M12 20.5v-11"/>
+              <path d="M17 20.5v-15"/>
+            </svg>
+          </div>
+          <div class="ui-empty-title">No usage yet</div>
+          <div class="ui-empty-hint">Token and cost stats appear when a session runs.</div>
+        </div>
+        <div class="usage-cards" id="usage-cards"></div>
+        <div class="cost-section ui-card" id="cost-section">
+          <div class="ui-section-head">
+            <div class="ui-section-title">Estimated Cost</div>
+            <div class="ui-section-sub">Estimated spend from recorded token usage.</div>
+          </div>
+          <div class="cost-grid" id="cost-grid"></div>
+        </div>
+        <div class="token-history ui-card" id="token-history">
+          <div class="ui-section-head">
+            <div class="ui-section-title">Tokens per Turn</div>
+            <div class="ui-section-sub">Context size sent on each turn of this session.</div>
+          </div>
+          <div class="history-chart" id="history-chart"></div>
+        </div>
+        <div class="stats-loading" id="stats-session-loading" role="status" aria-live="polite">
+          <span class="stats-loading-spinner" aria-hidden="true"></span>
+          <span>
+            <span class="stats-loading-title">Loading session stats...</span>
+            <span class="stats-loading-detail">More usage sections will appear here.</span>
+          </span>
+        </div>
+        <div class="cost-section token-activity-section ui-card" id="token-activity-section">
+          <div class="ui-section-head">
+            <div class="ui-section-title" id="token-activity-title">Token Activity</div>
+            <div class="ui-section-sub">Daily token volume across this host's sessions.</div>
+            <div class="ui-section-actions token-activity-controls">
+              <div class="token-activity-segment" id="token-activity-agent" role="tablist" aria-label="Token activity agent">
+                <button type="button" data-agent="codex">Codex</button>
+                <button type="button" data-agent="all">All</button>
+                <button type="button" data-agent="claude">Claude</button>
+              </div>
+              <div class="token-activity-segment" id="token-activity-view" role="tablist" aria-label="Token activity view">
+                <button type="button" data-view="daily">Daily</button>
+                <button type="button" data-view="weekly">Weekly</button>
+                <button type="button" data-view="cumulative">Cumulative</button>
+              </div>
+            </div>
+          </div>
+          <div class="token-activity-stats" id="token-activity-stats"></div>
+          <div class="token-activity-skyline" id="token-activity-skyline"></div>
+          <div class="token-activity-heatmap-wrap">
+            <div class="token-activity-months" id="token-activity-months"></div>
+            <div class="token-activity-heatmap" id="token-activity-heatmap"></div>
+          </div>
+          <div class="token-activity-detail" id="token-activity-detail"></div>
+        </div>
+        <div class="cost-section ui-card" id="all-sessions-usage">
+          <div class="ui-section-head">
+            <div class="ui-section-title">All Sessions</div>
+            <div class="ui-section-sub">Aggregate usage across every stored session.</div>
+          </div>
+          <div class="cost-grid" id="all-sessions-grid"></div>
+        </div>
+        <div class="cost-section ui-card" id="daily-usage-section">
+          <div class="ui-section-head">
+            <div class="ui-section-title">Daily Usage</div>
+            <div class="ui-section-sub">The most recent active days, newest first.</div>
+          </div>
+          <div class="cost-grid" id="daily-usage-grid"></div>
+        </div>
+        <div class="cost-section ui-card" id="agent-usage-section">
+          <div class="ui-section-head">
+            <div class="ui-section-title">By Agent And Period</div>
+            <div class="ui-section-sub">Usage split by agent for today, this week, and all time.</div>
+          </div>
+          <div class="cost-grid" id="agent-usage-grid"></div>
+        </div>
+        <div class="cost-section ui-card" id="disk-usage-section">
+          <div class="ui-section-head">
+            <div class="ui-section-title">Disk Usage</div>
+            <div class="ui-section-sub">Space used by session recordings, frames, turns, and logs.</div>
+          </div>
+          <div class="cost-grid" id="disk-usage-grid"></div>
+        </div>
+        <div id="display-metrics-container"></div>
+      </div>
+    </div>
+
+    <!-- Terminal Tab -->
+    <div id="tab-terminal" class="tab-pane">
+      <div class="subtabs">
+        <button class="subtab-btn active" data-term-tab="tui">TUI</button>
+        <button class="subtab-btn" data-term-tab="shell">Shell</button>
+        <button class="keybar-toggle" id="keybar-toggle" title="Show/hide the special-key bar (Esc, Tab, Ctrl, arrows, …)">Keys</button>
+      </div>
+      <div class="subtab-panes">
+        <div class="subtab-pane active" id="term-pane-tui">
+          <div class="terminal-container" id="terminal-container"></div>
+          <div class="ui-empty tui-empty-overlay" id="tui-empty-state" aria-hidden="true">
+            <div class="ui-empty-glyph">
+              <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="2.5" y="4" width="19" height="16" rx="2"/>
+                <path d="M6.5 9.5l3.5 3-3.5 3"/>
+                <path d="M12.5 15.5h5"/>
+              </svg>
+            </div>
+            <div class="ui-empty-title">TUI mirror idle</div>
+            <div class="ui-empty-hint">The agent's terminal appears here while a session is active. Use the Shell subtab for an interactive shell on this daemon.</div>
+          </div>
+          <div class="terminal-unavailable hidden" id="terminal-tui-unavailable" role="status" aria-live="polite"></div>
+        </div>
+        <div class="subtab-pane" id="term-pane-shell">
+          <div class="shell-toolbar">
+            <label for="shell-host-select">Target</label>
+            <select id="shell-host-select" title="Shell target"></select>
+            <span class="shell-host-status" id="shell-host-status"></span>
+            <button id="shell-share-btn" class="shell-share-btn hidden" title="Share this shell session so scoped collaborators (terminal.view / terminal.write) can attach">Share</button>
+            <div id="shell-target-summary" class="target-summary" aria-live="polite"></div>
+          </div>
+          <div class="terminal-container" id="shell-container"></div>
+          <div class="shell-keybar" id="shell-keybar">
+            <button class="shell-key" data-key="esc">Esc</button>
+            <button class="shell-key" data-key="tab">Tab</button>
+            <button class="shell-key sticky wide" data-sticky="ctrl">Ctrl</button>
+            <button class="shell-key sticky wide" data-sticky="alt">Alt</button>
+            <button class="shell-key" data-key="up" title="Up">&#x2191;</button>
+            <button class="shell-key" data-key="down" title="Down">&#x2193;</button>
+            <button class="shell-key" data-key="left" title="Left">&#x2190;</button>
+            <button class="shell-key" data-key="right" title="Right">&#x2192;</button>
+            <button class="shell-key" data-key="home" title="Home">Home</button>
+            <button class="shell-key" data-key="end" title="End">End</button>
+            <button class="shell-key" data-key="pgup" title="Page Up">PgUp</button>
+            <button class="shell-key" data-key="pgdn" title="Page Down">PgDn</button>
+            <button class="shell-key" data-key="del" title="Delete">Del</button>
+            <button class="shell-key" data-key="pipe">|</button>
+            <button class="shell-key" data-key="slash">/</button>
+            <button class="shell-key" data-key="backslash">\</button>
+            <button class="shell-key" data-key="tilde">~</button>
+            <button class="shell-key" data-key="dash">-</button>
+            <button class="shell-key" data-key="dollar">$</button>
+            <button class="shell-key" data-key="star">*</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Displays Tab -->
+    <div id="tab-displays" class="tab-pane">
+      <div class="display-approval-banner hidden" id="display-approval-banner">
+        <div class="icon">&#x26A0;</div>
+        <div class="text">
+          <div class="title">Screen sharing approval needed</div>
+          <div class="subtitle">A dialog should be visible on the guest desktop — approve it to start the video stream.</div>
+        </div>
+      </div>
+      <div class="shared-view-banner hidden" id="shared-view-banner" data-shared-view-banner>
+        <span class="shared-view-kicker">Shared view</span>
+        <span class="shared-view-message" id="shared-view-message" data-shared-view-message></span>
+        <span class="shared-view-actions">
+          <button class="shared-view-action" id="shared-view-take-input" type="button" style="display:none" data-shared-view-take-input title="Take input authority for the focused display">Take input</button>
+          <button class="shared-view-close" type="button" id="shared-view-close" data-shared-view-close title="Hide shared view">&times;</button>
+        </span>
+      </div>
+      <div class="displays-container" id="displays-container">
+        <div class="displays-placeholder ui-empty" id="displays-placeholder">
+          <div class="ui-empty-glyph" aria-hidden="true">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2.5" y="4.5" width="19" height="12.5" rx="2"/>
+              <path d="M12 17v3"/>
+              <path d="M8.5 20.5h7"/>
+            </svg>
+          </div>
+          <div class="ui-empty-title">No displays active</div>
+          <div class="ui-empty-hint">Displays will appear when the agent launches a GUI</div>
+        </div>
+      </div>
+      <div class="displays-collapse-bar hidden" id="displays-collapse-bar">
+        <button id="displays-collapse-btn" title="Collapse/expand display viewer">&#x25B4; Displays</button>
+      </div>
+      <div class="displays-split-handle" id="displays-split-handle" style="display:none"></div>
+      <div class="recording-section hidden" id="recording-section">
+        <div class="recording-header">
+          <span>Recordings</span>
+          <select id="recording-stream-select"></select>
+          <span class="rec-status" id="rec-status"></span>
+        </div>
+        <div class="recording-player-wrap" id="recording-player-wrap">
+          <video id="recording-video" preload="auto"></video>
+          <canvas class="recording-overlay" id="recording-overlay"></canvas>
+        </div>
+        <div class="annotation-toolbar hidden" id="annotation-toolbar">
+          <div class="ann-tools">
+            <button class="ann-btn active" data-tool="freehand" title="Pen (freehand)">&#9998;</button>
+            <button class="ann-btn" data-tool="rect" title="Rectangle">&#9633;</button>
+            <button class="ann-btn" data-tool="circle" title="Circle">&#9675;</button>
+            <button class="ann-btn" data-tool="arrow" title="Arrow">&#8599;</button>
+            <button class="ann-btn" data-tool="text" title="Text">T</button>
+          </div>
+          <div class="ann-colors">
+            <button class="ann-color active" data-color="#f38ba8" style="background:#f38ba8" title="Red"></button>
+            <button class="ann-color" data-color="#f9e2af" style="background:#f9e2af" title="Yellow"></button>
+            <button class="ann-color" data-color="#a6e3a1" style="background:#a6e3a1" title="Green"></button>
+            <button class="ann-color" data-color="#89b4fa" style="background:#89b4fa" title="Blue"></button>
+            <button class="ann-color" data-color="#cdd6f4" style="background:#cdd6f4" title="White"></button>
+          </div>
+          <div class="ann-thickness">
+            <button class="ann-thick" data-thick="2" title="Thin">&#8212;</button>
+            <button class="ann-thick active" data-thick="4" title="Medium">&#9473;</button>
+            <button class="ann-thick" data-thick="8" title="Thick">&#9608;</button>
+          </div>
+          <div class="ann-actions">
+            <button class="ann-act" id="ann-undo" title="Undo (Ctrl+Z)">&#8630;</button>
+            <button class="ann-act" id="ann-redo" title="Redo (Ctrl+Shift+Z)">&#8631;</button>
+            <button class="ann-act" id="ann-clear" title="Clear">&#10005;</button>
+          </div>
+          <div class="ann-submit">
+            <input class="ann-note" id="ann-note" placeholder="Note..." />
+            <button class="ann-save-btn" id="ann-save-btn" title="Save annotation to disk">Save</button>
+            <button class="ann-attach-btn" id="ann-attach-btn" title="Queue for the next task (works without an agent)">Attach</button>
+            <button class="ann-submit-btn" id="ann-submit-btn" title="Save and inject into the live presence layer">Send</button>
+          </div>
+          <span class="ann-result" id="ann-result"></span>
+          <button class="ann-close" id="ann-close" title="Exit annotation (Esc)">&times;</button>
+        </div>
+        <div class="recording-timeline" id="recording-timeline">
+          <div class="timeline-bar" id="timeline-bar"></div>
+          <div class="timeline-progress" id="timeline-progress"></div>
+          <div class="timeline-cursor" id="timeline-cursor"></div>
+        </div>
+        <div class="clip-toolbar hidden" id="clip-toolbar">
+          <div class="clip-range-display" id="clip-range">
+            <span id="clip-in-label">In: --</span>
+            <span id="clip-out-label">Out: --</span>
+            <span id="clip-duration-label"></span>
+            <a href="#" id="clip-clear-range">Clear</a>
+          </div>
+          <label>FPS:</label>
+          <select id="clip-fps">
+            <option value="1">1</option>
+            <option value="2" selected>2</option>
+            <option value="5">5</option>
+            <option value="10">10</option>
+          </select>
+          <span class="clip-frame-count" id="clip-frame-count"></span>
+          <button id="clip-keyframe-btn" title="Toggle keyframe marking mode">+ Keyframe</button>
+          <button id="clip-ann-range-btn" title="Annotate a time range">Annotate Range</button>
+          <span class="clip-ann-prompt hidden" id="clip-ann-prompt"></span>
+          <div style="margin-left:auto;display:flex;gap:4px;align-items:center">
+            <button id="clip-preview-btn" title="Generate preview thumbnails">Preview</button>
+            <input class="ann-note" id="clip-note" placeholder="Clip note..." />
+            <button class="clip-save-btn" id="clip-save-btn" title="Save clip frames to registry">Save</button>
+            <button class="ann-attach-btn" id="clip-attach-btn" title="Queue clip frames for the next task (works without an agent)">Attach</button>
+            <button class="clip-send-btn" id="clip-send-btn" title="Save and inject into the live presence layer">Send</button>
+            <span class="clip-status" id="clip-status"></span>
+            <button class="ann-close" id="clip-close" title="Exit clip mode (Esc)">&times;</button>
+          </div>
+          <div class="clip-progress hidden" id="clip-progress">
+            <div class="bar-track"><div class="bar-fill" id="clip-progress-fill"></div></div>
+            <span class="clip-progress-text" id="clip-progress-text"></span>
+            <button class="clip-cancel-btn" id="clip-cancel-btn">Cancel</button>
+          </div>
+        </div>
+        <div class="clip-preview-strip hidden" id="clip-preview-strip"></div>
+        <div class="recording-controls">
+          <button id="rec-play-btn" title="Play/Pause">&#x25B6;</button>
+          <span class="rec-time" id="rec-time">0:00 / 0:00</span>
+          <select id="rec-speed" title="Playback speed">
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option>
+            <option value="2">2x</option>
+            <option value="4">4x</option>
+          </select>
+          <button id="rec-annotate-btn" title="Annotate frame (A)">&#9998; Annotate</button>
+          <button id="rec-clip-btn" title="Send Clip (C)">&#127916; Clip</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sessions Tab -->
+    <div id="tab-sessions" class="tab-pane">
+      <div class="sessions-container">
+        <div class="subtabs" id="sessions-subtabs">
+          <button class="subtab-btn active" data-sessions-tab="recent">Recent</button>
+          <button class="subtab-btn" data-sessions-tab="deep">Deep Search</button>
+          <button class="subtab-btn" data-sessions-tab="worktrees">Worktrees</button>
+          <button class="subtab-btn" data-sessions-tab="new">New Session</button>
+        </div>
+        <div class="subtab-panes sessions-subtab-panes">
+          <div class="subtab-pane active" id="sessions-pane-recent">
+            <div class="sessions-header">
+              <div class="sessions-title-line">
+                <span class="sessions-title">Recent Sessions</span>
+                <button class="ui-btn sessions-refresh" onclick="loadSessions()" title="Reload session list">Refresh</button>
+              </div>
+              <div class="sessions-toolbar">
+                <label class="sessions-search" for="sessions-search">
+                  <span>Quick search</span>
+                  <input type="search" id="sessions-search" placeholder="ID, name, task, model, path..." autocomplete="off" spellcheck="false">
+                </label>
+                <div class="sessions-control sessions-multi-filter sessions-project-filter" data-session-filter="project">
+                  <span>Project</span>
+                  <button type="button" class="sessions-multi-filter-btn" id="filter-session-project" aria-haspopup="true" aria-expanded="false">All projects</button>
+                  <div class="sessions-multi-filter-menu sessions-project-filter-menu hidden" id="filter-session-project-menu" role="menu" aria-label="Project filters"></div>
+                </div>
+                <div class="sessions-control sessions-multi-filter" data-session-filter="source">
+                  <span>Source</span>
+                  <button type="button" class="sessions-multi-filter-btn" id="filter-session-source" aria-haspopup="true" aria-expanded="false">All sources</button>
+                  <div class="sessions-multi-filter-menu hidden" id="filter-session-source-menu" role="menu" aria-label="Source filters">
+                    <label><input type="checkbox" value="intendant"> Intendant</label>
+                    <label><input type="checkbox" value="external"> External agents</label>
+                    <label><input type="checkbox" value="codex"> Codex</label>
+                    <label><input type="checkbox" value="claude-code"> Claude</label>
+                  </div>
+                </div>
+                <div class="sessions-control sessions-multi-filter" data-session-filter="status">
+                  <span>Status</span>
+                  <button type="button" class="sessions-multi-filter-btn" id="filter-session-status" aria-haspopup="true" aria-expanded="false">All statuses</button>
+                  <div class="sessions-multi-filter-menu hidden" id="filter-session-status-menu" role="menu" aria-label="Status filters">
+                    <label><input type="checkbox" value="active"> Active</label>
+                    <label><input type="checkbox" value="idle"> Idle</label>
+                    <label><input type="checkbox" value="completed"> Completed</label>
+                    <label><input type="checkbox" value="abandoned"> Abandoned</label>
+                    <label><input type="checkbox" value="interrupted"> Interrupted</label>
+                  </div>
+                </div>
+                <div class="sessions-control sessions-toggle-field">
+                  <span>Subagents</span>
+                  <label class="sessions-toggle sessions-subagent-toggle" title="Include child agent sessions in Recent">
+                    <input type="checkbox" id="sessions-show-subagents">
+                    <span>Show</span>
+                  </label>
+                </div>
+                <label class="sessions-sort">
+                  <span>Sort</span>
+                  <select id="sort-sessions">
+                    <option value="updated-desc" selected>Date changed (newest)</option>
+                    <option value="updated-asc">Date changed (oldest)</option>
+                    <option value="created-desc">Creation date (newest)</option>
+                    <option value="created-asc">Creation date (oldest)</option>
+                    <option value="cost-desc">Cost (highest)</option>
+                    <option value="cost-asc">Cost (lowest)</option>
+                    <option value="size-desc">Size (largest)</option>
+                    <option value="size-asc">Size (smallest)</option>
+                    <option value="turns-desc">Turns (most)</option>
+                    <option value="turns-asc">Turns (fewest)</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div class="sessions-aggregate" id="sessions-aggregate"></div>
+            <div class="sessions-hydration-status hidden" id="sessions-hydration-status" aria-live="polite"></div>
+            <div class="sessions-list" id="sessions-list">
+              <div class="empty-state">Loading sessions...</div>
+            </div>
+            <div class="session-detail hidden" id="session-detail">
+              <div class="session-detail-header">
+                <button class="session-back-btn" onclick="closeSessionDetail()">&larr; Back</button>
+                <span class="session-detail-title" id="session-detail-title"></span>
+                <button class="session-detail-action-btn session-resume-btn" id="session-detail-resume" type="button" title="Resume this session in Activity">Resume session</button>
+                <button class="session-detail-action-btn session-config-btn" id="session-detail-config" type="button" title="Configure launch settings for this session">Configure</button>
+                <button class="session-detail-action-btn session-rename-btn" id="session-detail-rename" type="button" title="Rename this session">Rename</button>
+              </div>
+              <div class="session-detail-body" id="session-detail-body">
+                <div class="sd-section hidden" id="sd-recordings">
+                  <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
+                    <span class="sd-section-chevron">&#x25BE;</span>
+                    <span class="sd-section-title">Recordings</span>
+                    <span class="sd-section-badge" id="sd-recordings-badge"></span>
+                  </div>
+                  <div class="sd-section-content" id="session-detail-recordings"></div>
+                </div>
+                <div class="sd-section hidden" id="sd-frames">
+                  <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
+                    <span class="sd-section-chevron">&#x25BE;</span>
+                    <span class="sd-section-title">Frames</span>
+                    <span class="sd-section-badge" id="sd-frames-badge"></span>
+                  </div>
+                  <div class="sd-section-content" id="session-detail-frames"></div>
+                </div>
+                <div class="sd-section" id="sd-logs">
+                  <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
+                    <span class="sd-section-chevron">&#x25BE;</span>
+                    <span class="sd-section-title">Logs</span>
+                    <span class="sd-section-badge" id="sd-logs-badge"></span>
+                  </div>
+                  <div class="sd-section-content session-detail-logs" id="session-detail-logs"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="subtab-pane" id="sessions-pane-deep">
+            <div class="sessions-header">
+              <div class="sessions-title-line">
+                <span class="sessions-title">Deep Search</span>
+                <button class="ui-btn sessions-refresh" onclick="loadSessions()" title="Reload session list metadata">Refresh</button>
+              </div>
+              <div class="sessions-deep-search" id="sessions-deep-search-panel">
+                <div class="sessions-deep-search-row">
+                  <div class="sessions-deep-search-title">
+                    <span>Log Search</span>
+                    <span>Scans every matching session log, including full log files. Large histories can take minutes.</span>
+                  </div>
+                  <label class="sessions-deep-search-query" for="sessions-deep-search-query">
+                    <span>Log query</span>
+                    <input type="search" id="sessions-deep-search-query" placeholder="Search session log content..." autocomplete="off" spellcheck="false">
+                  </label>
+                  <label class="sessions-deep-search-query" for="sessions-deep-search-mode">
+                    <span>Match mode</span>
+                    <select id="sessions-deep-search-mode">
+                      <option value="all_keywords" selected>All keywords in one entry</option>
+                      <option value="exact_phrase">Exact phrase</option>
+                      <option value="any_keyword_session">Any keyword anywhere in session</option>
+                      <option value="user_message_all_keywords">All keywords in one user message</option>
+                    </select>
+                  </label>
+                  <button type="button" class="sessions-deep-search-btn" id="sessions-deep-search-run">Run deep search</button>
+                  <button type="button" class="sessions-deep-search-btn secondary hidden" id="sessions-deep-search-cancel">Cancel</button>
+                  <button type="button" class="sessions-deep-search-btn secondary" id="sessions-deep-search-clear">Clear</button>
+                </div>
+                <div class="sessions-search-status">Project narrows the scan before it starts; the remaining controls refine matches after the exhaustive scan.</div>
+                <div class="sessions-search-status" id="sessions-deep-search-status"></div>
+              </div>
+              <div class="sessions-toolbar">
+                <label class="sessions-search" for="sessions-deep-result-search">
+                  <span>Result filter</span>
+                  <input type="search" id="sessions-deep-result-search" placeholder="ID, name, task, model, path..." autocomplete="off" spellcheck="false">
+                </label>
+                <div class="sessions-control sessions-multi-filter sessions-project-filter" data-session-filter="deep-project">
+                  <span>Project</span>
+                  <button type="button" class="sessions-multi-filter-btn" id="filter-session-deep-project" aria-haspopup="true" aria-expanded="false">All projects</button>
+                  <div class="sessions-multi-filter-menu sessions-project-filter-menu hidden" id="filter-session-deep-project-menu" role="menu" aria-label="Deep search project filters"></div>
+                </div>
+                <div class="sessions-control sessions-multi-filter" data-session-filter="deep-source">
+                  <span>Source</span>
+                  <button type="button" class="sessions-multi-filter-btn" id="filter-session-deep-source" aria-haspopup="true" aria-expanded="false">All sources</button>
+                  <div class="sessions-multi-filter-menu hidden" id="filter-session-deep-source-menu" role="menu" aria-label="Deep search source filters">
+                    <label><input type="checkbox" value="intendant"> Intendant</label>
+                    <label><input type="checkbox" value="external"> External agents</label>
+                    <label><input type="checkbox" value="codex"> Codex</label>
+                    <label><input type="checkbox" value="claude-code"> Claude</label>
+                  </div>
+                </div>
+                <div class="sessions-control sessions-multi-filter" data-session-filter="deep-status">
+                  <span>Status</span>
+                  <button type="button" class="sessions-multi-filter-btn" id="filter-session-deep-status" aria-haspopup="true" aria-expanded="false">All statuses</button>
+                  <div class="sessions-multi-filter-menu hidden" id="filter-session-deep-status-menu" role="menu" aria-label="Deep search status filters">
+                    <label><input type="checkbox" value="active"> Active</label>
+                    <label><input type="checkbox" value="idle"> Idle</label>
+                    <label><input type="checkbox" value="completed"> Completed</label>
+                    <label><input type="checkbox" value="abandoned"> Abandoned</label>
+                    <label><input type="checkbox" value="interrupted"> Interrupted</label>
+                  </div>
+                </div>
+                <label class="sessions-sort">
+                  <span>Sort</span>
+                  <select id="sort-sessions-deep">
+                    <option value="updated-desc" selected>Date changed (newest)</option>
+                    <option value="updated-asc">Date changed (oldest)</option>
+                    <option value="created-desc">Creation date (newest)</option>
+                    <option value="created-asc">Creation date (oldest)</option>
+                    <option value="cost-desc">Cost (highest)</option>
+                    <option value="cost-asc">Cost (lowest)</option>
+                    <option value="size-desc">Size (largest)</option>
+                    <option value="size-asc">Size (smallest)</option>
+                    <option value="turns-desc">Turns (most)</option>
+                    <option value="turns-asc">Turns (fewest)</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div class="sessions-list" id="sessions-deep-list">
+              <div class="empty-state">Run a deep search to show log matches</div>
+            </div>
+          </div>
+          <div class="subtab-pane" id="sessions-pane-worktrees">
+            <div class="sessions-header worktrees-header">
+              <div class="sessions-title-line">
+                <span class="sessions-title">Worktrees</span>
+                <button class="ui-btn sessions-refresh" id="worktrees-scan-btn" title="Scan known worktree roots">Scan</button>
+              </div>
+              <div class="sessions-toolbar">
+                <label class="sessions-search" for="worktrees-search">
+                  <span>Search</span>
+                  <input type="search" id="worktrees-search" placeholder="Path, branch, repo, label..." autocomplete="off" spellcheck="false">
+                </label>
+                <button class="ui-btn sessions-refresh" id="worktrees-refresh-btn" title="Reload the last cached scan">Cached</button>
+                <label class="sessions-toggle"><input type="checkbox" id="filter-worktrees-active" checked> Active</label>
+                <label class="sessions-toggle"><input type="checkbox" id="filter-worktrees-dirty" checked> Dirty</label>
+                <label class="sessions-toggle"><input type="checkbox" id="filter-worktrees-unmerged" checked> Unmerged</label>
+                <label class="sessions-toggle"><input type="checkbox" id="filter-worktrees-main"> Main</label>
+                <label class="sessions-sort">
+                  <span>Sort</span>
+                  <select id="sort-worktrees">
+                    <option value="size-desc" selected>Size (largest)</option>
+                    <option value="changed-desc">Changed (newest)</option>
+                    <option value="changed-asc">Changed (oldest)</option>
+                    <option value="head-age-desc">Commit age (oldest)</option>
+                    <option value="risk-desc">Risk first</option>
+                    <option value="path-asc">Path</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div class="sessions-search-status" id="worktrees-status"></div>
+            <div class="sessions-spawn-notice hidden" id="worktrees-activity-notice" role="status" aria-live="polite">
+              <span class="sessions-spawn-spinner" aria-hidden="true"></span>
+              <span id="worktrees-activity-text"></span>
+            </div>
+            <div class="sessions-aggregate" id="worktrees-aggregate"></div>
+            <div class="worktrees-list" id="worktrees-list">
+              <div class="empty-state">No worktree scan yet</div>
+            </div>
+          </div>
+          <div class="subtab-pane sessions-new-pane" id="sessions-pane-new">
+            <div class="sessions-new-panel ui-card">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title">New session</h3>
+                <div class="ui-section-sub">Start a fresh session on this daemon — internal agent or a supervised external CLI.</div>
+              </div>
+              <div class="sessions-new-task">
+                <label class="sessions-new-session-field" for="new-session-name">
+                  Session name
+                  <input id="new-session-name" class="sessions-project-input" type="text" maxlength="180" autocomplete="off" spellcheck="false" placeholder="Optional display name">
+                </label>
+                <label class="sessions-new-session-field sessions-new-session-task" for="new-session-input">
+                  Initial message
+                  <textarea id="new-session-input" class="sessions-new-task-input" rows="4" placeholder="Initial message..."></textarea>
+                </label>
+                <div class="sessions-attach-row">
+                  <button type="button" id="new-session-attach-btn" class="sessions-attach-btn" title="Attach file(s) to this new session">Attach</button>
+                  <div class="pending-attachments-bar hidden" id="new-session-attachments-bar">
+                    <span class="pending-attachments-label">Attachments</span>
+                    <span class="pending-attachments-count" id="new-session-attachments-count">0</span>
+                    <div id="new-session-attachments-list" class="pending-attachments-list"></div>
+                    <button type="button" class="pending-attachments-clear" id="new-session-attachments-clear" data-pending-attachments-clear title="Remove all attachments">Clear</button>
+                  </div>
+                </div>
+                <div class="sessions-new-session-field sessions-new-session-project">
+                  <label class="sessions-project-label" for="new-session-project-root">Project</label>
+                  <div class="sessions-project-row">
+                    <input id="new-session-project-root" class="sessions-project-input" type="text" autocomplete="off" spellcheck="false" list="new-session-project-options" placeholder="/path/to/project">
+                    <button type="button" class="sessions-project-browse" onclick="openProjectDirectoryPicker()">Browse</button>
+                    <label class="sessions-project-create-label" id="new-session-create-project-dir-wrap" title="Create this directory on the Intendant host before starting">
+                      <input id="new-session-create-project-dir" type="checkbox">
+                      Create
+                    </label>
+                  </div>
+                  <div id="new-session-project-status" class="sessions-project-status"></div>
+                  <datalist id="new-session-project-options"></datalist>
+                </div>
+                <div class="sessions-new-agent-row sessions-new-agent-picker">
+                  <label class="sessions-new-session-field" for="new-session-agent">
+                    Agent
+                    <select id="new-session-agent" class="sessions-agent-select">
+                      <option value="">Current setting</option>
+                      <option value="internal">Internal agent</option>
+                      <option value="codex">Codex</option>
+                      <option value="claude-code">Claude Code</option>
+                    </select>
+                  </label>
+                </div>
+                <details class="ui-fold sessions-new-external-fold" id="new-session-external-fold">
+                  <summary>External agent options</summary>
+                  <div class="ui-fold-body">
+                    <p class="ui-fold-hint">These apply to external agents — pick Codex or Claude Code above to enable.</p>
+                    <div class="sessions-new-agent-row sessions-new-external-grid">
+                      <div class="sessions-new-session-field">
+                        <label for="new-session-agent-command">Binary path</label>
+                        <div class="sessions-agent-command-row">
+                          <input id="new-session-agent-command" class="sessions-agent-command-input" type="text" autocomplete="off" spellcheck="false" placeholder="Select an external agent" disabled>
+                          <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
+                        </div>
+                      </div>
+                      <label class="sessions-new-session-field" for="new-session-claude-model-select">
+                        Claude model
+                        <select id="new-session-claude-model-select" onchange="onNewSessionClaudeModelSelectChange()" disabled>
+                          <option value="">Global setting</option>
+                          <option value="fable">fable — latest Fable</option>
+                          <option value="opus">opus — latest Opus</option>
+                          <option value="sonnet">sonnet — latest Sonnet</option>
+                          <option value="haiku">haiku — latest Haiku</option>
+                          <option value="__custom__">Custom model id…</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field hidden" for="new-session-claude-model" id="new-session-claude-model-custom-row">
+                        Custom model id
+                        <input id="new-session-claude-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. claude-haiku-4-5-20251001" disabled>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-claude-permission-mode">
+                        Permissions
+                        <select id="new-session-claude-permission-mode" disabled>
+                          <option value="">Global setting</option>
+                          <option value="default">default</option>
+                          <option value="acceptEdits">acceptEdits</option>
+                          <option value="plan">plan</option>
+                          <option value="bypassPermissions">bypassPermissions</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-claude-effort">
+                        Effort
+                        <select id="new-session-claude-effort" disabled>
+                          <option value="">Global setting</option>
+                          <option value="low">low</option>
+                          <option value="medium">medium</option>
+                          <option value="high">high</option>
+                          <option value="xhigh">xhigh</option>
+                          <option value="max">max</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-codex-sandbox">
+                        Sandbox
+                        <select id="new-session-codex-sandbox" disabled>
+                          <option value="workspace-write">workspace-write</option>
+                          <option value="danger-full-access">danger-full-access</option>
+                          <option value="read-only">read-only</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-codex-approval-policy">
+                        Approval
+                        <select id="new-session-codex-approval-policy" disabled>
+                          <option value="on-request">on-request</option>
+                          <option value="never">never</option>
+                          <option value="untrusted">untrusted</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-codex-managed-context">
+                        Managed context
+                        <select id="new-session-codex-managed-context" class="sessions-agent-managed-context-select" disabled>
+                          <option value="vanilla">vanilla</option>
+                          <option value="managed">managed</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-codex-context-archive">
+                        Context replay
+                        <select id="new-session-codex-context-archive" class="sessions-agent-context-archive-select" disabled>
+                          <option value="summary">summary</option>
+                          <option value="exact">exact</option>
+                          <option value="off">off</option>
+                        </select>
+                      </label>
+                      <div class="sessions-new-session-field">
+                        Service tier
+                        <label class="sessions-new-fast-toggle disabled" id="new-session-codex-fast-wrap" title="Start the new Codex session with Fast service tier">
+                          <input id="new-session-codex-fast" type="checkbox" disabled>
+                          Fast
+                        </label>
+                      </div>
+                    </div>
+                    <div id="new-session-managed-context-note" class="sessions-agent-note"></div>
+                  </div>
+                </details>
+                <button class="sessions-start-btn" id="new-session-start-btn" onclick="startNewSession()">Start session</button>
+                <div class="sessions-spawn-notice hidden" id="new-session-spawn-notice" role="status" aria-live="polite">
+                  <span class="sessions-spawn-spinner" aria-hidden="true"></span>
+                  <span id="new-session-spawn-text"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Files Tab -->
+    <div id="tab-files" class="tab-pane">
+      <div class="subtabs">
+        <button class="subtab-btn active" data-files-tab="editor">Editor</button>
+        <button class="subtab-btn" data-files-tab="transfers">Transfers</button>
+      </div>
+      <div class="subtab-panes">
+        <div class="subtab-pane active" id="files-pane-editor" aria-label="File editor">
+          <div class="files-ide-toolbar">
+            <label for="files-ide-host">Target</label>
+            <select id="files-ide-host" onchange="onFilesIdeHostChanged()">
+              <option value="">This daemon</option>
+            </select>
+            <div id="files-ide-target-summary" class="target-summary" aria-live="polite"></div>
+            <span class="files-ide-toolbar-spacer"></span>
+            <button id="files-ide-new-file-btn" class="ui-btn" type="button" onclick="filesIdeBeginCreate('file')">New file</button>
+            <button id="files-ide-new-folder-btn" class="ui-btn" type="button" onclick="filesIdeBeginCreate('folder')">New folder</button>
+          </div>
+          <div class="files-ide-body">
+            <div class="files-ide-tree-pane">
+              <div class="files-ide-tree-toolbar">
+                <button id="files-ide-up-btn" class="ui-btn" type="button" title="Parent directory" onclick="filesIdeTreeUp()">&#8593;</button>
+                <input id="files-ide-root" type="text" autocomplete="off" spellcheck="false" placeholder="/folder or ~/folder"
+                       onkeydown="if (event.key === 'Enter') filesIdeSetRoot(this.value)">
+                <button id="files-ide-hidden-btn" class="ui-btn" type="button" title="Show hidden files" aria-pressed="false" onclick="filesIdeToggleHidden()">.h</button>
+                <button id="files-ide-tree-refresh-btn" class="ui-btn" type="button" title="Refresh" onclick="filesIdeRefreshTree()">&#10227;</button>
+              </div>
+              <div id="files-ide-tree" class="files-ide-tree" role="tree" aria-label="File browser"></div>
+              <div id="files-ide-tree-status" class="files-download-status" aria-live="polite"></div>
+            </div>
+            <div class="files-ide-editor-pane">
+              <div id="files-ide-tabs" class="files-ide-tabs" role="tablist"></div>
+              <div id="files-ide-banner" class="files-ide-banner hidden" aria-live="polite"></div>
+              <div id="files-ide-editor-host" class="files-ide-editor-host">
+                <div id="files-ide-find" class="files-ide-find hidden" role="search" aria-label="Find in file">
+                  <input id="files-ide-find-input" type="text" autocomplete="off" spellcheck="false" placeholder="Find in file"
+                         oninput="filesIdeFindOnInput()"
+                         onkeydown="if (event.key === 'Enter') { event.preventDefault(); filesIdeFindStep(event.shiftKey ? -1 : 1); } else if (event.key === 'Escape') { filesIdeCloseFind(); }">
+                  <span id="files-ide-find-count" class="files-ide-find-count" aria-live="polite"></span>
+                  <button type="button" class="ui-btn" title="Previous match (Shift+Enter)" aria-label="Previous match" onclick="filesIdeFindStep(-1)">&#8593;</button>
+                  <button type="button" class="ui-btn" title="Next match (Enter)" aria-label="Next match" onclick="filesIdeFindStep(1)">&#8595;</button>
+                  <button type="button" class="ui-btn" title="Close (Esc)" aria-label="Close find" onclick="filesIdeCloseFind()">&#10005;</button>
+                </div>
+                <div id="files-ide-empty" class="files-ide-empty">
+                  <div class="ui-empty-title">No file open</div>
+                  <div class="ui-empty-sub">Choose a file from the browser on the left, or create one with New file. Every write is checked against this target's filesystem grants.</div>
+                </div>
+              </div>
+              <div class="files-ide-statusbar">
+                <span id="files-ide-status-host" class="files-ide-status-host"><span class="files-ide-host-dot"></span><span id="files-ide-status-host-label"></span></span>
+                <span id="files-ide-status-path" class="files-ide-status-path" title=""></span>
+                <span id="files-ide-status-meta" class="files-ide-status-meta"></span>
+                <span class="files-ide-statusbar-spacer"></span>
+                <span id="files-ide-save-status" class="files-ide-save-status" aria-live="polite"></span>
+                <button id="files-ide-save-btn" class="ui-btn primary" type="button" onclick="filesIdeSaveActive()" disabled>Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="subtab-pane" id="files-pane-transfers">
+      <div class="files-pane">
+        <section class="files-tool ui-card" aria-labelledby="files-download-heading">
+          <div class="ui-section-head">
+            <h3 class="ui-section-title" id="files-download-heading">Downloads</h3>
+            <div class="ui-section-sub">Pull a file from a daemon to this browser.</div>
+          </div>
+          <div class="files-download-host-row">
+            <label for="files-download-host">Target</label>
+            <select id="files-download-host" onchange="onFilesDownloadHostChanged()">
+              <option value="">This daemon</option>
+            </select>
+          </div>
+          <div id="files-target-summary" class="target-summary" aria-live="polite"></div>
+          <div class="files-download-row">
+            <input id="files-download-path" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/file">
+            <button id="files-download-browse-btn" class="ui-btn" type="button" onclick="openFilesDownloadPicker()">Browse</button>
+            <button id="files-download-btn" class="ui-btn primary" type="button" onclick="startFilesDownload()">Download</button>
+          </div>
+          <div id="files-download-status" class="files-download-status" aria-live="polite"></div>
+          <div id="files-download-meter" class="files-download-meter ui-meter hidden" aria-hidden="true">
+            <div id="files-download-progress" class="files-download-meter-fill"></div>
+          </div>
+        </section>
+        <section class="files-tool ui-card" aria-labelledby="files-transfers-heading">
+          <div class="ui-section-head">
+            <h3 class="ui-section-title" id="files-transfers-heading">Transfers</h3>
+            <div class="ui-section-sub">Progress and history for downloads and uploads.</div>
+            <div class="ui-section-actions">
+              <button id="files-transfer-refresh-btn" class="ui-btn" type="button" onclick="refreshFilesTransferJobs()">Refresh</button>
+              <button id="files-transfer-clear-btn" class="ui-btn" type="button" onclick="clearFilesTransferHistory()">Clear finished</button>
+            </div>
+          </div>
+          <div id="files-transfer-list" class="files-transfer-list"></div>
+        </section>
+        <section class="files-tool ui-card" aria-labelledby="files-upload-heading">
+          <div class="ui-section-head">
+            <h3 class="ui-section-title" id="files-upload-heading">Uploads</h3>
+            <div class="ui-section-sub">Send files from this browser to the daemon — staged for the agent or written to a path.</div>
+          </div>
+          <input id="files-upload-input" class="files-hidden-input" type="file" multiple>
+          <div class="files-upload-config">
+            <input id="files-upload-destination" type="text" autocomplete="off" spellcheck="false" placeholder="/destination/folder-or-file">
+            <button id="files-upload-destination-browse-btn" class="ui-btn" type="button" onclick="openFilesUploadDestinationPicker()">Browse</button>
+            <select id="files-upload-conflict" aria-label="Upload conflict policy">
+              <option value="fail">Fail on conflict</option>
+              <option value="rename">Rename</option>
+              <option value="overwrite">Overwrite</option>
+            </select>
+          </div>
+          <div class="files-upload-actions">
+            <button id="files-upload-choose-btn" class="ui-btn" type="button" onclick="chooseFilesForUpload()">Choose files</button>
+            <button id="files-staged-refresh-btn" class="ui-btn" type="button" onclick="refreshFilesStagedUploads()">Refresh staged</button>
+          </div>
+          <div id="files-upload-dropzone" class="files-upload-dropzone">Drop files</div>
+          <div id="files-upload-status" class="files-download-status" aria-live="polite"></div>
+          <div id="files-staged-list" class="files-staged-list"></div>
+        </section>
+      </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Debug Tab -->
+    <div id="tab-debug" class="tab-pane">
+      <div class="debug-pane">
+        <section class="ui-card" aria-labelledby="debug-observer-heading">
+          <div class="ui-section-head">
+            <h3 class="ui-section-title" id="debug-observer-heading">Observer Display</h3>
+            <div class="ui-section-sub">A headless debug screen the agent can draw on; recordable.</div>
+          </div>
+          <p id="debug-status" class="debug-status">Not active</p>
+          <div class="debug-actions">
+            <button id="debug-setup-btn" class="ui-btn" onclick="toggleDebugScreen()">Set up debug screen</button>
+            <button id="debug-record-btn" class="ui-btn" onclick="toggleDebugRecording()" disabled>Start recording</button>
+          </div>
+          <div id="debug-info" class="debug-info hidden">
+            <p>Display: <code>:<span id="debug-display-id"></span></code></p>
+          </div>
+        </section>
+        <section class="ui-card" aria-labelledby="debug-workspaces-heading">
+          <div class="ui-section-head">
+            <h3 class="ui-section-title" id="debug-workspaces-heading">Browser Workspaces</h3>
+            <div class="ui-section-sub">Managed Chrome instances the agent can drive.</div>
+          </div>
+          <div class="debug-workspace-form">
+            <label>URL
+              <input id="browser-workspace-url" type="text" placeholder="http://localhost:8765" autocomplete="off">
+            </label>
+            <label>Provider
+              <select id="browser-workspace-provider">
+                <option value="auto">auto</option>
+                <option value="cdp">cdp</option>
+                <option value="system_cdp">system_cdp</option>
+                <option value="playwright">playwright</option>
+                <option value="agent_browser">agent_browser</option>
+              </select>
+            </label>
+            <label>Label
+              <input id="browser-workspace-label" type="text" placeholder="Dashboard" autocomplete="off">
+            </label>
+            <button type="button" class="ui-btn primary" onclick="createBrowserWorkspaceFromDebug()">Create</button>
+          </div>
+          <div id="browser-workspace-status" class="debug-workspace-status"></div>
+          <div id="browser-workspace-list" class="debug-workspace-list"></div>
+        </section>
+      </div>
+    </div>
+
+    <!-- Access Tab -->
+    <div id="tab-access" class="tab-pane">
+      <div class="subtabs" id="access-subtabs">
+        <button class="subtab-btn active" data-access-tab="overview">Overview</button>
+        <button class="subtab-btn" data-access-tab="daemons">Daemons</button>
+        <button class="subtab-btn" data-access-tab="people">People &amp; Devices</button>
+        <button class="subtab-btn" data-access-tab="peers">Peers</button>
+        <button class="subtab-btn" data-access-tab="diagnostics">Diagnostics</button>
+        <button class="subtab-btn" data-access-tab="advanced">Advanced</button>
+      </div>
+
+      <div class="subtab-panes">
+

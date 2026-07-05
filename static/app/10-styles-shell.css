@@ -1,0 +1,1091 @@
+:root {
+  --base: #1e1e2e;
+  --mantle: #181825;
+  --crust: #11111b;
+  --surface0: #313244;
+  --surface1: #45475a;
+  --surface2: #585b70;
+  --overlay0: #6c7086;
+  --overlay1: #7f849c;
+  --text: #cdd6f4;
+  --subtext0: #a6adc8;
+  --subtext1: #bac2de;
+  --blue: #89b4fa;
+  --green: #a6e3a1;
+  --teal: #94e2d5;
+  --yellow: #f9e2af;
+  --peach: #fab387;
+  --red: #f38ba8;
+  --mauve: #cba6f7;
+  --lavender: #b4befe;
+  --sapphire: #74c7ec;
+
+  --log-info: var(--text);
+  --log-model: var(--blue);
+  --log-agent: var(--teal);
+  --log-error: var(--red);
+  --log-warn: var(--yellow);
+  --log-subagent: var(--mauve);
+  --log-detail: #a2a8be;
+  --log-debug: var(--overlay1);
+  --log-presence: var(--green);
+  --concurrent-view-bg: rgba(24, 24, 37, 0.68);
+  --concurrent-view-hover-bg: rgba(24, 24, 37, 0.78);
+  --session-window-bg: rgba(24, 24, 37, 0.72);
+  --session-window-header-bg: rgba(17, 17, 27, 0.64);
+  --session-window-hover-bg: rgba(24, 24, 37, 0.80);
+  --session-window-chip-bg: rgba(49, 50, 68, 0.64);
+
+  /* Liquid-glass chrome tokens. backdrop-filter is reserved for flow-layout
+     chrome that can never overlap the Station canvases (status bar, ticker,
+     task bar, tab bar, Station header band). Overlays that can sit on top of
+     the canvas area (toasts, pickers, #station-status) use the translucent
+     layered backgrounds WITHOUT blur so the WebGPU/canvas scene is never
+     forced into constant recomposite. */
+  --glass-bg: rgba(24, 24, 37, 0.58);
+  --glass-bg-deep: linear-gradient(180deg, rgba(30, 30, 46, 0.72), rgba(17, 17, 27, 0.62));
+  --glass-hairline: rgba(205, 214, 244, 0.09);
+  --glass-hairline-bright: rgba(205, 214, 244, 0.16);
+  --glass-highlight: inset 0 1px 0 rgba(205, 214, 244, 0.05);
+  --glass-blur: blur(14px) saturate(1.2);
+  /* Validated viz ramps (dataviz method; ordinal blue ramp passes monotone-L,
+     step-gap, and light-end checks on the Mocha surface). */
+  --viz-ramp-1: #455477;
+  --viz-ramp-2: #566c98;
+  --viz-ramp-3: #6784b8;
+  --viz-ramp-4: #789cd9;
+  --viz-ramp-5: #89b4fa;
+  --viz-empty: #313244;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  height: 100%; width: 100%;
+  background: var(--base);
+  color: var(--text);
+  font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code', Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  overflow: hidden;
+  -webkit-text-size-adjust: none;
+}
+
+/* ── Scrollbars (glass) ──
+   Thin translucent thumbs on a transparent track, app-wide. Firefox picks
+   up scrollbar-color from html (inherited); WebKit/Blink use the pseudo-
+   element rules. Component-specific rules (e.g. .shell-keybar) still win
+   on specificity. */
+html {
+  scrollbar-color: rgba(88, 91, 112, 0.55) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(88, 91, 112, 0.45);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(108, 112, 134, 0.65);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ── Layout ── */
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* ── Status Bar ── */
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: var(--glass-bg-deep);
+  border-bottom: 1px solid var(--glass-hairline-bright);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-highlight), 0 1px 10px rgba(0, 0, 0, 0.2);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  overflow-x: hidden;
+  white-space: normal;
+  row-gap: 4px;
+  font-size: 12px;
+}
+.status-bar > span,
+.status-bar > div {
+  min-width: 0;
+  white-space: nowrap;
+}
+.status-bar .host-label {
+  color: var(--peach);
+  font-weight: 600;
+  padding: 1px 6px;
+  background: var(--surface0);
+  border-radius: 3px;
+  font-size: 10px;
+  letter-spacing: 0.3px;
+}
+/* Aggregate multi-host connection state: one dot summarizing all
+   configured secondaries. Hidden on single-host setups. Click jumps
+   to Access targets. */
+.hosts-aggregate-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--overlay0);
+  flex-shrink: 0;
+  cursor: pointer;
+  margin-right: 4px;
+}
+.hosts-aggregate-dot.ok { background: var(--green); }
+.hosts-aggregate-dot.warn { background: var(--yellow); }
+.hosts-aggregate-dot.err { background: var(--red); }
+.status-bar .provider,
+.status-bar .model,
+.status-bar .session,
+.status-bar #sb-dashboard-transport-label,
+.status-bar #sb-voice-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.status-bar .provider {
+  color: var(--blue);
+  max-width: min(140px, 18vw);
+}
+.status-bar .model {
+  color: var(--green);
+  max-width: min(260px, 26vw);
+}
+.status-bar .turn { color: var(--yellow); }
+.status-bar .session {
+  color: var(--overlay1);
+  font-size: 11px;
+  max-width: min(220px, 22vw);
+}
+.status-bar #sb-voice-label {
+  display: inline-block;
+  max-width: 96px;
+  vertical-align: bottom;
+  font-size: 11px;
+  color: var(--overlay0);
+}
+.status-bar #sb-dashboard-transport-label {
+  display: inline-block;
+  color: var(--overlay0);
+  font-size: 11px;
+  max-width: 112px;
+  vertical-align: bottom;
+}
+.status-bar .autonomy {
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+.status-bar .sep { color: var(--surface2); }
+.status-bar .field-label { color: var(--overlay0); font-size: 10px; margin-right: -6px; }
+/* The negative margin above is sized for direct status-bar children
+   (which have an 8px flex gap, so -6 leaves a 2px effective gap).
+   Inside our nested wrappers (`inline-flex` with their own small gap)
+   it overshoots into a visible overlap. Reset the margin in those
+   contexts so the wrapper's own gap rule controls the spacing. */
+.status-bar .display-toggle-wrap .field-label,
+.status-bar .sb-dot-group .field-label { margin-right: 0; }
+.status-bar .display-toggle-wrap .field-label { cursor: pointer; }
+/* Grant state colors itself: red until the user grants their display. */
+.status-bar #sb-display-access {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--red);
+}
+.status-bar #sb-display-access.granted { color: var(--green); }
+.display-toggle-wrap { position: relative; display: inline-flex; align-items: center; gap: 4px; }
+.display-picker {
+  display: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  /* Translucent layered glass, deliberately blur-free: the open picker can
+     extend over tab content (including the Station canvases). */
+  background: linear-gradient(180deg, rgba(49, 50, 68, 0.94), rgba(30, 30, 46, 0.96));
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 10px;
+  padding: 4px 0;
+  z-index: 200;
+  min-width: 200px;
+  box-shadow: var(--glass-highlight), 0 10px 28px rgba(0, 0, 0, 0.45);
+}
+.display-picker.visible { display: block; }
+.display-picker-item {
+  padding: 6px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text);
+}
+.display-picker-item:hover { background: var(--surface1); }
+.display-picker-item .dp-primary { color: var(--green); font-size: 10px; margin-left: 4px; }
+.budget-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.budget-bar .bar-track {
+  display: inline-block;
+  width: 60px;
+  height: 6px;
+  background: var(--surface0);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.budget-bar .bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s, background 0.3s;
+}
+.budget-pct { font-size: 11px; }
+
+/* ── Connection Dot ── */
+.conn-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.conn-dot.ok { background: var(--green); }
+.conn-dot.warn { background: var(--yellow); }
+.conn-dot.err { background: var(--red); }
+
+/* Group wrapper for status-bar dot + label pairs. Each group is an
+   `inline-flex` with a tight gap so the label sticks to its dot, and
+   the wrapper's `title` attribute provides a generous hover target
+   for the tooltip instead of relying on the bare 8x8 dot. The right-
+   anchor (`margin-left: auto` for "everything floats right") lives on
+   `.active-badge` instead of any of these groups so separators flow
+   naturally between them. */
+.status-bar .sb-dot-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  cursor: default;
+}
+.status-bar .sb-dot-group.clickable { cursor: pointer; }
+.status-bar .sb-dot-group .sep { margin: 0 2px; }
+.status-bar .active-badge {
+  margin-left: 0;
+  flex-shrink: 0;
+}
+.status-bar .access-nav-link {
+  color: var(--blue);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+body.access-page .ticker-bar,
+body.access-page .global-task-bar,
+body.access-page .tab-bar {
+  display: none;
+}
+
+body.access-page #tab-access {
+  padding-top: 0;
+}
+
+/* ── Active/Passive Badge ── */
+.active-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  user-select: none;
+  font-weight: 600;
+  transition: all 0.15s;
+  border: 1px solid transparent;
+}
+.active-badge.is-active {
+  color: var(--green);
+  border-color: var(--green);
+}
+.active-badge.is-passive {
+  color: var(--peach);
+  border-color: var(--peach);
+}
+.active-badge:hover {
+  background: var(--surface1);
+}
+
+/* ── Token Ticker ── */
+.ticker-bar {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 3px 12px;
+  background: var(--glass-bg);
+  border-bottom: 1px solid var(--glass-hairline);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+  font-size: 11px;
+  color: var(--subtext0);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.ticker-collapsed { display: flex; gap: 8px; align-items: center; white-space: nowrap; }
+.ticker-expanded { display: flex; flex-direction: column; gap: 2px; font-size: 11px; }
+.ticker-expanded > div { white-space: nowrap; }
+.tk-sep { color: var(--surface2); }
+.ticker-chevron { color: var(--overlay0); font-size: 10px; line-height: 1; margin-top: 2px; flex-shrink: 0; }
+@keyframes tk-flash { 0% { color: var(--green); } 100% { color: inherit; } }
+.tk-flash { animation: tk-flash 0.8s ease-out; }
+
+/* ── Tab Bar ── */
+.tab-bar {
+  display: flex;
+  background: var(--glass-bg);
+  border-bottom: 1px solid var(--glass-hairline-bright);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-highlight);
+  flex-shrink: 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.tab-btn {
+  padding: 8px 16px;
+  min-height: 36px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 9px 9px 0 0;
+  color: var(--overlay1);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+  position: relative;
+}
+.tab-btn:hover {
+  color: var(--subtext1);
+  background: rgba(205, 214, 244, 0.045);
+}
+.tab-btn.active {
+  color: var(--blue);
+  border-bottom-color: var(--blue);
+}
+.tab-btn .badge {
+  position: absolute;
+  top: 4px; right: 4px;
+  min-width: 16px; height: 16px;
+  border-radius: 8px;
+  background: var(--red);
+  color: var(--crust);
+  font-size: 10px;
+  font-weight: 700;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+}
+.tab-btn .badge.visible { display: flex; }
+
+/* ── Tab Content ── */
+.tab-content {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
+.tab-pane {
+  display: none;
+  flex-direction: column;
+  position: absolute;
+  inset: 0;
+}
+.tab-pane.active {
+  display: flex;
+}
+
+/* ── Station Tab ── */
+/* Glass chip band above the canvas (own flex row inside #tab-station, so it
+   never overlaps the canvases — backdrop-filter is safe here). Hidden until
+   a display-capable peer exists. One chip per peer, wired to the same
+   openPeerDisplay flow as Access targets "View display". */
+.station-peer-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 5px 12px;
+  background: var(--glass-bg);
+  border-bottom: 1px solid var(--glass-hairline);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+}
+.station-peer-chips.hidden { display: none; }
+.station-peer-chips-label {
+  color: var(--overlay0);
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+.station-peer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 220px;
+  padding: 3px 10px;
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 999px;
+  background: rgba(49, 50, 68, 0.5);
+  color: var(--subtext1);
+  font-family: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  box-shadow: var(--glass-highlight);
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.station-peer-chip:hover:not(:disabled) {
+  border-color: rgba(137, 180, 250, 0.55);
+  background: rgba(137, 180, 250, 0.1);
+  color: var(--blue);
+}
+.station-peer-chip:focus-visible {
+  outline: 2px solid rgba(137, 180, 250, 0.72);
+  outline-offset: 1px;
+}
+.station-peer-chip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.station-peer-chip .chip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--overlay0);
+  flex-shrink: 0;
+}
+.station-peer-chip .chip-dot.ok { background: var(--green); }
+.station-pane {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse at center, var(--base) 0%, var(--crust) 72%, #07070d 100%);
+}
+.station-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+}
+#station-scene-canvas {
+  z-index: 1;
+}
+#station-hud-canvas {
+  z-index: 2;
+  pointer-events: auto;
+  cursor: grab;
+}
+#station-hud-canvas[data-station-cursor="drag"] {
+  cursor: grabbing;
+}
+#station-hud-canvas[data-station-cursor="pointer"] {
+  cursor: pointer;
+}
+.station-hotspots {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+.station-hotspot {
+  position: absolute;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  color: transparent;
+  cursor: pointer;
+  pointer-events: none;
+  outline: none;
+  box-shadow: none;
+}
+.station-hotspot:focus,
+.station-hotspot:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+/* Composer input overlay: visually part of the canvas-drawn glass strip
+   (transparent background, no border) — the canvas paints the slot. */
+.station-composer-input {
+  position: absolute;
+  z-index: 5;
+  background: transparent;
+  border: 0;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  color: var(--text);
+  caret-color: var(--blue);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 18px;
+  padding: 1px 2px;
+}
+.station-composer-input::placeholder {
+  color: var(--overlay1);
+  opacity: 0.75;
+}
+/* Glass status chip pinned to the lower-left of the Station canvas. The
+   metrics span carries the always-on `renderer · fps · displays` readout;
+   the text span carries the transient status line the validator asserts on
+   (`Opening <kind>`, debug_state dumps, failures). Deliberately blur-free:
+   it overlays the canvases. */
+.station-status {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  max-width: min(560px, calc(100% - 24px));
+  color: var(--overlay1);
+  font-size: 10px;
+  line-height: 1.35;
+  padding: 5px 9px;
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 9px;
+  background: linear-gradient(180deg, rgba(30, 30, 46, 0.78), rgba(17, 17, 27, 0.84));
+  box-shadow: var(--glass-highlight), 0 4px 14px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.station-status-metrics {
+  flex-shrink: 0;
+  color: var(--subtext0);
+  padding-right: 7px;
+  margin-right: 7px;
+  border-right: 1px solid rgba(205, 214, 244, 0.16);
+}
+.station-status-metrics:empty { display: none; }
+.station-status-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Settings ── */
+.settings-pane-body {
+  padding: 20px;
+  max-width: 760px;
+  width: 100%;
+  margin: 0 auto;
+  overflow-y: auto;
+  flex: 1;
+}
+/* Network pane needs more horizontal room than the text-input panes —
+   the .daemon-row flex children (label + URL + capability badges +
+   version + status chip + expand button + Remove button) only fit
+   above ~900px. Account / Agent / Debug stay at the readability-
+   optimised 760px. */
+.settings-pane-body--wide {
+  max-width: 1024px;
+}
+.access-pane-body {
+  padding: 18px 20px;
+  max-width: 1120px;
+  width: 100%;
+  margin: 0 auto;
+  overflow-y: auto;
+  flex: 1;
+}
+.access-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  margin: 0 0 14px;
+}
+.access-card {
+  min-width: 0;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--base);
+}
+.access-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.access-card-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.access-card-kind {
+  flex: 0 0 auto;
+  color: var(--overlay0);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.access-card-detail {
+  margin-top: 5px;
+  min-height: 16px;
+  color: var(--subtext0);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.access-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.access-card-actions button {
+  padding: 5px 9px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+.access-card-actions button.primary {
+  border-color: var(--blue);
+  background: var(--blue);
+  color: var(--crust);
+  font-weight: 700;
+}
+.access-card-actions button.danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+.access-card-actions button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.access-card-actions button:hover {
+  border-color: var(--blue);
+}
+.access-card-actions button.danger:hover {
+  border-color: var(--red);
+}
+.access-empty {
+  color: var(--subtext0);
+  font-size: 12px;
+  padding: 8px 0;
+}
+.access-target-surface {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+.access-admin-grid,
+.access-detail-grid {
+  display: grid;
+  gap: 12px;
+  margin: 0 0 16px;
+}
+.access-admin-grid.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.access-detail-card {
+  min-width: 0;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--base);
+}
+.access-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--surface1);
+}
+.access-detail-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+}
+.access-detail-body {
+  display: grid;
+  gap: 8px;
+  padding: 10px 11px;
+}
+.access-detail-actions {
+  padding: 0 11px 11px;
+}
+.access-detail-line {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.45fr) minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+  color: var(--subtext0);
+  font-size: 11px;
+}
+.access-detail-line strong {
+  min-width: 0;
+  color: var(--overlay1);
+  font-weight: 800;
+}
+.access-detail-line span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.access-matrix {
+  min-width: 0;
+  overflow-x: auto;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--base);
+}
+.access-matrix-table {
+  width: 100%;
+  min-width: 760px;
+  border-collapse: collapse;
+}
+.access-matrix-table th,
+.access-matrix-table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid rgba(205, 214, 244, 0.1);
+  color: var(--subtext0);
+  font-size: 11px;
+  text-align: left;
+  vertical-align: top;
+}
+.access-matrix-table th {
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+.access-matrix-table tr:last-child td {
+  border-bottom: 0;
+}
+.access-matrix-policy {
+  color: var(--text);
+  font-weight: 800;
+}
+.access-matrix-cell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 56px;
+  min-height: 20px;
+  padding: 2px 7px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  color: var(--overlay0);
+  background: var(--surface0);
+  font-size: 10px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.access-matrix-cell.yes {
+  border-color: rgba(166, 227, 161, 0.28);
+  color: var(--green);
+  background: rgba(166, 227, 161, 0.08);
+}
+.access-matrix-cell.no {
+  border-color: rgba(243, 139, 168, 0.28);
+  color: var(--red);
+  background: rgba(243, 139, 168, 0.08);
+}
+.access-matrix-cell.conditional,
+.access-matrix-cell.planned {
+  border-color: rgba(249, 226, 175, 0.28);
+  color: var(--yellow);
+  background: rgba(249, 226, 175, 0.08);
+}
+.access-model-details {
+  display: grid;
+  gap: 12px;
+  margin: 0 0 16px;
+}
+.access-model-section {
+  min-width: 0;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--base);
+}
+.access-model-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--surface1);
+}
+.access-model-section-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+}
+.access-model-section-count {
+  flex: 0 0 auto;
+  color: var(--overlay0);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+.access-model-table {
+  display: grid;
+}
+.access-model-row {
+  display: grid;
+  grid-template-columns: minmax(170px, 1.1fr) minmax(130px, 0.85fr) minmax(190px, 1.2fr) minmax(90px, auto);
+  gap: 8px 12px;
+  align-items: center;
+  min-width: 0;
+  padding: 9px 11px;
+}
+.access-model-row + .access-model-row {
+  border-top: 1px solid rgba(205, 214, 244, 0.1);
+}
+.access-model-main,
+.access-model-meta,
+.access-model-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.access-model-main {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+}
+.access-model-meta {
+  color: var(--subtext0);
+  font-size: 11px;
+}
+.access-model-detail {
+  color: var(--overlay0);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 10px;
+}
+.access-model-status {
+  justify-self: end;
+  padding: 2px 7px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  color: var(--overlay0);
+  background: var(--surface0);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+.access-model-status.active,
+.access-model-status.connected,
+.access-model-status.enforced,
+.access-model-status.current {
+  border-color: rgba(166, 227, 161, 0.28);
+  color: var(--green);
+  background: rgba(166, 227, 161, 0.08);
+}
+.access-model-status.offline,
+.access-model-status.planned,
+.access-model-status.expired,
+.access-model-status.draft {
+  border-color: rgba(249, 226, 175, 0.28);
+  color: var(--yellow);
+  background: rgba(249, 226, 175, 0.08);
+}
+.access-model-status.revoked,
+.access-model-status.disabled,
+.access-model-status.failed {
+  border-color: rgba(243, 139, 168, 0.28);
+  color: var(--red);
+  background: rgba(243, 139, 168, 0.08);
+}
+.access-target-row {
+  --access-target-accent: var(--blue);
+  display: grid;
+  grid-template-columns: minmax(180px, 1.2fr) minmax(160px, 0.9fr) minmax(180px, 1fr) minmax(160px, 0.8fr) auto;
+  gap: 10px 14px;
+  align-items: center;
+  min-width: 0;
+  padding: 11px 13px;
+  border: 1px solid var(--glass-hairline-bright);
+  border-left: 3px solid var(--access-target-accent);
+  border-radius: 8px;
+  background: var(--glass-bg);
+  box-shadow: var(--glass-highlight);
+}
+.access-target-row.ok { --access-target-accent: var(--green); }
+.access-target-row.warn,
+.access-target-row.checking { --access-target-accent: var(--yellow); }
+.access-target-row.err { --access-target-accent: var(--red); }
+.access-target-main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 8px;
+  align-items: center;
+  min-width: 0;
+}
+.access-target-dot {
+  grid-row: 1 / span 2;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--access-target-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--access-target-accent) 16%, transparent);
+}
+.access-target-title-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.access-target-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.access-target-badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid rgba(137, 180, 250, 0.26);
+  border-radius: 999px;
+  color: var(--blue);
+  background: rgba(137, 180, 250, 0.08);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+.access-target-subtitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--subtext0);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.access-target-cell {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.access-target-label {
+  color: var(--overlay0);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.access-target-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.access-target-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--subtext0);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.access-target-chips {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.access-target-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 176px;
+}
+.access-target-actions button {
+  min-height: 28px;
+  padding: 4px 9px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
+}
+.access-target-actions button.primary {
+  border-color: var(--blue);
+  background: var(--blue);
+  color: var(--crust);
+  font-weight: 800;
+}
+.access-target-actions button.danger {
+  border-color: rgba(243, 139, 168, 0.7);
+  color: var(--red);
+}
+.access-target-actions button:hover {
+  border-color: var(--blue);
+}
+.access-target-actions button.danger:hover {
+  border-color: var(--red);
+}
+.access-target-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.access-peer-display-slot {
+  grid-column: 1 / -1;
+}
+

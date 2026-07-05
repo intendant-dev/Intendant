@@ -25,7 +25,7 @@ The runtime/controller split is the load-bearing security decision: a compromise
 
 ## Architecture at a Glance
 
-The controller runs a budget-aware loop in one of **four execution modes**: Direct (`--direct`), User (an orchestrator decomposes work to sub-agents in isolated git worktrees), Sub-Agent (`INTENDANT_ROLE`), and External-Agent (`--agent`, supervising a third-party coding CLI). A separate **presence** AI mediates between the user and the worker. A single-writer **control plane** owns shared state — frontends are display-only, emitting intents (`ControlMsg`) rather than mutating state. A persistent **daemon** owns long-lived sessions; the web dashboard is the default frontend (`--web` is on by default).
+The controller runs a budget-aware in-process loop in one of several **execution shapes**: Direct (`--direct`, and every non-daemon CLI path), Orchestrate (the same loop with the orchestration prompt; delegates via the `spawn_sub_agent` / `wait_sub_agents` tools), Sub-Agent (a supervised child session that reports back with `submit_result`, optionally in an isolated git worktree), and External-Agent (`--agent`, supervising a third-party coding CLI). Orchestration is a capability of every supervised native session, not a separate mode — the February-era subprocess pipeline (`run_user_mode`, `INTENDANT_ROLE` child processes, result-file polling) is gone. A separate **presence** AI mediates between the user and the worker. A single-writer **control plane** owns shared state — frontends are display-only, emitting intents (`ControlMsg`) rather than mutating state. A persistent **daemon** owns long-lived sessions; the web dashboard is the default frontend (`--web` is on by default).
 
 Read the relevant chapter before changing a subsystem:
 
@@ -93,7 +93,7 @@ src/
 │   ├── control_plane.rs, event.rs, frontend.rs   # single-writer state; EventBus; UserAction/ControlMsg
 │   ├── session_supervisor.rs, task_dispatch.rs, file_watcher.rs   # daemon: sessions, dispatch, rewind snapshots
 │   ├── provider.rs, conversation.rs, tools.rs, prompts.rs, skills.rs, autonomy.rs, approval.rs
-│   ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, user_mode.rs, agent_runner.rs   # native multi-agent
+│   ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, agent_runner.rs   # native multi-agent
 │   ├── context_rewind.rs, fission_ledger.rs, fission_lifecycle.rs, lineage_ledger.rs   # managed context: rewinds, fission, lineage
 │   ├── external_agent/         # supervise Codex / Claude Code (+ external_wrapper_index.rs)
 │   ├── access/                 # trust architecture: client keys, IAM, org roots/issuers/ORL, enrollment, platform keystores
@@ -110,7 +110,8 @@ src/
 │   └── tui/                    # ratatui TUI (display-only client of the control plane)
 └── bin/connect/                # intendant-connect: hosted rendezvous (accounts, daemon claims, fleet sync, vault blobs, push, transparency log)
 crates/{presence-core, presence-web, station-web}   # WASM: shared presence types/tools/dispatch, browser presence client, Station renderer
-static/         # app.html dashboard SPA + compiled wasm-web/ + wasm-station/
+crates/app-html-assembler   # assembles static/app.html from static/app/ (build.rs + the CI regen gate)
+static/         # dashboard SPA: app/ fragments (source) → generated app.html; compiled wasm-web/ + wasm-station/
 macos-app/      # native macOS WKWebView wrapper (built by scripts/bundle-macos.sh)
 vendor/         # vortex-guest-tools (macOS Vortex Audio HAL plugin)
 scripts/        # setup-{linux,macos,windows}, setup-lan*, bundle-macos, validate-dashboard.cjs (dashboard/Station QA), …
@@ -127,7 +128,32 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
 - tokio (full features), `Arc<RwLock/Mutex<T>>` for shared state, `mpsc` for channels
 - TLS/cert code is **pure-Rust `ring`/`rcgen`/`rustls`** (`web_tls.rs`, `access/certs.rs`) — no OpenSSL; prefer that path when touching crypto/cert code
 - Tests live in inline `#[cfg(test)]` modules only
+- **File size budget:** keep a source file under ~3k lines (4k absolute ceiling;
+  the remaining god-files are legacy being carved down, not precedents). When a
+  file outgrows its seams, split along domain boundaries as **pure-move
+  commits**: relocate code *and its tests* verbatim into a new module, add
+  `mod new_module; pub(crate) use new_module::*;` at the old location so every
+  existing reference keeps compiling, and widen moved items to `pub(crate)` as
+  needed — that widening is the only permitted non-move edit. No renames,
+  reformatting, or logic changes ride in a move commit; review with
+  `git diff --color-moved=dimmed-zebra`, where any non-dimmed red/green is a
+  violation.
+- **Derive, don't mirror.** Daemon truth a frontend needs — permission
+  catalogs, feature lists, availability booleans, option vocabularies — is
+  declared once and derived everywhere else (exemplar: `CONTROL_METHODS` in
+  `dashboard_control.rs` drives the authorizer, the `features` list, and the
+  per-method availability booleans). When a static frontend fallback copy is
+  unavoidable (app.html's IAM catalog, the peer-profile picker), a
+  daemon-side parity test pins its ID sets to the source, so a catalog
+  change that forgets the mirror fails the suite instead of shipping as
+  drift.
 - WASM boundary: `serde_wasm_bindgen` with `serialize_maps_as_objects(true)`
+- `static/app.html` is **generated** from the `static/app/` fragments (order =
+  `static/app/manifest.txt`; assembled by `build.rs` via
+  `crates/app-html-assembler`; CI enforces the match). Edit the fragments,
+  never the artifact. Merge conflicts: resolve them in the fragments, run
+  `cargo run -p app-html-assembler`, then `git add static/app.html` — never
+  hand-reconcile the generated file.
 - Pure-safe Rust by default. The Unix (macOS / Linux) code paths keep `unsafe`
   confined to documented islands: small platform probes/signals and display or
   identity queries in `platform.rs`; macOS Accessibility bindings in `ax.rs`

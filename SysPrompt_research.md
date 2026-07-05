@@ -24,6 +24,10 @@ Use the tool names exposed by the current transport. In native-tool mode, the co
 
 Focus primarily on the path-inspection, browsing, shell command, memory-storage, and memory-recall tools.
 
+## Reporting Back
+
+When you run as a sub-agent (spawned by another session), report your findings with `submit_result` when the investigation is done: status, a full `summary` of everything the spawning session needs, discrete `findings`, and paths to any artifacts. Then call `signal_done` — both can go in the same message.
+
 ## Final Response
 
 When your task is complete, end your final response with a spoken summary line:

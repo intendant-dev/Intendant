@@ -1,3 +1,4 @@
+<!-- GENERATED from static/app/ — edit the fragments, not this file. Order: static/app/manifest.txt; any cargo build reassembles; CI enforces the match. -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9,6 +10,7 @@
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#11111b">
 <style>
+/* ── static/app/10-styles-shell.css ── */
 :root {
   --base: #1e1e2e;
   --mantle: #181825;
@@ -1100,6 +1102,7 @@ body.access-page #tab-access {
   grid-column: 1 / -1;
 }
 
+/* ── static/app/11-styles-access-files.css ── */
 /* ── Access redesign components (.acc-*) ──
    The Access surface speaks one visual language: glass cards on the
    base background, route chips (how you reach a daemon), role badges
@@ -3826,6 +3829,7 @@ body.access-page #tab-access {
   color: var(--green);
 }
 
+/* ── static/app/12-styles-tasks-log.css ── */
 /* ── Activity Log Controls ── */
 .activity-subtab-controls {
   display: flex;
@@ -6661,6 +6665,7 @@ body.context-focus-active {
 }
 .history-bar:hover { opacity: 1; }
 
+/* ── static/app/13-styles-sessions-terminal.css ── */
 /* ── Sessions Tab ── */
 .sessions-container {
   padding: 0 16px 16px;
@@ -9710,6 +9715,7 @@ body.context-focus-active {
 .keybar-toggle:hover { color: var(--text); }
 .keybar-toggle.active { color: var(--blue); border-color: var(--blue); }
 
+/* ── static/app/14-styles-displays-voice.css ── */
 /* ── Displays Tab ── */
 .display-approval-banner {
   display: flex;
@@ -9901,7 +9907,10 @@ body.display-fullscreen-open {
 .display-toolbar .release-control-btn,
 .display-toolbar .stream-btn,
 .display-toolbar .annotate-btn,
+.display-toolbar .ann-attach-btn,
+.display-toolbar .record-btn,
 .display-toolbar .display-fullscreen-btn,
+.display-toolbar .display-close-btn,
 .peer-display-controls .take-control-btn,
 .peer-display-controls .release-control-btn {
   padding: 3px 10px;
@@ -9911,6 +9920,17 @@ body.display-fullscreen-open {
   color: var(--text);
   cursor: pointer;
   font-size: 12px;
+  font-weight: 400;
+}
+.display-toolbar .ann-attach-btn:hover {
+  background: var(--peach);
+  color: var(--base);
+  border-color: var(--peach);
+}
+.display-toolbar .display-close-btn:hover {
+  background: var(--surface1);
+  color: var(--red);
+  border-color: var(--red);
 }
 .display-toolbar .take-control-btn {
   margin-left: auto;
@@ -9931,10 +9951,9 @@ body.display-fullscreen-open {
   color: var(--base);
   border-color: var(--blue);
 }
-.display-toolbar .record-btn {
-  border-color: var(--red);
-  color: var(--red);
-}
+/* Record rests quiet like its neighbours; red is reserved for intent
+   (hover) and the live recording state — a danger accent idling in the
+   toolbar reads as a warning that isn't there. */
 .display-toolbar .record-btn:hover,
 .display-toolbar .record-btn.active {
   background: var(--red);
@@ -11530,6 +11549,7 @@ body.display-fullscreen-open {
   }
 }
 </style>
+<!-- ── static/app/20-shell.html ── -->
 </head>
 <body>
 <div id="app">
@@ -13181,6 +13201,7 @@ body.display-fullscreen-open {
 
       <div class="subtab-panes">
 
+<!-- ── static/app/21-access-dialogs.html ── -->
         <!-- ── Overview: who you are, your fleet, how the model works ── -->
         <div class="subtab-pane active" id="access-pane-overview">
           <div class="access-pane-body">
@@ -14042,6 +14063,7 @@ body.display-fullscreen-open {
   <button class="video-btn is-disabled" id="videoBtn" title="Send your camera feed to the voice model">&#128249;</button>
   <button class="mic-btn" id="micBtn" title="Start or stop your microphone for voice conversation">&#127908;</button>
 </div>
+<!-- ── static/app/22-voice-bootstrap.html ── -->
 <script>
 (function() {
   const el = document.getElementById('voiceOverlay');
@@ -14098,6 +14120,7 @@ body.display-fullscreen-open {
   document.addEventListener('touchend', onUp);
 })();
 </script>
+<!-- ── static/app/23-voice-dialogs.html ── -->
 
 <!-- Voice Settings Dialog -->
 <div class="dialog-overlay hidden" id="settingsDialog">
@@ -14140,6 +14163,7 @@ body.display-fullscreen-open {
       id="xterm-css" disabled>
 
 <script type="module">
+/* ── static/app/31-init-identity-fleet.js ── */
 'use strict';
 
 import init, { PresenceWeb } from '/wasm-web/presence_web.js';
@@ -15232,6 +15256,7 @@ async function accessFleetRefreshProvenance() {
   if (changed) renderAccessAdminSummaries();
 }
 
+/* ── static/app/32-vault-custody.js ── */
 /* ── Credential vault (credential custody v1) ──
    The user's provider credentials, end-to-end encrypted client-side and
    synced blind through the hosted rendezvous (/api/vault). A random
@@ -16367,7 +16392,17 @@ function vaultLeaseTransportReady() {
   if (!DASHBOARD_CONNECT_MODE) return false;
   try {
     const status = window.intendantDashboardControl?.status?.();
-    return Boolean(status?.connected && status?.verifiedBinding?.ok);
+    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
+    // Leases need the credential RPC family. A daemon that advertises its
+    // control surface but not these methods is too old — report
+    // unsupported instead of firing calls that fail one by one. An empty
+    // list means the hello_ack hasn't landed yet: fall through and let
+    // the RPCs answer.
+    const features = status.controlFeatures;
+    if (Array.isArray(features) && features.length) {
+      return features.includes('api_credential_lease_status');
+    }
+    return true;
   } catch {
     return false;
   }
@@ -18072,6 +18107,7 @@ function stationStatus(text) {
   el.textContent = value;
 }
 
+/* ── static/app/33-station-core.js ── */
 // ── Station status metrics chip ──
 // Always-on `renderer · fps · displays` readout in #station-status-metrics.
 // Prefers the structured station.debug_json() export when the loaded WASM
@@ -20584,6 +20620,7 @@ async function stationApplyManagedAction(op, id = '', sessionId = '') {
   }
 }
 
+/* ── static/app/34-station-panes.js ── */
 async function stationSelectChange(path) {
   stationSelectedChangePath = path || stationSelectedChangePath || activeChangesFile || '';
   if (stationSelectedChangePath) {
@@ -22453,6 +22490,7 @@ function stationMaybeRefreshTranscript(force = false) {
   stationOpenTranscript(live.sessionId, { source: live.source, refresh: true });
 }
 
+/* ── static/app/35-station-diff-viewer.js ── */
 // ── Station diff viewer ──
 // Changed-file rows feed the same viewer in diff mode (kind-colored
 // +/-/@@ lines); diffs are static, so no live refresh.
@@ -24485,6 +24523,7 @@ let tickerFramesSent = 0;
 let tickerFramesDropped = 0;
 let tickerExpanded = false;
 
+/* ── static/app/36-voice-wasm-init.js ── */
 // ── Audio Helpers ──
 function downsample(buffer, fromRate, toRate) {
   if (fromRate === toRate) return buffer;
@@ -25573,6 +25612,7 @@ async function main() {
   });
 }
 
+/* ── static/app/37-uicommand-changes-control.js ── */
 // ── UiCommand Processor ──
 function processCommands(cmds) {
   if (!Array.isArray(cmds)) return;
@@ -27822,6 +27862,7 @@ if (document.readyState === 'loading') {
   wireControlPaneListeners();
 }
 
+/* ── static/app/38-managed-context.js ── */
 // ── Managed context dashboard ──
 let sessionsLoaded = false;
 let _cachedSessions = [];
@@ -30236,6 +30277,7 @@ function applyServerPhaseToSessionWindow(sessionId, phase) {
   updateSessionWindow(sid, { phase });
 }
 
+/* ── static/app/39-session-windows.js ── */
 function clearSessionWindowPendingActive(sessionId, phase = '') {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -32637,6 +32679,7 @@ function sessionConfigApprovalPolicy(meta = {}) {
   );
 }
 
+/* ── static/app/40-session-launch.js ── */
 function sessionConfigArchiveMode(meta = {}) {
   return normalizeContextArchiveMode(String(
     meta.codexContextArchive ||
@@ -35024,6 +35067,7 @@ function attachSessionWindowAction(sessionId) {
   showControlToast('info', `Attaching session ${shortSessionId(sid)}`);
 }
 
+/* ── static/app/41-session-window-actions.js ── */
 function runSessionWindowAction(sessionId, op) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -37447,6 +37491,7 @@ function hideBadge(tab) {
   if (badge) { badge.classList.remove('visible'); badge.textContent = ''; }
 }
 
+/* ── static/app/42-usage-terminal.js ── */
 // ── Usage Tab Rendering ──
 // ── Token Ticker ──
 function fmtK(n) {
@@ -38881,7 +38926,7 @@ function accessIamEnforcementReason(iam) {
 }
 
 function accessFallbackIamRoles() {
-  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'];
+  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'credentials.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'];
   return [{
     id: 'role:root',
     label: 'Root',
@@ -38939,11 +38984,18 @@ function accessFallbackIamRoles() {
     permissions: ['presence.read', 'stats.read', 'access.inspect', 'filesystem.read', 'filesystem.write'],
     source: 'builtin',
   }, {
+    id: 'role:peer-user',
+    label: 'Peer user',
+    status: 'enforced',
+    summary: "Reach connected peers through this daemon (peer files, terminal, display tunnels); what each tunnel may do is decided by that peer's grants for this daemon. Combine with local roles as needed.",
+    permissions: ['presence.read', 'stats.read', 'access.inspect', 'peer.inspect', 'peer.use'],
+    source: 'builtin',
+  }, {
     id: 'role:operator',
     label: 'Operator',
     status: 'enforced',
-    summary: 'Operate sessions, display, shell, files, and approvals without access/settings administration.',
-    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'filesystem.read', 'filesystem.write'],
+    summary: 'Operate sessions, display, shell, files, peers, and approvals without access/settings administration.',
+    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'credentials.manage', 'filesystem.read', 'filesystem.write'],
     source: 'builtin',
   }];
 }
@@ -38958,6 +39010,7 @@ function accessFallbackPolicyIdForRole(roleId) {
     'role:terminal': 'policy:terminal',
     'role:files-read': 'policy:files-read',
     'role:files-write': 'policy:files-write',
+    'role:peer-user': 'policy:peer-user',
     'role:operator': 'policy:operator',
   }[roleId] || `policy:${String(roleId || 'role').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase()}`;
 }
@@ -38995,7 +39048,8 @@ function accessFallbackPermissions() {
     'access.inspect': ['Access inspect', 'access', 'Read targets, principals, grants, policies, transports, and access architecture notes.'],
     'access.manage': ['Access manage', 'access', 'Approve, revoke, or change access grants.'],
     'peer.inspect': ['Peer inspect', 'peer', 'Read configured peer routes and peer eligibility.'],
-    'peer.manage': ['Peer manage', 'peer', 'Create, remove, pair, and use daemon peer routes.'],
+    'peer.manage': ['Peer manage', 'peer', 'Administer peer relationships: create, remove, and pair daemon peer routes.'],
+    'peer.use': ['Peer use', 'peer', "Act through connected peers (files, terminal, display tunnels, quick controls); the receiving peer's own grants bound each tunnel."],
     'session.inspect': ['Session inspect', 'session', 'Read session lists, logs, reports, recordings, and replay metadata.'],
     'session.manage': ['Session manage', 'session', 'Delete, rewind, prune, upload to, or otherwise mutate sessions.'],
     'terminal.use': ['Terminal (legacy)', 'terminal', 'Legacy aggregate: implies terminal.view, terminal.write, and shell.spawn.'],
@@ -39003,6 +39057,7 @@ function accessFallbackPermissions() {
     'terminal.write': ['Terminal write', 'terminal', 'Type into, resize, and close shell sessions you can see.'],
     'shell.spawn': ['Shell spawn', 'terminal', 'Create new shell sessions on this daemon.'],
     'settings.manage': ['Settings manage', 'settings', 'Read or write daemon settings and API keys.'],
+    'credentials.manage': ['Credentials manage', 'credentials', 'Grant, renew, revoke, and inspect credential leases; register client egress.'],
     'runtime.control': ['Runtime control', 'runtime', 'Use runtime-control surfaces such as TUI, media, and recording controls.'],
     'filesystem.read': ['Filesystem read', 'filesystem', 'Stat, list, and read files through dashboard APIs.'],
     'filesystem.write': ['Filesystem write', 'filesystem', 'Create directories or write uploaded file content.'],
@@ -39764,7 +39819,7 @@ const ACCESS_GRANT_KIND_CHOICES = [{
 
 const ACCESS_ROLE_PICKER_ORDER = [
   'role:scoped-human', 'role:observer', 'role:session-reader', 'role:files-read',
-  'role:files-write', 'role:terminal', 'role:operator', 'role:root',
+  'role:files-write', 'role:terminal', 'role:peer-user', 'role:operator', 'role:root',
 ];
 
 /* Grant fanout: the daemons this page can apply a grant to, each with the
@@ -40503,6 +40558,7 @@ function accessDiagnosticsCards() {
   ];
 }
 
+/* ── static/app/43-access-panes.js ── */
 /* ── Access redesign: role metadata, chips, and pane renderers ──
    One vocabulary everywhere: a PRINCIPAL acts, a ROUTE carries the
    request (never authority), and the target DAEMON decides via its
@@ -40515,6 +40571,7 @@ const ACCESS_ROLE_META = {
   'role:files-write': { cls: 'role-files', short: 'Browse, download, and upload files.' },
   'role:files-read': { cls: 'role-files', short: 'Browse and download files, read-only.' },
   'role:session-reader': { cls: 'role-sessions', short: 'Read sessions, logs, and status.' },
+  'role:peer-user': { cls: 'role-peer', short: 'Act through connected peers; each peer\'s own grants bound the reach.' },
   'role:observer': { cls: 'role-observer', short: 'Watch read-only, including live displays.' },
   'role:scoped-human': { cls: 'role-scoped', short: 'Inspect the access model only. A safe first grant.' },
   'role:peer-profile': { cls: 'role-peer', short: 'Daemon-to-daemon authority bounded by the peer profile.' },
@@ -42315,6 +42372,7 @@ function setShellHost(hostId) {
   }
 }
 
+/* ── static/app/44-shell-frames.js ── */
 // ── Standalone shell output handler ──
 // Called when the server sends {"t":"terminal_output", "data":"<base64>"}
 // for this host/terminal pair.
@@ -43317,6 +43375,7 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+/* ── static/app/45-displays-webrtc.js ── */
 // ── Displays (WebRTC — video track + data channels for input) ──
 
 function dashboardApplyServerFrames(frames) {
@@ -43453,15 +43512,15 @@ class DisplaySlot {
         <span class="display-status" id="ds-status-${displayId}">Connecting...</span>
         <span class="display-input-authority" id="ds-authority-${displayId}" style="display:none" title="Input authority for this display: who can drive keyboard/mouse. Phase 5c."></span>
         <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
-        <button class="stream-btn" id="ds-stream-${displayId}" title="Continuously send screenshots of this display to the live presence (voice) model. Main agents are not affected.">&#x1F441; Stream</button>
-        <button class="ann-attach-btn" id="ds-attach-${displayId}" title="Capture current frame and attach to next task">&#x1F4CE; Attach</button>
+        <button class="stream-btn" id="ds-stream-${displayId}" title="Continuously send screenshots of this display to the live presence (voice) model. Main agents are not affected.">Stream</button>
+        <button class="ann-attach-btn" id="ds-attach-${displayId}" title="Capture current frame and attach to next task">Attach</button>
         <button class="annotate-btn" id="ds-annotate-${displayId}" title="Freeze current frame and annotate it">&#9998; Annotate</button>
-        <button class="record-btn" id="ds-record-${displayId}" title="Record this display (ffmpeg)">&#x23FA; Record</button>
+        <button class="record-btn" id="ds-record-${displayId}" title="Record this display (ffmpeg)">Record</button>
         <button class="display-fullscreen-btn" id="ds-fullscreen-${displayId}" title="Full screen">&#x26F6;</button>
         <button class="display-close-btn" id="ds-close-${displayId}" title="Close this display stream">&times;</button>
         <button class="take-control-btn" id="ds-take-${displayId}" title="Take interactive control of this display (keyboard and mouse)">Take Control</button>
         <button class="release-control-btn" id="ds-release-${displayId}" style="display:none" title="Release control and return display to view-only mode">Release</button>
-        <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" style="display:none" title="Delete recording files for this display">&#x1F5D1; Delete</button>
+        <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" style="display:none" title="Delete recording files for this display">Delete</button>
         <span class="stream-frame-id" id="ds-frame-${displayId}" style="display:none;font-size:10px;color:var(--overlay0);margin-left:auto"></span>
       </div>
       <div class="display-canvas" id="display-canvas-${displayId}"></div>`;
@@ -44901,6 +44960,7 @@ function applyDisplayStripState() {
   });
 }
 
+/* ── static/app/46-recording-replay.js ── */
 // ── Recording Replay ──
 
 /** Parse MP4 box structure from an ArrayBuffer. Returns [{type, offset, size}]. */
@@ -45897,6 +45957,7 @@ async function reconcileRecordingStreams() {
   } catch { /* no recordings available */ }
 }
 
+/* ── static/app/47-annotation-clips.js ── */
 // ── Annotation Drawing ──
 /** Draw an array of annotation shapes onto a canvas context.
  *  Optional scaleX/scaleY for rendering on a differently-sized canvas (e.g. thumbnails). */
@@ -48123,6 +48184,7 @@ document.getElementById('recording-timeline').addEventListener('contextmenu', (e
   }
 });
 
+/* ── static/app/48-router-settings.js ── */
 // ── Tab Switching ──
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => routeTo(btn.dataset.tab));
@@ -50149,6 +50211,7 @@ if (document.readyState === 'loading') {
   applyInitialRouteFromHash();
 }
 
+/* ── static/app/49-daemons-multihost.js ── */
 // ── Daemons (multi-host) ──
 //
 // The self host (the daemon serving this page) is always rendered
@@ -52445,6 +52508,7 @@ window.intendantDashboardControl = {
   },
 };
 
+/* ── static/app/50-control-transport.js ── */
 class DashboardControlTransport {
   constructor() {
     this.pc = null;
@@ -52660,6 +52724,10 @@ class DashboardControlTransport {
   handleFrame(msg) {
     if (msg.t === 'hello_ack') {
       console.info('[dashboard-control] hello_ack', msg.session_id || '');
+      // The daemon advertises its control-RPC surface here; readiness
+      // checks (vault leases, egress) consult it to distinguish
+      // "daemon too old to support this" from "denied for this session".
+      this.controlFeatures = Array.isArray(msg.features) ? msg.features : [];
       return;
     }
     if (msg.t === 'egress_request' || msg.t === 'egress_request_chunk' ||
@@ -53519,6 +53587,7 @@ class DashboardControlTransport {
       connected,
       pcState: this.pc?.connectionState || '',
       channelState: this.channel?.readyState || '',
+      controlFeatures: this.controlFeatures || [],
       sessionId: this.sessionId,
       verifiedBinding: this.verifiedBinding,
       claimedDaemonPublicKey: this.claimedDaemonPublicKey,
@@ -55299,6 +55368,7 @@ function applyDaemonExpandedState(hostId, expanded) {
 // and the server-side parser splits on the literal `:` to recover
 // the kind prefix; URL-encoding `:` as `%3A` would break the lookup
 // because the registry keys on the un-encoded id.
+/* ── static/app/51-peer-approvals.js ── */
 // ── Per-peer pending approvals ──
 //
 // Approval requests arrive over each peer's secondary WebSocket as
@@ -57066,6 +57136,7 @@ if (tileTestEnabled()) {
   }
 }
 
+/* ── static/app/52-peer-display.js ── */
 class PeerDisplayConnection {
   constructor(hostId, displayId, sessionId, advertiseTcpViaUrl) {
     this.hostId = hostId;
@@ -58726,6 +58797,26 @@ const PEER_PROFILE_OPTIONS = [
     summary: 'Presence, stats, messages, and task delegation.',
   },
   {
+    profile: 'session-reader',
+    label: 'Session reader',
+    summary: 'Presence, stats, and session inspection (lists, logs, reports). Read-only.',
+  },
+  {
+    profile: 'file-reader',
+    label: 'File reader',
+    summary: 'Presence, stats, and read-only filesystem access.',
+  },
+  {
+    profile: 'file-operator',
+    label: 'File operator',
+    summary: 'Presence, stats, and filesystem read/write.',
+  },
+  {
+    profile: 'terminal-operator',
+    label: 'Terminal operator',
+    summary: 'Presence, stats, session inspection, and shared shells (view, type, spawn).',
+  },
+  {
     profile: 'stats',
     label: 'Stats',
     summary: 'Presence and usage statistics only.',
@@ -58749,6 +58840,16 @@ function peerProfileMeta(profile) {
     'stats-only': 'stats',
     'display-read-only': 'read-only-display',
     spectator: 'shared-session-spectator',
+    'sessions-read': 'session-reader',
+    'session-inspect': 'session-reader',
+    'logs-read': 'session-reader',
+    'files-read': 'file-reader',
+    'filesystem-read-only': 'file-reader',
+    files: 'file-operator',
+    'filesystem-operator': 'file-operator',
+    'peer-terminal-operator': 'terminal-operator',
+    terminal: 'terminal-operator',
+    shell: 'terminal-operator',
     operator: 'peer-operator',
     admin: 'peer-root',
     'admin-peer': 'peer-root',
@@ -59574,6 +59675,7 @@ async function initDaemons() {
   });
 }
 
+/* ── static/app/53-stats-settings.js ── */
 // ── Activity host filter ──
 //
 // Dropdown at the top of the Activity tab lets the user restrict the
@@ -61357,6 +61459,7 @@ function focusActivityForSessionEvent(options = {}) {
   }
 }
 
+/* ── static/app/54-session-lifecycle.js ── */
 // ── Session Lifecycle ──
 function onSessionStarted(sessionId, task) {
   const sid = String(sessionId || '').trim();
@@ -64121,6 +64224,7 @@ function fsPathLooksAbsolute(path) {
   return value === '~' || value.startsWith('~/') || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
 }
 
+/* ── static/app/55-files-ide.js ── */
 // ── Files tab: editor ──
 //
 // A small IDE over the fs API family. Reads ride GET /api/fs/* (or the
@@ -66780,6 +66884,7 @@ async function startNewSession() {
 }
 window.startNewSession = startNewSession;
 
+/* ── static/app/56-debug-sessions.js ── */
 // ── Debug Screen ──
 let debugScreenActive = false;
 let debugRecording = false;
@@ -68396,6 +68501,7 @@ function renderAggregateStatTiles(el, cards) {
   }
 }
 
+/* ── static/app/57-sessions-replay.js ── */
 function renderSessionsList(sessions, el, options = {}) {
   if (!el) return;
   el.innerHTML = '';
@@ -71151,6 +71257,7 @@ function loadNewerSessionDetailRows(view) {
   return true;
 }
 
+/* ── static/app/58-shortcuts-boot.js ── */
 // ── Keyboard Shortcuts ──
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;

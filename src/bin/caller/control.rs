@@ -34,7 +34,7 @@ pub fn spawn_control_server(
     let _ = std::fs::remove_file(&path);
 
     let handle = tokio::spawn(async move {
-        let listener = match UnixListener::bind(&path) {
+        let mut listener = match UnixListener::bind(&path) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("Control socket bind failed: {}", e);
@@ -46,9 +46,11 @@ pub fn spawn_control_server(
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
 
+        let mut fatal_accept_streak: u32 = 0;
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    fatal_accept_streak = 0;
                     #[cfg(unix)]
                     {
                         let current_uid = super::platform::current_uid();
@@ -132,7 +134,59 @@ pub fn spawn_control_server(
                         let _ = tokio::join!(inbound, outbound);
                     });
                 }
-                Err(_) => break,
+                Err(e) => {
+                    if crate::web_gateway::should_continue_after_accept_error(&e) {
+                        eprintln!("Control socket accept failed: {e} (continuing)");
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    // Fatal-class errors can be spurious (see the web
+                    // gateway's accept loop): retry the same socket briefly
+                    // before declaring it dead.
+                    fatal_accept_streak += 1;
+                    if fatal_accept_streak < crate::web_gateway::FATAL_ACCEPT_REBIND_THRESHOLD {
+                        eprintln!(
+                            "Control socket accept failed: {e} (retry {fatal_accept_streak} before rebind)"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    fatal_accept_streak = 0;
+                    // The listening socket itself is dead (same fd-invalidation
+                    // class the web gateway recovers from): re-listen on the
+                    // same path instead of silently dropping the control
+                    // socket for the rest of the daemon's life.
+                    eprintln!(
+                        "Control socket accept failed: {e} (rebinding {})",
+                        path.display()
+                    );
+                    // Unlike a TCP port, re-listening only needs the stale
+                    // path removed — but drop the dead listener first anyway
+                    // so its fd doesn't linger across the retry loop.
+                    drop(listener);
+                    let mut delay = std::time::Duration::from_millis(250);
+                    listener = loop {
+                        tokio::time::sleep(delay).await;
+                        let _ = std::fs::remove_file(&path);
+                        match UnixListener::bind(&path) {
+                            Ok(fresh) => {
+                                let _ = std::fs::set_permissions(
+                                    &path,
+                                    std::fs::Permissions::from_mode(0o600),
+                                );
+                                eprintln!("Control socket rebound at {}", path.display());
+                                break fresh;
+                            }
+                            Err(err) => {
+                                delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                                eprintln!(
+                                    "Control socket rebind failed: {err} (retrying in {:.1}s)",
+                                    delay.as_secs_f32()
+                                );
+                            }
+                        }
+                    };
+                }
             }
         }
     });

@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 /// Extra tool definitions registered at runtime (e.g. from MCP servers).
 static EXTRA_TOOLS: Mutex<Vec<ToolDefinition>> = Mutex::new(Vec::new());
-const BUILT_IN_TOOL_COUNT: usize = 14;
+const BUILT_IN_TOOL_COUNT: usize = 17;
 
 /// Provider-agnostic tool definition.
 #[derive(Debug, Clone, Serialize)]
@@ -452,6 +452,114 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         }),
     });
 
+    // 15. spawn_sub_agent (caller-handled, supervised sessions only)
+    tools.push(ToolDefinition {
+        name: "spawn_sub_agent".to_string(),
+        description: "Delegate a self-contained subtask to a sub-agent running as its own supervised session (visible in the dashboard, with its own approvals and steering). Returns immediately with the child's session id; collect its result with wait_sub_agents. Only available in supervised sessions under the web daemon. Spawn independent subtasks in parallel; concurrency is capped per session.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Complete, self-contained task description for the sub-agent. Include all context it needs — it does not see this conversation."
+                },
+                "role": {
+                    "type": "string",
+                    "description": "Role preset resolving the sub-agent's system prompt: research, implementation, or testing. Any other string runs the base prompt. Default: worker (base prompt)."
+                },
+                "system_prompt": {
+                    "type": "string",
+                    "description": "Custom system prompt for the sub-agent, replacing the role preset entirely."
+                },
+                "backend": {
+                    "type": "string",
+                    "enum": ["internal", "codex", "claude-code"],
+                    "description": "Which agent runs the task: the internal native loop (default), or a supervised external coding agent."
+                },
+                "worktree": {
+                    "type": "boolean",
+                    "description": "Isolate the sub-agent in a fresh git worktree branched off this project's HEAD. Use for implementation work that edits files in parallel with others. The worktree persists after the child finishes so you can merge its branch. Default: false."
+                },
+                "inherit_memory": {
+                    "type": "boolean",
+                    "description": "Inject the project knowledge store into the sub-agent's context. Default: false."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Display name for the sub-agent's session."
+                }
+            },
+            "required": ["task"],
+            "additionalProperties": false
+        }),
+    });
+
+    // 16. wait_sub_agents (caller-handled, blocking)
+    tools.push(ToolDefinition {
+        name: "wait_sub_agents".to_string(),
+        description: "Wait for sub-agents spawned with spawn_sub_agent to finish and collect their results. Blocks until the requested children complete (mode all, the default), the first one completes (mode any), or the timeout lapses — then returns each finished child's structured result. Children still running are listed so you can wait again.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "agent_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Child session ids (or names) to wait for. Omit to wait for every pending sub-agent."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["all", "any"],
+                    "description": "all (default): return when every requested child finished. any: return as soon as one finishes."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Give up waiting after this many seconds and report what is still running (5-7200, default 600)."
+                }
+            },
+            "additionalProperties": false
+        }),
+    });
+
+    // 17. submit_result (caller-handled, sub-agent sessions only)
+    tools.push(ToolDefinition {
+        name: "submit_result".to_string(),
+        description: "Report your structured result to the session that spawned you. Only available when running as a sub-agent. Call it once when your task is done (or has definitively failed), then call signal_done — both can go in the same message. If you finish without submitting, a result is synthesized from your final message.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["completed", "failed"],
+                    "description": "Task outcome. Default: completed."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Full result summary for the parent: what was done, key findings, decisions, and anything the parent must know."
+                },
+                "brief": {
+                    "type": "string",
+                    "description": "1-2 sentence spoken-style summary. Derived from summary when omitted."
+                },
+                "failure_reason": {
+                    "type": "string",
+                    "description": "Why the task failed (with status failed)."
+                },
+                "findings": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Discrete findings worth surfacing individually."
+                },
+                "artifacts": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Paths to files or outputs produced."
+                }
+            },
+            "required": ["summary"],
+            "additionalProperties": false
+        }),
+    });
+
     // Append any extra tools registered at runtime (MCP servers, etc.)
     if let Ok(extra) = EXTRA_TOOLS.lock() {
         tools.extend(extra.iter().cloned());
@@ -516,6 +624,9 @@ mod tests {
         "invoke_skill",
         "shared_view",
         "spawn_live_audio",
+        "spawn_sub_agent",
+        "wait_sub_agents",
+        "submit_result",
     ];
 
     #[test]

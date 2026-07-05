@@ -1,0 +1,54 @@
+# static/app/manifest.txt — assembly order for static/app.html.
+#
+# static/app.html is GENERATED: build.rs (via crates/app-html-assembler)
+# concatenates the fragments below, in this order, into static/app.html.
+# Edit the fragments, never the generated file. Blank lines and #-comments
+# here are ignored. Every .css/.js/.html file in this directory must be
+# listed exactly once — the assembler fails the build otherwise.
+00-head.html
+09-style-open.html
+
+10-styles-shell.css
+11-styles-access-files.css
+12-styles-tasks-log.css
+13-styles-sessions-terminal.css
+14-styles-displays-voice.css
+19-style-close.html
+
+20-shell.html
+21-access-dialogs.html
+22-voice-bootstrap.html
+23-voice-dialogs.html
+
+30-module-open.html
+31-init-identity-fleet.js
+32-vault-custody.js
+33-station-core.js
+34-station-panes.js
+35-station-diff-viewer.js
+36-voice-wasm-init.js
+37-uicommand-changes-control.js
+38-managed-context.js
+39-session-windows.js
+
+40-session-launch.js
+41-session-window-actions.js
+42-usage-terminal.js
+43-access-panes.js
+44-shell-frames.js
+45-displays-webrtc.js
+46-recording-replay.js
+47-annotation-clips.js
+48-router-settings.js
+49-daemons-multihost.js
+
+50-control-transport.js
+51-peer-approvals.js
+52-peer-display.js
+53-stats-settings.js
+54-session-lifecycle.js
+55-files-ide.js
+56-debug-sessions.js
+57-sessions-replay.js
+58-shortcuts-boot.js
+59-module-close.html

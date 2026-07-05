@@ -1,0 +1,17 @@
+[package]
+name = "app-html-assembler"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Assembles static/app.html from the ordered fragments in static/app/"
+
+# Two entry points, one implementation:
+#   - build.rs depends on the library and assembles during every build, so
+#     `include_str!` always embeds an artifact that matches the fragments.
+#   - CI runs the binary (`cargo run -p app-html-assembler`) and then
+#     `git diff --exit-code static/app.html` — the regen gate for pushes that
+#     touch only static/ and therefore skip the heavyweight test workflow.
+# std-only on purpose: the CI job must compile in seconds.
+
+[dev-dependencies]
+tempfile = "3"

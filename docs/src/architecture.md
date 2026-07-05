@@ -38,8 +38,8 @@ $INTENDANT_LOG_DIR/           │             ▼            ▼             ▼
                               │      │ state)     │ │ lifecycle│ │ routing) │  │
                               │      └────────────┘ └──────────┘ └──────────┘  │
                               │                            │                    │
-                              │     Per-session agent loops (one of four modes):│
-                              │     Direct · External-Agent · User · Sub-Agent  │
+                              │   Per-session agent loops (execution shapes):  │
+                              │   Direct · Orchestrate · Sub-Agent · External  │
                               │                            │                    │
                               │   Cross-cutting subsystems:                     │
                               │     Presence layer · WebRTC display · Live audio │
@@ -97,51 +97,55 @@ the tool returns. Per-nonce stdout/stderr go to `<nonce>_stdout.log` /
 `<nonce>_stderr.log` inside the session directory the controller passes via
 `INTENDANT_LOG_DIR`.
 
-## Execution Modes
+## Execution Shapes
 
-The controller runs one of **four** execution modes. The current code selects
-them in `main.rs`; the trusted summary of "three modes" in older docs is stale —
-external-agent supervision is now a first-class fourth mode.
+The controller runs every native session through **one in-process loop**
+(`run_direct_mode`); what used to be separate process modes are now
+configurations of that loop, plus external-agent supervision. The February-era
+subprocess pipeline (User mode's `run_user_mode` monitor and `INTENDANT_ROLE`
+child processes with progress/result files) is gone.
 
-### Direct Mode (`run_direct_mode`)
+### Direct (`run_direct_mode`)
 
 Single in-process agent loop driving Intendant's own provider abstraction
 (OpenAI / Anthropic / Gemini). Selected for simple tasks, forced with `--direct`,
-or chosen automatically when a task looks simple (`is_simple_task`). Budget-aware:
-stops at context exhaustion, an explicit `done` signal, or a 500-turn safety cap
-(`SAFETY_CAP`). This is the loop documented step-by-step below.
+chosen automatically when a task looks simple (`is_simple_task`), and always
+used by non-daemon CLI paths. Budget-aware: stops at context exhaustion, an
+explicit `done` signal, or a 500-turn safety cap (`SAFETY_CAP`). This is the
+loop documented step-by-step below.
+
+### Orchestrate (`run_direct_mode` with the orchestration prompt)
+
+Selected for complex tasks under the daemon without `--direct`. The same loop
+runs with `SysPrompt_orchestrator.md` appended; it decomposes the task and
+delegates through the `spawn_sub_agent` / `wait_sub_agents` tools. Every
+supervised native session carries those tools — orchestration is a capability,
+not a mode; the shape only changes the prompt. Full detail in
+[Multi-Agent Orchestration](./multi-agent.md).
+
+### Sub-Agent (a supervised child session)
+
+Spawned by another session's `spawn_sub_agent` call
+(`SessionSupervisor::start_sub_agent_session`). The child is a full managed
+session — dashboard row, approvals, steering, lineage link to its parent — with
+a role prompt (`SysPrompt_research.md`, `SysPrompt_implementation.md`, …),
+optionally isolated in a git worktree. It reports back with the
+`submit_result` tool and ends when its task ends. Full detail in
+[Multi-Agent Orchestration](./multi-agent.md).
 
 ### External-Agent Mode (`run_external_agent_mode`)
 
-Selected with `--agent <backend>` or when an external backend is configured.
-Instead of running Intendant's own loop, the controller spawns and supervises an
-external coding CLI as a subordinate worker (`external_agent::AgentBackend`):
-`Codex` or `ClaudeCode`. Intendant translates its task, approval, and
-attachment surface onto each backend's native protocol (Codex app-server
-JSON-RPC, Claude Code stream-json) and surfaces their events back
-onto the EventBus so every frontend renders them identically. This is a
-master/worker relationship — see [Multi-Agent Orchestration](./multi-agent.md).
+Selected with `--agent <backend>` or when an external backend is configured
+(including `backend` on `spawn_sub_agent`). Instead of running Intendant's own
+loop, the controller spawns and supervises an external coding CLI as a
+subordinate worker (`external_agent::AgentBackend`): `Codex` or `ClaudeCode`.
+Intendant translates its task, approval, and attachment surface onto each
+backend's native protocol (Codex app-server JSON-RPC, Claude Code stream-json)
+and surfaces their events back onto the EventBus so every frontend renders
+them identically. This is a master/worker relationship — see
+[External-Agent Orchestration](./external-agent-orchestration.md).
 
-### User Mode (`run_user_mode`)
-
-Selected for complex tasks without `--direct`. The controller becomes a pure
-subprocess monitor (zero model API calls at this layer): it spawns an
-**orchestrator** sub-agent as a child `intendant` process, polls its progress
-file, and reads its result file on exit. The orchestrator decomposes the task
-and delegates to specialized sub-agents (research, implementation, testing)
-running in isolated git worktrees. Full detail in
-[Multi-Agent Orchestration](./multi-agent.md).
-
-### Sub-Agent Mode (`run_sub_agent_mode`)
-
-Activated when the `INTENDANT_ROLE` env var is set (`detect_sub_agent_mode`).
-The process runs as a scoped child agent with a role-specific system prompt
-(`SysPrompt_research.md`, `SysPrompt_implementation.md`, …), writing periodic
-progress to `INTENDANT_PROGRESS_FILE` and final results to
-`INTENDANT_RESULT_FILE`. This is the mode every orchestrator-spawned worker runs
-in.
-
-> **Peer federation is orthogonal to all four.** The `peer/` module federates
+> **Peer federation is orthogonal to all of these.** The `peer/` module federates
 > with *other* autonomous daemons (other Intendants, A2A-speaking peers,
 > MCP-shaped peers) as equals, where `external_agent` supervises a *subordinate*
 > CLI. The two compose: a peer Intendant can itself supervise a Codex subprocess
@@ -331,8 +335,8 @@ history. Windows is a first-class target (see
   daemon, and cost accounting.
 - [Session Logging](./session-logging.md) — the on-disk session layout, JSONL
   event format, replay/rehydration, and cross-backend naming.
-- [Multi-Agent Orchestration](./multi-agent.md) — User mode, sub-agents,
-  worktrees, and external-agent supervision.
+- [Multi-Agent Orchestration](./multi-agent.md) — orchestration sessions,
+  supervised sub-agents, worktrees, and external-agent supervision.
 - [Presence Layer](./presence.md), [Web Dashboard](./web-dashboard.md),
   [MCP Server](./mcp-server.md), [Display Pipeline](./display-pipeline.md),
   [Computer Use & Live Audio](./computer-use-and-audio.md).

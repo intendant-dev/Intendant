@@ -6403,6 +6403,11 @@ fn translate_notification_with_scope(
             }
         }
 
+        // codex-cli 0.142+ announces changes to its skills catalog on every
+        // app-server spawn. Intendant doesn't consume the catalog; ignore the
+        // notification instead of logging it as unknown.
+        "skills/changed" => {}
+
         other => {
             eprintln!(
                 "[codex] unknown notification method: {:?} params: {}",

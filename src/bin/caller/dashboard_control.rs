@@ -8,6 +8,7 @@
 use crate::daemon_identity::{b64u, DaemonIdentity};
 use crate::error::CallerError;
 use crate::event::{AppEvent, ControlMsg};
+use crate::peer::access_policy::PeerOperation;
 use crate::types::{truncate_str, LogLevel};
 use base64::Engine as _;
 use bytes::BytesMut;
@@ -50,22 +51,266 @@ const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
 const CONTROL_BINDING_TTL_MS: i64 = 5 * 60 * 1000;
 const DASHBOARD_MEDIA_CLIP_MAX_FRAMES: usize = 1000;
 static NEXT_DASHBOARD_DISPLAY_PEER_ID: AtomicU64 = AtomicU64::new(1);
-const CONTROL_FEATURES: &[&str] = &[
-    "ping",
-    "config",
-    "api_agent_card",
-    "api_cached_bootstrap_events",
-    "api_browser_workspace_snapshot",
-    "api_state_snapshot",
-    "api_display_bootstrap",
-    "api_display_webrtc_signal",
-    "api_display_input_authority_snapshot",
-    "api_display_input_authority_request",
-    "api_display_input_authority_release",
-    "api_session_log_replay",
-    "api_external_session_activity_replay",
-    "api_dashboard_bootstrap",
-    "status",
+/// One dashboard-control method's declared surface. `CONTROL_METHODS` is the
+/// single source the method authorizer (`authorize_dashboard_control_method`),
+/// the advertised feature list (`control_features`), the per-method
+/// `<method>_available` status booleans, and the upload-frame allowlist
+/// (`authorize_dashboard_control_upload`) all derive from — a method added or
+/// re-gated in one place cannot drift out of sync in the others. Composite
+/// rollup booleans the SPA also reads (peer mutations, managed context, …)
+/// stay hand-written next to the derived block in `status_response_frame`.
+struct ControlMethodSpec {
+    name: &'static str,
+    /// Operation gating the method; `None` = any bound session (ping).
+    op: Option<PeerOperation>,
+    /// Listed in the `features` handshake. `subscribe_events` /
+    /// `unsubscribe_events` ride the "events" umbrella; upload-only
+    /// methods advertise through the "upload_frames" transport feature.
+    advertised: bool,
+    /// May also (or only) be delivered as an upload frame.
+    upload: bool,
+}
+
+/// Advertised request method gated by `op`.
+const fn method(name: &'static str, op: PeerOperation) -> ControlMethodSpec {
+    ControlMethodSpec {
+        name,
+        op: Some(op),
+        advertised: true,
+        upload: false,
+    }
+}
+
+/// Request method the feature list doesn't name (covered by an umbrella).
+const fn internal(name: &'static str, op: PeerOperation) -> ControlMethodSpec {
+    ControlMethodSpec {
+        name,
+        op: Some(op),
+        advertised: false,
+        upload: false,
+    }
+}
+
+/// Advertised method that may also arrive as an upload frame.
+const fn uploadable(name: &'static str, op: PeerOperation) -> ControlMethodSpec {
+    ControlMethodSpec {
+        name,
+        op: Some(op),
+        advertised: true,
+        upload: true,
+    }
+}
+
+/// Upload-frame-only method (no request-lane dispatch, no feature entry).
+const fn upload_only(name: &'static str, op: PeerOperation) -> ControlMethodSpec {
+    ControlMethodSpec {
+        name,
+        op: Some(op),
+        advertised: false,
+        upload: true,
+    }
+}
+
+const CONTROL_METHODS: &[ControlMethodSpec] = &[
+    ControlMethodSpec {
+        name: "ping",
+        op: None,
+        advertised: true,
+        upload: false,
+    },
+    method("config", PeerOperation::RuntimeControl),
+    method("status", PeerOperation::PresenceRead),
+    method("api_agent_card", PeerOperation::PresenceRead),
+    method("api_cached_bootstrap_events", PeerOperation::SessionInspect),
+    internal("subscribe_events", PeerOperation::SessionInspect),
+    internal("unsubscribe_events", PeerOperation::SessionInspect),
+    method("api_access_overview", PeerOperation::AccessInspect),
+    method("api_access_iam_state", PeerOperation::AccessInspect),
+    method("api_access_enrollment_requests", PeerOperation::AccessInspect),
+    method("api_dashboard_targets", PeerOperation::AccessInspect),
+    // Credential custody (vault leases + client egress): granting, renewing,
+    // revoking, and even reading lease status all sit behind the dedicated
+    // gate — a scoped guest session can neither fuel nor drain a daemon, nor
+    // see which providers are fueled. Raw egress_* relay frames are a
+    // separate wire family and deliberately not methods here.
+    method("api_credential_lease_grant", PeerOperation::CredentialsManage),
+    method("api_credential_lease_renew", PeerOperation::CredentialsManage),
+    method("api_credential_lease_revoke", PeerOperation::CredentialsManage),
+    method("api_credential_lease_status", PeerOperation::CredentialsManage),
+    method("api_credential_custody_trail", PeerOperation::CredentialsManage),
+    method(
+        "api_credential_egress_register",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_credential_egress_unregister",
+        PeerOperation::CredentialsManage,
+    ),
+    method("api_credential_egress_probe", PeerOperation::CredentialsManage),
+    method(
+        "api_access_iam_upsert_user_client_grant",
+        PeerOperation::AccessManage,
+    ),
+    method("api_access_iam_update_grant", PeerOperation::AccessManage),
+    method("api_access_enrollment_decide", PeerOperation::AccessManage),
+    method("api_access_org_trust", PeerOperation::AccessManage),
+    method("api_access_org_revoke", PeerOperation::AccessManage),
+    method("api_access_org_issue", PeerOperation::AccessManage),
+    method("api_access_org_revoke_member", PeerOperation::AccessManage),
+    method("api_access_org_issuer_init", PeerOperation::AccessManage),
+    method("api_access_org_issuer_delegate", PeerOperation::AccessManage),
+    method("api_access_org_issuer_install", PeerOperation::AccessManage),
+    // Presenting a signed org document (or list) only requires a session;
+    // the document itself is the authorization and is fully re-verified.
+    // Same for reading the org's public revocation list and renewing a
+    // still-valid document.
+    method("api_access_org_present", PeerOperation::AccessInspect),
+    method("api_access_org_orl", PeerOperation::AccessInspect),
+    method("api_access_org_renew", PeerOperation::AccessInspect),
+    // Applying a root-signed revocation list mirrors a PUBLIC doorbell
+    // (`POST /api/access/orgs/revocations/apply`): the signature is the
+    // authority, so any session may courier one through the tunnel.
+    method("api_access_org_orl_apply", PeerOperation::PresenceRead),
+    method("api_peer_pairing_requests", PeerOperation::AccessInspect),
+    method("api_peer_pairing_identities", PeerOperation::AccessInspect),
+    method(
+        "api_peer_pairing_request_decision",
+        PeerOperation::AccessManage,
+    ),
+    method(
+        "api_peer_pairing_identity_revoke",
+        PeerOperation::AccessManage,
+    ),
+    method("api_peer_pairing_invite", PeerOperation::AccessManage),
+    method("api_peers", PeerOperation::PeerInspect),
+    method("api_peer_eligible", PeerOperation::PeerInspect),
+    // Acting through a connected peer — signaling relays that open tunnels,
+    // and the message/task/approval quick controls — is peer use, not peer
+    // administration: the receiving peer authorizes each action against its
+    // own grants for this daemon. Mirrors the HTTP lane's
+    // `federation_http_operation`.
+    method("api_peer_webrtc_signal", PeerOperation::PeerUse),
+    method("api_peer_file_transfer_signal", PeerOperation::PeerUse),
+    method("api_peer_dashboard_control_signal", PeerOperation::PeerUse),
+    method("api_peer_message", PeerOperation::PeerUse),
+    method("api_peer_task", PeerOperation::PeerUse),
+    method("api_peer_approval", PeerOperation::PeerUse),
+    method("api_peer_add", PeerOperation::PeerManage),
+    method("api_peer_remove", PeerOperation::PeerManage),
+    method("api_peer_pairing_join", PeerOperation::PeerManage),
+    method("api_peer_pairing_request_access", PeerOperation::PeerManage),
+    method(
+        "api_peer_pairing_request_access_poll",
+        PeerOperation::PeerManage,
+    ),
+    method("api_coordinator_route", PeerOperation::PeerManage),
+    method("api_sessions", PeerOperation::SessionInspect),
+    method("api_sessions_stream", PeerOperation::SessionInspect),
+    method("api_session_detail", PeerOperation::SessionInspect),
+    method("api_session_report", PeerOperation::SessionInspect),
+    method("api_session_agent_output", PeerOperation::SessionInspect),
+    method("api_sessions_search", PeerOperation::SessionInspect),
+    method("api_session_recordings", PeerOperation::SessionInspect),
+    method("api_session_recording_asset", PeerOperation::SessionInspect),
+    method("api_session_frame_asset", PeerOperation::SessionInspect),
+    method("api_worktrees", PeerOperation::SessionInspect),
+    method("api_worktrees_inspect", PeerOperation::SessionInspect),
+    method("api_session_delete", PeerOperation::SessionManage),
+    method("api_session_current_history", PeerOperation::SessionManage),
+    method("api_session_current_rollback", PeerOperation::SessionManage),
+    method("api_session_current_redo", PeerOperation::SessionManage),
+    method("api_session_current_prune", PeerOperation::SessionManage),
+    method("api_session_current_changes", PeerOperation::SessionManage),
+    method("api_session_current_uploads", PeerOperation::SessionManage),
+    method("api_session_current_upload_raw", PeerOperation::SessionManage),
+    method(
+        "api_session_current_upload_delete",
+        PeerOperation::SessionManage,
+    ),
+    method(
+        "api_session_current_agent_output",
+        PeerOperation::SessionManage,
+    ),
+    method("api_session_context_snapshot", PeerOperation::SessionManage),
+    method("api_session_control_msg", PeerOperation::SessionManage),
+    method("api_worktrees_scan", PeerOperation::SessionManage),
+    method("api_worktrees_remove", PeerOperation::SessionManage),
+    upload_only("api_session_current_upload", PeerOperation::SessionManage),
+    method("api_transfer_jobs", PeerOperation::FilesystemRead),
+    method("api_transfer_download_read", PeerOperation::FilesystemRead),
+    method("api_fs_stat", PeerOperation::FilesystemRead),
+    method("api_fs_list", PeerOperation::FilesystemRead),
+    method("api_fs_read", PeerOperation::FilesystemRead),
+    method("api_transfer_job_create", PeerOperation::FilesystemWrite),
+    method("api_transfer_job_delete", PeerOperation::FilesystemWrite),
+    // Transfer chunks arrive only as upload frames; their destination was
+    // path-scoped when the transfer job was created, so the chunk itself
+    // only needs the write operation (`authorize_dashboard_control_upload`).
+    uploadable("api_transfer_upload_chunk", PeerOperation::FilesystemWrite),
+    method("api_transfer_upload_commit", PeerOperation::FilesystemWrite),
+    method("api_fs_mkdir", PeerOperation::FilesystemWrite),
+    uploadable("api_fs_write", PeerOperation::FilesystemWrite),
+    method("api_fs_rename", PeerOperation::FilesystemWrite),
+    method("api_fs_delete", PeerOperation::FilesystemWrite),
+    method("api_display_bootstrap", PeerOperation::DisplayView),
+    method("api_display_webrtc_signal", PeerOperation::DisplayView),
+    method("api_displays", PeerOperation::DisplayView),
+    method(
+        "api_display_input_authority_snapshot",
+        PeerOperation::DisplayInput,
+    ),
+    method(
+        "api_display_input_authority_request",
+        PeerOperation::DisplayInput,
+    ),
+    method(
+        "api_display_input_authority_release",
+        PeerOperation::DisplayInput,
+    ),
+    method(
+        "api_diagnostics_visual_freshness",
+        PeerOperation::DisplayInput,
+    ),
+    method("api_control_msg", PeerOperation::Message),
+    method("api_dashboard_action_msg", PeerOperation::Message),
+    method("api_mcp_tool_call", PeerOperation::Message),
+    method("api_settings", PeerOperation::Settings),
+    method("api_settings_save", PeerOperation::Settings),
+    method("api_key_status", PeerOperation::Settings),
+    method("api_api_keys_save", PeerOperation::Settings),
+    method("api_project_root", PeerOperation::Settings),
+    method("api_voice_session", PeerOperation::RuntimeControl),
+    uploadable("api_presence_video_frame", PeerOperation::RuntimeControl),
+    uploadable("api_media_annotation_attach", PeerOperation::RuntimeControl),
+    uploadable("api_media_annotation_submit", PeerOperation::RuntimeControl),
+    method("api_media_clip_start", PeerOperation::RuntimeControl),
+    uploadable("api_media_clip_frame", PeerOperation::RuntimeControl),
+    method("api_media_clip_end", PeerOperation::RuntimeControl),
+    method("api_media_clip_cancel", PeerOperation::RuntimeControl),
+    method("api_recordings", PeerOperation::RuntimeControl),
+    method("api_recording_asset", PeerOperation::RuntimeControl),
+    method("api_browser_workspace_snapshot", PeerOperation::SessionInspect),
+    method("api_state_snapshot", PeerOperation::SessionInspect),
+    method("api_session_log_replay", PeerOperation::SessionInspect),
+    method(
+        "api_external_session_activity_replay",
+        PeerOperation::SessionInspect,
+    ),
+    method("api_dashboard_bootstrap", PeerOperation::SessionInspect),
+    method("api_managed_context_records", PeerOperation::SessionInspect),
+    method("api_managed_context_anchors", PeerOperation::SessionInspect),
+    method("api_managed_context_fission", PeerOperation::SessionInspect),
+    method("api_external_agents", PeerOperation::SessionInspect),
+];
+
+fn control_method_spec(method: &str) -> Option<&'static ControlMethodSpec> {
+    CONTROL_METHODS.iter().find(|spec| spec.name == method)
+}
+
+/// Transport/frame-family features that aren't request methods (chunking,
+/// credit, frame families, the events umbrella covering
+/// `subscribe_events`/`unsubscribe_events`).
+const CONTROL_WIRE_FEATURES: &[&str] = &[
     "events",
     "response_chunks",
     "response_credit",
@@ -77,106 +322,52 @@ const CONTROL_FEATURES: &[&str] = &[
     "presence_frames",
     "presence_active_handoff",
     "presence_tool_request",
-    "api_session_current_uploads",
-    "api_session_current_upload_raw",
-    "api_presence_video_frame",
-    "api_media_annotation_attach",
-    "api_media_annotation_submit",
-    "api_media_clip_start",
-    "api_media_clip_frame",
-    "api_media_clip_end",
-    "api_media_clip_cancel",
-    "api_peers",
-    "api_sessions",
-    "api_sessions_stream",
-    "api_session_detail",
-    "api_session_report",
-    "api_session_delete",
-    "api_session_agent_output",
-    "api_session_current_agent_output",
-    "api_session_current_history",
-    "api_session_current_rollback",
-    "api_session_current_redo",
-    "api_session_current_prune",
-    "api_session_current_changes",
-    "api_session_context_snapshot",
-    "api_session_current_upload_delete",
-    "api_transfer_jobs",
-    "api_transfer_job_create",
-    "api_transfer_job_delete",
-    "api_transfer_download_read",
-    "api_transfer_upload_chunk",
-    "api_transfer_upload_commit",
-    "api_fs_stat",
-    "api_fs_list",
-    "api_fs_mkdir",
-    "api_fs_read",
-    "api_fs_write",
-    "api_fs_rename",
-    "api_fs_delete",
-    "api_sessions_search",
-    "api_settings",
-    "api_settings_save",
-    "api_control_msg",
-    "api_session_control_msg",
-    "api_dashboard_action_msg",
-    "api_diagnostics_visual_freshness",
-    "api_key_status",
-    "api_api_keys_save",
-    "api_external_agents",
-    "api_voice_session",
-    "api_project_root",
-    "api_displays",
-    "api_recordings",
-    "api_recording_asset",
-    "api_session_recordings",
-    "api_session_recording_asset",
-    "api_session_frame_asset",
-    "api_worktrees",
-    "api_worktrees_inspect",
-    "api_worktrees_scan",
-    "api_worktrees_remove",
-    "api_managed_context_records",
-    "api_managed_context_anchors",
-    "api_managed_context_fission",
-    "api_mcp_tool_call",
-    "api_peer_add",
-    "api_peer_remove",
-    "api_peer_eligible",
-    "api_peer_message",
-    "api_peer_task",
-    "api_peer_approval",
-    "api_peer_webrtc_signal",
-    "api_peer_file_transfer_signal",
-    "api_peer_dashboard_control_signal",
-    "api_peer_pairing_invite",
-    "api_peer_pairing_join",
-    "api_peer_pairing_request_access",
-    "api_peer_pairing_request_access_poll",
-    "api_peer_pairing_requests",
-    "api_peer_pairing_request_decision",
-    "api_peer_pairing_identities",
-    "api_peer_pairing_identity_revoke",
-    "api_access_overview",
-    "api_access_iam_state",
-    "api_access_enrollment_requests",
-    "api_access_enrollment_decide",
-    "api_access_iam_upsert_user_client_grant",
-    "api_access_iam_update_grant",
-    "api_access_org_trust",
-    "api_access_org_revoke",
-    "api_access_org_issue",
-    "api_access_org_present",
-    "api_access_org_revoke_member",
-    "api_access_org_issuer_init",
-    "api_access_org_issuer_delegate",
-    "api_access_org_issuer_install",
-    "api_access_org_orl",
-    "api_access_org_orl_apply",
-    "api_access_org_renew",
-    "api_dashboard_targets",
-    "api_coordinator_route",
 ];
+
+/// The advertised `features` list: every advertised method in
+/// `CONTROL_METHODS` plus the wire features. Consumers membership-test —
+/// order carries no meaning.
+fn control_features() -> &'static [&'static str] {
+    static FEATURES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    FEATURES.get_or_init(|| {
+        let mut features: Vec<&'static str> = CONTROL_WIRE_FEATURES.to_vec();
+        features.extend(
+            CONTROL_METHODS
+                .iter()
+                .filter(|spec| spec.advertised)
+                .map(|spec| spec.name),
+        );
+        features
+    })
+}
+
+/// Runtime prerequisites for a method beyond its operation grant: the
+/// subsystem the method drives must be wired on this daemon (peer registry
+/// configured, project root known, display-authority bridge present, MCP
+/// server running). `true` for methods with no such dependency.
+fn control_method_runtime_ready(runtime: &ControlRuntime, method: &str) -> bool {
+    match method {
+        "api_peers"
+        | "api_peer_eligible"
+        | "api_peer_add"
+        | "api_peer_remove"
+        | "api_peer_message"
+        | "api_peer_task"
+        | "api_peer_approval"
+        | "api_peer_webrtc_signal"
+        | "api_peer_file_transfer_signal"
+        | "api_peer_dashboard_control_signal"
+        | "api_coordinator_route" => runtime.peer_registry.is_some(),
+        "api_settings_save" => runtime.project_root.is_some(),
+        "api_mcp_tool_call" => runtime.mcp_server.is_some(),
+        method if method.starts_with("api_transfer_") => runtime.project_root.is_some(),
+        method if method.starts_with("api_display_input_authority_") => {
+            runtime.display_authority.is_some()
+        }
+        _ => true,
+    }
+}
+
 const UDP_BUF_LEN: usize = 2000;
 const COMMAND_CHANNEL: usize = 16;
 const TCP_OUT_QUEUE: usize = 256;
@@ -2069,149 +2260,6 @@ fn dashboard_control_frame_operation(t: &str) -> Option<crate::peer::access_poli
     }
 }
 
-fn dashboard_control_method_operation(
-    method: &str,
-) -> Option<crate::peer::access_policy::PeerOperation> {
-    use crate::peer::access_policy::PeerOperation;
-    match method {
-        "status" | "api_agent_card" => Some(PeerOperation::PresenceRead),
-        "api_cached_bootstrap_events" | "subscribe_events" | "unsubscribe_events" => {
-            Some(PeerOperation::SessionInspect)
-        }
-        "config" => Some(PeerOperation::RuntimeControl),
-        "api_access_overview"
-        | "api_access_iam_state"
-        | "api_access_enrollment_requests"
-        | "api_dashboard_targets" => Some(PeerOperation::AccessInspect),
-        // Credential leases (credential custody): granting, renewing,
-        // revoking, and even reading lease status all sit behind the
-        // dedicated gate — a scoped guest session can neither fuel nor
-        // drain a daemon, nor see which providers are fueled.
-        "api_credential_lease_grant"
-        | "api_credential_lease_renew"
-        | "api_credential_lease_revoke"
-        | "api_credential_lease_status"
-        | "api_credential_custody_trail"
-        | "api_credential_egress_register"
-        | "api_credential_egress_unregister"
-        | "api_credential_egress_probe" => Some(PeerOperation::CredentialsManage),
-        "api_access_iam_upsert_user_client_grant"
-        | "api_access_iam_update_grant"
-        | "api_access_enrollment_decide"
-        | "api_access_org_trust"
-        | "api_access_org_revoke"
-        | "api_access_org_issue"
-        | "api_access_org_revoke_member"
-        | "api_access_org_issuer_init"
-        | "api_access_org_issuer_delegate"
-        | "api_access_org_issuer_install" => Some(PeerOperation::AccessManage),
-        // Presenting a signed org document (or list) only requires a
-        // session; the document itself is the authorization and is fully
-        // re-verified. Same for reading the org's public revocation list
-        // and renewing a still-valid document.
-        "api_access_org_present" | "api_access_org_orl" | "api_access_org_renew" => {
-            Some(PeerOperation::AccessInspect)
-        }
-        // Applying a root-signed revocation list mirrors a PUBLIC doorbell
-        // (`POST /api/access/orgs/revocations/apply`): the signature is the
-        // authority, so any session may courier one through the tunnel.
-        "api_access_org_orl_apply" => Some(PeerOperation::PresenceRead),
-        "api_peer_pairing_requests" | "api_peer_pairing_identities" => {
-            Some(PeerOperation::AccessInspect)
-        }
-        "api_peer_pairing_request_decision" | "api_peer_pairing_identity_revoke" => {
-            Some(PeerOperation::AccessManage)
-        }
-        "api_peer_pairing_invite" => Some(PeerOperation::AccessManage),
-        "api_peers" | "api_peer_eligible" => Some(PeerOperation::PeerInspect),
-        // Acting through a connected peer — signaling relays that open
-        // tunnels, and the message/task/approval quick controls — is peer
-        // use, not peer administration: the receiving peer authorizes each
-        // action against its own grants for this daemon. Mirrors the HTTP
-        // lane's `federation_http_operation`.
-        "api_peer_webrtc_signal"
-        | "api_peer_file_transfer_signal"
-        | "api_peer_dashboard_control_signal"
-        | "api_peer_message"
-        | "api_peer_task"
-        | "api_peer_approval" => Some(PeerOperation::PeerUse),
-        "api_peer_add"
-        | "api_peer_remove"
-        | "api_peer_pairing_join"
-        | "api_peer_pairing_request_access"
-        | "api_peer_pairing_request_access_poll"
-        | "api_coordinator_route" => Some(PeerOperation::PeerManage),
-        "api_sessions"
-        | "api_sessions_stream"
-        | "api_session_detail"
-        | "api_session_report"
-        | "api_session_agent_output"
-        | "api_sessions_search"
-        | "api_session_recordings"
-        | "api_session_recording_asset"
-        | "api_session_frame_asset"
-        | "api_worktrees"
-        | "api_worktrees_inspect" => Some(PeerOperation::SessionInspect),
-        "api_session_delete"
-        | "api_session_current_history"
-        | "api_session_current_rollback"
-        | "api_session_current_redo"
-        | "api_session_current_prune"
-        | "api_session_current_changes"
-        | "api_session_current_uploads"
-        | "api_session_current_upload_raw"
-        | "api_session_current_upload_delete"
-        | "api_session_current_agent_output"
-        | "api_session_context_snapshot"
-        | "api_session_control_msg"
-        | "api_worktrees_scan"
-        | "api_worktrees_remove" => Some(PeerOperation::SessionManage),
-        "api_transfer_jobs"
-        | "api_transfer_download_read"
-        | "api_fs_stat"
-        | "api_fs_list"
-        | "api_fs_read" => Some(PeerOperation::FilesystemRead),
-        "api_transfer_job_create"
-        | "api_transfer_job_delete"
-        | "api_transfer_upload_commit"
-        | "api_fs_mkdir"
-        | "api_fs_write"
-        | "api_fs_rename"
-        | "api_fs_delete" => Some(PeerOperation::FilesystemWrite),
-        "api_display_bootstrap" | "api_display_webrtc_signal" | "api_displays" => {
-            Some(PeerOperation::DisplayView)
-        }
-        "api_display_input_authority_snapshot"
-        | "api_display_input_authority_request"
-        | "api_display_input_authority_release"
-        | "api_diagnostics_visual_freshness" => Some(PeerOperation::DisplayInput),
-        "api_control_msg" | "api_dashboard_action_msg" | "api_mcp_tool_call" => {
-            Some(PeerOperation::Message)
-        }
-        "api_settings" | "api_settings_save" | "api_key_status" | "api_api_keys_save"
-        | "api_project_root" => Some(PeerOperation::Settings),
-        "api_voice_session"
-        | "api_presence_video_frame"
-        | "api_media_annotation_attach"
-        | "api_media_annotation_submit"
-        | "api_media_clip_start"
-        | "api_media_clip_frame"
-        | "api_media_clip_end"
-        | "api_media_clip_cancel" => Some(PeerOperation::RuntimeControl),
-        "api_recordings" | "api_recording_asset" => Some(PeerOperation::RuntimeControl),
-        "api_browser_workspace_snapshot"
-        | "api_state_snapshot"
-        | "api_session_log_replay"
-        | "api_external_session_activity_replay"
-        | "api_dashboard_bootstrap"
-        | "api_managed_context_records"
-        | "api_managed_context_anchors"
-        | "api_managed_context_fission"
-        | "api_external_agents" => Some(PeerOperation::SessionInspect),
-        _ => None,
-    }
-}
-
 /// Paths a filesystem method touches, for scope checks and the audit trail.
 /// Rename is the two-legged case: removing the source and creating the
 /// destination are both writes, so both paths must clear the grant's scope.
@@ -2267,7 +2315,13 @@ fn authorize_dashboard_control_method(
     method: &str,
     params: Option<&serde_json::Value>,
 ) -> Result<(), String> {
-    let Some(op) = dashboard_control_method_operation(method) else {
+    // Fail closed: a method must be declared in `CONTROL_METHODS` to be
+    // callable at all — a dispatch arm added without a table row is denied
+    // here instead of shipping ungated.
+    let Some(spec) = control_method_spec(method) else {
+        return Err(format!("unknown dashboard-control method: {method}"));
+    };
+    let Some(op) = spec.op else {
         return Ok(());
     };
     let result = runtime_operation_decision(runtime, op)
@@ -2354,15 +2408,13 @@ fn authorize_dashboard_control_upload(
     runtime: &ControlRuntime,
     method: &str,
 ) -> Result<(), String> {
-    use crate::peer::access_policy::PeerOperation;
-    let op = match method {
-        "api_session_current_upload" => PeerOperation::SessionManage,
-        "api_transfer_upload_chunk" | "api_fs_write" => PeerOperation::FilesystemWrite,
-        "api_media_annotation_attach"
-        | "api_media_annotation_submit"
-        | "api_media_clip_frame"
-        | "api_presence_video_frame" => PeerOperation::RuntimeControl,
-        _ => return Err(format!("unknown upload method: {method}")),
+    // Fail closed twice over: the method must be declared upload-deliverable
+    // in `CONTROL_METHODS`, and upload methods are always operation-gated.
+    let Some(op) = control_method_spec(method)
+        .filter(|spec| spec.upload)
+        .and_then(|spec| spec.op)
+    else {
+        return Err(format!("unknown upload method: {method}"));
     };
     runtime_operation_decision(runtime, op)
         .ensure_allowed()
@@ -2421,7 +2473,7 @@ fn control_frame_response(
                 "protocol": CONTROL_PROTOCOL_VERSION,
                 "session_id": runtime.session_id,
                 "daemon_public_key": runtime.daemon_public_key,
-                "features": CONTROL_FEATURES,
+                "features": control_features(),
             }))
         }
         "ping" => Some(serde_json::json!({
@@ -4460,7 +4512,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         "created_unix_ms".to_string(),
         serde_json::json!(runtime.created_unix_ms),
     );
-    result.insert("features".to_string(), serde_json::json!(CONTROL_FEATURES));
+    result.insert("features".to_string(), serde_json::json!(control_features()));
     result.insert(
         "transport".to_string(),
         serde_json::json!("webrtc-datachannel"),
@@ -4514,10 +4566,6 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
     );
 
     let peer_registry_available = runtime.peer_registry.is_some();
-    let presence_read = runtime_allows_operation(
-        runtime,
-        crate::peer::access_policy::PeerOperation::PresenceRead,
-    );
     let session_inspect = runtime_allows_operation(
         runtime,
         crate::peer::access_policy::PeerOperation::SessionInspect,
@@ -4525,10 +4573,6 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
     let session_manage = runtime_allows_operation(
         runtime,
         crate::peer::access_policy::PeerOperation::SessionManage,
-    );
-    let fs_read = runtime_allows_operation(
-        runtime,
-        crate::peer::access_policy::PeerOperation::FilesystemRead,
     );
     let fs_write = runtime_allows_operation(
         runtime,
@@ -4538,16 +4582,10 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         runtime,
         crate::peer::access_policy::PeerOperation::TerminalView,
     );
-    let display_view = runtime_allows_operation(
-        runtime,
-        crate::peer::access_policy::PeerOperation::DisplayView,
-    );
     let display_input = runtime_allows_operation(
         runtime,
         crate::peer::access_policy::PeerOperation::DisplayInput,
     );
-    let settings =
-        runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Settings);
     let runtime_control = runtime_allows_operation(
         runtime,
         crate::peer::access_policy::PeerOperation::RuntimeControl,
@@ -4572,61 +4610,40 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::PeerUse);
     let message =
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Message);
+
+    // Every gated api_* method derives its `<method>_available` boolean from
+    // `CONTROL_METHODS`: operation granted && backing subsystem wired
+    // (`control_method_runtime_ready`). One boolean per advertised RPC lets
+    // the SPA distinguish "denied for this session" from "unsupported
+    // daemon" (feature list) without probing calls.
+    for spec in CONTROL_METHODS {
+        if !spec.name.starts_with("api_") {
+            continue;
+        }
+        let Some(op) = spec.op else { continue };
+        let available = runtime_allows_operation(runtime, op)
+            && control_method_runtime_ready(runtime, spec.name);
+        result.insert(
+            format!("{}_available", spec.name),
+            serde_json::json!(available),
+        );
+    }
+
+    // Operation aggregates, composite rollups, and frame-transport
+    // availability the SPA reads — none has a single backing method in
+    // `CONTROL_METHODS`, so they stay hand-written.
     let capabilities = [
         ("access_inspect_available", access_inspect),
         ("access_manage_available", access_manage),
         ("peer_inspect_available", peer_inspect),
         ("peer_manage_available", peer_manage),
         ("peer_use_available", peer_use),
-        (
-            "api_peers_available",
-            peer_registry_available && peer_inspect,
-        ),
-        ("api_access_overview_available", access_inspect),
-        ("api_access_iam_state_available", access_inspect),
-        ("api_access_enrollment_requests_available", access_inspect),
-        ("api_access_enrollment_decide_available", access_manage),
-        ("api_access_org_trust_available", access_manage),
-        ("api_access_org_revoke_available", access_manage),
-        ("api_access_org_issue_available", access_manage),
-        ("api_access_org_present_available", access_inspect),
-        ("api_access_org_revoke_member_available", access_manage),
-        ("api_access_org_issuer_init_available", access_manage),
-        ("api_access_org_issuer_delegate_available", access_manage),
-        ("api_access_org_issuer_install_available", access_manage),
-        ("api_access_org_orl_available", access_inspect),
-        // Derived from the method gate, not hard-coded: orl_apply is
-        // deliberately courierable by any session (the root signature is
-        // the authority), so its availability must track that rule.
-        (
-            "api_access_org_orl_apply_available",
-            dashboard_control_method_operation("api_access_org_orl_apply")
-                .map(|op| runtime_allows_operation(runtime, op))
-                .unwrap_or(false),
-        ),
-        ("api_access_org_renew_available", access_inspect),
-        (
-            "api_access_iam_upsert_user_client_grant_available",
-            access_manage,
-        ),
-        ("api_access_iam_update_grant_available", access_manage),
-        ("api_dashboard_targets_available", access_inspect),
-        ("api_agent_card_available", presence_read),
-        ("api_cached_bootstrap_events_available", session_inspect),
-        ("api_browser_workspace_snapshot_available", session_inspect),
-        ("api_state_snapshot_available", session_inspect),
-        ("api_display_bootstrap_available", display_view),
+        // The three display-input-authority methods roll up for the SPA's
+        // single input-authority readiness check.
         (
             "api_display_input_authority_available",
             runtime.display_authority.is_some() && display_input,
         ),
-        ("api_display_webrtc_signal_available", display_view),
-        ("api_session_log_replay_available", session_inspect),
-        (
-            "api_external_session_activity_replay_available",
-            session_inspect,
-        ),
-        ("api_dashboard_bootstrap_available", session_inspect),
         ("byte_streams_available", true),
         // Upload frames authorize per delivered method; the transport is
         // available as soon as any upload-capable operation is granted.
@@ -4642,94 +4659,8 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
             runtime.presence.is_some() && message,
         ),
         ("presence_tool_request_available", message),
-        ("api_presence_video_frame_available", runtime_control),
-        ("api_sessions_available", session_inspect),
-        ("api_sessions_stream_available", session_inspect),
-        ("api_session_detail_available", session_inspect),
-        ("api_session_report_available", session_inspect),
-        ("api_session_delete_available", session_manage),
-        ("api_session_agent_output_available", session_inspect),
-        ("api_session_current_agent_output_available", session_manage),
-        ("api_session_current_history_available", session_manage),
-        ("api_session_current_rollback_available", session_manage),
-        ("api_session_current_redo_available", session_manage),
-        ("api_session_current_prune_available", session_manage),
-        ("api_session_current_changes_available", session_manage),
-        ("api_session_context_snapshot_available", session_manage),
-        ("api_session_current_uploads_available", session_manage),
-        ("api_session_current_upload_available", session_manage),
-        ("api_session_current_upload_raw_available", session_manage),
-        (
-            "api_session_current_upload_delete_available",
-            session_manage,
-        ),
-        (
-            "api_transfer_jobs_available",
-            runtime.project_root.is_some() && fs_read,
-        ),
-        (
-            "api_transfer_job_create_available",
-            runtime.project_root.is_some() && fs_write,
-        ),
-        (
-            "api_transfer_job_delete_available",
-            runtime.project_root.is_some() && fs_write,
-        ),
-        (
-            "api_transfer_download_read_available",
-            runtime.project_root.is_some() && fs_read,
-        ),
-        (
-            "api_transfer_upload_chunk_available",
-            runtime.project_root.is_some() && fs_write,
-        ),
-        (
-            "api_transfer_upload_commit_available",
-            runtime.project_root.is_some() && fs_write,
-        ),
         ("api_media_editor_available", runtime_control),
-        ("api_media_annotation_attach_available", runtime_control),
-        ("api_media_annotation_submit_available", runtime_control),
-        ("api_media_clip_start_available", runtime_control),
-        ("api_media_clip_frame_available", runtime_control),
-        ("api_media_clip_end_available", runtime_control),
-        ("api_media_clip_cancel_available", runtime_control),
-        ("api_fs_stat_available", fs_read),
-        ("api_fs_list_available", fs_read),
-        ("api_fs_mkdir_available", fs_write),
-        ("api_fs_read_available", fs_read),
-        ("api_fs_write_available", fs_write),
-        ("api_fs_rename_available", fs_write),
-        ("api_fs_delete_available", fs_write),
-        ("api_sessions_search_available", session_inspect),
-        ("api_settings_available", settings),
-        (
-            "api_settings_save_available",
-            runtime.project_root.is_some() && settings,
-        ),
-        ("api_control_msg_available", message),
-        ("api_session_control_msg_available", session_manage),
-        ("api_dashboard_action_msg_available", message),
-        ("api_diagnostics_visual_freshness_available", display_input),
-        ("api_key_status_available", settings),
-        ("api_api_keys_save_available", settings),
-        ("api_voice_session_available", runtime_control),
-        ("api_project_root_available", settings),
-        ("api_displays_available", display_view),
-        ("api_recordings_available", runtime_control),
-        ("api_recording_asset_available", runtime_control),
-        ("api_session_recordings_available", session_inspect),
-        ("api_session_recording_asset_available", session_inspect),
-        ("api_session_frame_asset_available", session_inspect),
-        ("api_worktrees_available", session_inspect),
-        ("api_worktrees_inspect_available", session_inspect),
-        ("api_worktrees_scan_available", session_manage),
-        ("api_worktrees_remove_available", session_manage),
         ("api_managed_context_available", session_inspect),
-        (
-            "api_mcp_tool_call_available",
-            runtime.mcp_server.is_some() && message,
-        ),
         (
             "api_peer_mutations_available",
             peer_registry_available && peer_manage,
@@ -4740,32 +4671,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
             "api_peer_quick_controls_available",
             peer_registry_available && peer_use,
         ),
-        (
-            "api_peer_webrtc_signal_available",
-            peer_registry_available && peer_use,
-        ),
-        (
-            "api_peer_file_transfer_signal_available",
-            peer_registry_available && peer_use,
-        ),
-        (
-            "api_peer_dashboard_control_signal_available",
-            peer_registry_available && peer_use,
-        ),
         ("api_peer_pairing_available", peer_manage || access_manage),
-        ("api_peer_pairing_invite_available", access_manage),
-        ("api_peer_pairing_join_available", peer_manage),
-        ("api_peer_pairing_request_access_available", peer_manage),
-        ("api_peer_pairing_request_decision_available", access_manage),
-        (
-            "api_peer_pairing_requests_available",
-            access_inspect || access_manage,
-        ),
-        (
-            "api_peer_pairing_identities_available",
-            access_inspect || access_manage,
-        ),
-        ("api_peer_pairing_identity_revoke_available", access_manage),
         (
             "api_coordinator_available",
             peer_registry_available && peer_manage,
@@ -11287,6 +11193,11 @@ mod tests {
         );
     }
 
+    /// The operation a method's `CONTROL_METHODS` row declares.
+    fn method_operation(method: &str) -> Option<crate::peer::access_policy::PeerOperation> {
+        control_method_spec(method).and_then(|spec| spec.op)
+    }
+
     #[test]
     fn credential_lease_methods_sit_behind_credentials_manage() {
         use crate::peer::access_policy::PeerOperation;
@@ -11298,7 +11209,7 @@ mod tests {
             "api_credential_custody_trail",
         ] {
             assert_eq!(
-                dashboard_control_method_operation(method),
+                method_operation(method),
                 Some(PeerOperation::CredentialsManage),
                 "{method} must ride the credentials.manage gate"
             );
@@ -11318,6 +11229,89 @@ mod tests {
         rt.grant = DashboardControlGrant::TrustedLocal;
         assert!(
             authorize_dashboard_control_method(&rt, "api_credential_lease_grant", None).is_ok()
+        );
+    }
+
+    #[test]
+    fn control_method_table_is_coherent() {
+        let mut seen = HashSet::new();
+        for spec in CONTROL_METHODS {
+            assert!(
+                seen.insert(spec.name),
+                "duplicate method row: {}",
+                spec.name
+            );
+            assert!(
+                !spec.upload || spec.op.is_some(),
+                "upload method {} must be operation-gated",
+                spec.name
+            );
+        }
+        let features = control_features();
+        let unique: HashSet<_> = features.iter().collect();
+        assert_eq!(
+            unique.len(),
+            features.len(),
+            "wire features must not collide with method names"
+        );
+    }
+
+    #[test]
+    fn unknown_dashboard_control_methods_are_denied_fail_closed() {
+        let rt = runtime();
+        assert!(
+            authorize_dashboard_control_method(&rt, "api_added_without_table_row", None).is_err()
+        );
+        assert!(authorize_dashboard_control_upload(&rt, "api_added_without_table_row").is_err());
+        // Request methods are not upload-deliverable unless declared so.
+        assert!(authorize_dashboard_control_upload(&rt, "api_sessions").is_err());
+        // ping stays reachable for any bound session; declared upload
+        // methods authorize by their table operation.
+        assert!(authorize_dashboard_control_method(&rt, "ping", None).is_ok());
+        assert!(authorize_dashboard_control_upload(&rt, "api_fs_write").is_ok());
+    }
+
+    #[test]
+    fn status_advertises_an_availability_boolean_for_every_gated_api_method() {
+        let rt = runtime();
+        let status = status_response_frame("s1".to_string(), &rt);
+        for spec in CONTROL_METHODS {
+            if !spec.name.starts_with("api_") || spec.op.is_none() {
+                continue;
+            }
+            let key = format!("{}_available", spec.name);
+            assert!(
+                status["result"][&key].is_boolean(),
+                "status result missing {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn contract_pins_for_deliberate_method_gates() {
+        use crate::peer::access_policy::PeerOperation;
+        // ORL apply is courierable by any session — the root signature is
+        // the authority (see the table row comment).
+        assert_eq!(
+            method_operation("api_access_org_orl_apply"),
+            Some(PeerOperation::PresenceRead)
+        );
+        // Peer quick controls ride peer.use, not peer administration.
+        for method in ["api_peer_message", "api_peer_task", "api_peer_approval"] {
+            assert_eq!(
+                method_operation(method),
+                Some(PeerOperation::PeerUse),
+                "{method} must ride peer.use"
+            );
+        }
+        // Both delivery lanes of a dual-delivery method share one gate.
+        assert_eq!(
+            method_operation("api_fs_write"),
+            Some(PeerOperation::FilesystemWrite)
+        );
+        assert_eq!(
+            method_operation("api_transfer_upload_chunk"),
+            Some(PeerOperation::FilesystemWrite)
         );
     }
 

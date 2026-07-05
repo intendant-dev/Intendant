@@ -28,6 +28,15 @@ pub struct ToolBatchResult {
     /// Live audio spawn requests extracted from spawn_live_audio tool calls.
     /// Vec of (call_id, session_id, full_args_json).
     pub live_audio_spawns: Vec<(String, String, serde_json::Value)>,
+    /// Sub-agent spawn requests extracted from spawn_sub_agent tool calls.
+    /// Vec of (call_id, args).
+    pub sub_agent_spawns: Vec<(String, serde_json::Value)>,
+    /// Sub-agent wait requests extracted from wait_sub_agents tool calls.
+    /// Vec of (call_id, args).
+    pub sub_agent_waits: Vec<(String, serde_json::Value)>,
+    /// Structured results extracted from submit_result tool calls
+    /// (sub-agent sessions reporting to their parent). Vec of (call_id, args).
+    pub sub_agent_results: Vec<(String, serde_json::Value)>,
 }
 
 /// Assemble an AgentInput batch from individual tool calls.
@@ -44,6 +53,9 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
     let mut skill_invocations = Vec::new();
     let mut shared_view_calls = Vec::new();
     let mut live_audio_spawns = Vec::new();
+    let mut sub_agent_spawns = Vec::new();
+    let mut sub_agent_waits = Vec::new();
+    let mut sub_agent_results = Vec::new();
 
     for tc in tool_calls {
         call_id_names.push((tc.call_id.clone(), tc.name.clone()));
@@ -83,6 +95,21 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
                         .to_string();
                     live_audio_spawns.push((tc.call_id.clone(), session_id, args));
                 }
+            }
+            "spawn_sub_agent" => {
+                let args =
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or_default();
+                sub_agent_spawns.push((tc.call_id.clone(), args));
+            }
+            "wait_sub_agents" => {
+                let args =
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or_default();
+                sub_agent_waits.push((tc.call_id.clone(), args));
+            }
+            "submit_result" => {
+                let args =
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or_default();
+                sub_agent_results.push((tc.call_id.clone(), args));
             }
             "signal_done" => {
                 is_done = true;
@@ -148,6 +175,9 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
         skill_invocations,
         shared_view_calls,
         live_audio_spawns,
+        sub_agent_spawns,
+        sub_agent_waits,
+        sub_agent_results,
     }
 }
 
@@ -221,6 +251,9 @@ pub fn map_results_to_tool_responses(
             || tool_name == "invoke_skill"
             || tool_name == "shared_view"
             || tool_name == "spawn_live_audio"
+            || tool_name == "spawn_sub_agent"
+            || tool_name == "wait_sub_agents"
+            || tool_name == "submit_result"
         {
             results.push((call_id.clone(), tool_name.clone(), "OK".to_string()));
             continue;
@@ -247,6 +280,43 @@ pub fn map_results_to_tool_responses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assemble_batch_collects_sub_agent_calls() {
+        let calls = vec![
+            provider::ToolCall {
+                id: "call_1".to_string(),
+                call_id: "call_1".to_string(),
+                name: "spawn_sub_agent".to_string(),
+                arguments: r#"{"task":"研究 the schema","role":"research","worktree":true}"#
+                    .to_string(),
+            },
+            provider::ToolCall {
+                id: "call_2".to_string(),
+                call_id: "call_2".to_string(),
+                name: "wait_sub_agents".to_string(),
+                arguments: r#"{"mode":"any","timeout_secs":30}"#.to_string(),
+            },
+            provider::ToolCall {
+                id: "call_3".to_string(),
+                call_id: "call_3".to_string(),
+                name: "submit_result".to_string(),
+                arguments: r#"{"status":"completed","summary":"done"}"#.to_string(),
+            },
+        ];
+        let result = assemble_batch_from_tool_calls(&calls);
+        assert_eq!(result.sub_agent_spawns.len(), 1);
+        assert_eq!(result.sub_agent_spawns[0].0, "call_1");
+        assert_eq!(result.sub_agent_spawns[0].1["role"], "research");
+        assert_eq!(result.sub_agent_waits.len(), 1);
+        assert_eq!(result.sub_agent_waits[0].1["mode"], "any");
+        assert_eq!(result.sub_agent_results.len(), 1);
+        assert_eq!(result.sub_agent_results[0].1["summary"], "done");
+        assert!(
+            result.agent_input_json.is_none(),
+            "sub-agent tools are caller-handled and must not reach the runtime"
+        );
+    }
 
     #[test]
     fn assemble_batch_collects_shared_view_call() {
