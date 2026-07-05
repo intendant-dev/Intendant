@@ -3,6 +3,7 @@
 //! the internal-agent unification window opens.
 
 pub(crate) mod daemon;
+pub(crate) mod mcp_mode;
 pub(crate) mod peer_boot;
 pub(crate) mod web;
 
