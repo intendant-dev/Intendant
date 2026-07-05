@@ -167,6 +167,14 @@ export class PresenceWeb {
      */
     send_presence_checkpoint(summary: string): void;
     /**
+     * Answer the pending structured user question. `answers_json` is a
+     * `{question text → answer}` JSON object. Fallback sender for
+     * surfaces without session-scoped dispatch (Station); the main
+     * dashboard panel dispatches `answer_question` itself with a
+     * session id.
+     */
+    send_question_answers(answers_json: string): any;
+    /**
      * Send a raw JSON string through the server WebSocket.
      * Use this for transport-level messages (WebRTC signaling) that don't
      * need to go through the WASM state machine or serde conversion.
@@ -391,6 +399,7 @@ export interface InitOutput {
     readonly presenceweb_send_key: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly presenceweb_send_make_active: (a: number) => number;
     readonly presenceweb_send_presence_checkpoint: (a: number, b: number, c: number) => void;
+    readonly presenceweb_send_question_answers: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_raw: (a: number, b: number, c: number) => number;
     readonly presenceweb_send_resize: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_server_action: (a: number, b: any) => void;
@@ -445,9 +454,9 @@ export interface InitOutput {
     readonly wasmpresence_phase: (a: number) => [number, number];
     readonly wasmpresence_set_state: (a: number, b: any) => void;
     readonly wasmpresence_update_from_event: (a: number, b: any) => any;
-    readonly wasm_bindgen__closure__destroy__h2bbc3efb9fa169ba: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h60cc6b2ac5050cb0: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hae6cb4f6677cde4f: (a: number, b: number) => void;
+    readonly wasm_bindgen__closure__destroy__h28a9a63aa3ddc246: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h03ee4e0dc48c1851: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__ha5d8664ce0aa7add: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

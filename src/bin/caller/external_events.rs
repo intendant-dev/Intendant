@@ -1674,6 +1674,24 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     }
                 } else {
                     let id = approval_counter.fetch_add(1, Ordering::Relaxed);
+                    // Arm the responder BEFORE announcing the approval: a
+                    // frontend that reacts to the event instantly (scripted
+                    // control-socket clients) must find the registry entry,
+                    // or its response is dropped as "not pending".
+                    let rx = if let Some(slot) = config.json_approval {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        {
+                            let mut guard = slot.lock().unwrap();
+                            *guard = Some((id, tx));
+                        }
+                        rx
+                    } else {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        {
+                            config.approval_registry.lock().unwrap().insert(id, tx);
+                        }
+                        rx
+                    };
                     config.bus.send(AppEvent::ApprovalRequired {
                         session_id: config.session_id.clone(),
                         id,
@@ -1693,21 +1711,6 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         format!("Awaiting approval: {}", approval_status_preview),
                     )
                     .await;
-
-                    let rx = if let Some(slot) = config.json_approval {
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        {
-                            let mut guard = slot.lock().unwrap();
-                            *guard = Some((id, tx));
-                        }
-                        rx
-                    } else {
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        {
-                            config.approval_registry.lock().unwrap().insert(id, tx);
-                        }
-                        rx
-                    };
 
                     match rx.await {
                         Ok(response) => {
@@ -1730,6 +1733,11 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                 }
                                 event::ApprovalResponse::Skip => {
                                     (external_agent::ApprovalDecision::Cancel, "skip")
+                                }
+                                // Answer targets question prompts; a command
+                                // approval receiving one fails closed.
+                                event::ApprovalResponse::Answer { .. } => {
+                                    (external_agent::ApprovalDecision::Decline, "deny")
                                 }
                             };
                             config.bus.send(AppEvent::ApprovalResolved {
@@ -1769,6 +1777,171 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         stats.turns,
                         "running",
                         "Approval resolved — continuing".to_string(),
+                    )
+                    .await;
+                }
+            }
+            external_agent::AgentEvent::UserQuestionRequest {
+                request_id,
+                questions,
+            } => {
+                emit_external_context_snapshot_if_changed(
+                    agent,
+                    config,
+                    external_context_snapshot_turn(stats),
+                    &mut context_snapshot_state,
+                )
+                .await;
+                let preview = user_question_preview(&questions);
+                // A question is a request for *input*, not permission:
+                // autonomy policy, per-category rules, and a session-wide
+                // approve-all grant never auto-resolve it. The only automatic
+                // path is headless-without-frontends, where nobody can
+                // answer — tell the model that instead of blocking forever.
+                if config.headless && config.json_approval.is_none() && config.web_port.is_none() {
+                    let content = format!("No user available to answer: {}", preview);
+                    slog(config.session_log, |l| l.warn(&content));
+                    config.bus.send(AppEvent::LogEntry {
+                        session_id: config.session_id.clone(),
+                        level: "warn".to_string(),
+                        source: external_agent_log_source(config.agent_source.as_deref()),
+                        content,
+                        turn: None,
+                    });
+                    let answers = unanswered_question_answers(
+                        &questions,
+                        "No user is connected to answer right now. Proceed using your \
+                         best judgment based on the context so far; you can re-ask \
+                         later if it is still relevant.",
+                    );
+                    if let Err(e) = agent.resolve_user_question(&request_id, &answers).await {
+                        slog(config.session_log, |l| {
+                            l.warn(&format!("Failed to answer question: {}", e))
+                        });
+                    }
+                } else {
+                    let id = approval_counter.fetch_add(1, Ordering::Relaxed);
+                    // Arm the responder BEFORE announcing the question (same
+                    // race as approvals: an instant answer must find the
+                    // registry entry).
+                    let rx = if let Some(slot) = config.json_approval {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        {
+                            let mut guard = slot.lock().unwrap();
+                            *guard = Some((id, tx));
+                        }
+                        rx
+                    } else {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        {
+                            config.approval_registry.lock().unwrap().insert(id, tx);
+                        }
+                        rx
+                    };
+                    config.bus.send(AppEvent::UserQuestionRequired {
+                        session_id: config.session_id.clone(),
+                        id,
+                        questions: questions.clone(),
+                    });
+                    slog(config.session_log, |l| {
+                        l.info(&format!("Question for the user: {}", preview))
+                    });
+                    let status_preview: String = preview.chars().take(80).collect();
+                    emit_external_turn_status(
+                        config.bus,
+                        &config.autonomy,
+                        config.session_id.as_deref(),
+                        stats.turns,
+                        "waiting_human",
+                        format!("Awaiting answer: {}", status_preview),
+                    )
+                    .await;
+
+                    match rx.await {
+                        Ok(response) => {
+                            let (action_str, result) = match response {
+                                event::ApprovalResponse::Answer { answers } => (
+                                    "answer",
+                                    agent.resolve_user_question(&request_id, &answers).await,
+                                ),
+                                // A bare approve comes from callers that only
+                                // speak the approval verbs (control socket,
+                                // MCP). It can't carry a choice — let the
+                                // model proceed on its own judgment rather
+                                // than fabricating one. ApproveAll on a
+                                // question deliberately does NOT arm the
+                                // session-wide grant: answering a question
+                                // must never widen command autonomy.
+                                event::ApprovalResponse::Approve
+                                | event::ApprovalResponse::ApproveAll => {
+                                    let answers = unanswered_question_answers(
+                                        &questions,
+                                        "The supervisor let this question through without \
+                                         selecting an option. Proceed using your best \
+                                         judgment.",
+                                    );
+                                    (
+                                        "approve",
+                                        agent.resolve_user_question(&request_id, &answers).await,
+                                    )
+                                }
+                                // Both dismissals map to a plain decline —
+                                // never Cancel, which would abort the whole
+                                // turn over an unanswered question.
+                                event::ApprovalResponse::Deny => (
+                                    "deny",
+                                    agent
+                                        .resolve_approval(
+                                            &request_id,
+                                            external_agent::ApprovalDecision::Decline,
+                                        )
+                                        .await,
+                                ),
+                                event::ApprovalResponse::Skip => (
+                                    "skip",
+                                    agent
+                                        .resolve_approval(
+                                            &request_id,
+                                            external_agent::ApprovalDecision::Decline,
+                                        )
+                                        .await,
+                                ),
+                            };
+                            config.bus.send(AppEvent::ApprovalResolved {
+                                session_id: config.session_id.clone(),
+                                id,
+                                action: action_str.to_string(),
+                            });
+                            if let Err(e) = result {
+                                slog(config.session_log, |l| {
+                                    l.warn(&format!("Failed to resolve question: {}", e))
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            slog(config.session_log, |l| {
+                                l.warn("Question channel closed, dismissing")
+                            });
+                            if let Err(e) = agent
+                                .resolve_approval(
+                                    &request_id,
+                                    external_agent::ApprovalDecision::Decline,
+                                )
+                                .await
+                            {
+                                slog(config.session_log, |l| {
+                                    l.warn(&format!("Failed to resolve question: {}", e))
+                                });
+                            }
+                        }
+                    }
+                    emit_external_turn_status(
+                        config.bus,
+                        &config.autonomy,
+                        config.session_id.as_deref(),
+                        stats.turns,
+                        "running",
+                        "Question resolved — continuing".to_string(),
                     )
                     .await;
                 }
@@ -1836,13 +2009,8 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     }
                 } else {
                     let id = approval_counter.fetch_add(1, Ordering::Relaxed);
-                    config.bus.send(AppEvent::ApprovalRequired {
-                        session_id: config.session_id.clone(),
-                        id,
-                        command_preview: format!("{}\n{}", preview, diff),
-                        category: cat,
-                    });
-
+                    // Arm the responder BEFORE announcing (same race as the
+                    // command-approval arm above).
                     let rx = if let Some(slot) = config.json_approval {
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         {
@@ -1857,6 +2025,12 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         }
                         rx
                     };
+                    config.bus.send(AppEvent::ApprovalRequired {
+                        session_id: config.session_id.clone(),
+                        id,
+                        command_preview: format!("{}\n{}", preview, diff),
+                        category: cat,
+                    });
 
                     match rx.await {
                         Ok(response) => {
@@ -1879,6 +2053,11 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                 }
                                 event::ApprovalResponse::Skip => {
                                     (external_agent::ApprovalDecision::Cancel, "skip")
+                                }
+                                // Answer targets question prompts; a command
+                                // approval receiving one fails closed.
+                                event::ApprovalResponse::Answer { .. } => {
+                                    (external_agent::ApprovalDecision::Decline, "deny")
                                 }
                             };
                             config.bus.send(AppEvent::ApprovalResolved {

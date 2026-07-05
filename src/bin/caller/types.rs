@@ -213,6 +213,33 @@ pub struct SharedViewRegion {
     pub height: f64,
 }
 
+/// One selectable option of a [`UserQuestion`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionOption {
+    pub label: String,
+    /// What choosing this option means. May be empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// One question an agent asks the human, with structured choices
+/// (Claude Code's `AskUserQuestion` shape). Unlike an approval this is a
+/// request for *input*, not permission: it is never auto-approved, and the
+/// reply carries the chosen answer back to the backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestion {
+    pub question: String,
+    /// Very short topic chip (e.g. "Auth method"). May be empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub header: String,
+    /// Offered choices. Free-text answers are always allowed on top.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<UserQuestionOption>,
+    /// Multiple options may be selected (answers join with ", ").
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
 /// Events sent to connected control socket clients, web gateway, and MCP.
 ///
 /// Also deserialized by `crate::peer::upcast::OutboundEventUpcaster`
@@ -248,6 +275,15 @@ pub enum OutboundEvent {
         session_id: Option<String>,
         id: u64,
         command: String,
+    },
+    /// The agent asks the human structured question(s) and blocks until
+    /// answered via `{"action":"answer_question","id":…,"answers":{…}}`
+    /// (or dismissed via deny/skip on the same id).
+    UserQuestion {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: u64,
+        questions: Vec<UserQuestion>,
     },
     AskHuman {
         question: String,

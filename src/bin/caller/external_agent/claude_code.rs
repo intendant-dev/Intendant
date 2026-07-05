@@ -45,6 +45,11 @@ pub const CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER: &str = "### Intendant Supervisi
 /// Claude models currently ship a 200k context window; the authoritative
 /// value arrives with the first `result` message's `modelUsage` map and
 /// replaces this default.
+/// Assumed context window until the first turn `result` reveals the real
+/// one (`modelUsage.<model>.contextWindow`). Known residual: on a resumed
+/// session whose model has a larger window (1M-beta) and >200k tokens on
+/// board, the FIRST turn's mid-turn meter divides by this default and can
+/// read >100% until that first result corrects it.
 const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 
 /// Placeholder thread id used until Claude Code reveals the native session
@@ -250,6 +255,98 @@ fn approval_category_for_tool(tool_name: &str) -> ApprovalCategory {
         name if name.starts_with("mcp__") => ApprovalCategory::McpTool,
         _ => ApprovalCategory::CommandExecution,
     }
+}
+
+/// Parse an `AskUserQuestion` tool input into structured questions.
+///
+/// Returns `None` when the input doesn't carry at least one question with
+/// text, so a malformed call degrades to the generic approval prompt
+/// instead of being dropped.
+fn parse_user_questions(input: &serde_json::Value) -> Option<Vec<crate::types::UserQuestion>> {
+    let questions: Vec<crate::types::UserQuestion> = input
+        .get("questions")?
+        .as_array()?
+        .iter()
+        .filter_map(|q| {
+            let text = q.get("question")?.as_str()?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let options = q
+                .get("options")
+                .and_then(|o| o.as_array())
+                .map(|opts| {
+                    opts.iter()
+                        .filter_map(|opt| {
+                            // The schema says `{label, description}`, but older
+                            // CLIs sent plain strings — accept both.
+                            let (label, description) = match opt {
+                                serde_json::Value::String(s) => (s.trim(), ""),
+                                _ => (
+                                    opt.get("label").and_then(|l| l.as_str())?.trim(),
+                                    opt.get("description")
+                                        .and_then(|d| d.as_str())
+                                        .unwrap_or(""),
+                                ),
+                            };
+                            if label.is_empty() {
+                                return None;
+                            }
+                            Some(crate::types::UserQuestionOption {
+                                label: label.to_string(),
+                                description: description.trim().to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(crate::types::UserQuestion {
+                question: text.to_string(),
+                header: q
+                    .get("header")
+                    .and_then(|h| h.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                options,
+                multi_select: q
+                    .get("multiSelect")
+                    .and_then(|m| m.as_bool())
+                    .unwrap_or(false),
+            })
+        })
+        .collect();
+    if questions.is_empty() {
+        None
+    } else {
+        Some(questions)
+    }
+}
+
+/// PermissionResult payload answering an `AskUserQuestion` request with the
+/// human's answers. Echoes the original input (Claude Code validates
+/// `updatedInput` against the tool's strict schema — only `questions`,
+/// `answers`, `annotations`, `metadata` are legal keys) and adds
+/// `answers: {question text → answer}`, exactly what the CLI's own
+/// interactive picker returns.
+fn question_answer_payload(
+    pending: &PendingCcApproval,
+    answers: &std::collections::HashMap<String, String>,
+) -> serde_json::Value {
+    let mut updated = pending.tool_input.clone();
+    if !updated.is_object() {
+        updated = serde_json::json!({});
+    }
+    if let Some(obj) = updated.as_object_mut() {
+        obj.insert(
+            "answers".into(),
+            serde_json::to_value(answers).unwrap_or_else(|_| serde_json::json!({})),
+        );
+    }
+    serde_json::json!({
+        "behavior": "allow",
+        "updatedInput": updated,
+    })
 }
 
 /// Extract the `addRules`/allow suggestions from a `can_use_tool` request,
@@ -550,6 +647,12 @@ struct CcReader {
     /// Most recent model name seen (init message / message_start).
     model: String,
     context_window: u64,
+    /// Raw usage of the turn's most recent API call (`message_delta`).
+    /// The turn `result`'s own usage SUMS every call in the turn — spend,
+    /// not footprint — so the end-of-turn context meter re-emits this
+    /// last-call usage instead (a multi-call turn's summed usage exceeds
+    /// the context window and read as >100%).
+    last_call_usage: Option<serde_json::Value>,
     last_intendant_mcp_status: Option<String>,
     init_logged: bool,
     announced_session_id: Option<String>,
@@ -573,6 +676,7 @@ impl CcReader {
             limit_windows: std::collections::BTreeMap::new(),
             model: "claude".to_string(),
             context_window: DEFAULT_CONTEXT_WINDOW,
+            last_call_usage: None,
             last_intendant_mcp_status: None,
             init_logged: false,
             announced_session_id: None,
@@ -1230,6 +1334,7 @@ impl CcReader {
                     if let Some(mut snapshot) =
                         usage_snapshot_from_api_usage(usage, &self.model, self.context_window)
                     {
+                        self.last_call_usage = Some(usage.clone());
                         snapshot.limits = self.current_limit_windows();
                         out.events.push(AgentEvent::Usage { usage: snapshot });
                     }
@@ -1261,8 +1366,11 @@ impl CcReader {
             );
             return;
         }
+        let last_call_usage = self.last_call_usage.take();
         if let Some(usage) = msg.get("usage") {
             // Goal-budget currency: fresh work only (cache reads excluded).
+            // The result usage SUMS every API call in the turn — exactly
+            // right for spend accounting.
             let fresh: u64 = [
                 "input_tokens",
                 "cache_creation_input_tokens",
@@ -1276,8 +1384,15 @@ impl CcReader {
                     .cumulative_fresh_tokens
                     .fetch_add(fresh, Ordering::Relaxed);
             }
+            // Context meter: the summed turn usage is NOT a footprint — a
+            // multi-call turn sums past the context window and reads >100%.
+            // Re-emit the turn's LAST per-call usage instead (now against
+            // the window this result just corrected); fall back to the
+            // result usage only when no per-call usage was streamed (then
+            // the turn had a single call and the sum IS that call).
+            let meter_usage = last_call_usage.as_ref().unwrap_or(usage);
             if let Some(mut snapshot) =
-                usage_snapshot_from_api_usage(usage, &self.model, self.context_window)
+                usage_snapshot_from_api_usage(meter_usage, &self.model, self.context_window)
             {
                 snapshot.limits = self.current_limit_windows();
                 out.events.push(AgentEvent::Usage { usage: snapshot });
@@ -1359,6 +1474,17 @@ impl CcReader {
                 .unwrap_or("unknown")
                 .to_string();
             let input = request.get("input").cloned().unwrap_or_default();
+
+            // AskUserQuestion is not a permission request — it's the model
+            // asking the human something, with the answer riding back on
+            // `updatedInput.answers`. Surface it as a structured question
+            // (a malformed input falls through to the generic approval so
+            // the request is never dropped on the floor).
+            let questions = if tool_name == "AskUserQuestion" {
+                parse_user_questions(&input)
+            } else {
+                None
+            };
             let preview = tool_input_preview(&input);
 
             self.approval_counter += 1;
@@ -1373,10 +1499,16 @@ impl CcReader {
                 },
             );
 
-            out.events.push(AgentEvent::ApprovalRequest {
-                request_id: our_id,
-                command: format!("{}: {}", tool_name, preview),
-                category: approval_category_for_tool(&tool_name),
+            out.events.push(match questions {
+                Some(questions) => AgentEvent::UserQuestionRequest {
+                    request_id: our_id,
+                    questions,
+                },
+                None => AgentEvent::ApprovalRequest {
+                    request_id: our_id,
+                    command: format!("{}: {}", tool_name, preview),
+                    category: approval_category_for_tool(&tool_name),
+                },
             });
         } else {
             // Fail closed: never auto-approve a control request Intendant
@@ -2123,6 +2255,35 @@ impl ExternalAgent for ClaudeCodeAgent {
         self.write_line(&line).await
     }
 
+    async fn resolve_user_question(
+        &mut self,
+        request_id: &str,
+        answers: &std::collections::HashMap<String, String>,
+    ) -> Result<(), CallerError> {
+        let pending = {
+            let mut map = lock_pending(&self.pending_approvals);
+            map.remove(request_id).ok_or_else(|| {
+                CallerError::ExternalAgent(format!(
+                    "No pending question for request_id '{}'",
+                    request_id
+                ))
+            })?
+        };
+
+        let response = CcControlResponse {
+            msg_type: "control_response".into(),
+            response: CcControlResponseInner {
+                subtype: "success".into(),
+                request_id: pending.cc_request_id.clone(),
+                response: Some(question_answer_payload(&pending, answers)),
+                error: None,
+            },
+        };
+
+        let line = serde_json::to_string(&response)?;
+        self.write_line(&line).await
+    }
+
     async fn shutdown(&mut self) -> Result<(), CallerError> {
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
@@ -2566,6 +2727,56 @@ mod tests {
             .expect("usage event");
         assert_eq!(usage.context_window, 150_000);
         assert_eq!(reader.context_window, 150_000);
+    }
+
+    #[test]
+    fn result_meter_uses_last_call_usage_not_turn_sum() {
+        // The result's usage sums every API call in the turn; a multi-call
+        // turn sums past the context window and the meter read >100%
+        // (the live 104.4% sighting: a 4-call turn summed 208,720 against
+        // a 200k window). The meter must re-emit the LAST call's usage.
+        let mut reader = test_reader();
+        // Two API calls stream their per-call usage.
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"input_tokens":10,"cache_read_input_tokens":90000,"output_tokens":500}},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"input_tokens":20,"cache_read_input_tokens":95000,"output_tokens":700}},"session_id":"s1"}"#,
+        );
+        // The result sums both calls (185,000+ tokens ≈ 92% — but a longer
+        // turn would exceed 100%); the meter must report the last call.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","result":"done","session_id":"s1","usage":{"input_tokens":30,"cache_read_input_tokens":185000,"output_tokens":1200},"modelUsage":{"claude":{"contextWindow":200000}}}"#,
+        );
+        let usage = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Usage { usage } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.tokens_used, 20 + 95000 + 700);
+        assert!(usage.usage_pct < 100.0);
+        // Spend accounting still books the result's summed fresh tokens
+        // (input + cache_creation + output; deltas don't feed the budget).
+        assert_eq!(reader.shared.fresh_tokens(), 30 + 1200);
+
+        // Next turn: a single-call turn with no streamed deltas falls back
+        // to the result usage (the sum IS the single call) — the previous
+        // turn's last-call usage must not leak.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","result":"done","session_id":"s1","usage":{"input_tokens":5,"cache_read_input_tokens":96000,"output_tokens":100}}"#,
+        );
+        let usage = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Usage { usage } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.tokens_used, 5 + 96000 + 100);
     }
 
     #[test]
@@ -3172,6 +3383,100 @@ mod tests {
         assert_eq!(pending.tool_input["command"], "echo hi > f.txt");
         assert_eq!(pending.session_rules.len(), 1);
         assert_eq!(pending.session_rules[0]["destination"], "session");
+    }
+
+    #[test]
+    fn reader_ask_user_question_surfaces_structured_questions() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"control_request","request_id":"cc-q1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Which DB?","header":"Database","multiSelect":false,"options":[{"label":"PostgreSQL","description":"Relational"},{"label":"SQLite","description":"Embedded"}]}]}},"session_id":"s1"}"#,
+        );
+        let request_id = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::UserQuestionRequest {
+                    request_id,
+                    questions,
+                } => {
+                    assert_eq!(questions.len(), 1);
+                    assert_eq!(questions[0].question, "Which DB?");
+                    assert_eq!(questions[0].header, "Database");
+                    assert!(!questions[0].multi_select);
+                    assert_eq!(questions[0].options.len(), 2);
+                    assert_eq!(questions[0].options[0].label, "PostgreSQL");
+                    assert_eq!(questions[0].options[0].description, "Relational");
+                    Some(request_id.clone())
+                }
+                _ => None,
+            })
+            .expect("user question event");
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ApprovalRequest { .. })),
+            "a parsed question must not double-emit as an approval"
+        );
+        let map = lock_pending(&reader.pending_approvals);
+        let pending = map.get(&request_id).expect("pending entry stored");
+        assert_eq!(pending.cc_request_id, "cc-q1");
+    }
+
+    #[test]
+    fn reader_malformed_ask_user_question_degrades_to_approval() {
+        // No parsable questions → the request must still surface (as the
+        // generic approval prompt), never be dropped.
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"control_request","request_id":"cc-q2","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[]}},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ApprovalRequest { command, .. } if command.starts_with("AskUserQuestion")
+        )));
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UserQuestionRequest { .. })));
+    }
+
+    #[test]
+    fn parse_user_questions_accepts_plain_string_options() {
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "Pick one",
+                "options": ["alpha", "beta"],
+                "multiSelect": true
+            }]
+        });
+        let questions = parse_user_questions(&input).expect("parsed");
+        assert_eq!(questions[0].options.len(), 2);
+        assert_eq!(questions[0].options[0].label, "alpha");
+        assert_eq!(questions[0].options[0].description, "");
+        assert!(questions[0].multi_select);
+        assert_eq!(questions[0].header, "");
+    }
+
+    #[test]
+    fn question_answer_payload_echoes_input_and_adds_answers() {
+        let pending = PendingCcApproval {
+            cc_request_id: "cc-q1".into(),
+            tool_input: serde_json::json!({
+                "questions": [{"question": "Which DB?", "options": []}]
+            }),
+            session_rules: Vec::new(),
+        };
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("Which DB?".to_string(), "PostgreSQL".to_string());
+        let payload = question_answer_payload(&pending, &answers);
+        assert_eq!(payload["behavior"], "allow");
+        // The original input must survive (CC validates updatedInput against
+        // the tool schema) with the answers grafted on.
+        assert_eq!(
+            payload["updatedInput"]["questions"][0]["question"],
+            "Which DB?"
+        );
+        assert_eq!(payload["updatedInput"]["answers"]["Which DB?"], "PostgreSQL");
     }
 
     #[test]

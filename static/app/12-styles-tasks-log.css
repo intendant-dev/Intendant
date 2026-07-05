@@ -2377,6 +2377,82 @@ body.context-focus-active {
 .approval-actions button.deny { border-color: var(--red); color: var(--red); }
 .approval-actions button.deny:hover { background: rgba(243, 139, 168, 0.12); }
 
+/* Structured user question — blue-tinted sibling of the approval card
+   (a question is a request for input, not permission) */
+#question-panel {
+  border-top: none;
+  background: transparent;
+}
+#question-panel .panel-body { padding: 8px 12px; }
+#question-panel .approval-card {
+  background: rgba(137, 180, 250, 0.10);
+  border-color: rgba(137, 180, 250, 0.4);
+}
+.question-block { margin-bottom: 10px; }
+.question-block:last-of-type { margin-bottom: 0; }
+.question-header-chip {
+  display: inline-block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--subtext0);
+  background: var(--surface0);
+  border-radius: 999px;
+  padding: 2px 8px;
+  margin-bottom: 4px;
+}
+.question-text {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--blue);
+  margin-bottom: 6px;
+}
+.question-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.question-option {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.question-option:hover { background: var(--surface1); border-color: var(--overlay0); }
+.question-option.selected {
+  border-color: var(--blue);
+  background: rgba(137, 180, 250, 0.14);
+}
+.question-option .question-option-label { font-weight: 600; white-space: nowrap; }
+.question-option .question-option-desc {
+  color: var(--subtext0);
+  font-size: 11px;
+  min-width: 0;
+}
+.question-free-text {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--mantle);
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  margin-bottom: 6px;
+  box-sizing: border-box;
+}
+.question-free-text:focus { border-color: var(--blue); outline: none; }
+
 /* Input / Follow-up */
 .input-question {
   padding: 4px 0 8px;

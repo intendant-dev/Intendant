@@ -906,6 +906,15 @@ pub enum AgentEvent {
         path: String,
         diff: String,
     },
+    /// The agent asks the human structured question(s) — Claude Code's
+    /// `AskUserQuestion` tool. Not a permission: the drain must surface it
+    /// to the user regardless of autonomy policy and deliver the reply via
+    /// [`ExternalAgent::resolve_user_question`] (or dismiss it via
+    /// [`ExternalAgent::resolve_approval`] with `Decline`).
+    UserQuestionRequest {
+        request_id: String,
+        questions: Vec<crate::types::UserQuestion>,
+    },
     /// The agent's turn is complete.
     TurnCompleted { message: Option<String> },
     /// A diff of files changed so far.
@@ -1285,6 +1294,22 @@ pub trait ExternalAgent: Send + Sync {
         request_id: &str,
         decision: ApprovalDecision,
     ) -> Result<(), CallerError>;
+
+    /// Deliver the human's answers for a pending
+    /// [`AgentEvent::UserQuestionRequest`]: question text → chosen option
+    /// label(s) (multi-select joined with ", ") or free text. Only backends
+    /// that emit question events implement this; the default rejects so a
+    /// misrouted answer can never silently approve anything.
+    async fn resolve_user_question(
+        &mut self,
+        request_id: &str,
+        answers: &std::collections::HashMap<String, String>,
+    ) -> Result<(), CallerError> {
+        let _ = (request_id, answers);
+        Err(CallerError::ExternalAgent(
+            "user-question answers not supported by this backend".into(),
+        ))
+    }
 
     /// Request interruption of the current turn. Default implementation is a no-op
     /// for backends that don't support mid-turn interruption.

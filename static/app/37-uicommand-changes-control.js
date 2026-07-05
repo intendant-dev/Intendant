@@ -58,6 +58,7 @@ function processCommands(cmds) {
       }
       case 'show_approval': showApproval(c.id, c.command, c.category, c.session_id); break;
       case 'hide_approval': clearPendingApproval(); hidePanel('approval-panel'); break;
+      case 'show_user_question': showUserQuestion(c.id, c.questions, c.session_id); break;
       case 'show_human_input': showHumanInput(c.question); break;
       case 'hide_human_input': hidePanel('human-panel'); break;
       case 'hide_all_panels': hideAllPanels(); break;

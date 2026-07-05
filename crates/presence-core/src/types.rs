@@ -173,6 +173,12 @@ pub struct AgentStateSnapshot {
     /// Cleared when the approval is resolved (agent starts running).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<PendingApprovalSnapshot>,
+    /// Pending structured user question (set when phase is
+    /// "waiting_human" because of a `user_question` prompt). Cleared when
+    /// answered/dismissed. Lets a late-joining browser re-render the
+    /// question panel — questions routinely outlive page loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_question: Option<PendingQuestionSnapshot>,
     /// Full result text from the last completed task (available via `query_detail` scope `task_result`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_task_result: Option<String>,
@@ -189,6 +195,16 @@ pub struct PendingApprovalSnapshot {
     pub id: u64,
     pub command_preview: String,
     pub category: String,
+}
+
+/// Serializable snapshot of a pending structured user question.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingQuestionSnapshot {
+    pub id: u64,
+    /// Raw `UserQuestion[]` JSON exactly as sent on the `user_question`
+    /// event ({question, header, options: [{label, description}],
+    /// multi_select}).
+    pub questions: serde_json::Value,
 }
 
 impl AgentStateSnapshot {
@@ -260,6 +276,32 @@ impl AgentStateSnapshot {
             }
             "ask_human" => {
                 let question = event["question"].as_str().unwrap_or("").to_string();
+                self.phase = "waiting_human".to_string();
+                Some(PresenceEvent::HumanQuestion { question })
+            }
+            "user_question" => {
+                // Structured question (options ride the payload); narrate the
+                // first question with its option labels so voice presence can
+                // read the choices out.
+                let questions = event["questions"].as_array();
+                let first = questions.and_then(|qs| qs.first());
+                let mut question = first
+                    .and_then(|q| q["question"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if let Some(options) = first.and_then(|q| q["options"].as_array()) {
+                    let labels: Vec<&str> = options
+                        .iter()
+                        .filter_map(|o| o["label"].as_str())
+                        .collect();
+                    if !labels.is_empty() {
+                        question.push_str(&format!(" ({})", labels.join(" / ")));
+                    }
+                }
+                let extra = questions.map(|qs| qs.len().saturating_sub(1)).unwrap_or(0);
+                if extra > 0 {
+                    question.push_str(&format!(" [+{} more]", extra));
+                }
                 self.phase = "waiting_human".to_string();
                 Some(PresenceEvent::HumanQuestion { question })
             }

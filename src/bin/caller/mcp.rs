@@ -4022,6 +4022,32 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_APPROVAL_URI)
         }
+        ControlMsg::AnswerQuestion { id, answers, .. } => {
+            // MCP mode has no question panel of its own; deliver the
+            // structured answers straight to whichever waiter registered
+            // this id (question prompts share the approval registry).
+            let mut s = state.write().await;
+            resolve_approval(
+                &s.approval_registry,
+                id,
+                ApprovalResponse::Answer { answers },
+            );
+            s.set_phase(Phase::RunningAgent);
+            s.push_log(LogLevel::Info, "Question answered by MCP agent".to_string());
+            bus.send(AppEvent::ApprovalResolved {
+                session_id: None,
+                id,
+                action: "answer".to_string(),
+            });
+            emit_control_result(
+                control_tx,
+                "answer_question",
+                true,
+                "answers delivered".to_string(),
+                None,
+            );
+            Some(RESOURCE_APPROVAL_URI)
+        }
         ControlMsg::Input { text } => {
             let mut s = state.write().await;
             let outcome = process_action_sync(&mut s, UserAction::RespondHuman { text });
@@ -5762,6 +5788,34 @@ pub fn spawn_event_listener(
                             category: category.to_string(),
                         });
                         resource_changed = Some("intendant://pending-approval");
+                    }
+
+                    // Questions carry structured options MCP tools can't
+                    // render yet; log them (with the id an `answer_question`
+                    // control command needs) without arming the
+                    // pending-approval slot — approve/deny must not look
+                    // like valid replies.
+                    AppEvent::UserQuestionRequired {
+                        ref session_id,
+                        id,
+                        ref questions,
+                    } => {
+                        s.set_phase(Phase::WaitingHuman);
+                        s.note_session_phase(
+                            session_id.as_deref(),
+                            None,
+                            Phase::WaitingHuman,
+                            None,
+                        );
+                        s.push_log(
+                            LogLevel::Info,
+                            format!(
+                                "Question for the user (id {}): {}",
+                                id,
+                                crate::external_output::user_question_preview(questions)
+                            ),
+                        );
+                        resource_changed = Some("intendant://logs");
                     }
 
                     AppEvent::DisplayReady { display_id, .. } => {

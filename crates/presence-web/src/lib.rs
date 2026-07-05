@@ -1299,6 +1299,27 @@ mod wasm_impl {
             to_js(&cmds)
         }
 
+        /// Answer the pending structured user question. `answers_json` is a
+        /// `{question text → answer}` JSON object. Fallback sender for
+        /// surfaces without session-scoped dispatch (Station); the main
+        /// dashboard panel dispatches `answer_question` itself with a
+        /// session id.
+        #[wasm_bindgen]
+        pub fn send_question_answers(&self, answers_json: &str) -> JsValue {
+            let answers: serde_json::Value = match serde_json::from_str(answers_json) {
+                Ok(value) => value,
+                Err(_) => return JsValue::NULL,
+            };
+            let msg = self.dashboard.borrow_mut().process_question_answer(answers);
+            match msg {
+                Some(msg) => {
+                    self.server.borrow().send_json(&msg);
+                    to_js(&Vec::<app_state::UiCommand>::new())
+                }
+                None => JsValue::NULL,
+            }
+        }
+
         /// Send a follow-up message. `direct = true` bypasses the presence
         /// layer and dispatches the follow-up straight to the agent as a
         /// force_direct task, mirroring how direct start_task works. Used

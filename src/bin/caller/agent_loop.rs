@@ -1577,7 +1577,13 @@ pub(crate) async fn run_agent_loop(
                                 });
                                 should_skip = true;
                             }
-                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                            // Answer targets question prompts; a native
+                            // command approval receiving one fails closed.
+                            Ok(
+                                event::ApprovalResponse::Deny
+                                | event::ApprovalResponse::Answer { .. },
+                            )
+                            | Err(_) => {
                                 slog(&session_log, |l| {
                                     l.approval(&cat.to_string(), &preview, "denied")
                                 });
@@ -1647,7 +1653,13 @@ pub(crate) async fn run_agent_loop(
                                 });
                                 should_skip = true;
                             }
-                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                            // Answer targets question prompts; a native
+                            // command approval receiving one fails closed.
+                            Ok(
+                                event::ApprovalResponse::Deny
+                                | event::ApprovalResponse::Answer { .. },
+                            )
+                            | Err(_) => {
                                 // Distinguish a real user deny from an interrupt
                                 // that caused the watcher to drain the registry
                                 // with Deny as a synthetic response. Interrupt
@@ -2013,7 +2025,13 @@ Proceed with explicit assumptions and continue without additional questions."
                                 });
                                 should_skip = true;
                             }
-                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                            // Answer targets question prompts; a native
+                            // command approval receiving one fails closed.
+                            Ok(
+                                event::ApprovalResponse::Deny
+                                | event::ApprovalResponse::Answer { .. },
+                            )
+                            | Err(_) => {
                                 slog(&session_log, |l| {
                                     l.approval(&cat.to_string(), &preview, "denied")
                                 });
@@ -2083,7 +2101,13 @@ Proceed with explicit assumptions and continue without additional questions."
                                 });
                                 should_skip = true;
                             }
-                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                            // Answer targets question prompts; a native
+                            // command approval receiving one fails closed.
+                            Ok(
+                                event::ApprovalResponse::Deny
+                                | event::ApprovalResponse::Answer { .. },
+                            )
+                            | Err(_) => {
                                 // Distinguish a real user deny from an interrupt
                                 // that caused the watcher to drain the registry
                                 // with Deny as a synthetic response. Interrupt

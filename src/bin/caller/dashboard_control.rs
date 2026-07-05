@@ -9293,6 +9293,7 @@ fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::Deny { .. }
             | ControlMsg::Skip { .. }
             | ControlMsg::ApproveAll { .. }
+            | ControlMsg::AnswerQuestion { .. }
             | ControlMsg::RenameSession { .. }
             | ControlMsg::ConfigureSessionAgent { .. }
             | ControlMsg::StopSession { .. }
@@ -9341,6 +9342,7 @@ fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::Deny { .. } => "deny",
         ControlMsg::Skip { .. } => "skip",
         ControlMsg::ApproveAll { .. } => "approve_all",
+        ControlMsg::AnswerQuestion { .. } => "answer_question",
         ControlMsg::Input { .. } => "input",
         ControlMsg::SetAutonomy { .. } => "set_autonomy",
         ControlMsg::SetApprovalRule { .. } => "set_approval_rule",

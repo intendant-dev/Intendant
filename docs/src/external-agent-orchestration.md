@@ -670,6 +670,35 @@ the rest of the session. Note that `--web` providing a `web_port` is what keeps 
 otherwise-headless run from auto-denying: it signals that an interactive frontend
 exists.
 
+## User Questions (AskUserQuestion)
+
+Claude Code's `AskUserQuestion` tool is **not a permission request** — it's the
+model asking the human to pick between structured options (question text, a
+short header chip, 2–4 labeled options with descriptions, optional
+multi-select). The adapter detects the tool inside the same `can_use_tool`
+control request and emits `AgentEvent::UserQuestionRequest` instead of an
+approval (a malformed input degrades to the generic approval prompt rather
+than being dropped). The drain surfaces it as
+`AppEvent::UserQuestionRequired { id, questions }` →
+`OutboundEvent::UserQuestion`, and — deliberately unlike approvals — **never
+auto-resolves it from autonomy policy or a session-wide approve-all grant**:
+somebody asked a question; policy can't answer it.
+
+Frontends answer with `{"action": "answer_question", "id", "answers":
+{question → chosen label(s) or free text}}` (multi-select answers join with
+", "). The adapter replies `allow` + `updatedInput.answers`, exactly what the
+CLI's own interactive picker returns, so the tool result reads "Your questions
+have been answered: …". The web dashboard renders a dedicated question panel
+(option buttons + free-text input + Skip); the TUI gets a `Question` mode
+(number keys pick, typing gives a custom answer, Esc dismisses); presence
+narrates the question text with its option labels. Dismissals (deny/skip) send
+a plain `deny` — never `interrupt` — so the model continues gracefully without
+an answer, and the bare approval verbs (`approve`/`approve_all` from clients
+that only speak approvals) let the question through with a "proceed on your
+best judgment" note instead of fabricating a choice. Headless runs without any
+frontend answer the same way instead of blocking forever, mirroring the CLI's
+own away-from-keyboard fallback.
+
 ## Configuration
 
 External-agent settings live under `[agent]` in `intendant.toml`

@@ -71,6 +71,22 @@ node tests/skills/claude-code-e2e/driver.cjs            # uses target/release/in
 # options: --binary <path> --workdir <path> --port <n> --keep
 ```
 
+### AskUserQuestion scenario
+
+```bash
+node tests/skills/claude-code-e2e/question-verify.cjs   # same options
+```
+
+Verifies the structured user-question rail: an `AskUserQuestion` tool call
+surfaces as the `user_question` outbound event (id + questions with header /
+options / descriptions / multi_select) and **not** as a generic
+`approval_required`; `{"action":"answer_question","id","answers":{question →
+label}}` delivers the choice back through `updatedInput.answers` (the model's
+reply echoes the picked option); and `{"action":"skip"}` dismisses the prompt
+as a plain deny the model handles gracefully (no turn abort). Questions are
+requests for input, not permission — autonomy policy and approve-all grants
+never auto-resolve them (`external_events.rs` question arm).
+
 The driver creates a disposable git repo with:
 
 ```toml

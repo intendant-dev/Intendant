@@ -529,6 +529,38 @@ pub(crate) fn external_agent_log_source(agent_source: Option<&str>) -> String {
         .to_string()
 }
 
+/// One-line human preview of a structured question set, used for turn-status
+/// badges and log lines: the first question with its option labels, plus a
+/// count of any remaining questions.
+pub(crate) fn user_question_preview(questions: &[crate::types::UserQuestion]) -> String {
+    let Some(first) = questions.first() else {
+        return "Question".to_string();
+    };
+    let mut preview = first.question.clone();
+    if !first.options.is_empty() {
+        let labels: Vec<&str> = first.options.iter().map(|o| o.label.as_str()).collect();
+        preview.push_str(&format!(" ({})", labels.join(" / ")));
+    }
+    if questions.len() > 1 {
+        preview.push_str(&format!(" [+{} more]", questions.len() - 1));
+    }
+    preview
+}
+
+/// Answer set for a question nobody picked an option for (headless runs,
+/// bare approve verbs): every question gets the same note so the model
+/// proceeds instead of blocking — mirroring Claude Code's own
+/// away-from-keyboard fallback text.
+pub(crate) fn unanswered_question_answers(
+    questions: &[crate::types::UserQuestion],
+    note: &str,
+) -> std::collections::HashMap<String, String> {
+    questions
+        .iter()
+        .map(|q| (q.question.clone(), note.to_string()))
+        .collect()
+}
+
 pub(crate) fn external_tool_failure_content(
     item_id: &str,
     message: &str,
@@ -907,6 +939,61 @@ mod tests {
         assert_eq!(external_agent_log_source(Some("Codex")), "Codex");
         assert_eq!(external_agent_log_source(Some("  ")), "worker");
         assert_eq!(external_agent_log_source(None), "worker");
+    }
+
+    #[test]
+    fn user_question_preview_inlines_options_and_counts_extras() {
+        let questions = vec![
+            crate::types::UserQuestion {
+                question: "Which DB?".into(),
+                header: "Database".into(),
+                options: vec![
+                    crate::types::UserQuestionOption {
+                        label: "PostgreSQL".into(),
+                        description: "Relational".into(),
+                    },
+                    crate::types::UserQuestionOption {
+                        label: "SQLite".into(),
+                        description: String::new(),
+                    },
+                ],
+                multi_select: false,
+            },
+            crate::types::UserQuestion {
+                question: "Auth?".into(),
+                header: String::new(),
+                options: Vec::new(),
+                multi_select: false,
+            },
+        ];
+        assert_eq!(
+            user_question_preview(&questions),
+            "Which DB? (PostgreSQL / SQLite) [+1 more]"
+        );
+        assert_eq!(user_question_preview(&questions[1..]), "Auth?");
+        assert_eq!(user_question_preview(&[]), "Question");
+    }
+
+    #[test]
+    fn unanswered_question_answers_cover_every_question() {
+        let questions = vec![
+            crate::types::UserQuestion {
+                question: "Q1".into(),
+                header: String::new(),
+                options: Vec::new(),
+                multi_select: false,
+            },
+            crate::types::UserQuestion {
+                question: "Q2".into(),
+                header: String::new(),
+                options: Vec::new(),
+                multi_select: true,
+            },
+        ];
+        let answers = unanswered_question_answers(&questions, "note");
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers["Q1"], "note");
+        assert_eq!(answers["Q2"], "note");
     }
 
     #[test]
