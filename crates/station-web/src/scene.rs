@@ -9,8 +9,8 @@ use crate::gpu::GpuFrame;
 use crate::model::{StationAgent, StationHost, StationSnapshot};
 use crate::util::phase_color;
 use crate::util::{
-    css_rgba, relationship_color, role_color, stable_angle, stable_unit, Color, C_BLUE, C_GREEN,
-    C_PEACH, C_RED, C_SAPPHIRE, C_SURFACE0, C_TEAL, C_YELLOW,
+    css_rgba, goal_status_color, relationship_color, role_color, stable_angle, stable_unit, Color,
+    C_BLUE, C_GREEN, C_PEACH, C_RED, C_SAPPHIRE, C_SURFACE0, C_TEAL, C_YELLOW,
 };
 use crate::StationInner;
 
@@ -255,25 +255,45 @@ impl StationInner {
         let role = role_color(&agent.role);
         let phase = phase_color(&agent.phase);
         let spin = time_ms as f32 * 0.0005 * self.motion + stable_angle(&agent.id);
+        // Recent (closed-window) sessions read as archive: dim body, no
+        // pressure/phase rings — the constellation keeps its focus on what
+        // is actually running.
+        let body_alpha = if agent.recent { 0.42 } else { 0.95 };
         match agent.role.as_str() {
-            "orchestrator" => frame.add_wire_octa(project, pos, 0.34, spin, role.with_alpha(0.96)),
-            "sub-agent" => frame.add_wire_tetra(project, pos, 0.31, spin, role.with_alpha(0.95)),
-            _ => frame.add_wire_icosa(project, pos, 0.31, spin, role.with_alpha(0.95)),
+            "orchestrator" => {
+                frame.add_wire_octa(project, pos, 0.34, spin, role.with_alpha(body_alpha + 0.01))
+            }
+            "sub-agent" => frame.add_wire_tetra(project, pos, 0.31, spin, role.with_alpha(body_alpha)),
+            _ => frame.add_wire_icosa(project, pos, 0.31, spin, role.with_alpha(body_alpha)),
         }
-        let pct = if agent.token_cap > 0.0 {
-            (agent.tokens / agent.token_cap).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let budget = if pct < 0.5 {
-            C_GREEN
-        } else if pct < 0.85 {
-            C_YELLOW
-        } else {
-            C_RED
-        };
-        frame.add_ring(project, pos, 0.56, budget.with_alpha(0.66), Plane::XY);
-        frame.add_ring(project, pos, 0.38, phase.with_alpha(0.2), Plane::YZ);
+        if !agent.recent {
+            let pct = if agent.token_cap > 0.0 {
+                (agent.tokens / agent.token_cap).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let budget = if pct < 0.5 {
+                C_GREEN
+            } else if pct < 0.85 {
+                C_YELLOW
+            } else {
+                C_RED
+            };
+            frame.add_ring(project, pos, 0.56, budget.with_alpha(0.66), Plane::XY);
+            frame.add_ring(project, pos, 0.38, phase.with_alpha(0.2), Plane::YZ);
+        }
+        let goal_status = agent.goal_status.trim();
+        if !goal_status.is_empty() {
+            // Goal state as a thin band between the budget ring (0.56) and
+            // the running pulse (0.72), tinted like the focus-panel goal row.
+            frame.add_ring(
+                project,
+                pos,
+                0.64,
+                goal_status_color(goal_status).with_alpha(if agent.recent { 0.3 } else { 0.5 }),
+                Plane::XY,
+            );
+        }
         if agent.status == "in_progress" || agent.phase == "running" {
             frame.add_ring(
                 project,
