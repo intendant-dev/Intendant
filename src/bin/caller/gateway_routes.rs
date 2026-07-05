@@ -650,7 +650,7 @@ pub(crate) static ROUTES: &[Route] = &[
     //    by federation_http_operation). Declaring the operation here is
     //    the fail-closed fix; the differential test allowlists it.
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/sessions/stream"),
         PeerOperation::SessionInspect,
         BodyPolicy::None,
@@ -658,29 +658,27 @@ pub(crate) static ROUTES: &[Route] = &[
         "NDJSON stream of the session list",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/sessions/search"),
         PeerOperation::SessionInspect,
         BodyPolicy::None,
         RouteHandlerId::SessionsSearch,
         "Search sessions (q, source, mode, project filters)",
     ),
-    // Method-agnostic in the legacy chain (see RouteMethod::Any).
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/sessions"),
         PeerOperation::SessionInspect,
         BodyPolicy::None,
         RouteHandlerId::SessionsList,
         "List sessions (id filter, limit, usage view; response CORS * for the fleet Stats tab)",
     ),
-    // ── Settings / info endpoints. `Any` rows port arms that were
-    //    method-blind in the legacy chain; their single declared
-    //    operation now classifies every method (fail-closed vs the
-    //    residual classifier's method-specific holes — allowlisted in
-    //    the differential test).
+    // ── Settings / info endpoints. Ported method-blind from the legacy
+    //    chain as `Any` rows, then tightened to their real methods: an
+    //    undeclared method on a declared path now gets the dispatch-level
+    //    405-with-Allow instead of reaching a read handler.
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/project-root"),
         PeerOperation::Settings,
         BodyPolicy::None,
@@ -696,7 +694,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Update runtime settings",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/settings"),
         PeerOperation::Settings,
         BodyPolicy::None,
@@ -712,7 +710,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Store provider API keys in the project .env",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/api-key-status"),
         PeerOperation::Settings,
         BodyPolicy::None,
@@ -720,7 +718,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Which provider keys are configured (presence only)",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/external-agents"),
         PeerOperation::SessionInspect,
         BodyPolicy::None,
@@ -736,7 +734,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Visual-freshness diagnostics transcript sink (NDJSON body)",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/displays"),
         PeerOperation::DisplayView,
         BodyPolicy::None,
@@ -747,6 +745,10 @@ pub(crate) static ROUTES: &[Route] = &[
     //    signature/shape is the authority; RouteAuthz::Public makes the
     //    no-IAM-gate decision explicit (these paths are also exempted by
     //    the mTLS and origin gates, which match on the same constants).
+    //    The doorbell stays a method-`Any` catch-all row on purpose:
+    //    its handler routes POST-knock vs GET-poll internally and answers
+    //    garbage subpaths with a public-CORS JSON 404 — per-shape rows
+    //    would drop those to the SPA-shell fallback instead.
     public_route(
         RouteMethod::Any,
         PathPattern::Under(crate::peer::access_request::PUBLIC_REQUEST_PATH),
@@ -755,7 +757,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath)",
     ),
     public_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants"),
         BodyPolicy::Capped,
         RouteHandlerId::AccessOrgGrantPresent,
@@ -775,14 +777,14 @@ pub(crate) static ROUTES: &[Route] = &[
         "Org revocation list (ORL) for a trusted org",
     ),
     public_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/orgs/revocations/apply"),
         BodyPolicy::Capped,
         RouteHandlerId::AccessOrgApplyRenew,
         "Apply a signed org revocation list",
     ),
     public_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/renew"),
         BodyPolicy::Capped,
         RouteHandlerId::AccessOrgApplyRenew,
@@ -791,7 +793,7 @@ pub(crate) static ROUTES: &[Route] = &[
     // ── Access administration (fleet-CORS where the anchor page needs
     //    to read responses; own-origin otherwise).
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/iam/user-client-grants"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -799,7 +801,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Upsert a user-client grant",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/iam/grants/update"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -807,7 +809,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Update an IAM grant",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/orgs/trust"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -815,7 +817,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Trust an org root key on this daemon",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/orgs/revoke"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -823,7 +825,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Withdraw trust in an org root key",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/issue"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -831,7 +833,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Issue an org grant (org root/issuer key on this daemon)",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/revoke-member"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -839,7 +841,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Revoke an org member (appends to the ORL)",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/issuers/init"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -847,7 +849,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Initialize an org issuer key",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/issuers/delegate"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -855,7 +857,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Delegate to an org issuer",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/issuers/install"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -863,7 +865,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Install a delegated org issuer key",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/enrollment-requests/decide"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -871,7 +873,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Approve or deny a pending enrollment request",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/access/enrollment-requests"),
         PeerOperation::AccessInspect,
         BodyPolicy::None,
@@ -879,7 +881,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Pending enrollment requests",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/access/iam/state"),
         PeerOperation::AccessInspect,
         BodyPolicy::None,
@@ -887,7 +889,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Local IAM state (roles, grants, bindings)",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/access/overview"),
         PeerOperation::AccessInspect,
         BodyPolicy::None,
@@ -895,7 +897,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Access overview for the calling principal",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/dashboard/targets"),
         PeerOperation::AccessInspect,
         BodyPolicy::None,
@@ -903,9 +905,12 @@ pub(crate) static ROUTES: &[Route] = &[
         "Dashboard target list (this daemon + connected peers)",
     ),
     // ── Federation surface: registry, pairing, quick controls,
-    //    capability routing. One verbatim sub-router row per family;
-    //    IAM delegates to federation_http_operation (see
-    //    RouteAuthz::PeerFederation).
+    //    capability routing. The peers sub-router keeps its method-`Any`
+    //    catch-all row on purpose: IAM already classifies per leaf through
+    //    federation_http_operation (see RouteAuthz::PeerFederation), the
+    //    handler routes methods per leaf internally, and unknown subpaths
+    //    get its JSON 404 — per-leaf rows would either drop garbage to the
+    //    SPA-shell fallback or need a catch-all that neuters them.
     federation_route(
         RouteMethod::Any,
         PathPattern::Under("/api/peers"),
@@ -914,7 +919,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Peer registry (list/add/remove), pairing (invite/join/requests/identities), eligibility, and per-peer quick controls + signaling relays",
     ),
     federation_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/coordinator/route"),
         BodyPolicy::Default,
         RouteHandlerId::CoordinatorRoute,
@@ -1366,7 +1371,9 @@ mod tests {
     #[test]
     fn exact_match_honors_boundaries() {
         assert!(match_route("GET", "/api/sessions").is_some());
-        assert!(match_route("POST", "/api/sessions").is_some()); // Any-method legacy arm
+        // Method tightening: the session list is GET-only; other methods
+        // fall to the dispatch-level 405-with-Allow.
+        assert!(match_route("POST", "/api/sessions").is_none());
         assert!(match_route("GET", "/api/sessionsfoo").is_none());
         assert!(match_route("GET", "/api/sessions/").is_none());
         assert!(match_route("GET", "/api/sessions/stream").is_some());
@@ -1375,6 +1382,79 @@ mod tests {
         assert!(match_route("POST", "/api/worktrees/inspect").is_some());
         assert!(match_route("GET", "/api/worktrees/inspect").is_none());
         assert!(match_route("POST", "/api/worktrees/inspect-old").is_none());
+    }
+
+    #[test]
+    fn method_tightening_rejects_undeclared_methods_with_allow_union() {
+        // Tightened read rows: only GET matches; the dispatch layer turns
+        // the miss into 405 with this Allow union (previously the
+        // method-blind arm served any method, or the request fell through
+        // to the SPA shell).
+        for path in [
+            "/api/sessions",
+            "/api/sessions/stream",
+            "/api/sessions/search",
+            "/api/project-root",
+            "/api/api-key-status",
+            "/api/external-agents",
+            "/api/displays",
+            "/api/access/enrollment-requests",
+            "/api/access/iam/state",
+            "/api/access/overview",
+            "/api/dashboard/targets",
+        ] {
+            assert!(match_route("GET", path).is_some(), "{path}");
+            assert!(match_route("DELETE", path).is_none(), "{path}");
+            assert_eq!(
+                allowed_methods_for_path(path).as_deref(),
+                Some("GET, OPTIONS"),
+                "{path}"
+            );
+        }
+        // Tightened admin/present rows: POST-only.
+        for path in [
+            "/api/access/org-grants",
+            "/api/access/orgs/revocations/apply",
+            "/api/access/org-grants/renew",
+            "/api/access/iam/user-client-grants",
+            "/api/access/iam/grants/update",
+            "/api/access/orgs/trust",
+            "/api/access/orgs/revoke",
+            "/api/access/org-grants/issue",
+            "/api/access/org-grants/revoke-member",
+            "/api/access/org-grants/issuers/init",
+            "/api/access/org-grants/issuers/delegate",
+            "/api/access/org-grants/issuers/install",
+            "/api/access/enrollment-requests/decide",
+            "/api/coordinator/route",
+        ] {
+            assert!(match_route("POST", path).is_some(), "{path}");
+            assert!(match_route("GET", path).is_none(), "{path}");
+            assert_eq!(
+                allowed_methods_for_path(path).as_deref(),
+                Some("POST, OPTIONS"),
+                "{path}"
+            );
+        }
+        // Mixed-method path: the Allow union spans both rows, and an
+        // undeclared method (PUT here) matches neither.
+        assert_eq!(
+            allowed_methods_for_path("/api/settings").as_deref(),
+            Some("GET, POST, OPTIONS")
+        );
+        assert!(match_route("PUT", "/api/settings").is_none());
+        // The two deliberate `Any` catch-alls keep matching every method:
+        // their handlers route methods per leaf internally and answer
+        // garbage with JSON 404s a per-shape row split would forfeit.
+        assert!(match_route("DELETE", "/api/peers").is_some());
+        assert!(match_route(
+            "DELETE",
+            crate::peer::access_request::PUBLIC_REQUEST_PATH
+        )
+        .is_some());
+        // Undeclared paths still fall through to the legacy chain / SPA
+        // shell rather than the 405 arm.
+        assert_eq!(allowed_methods_for_path("/api/no-such-endpoint"), None);
     }
 
     #[test]

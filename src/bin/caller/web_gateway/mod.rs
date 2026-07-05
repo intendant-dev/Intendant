@@ -8503,6 +8503,43 @@ pub fn spawn_web_gateway(
                                 return handle_mcp_stream(stream, &header_text, is_tls).await;
                             }
                         }
+                    } else if let Some(allow) =
+                        crate::gateway_routes::allowed_methods_for_path(req_path)
+                    {
+                        // Declared API path, undeclared method: uniform 405
+                        // with an Allow header derived from the route table.
+                        // Before the method tightening these requests either
+                        // reached a method-blind read handler or fell all the
+                        // way through to the SPA-shell fallback. CORS posture
+                        // mirrors the path's declared posture so cross-origin
+                        // fleet/public callers can read the error.
+                        use tokio::io::AsyncWriteExt;
+                        let body = serde_json::json!({
+                            "error": "method not allowed",
+                            "allow": allow,
+                        })
+                        .to_string();
+                        let base = format!(
+                            "HTTP/1.1 405 Method Not Allowed\r\n\
+                             Allow: {allow}\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {body}",
+                            body.len(),
+                        );
+                        let response = match crate::gateway_routes::preflight_posture(req_path) {
+                            Some(crate::gateway_routes::CorsPosture::Public) => {
+                                with_public_cors(base)
+                            }
+                            Some(crate::gateway_routes::CorsPosture::FleetAllowlist) => {
+                                with_fleet_cors(base, fleet_cors_origin.as_deref())
+                            }
+                            _ => base,
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "GET" && req_path == "/connect/bootstrap" {
                         use tokio::io::AsyncWriteExt;
                         let body = connect_bootstrap_html();
@@ -13630,11 +13667,14 @@ mod tests {
         );
         // /mcp is token-bound inside the handler, not operation-gated.
         assert_eq!(dashboard_http_operation("POST", "/mcp"), None);
-        // The Any-method settings row closed a method-blind hole: DELETE
-        // /api/settings used to serve the settings body with no gate.
+        // Method tightening (phase 4d) superseded the Any-era gate on
+        // DELETE /api/settings: the method matches no row, so it never
+        // classifies — and never reaches a handler; dispatch answers the
+        // miss with 405 + the Allow union derived from the table.
+        assert_eq!(dashboard_http_operation("DELETE", "/api/settings"), None);
         assert_eq!(
-            dashboard_http_operation("DELETE", "/api/settings"),
-            Some(PeerOperation::Settings)
+            crate::gateway_routes::allowed_methods_for_path("/api/settings").as_deref(),
+            Some("GET, POST, OPTIONS")
         );
     }
 
