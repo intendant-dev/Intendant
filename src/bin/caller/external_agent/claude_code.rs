@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
@@ -12,8 +12,9 @@ use tokio::sync::{mpsc, Mutex};
 use crate::error::CallerError;
 
 use super::{
-    AgentConfig, AgentEvent, AgentThread, AgentUsageSnapshot, ApprovalCategory, ApprovalDecision,
-    ExternalAgent, SubAgentState, ToolCompletionStatus,
+    normalize_plan_status, AgentConfig, AgentEvent, AgentThread, AgentUsageSnapshot,
+    ApprovalCategory, ApprovalDecision, ExternalAgent, GoalActionOutcome, GoalEngine,
+    SubAgentState, ToolCompletionStatus,
 };
 
 /// Appended to the first user message when an Intendant web port is
@@ -158,11 +159,12 @@ struct CcShared {
     /// conversation turn; this flag lets the reader absorb it so it cannot
     /// prematurely complete the next real turn.
     compact_pending: AtomicBool,
-    /// Wrapper-level goal engine state. Claude Code has no native `/goal`,
+    /// Wrapper-level goal engine (the shared backend-agnostic
+    /// `external_agent::GoalEngine`). Claude Code has no native `/goal`,
     /// so the adapter owns the operator goal and rides the universal
     /// `GoalUpdated`/`GoalCleared` rails (window chip, log persistence, and
     /// replay all come for free from the Codex-built plumbing).
-    goal: StdMutex<Option<CcGoal>>,
+    goal: StdMutex<GoalEngine>,
     /// Fresh tokens spent by this process — uncached input + cache creation
     /// + output, accumulated per result. The goal-budget currency: cache
     /// reads are excluded so a budget measures real work, not re-reads.
@@ -173,71 +175,35 @@ struct CcShared {
     turn_active: AtomicBool,
 }
 
-/// Operator goal tracked by the wrapper-level engine.
-#[derive(Debug, Clone)]
-struct CcGoal {
-    objective: String,
-    /// Same status vocabulary as Codex goals (`normalize_goal_status`).
-    status: String,
-    token_budget: Option<u64>,
-    set_at: std::time::Instant,
-    /// `cumulative_fresh_tokens` snapshot when the goal was set; spend
-    /// against the budget is measured from here.
-    tokens_at_set: u64,
-}
-
 impl CcShared {
     fn new(resume_session: Option<String>) -> Self {
         Self {
             session_id: StdMutex::new(resume_session),
             interrupt_pending: AtomicBool::new(false),
             compact_pending: AtomicBool::new(false),
-            goal: StdMutex::new(None),
+            goal: StdMutex::new(GoalEngine::default()),
             cumulative_fresh_tokens: AtomicU64::new(0),
             turn_active: AtomicBool::new(false),
         }
     }
 
-    fn lock_goal(&self) -> std::sync::MutexGuard<'_, Option<CcGoal>> {
+    fn lock_goal(&self) -> std::sync::MutexGuard<'_, GoalEngine> {
         match self.goal.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
     }
 
-    /// Current goal as the wire type (elapsed + budget spend computed now).
-    fn goal_snapshot(&self) -> Option<crate::types::SessionGoal> {
-        let guard = self.lock_goal();
-        let goal = guard.as_ref()?;
-        let used = self
-            .cumulative_fresh_tokens
-            .load(Ordering::Relaxed)
-            .saturating_sub(goal.tokens_at_set);
-        Some(crate::types::SessionGoal {
-            objective: goal.objective.clone(),
-            status: Some(goal.status.clone()),
-            elapsed_seconds: Some(goal.set_at.elapsed().as_secs()),
-            tokens_used: Some(used),
-            token_budget: goal.token_budget,
-        })
+    fn fresh_tokens(&self) -> u64 {
+        self.cumulative_fresh_tokens.load(Ordering::Relaxed)
     }
 
     /// Refresh the goal after a turn result: recompute spend, flip an
     /// `active` goal to `budgetLimited` when the budget is exhausted, and
     /// return the updated snapshot for a `GoalUpdated` emission.
     fn refresh_goal_after_result(&self) -> Option<crate::types::SessionGoal> {
-        {
-            let mut guard = self.lock_goal();
-            let goal = guard.as_mut()?;
-            let used = self
-                .cumulative_fresh_tokens
-                .load(Ordering::Relaxed)
-                .saturating_sub(goal.tokens_at_set);
-            if goal.status == "active" && goal.token_budget.is_some_and(|budget| used >= budget) {
-                goal.status = "budgetLimited".to_string();
-            }
-        }
-        self.goal_snapshot()
+        let fresh = self.fresh_tokens();
+        self.lock_goal().refresh_after_result(fresh)
     }
 
     fn session_id(&self) -> Option<String> {
@@ -472,6 +438,31 @@ fn is_task_tool(name: &str) -> bool {
     name == "Agent" || name == "Task"
 }
 
+/// Plan entries from a `TodoWrite` tool_use input, in `PlanUpdate` shape:
+/// `(content, priority, status)` — todos carry no priority, and statuses
+/// normalize to the shared plan vocabulary ("in_progress" → "inprogress").
+fn cc_plan_entries(input: &serde_json::Value) -> Vec<(String, String, String)> {
+    let Some(todos) = input.get("todos").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    todos
+        .iter()
+        .filter_map(|todo| {
+            let content = todo
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            let status = todo
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(normalize_plan_status)
+                .unwrap_or_default();
+            Some((content.to_string(), String::new(), status))
+        })
+        .collect()
+}
+
 /// Terminal summaries ride log lines; keep them one line and short.
 fn task_summary_snippet(text: &str) -> Option<String> {
     let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -523,6 +514,12 @@ struct CcReader {
     /// `task_id` (the key `system:task_*` events use) → spawning
     /// tool_use id.
     task_ids: HashMap<String, String>,
+    /// tool_use ids of `TodoWrite` calls already rendered as `PlanUpdate`,
+    /// so their bookkeeping tool_result ("Todos have been modified
+    /// successfully…") is dropped instead of rendered. Entries are removed
+    /// when the result arrives; ids orphaned by an interrupted turn are
+    /// inert (tool_use ids never recur) and merely idle here.
+    plan_tools: HashSet<String>,
     /// Most recent model name seen (init message / message_start).
     model: String,
     context_window: u64,
@@ -545,6 +542,7 @@ impl CcReader {
             open_tools: HashMap::new(),
             task_children: HashMap::new(),
             task_ids: HashMap::new(),
+            plan_tools: HashSet::new(),
             model: "claude".to_string(),
             context_window: DEFAULT_CONTEXT_WINDOW,
             last_intendant_mcp_status: None,
@@ -1016,6 +1014,18 @@ impl CcReader {
                         self.register_task_child(&tool_id, child_scope, spawn, out);
                         continue;
                     }
+                    if tool_name == "TodoWrite" && !tool_id.is_empty() {
+                        let entries = cc_plan_entries(&input);
+                        if !entries.is_empty() {
+                            // Render the todo list as a plan, not a raw
+                            // tool call; the acknowledgment tool_result is
+                            // dropped in tool_result_events. Malformed
+                            // inputs fall through to the plain-tool path.
+                            self.plan_tools.insert(tool_id);
+                            out.events.push(AgentEvent::PlanUpdate { entries });
+                            continue;
+                        }
+                    }
                     if !tool_id.is_empty() {
                         self.open_tools
                             .insert(tool_id.clone(), child_scope.map(str::to_string));
@@ -1118,6 +1128,16 @@ impl CcReader {
                     task_summary_snippet(&content_text),
                     out,
                 );
+            }
+            return;
+        }
+
+        if self.plan_tools.remove(&tool_id) {
+            // TodoWrite's acknowledgment is bookkeeping — the PlanUpdate
+            // already rendered. Failures still surface.
+            if is_error {
+                let message: String = content_text.chars().take(200).collect();
+                out.log("warn", format!("TodoWrite failed: {}", message.trim()));
             }
             return;
         }
@@ -1577,125 +1597,40 @@ impl ClaudeCodeAgent {
     }
 
     /// Wrapper-level `/goal` engine (Claude Code has no native goals).
-    /// Wire conventions — statuses, budget shape, objective limit — are
-    /// shared with Codex via the `external_agent` helpers, so frontends see
-    /// one goal dialect regardless of backend.
+    /// Semantics live in the shared `external_agent::GoalEngine` so every
+    /// backend speaks one goal dialect; this host emits the goal events
+    /// and delivers notices (mid-turn steer or next-prompt prelude).
     async fn dispatch_goal_action(
         &mut self,
         op: &str,
         params: &serde_json::Value,
     ) -> Result<String, CallerError> {
-        let clear_requested = op == "goal-clear"
-            || params
-                .get("clear")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-        if clear_requested {
-            let had_goal = self.shared.lock_goal().take().is_some();
-            if !had_goal {
-                return Ok("no active goal".to_string());
+        let fresh = self.shared.fresh_tokens();
+        let outcome = self.shared.lock_goal().dispatch(op, params, fresh)?;
+        match outcome {
+            GoalActionOutcome::Report { message, goal } => {
+                if let Some(goal) = goal {
+                    self.emit_agent_event(AgentEvent::GoalUpdated { goal });
+                }
+                Ok(message)
             }
-            self.emit_agent_event(AgentEvent::GoalCleared);
-            self.deliver_goal_notice(
-                "[Operator goal cleared — no standing goal is in effect.]".to_string(),
-            )
-            .await?;
-            return Ok("goal cleared".to_string());
-        }
-
-        let implied_status = match op {
-            "goal-pause" => Some("paused"),
-            "goal-resume" => Some("active"),
-            "goal-complete" => Some("complete"),
-            "goal-budget-limited" => Some("budgetLimited"),
-            _ => None,
-        };
-        let status = match params.get("status").and_then(|v| v.as_str()) {
-            Some(raw) => Some(super::normalize_goal_status(raw)?),
-            None => implied_status.map(str::to_string),
-        };
-        let objective = params
-            .get("objective")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        if let Some(ref objective) = objective {
-            super::validate_goal_objective(objective)?;
-        }
-        let token_budget = super::parse_goal_token_budget(params)?;
-
-        let is_update =
-            objective.is_some() || status.is_some() || token_budget.is_some() || op == "goal-set";
-        if !is_update {
-            // goal / goal-get / goal-status with no fields: report.
-            return match self.shared.goal_snapshot() {
-                Some(goal) => {
-                    self.emit_agent_event(AgentEvent::GoalUpdated { goal: goal.clone() });
-                    Ok(format!(
-                        "goal {}: {}",
-                        goal.status.as_deref().unwrap_or("active"),
-                        goal.objective
-                    ))
+            GoalActionOutcome::Cleared { message, notice } => {
+                self.emit_agent_event(AgentEvent::GoalCleared);
+                self.deliver_goal_notice(notice).await?;
+                Ok(message)
+            }
+            GoalActionOutcome::Updated {
+                message,
+                goal,
+                notice,
+            } => {
+                self.emit_agent_event(AgentEvent::GoalUpdated { goal });
+                if let Some(notice) = notice {
+                    self.deliver_goal_notice(notice).await?;
                 }
-                None => Ok("no active goal".to_string()),
-            };
-        }
-
-        let objective_changed = objective.is_some();
-        let resumed = status.as_deref() == Some("active");
-        {
-            let mut guard = self.shared.lock_goal();
-            match guard.as_mut() {
-                Some(goal) => {
-                    if let Some(objective) = objective {
-                        goal.objective = objective;
-                    }
-                    if let Some(status) = status {
-                        goal.status = status;
-                    }
-                    if let Some(budget) = token_budget {
-                        goal.token_budget = budget;
-                    }
-                }
-                None => {
-                    let Some(objective) = objective else {
-                        return Err(CallerError::ExternalAgent(
-                            "no active goal — set an objective first".into(),
-                        ));
-                    };
-                    *guard = Some(CcGoal {
-                        objective,
-                        status: status.unwrap_or_else(|| "active".to_string()),
-                        token_budget: token_budget.flatten(),
-                        set_at: std::time::Instant::now(),
-                        tokens_at_set: self.shared.cumulative_fresh_tokens.load(Ordering::Relaxed),
-                    });
-                }
+                Ok(message)
             }
         }
-        let goal = self
-            .shared
-            .goal_snapshot()
-            .expect("goal was just set or updated");
-        self.emit_agent_event(AgentEvent::GoalUpdated { goal: goal.clone() });
-        if objective_changed || resumed {
-            let mut notice = format!("[Operator goal] {}", goal.objective);
-            if let Some(budget) = goal.token_budget {
-                notice.push_str(&format!(" (token budget: {budget})"));
-            }
-            self.deliver_goal_notice(notice).await?;
-        } else if goal.status.as_deref() == Some("paused") {
-            self.deliver_goal_notice(
-                "[Operator goal paused — deprioritize it until resumed.]".to_string(),
-            )
-            .await?;
-        }
-        Ok(format!(
-            "goal {}: {}",
-            goal.status.as_deref().unwrap_or("active"),
-            goal.objective
-        ))
     }
 
     /// Send a live-reconfig control request (verified on CC 2.1.201:
@@ -3045,6 +2980,110 @@ mod tests {
         assert!(snippet.chars().count() <= 241 && snippet.ends_with('…'));
     }
 
+    // ---------------------------------------------------------------
+    // TodoWrite → PlanUpdate
+    // ---------------------------------------------------------------
+
+    const TODO_WRITE_USE: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"td1","name":"TodoWrite","input":{"todos":[{"content":"Survey the code","status":"completed","activeForm":"Surveying the code"},{"content":"Write the fix","status":"in_progress","activeForm":"Writing the fix"},{"content":"Run the tests","status":"pending","activeForm":"Running the tests"}]}}]},"session_id":"s1"}"#;
+
+    #[test]
+    fn todo_write_renders_as_plan_update() {
+        let mut reader = test_reader();
+        let out = reader.process_line(TODO_WRITE_USE);
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolStarted { .. })),
+            "TodoWrite must not double-render as a plain tool"
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PlanUpdate { entries }
+                if entries.len() == 3
+                    && entries[0] == ("Survey the code".into(), String::new(), "completed".into())
+                    && entries[1] == ("Write the fix".into(), String::new(), "inprogress".into())
+                    && entries[2] == ("Run the tests".into(), String::new(), "pending".into())
+        )));
+        // Not an open tool (nothing to force-close at turn end), but marked
+        // so its acknowledgment result is dropped.
+        assert!(reader.open_tools.is_empty());
+        assert!(reader.plan_tools.contains("td1"));
+    }
+
+    #[test]
+    fn todo_write_result_is_suppressed() {
+        let mut reader = test_reader();
+        reader.process_line(TODO_WRITE_USE);
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"td1","content":"Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress.","is_error":false}]},"session_id":"s1"}"#,
+        );
+        assert!(
+            out.events.is_empty(),
+            "acknowledgment must be dropped, got {:?}",
+            out.events
+        );
+        assert!(!reader.plan_tools.contains("td1"));
+    }
+
+    #[test]
+    fn todo_write_error_result_still_warns() {
+        let mut reader = test_reader();
+        reader.process_line(TODO_WRITE_USE);
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"td1","content":"boom","is_error":true}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message } if level == "warn" && message.contains("boom")
+        )));
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolOutputDelta { .. })),
+            "failed TodoWrite must not render as tool output"
+        );
+    }
+
+    #[test]
+    fn todo_write_without_todos_falls_back_to_plain_tool() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"td2","name":"TodoWrite","input":{}}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolStarted { item_id, tool_name, .. }
+                if item_id == "td2" && tool_name == "TodoWrite"
+        )));
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::PlanUpdate { .. })),
+            "an empty todo list is not a plan"
+        );
+        assert!(reader.open_tools.contains_key("td2"));
+        assert!(reader.plan_tools.is_empty());
+    }
+
+    #[test]
+    fn child_scoped_todo_write_scopes_the_plan() {
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"td3","name":"TodoWrite","input":{"todos":[{"content":"Child step","status":"pending","activeForm":"Stepping"}]}}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::PlanUpdate { entries }
+                            if entries.len() == 1 && entries[0].0 == "Child step"
+                    )
+        )));
+    }
+
     #[test]
     fn reader_approval_request_stores_input_and_rules() {
         let mut reader = test_reader();
@@ -3401,16 +3440,15 @@ mod tests {
     #[test]
     fn goal_budget_flips_to_budget_limited_from_fresh_token_spend() {
         let mut reader = test_reader();
-        {
-            let mut guard = reader.shared.lock_goal();
-            *guard = Some(CcGoal {
-                objective: "stay cheap".into(),
-                status: "active".into(),
-                token_budget: Some(50),
-                set_at: std::time::Instant::now(),
-                tokens_at_set: 0,
-            });
-        }
+        reader
+            .shared
+            .lock_goal()
+            .dispatch(
+                "goal-set",
+                &serde_json::json!({ "objective": "stay cheap", "tokenBudget": 50 }),
+                0,
+            )
+            .expect("seed goal");
         // A result whose fresh spend (input + cache creation + output,
         // cache reads EXCLUDED) crosses the budget.
         let out = reader.process_line(

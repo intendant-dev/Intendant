@@ -99,6 +99,26 @@ pub(crate) fn phase_color_css(phase: &str) -> &'static str {
     }
 }
 
+/// Session-goal status tint (the shared goal vocabulary from
+/// `normalize_goal_status`, plus the dashboard's kebab-case synonyms).
+pub(crate) fn goal_status_color(status: &str) -> Color {
+    match status {
+        "active" => C_GREEN,
+        "paused" | "budgetLimited" | "budget-limited" => C_YELLOW,
+        "completed" | "complete" => C_BLUE,
+        _ => C_LAVENDER,
+    }
+}
+
+pub(crate) fn goal_status_color_css(status: &str) -> &'static str {
+    match status {
+        "active" => C_GREEN_CSS,
+        "paused" | "budgetLimited" | "budget-limited" => C_YELLOW_CSS,
+        "completed" | "complete" => C_BLUE_CSS,
+        _ => C_LAVENDER_CSS,
+    }
+}
+
 pub(crate) fn level_color(level: &str) -> Color {
     match level {
         "error" => C_RED,
@@ -389,6 +409,33 @@ mod tests {
         let think: [f32; 4] = phase_color("thinking").into();
         let lavender: [f32; 4] = C_LAVENDER.into();
         assert_eq!(think, lavender);
+    }
+
+    #[test]
+    fn goal_status_colors_agree_between_scene_and_css() {
+        // The scene ring (Color) and the HUD rows (CSS) derive from the
+        // same mapping; hex_color(css) must match the Color for every
+        // status in the shared goal vocabulary plus the fallback.
+        for status in [
+            "active",
+            "paused",
+            "budgetLimited",
+            "budget-limited",
+            "completed",
+            "complete",
+            "blocked",
+            "",
+        ] {
+            let scene: [f32; 4] = goal_status_color(status).into();
+            let css: [f32; 4] = hex_color(goal_status_color_css(status))
+                .expect("goal css colors are #rrggbb")
+                .into();
+            assert_eq!(
+                &scene[..3],
+                &css[..3],
+                "goal color mismatch for status {status:?}"
+            );
+        }
     }
 
     #[test]

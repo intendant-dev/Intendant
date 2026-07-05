@@ -5192,6 +5192,35 @@ body.context-focus-active {
     display: none;
   }
 }
+.session-window-vitals {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 280px;
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border: 1px solid rgba(148, 226, 213, 0.22);
+  border-radius: 999px;
+  background: rgba(148, 226, 213, 0.06);
+  color: var(--subtext0);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+.session-window-vitals.conflict {
+  border-color: rgba(243, 139, 168, 0.38);
+  background: rgba(243, 139, 168, 0.08);
+  color: var(--red);
+}
+@container (max-width: 560px) {
+  .session-window-vitals {
+    display: none;
+  }
+}
 .session-window-action-cluster {
   flex-shrink: 0;
   display: inline-flex;
@@ -14902,6 +14931,7 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'session_relationship',
   'session_capabilities',
   'session_goal',
+  'session_vitals',
   'session_attached',
   'session_ended',
   'status',
@@ -18889,7 +18919,9 @@ let stationLaunchDraft = {
   managed: '',
   archive: '',
   fast: false,
-  direct: false,
+  // Execution shape for the internal agent: '' (auto) | 'orchestrate' |
+  // 'direct'.
+  execution: '',
 };
 
 const STATION_SYSTEM_TARGETS = Object.freeze([
@@ -20908,6 +20940,18 @@ function stationEffectiveLaunchAgent() {
   return normalizeAgentId(selected) || newSessionConfiguredAgent || '';
 }
 
+// Execution shape (auto / orchestrate / direct) only applies to the
+// internal agent — external CLIs run their own loops.
+function stationLaunchExecutionApplies(agent = stationEffectiveLaunchAgent()) {
+  return !agent || agent === 'internal' || agent === 'intendant';
+}
+
+function stationLaunchExecution() {
+  if (!stationLaunchExecutionApplies()) return '';
+  const mode = String(stationLaunchDraft.execution || '');
+  return mode === 'orchestrate' || mode === 'direct' ? mode : '';
+}
+
 
 function stationLaunchCommandForAgent(agent) {
   const backend = normalizeAgentId(agent);
@@ -20966,7 +21010,8 @@ function stationBuildLaunchReadiness() {
     taskChars: task.length,
     project,
     attachments,
-    direct: !!stationLaunchDraft.direct || !!document.getElementById('direct-mode-toggle')?.checked,
+    executionApplies: stationLaunchExecutionApplies(agent),
+    execution: stationLaunchExecution(),
     notice: stationLaunchNoticeText(),
     codex,
     managed: codex ? (stationLaunchDraftValue('managed', newSessionCodexManagedContext || controlCodexConfig.managed_context || 'vanilla')) : '',
@@ -21063,7 +21108,17 @@ async function stationStartSession() {
       }
     }
   }
-  if (stationLaunchDraft.direct) msg.direct = true;
+  // Execution shape: an explicit per-launch choice beats the global Direct
+  // toggle; Auto (or an external agent — the pills are hidden and the draft
+  // choice inert then) preserves the old behavior of the toggle forcing
+  // direct.
+  const execution = stationLaunchExecution();
+  const globalDirect = document.getElementById('direct-mode-toggle')?.checked || false;
+  if (execution === 'orchestrate') {
+    msg.orchestrate = true;
+  } else if (execution === 'direct' || globalDirect) {
+    msg.direct = true;
+  }
   if (Array.isArray(pendingAttachments) && pendingAttachments.length > 0) {
     msg.attachments = pendingAttachments.map(a => a.frameId).filter(Boolean);
   }
@@ -22186,8 +22241,10 @@ function stationHandleControlsAction(action) {
     stationScheduleUpdate({ immediate: true });
     return;
   }
-  if (op === 'launch-direct:toggle') {
-    stationLaunchDraft.direct = !stationLaunchDraft.direct;
+  if (op.startsWith('launch-execution:')) {
+    const mode = op.slice('launch-execution:'.length).trim();
+    if (!['auto', 'orchestrate', 'direct'].includes(mode)) return;
+    stationLaunchDraft.execution = mode === 'auto' ? '' : mode;
     stationScheduleUpdate({ immediate: true });
     return;
   }
@@ -23785,7 +23842,10 @@ function stationBuildControlsSummary() {
     launchCommand: launchReadiness.command || '',
     launchTaskChars: stationNum(launchReadiness.taskChars),
     launchProject: launchReadiness.project ? compactPathLabel(launchReadiness.project, true) : '',
-    launchMode: launchReadiness.direct ? 'direct' : 'orchestrated',
+    // 'auto' | 'orchestrate' | 'direct' for the internal agent; empty when
+    // execution does not apply (external agent) so the canvas hides the
+    // pills.
+    launchMode: launchReadiness.executionApplies ? (launchReadiness.execution || 'auto') : '',
     launchAttachments: stationNum(launchReadiness.attachments),
     launchNotice: launchReadiness.notice || '',
   };
@@ -24085,6 +24145,16 @@ function stationDisplayRunwaySnapshot(controls = null) {
 
 function stationAgentForSelf(usage) {
   const phase = normalizeStationPhase(currentPhase);
+  // Goal fields light the scene's goal ring + the focus-panel goal row for
+  // the primary session too (session_id stays unset on purpose: the
+  // primary node keeps the classic agent focus panel, not session pills).
+  let goal = null;
+  if (currentSessionFullId) {
+    try {
+      const meta = sessionMetadataById.get(String(currentSessionFullId)) || {};
+      goal = normalizeSessionGoal(meta.goal || meta.session_goal || meta.sessionGoal || null);
+    } catch (_) {}
+  }
   return {
     id: 'primary-agent',
     hostId: selfPeerId,
@@ -24109,6 +24179,11 @@ function stationAgentForSelf(usage) {
     approvalId: stationCurrentApproval && stationCurrentApproval.id,
     approvalCommand: stationCurrentApproval && stationCurrentApproval.command || '',
     approvalCategory: stationCurrentApproval && stationCurrentApproval.category || '',
+    goalStatus: goal ? String(goal.status || '') : '',
+    goalObjective: goal ? String(goal.objective || '') : '',
+    goalTokens: goal && goal.tokensUsed !== null && goal.tokensUsed !== undefined
+      ? String(goal.tokensUsed)
+      : '',
   };
 }
 
@@ -24279,6 +24354,77 @@ function stationSessionAgentsInner() {
       canInterrupt: active,
     });
   }
+  // Recent (closed-window) sessions join as dim, inert nodes. The scene is
+  // deliberately a bounded constellation — the freshest few, not the whole
+  // archive; the sessions panel remains the exhaustive list.
+  const RECENT_SCENE_NODES = 6;
+  try {
+    const { sortedSessions } = stationCollectSessionSet();
+    let added = 0;
+    for (const session of sortedSessions) {
+      if (added >= RECENT_SCENE_NODES) break;
+      const id = String(
+        session?.session_id || session?.resume_id || session?.backend_session_id || ''
+      ).trim();
+      if (!id || primaryIds.has(id) || liveIds.has(id)) continue;
+      // The daemon's own log id may differ from currentSessionFullId —
+      // it is the primary node, not an archived session.
+      if (id === String(daemonSessionFullId || '') || id === String(foregroundSessionFullId || '')) continue;
+      const meta = sessionMetadataById.get(id) || {};
+      const kind = String(meta.relationshipKind || '').trim();
+      const source = normalizeAgentId(
+        session?.backend_source || session?.source || meta.backendSource || meta.source || ''
+      ) || '';
+      const goal = meta.goal && typeof meta.goal === 'object' ? meta.goal : null;
+      const parentSid = String(meta.parentId || '').trim();
+      let parentNodeId = null;
+      if (parentSid) {
+        if (primaryIds.has(parentSid)) parentNodeId = 'primary-agent';
+        else if (liveIds.has(parentSid)) parentNodeId = 'session-' + sanitizeStationId(parentSid);
+      }
+      const name = compactSessionText(session?.name || meta.name || meta.displayName || '');
+      const task = name
+        || compactSessionText(session?.task || meta.initial_message || meta.initialMessage || '')
+        || shortSessionId(id);
+      out.push({
+        id: 'session-' + sanitizeStationId(id),
+        hostId: selfPeerId,
+        role: kind === 'subagent'
+          ? 'sub-agent'
+          : (source && source !== 'intendant' ? 'external' : 'session'),
+        phase: 'idle',
+        status: 'idle',
+        task,
+        provider: String(session?.provider || ''),
+        model: String(session?.model || ''),
+        tokens: stationNum(session?.total_tokens),
+        tokenCap: 0,
+        prompt: stationNum(session?.prompt_tokens),
+        completion: stationNum(session?.completion_tokens),
+        cached: stationNum(session?.cached_tokens),
+        cost: 0,
+        turns: stationNum(session?.turns),
+        turnCap: 0,
+        autonomy: '',
+        worktree: String(sessionProjectDirectory(session) || ''),
+        parentId: parentNodeId,
+        needsApproval: false,
+        approvalId: null,
+        approvalCommand: '',
+        approvalCategory: '',
+        sessionId: id,
+        source,
+        relationshipKind: kind,
+        goalStatus: goal ? String(goal.status || '') : '',
+        goalObjective: goal ? String(goal.objective || '') : '',
+        goalTokens: '',
+        threadActions: [],
+        canInterrupt: false,
+        recent: true,
+      });
+      added += 1;
+    }
+  } catch (_) {}
   return out;
 }
 
@@ -25146,6 +25292,7 @@ async function main() {
         applySessionIdentitiesFromReplayEntries(filtered.entries);
         applyExternalIdentitiesFromLogEntries(filtered.entries);
         applySessionGoalsFromReplayEntries(filtered.entries);
+        applySessionVitalsFromReplayEntries(filtered.entries);
         resetSessionWindowsForReplay(filtered.entries);
         const wasProcessingLogReplay = processingLogReplay;
         processingLogReplay = true;
@@ -25202,6 +25349,9 @@ async function main() {
       }
       if (d.event === 'session_goal') {
         applySessionGoal(d);
+      }
+      if (d.event === 'session_vitals') {
+        applySessionVitals(d);
       }
       if (d.event === 'session_agent_config_result') {
         handleSessionConfigResult(d);
@@ -25934,6 +26084,7 @@ function processCommands(cmds) {
         break;
       case 'session_capabilities': applySessionCapabilities(c); break;
       case 'session_goal': applySessionGoal(c); break;
+      case 'session_vitals': applySessionVitals(c); break;
       case 'session_attached':
         onSessionAttached(c.session_id, c.source);
         stationScheduleUpdate();
@@ -31161,6 +31312,96 @@ function applySessionGoalsFromReplayEntries(entries) {
   }
 }
 
+// ── Session vitals (git / cache / limits chips — the statusline port) ──
+
+function renderSessionWindowVitals(win, vitals) {
+  if (!win?.vitals) return;
+  const git = vitals && typeof vitals === 'object' ? vitals.git : null;
+  if (!git || typeof git !== 'object') {
+    win.vitals.className = 'session-window-vitals hidden';
+    win.vitals.textContent = '';
+    win.vitals.title = '';
+    return;
+  }
+  const parts = [];
+  const titleLines = [];
+  const branch = String(git.branch || '').trim();
+  if (branch) {
+    parts.push(`⎇ ${branch}`);
+    titleLines.push(`Branch: ${branch}`);
+  }
+  const dirty = Number(git.dirtyFiles) || 0;
+  if (dirty > 0) {
+    parts.push(`●${dirty}`);
+    titleLines.push(`Dirty files: ${dirty}`);
+  }
+  const primaryRef = String(git.primaryRef || '').trim();
+  if (primaryRef) {
+    const ahead = Number(git.ahead) || 0;
+    const behind = Number(git.behind) || 0;
+    parts.push(`+${ahead}/−${behind}`);
+    titleLines.push(`vs ${primaryRef}: ${ahead} ahead, ${behind} behind`);
+  }
+  const parity = String(git.mergeParity || '').trim();
+  if (parity === 'clean') {
+    parts.push('✓');
+    titleLines.push(`Merge with ${primaryRef || 'primary'}: clean`);
+  } else if (parity === 'conflict') {
+    parts.push('⚠');
+    titleLines.push(`Merge with ${primaryRef || 'primary'}: WOULD CONFLICT`);
+  }
+  if (git.unpushed !== null && git.unpushed !== undefined) {
+    parts.push(`⇡${git.unpushed}`);
+    titleLines.push(`Unpushed on ${branch || 'branch'}: ${git.unpushed}`);
+  }
+  if (git.primaryUnpushed !== null && git.primaryUnpushed !== undefined && primaryRef) {
+    const primaryName = primaryRef.replace(/^origin\//, '');
+    parts.push(`${primaryName}⇡${git.primaryUnpushed}`);
+    titleLines.push(`Unpushed on ${primaryName}: ${git.primaryUnpushed}`);
+  }
+  if (!parts.length) {
+    win.vitals.className = 'session-window-vitals hidden';
+    win.vitals.textContent = '';
+    win.vitals.title = '';
+    return;
+  }
+  win.vitals.className = `session-window-vitals${parity === 'conflict' ? ' conflict' : ''}`;
+  win.vitals.textContent = parts.join(' ');
+  win.vitals.title = titleLines.join('\n');
+}
+
+function normalizeSessionVitals(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const src = raw.vitals && typeof raw.vitals === 'object' ? raw.vitals : raw;
+  const git = src.git && typeof src.git === 'object' ? src.git : null;
+  const cache = src.cache && typeof src.cache === 'object' ? src.cache : null;
+  const limits = Array.isArray(src.limits) ? src.limits : [];
+  if (!git && !cache && !limits.length) return null;
+  return { git, cache, limits };
+}
+
+function applySessionVitals(raw = {}) {
+  const data = raw?.data && typeof raw.data === 'object' ? raw.data : raw;
+  const sid = String(data?.session_id || data?.sessionId || '').trim();
+  if (!sid) return;
+  const vitals = normalizeSessionVitals(data);
+  for (const id of sessionGoalUpdateIds(sid)) {
+    const meta = { ...(sessionMetadataById.get(id) || {}), vitals };
+    sessionMetadataById.set(id, meta);
+    if (sessionWindows.has(id)) {
+      renderSessionWindowVitals(sessionWindows.get(id), vitals);
+    }
+  }
+}
+
+function applySessionVitalsFromReplayEntries(entries) {
+  if (!Array.isArray(entries)) return;
+  for (const entry of entries) {
+    if (entry?.event !== 'session_vitals') continue;
+    applySessionVitals(entry);
+  }
+}
+
 function sessionWindowMetaFromSession(session) {
   if (!session || typeof session !== 'object') return {};
   const meta = {
@@ -35552,6 +35793,8 @@ function ensureSessionWindow(sessionId, meta = {}) {
   goal.appendChild(goalText);
   const tier = document.createElement('span');
   tier.className = 'session-window-tier hidden';
+  const vitals = document.createElement('span');
+  vitals.className = 'session-window-vitals hidden';
   header.title = 'Click header to collapse or expand';
   const menuControls = document.createElement('div');
   menuControls.className = 'session-window-action-cluster session-window-menu-cluster';
@@ -35607,6 +35850,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   header.appendChild(title);
   header.appendChild(goal);
   header.appendChild(tier);
+  header.appendChild(vitals);
   header.appendChild(status);
   header.appendChild(menuControls);
   header.appendChild(windowControls);
@@ -35705,6 +35949,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     goal,
     goalText,
     tier,
+    vitals,
     source: meta.source || '',
     actionMenuButton: actions,
     actionMenu,
@@ -35810,6 +36055,7 @@ function updateSessionWindow(sessionId, meta = {}) {
   }
   renderSessionWindowGoal(win, meta.goal || null);
   renderSessionWindowTier(win);
+  renderSessionWindowVitals(win, (sessionMetadataById.get(sid) || {}).vitals || meta.vitals || null);
   refreshSessionGoalTicker();
   updateSessionWindowActionMenuVisibility(sid);
   updateControlFastButtonState();
@@ -60682,7 +60928,7 @@ function renderStatsKpiRow(sessions) {
     .filter(bucket => bucket.total > 0).length;
   row.innerHTML = [
     statsKpiTileHtml('Today cost', formatUsdCompact(totals.todayCost)),
-    statsKpiTileHtml('Week cost', formatUsdCompact(totals.weekCost)),
+    statsKpiTileHtml('7-day cost', formatUsdCompact(totals.weekCost)),
     statsKpiTileHtml('All-time cost', formatUsdCompact(totals.allCost)),
     statsKpiTileHtml('Lifetime tokens', formatCompactNumber(totals.allTokens)),
     statsKpiTileHtml('Active days', activeDays.toLocaleString()),
@@ -60886,9 +61132,13 @@ function sessionUsageEntries(session) {
   }];
 }
 
-function usageEntryInCalendarWeek(day, todayIso) {
+// Rolling window: today plus the six preceding days, in local time.
+// (Was a Sunday-anchored calendar week, which made the "week" numbers
+// equal the "today" numbers every Sunday.)
+function usageEntryInLast7Days(day, todayIso) {
   if (!day || !todayIso || day > todayIso) return false;
-  return day >= startOfWeekIso(todayIso);
+  const start = addIsoDays(todayIso, -6);
+  return !!start && day >= start;
 }
 
 function summarizeSessionUsage(sessions) {
@@ -60913,7 +61163,7 @@ function summarizeSessionUsage(sessions) {
       totals.allTokens += entry.total;
       totals.allCost += entry.cost;
       if (entry.day === todayIso) totals.todayCost += entry.cost;
-      if (usageEntryInCalendarWeek(entry.day, todayIso)) totals.weekCost += entry.cost;
+      if (usageEntryInLast7Days(entry.day, todayIso)) totals.weekCost += entry.cost;
     }
   }
   return totals;
@@ -60976,7 +61226,7 @@ function summarizeUsageByAgent(sessions) {
   const order = ['codex', 'claude', 'intendant', 'other'];
   const periods = [
     { key: 'today', label: 'Today' },
-    { key: 'week', label: 'This Week' },
+    { key: 'week', label: 'Last 7 Days' },
     { key: 'all', label: 'All Time' },
   ];
   const buckets = new Map();
@@ -60998,7 +61248,7 @@ function summarizeUsageByAgent(sessions) {
         if (
           period.key === 'all' ||
           (period.key === 'today' && entry.day === todayIso) ||
-          (period.key === 'week' && usageEntryInCalendarWeek(entry.day, todayIso))
+          (period.key === 'week' && usageEntryInLast7Days(entry.day, todayIso))
         ) {
           addEntryToAgentUsageBucket(bucketFor(key, period), sessionId, entry);
         }
@@ -61456,7 +61706,7 @@ function renderSessionStatsFallback(sessions) {
       grid.style.gridTemplateColumns = 'auto 1fr';
       grid.innerHTML = `
         <span class="label">Today</span><span class="value">${formatUsd(totals.todayCost, 2)}</span>
-        <span class="label">This Week</span><span class="value">${formatUsd(totals.weekCost, 2)}</span>
+        <span class="label">Last 7 Days</span><span class="value">${formatUsd(totals.weekCost, 2)}</span>
         <span class="label strong">All Time</span><span class="value">${formatUsd(totals.allCost, 2)}</span>
       `;
     }
@@ -61492,10 +61742,19 @@ function loadAllSessionsUsage(hostId, options = {}) {
     })
     .catch(err => {
       const currentHost = activeStatsHost || selfPeerId;
-      if (currentHost === hostId) {
-        setStatsSessionLoading(hostId, false);
-        renderAllSessionsUsageError(err.message || 'Failed to load session usage');
+      if (currentHost !== hostId) return;
+      setStatsSessionLoading(hostId, false);
+      // A failed refresh must not tear down a view the user already has:
+      // keep rendering the cached corpus and surface the failure as a
+      // toast. Only fall back to the destructive error card when there
+      // was never anything to show.
+      const cached = cachedStatsSessions(hostId);
+      if (Array.isArray(cached)) {
+        renderStatsSessionSections(cached);
+        showControlToast('error', 'Session usage refresh failed: ' + (err.message || 'network error'));
+        return;
       }
+      renderAllSessionsUsageError(err.message || 'Failed to load session usage');
     });
 }
 
@@ -61547,7 +61806,7 @@ function renderAllSessionsUsage(sessions) {
         todayCached += entry.cached;
         todayCost += entry.cost;
       }
-      if (usageEntryInCalendarWeek(entry.day, todayIso)) {
+      if (usageEntryInLast7Days(entry.day, todayIso)) {
         weekTotal += entry.total;
         weekInput += entry.input;
         weekOutput += entry.output;
@@ -61562,7 +61821,7 @@ function renderAllSessionsUsage(sessions) {
 
   const rows = [
     ['Today', todayTotal, todayInput, todayCached, todayOutput, todayCost],
-    ['This Week', weekTotal, weekInput, weekCached, weekOutput, weekCost],
+    ['Last 7 Days', weekTotal, weekInput, weekCached, weekOutput, weekCost],
     ['All Time', allTotal, allInput, allCached, allOutput, allCost],
   ];
 
@@ -61719,26 +61978,37 @@ function renderDiskUsage(sessions) {
   grid.innerHTML = cells.join('');
 }
 
+// Re-render the stats sections after an in-section interaction (view or
+// agent toggle, heatmap day select). If the session cache has no entry
+// for the current host — a reload or transport reconnect raced the click
+// — refetch instead of letting the cache-miss path blank the whole
+// section stack under the user's cursor.
+function rerenderStatsSectionsOrReload() {
+  const hostKey = currentStatsHostKey();
+  if (renderCachedStatsSessionSections(hostKey)) return;
+  loadAllSessionsUsage(hostKey);
+}
+
 function selectTokenActivityDayFromCell(cell) {
   if (!cell || cell.classList.contains('future')) return;
   const day = cell.dataset.day;
   if (!day) return;
   tokenActivitySelectedDay = day;
-  renderCachedStatsSessionSections(currentStatsHostKey());
+  rerenderStatsSectionsOrReload();
 }
 
 document.getElementById('token-activity-agent')?.addEventListener('click', (event) => {
   const btn = event.target.closest('button[data-agent]');
   if (!btn || btn.disabled) return;
   tokenActivityAgent = btn.dataset.agent || 'codex';
-  renderCachedStatsSessionSections(currentStatsHostKey());
+  rerenderStatsSectionsOrReload();
 });
 
 document.getElementById('token-activity-view')?.addEventListener('click', (event) => {
   const btn = event.target.closest('button[data-view]');
   if (!btn || btn.disabled) return;
   tokenActivityView = btn.dataset.view || 'daily';
-  renderCachedStatsSessionSections(currentStatsHostKey());
+  rerenderStatsSectionsOrReload();
 });
 
 document.getElementById('token-activity-heatmap')?.addEventListener('click', (event) => {

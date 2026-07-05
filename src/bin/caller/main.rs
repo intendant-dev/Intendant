@@ -59,6 +59,7 @@ mod session_identity;
 mod session_log;
 mod session_names;
 mod session_supervisor;
+mod session_vitals;
 mod setup;
 mod skills;
 mod sub_agent;

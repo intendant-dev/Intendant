@@ -265,6 +265,222 @@ pub(crate) fn parse_goal_token_budget(
     Ok(Some(Some(budget)))
 }
 
+/// Canonicalize a plan-entry status for `AgentEvent::PlanUpdate` so every
+/// backend speaks the same vocabulary ("pending" / "inprogress" /
+/// "completed"): lowercase with separators stripped, mapping Codex's
+/// "in_progress" and Claude Code's TodoWrite statuses alike.
+pub(crate) fn normalize_plan_status(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+/// One standing operator goal, as tracked by the wrapper-level engine.
+#[derive(Debug)]
+pub(crate) struct GoalState {
+    pub(crate) objective: String,
+    /// Same status vocabulary as Codex goals (`normalize_goal_status`).
+    pub(crate) status: String,
+    pub(crate) token_budget: Option<u64>,
+    pub(crate) set_at: std::time::Instant,
+    /// Fresh-token counter snapshot when the goal was set; spend against
+    /// the budget is measured from here.
+    pub(crate) tokens_at_set: u64,
+}
+
+/// What a dispatched goal op did, for the host loop to act on: emit the
+/// matching goal event, deliver the notice to the model (mid-turn steer or
+/// next-prompt prelude — delivery is host-specific), and report `message`
+/// back to the caller.
+#[derive(Debug)]
+pub(crate) enum GoalActionOutcome {
+    /// Read-only op (`goal` / `goal-get`): no state change. `goal` is the
+    /// current snapshot when one is active (hosts re-emit it so frontends
+    /// refresh), `None` when there is no goal.
+    Report {
+        message: String,
+        goal: Option<crate::types::SessionGoal>,
+    },
+    /// The goal was cleared; `notice` tells the model.
+    Cleared { message: String, notice: String },
+    /// The goal was set or updated; `notice` (when present) tells the
+    /// model about the new objective / pause.
+    Updated {
+        message: String,
+        goal: crate::types::SessionGoal,
+        notice: Option<String>,
+    },
+}
+
+/// Backend-agnostic operator-goal engine: the op semantics, status/budget
+/// vocabulary, spend accounting, and notice texts of the `/goal` family in
+/// one place. Hosts own delivery and event emission: the Claude Code
+/// adapter wraps this in its shared state (steer mid-turn, prelude when
+/// idle), and the native session loop drives the same engine so every
+/// backend speaks one goal dialect. Engine state is per-process by design
+/// — after a resume the chip rehydrates from the session log but the
+/// engine starts empty.
+#[derive(Debug, Default)]
+pub(crate) struct GoalEngine {
+    goal: Option<GoalState>,
+}
+
+impl GoalEngine {
+    /// Current goal as the wire type (elapsed + budget spend computed from
+    /// `fresh_tokens_now`, the host's cumulative fresh-token counter).
+    pub(crate) fn snapshot(&self, fresh_tokens_now: u64) -> Option<crate::types::SessionGoal> {
+        let goal = self.goal.as_ref()?;
+        Some(crate::types::SessionGoal {
+            objective: goal.objective.clone(),
+            status: Some(goal.status.clone()),
+            elapsed_seconds: Some(goal.set_at.elapsed().as_secs()),
+            tokens_used: Some(fresh_tokens_now.saturating_sub(goal.tokens_at_set)),
+            token_budget: goal.token_budget,
+        })
+    }
+
+    /// Refresh after a turn result: recompute spend, flip an `active` goal
+    /// to `budgetLimited` when the budget is exhausted, and return the
+    /// updated snapshot for a goal-updated emission.
+    pub(crate) fn refresh_after_result(
+        &mut self,
+        fresh_tokens_now: u64,
+    ) -> Option<crate::types::SessionGoal> {
+        {
+            let goal = self.goal.as_mut()?;
+            let used = fresh_tokens_now.saturating_sub(goal.tokens_at_set);
+            if goal.status == "active" && goal.token_budget.is_some_and(|budget| used >= budget) {
+                goal.status = "budgetLimited".to_string();
+            }
+        }
+        self.snapshot(fresh_tokens_now)
+    }
+
+    /// Execute one `goal*` op against the engine. Pure state transition —
+    /// the returned outcome tells the host what to emit and deliver.
+    pub(crate) fn dispatch(
+        &mut self,
+        op: &str,
+        params: &serde_json::Value,
+        fresh_tokens_now: u64,
+    ) -> Result<GoalActionOutcome, CallerError> {
+        let clear_requested = op == "goal-clear"
+            || params
+                .get("clear")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        if clear_requested {
+            if self.goal.take().is_none() {
+                return Ok(GoalActionOutcome::Report {
+                    message: "no active goal".to_string(),
+                    goal: None,
+                });
+            }
+            return Ok(GoalActionOutcome::Cleared {
+                message: "goal cleared".to_string(),
+                notice: "[Operator goal cleared — no standing goal is in effect.]".to_string(),
+            });
+        }
+
+        let implied_status = match op {
+            "goal-pause" => Some("paused"),
+            "goal-resume" => Some("active"),
+            "goal-complete" => Some("complete"),
+            "goal-budget-limited" => Some("budgetLimited"),
+            _ => None,
+        };
+        let status = match params.get("status").and_then(|v| v.as_str()) {
+            Some(raw) => Some(normalize_goal_status(raw)?),
+            None => implied_status.map(str::to_string),
+        };
+        let objective = params
+            .get("objective")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(ref objective) = objective {
+            validate_goal_objective(objective)?;
+        }
+        let token_budget = parse_goal_token_budget(params)?;
+
+        let is_update =
+            objective.is_some() || status.is_some() || token_budget.is_some() || op == "goal-set";
+        if !is_update {
+            // goal / goal-get / goal-status with no fields: report.
+            return Ok(match self.snapshot(fresh_tokens_now) {
+                Some(goal) => GoalActionOutcome::Report {
+                    message: format!(
+                        "goal {}: {}",
+                        goal.status.as_deref().unwrap_or("active"),
+                        goal.objective
+                    ),
+                    goal: Some(goal),
+                },
+                None => GoalActionOutcome::Report {
+                    message: "no active goal".to_string(),
+                    goal: None,
+                },
+            });
+        }
+
+        let objective_changed = objective.is_some();
+        let resumed = status.as_deref() == Some("active");
+        match self.goal.as_mut() {
+            Some(goal) => {
+                if let Some(objective) = objective {
+                    goal.objective = objective;
+                }
+                if let Some(status) = status {
+                    goal.status = status;
+                }
+                if let Some(budget) = token_budget {
+                    goal.token_budget = budget;
+                }
+            }
+            None => {
+                let Some(objective) = objective else {
+                    return Err(CallerError::ExternalAgent(
+                        "no active goal — set an objective first".into(),
+                    ));
+                };
+                self.goal = Some(GoalState {
+                    objective,
+                    status: status.unwrap_or_else(|| "active".to_string()),
+                    token_budget: token_budget.flatten(),
+                    set_at: std::time::Instant::now(),
+                    tokens_at_set: fresh_tokens_now,
+                });
+            }
+        }
+        let goal = self
+            .snapshot(fresh_tokens_now)
+            .expect("goal was just set or updated");
+        let notice = if objective_changed || resumed {
+            let mut notice = format!("[Operator goal] {}", goal.objective);
+            if let Some(budget) = goal.token_budget {
+                notice.push_str(&format!(" (token budget: {budget})"));
+            }
+            Some(notice)
+        } else if goal.status.as_deref() == Some("paused") {
+            Some("[Operator goal paused — deprioritize it until resumed.]".to_string())
+        } else {
+            None
+        };
+        Ok(GoalActionOutcome::Updated {
+            message: format!(
+                "goal {}: {}",
+                goal.status.as_deref().unwrap_or("active"),
+                goal.objective
+            ),
+            goal,
+            notice,
+        })
+    }
+}
+
 /// One image attachment passed alongside a user message.
 ///
 /// Codex prefers file paths to keep base64 out of the JSON-RPC stream. We keep
@@ -1247,6 +1463,64 @@ pub trait ExternalAgent: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goal_engine_dispatch_outcomes_cover_report_clear_update() {
+        let mut engine = GoalEngine::default();
+
+        // No goal yet: read ops report calmly, status ops refuse.
+        match engine.dispatch("goal-get", &serde_json::Value::Null, 0) {
+            Ok(GoalActionOutcome::Report { message, goal }) => {
+                assert_eq!(message, "no active goal");
+                assert!(goal.is_none());
+            }
+            other => panic!("expected calm report, got {other:?}"),
+        }
+        assert!(engine
+            .dispatch("goal-pause", &serde_json::Value::Null, 0)
+            .is_err());
+
+        // Set: Updated with an operator notice carrying the budget.
+        let params = serde_json::json!({ "objective": "ship it", "tokenBudget": 1000 });
+        match engine.dispatch("goal-set", &params, 100) {
+            Ok(GoalActionOutcome::Updated { goal, notice, .. }) => {
+                assert_eq!(goal.status.as_deref(), Some("active"));
+                assert_eq!(goal.tokens_used, Some(0));
+                let notice = notice.expect("new objective notifies the model");
+                assert!(notice.contains("[Operator goal] ship it"));
+                assert!(notice.contains("token budget: 1000"));
+            }
+            other => panic!("expected update, got {other:?}"),
+        }
+
+        // Spend counts from the fresh-token snapshot at set time; the
+        // budget flip happens in refresh_after_result.
+        let goal = engine.refresh_after_result(1200).expect("goal active");
+        assert_eq!(goal.status.as_deref(), Some("budgetLimited"));
+        assert_eq!(goal.tokens_used, Some(1100));
+
+        // Pause notice; resume notice re-states the objective.
+        match engine.dispatch("goal-pause", &serde_json::Value::Null, 1200) {
+            Ok(GoalActionOutcome::Updated { notice, .. }) => {
+                assert!(notice.expect("pause notifies").contains("paused"));
+            }
+            other => panic!("expected update, got {other:?}"),
+        }
+
+        // Clear: outcome carries the cleared notice; second clear is calm.
+        match engine.dispatch("goal-clear", &serde_json::Value::Null, 1200) {
+            Ok(GoalActionOutcome::Cleared { notice, .. }) => {
+                assert!(notice.contains("goal cleared"));
+            }
+            other => panic!("expected clear, got {other:?}"),
+        }
+        match engine.dispatch("goal-clear", &serde_json::Value::Null, 1200) {
+            Ok(GoalActionOutcome::Report { message, .. }) => {
+                assert_eq!(message, "no active goal")
+            }
+            other => panic!("expected calm report, got {other:?}"),
+        }
+    }
 
     #[test]
     fn from_str_loose_codex() {

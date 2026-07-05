@@ -1188,7 +1188,10 @@ function stationBuildControlsSummary() {
     launchCommand: launchReadiness.command || '',
     launchTaskChars: stationNum(launchReadiness.taskChars),
     launchProject: launchReadiness.project ? compactPathLabel(launchReadiness.project, true) : '',
-    launchMode: launchReadiness.direct ? 'direct' : 'orchestrated',
+    // 'auto' | 'orchestrate' | 'direct' for the internal agent; empty when
+    // execution does not apply (external agent) so the canvas hides the
+    // pills.
+    launchMode: launchReadiness.executionApplies ? (launchReadiness.execution || 'auto') : '',
     launchAttachments: stationNum(launchReadiness.attachments),
     launchNotice: launchReadiness.notice || '',
   };
@@ -1488,6 +1491,16 @@ function stationDisplayRunwaySnapshot(controls = null) {
 
 function stationAgentForSelf(usage) {
   const phase = normalizeStationPhase(currentPhase);
+  // Goal fields light the scene's goal ring + the focus-panel goal row for
+  // the primary session too (session_id stays unset on purpose: the
+  // primary node keeps the classic agent focus panel, not session pills).
+  let goal = null;
+  if (currentSessionFullId) {
+    try {
+      const meta = sessionMetadataById.get(String(currentSessionFullId)) || {};
+      goal = normalizeSessionGoal(meta.goal || meta.session_goal || meta.sessionGoal || null);
+    } catch (_) {}
+  }
   return {
     id: 'primary-agent',
     hostId: selfPeerId,
@@ -1512,6 +1525,11 @@ function stationAgentForSelf(usage) {
     approvalId: stationCurrentApproval && stationCurrentApproval.id,
     approvalCommand: stationCurrentApproval && stationCurrentApproval.command || '',
     approvalCategory: stationCurrentApproval && stationCurrentApproval.category || '',
+    goalStatus: goal ? String(goal.status || '') : '',
+    goalObjective: goal ? String(goal.objective || '') : '',
+    goalTokens: goal && goal.tokensUsed !== null && goal.tokensUsed !== undefined
+      ? String(goal.tokensUsed)
+      : '',
   };
 }
 
@@ -1682,6 +1700,77 @@ function stationSessionAgentsInner() {
       canInterrupt: active,
     });
   }
+  // Recent (closed-window) sessions join as dim, inert nodes. The scene is
+  // deliberately a bounded constellation — the freshest few, not the whole
+  // archive; the sessions panel remains the exhaustive list.
+  const RECENT_SCENE_NODES = 6;
+  try {
+    const { sortedSessions } = stationCollectSessionSet();
+    let added = 0;
+    for (const session of sortedSessions) {
+      if (added >= RECENT_SCENE_NODES) break;
+      const id = String(
+        session?.session_id || session?.resume_id || session?.backend_session_id || ''
+      ).trim();
+      if (!id || primaryIds.has(id) || liveIds.has(id)) continue;
+      // The daemon's own log id may differ from currentSessionFullId —
+      // it is the primary node, not an archived session.
+      if (id === String(daemonSessionFullId || '') || id === String(foregroundSessionFullId || '')) continue;
+      const meta = sessionMetadataById.get(id) || {};
+      const kind = String(meta.relationshipKind || '').trim();
+      const source = normalizeAgentId(
+        session?.backend_source || session?.source || meta.backendSource || meta.source || ''
+      ) || '';
+      const goal = meta.goal && typeof meta.goal === 'object' ? meta.goal : null;
+      const parentSid = String(meta.parentId || '').trim();
+      let parentNodeId = null;
+      if (parentSid) {
+        if (primaryIds.has(parentSid)) parentNodeId = 'primary-agent';
+        else if (liveIds.has(parentSid)) parentNodeId = 'session-' + sanitizeStationId(parentSid);
+      }
+      const name = compactSessionText(session?.name || meta.name || meta.displayName || '');
+      const task = name
+        || compactSessionText(session?.task || meta.initial_message || meta.initialMessage || '')
+        || shortSessionId(id);
+      out.push({
+        id: 'session-' + sanitizeStationId(id),
+        hostId: selfPeerId,
+        role: kind === 'subagent'
+          ? 'sub-agent'
+          : (source && source !== 'intendant' ? 'external' : 'session'),
+        phase: 'idle',
+        status: 'idle',
+        task,
+        provider: String(session?.provider || ''),
+        model: String(session?.model || ''),
+        tokens: stationNum(session?.total_tokens),
+        tokenCap: 0,
+        prompt: stationNum(session?.prompt_tokens),
+        completion: stationNum(session?.completion_tokens),
+        cached: stationNum(session?.cached_tokens),
+        cost: 0,
+        turns: stationNum(session?.turns),
+        turnCap: 0,
+        autonomy: '',
+        worktree: String(sessionProjectDirectory(session) || ''),
+        parentId: parentNodeId,
+        needsApproval: false,
+        approvalId: null,
+        approvalCommand: '',
+        approvalCategory: '',
+        sessionId: id,
+        source,
+        relationshipKind: kind,
+        goalStatus: goal ? String(goal.status || '') : '',
+        goalObjective: goal ? String(goal.objective || '') : '',
+        goalTokens: '',
+        threadActions: [],
+        canInterrupt: false,
+        recent: true,
+      });
+      added += 1;
+    }
+  } catch (_) {}
   return out;
 }
 

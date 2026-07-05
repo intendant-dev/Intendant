@@ -1492,6 +1492,22 @@ impl SessionLog {
         });
     }
 
+    pub fn session_vitals(&mut self, session_id: &str, vitals: &crate::types::SessionVitals) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "session_vitals".to_string(),
+            level: Some("debug".to_string()),
+            message: Some(format!("Session vitals: {}", session_id)),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "vitals": vitals,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log a session ending (MCP multi-task).
     pub fn session_ended(&mut self, session_id: &str, reason: &str) {
         self.emit(LogEvent {
@@ -3337,6 +3353,17 @@ pub fn session_log_entry_to_app_event(
                 }
             });
             Some(AppEvent::SessionGoal { session_id, goal })
+        }
+        "session_vitals" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let vitals = data.and_then(|d| d.get("vitals")).and_then(|v| {
+                serde_json::from_value::<crate::types::SessionVitals>(v.clone()).ok()
+            })?;
+            Some(AppEvent::SessionVitals { session_id, vitals })
         }
         "session_ended" => {
             let session_id = data

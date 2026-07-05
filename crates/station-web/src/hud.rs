@@ -10,10 +10,11 @@ use crate::input::{HitAction, HitZone, ViewSliderKey};
 use crate::model::activity_retained_count;
 use crate::scene::{ndc_to_screen, LayoutName, Mood, NodeKind, ProjectedNode, Vec2};
 use crate::util::{
-    attention_level_color_css, css_rgba, fmt_compact, hex_color, level_color_css, nonempty,
-    pct_label, percent, phase_color_css, pressure_color, tone_color_css, truncate, Color, C_BLUE,
-    C_BLUE_CSS, C_GREEN_CSS, C_LAVENDER, C_LAVENDER_CSS, C_MAUVE_CSS, C_OVERLAY1, C_OVERLAY1_CSS,
-    C_PEACH, C_PEACH_CSS, C_RED_CSS, C_SUBTEXT0_CSS, C_TEAL, C_TEAL_CSS, C_TEXT_CSS, C_YELLOW_CSS,
+    attention_level_color_css, css_rgba, fmt_compact, goal_status_color_css, hex_color,
+    level_color_css, nonempty, pct_label, percent, phase_color_css, pressure_color,
+    tone_color_css, truncate, Color, C_BLUE, C_BLUE_CSS, C_GREEN_CSS, C_LAVENDER, C_LAVENDER_CSS,
+    C_MAUVE_CSS, C_OVERLAY1, C_OVERLAY1_CSS, C_PEACH, C_PEACH_CSS, C_RED_CSS, C_SUBTEXT0_CSS,
+    C_TEAL, C_TEAL_CSS, C_TEXT_CSS, C_YELLOW_CSS,
 };
 use crate::StationInner;
 
@@ -542,12 +543,7 @@ impl StationInner {
             "normal",
         );
         if !goal_status.is_empty() && tall_deck {
-            let goal_color = match goal_status {
-                "active" => C_GREEN_CSS,
-                "paused" | "budgetLimited" | "budget-limited" => C_YELLOW_CSS,
-                "completed" | "complete" => C_BLUE_CSS,
-                _ => C_LAVENDER_CSS,
-            };
+            let goal_color = goal_status_color_css(goal_status);
             let mut goal_line = format!(
                 "goal {}: {}",
                 goal_status,
@@ -2470,7 +2466,7 @@ impl StationInner {
 
     /// The composer strip: canvas-drawn chrome for the DOM input overlay.
     /// Send mode: target chip + input slot + send. Launch mode: input slot
-    /// + agent choice pills + direct toggle + launch.
+    /// + agent choice pills + execution pills + launch.
     fn draw_composer_strip(&mut self, w: f32, h: f32) {
         let (x, y, sw, sh) = self.composer_rect(w, h);
         let controls = &self.snapshot.controls;
@@ -2555,8 +2551,26 @@ impl StationInner {
         }
 
         if launch {
-            // Agent choice pills + direct-mode toggle.
+            // Agent choice pills + execution shape pills. An empty
+            // launch_mode means execution does not apply (external agent
+            // selected); the agent pills then reclaim the full row.
             self.text("agent", x + 16.0, y + 70.0, 8.0, C_TEAL_CSS, "bold");
+            let execution = controls.launch_mode.as_str();
+            let exec_pills = [
+                ("auto", "auto", C_TEAL_CSS),
+                ("orch", "orchestrate", C_LAVENDER_CSS),
+                ("direct", "direct", C_PEACH_CSS),
+            ];
+            let exec_w = exec_pills
+                .iter()
+                .map(|(label, _, _)| label.chars().count() as f32 * 5.8 + 16.0 + 4.0)
+                .sum::<f32>()
+                - 4.0;
+            let agent_limit = if execution.is_empty() {
+                x + sw - 16.0
+            } else {
+                x + sw - exec_w - 24.0
+            };
             let mut cx = x + 58.0;
             let selected_agent = controls.launch_agent.as_str();
             for (label, id) in [
@@ -2566,7 +2580,7 @@ impl StationInner {
                 ("claude", "claude-code"),
             ] {
                 let cw = label.chars().count() as f32 * 5.8 + 16.0;
-                if cx + cw > x + sw - 86.0 {
+                if cx + cw > agent_limit {
                     break;
                 }
                 let active = selected_agent == id;
@@ -2590,25 +2604,32 @@ impl StationInner {
                 ));
                 cx += cw + 6.0;
             }
-            let direct = controls.launch_mode == "direct";
-            self.pill_at(
-                x + sw - 80.0,
-                y + 58.0,
-                64.0,
-                21.0,
-                "direct",
-                if direct { C_PEACH_CSS } else { C_OVERLAY1_CSS },
-                direct,
-            );
-            self.hit_zones.push(HitZone::new(
-                x + sw - 80.0,
-                y + 58.0,
-                64.0,
-                21.0,
-                HitAction::ControlsAction {
-                    action: "launch-direct:toggle".into(),
-                },
-            ));
+            if !execution.is_empty() {
+                let mut ex = x + sw - exec_w - 16.0;
+                for (label, value, accent) in exec_pills {
+                    let cw = label.chars().count() as f32 * 5.8 + 16.0;
+                    let active = execution == value;
+                    self.pill_at(
+                        ex,
+                        y + 58.0,
+                        cw,
+                        21.0,
+                        label,
+                        if active { accent } else { C_OVERLAY1_CSS },
+                        active,
+                    );
+                    self.hit_zones.push(HitZone::new(
+                        ex,
+                        y + 58.0,
+                        cw,
+                        21.0,
+                        HitAction::ControlsAction {
+                            action: format!("launch-execution:{value}"),
+                        },
+                    ));
+                    ex += cw + 4.0;
+                }
+            }
         } else {
             // Target chip: click opens the sessions panel to retarget.
             let chip_w = 70.0;
@@ -2906,7 +2927,9 @@ impl StationInner {
         let y = (activity_lane_y - panel_h - 12.0).max(58.0);
         let phase = phase_color_css(&agent.phase);
         self.focus_panel_frame(x, y, panel_w, panel_h, &agent.id, phase);
-        let subtitle = if is_session {
+        let subtitle = if is_session && agent.recent {
+            format!("recent {} session", nonempty(&agent.source, "intendant"))
+        } else if is_session {
             format!("{} session", nonempty(&agent.source, "intendant"))
         } else {
             format!("{} agent", nonempty(&agent.role, "agent"))
@@ -2994,12 +3017,7 @@ impl StationInner {
         }
         if has_goal {
             let status = agent.goal_status.trim();
-            let goal_color = match status {
-                "active" => C_GREEN_CSS,
-                "paused" | "budgetLimited" | "budget-limited" => C_YELLOW_CSS,
-                "completed" | "complete" => C_BLUE_CSS,
-                _ => C_LAVENDER_CSS,
-            };
+            let goal_color = goal_status_color_css(status);
             let mut goal_text = if status.is_empty() {
                 agent.goal_objective.trim().to_string()
             } else if agent.goal_objective.trim().is_empty() {
@@ -3070,16 +3088,23 @@ impl StationInner {
             let py = row_y - 2.0;
             let mut px = x + 96.0;
             let mut pills: Vec<(&str, &str, &str)> =
-                vec![("log", C_BLUE_CSS, "station-log"), ("target", C_TEAL_CSS, "target")];
-            pills.push(("steer", C_LAVENDER_CSS, "steer"));
-            if agent.can_interrupt {
-                pills.push(("stop", C_RED_CSS, "interrupt"));
-            }
-            if ops.iter().any(|op| op == "compact") {
-                pills.push(("compact", C_MAUVE_CSS, "thread-compact"));
-            }
-            if ops.iter().any(|op| op == "fork") {
-                pills.push(("fork", C_PEACH_CSS, "thread-fork"));
+                vec![("log", C_BLUE_CSS, "station-log")];
+            if agent.recent {
+                // A closed session can be read or brought back — nothing
+                // else applies to it.
+                pills.push(("resume", C_GREEN_CSS, "resume"));
+            } else {
+                pills.push(("target", C_TEAL_CSS, "target"));
+                pills.push(("steer", C_LAVENDER_CSS, "steer"));
+                if agent.can_interrupt {
+                    pills.push(("stop", C_RED_CSS, "interrupt"));
+                }
+                if ops.iter().any(|op| op == "compact") {
+                    pills.push(("compact", C_MAUVE_CSS, "thread-compact"));
+                }
+                if ops.iter().any(|op| op == "fork") {
+                    pills.push(("fork", C_PEACH_CSS, "thread-fork"));
+                }
             }
             for (label, color, action) in pills {
                 let pw = label.chars().count() as f32 * 6.1 + 18.0;

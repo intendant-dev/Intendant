@@ -264,6 +264,17 @@ pub(crate) async fn run_daemon(
             },
         );
 
+        // Vitals chips for the daemon's primary session: git state of the
+        // project root (statusline port).
+        let _vitals_producer = if let Some(session_id) = session_log_id(&session_log) {
+            Some(session_vitals::spawn_session_vitals_producer(
+                bus.clone(),
+                vec![(session_id, project.root.clone())],
+            ))
+        } else {
+            None
+        };
+
         let startup_bus = bus.clone();
         let supervisor_handle = session_supervisor::SessionSupervisor::new(
             session_supervisor::SessionSupervisorConfig {

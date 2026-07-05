@@ -205,6 +205,18 @@ function stationEffectiveLaunchAgent() {
   return normalizeAgentId(selected) || newSessionConfiguredAgent || '';
 }
 
+// Execution shape (auto / orchestrate / direct) only applies to the
+// internal agent — external CLIs run their own loops.
+function stationLaunchExecutionApplies(agent = stationEffectiveLaunchAgent()) {
+  return !agent || agent === 'internal' || agent === 'intendant';
+}
+
+function stationLaunchExecution() {
+  if (!stationLaunchExecutionApplies()) return '';
+  const mode = String(stationLaunchDraft.execution || '');
+  return mode === 'orchestrate' || mode === 'direct' ? mode : '';
+}
+
 
 function stationLaunchCommandForAgent(agent) {
   const backend = normalizeAgentId(agent);
@@ -263,7 +275,8 @@ function stationBuildLaunchReadiness() {
     taskChars: task.length,
     project,
     attachments,
-    direct: !!stationLaunchDraft.direct || !!document.getElementById('direct-mode-toggle')?.checked,
+    executionApplies: stationLaunchExecutionApplies(agent),
+    execution: stationLaunchExecution(),
     notice: stationLaunchNoticeText(),
     codex,
     managed: codex ? (stationLaunchDraftValue('managed', newSessionCodexManagedContext || controlCodexConfig.managed_context || 'vanilla')) : '',
@@ -360,7 +373,17 @@ async function stationStartSession() {
       }
     }
   }
-  if (stationLaunchDraft.direct) msg.direct = true;
+  // Execution shape: an explicit per-launch choice beats the global Direct
+  // toggle; Auto (or an external agent — the pills are hidden and the draft
+  // choice inert then) preserves the old behavior of the toggle forcing
+  // direct.
+  const execution = stationLaunchExecution();
+  const globalDirect = document.getElementById('direct-mode-toggle')?.checked || false;
+  if (execution === 'orchestrate') {
+    msg.orchestrate = true;
+  } else if (execution === 'direct' || globalDirect) {
+    msg.direct = true;
+  }
   if (Array.isArray(pendingAttachments) && pendingAttachments.length > 0) {
     msg.attachments = pendingAttachments.map(a => a.frameId).filter(Boolean);
   }
@@ -1483,8 +1506,10 @@ function stationHandleControlsAction(action) {
     stationScheduleUpdate({ immediate: true });
     return;
   }
-  if (op === 'launch-direct:toggle') {
-    stationLaunchDraft.direct = !stationLaunchDraft.direct;
+  if (op.startsWith('launch-execution:')) {
+    const mode = op.slice('launch-execution:'.length).trim();
+    if (!['auto', 'orchestrate', 'direct'].includes(mode)) return;
+    stationLaunchDraft.execution = mode === 'auto' ? '' : mode;
     stationScheduleUpdate({ immediate: true });
     return;
   }

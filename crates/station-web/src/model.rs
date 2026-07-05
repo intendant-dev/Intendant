@@ -119,6 +119,10 @@ pub(crate) struct StationAgent {
     /// vocabulary); gates the focus panel's action pills.
     pub(crate) thread_actions: Vec<String>,
     pub(crate) can_interrupt: bool,
+    /// A recent (closed-window) session shown as a dim, inert constellation
+    /// node: dimmed body, no pressure/phase rings, and the focus panel
+    /// offers log + resume instead of the live-session pills.
+    pub(crate) recent: bool,
 }
 
 impl Default for StationAgent {
@@ -155,6 +159,7 @@ impl Default for StationAgent {
             goal_tokens: String::new(),
             thread_actions: Vec::new(),
             can_interrupt: false,
+            recent: false,
         }
     }
 }
@@ -944,6 +949,12 @@ mod tests {
                 "goalTokens": "1234",
                 "threadActions": ["compact", "fork"],
                 "canInterrupt": true
+            }, {
+                "id": "session-old",
+                "hostId": "local",
+                "role": "session",
+                "sessionId": "old",
+                "recent": true
             }]
         }))
         .expect("session node should deserialize");
@@ -957,6 +968,9 @@ mod tests {
         assert_eq!(agent.thread_actions, vec!["compact", "fork"]);
         assert!(agent.can_interrupt);
         assert_eq!(agent.parent_id.as_deref(), Some("session-parent"));
+        // Live nodes never send the flag; recent (closed-window) nodes do.
+        assert!(!agent.recent);
+        assert!(snapshot.agents[1].recent);
     }
 
     #[test]

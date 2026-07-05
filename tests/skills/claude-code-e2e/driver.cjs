@@ -581,6 +581,14 @@ async function main() {
     );
     check('task-launch-metadata-suppressed', !metadataLeak,
       metadataLeak ? `${metadataLeak.event}: ${(metadataLeak.summary || metadataLeak.content || metadataLeak.stdout || '').slice(0, 80)}` : '');
+
+    // (No TodoWrite phase: CC 2.1.201 print mode does not enable TodoWrite —
+    // asking for it yields "TodoWrite exists but is not enabled in this
+    // context" and the session exposes the Task tools (TaskCreate /
+    // TaskUpdate / …) instead, verified with a bare `claude -p` probe in the
+    // adapter's exact spawn shape. The TodoWrite → PlanUpdate translation is
+    // pinned by adapter unit tests; live plan surfacing for supervised
+    // sessions arrives with the Task-tools → PlanUpdate mapping.)
   } finally {
     await run.stop();
   }

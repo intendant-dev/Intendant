@@ -1015,6 +1015,7 @@ pub(crate) async fn run_agent_loop(
         loop_stats.usage.prompt_tokens += response.usage.prompt_tokens;
         loop_stats.usage.completion_tokens += response.usage.completion_tokens;
         loop_stats.usage.total_tokens += response.usage.total_tokens;
+        loop_stats.usage.cached_tokens += response.usage.cached_tokens;
         if !response.content.is_empty() {
             loop_stats.last_response = Some(response.content.clone());
         }
@@ -2238,6 +2239,7 @@ pub(crate) async fn run_round_loop(
         cumulative_stats.usage.prompt_tokens += stats.usage.prompt_tokens;
         cumulative_stats.usage.completion_tokens += stats.usage.completion_tokens;
         cumulative_stats.usage.total_tokens += stats.usage.total_tokens;
+        cumulative_stats.usage.cached_tokens += stats.usage.cached_tokens;
         cumulative_stats.rounds = round;
         // Carry the per-round terminal fields forward — the latest round's
         // values win. Sub-agent completion synthesis reads these off the

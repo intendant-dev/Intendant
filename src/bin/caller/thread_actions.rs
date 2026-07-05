@@ -285,6 +285,36 @@ pub(crate) fn emit_codex_session_capabilities_for_drain(
     });
 }
 
+/// The `goal*` op family served by the shared wrapper-level
+/// `external_agent::GoalEngine` — advertised identically by every host
+/// that runs the engine (the Claude Code adapter, the native session
+/// loop) so frontends see one goal dialect.
+pub(crate) const GOAL_THREAD_ACTION_OPS: [&str; 9] = [
+    "goal",
+    "goal-set",
+    "goal-edit",
+    "goal-get",
+    "goal-clear",
+    "goal-pause",
+    "goal-resume",
+    "goal-complete",
+    "goal-budget-limited",
+];
+
+pub(crate) fn goal_thread_action_op(op: &str) -> bool {
+    op == "goal" || op.starts_with("goal-")
+}
+
+/// Budget currency for goal engines: fresh tokens = uncached input +
+/// output. Cache reads are excluded so a budget measures real work, not
+/// re-reads — the same currency the Claude Code wrapper engine uses.
+pub(crate) fn goal_fresh_tokens(usage: &provider::TokenUsage) -> u64 {
+    usage
+        .prompt_tokens
+        .saturating_sub(usage.cached_tokens)
+        .saturating_add(usage.completion_tokens)
+}
+
 /// Thread actions the Claude Code adapter supports: `compact` dispatches a
 /// native `/compact` user message through `ClaudeCodeAgent::thread_action`;
 /// `fork` respawns a resumed process with `--fork-session` via the drain's
@@ -294,24 +324,47 @@ pub(crate) fn emit_codex_session_capabilities_for_drain(
 /// reconfigure the RUNNING process live via `set_model` /
 /// `set_permission_mode` control requests (verified on CC 2.1.201).
 pub(crate) fn claude_code_thread_action_capabilities() -> Vec<String> {
-    [
-        "compact",
-        "fork",
-        "goal",
-        "goal-set",
-        "goal-edit",
-        "goal-get",
-        "goal-clear",
-        "goal-pause",
-        "goal-resume",
-        "goal-complete",
-        "goal-budget-limited",
-        "model",
-        "permission-mode",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
+    ["compact", "fork"]
+        .into_iter()
+        .chain(GOAL_THREAD_ACTION_OPS)
+        .chain(["model", "permission-mode"])
+        .map(str::to_string)
+        .collect()
+}
+
+/// Capabilities of the primary NATIVE session: follow-up turns, mid-turn
+/// steering (the context-injection queue), interrupts, and the `goal*`
+/// family served by the shared `GoalEngine` running in the presence loop.
+/// The Codex-specific knobs stay unset so frontends keep those controls
+/// hidden.
+pub(crate) fn native_session_capabilities() -> types::SessionCapabilities {
+    types::SessionCapabilities {
+        follow_up: true,
+        steer: true,
+        interrupt: true,
+        thread_actions: GOAL_THREAD_ACTION_OPS
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        codex_thread_actions: Vec::new(),
+        codex_managed_context: None,
+        codex_sandbox: None,
+        codex_approval_policy: None,
+        codex_context_archive: None,
+        codex_command: None,
+        codex_fast_mode: None,
+        codex_service_tier: None,
+    }
+}
+
+pub(crate) fn emit_native_session_capabilities(bus: &EventBus, session_id: Option<&str>) {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    bus.send(AppEvent::SessionCapabilities {
+        session_id: session_id.to_string(),
+        capabilities: native_session_capabilities(),
+    });
 }
 
 /// Capabilities of a supervised Claude Code session: follow-up turns,
@@ -3253,6 +3306,44 @@ mod tests {
                 action
             );
         }
+    }
+
+    #[test]
+    fn native_capabilities_advertise_exactly_the_goal_family() {
+        let caps = native_session_capabilities();
+        assert!(caps.follow_up && caps.steer && caps.interrupt);
+        let expected: Vec<String> = GOAL_THREAD_ACTION_OPS
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(caps.thread_actions, expected);
+        // Every advertised op routes through the goal engine's dispatch.
+        for op in &caps.thread_actions {
+            assert!(goal_thread_action_op(op), "non-goal op advertised: {op}");
+        }
+        // The codex-named alias stays empty so codex-only UI never lights
+        // up on native sessions.
+        assert!(caps.codex_thread_actions.is_empty());
+        assert!(caps.codex_fast_mode.is_none());
+    }
+
+    #[test]
+    fn goal_fresh_tokens_excludes_cache_reads() {
+        let usage = provider::TokenUsage {
+            prompt_tokens: 1_000,
+            completion_tokens: 200,
+            total_tokens: 1_200,
+            cached_tokens: 900,
+        };
+        assert_eq!(goal_fresh_tokens(&usage), 300);
+        // Degenerate provider reports (cached > prompt) saturate at output.
+        let weird = provider::TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: 400,
+        };
+        assert_eq!(goal_fresh_tokens(&weird), 50);
     }
 
     #[test]

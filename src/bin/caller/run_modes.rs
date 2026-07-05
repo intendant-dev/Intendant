@@ -329,6 +329,14 @@ pub(crate) async fn run_with_presence(
     // just inside the drain) so actions still fire when the loop is idle,
     // waiting for the next task.
     let local_session_id = session_log_id(&session_log);
+    // Operator-goal engine for the NATIVE session (external backends run
+    // their own): answers the goal* thread actions between and during
+    // tasks, delivers notices via the context-injection queue, and
+    // measures budget spend in fresh tokens off cumulative_stats.
+    let mut native_goal_engine = external_agent::GoalEngine::default();
+    if shared_external_agent.read().await.is_none() {
+        emit_native_session_capabilities(&bus, local_session_id.as_deref());
+    }
     let mut outer_bus_rx = bus.subscribe();
     // Turn controls (steer / interrupt) need to be subscribed before the
     // turn-start RPC. Otherwise an immediate follow-up can land during the
@@ -464,6 +472,64 @@ pub(crate) async fn run_with_presence(
                 params,
             } => {
                 let mut action_params = params;
+                if persistent_agent.is_none() && goal_thread_action_op(&op) {
+                    // Native sessions answer the goal* family with the
+                    // shared engine — there is no external loop to forward
+                    // to. Notices ride the context-injection queue as
+                    // user-source entries: absorbed at the next turn
+                    // boundary of a running task, surviving idle gaps to
+                    // prelude the next prompt (idle updates never buy a
+                    // turn).
+                    let result_session =
+                        session_id.clone().or_else(|| local_session_id.clone());
+                    let fresh = goal_fresh_tokens(&cumulative_stats.usage);
+                    let (success, message) =
+                        match native_goal_engine.dispatch(&op, &action_params, fresh) {
+                            Ok(outcome) => {
+                                // goal_event: None = nothing to broadcast;
+                                // Some(None) = cleared; Some(goal) = state.
+                                let (message, goal_event, notice) = match outcome {
+                                    external_agent::GoalActionOutcome::Report {
+                                        message,
+                                        goal,
+                                    } => (message, goal.map(Some), None),
+                                    external_agent::GoalActionOutcome::Cleared {
+                                        message,
+                                        notice,
+                                    } => (message, Some(None), Some(notice)),
+                                    external_agent::GoalActionOutcome::Updated {
+                                        message,
+                                        goal,
+                                        notice,
+                                    } => (message, Some(Some(goal)), notice),
+                                };
+                                if let (Some(sid), Some(goal)) =
+                                    (result_session.clone(), goal_event)
+                                {
+                                    bus.send(AppEvent::SessionGoal {
+                                        session_id: sid,
+                                        goal,
+                                    });
+                                }
+                                if let Some(notice) = notice {
+                                    if let Ok(mut q) = context_injection.lock() {
+                                        q.push(event::ContextInjection::user_text(notice));
+                                    }
+                                }
+                                (true, message)
+                            }
+                            Err(e) => (false, e.to_string()),
+                        };
+                    bus.send(AppEvent::CodexThreadActionResult {
+                        session_id: result_session,
+                        action: op,
+                        success,
+                        message,
+                        record_id: None,
+                    });
+                    turn_bus_rx = bus.subscribe();
+                    continue;
+                }
                 if let Some(request) = external_context_rewind_request_from_action(
                     &op,
                     &action_params,
@@ -2653,6 +2719,11 @@ pub(crate) async fn run_with_presence(
             turn_bus_rx = bus.subscribe();
         } else {
             // ── Native agent path ──
+            // Re-advertise on every native task: the backend can flip
+            // native ↔ external between tasks and the external drains emit
+            // their own capabilities, so this keeps the last emission
+            // truthful for the shape that actually runs.
+            emit_native_session_capabilities(&bus, local_session_id.as_deref());
             if persistent_conv.is_none() {
                 // ── First task: full initialization ──
                 let proj = match Project::from_root(project_root.clone()) {
@@ -2789,6 +2860,20 @@ pub(crate) async fn run_with_presence(
                     cumulative_stats.usage.prompt_tokens += stats.usage.prompt_tokens;
                     cumulative_stats.usage.completion_tokens += stats.usage.completion_tokens;
                     cumulative_stats.usage.total_tokens += stats.usage.total_tokens;
+                    cumulative_stats.usage.cached_tokens += stats.usage.cached_tokens;
+                    // Refresh goal spend after the round: flips active →
+                    // budgetLimited at exhaustion and keeps the chip's
+                    // token count live, like the external engines do.
+                    if let Some(goal) = native_goal_engine
+                        .refresh_after_result(goal_fresh_tokens(&cumulative_stats.usage))
+                    {
+                        if let Some(sid) = local_session_id.clone() {
+                            bus.send(AppEvent::SessionGoal {
+                                session_id: sid,
+                                goal: Some(goal),
+                            });
+                        }
+                    }
                 }
                 Err(e) => {
                     // Log error but DON'T discard conversation — it persists

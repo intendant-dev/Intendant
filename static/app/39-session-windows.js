@@ -665,6 +665,96 @@ function applySessionGoalsFromReplayEntries(entries) {
   }
 }
 
+// ── Session vitals (git / cache / limits chips — the statusline port) ──
+
+function renderSessionWindowVitals(win, vitals) {
+  if (!win?.vitals) return;
+  const git = vitals && typeof vitals === 'object' ? vitals.git : null;
+  if (!git || typeof git !== 'object') {
+    win.vitals.className = 'session-window-vitals hidden';
+    win.vitals.textContent = '';
+    win.vitals.title = '';
+    return;
+  }
+  const parts = [];
+  const titleLines = [];
+  const branch = String(git.branch || '').trim();
+  if (branch) {
+    parts.push(`⎇ ${branch}`);
+    titleLines.push(`Branch: ${branch}`);
+  }
+  const dirty = Number(git.dirtyFiles) || 0;
+  if (dirty > 0) {
+    parts.push(`●${dirty}`);
+    titleLines.push(`Dirty files: ${dirty}`);
+  }
+  const primaryRef = String(git.primaryRef || '').trim();
+  if (primaryRef) {
+    const ahead = Number(git.ahead) || 0;
+    const behind = Number(git.behind) || 0;
+    parts.push(`+${ahead}/−${behind}`);
+    titleLines.push(`vs ${primaryRef}: ${ahead} ahead, ${behind} behind`);
+  }
+  const parity = String(git.mergeParity || '').trim();
+  if (parity === 'clean') {
+    parts.push('✓');
+    titleLines.push(`Merge with ${primaryRef || 'primary'}: clean`);
+  } else if (parity === 'conflict') {
+    parts.push('⚠');
+    titleLines.push(`Merge with ${primaryRef || 'primary'}: WOULD CONFLICT`);
+  }
+  if (git.unpushed !== null && git.unpushed !== undefined) {
+    parts.push(`⇡${git.unpushed}`);
+    titleLines.push(`Unpushed on ${branch || 'branch'}: ${git.unpushed}`);
+  }
+  if (git.primaryUnpushed !== null && git.primaryUnpushed !== undefined && primaryRef) {
+    const primaryName = primaryRef.replace(/^origin\//, '');
+    parts.push(`${primaryName}⇡${git.primaryUnpushed}`);
+    titleLines.push(`Unpushed on ${primaryName}: ${git.primaryUnpushed}`);
+  }
+  if (!parts.length) {
+    win.vitals.className = 'session-window-vitals hidden';
+    win.vitals.textContent = '';
+    win.vitals.title = '';
+    return;
+  }
+  win.vitals.className = `session-window-vitals${parity === 'conflict' ? ' conflict' : ''}`;
+  win.vitals.textContent = parts.join(' ');
+  win.vitals.title = titleLines.join('\n');
+}
+
+function normalizeSessionVitals(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const src = raw.vitals && typeof raw.vitals === 'object' ? raw.vitals : raw;
+  const git = src.git && typeof src.git === 'object' ? src.git : null;
+  const cache = src.cache && typeof src.cache === 'object' ? src.cache : null;
+  const limits = Array.isArray(src.limits) ? src.limits : [];
+  if (!git && !cache && !limits.length) return null;
+  return { git, cache, limits };
+}
+
+function applySessionVitals(raw = {}) {
+  const data = raw?.data && typeof raw.data === 'object' ? raw.data : raw;
+  const sid = String(data?.session_id || data?.sessionId || '').trim();
+  if (!sid) return;
+  const vitals = normalizeSessionVitals(data);
+  for (const id of sessionGoalUpdateIds(sid)) {
+    const meta = { ...(sessionMetadataById.get(id) || {}), vitals };
+    sessionMetadataById.set(id, meta);
+    if (sessionWindows.has(id)) {
+      renderSessionWindowVitals(sessionWindows.get(id), vitals);
+    }
+  }
+}
+
+function applySessionVitalsFromReplayEntries(entries) {
+  if (!Array.isArray(entries)) return;
+  for (const entry of entries) {
+    if (entry?.event !== 'session_vitals') continue;
+    applySessionVitals(entry);
+  }
+}
+
 function sessionWindowMetaFromSession(session) {
   if (!session || typeof session !== 'object') return {};
   const meta = {

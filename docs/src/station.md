@@ -69,7 +69,9 @@ backend argument is generic, not Codex-only).
 
 Working end-to-end from inside the canvas: approvals (approve/deny on the
 focused agent), the composer (prompt or steer the target, launch new
-sessions with a backend picker), session lifecycle (focus, resume, attach,
+sessions with a backend picker and — for the internal agent — execution
+pills: *auto* / *orch* / *direct*, the same three-state control as the
+dashboard's New Session pane), session lifecycle (focus, resume, attach,
 stop, halt, fork, transcript, copy), the controls panel (autonomy, backend
 selection, mic/cam/display, browser workspaces, recordings, Codex runtime
 options), managed-context operations (seed/rewind/backout/records), context
@@ -81,11 +83,14 @@ Known seams — the honest gap between the vision and the pixels:
 - **Live local sessions ARE in the scene** (Phase B first cut): one node
   per live session window, parent edges from `session_relationship` data,
   context-pressure rings, approval glow, and per-node action pills on the
-  focus panel. Still outside the scene: *recent* (closed-window) sessions
-  and peer daemons' sessions — peers render as one node each because they
-  publish no per-session data into the snapshot yet.
-- **Goals render on the focus panel and command deck**; nothing else reads
-  them yet (no goal ring on the node itself).
+  focus panel. *Recent* (closed-window) sessions join as dim, inert nodes —
+  a deliberately bounded tail (the freshest few; the sessions panel remains
+  the exhaustive list) whose focus panel offers log + resume. Still outside
+  the scene: peer daemons' sessions — peers render as one node each because
+  they publish no per-session data into the snapshot yet.
+- **Goals render on the focus panel, the command deck, and the node
+  itself** (a thin status-tinted ring between the pressure ring and the
+  running pulse).
 - **The scene is a backdrop.** All operational UI is screen-space 2D HUD
   paint; nothing interactive lives in world space yet.
 - **Both backends have rendered runtime blocks** in the controls panel
@@ -126,10 +131,12 @@ command deck (a goal line under the session line, or a short marker on
 narrow decks); the focus panel for a session node carries per-node action
 pills at session-window-kebab parity — log / target / steer / stop plus
 the session's advertised thread-action ops (compact, fork) — all
-dispatching through the dashboard's real session-action handler. Still
-open in this phase: nodes for *recent* (non-live) sessions, and session
-nodes for peer daemons' sessions (peers publish no per-session data into
-the snapshot yet).
+dispatching through the dashboard's real session-action handler. Recent
+(closed-window) sessions render as dim, inert nodes with log + resume
+pills, capped to the freshest few by design (a bounded constellation, not
+the whole archive), and goal state also rings the node itself. Still open
+in this phase: session nodes for peer daemons' sessions (peers publish no
+per-session data into the snapshot yet).
 
 ### Phase C — panes move into the scene
 

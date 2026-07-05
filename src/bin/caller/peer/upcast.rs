@@ -290,6 +290,7 @@ impl AppEventUpcaster {
             | AppEvent::SessionRelationship { .. }
             | AppEvent::SessionCapabilities { .. }
             | AppEvent::SessionGoal { .. }
+            | AppEvent::SessionVitals { .. }
             | AppEvent::FollowUpStatus { .. }
             | AppEvent::SharedView { .. }
             | AppEvent::BrowserWorkspaceChanged { .. }
@@ -1374,6 +1375,7 @@ impl WireEventUpcaster {
             | OutboundEvent::SessionRelationship { .. }
             | OutboundEvent::SessionCapabilities { .. }
             | OutboundEvent::SessionGoal { .. }
+            | OutboundEvent::SessionVitals { .. }
             | OutboundEvent::FollowUpStatus { .. }
             | OutboundEvent::SharedView { .. }
             | OutboundEvent::BrowserWorkspaceChanged { .. }

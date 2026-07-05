@@ -699,7 +699,9 @@ let stationLaunchDraft = {
   managed: '',
   archive: '',
   fast: false,
-  direct: false,
+  // Execution shape for the internal agent: '' (auto) | 'orchestrate' |
+  // 'direct'.
+  execution: '',
 };
 
 const STATION_SYSTEM_TARGETS = Object.freeze([

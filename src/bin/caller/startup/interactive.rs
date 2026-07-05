@@ -551,6 +551,17 @@ pub(crate) async fn run_interactive_mode(
                 }
             });
 
+            // Vitals chips for the primary session: git state of the
+            // project root (statusline port).
+            let _vitals_producer = if let Some(session_id) = session_log_id(&session_log) {
+                Some(session_vitals::spawn_session_vitals_producer(
+                    bus.clone(),
+                    vec![(session_id, project.root.clone())],
+                ))
+            } else {
+                None
+            };
+
             let agent_backend_for_presence = agent_backend.clone();
             let shared_external_agent_for_presence = shared_external_agent.clone();
             let shared_codex_config_for_presence = shared_codex_config.clone();

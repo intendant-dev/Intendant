@@ -589,13 +589,13 @@ capability-gated affordances in `app.html`, and `external_wrapper_index`.
 |---|---|---|---|
 | Steer / interrupt / stop affordances | `SessionCapabilities.{follow_up,steer,interrupt}`; the UI gates on capabilities, not backend type | emits all three | **Parity** (emits all three) |
 | Usage / context meter | `AgentEvent::Usage` → `UsageSnapshot` / `ContextSnapshot` | `token_count` notifications | **Parity** (`message_delta` + `result` usage) |
-| Goal chip in the agent-window header (`/goal`) | `SessionGoal` type; `AgentEvent::GoalUpdated/GoalCleared`; `session_goal` outbound + log replay; the window chip renderer is backend-neutral; goal wire conventions (statuses, budget shape, objective limit) shared via `external_agent` helpers | native `thread/goal/*` RPCs | **Live — wrapper goal engine in the adapter.** The full `goal*` op family is advertised and dispatched; goal state lives in `CcShared`, notices reach the model as mid-turn steers (absorbed) or as a prelude on the next prompt (idle updates never buy a turn), and budget spend is measured in FRESH tokens (uncached input + cache creation + output — cache reads excluded), flipping `active` → `budgetLimited` at exhaustion. Engine state is per-process: after a resume the chip rehydrates from the log but the engine starts empty (re-set the goal) |
+| Goal chip in the agent-window header (`/goal`) | `SessionGoal` type; `AgentEvent::GoalUpdated/GoalCleared`; `session_goal` outbound + log replay; the window chip renderer is backend-neutral; op semantics + wire conventions (statuses, budget shape, objective limit, notice texts) live in the shared `external_agent::GoalEngine`, which the Claude Code adapter and the native presence loop both run | native `thread/goal/*` RPCs | **Live — wrapper goal engine in the adapter.** The full `goal*` op family is advertised and dispatched; goal state lives in `CcShared`, notices reach the model as mid-turn steers (absorbed) or as a prelude on the next prompt (idle updates never buy a turn), and budget spend is measured in FRESH tokens (uncached input + cache creation + output — cache reads excluded), flipping `active` → `budgetLimited` at exhaustion. Engine state is per-process: after a resume the chip rehydrates from the log but the engine starts empty (re-set the goal) |
 | Per-window action menu (fork / compact / goals / …) | **Universal (landed):** `SessionCapabilities.thread_actions` op vocabulary + the `thread_action` control message (`codex_thread_action` stays a wire alias); the kebab and Station session actions render from the advertised op list, with the codex heuristic as legacy-replay fallback | full op set | **`compact` + `fork` live.** `compact` sends the native `/compact` user message (status → `compact_boundary` → free result); `fork` respawns via `ForkHandling::RespawnResume` → `ResumeSession { fork: true }` → `--resume <parent> --fork-session` (the child binds its own native id + the `fork` relationship on its first prompt). No Claude analog planned: side / fast / review / memory-reset |
 | Relationship wiring (parent/sub/fork header chips + SVG wires; Station edges) | `session_relationship` event + lineage ledger + `/api` serving + both renderers — all backend-neutral | side / subagent / fork / fission / rewind emitters | **`fork` + `subagent` emitted.** Fork on the forked child's first identity announcement (persisted `forked_from` lineage); in-band Task sub-agents ride `SubAgentToolCall` → ephemeral `task-*` child sessions with `subagent` relationships (fission observations stay Codex-only by design) |
 | Per-session persisted launch overlay | `SessionAgentConfig` + `ConfigureSessionAgent` / `Restart` (universal `agent_command` + backend fields, bundled as `LaunchOverrides`) | all `codex_*` fields | **Live.** `claude_model` / `claude_permission_mode` / `claude_allowed_tools` / `claude_effort` pins with inherit-vs-pin sentinels ("default" stays a pinnable permission mode; `all` pins explicitly-unrestricted tools), Launch-config modal rows, and LIVE apply of model + permission on save via the `model` / `permission-mode` thread actions (`set_model` / `set_permission_mode` control requests, verified on 2.1.201) |
 | Global runtime config pane | `Set*` ControlMsgs + `*ConfigChanged` broadcast + Settings/Control panes | 12 knobs | **3 knobs** (model / permission mode / allowed tools) — by design; grows only when CC grows equivalent concepts |
 | Station controls-panel runtime block | the controls panel renders per-backend blocks | approval policy / managed-context / fork-binary warning | **Live.** Model pills (default + the CLI's latest-version aliases fable/opus/sonnet/haiku, with a truthful `custom:` row for out-of-alias pins) and permission pills (default/edits/plan/bypass), gated `backend == "claude-code" \|\| launch_agent == "claude-code"` exactly like the Codex block, dispatching `set_claude_model` / `set_claude_permission_mode` (persisted to `intendant.toml` + broadcast, same as the dashboard Control pane) |
-| Plan / todo display | `AgentEvent::PlanUpdate` exists | emits plan updates | **Missing.** Plan: translate `TodoWrite` tool inputs into `PlanUpdate` |
+| Plan / todo display | `AgentEvent::PlanUpdate` exists | emits plan updates | **Translation live; supervised sessions rarely produce it.** `TodoWrite` tool calls translate into `PlanUpdate` (statuses normalized via the shared helper; the raw call and its acknowledgment are suppressed, failures still warn, a sub-agent's TodoWrite scopes to its `task-*` child; malformed inputs fall back to plain-tool rendering). CAVEAT (verified on 2.1.201): print-mode Claude Code does not enable `TodoWrite` — the CLI answers "TodoWrite exists but is not enabled in this context" and exposes the Task tools (`TaskCreate`/`TaskUpdate`/…) instead, so supervised sessions surface plans only once the Task-tools → `PlanUpdate` mapping lands |
 | Managed context / fission / rewind family | managed-context tools + ledgers | patched managed fork only | **Out of scope for parity** — Codex-fork-specific by design; Claude Code manages its own context (`/compact`, auto-compaction) |
 
 Catch-up order (each step unlocks UI in both surfaces at once):
@@ -603,10 +603,20 @@ Catch-up order (each step unlocks UI in both surfaces at once):
 1. ~~universal `thread_actions` capability + a Claude `thread_action`
    implementation (`compact`, `fork`)~~ — **landed** (window kebab and
    Station session actions render from the advertised ops; e2e phases 6–8);
-2. ~~the wrapper-level goal engine~~ — **landed for Claude Code** (adapter
-   engine; the kebab goal submenu and `/goal` slash light up from the
-   advertised ops). Still open: goals for NATIVE sessions and Station goal
-   rendering (plumbed but unrendered);
+2. ~~the wrapper-level goal engine~~ — **landed for Claude Code, then for
+   the primary NATIVE session** (the engine's op semantics now live in the
+   shared `external_agent::GoalEngine`; the presence loop answers the
+   `goal*` family for its native session, advertises it via
+   `SessionCapabilities`, delivers notices through the context-injection
+   queue — absorbed at the next turn boundary of a running task, surviving
+   idle gaps as a prelude so idle updates never buy a turn — and measures
+   budgets in fresh tokens off the cumulative native usage; the kebab goal
+   submenu and `/goal` slash light up from the advertised ops; Station
+   renders goal state on the focus panel, command deck, and node ring).
+   Still open: goals for supervisor-SPAWNED native sessions — their
+   `run_direct_mode` loops answer no thread actions yet, and the
+   supervisor's fallback responder says so honestly (it defers only for
+   ops a live loop advertised);
 3. ~~remaining relationship producers (in-band Task sub-agents)~~ —
    **landed** (async `Agent`-tool children become ephemeral `task-*` child
    sessions with scoped transcripts; `fork` already wired);
@@ -616,10 +626,10 @@ Catch-up order (each step unlocks UI in both surfaces at once):
 5. ~~the Station controls Claude block~~ — **landed** (model + permission
    pill rows in the rendered controls panel).
 
-All five catch-up items have landed; what remains on the Claude side of
-the matrix is the `TodoWrite` → `PlanUpdate` translation and goals for
-native sessions, plus the Station Phase B rendering work tracked in
-[station.md](./station.md).
+All five catch-up items have landed, followed by the `TodoWrite` →
+`PlanUpdate` translation and goals for the primary native session; what
+remains is goal support for supervisor-spawned native sessions, plus the
+Station work tracked in [station.md](./station.md).
 
 ## Approval Routing
 
