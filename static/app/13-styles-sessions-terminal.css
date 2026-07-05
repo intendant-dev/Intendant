@@ -361,10 +361,13 @@
   gap: 10px;
   align-items: end;
 }
-/* Agent picker sits alone; the dependent external-agent controls live in
-   the ui-fold below it. */
+/* Agent picker + execution shape sit side by side; the dependent
+   external-agent controls live in the ui-fold below them. */
 .sessions-new-agent-row.sessions-new-agent-picker {
-  grid-template-columns: minmax(200px, 340px);
+  grid-template-columns: repeat(auto-fit, minmax(200px, 340px));
+}
+#new-session-execution-wrap.disabled {
+  opacity: 0.55;
 }
 .sessions-new-external-fold {
   margin: 0;

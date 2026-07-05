@@ -7029,10 +7029,13 @@ body.context-focus-active {
   gap: 10px;
   align-items: end;
 }
-/* Agent picker sits alone; the dependent external-agent controls live in
-   the ui-fold below it. */
+/* Agent picker + execution shape sit side by side; the dependent
+   external-agent controls live in the ui-fold below them. */
 .sessions-new-agent-row.sessions-new-agent-picker {
-  grid-template-columns: minmax(200px, 340px);
+  grid-template-columns: repeat(auto-fit, minmax(200px, 340px));
+}
+#new-session-execution-wrap.disabled {
+  opacity: 0.55;
 }
 .sessions-new-external-fold {
   margin: 0;
@@ -12915,6 +12918,15 @@ body.display-fullscreen-open {
                       <option value="internal">Internal agent</option>
                       <option value="codex">Codex</option>
                       <option value="claude-code">Claude Code</option>
+                    </select>
+                  </label>
+                  <label class="sessions-new-session-field" for="new-session-execution" id="new-session-execution-wrap"
+                         title="Internal agent only. Auto lets the daemon decide from the task; Orchestrate starts a coordinator that delegates to supervised sub-agents; Direct runs a single agent.">
+                    Execution
+                    <select id="new-session-execution" class="sessions-agent-select">
+                      <option value="">Auto</option>
+                      <option value="orchestrate">Orchestrate &mdash; delegate to sub-agents</option>
+                      <option value="direct">Direct &mdash; single agent</option>
                     </select>
                   </label>
                 </div>
@@ -66534,6 +66546,18 @@ function renderNewSessionAgentControls(options = {}) {
     externalFold.open = hasExternalAgent ||
       (!!effectiveAgent && effectiveAgent !== 'internal' && effectiveAgent !== 'intendant');
   }
+  // Execution shape (auto / orchestrate / direct) only applies to the
+  // internal agent — external CLIs run their own loops.
+  const executionSel = document.getElementById('new-session-execution');
+  if (executionSel) {
+    const appliesToInternal =
+      !effectiveAgent || effectiveAgent === 'internal' || effectiveAgent === 'intendant';
+    executionSel.disabled = !appliesToInternal;
+    if (!appliesToInternal) executionSel.value = '';
+    document
+      .getElementById('new-session-execution-wrap')
+      ?.classList.toggle('disabled', !appliesToInternal);
+  }
   commandInput.disabled = !hasExternalAgent;
   if (browseBtn) browseBtn.disabled = !hasExternalAgent;
   commandInput.placeholder = hasExternalAgent
@@ -66863,7 +66887,16 @@ async function startNewSession() {
       }
     }
   }
-  if (direct) msg.direct = true;
+  // Execution shape: an explicit per-launch choice beats the global Direct
+  // toggle; Auto (or an external agent — the select is disabled and cleared
+  // then) preserves the old behavior of the toggle forcing direct.
+  const executionSel = document.getElementById('new-session-execution');
+  const execution = executionSel && !executionSel.disabled ? executionSel.value : '';
+  if (execution === 'orchestrate') {
+    msg.orchestrate = true;
+  } else if (execution === 'direct' || direct) {
+    msg.direct = true;
+  }
   if (attachments.length > 0) msg.attachments = attachments;
 
   try {
