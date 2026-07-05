@@ -89,7 +89,9 @@ src/
 ├── main.rs, agent.rs           # intendant-runtime (sandboxed executor)
 ├── models.rs, error.rs, utils.rs, win_sandbox.rs
 ├── bin/caller/                 # the intendant controller:
-│   ├── main.rs                 # entry: CLI parsing, agent + daemon loops
+│   ├── main.rs                 # entry: CLI flags/help, panic hook, startup prologue + mode dispatch
+│   ├── agent_loop.rs, run_modes.rs, external_mode.rs, external_supervision.rs, display_glue.rs   # carved from main.rs: the native loop + orchestration handlers; native/external mode runners; external supervision helpers; frame/CU/user-display glue
+│   ├── startup/                # web bind/TLS + peer boot; the four mode branches (daemon, mcp_mode, interactive, headless)
 │   ├── control_plane.rs, event.rs, frontend.rs   # single-writer state; EventBus; UserAction/ControlMsg
 │   ├── session_supervisor.rs, task_dispatch.rs, file_watcher.rs   # daemon: sessions, dispatch, rewind snapshots
 │   ├── provider.rs, conversation.rs, tools.rs, prompts.rs, skills.rs, autonomy.rs, approval.rs
