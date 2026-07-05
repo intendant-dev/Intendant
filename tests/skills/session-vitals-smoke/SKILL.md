@@ -25,10 +25,11 @@ control socket), connects, then **dirties a second file** — the producer
 emits on change only, and the startup emission always races the socket
 client, so the assertion rides the next 5s probe tick. Expects
 `branch=feature dirtyFiles=2 ahead=1 behind=0 primaryRef=main
-mergeParity=clean` **plus the cache section** from the startup task's
-usage: the mock's first request writes cache only (`hitPct=0`,
-`ttlSeconds=300`) and the hub's merged snapshot carries it alongside the
-git change.
+mergeParity=clean` **plus the cache and limits sections** from the
+startup task's usage: the mock's first request writes cache only
+(`hitPct=0`, `ttlSeconds=300`) and the scripted step declares a
+42%-used "5h" rate-limit window; the hub's merged snapshot carries all
+three sections alongside the git change.
 
 Gotchas encoded:
 

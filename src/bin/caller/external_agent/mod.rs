@@ -974,6 +974,10 @@ pub struct AgentUsageSnapshot {
     /// Prompt-cache TTL implied by the latest cache write (see
     /// [`crate::provider::TokenUsage::cache_ttl_seconds`]).
     pub cache_ttl_seconds: Option<u32>,
+    /// Latest known provider rate-limit windows, attached by the adapter
+    /// from its backend's rate-limit reporting (Codex
+    /// `account/rateLimits/updated`, Claude Code `rate_limit_event`).
+    pub limits: Vec<crate::types::SessionLimitWindow>,
 }
 
 impl AgentUsageSnapshot {
@@ -995,6 +999,7 @@ impl AgentUsageSnapshot {
             last_cache_creation_tokens: self.last_cache_creation_tokens,
             last_uncached_input_tokens: self.last_uncached_input_tokens,
             cache_ttl_seconds: self.cache_ttl_seconds,
+            limits: self.limits,
         }
     }
 }

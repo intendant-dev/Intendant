@@ -92,6 +92,47 @@ pub struct TokenUsage {
     /// value or fall back to a provider default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl_seconds: Option<u32>,
+    /// Provider rate-limit windows read from this response's headers
+    /// (Anthropic `anthropic-ratelimit-*`; empty for providers or
+    /// transports that expose none — the credential-egress relay strips
+    /// headers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rate_limit_windows: Vec<crate::types::SessionLimitWindow>,
+}
+
+/// Parse Anthropic's per-minute rate-limit headers into vitals windows.
+/// `-reset` is RFC 3339; a missing or unparsable header degrades to a
+/// gauge without a countdown.
+fn anthropic_rate_limit_windows_from_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Vec<crate::types::SessionLimitWindow> {
+    let read = |name: String| headers.get(name).and_then(|v| v.to_str().ok());
+    let mut windows = Vec::new();
+    for (label, prefix) in [
+        ("req/min", "anthropic-ratelimit-requests"),
+        ("tok/min", "anthropic-ratelimit-tokens"),
+    ] {
+        let limit = read(format!("{prefix}-limit")).and_then(|s| s.parse::<f64>().ok());
+        let remaining = read(format!("{prefix}-remaining")).and_then(|s| s.parse::<f64>().ok());
+        let (Some(limit), Some(remaining)) = (limit, remaining) else {
+            continue;
+        };
+        if limit <= 0.0 {
+            continue;
+        }
+        let used_pct = (((limit - remaining) / limit) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+        let resets_at_epoch = read(format!("{prefix}-reset"))
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp().max(0) as u64);
+        windows.push(crate::types::SessionLimitWindow {
+            label: label.to_string(),
+            used_pct,
+            resets_at_epoch,
+        });
+    }
+    windows
 }
 
 /// A tool call returned by the model.
@@ -203,6 +244,17 @@ impl ProviderHttpResponse {
                     .map(|chunk| chunk.map(|bytes| bytes.to_vec()).map_err(|e| e.to_string())),
             ),
             ProviderHttpResponse::Egress(response) => Box::pin(response.bytes_stream()),
+        }
+    }
+
+    /// Anthropic rate-limit windows from the response headers; empty for
+    /// egress-relayed calls (the relay strips headers).
+    fn anthropic_rate_limit_windows(&self) -> Vec<crate::types::SessionLimitWindow> {
+        match self {
+            ProviderHttpResponse::Direct(response) => {
+                anthropic_rate_limit_windows_from_headers(response.headers())
+            }
+            ProviderHttpResponse::Egress(_) => Vec::new(),
         }
     }
 }
@@ -1353,6 +1405,8 @@ impl AnthropicUsage {
                 self.cache_creation_input_tokens,
                 self.cache_creation.as_ref(),
             ),
+            // Header-derived; attached by the transport paths.
+            rate_limit_windows: Vec::new(),
         }
     }
 }
@@ -1598,6 +1652,7 @@ impl ChatProvider for AnthropicProvider {
             )));
         }
 
+        let rate_limit_windows = response.anthropic_rate_limit_windows();
         let chat_response: AnthropicChatResponse = response.json().await?;
 
         // Extract text content, tool_use blocks, and CU blocks
@@ -1646,10 +1701,11 @@ impl ChatProvider for AnthropicProvider {
 
         let content = text_parts.join("");
 
-        let usage = chat_response
+        let mut usage = chat_response
             .usage
             .map(|u| u.to_token_usage())
             .unwrap_or_default();
+        usage.rate_limit_windows = rate_limit_windows;
 
         Ok(ChatResponse {
             content,
@@ -1771,7 +1827,10 @@ impl ChatProvider for AnthropicProvider {
         let mut current_tool_json = String::new();
         let mut current_tool_id = String::new();
         let mut current_tool_name = String::new();
-        let mut usage = TokenUsage::default();
+        let mut usage = TokenUsage {
+            rate_limit_windows: response.anthropic_rate_limit_windows(),
+            ..Default::default()
+        };
         let mut line_buf = String::new();
 
         let mut stream = response.bytes_stream();
@@ -4653,6 +4712,34 @@ mod tests {
             ephemeral_1h_input_tokens: 0,
         };
         assert_eq!(anthropic_cache_ttl_seconds(8, Some(&five_minute)), Some(300));
+    }
+
+    #[test]
+    fn anthropic_rate_limit_headers_become_windows() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut set = |k: &'static str, v: &str| {
+            headers.insert(k, v.parse().unwrap());
+        };
+        set("anthropic-ratelimit-requests-limit", "4000");
+        set("anthropic-ratelimit-requests-remaining", "3999");
+        set("anthropic-ratelimit-requests-reset", "2026-07-05T12:00:00Z");
+        set("anthropic-ratelimit-tokens-limit", "400000");
+        set("anthropic-ratelimit-tokens-remaining", "80000");
+        let windows = anthropic_rate_limit_windows_from_headers(&headers);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "req/min");
+        assert_eq!(windows[0].used_pct, 0);
+        assert!(windows[0].resets_at_epoch.is_some());
+        assert_eq!(windows[1].label, "tok/min");
+        assert_eq!(windows[1].used_pct, 80);
+        // Missing reset degrades to a gauge without a countdown.
+        assert_eq!(windows[1].resets_at_epoch, None);
+
+        // No headers → no windows (e.g. the egress relay strips them).
+        assert!(
+            anthropic_rate_limit_windows_from_headers(&reqwest::header::HeaderMap::new())
+                .is_empty()
+        );
     }
 
     #[test]

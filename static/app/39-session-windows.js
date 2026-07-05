@@ -754,34 +754,75 @@ function sessionVitalsCacheSegment(cache) {
   return { text: parts.join(' '), titleLines, cls, ticking };
 }
 
+function formatLimitReset(resetsAtEpoch) {
+  const remaining = Number(resetsAtEpoch) - Date.now() / 1000;
+  if (!Number.isFinite(remaining) || remaining <= 0) return '';
+  if (remaining >= 86400) return `${Math.round(remaining / 86400)}d`;
+  if (remaining >= 3600) return `${Math.round(remaining / 3600)}h`;
+  return `${Math.max(1, Math.round(remaining / 60))}m`;
+}
+
+// The gauge shows the most-used window; the tooltip lists them all.
+function sessionVitalsLimitsSegment(limits) {
+  if (!Array.isArray(limits) || !limits.length) return null;
+  const windows = limits
+    .map((w) => ({
+      label: String(w?.label || '').trim() || 'window',
+      usedPct: Math.max(0, Math.min(100, Number(w?.usedPct) || 0)),
+      resetsAtEpoch: Number(w?.resetsAtEpoch) || null,
+    }));
+  const top = windows.reduce((a, b) => (b.usedPct > a.usedPct ? b : a));
+  let text = `▮${top.usedPct}% ${top.label}`;
+  let cls = 'vit-limits';
+  let severity = '';
+  if (top.usedPct >= 90) {
+    severity = 'crit';
+    cls += ' limits-crit';
+    const reset = top.resetsAtEpoch ? formatLimitReset(top.resetsAtEpoch) : '';
+    if (reset) text += ` ↻${reset}`;
+  } else if (top.usedPct >= 70) {
+    severity = 'warn';
+    cls += ' limits-warn';
+  }
+  const titleLines = windows.map((w) => {
+    const reset = w.resetsAtEpoch ? ` — resets in ${formatLimitReset(w.resetsAtEpoch) || 'moments'}` : '';
+    return `Rate limit ${w.label}: ${w.usedPct}% used${reset}`;
+  });
+  return { text, titleLines, cls, severity };
+}
+
 // Renders the chip; returns true while a cache countdown is live (the
 // vitals ticker keeps re-rendering until everything is cold or gone).
 function renderSessionWindowVitals(win, vitals) {
   if (!win?.vitals) return false;
   const git = sessionVitalsGitSegment(vitals && typeof vitals === 'object' ? vitals.git : null);
   const cache = sessionVitalsCacheSegment(vitals && typeof vitals === 'object' ? vitals.cache : null);
-  if (!git && !cache) {
+  const limits = sessionVitalsLimitsSegment(vitals && typeof vitals === 'object' ? vitals.limits : null);
+  if (!git && !cache && !limits) {
     win.vitals.className = 'session-window-vitals hidden';
     win.vitals.replaceChildren();
     win.vitals.title = '';
     return false;
   }
   const segments = [];
-  if (git) {
+  for (const seg of [
+    git && { cls: 'vit-git', text: git.text },
+    cache && { cls: cache.cls, text: cache.text },
+    limits && { cls: limits.cls, text: limits.text },
+  ]) {
+    if (!seg) continue;
     const span = document.createElement('span');
-    span.className = 'vit-git';
-    span.textContent = git.text;
-    segments.push(span);
-  }
-  if (cache) {
-    const span = document.createElement('span');
-    span.className = cache.cls;
-    span.textContent = cache.text;
+    span.className = seg.cls;
+    span.textContent = seg.text;
     segments.push(span);
   }
   win.vitals.className = `session-window-vitals${git?.conflict ? ' conflict' : ''}`;
   win.vitals.replaceChildren(...segments);
-  win.vitals.title = [...(git?.titleLines || []), ...(cache?.titleLines || [])].join('\n');
+  win.vitals.title = [
+    ...(git?.titleLines || []),
+    ...(cache?.titleLines || []),
+    ...(limits?.titleLines || []),
+  ].join('\n');
   return !!cache?.ticking;
 }
 

@@ -713,6 +713,9 @@ impl App {
                 })
                 .unwrap_or(0),
             cache_ttl_seconds: last.and_then(|u| u.cache_ttl_seconds),
+            limits: last
+                .map(|u| u.rate_limit_windows.clone())
+                .unwrap_or_default(),
         }
     }
 

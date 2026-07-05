@@ -306,6 +306,11 @@ fn spawn_cache_vitals_listener(
                         {
                             vitals.cache = Some(cache);
                         }
+                        // Sticky: rate limits move slowly and not every
+                        // usage emission re-states them.
+                        if !main.limits.is_empty() {
+                            vitals.limits = main.limits.clone();
+                        }
                     });
                 }
                 Ok(AppEvent::SessionEnded { session_id, .. }) => hub.remove(&session_id),
@@ -507,9 +512,15 @@ mod tests {
         let _listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
         let mut rx = bus.subscribe();
 
+        let mut with_limits = usage_with_sample("anthropic", 80, 10, 10, Some(300));
+        with_limits.limits = vec![crate::types::SessionLimitWindow {
+            label: "7d".into(),
+            used_pct: 49,
+            resets_at_epoch: Some(1_783_807_200),
+        }];
         bus.send(AppEvent::UsageSnapshot {
             session_id: Some("s7".into()),
-            main: usage_with_sample("anthropic", 80, 10, 10, Some(300)),
+            main: with_limits,
             presence: None,
         });
         let vitals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -526,6 +537,30 @@ mod tests {
         assert_eq!(cache.hit_pct, Some(80));
         assert_eq!(cache.ttl_seconds, Some(300));
         assert!(cache.last_activity_epoch > 0);
+        assert_eq!(vitals.limits.len(), 1);
+        assert_eq!(vitals.limits[0].used_pct, 49);
+
+        // Limits are sticky: a later usage emission without them keeps the
+        // last known gauges.
+        bus.send(AppEvent::UsageSnapshot {
+            session_id: Some("s7".into()),
+            main: usage_with_sample("anthropic", 90, 0, 10, None),
+            presence: None,
+        });
+        let vitals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    if session_id == "s7" && vitals.cache.as_ref().and_then(|c| c.hit_pct) == Some(90)
+                    {
+                        return vitals;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("listener emits updated vitals");
+        assert_eq!(vitals.limits.len(), 1, "limits survive limit-less usage");
+        assert_eq!(vitals.limits[0].label, "7d");
     }
 
     #[tokio::test]

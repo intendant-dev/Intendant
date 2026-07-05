@@ -96,6 +96,11 @@ pub struct ModelUsageSnapshot {
     /// Prompt-cache TTL implied by the latest cache write, seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl_seconds: Option<u32>,
+    /// Latest known provider rate-limit windows (subscription 5h/7d,
+    /// per-minute API windows) — feeds the vitals limit gauges. Empty when
+    /// the backend has reported none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<crate::types::SessionLimitWindow>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {

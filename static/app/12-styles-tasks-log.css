@@ -1408,6 +1408,20 @@ body.context-focus-active {
 .session-window-vitals .vit-cache.cache-cold {
   opacity: 0.55;
 }
+.session-window-vitals .vit-limits {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.85;
+}
+.session-window-vitals .vit-limits.limits-warn {
+  color: var(--yellow);
+  opacity: 1;
+}
+.session-window-vitals .vit-limits.limits-crit {
+  color: var(--red);
+  opacity: 1;
+}
 @container (max-width: 560px) {
   .session-window-vitals {
     display: none;

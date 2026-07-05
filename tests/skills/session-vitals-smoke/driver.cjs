@@ -26,7 +26,7 @@ g('add .'); g('commit -qm work');
 fs.writeFileSync(path.join(PROJ, 'a.txt'), 'one modified\n');
 
 const script = { profiles: [{ steps: [
-  { content: 'ok', tool_calls: [{ name: 'signal_done', arguments: { message: 'vitals smoke task done' } }] },
+  { content: 'ok', limit_used_pct: 42, tool_calls: [{ name: 'signal_done', arguments: { message: 'vitals smoke task done' } }] },
 ]}]};
 const scriptPath = path.join(HOME, 'mock_script.json');
 fs.writeFileSync(scriptPath, JSON.stringify(script));
@@ -76,6 +76,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         if (!line.includes('session_vitals')) continue;
         let e; try { e = JSON.parse(line); } catch { continue; }
         if (e.event !== 'session_vitals') continue;
+        // Earlier emissions (startup git state, the task's usage-driven
+        // cache/limits merge) can land after our connect — wait for the
+        // post-mutation snapshot (the second dirty file) specifically.
+        if ((e.vitals?.git?.dirtyFiles || 0) !== 2) continue;
         clearTimeout(timer);
         resolve(e);
       }
@@ -92,10 +96,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const cache = e.vitals && e.vitals.cache;
   const cacheOk = cache && cache.hitPct === 0 && cache.ttlSeconds === 300
     && Number(cache.lastActivityEpoch) > 0;
-  const ok = gitOk && cacheOk;
-  console.log(`vitals event: ${JSON.stringify(e).slice(0, 400)}`);
+  // The scripted step declares a 42%-used "5h" window (resets 2h out).
+  const limits = (e.vitals && e.vitals.limits) || [];
+  const limitsOk = limits.length === 1 && limits[0].label === '5h'
+    && limits[0].usedPct === 42 && Number(limits[0].resetsAtEpoch) > Date.now() / 1000;
+  const ok = gitOk && cacheOk && limitsOk;
+  console.log(`vitals event: ${JSON.stringify(e).slice(0, 500)}`);
   if (!gitOk) console.log('git segment mismatch');
   if (!cacheOk) console.log('cache segment mismatch');
+  if (!limitsOk) console.log('limits segment mismatch');
   console.log(ok ? 'VITALS SMOKE PASS' : 'VITALS SMOKE FAIL');
   child.kill('SIGTERM');
   process.exit(ok ? 0 : 1);

@@ -123,6 +123,20 @@ pub(crate) struct StationAgent {
     /// node: dimmed body, no pressure/phase rings, and the focus panel
     /// offers log + resume instead of the live-session pills.
     pub(crate) recent: bool,
+    /// Session vitals for the focus panel (the statusline port). Git and
+    /// limits arrive pre-formatted from the dashboard feed (single source
+    /// of truth for the chip text); the cache section arrives as raw
+    /// numbers so the TTL countdown renders live per frame.
+    pub(crate) vitals_git: String,
+    pub(crate) vitals_git_conflict: bool,
+    /// Latest request's cache-hit percentage; negative = no cache section.
+    pub(crate) cache_hit_pct: f64,
+    pub(crate) cache_last_activity_epoch: f64,
+    pub(crate) cache_ttl_seconds: f64,
+    /// Pre-formatted top rate-limit gauge ("▮49% 7d") and its severity
+    /// ("", "warn", "crit").
+    pub(crate) vitals_limits: String,
+    pub(crate) vitals_limits_state: String,
 }
 
 impl Default for StationAgent {
@@ -160,6 +174,13 @@ impl Default for StationAgent {
             thread_actions: Vec::new(),
             can_interrupt: false,
             recent: false,
+            vitals_git: String::new(),
+            vitals_git_conflict: false,
+            cache_hit_pct: -1.0,
+            cache_last_activity_epoch: 0.0,
+            cache_ttl_seconds: 0.0,
+            vitals_limits: String::new(),
+            vitals_limits_state: String::new(),
         }
     }
 }
@@ -948,7 +969,14 @@ mod tests {
                 "goalObjective": "keep replies short",
                 "goalTokens": "1234",
                 "threadActions": ["compact", "fork"],
-                "canInterrupt": true
+                "canInterrupt": true,
+                "vitalsGit": "⎇ feature ●1 +1/−0 ✓",
+                "vitalsGitConflict": false,
+                "cacheHitPct": 97,
+                "cacheLastActivityEpoch": 1783256064,
+                "cacheTtlSeconds": 300,
+                "vitalsLimits": "▮49% 7d",
+                "vitalsLimitsState": "warn"
             }, {
                 "id": "session-old",
                 "hostId": "local",
@@ -971,6 +999,16 @@ mod tests {
         // Live nodes never send the flag; recent (closed-window) nodes do.
         assert!(!agent.recent);
         assert!(snapshot.agents[1].recent);
+        // Vitals: git/limits pre-formatted, cache raw for the live countdown.
+        assert_eq!(agent.vitals_git, "⎇ feature ●1 +1/−0 ✓");
+        assert_eq!(agent.cache_hit_pct, 97.0);
+        assert_eq!(agent.cache_last_activity_epoch, 1_783_256_064.0);
+        assert_eq!(agent.cache_ttl_seconds, 300.0);
+        assert_eq!(agent.vitals_limits, "▮49% 7d");
+        assert_eq!(agent.vitals_limits_state, "warn");
+        // Nodes without vitals default to the "absent" sentinels.
+        assert_eq!(snapshot.agents[1].cache_hit_pct, -1.0);
+        assert!(snapshot.agents[1].vitals_git.is_empty());
     }
 
     #[test]

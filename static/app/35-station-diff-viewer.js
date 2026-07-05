@@ -1489,19 +1489,55 @@ function stationDisplayRunwaySnapshot(controls = null) {
   };
 }
 
+// StationAgent vitals fields from a session's normalized vitals: git and
+// limits reuse the chip formatters (single source of truth for the text);
+// the cache section passes raw numbers so the wasm HUD renders the TTL
+// countdown live per frame.
+function stationVitalsFields(vitals) {
+  const out = {};
+  if (!vitals || typeof vitals !== 'object') return out;
+  try {
+    const git = sessionVitalsGitSegment(vitals.git);
+    if (git) {
+      out.vitalsGit = git.text;
+      out.vitalsGitConflict = !!git.conflict;
+    }
+    const cache = vitals.cache;
+    if (cache && typeof cache === 'object') {
+      out.cacheHitPct = cache.hitPct === null || cache.hitPct === undefined || !Number.isFinite(Number(cache.hitPct))
+        ? -1
+        : Number(cache.hitPct);
+      out.cacheLastActivityEpoch = Number(cache.lastActivityEpoch) || 0;
+      out.cacheTtlSeconds = Number(cache.ttlSeconds) || 0;
+    }
+    const limits = sessionVitalsLimitsSegment(vitals.limits);
+    if (limits) {
+      out.vitalsLimits = limits.text;
+      out.vitalsLimitsState = limits.severity || '';
+    }
+  } catch (_) {}
+  return out;
+}
+
 function stationAgentForSelf(usage) {
   const phase = normalizeStationPhase(currentPhase);
   // Goal fields light the scene's goal ring + the focus-panel goal row for
   // the primary session too (session_id stays unset on purpose: the
   // primary node keeps the classic agent focus panel, not session pills).
+  // currentSessionFullId is only set once a window is focused — the
+  // daemon's own session is the primary node's identity until then.
   let goal = null;
-  if (currentSessionFullId) {
+  let vitals = null;
+  const selfSessionId = String(currentSessionFullId || daemonSessionFullId || '').trim();
+  if (selfSessionId) {
     try {
-      const meta = sessionMetadataById.get(String(currentSessionFullId)) || {};
+      const meta = sessionMetadataById.get(selfSessionId) || {};
       goal = normalizeSessionGoal(meta.goal || meta.session_goal || meta.sessionGoal || null);
+      vitals = meta.vitals || null;
     } catch (_) {}
   }
   return {
+    ...stationVitalsFields(vitals),
     id: 'primary-agent',
     hostId: selfPeerId,
     role: 'direct',
@@ -1661,6 +1697,7 @@ function stationSessionAgentsInner() {
       || compactSessionText(meta.initial_message || meta.initialMessage || meta.task || '')
       || shortSessionId(id);
     out.push({
+      ...stationVitalsFields(meta.vitals || null),
       id: 'session-' + sanitizeStationId(id),
       hostId: selfPeerId,
       role: kind === 'subagent'
