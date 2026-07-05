@@ -242,6 +242,14 @@ app-html-assembler = { path = "crates/app-html-assembler" }
 [profile.dev]
 split-debuginfo = "unpacked"
 
+# The edit→rebuild loop ships from target/release (the multi-agent
+# convention), and the caller is one huge compilation unit — without
+# incremental every touched line recompiles all of it (~1m); with it,
+# steady-state rebuilds are far cheaper. Runtime cost is negligible for
+# a dev binary; CI release builds are cold either way.
+[profile.release]
+incremental = true
+
 [dev-dependencies]
 # Enable tokio's `test-util` feature in test builds so `#[tokio::test(start_paused = true)]`
 # and `tokio::time::advance` are available. Cargo merges features additively between
