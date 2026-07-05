@@ -71,7 +71,7 @@
 //!   surfaces RR usefully, add a sibling `RrTapInterceptor`
 //!   rather than overloading this one.
 //! - **No adaptation decisions.** The tap is a sensor; the
-//!   capacity policy in [`crate::display::aggregator`] decides
+//!   capacity policy in [`crate::aggregator`] decides
 //!   what to do with the signal.
 //!
 //! ## Lifecycle
@@ -178,7 +178,7 @@ pub struct TwccEvent {
 /// - [`Self::batches`] — number of `TwccEvent`s aggregated in this
 ///   window. Always `>= 1` in a published `TwccHealth`. The
 ///   defensive guard in
-///   [`crate::display::aggregator::step_aggregate_layer_capacity`]
+///   [`crate::aggregator::step_aggregate_layer_capacity`]
 ///   treats `batches == 0` as "no signal" anyway, so the invariant
 ///   isn't load-bearing — but in practice the aggregator never
 ///   emits a `TwccHealth` with `batches == 0`.
@@ -253,7 +253,7 @@ impl WindowAccumulator {
 /// activity); 1 Hz aggregation gives the capacity policy a steady
 /// signal without flooding. Matches the policy's debounce
 /// granularity (5 s drop / 1 s restore from
-/// [`crate::display::aggregator::CapacityPolicyConfig`]).
+/// [`crate::aggregator::CapacityPolicyConfig`]).
 const HEALTH_WINDOW: Duration = Duration::from_secs(1);
 
 /// Drain [`TwccEvent`]s from `event_rx` and publish a

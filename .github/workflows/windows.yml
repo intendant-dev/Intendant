@@ -143,7 +143,7 @@ jobs:
       # `--locked` makes lockfile drift a hard failure: CI must test exactly
       # the dependency set main pins, never a silent re-resolution of it.
       - name: cargo test
-        run: cargo test -p intendant --bins --locked --target ${{ matrix.target }}
+        run: cargo test -p intendant --bins -p intendant-core -p intendant-display --locked --target ${{ matrix.target }}
 
       # Headless end-to-end: the real `intendant` + `intendant-runtime`
       # binaries driven by the scripted mock provider (see tests/e2e/main.rs).

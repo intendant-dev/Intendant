@@ -1,0 +1,28 @@
+[package]
+name = "intendant-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+presence-core = { path = "../presence-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["sync"] }
+# CallerError carries reqwest::Error in its Http variant; feature set
+# mirrors the caller's so workspace feature unification stays a no-op.
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "multipart"], default-features = false }
+
+[dev-dependencies]
+# autonomy's approval-config tests parse TOML fixtures; frames' tests
+# write registries into temp dirs.
+toml = "0.8"
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Windows has no getifaddrs(3); if-addrs wraps GetAdaptersAddresses.
+if-addrs = "0.15"

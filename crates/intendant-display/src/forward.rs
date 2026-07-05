@@ -1,6 +1,6 @@
 //! Legacy helper vocabulary for display forwarding.
 //!
-//! Runtime forwarding lives in [`crate::display::webrtc::WebRtcPeer`]: each peer
+//! Runtime forwarding lives in [`crate::webrtc::WebRtcPeer`]: each peer
 //! driver subscribes to the shared encoder pool, requests keyframes from that
 //! pool on PLI/FIR, checks each frame's payload spec against the negotiated
 //! sender codec, and writes RTP through its own `RTCPeerConnection`.
@@ -11,7 +11,7 @@
 //! gating, and [`inject_recv_simulcast_into_video_offer`] for the SDP helper
 //! mirrored by the browser.
 
-use crate::display::encode::pool::{CodecKind, PeerCodecPreferences, SimulcastRid};
+use crate::encode::pool::{CodecKind, PeerCodecPreferences, SimulcastRid};
 use std::fmt;
 use tokio::sync::RwLock;
 
@@ -20,7 +20,7 @@ use tokio::sync::RwLock;
 // ---------------------------------------------------------------------------
 
 /// Forwarder-layer errors. These are in-process errors; wire-layer
-/// WebRTC errors stay in [`crate::display::webrtc`].
+/// WebRTC errors stay in [`crate::webrtc`].
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum ForwarderError {
@@ -171,16 +171,16 @@ impl Default for LayerSelector {
 /// produces Constrained Baseline / mode 1 — a silent-black-screen
 /// class of bug that the whole 3c.0 contract exists to prevent.
 ///
-/// The guard is [`crate::display::encode::offer_has_poolable_h264_variant`],
+/// The guard is [`crate::encode::offer_has_poolable_h264_variant`],
 /// which requires a variant that exactly matches the encoder pool's cached
-/// [`crate::display::encode::PayloadSpec::h264_constrained_baseline`].
+/// [`crate::encode::PayloadSpec::h264_constrained_baseline`].
 ///
 /// VP9 / AV1 don't need the guard today (no backend; pool excludes
 /// them at `on_demand_spawnable`), but including them unconditionally
 /// in prefs is harmless and matches the "prefs advertise what the
 /// peer supports, pool decides what's serveable" split.
 pub fn codec_preferences_from_offer(sdp: &str) -> PeerCodecPreferences {
-    let offered = crate::display::encode::parse_offered_codecs(sdp);
+    let offered = crate::encode::parse_offered_codecs(sdp);
     let mut supported = Vec::new();
     for name in offered {
         match name.as_str() {
@@ -196,7 +196,7 @@ pub fn codec_preferences_from_offer(sdp: &str) -> PeerCodecPreferences {
                 // those, so they'd result in silent black-screen
                 // frame-drop. See the detailed rules next to
                 // `offer_has_poolable_h264_variant`.
-                if crate::display::encode::offer_has_poolable_h264_variant(sdp) {
+                if crate::encode::offer_has_poolable_h264_variant(sdp) {
                     supported.push(CodecKind::H264);
                 }
             }
@@ -307,7 +307,7 @@ pub fn inject_recv_simulcast_into_video_offer(sdp: &str, rids: &[&str]) -> Strin
     lines.join("\r\n")
 }
 
-/// Map [`crate::display::IceServer`]s onto the shape an
+/// Map [`crate::IceServer`]s onto the shape an
 /// `RTCPeerConnection` constructor expects in its `iceServers` array.
 ///
 /// The transform is small but has one non-obvious rule: `username` and
@@ -330,11 +330,11 @@ pub fn inject_recv_simulcast_into_video_offer(sdp: &str, rids: &[&str]) -> Strin
 /// multiple servers, default-empty config).
 #[allow(dead_code)]
 pub fn ice_servers_to_rtc_peer_connection_config(
-    servers: &[crate::display::IceServer],
-) -> Vec<crate::display::IceServer> {
+    servers: &[crate::IceServer],
+) -> Vec<crate::IceServer> {
     servers
         .iter()
-        .map(|s| crate::display::IceServer {
+        .map(|s| crate::IceServer {
             urls: s.urls.clone(),
             username: s.username.as_ref().filter(|u| !u.is_empty()).cloned(),
             credential: s.credential.as_ref().filter(|c| !c.is_empty()).cloned(),
@@ -349,8 +349,8 @@ pub fn ice_servers_to_rtc_peer_connection_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::display::encode::pool::{EncoderId, EncoderSubscription, LayerSpec, SimulcastRid};
-    use crate::display::PeerId;
+    use crate::encode::pool::{EncoderId, EncoderSubscription, LayerSpec, SimulcastRid};
+    use crate::PeerId;
     use tokio::sync::broadcast;
 
     #[allow(dead_code)]
@@ -858,7 +858,7 @@ mod tests {
     // ice_servers_to_rtc_peer_connection_config — JS-mirror coverage
     // -----------------------------------------------------------------
 
-    use crate::display::IceServer;
+    use crate::IceServer;
 
     fn srv(urls: &[&str], username: Option<&str>, credential: Option<&str>) -> IceServer {
         IceServer {

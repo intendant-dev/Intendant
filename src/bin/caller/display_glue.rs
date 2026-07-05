@@ -14,6 +14,36 @@
 // is the deferred cosmetic pass (see the god-file split design).
 use crate::*;
 
+/// Adapt a display session's [`display::DisplayEvent`] stream onto the
+/// EventBus. The display pipeline has no dependency on the event layer;
+/// this forwarder is where its lifecycle/telemetry events become
+/// `AppEvent`s.
+pub(crate) fn display_event_forwarder(bus: EventBus) -> display::DisplayEventSender {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            bus.send(match ev {
+                display::DisplayEvent::CaptureLost { display_id, reason } => {
+                    AppEvent::DisplayCaptureLost { display_id, reason }
+                }
+                display::DisplayEvent::Metrics { snapshot } => {
+                    AppEvent::DisplayMetrics { snapshot }
+                }
+                display::DisplayEvent::Resize {
+                    display_id,
+                    width,
+                    height,
+                } => AppEvent::DisplayResize {
+                    display_id,
+                    width,
+                    height,
+                },
+            });
+        }
+    });
+    tx
+}
+
 /// Resolve `frames:` context hints into HQ images from the frame registry.
 pub(crate) async fn resolve_frame_hints(
     hints: &[String],
@@ -511,7 +541,11 @@ pub(crate) async fn activate_user_display(
         const WAYLAND_PORTAL_APPROVAL_TIMEOUT_SECS: u64 = 300;
         match tokio::time::timeout(
             std::time::Duration::from_secs(WAYLAND_PORTAL_APPROVAL_TIMEOUT_SECS),
-            session.start(30, frame_registry.clone(), Some(bus.clone())),
+            session.start(
+                30,
+                frame_registry.clone(),
+                Some(display_event_forwarder(bus.clone())),
+            ),
         )
         .await
         {
@@ -519,7 +553,7 @@ pub(crate) async fn activate_user_display(
                 // Use the backend's resolution (from portal), not xdpyinfo.
                 let (width, height) = session.resolution();
                 let session = Arc::new(session);
-                session.spawn_metrics_logger(Some(bus.clone()));
+                session.spawn_metrics_logger(Some(display_event_forwarder(bus.clone())));
                 session_registry.write().await.insert(display_id, session);
                 bus.send(AppEvent::DisplayReady {
                     display_id,
@@ -598,7 +632,11 @@ pub(crate) async fn activate_user_display(
             if let Ok(backend) = backend {
                 let session = display::DisplaySession::new(display_id, Arc::new(backend));
                 if let Err(e) = session
-                    .start(30, frame_registry.clone(), Some(bus.clone()))
+                    .start(
+                        30,
+                        frame_registry.clone(),
+                        Some(display_event_forwarder(bus.clone())),
+                    )
                     .await
                 {
                     eprintln!("[user_display] X11 display session failed: {}", e);
@@ -619,7 +657,7 @@ pub(crate) async fn activate_user_display(
                     }
                     let (width, height) = session.resolution();
                     let session = Arc::new(session);
-                    session.spawn_metrics_logger(Some(bus.clone()));
+                    session.spawn_metrics_logger(Some(display_event_forwarder(bus.clone())));
                     session_registry.write().await.insert(display_id, session);
                     bus.send(AppEvent::DisplayReady {
                         display_id,
@@ -664,7 +702,9 @@ pub(crate) async fn activate_user_display(
             display::macos::MacOSBackend::new()
         };
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
-        if let Err(e) = session.start(30, frame_registry, Some(bus.clone())).await {
+        if let Err(e) = session
+            .start(30, frame_registry, Some(display_event_forwarder(bus.clone())))
+            .await {
             report_user_display_capture_unavailable(
                 bus,
                 display_id,
@@ -674,7 +714,7 @@ pub(crate) async fn activate_user_display(
         } else {
             let (width, height) = session.resolution();
             let session = Arc::new(session);
-            session.spawn_metrics_logger(Some(bus.clone()));
+            session.spawn_metrics_logger(Some(display_event_forwarder(bus.clone())));
             session_registry.write().await.insert(display_id, session);
             bus.send(AppEvent::DisplayReady {
                 display_id,
@@ -706,7 +746,9 @@ pub(crate) async fn activate_user_display(
             display::windows::WindowsBackend::new()
         };
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
-        if let Err(e) = session.start(30, frame_registry, Some(bus.clone())).await {
+        if let Err(e) = session
+            .start(30, frame_registry, Some(display_event_forwarder(bus.clone())))
+            .await {
             report_user_display_capture_unavailable(
                 bus,
                 display_id,
@@ -716,7 +758,7 @@ pub(crate) async fn activate_user_display(
         } else {
             let (width, height) = session.resolution();
             let session = Arc::new(session);
-            session.spawn_metrics_logger(Some(bus.clone()));
+            session.spawn_metrics_logger(Some(display_event_forwarder(bus.clone())));
             session_registry.write().await.insert(display_id, session);
             bus.send(AppEvent::DisplayReady {
                 display_id,

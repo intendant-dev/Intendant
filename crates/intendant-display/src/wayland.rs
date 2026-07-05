@@ -6,7 +6,7 @@
 //! frames and an `AtomicBool` for shutdown signaling.
 
 use super::{DisplayBackend, Frame, FrameFormat, InputEvent};
-use crate::error::CallerError;
+use intendant_core::error::CallerError;
 use ashpd::desktop::clipboard::Clipboard;
 use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
@@ -1003,7 +1003,7 @@ mod tests {
         is_text_plain_mime, target_pipewire_framerate, wayland_input_error,
         wayland_remote_interaction_error,
     };
-    use crate::display::keymap::char_to_x11_keysym;
+    use crate::keymap::char_to_x11_keysym;
 
     #[test]
     fn paste_mime_matching() {

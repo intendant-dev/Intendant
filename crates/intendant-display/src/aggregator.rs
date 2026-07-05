@@ -3,8 +3,8 @@
 //! ## Architecture
 //!
 //! One coordinator task per display owns
-//! [`crate::display::encode::pool::EncoderPool::pause_layer`] /
-//! [`crate::display::encode::pool::EncoderPool::resume_layer`]
+//! [`crate::encode::pool::EncoderPool::pause_layer`] /
+//! [`crate::encode::pool::EncoderPool::resume_layer`]
 //! decisions. Three policies vote — presence, aggregate-TWCC, and
 //! per-RID RR — and the coordinator composes by intersection: a
 //! layer is wanted iff every active policy agrees. **Pause wins;
@@ -15,8 +15,8 @@
 //! ## Why display-level, not encode-level
 //!
 //! This module ties **peer presence**
-//! ([`crate::display::webrtc::WebRtcPeer`]) to **encoder pool
-//! lifecycle** ([`crate::display::encode::pool::EncoderPool`]).
+//! ([`crate::webrtc::WebRtcPeer`]) to **encoder pool
+//! lifecycle** ([`crate::encode::pool::EncoderPool`]).
 //! Putting it under `encode/` would force `encode/` to depend
 //! upward on `webrtc` (a module that's `encode/`'s consumer, not
 //! its peer), inverting the dependency graph. Living at the
@@ -35,7 +35,7 @@
 //!   federation-rehandshake thrashing).
 //! - **Aggregate-TWCC policy**: per-peer cascaded loss-driven
 //!   pause via [`AggregateLayerCapacity`] + [`step_aggregate_layer_capacity`]
-//!   reading from [`crate::display::twcc_tap`]. Cascade pauses
+//!   reading from [`crate::twcc_tap`]. Cascade pauses
 //!   top first, then mid, on sustained loss; reverse on
 //!   recovery. The actionable signal source on the rtc 0.9 +
 //!   WKWebView stack.
@@ -61,16 +61,16 @@
 //!
 //! [`spawn_layer_policy_coordinator`] takes
 //! `Box<dyn Fn(CapacityAction)>` instead of a direct
-//! [`crate::display::encode::pool::EncoderPool`] reference. The
+//! [`crate::encode::pool::EncoderPool`] reference. The
 //! closure pattern keeps the per-policy state machines pure
 //! (testable without spawning a real pool, capturing rids, or
 //! constructing fake encoder backends) and lets the production
-//! wiring at [`crate::display::DisplaySession::start`] capture the
+//! wiring at [`crate::DisplaySession::start`] capture the
 //! pool in one place.
 
-use crate::display::encode::pool::SimulcastRid;
-use crate::display::webrtc::{PeerLayerHealth, WebRtcPeer};
-use crate::display::PeerId;
+use crate::encode::pool::SimulcastRid;
+use crate::webrtc::{PeerLayerHealth, WebRtcPeer};
+use crate::PeerId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -440,7 +440,7 @@ pub enum AggregateLayerCapacity {
 }
 
 /// Pure transition for one peer's aggregate-loss state given the
-/// most recent [`crate::display::twcc_tap::TwccHealth`] reading.
+/// most recent [`crate::twcc_tap::TwccHealth`] reading.
 /// No side effects; caller owns state.
 ///
 /// `health = None` (no snapshot from the aggregator yet, or
@@ -459,7 +459,7 @@ pub enum AggregateLayerCapacity {
 /// link is in worse shape than the most recent loss reading
 /// suggested.
 ///
-/// The aggregator at [`crate::display::twcc_tap::spawn_twcc_health_aggregator`]
+/// The aggregator at [`crate::twcc_tap::spawn_twcc_health_aggregator`]
 /// publishes `None` for empty windows precisely so the policy
 /// short-circuits via the `let Some(h) = health` arm above. The
 /// `batches == 0 || reported_packets == 0` guard here is
@@ -468,7 +468,7 @@ pub enum AggregateLayerCapacity {
 /// on it.
 pub fn step_aggregate_layer_capacity(
     prev: AggregateLayerCapacity,
-    health: Option<&crate::display::twcc_tap::TwccHealth>,
+    health: Option<&crate::twcc_tap::TwccHealth>,
     config: &CapacityPolicyConfig,
     now: Instant,
 ) -> AggregateLayerCapacity {
@@ -631,9 +631,9 @@ pub fn aggregate_state_wanted_upper_layers(
 
 /// Side-effecting action the layer-policy coordinator emits at the
 /// end of each tick. Production wiring at
-/// [`crate::display::DisplaySession::start`] maps each variant to
-/// [`crate::display::encode::pool::EncoderPool::pause_layer`] /
-/// [`crate::display::encode::pool::EncoderPool::resume_layer`]
+/// [`crate::DisplaySession::start`] maps each variant to
+/// [`crate::encode::pool::EncoderPool::pause_layer`] /
+/// [`crate::encode::pool::EncoderPool::resume_layer`]
 /// with `CodecKind::Vp8` (the always-on simulcast codec). The
 /// per-RID-RR and aggregate-TWCC policies vote for a wanted set;
 /// the coordinator composes via intersection and emits one
@@ -759,7 +759,7 @@ pub fn diff_wanted_aggregate(
 ///
 /// **#57 — `pinned_layers` overrides intersection narrowing.** Each
 /// peer with exactly one negotiated RID
-/// ([`crate::display::webrtc::WebRtcPeer::active_rids`]) contributes
+/// ([`crate::webrtc::WebRtcPeer::active_rids`]) contributes
 /// that RID to `pinned_layers`. After computing the regular
 /// presence × twcc × rr intersection, those pinned RIDs are
 /// unconditionally unioned into the effective wanted set (still
@@ -771,7 +771,7 @@ pub fn diff_wanted_aggregate(
 ///
 /// **#48 — `demanded_layers` is the hard upper bound.** The union
 /// of all live peers' negotiated active RIDs
-/// ([`crate::display::webrtc::WebRtcPeer::active_rids`]) defines
+/// ([`crate::webrtc::WebRtcPeer::active_rids`]) defines
 /// the set of RIDs ANY live peer can actually consume. Layers
 /// outside this set are wasted CPU — the encoder produces frames
 /// that no peer's WebRTC track can decode. The bound is applied
@@ -827,9 +827,9 @@ pub fn compose_effective_wanted(
 /// Spawn the single layer-policy coordinator for one display.
 ///
 /// One task, three policies, one writer. Subscribes to each peer's
-/// [`crate::display::webrtc::WebRtcPeer::subscribe_twcc_health`]
+/// [`crate::webrtc::WebRtcPeer::subscribe_twcc_health`]
 /// and
-/// [`crate::display::webrtc::WebRtcPeer::subscribe_remote_inbound_health`]
+/// [`crate::webrtc::WebRtcPeer::subscribe_remote_inbound_health`]
 /// watches lazily on first observation, advances per-peer state for
 /// each policy on every tick, composes via intersection through
 /// [`compose_effective_wanted`], diffs once against actual pool
@@ -881,7 +881,7 @@ pub fn spawn_layer_policy_coordinator(
         let mut twcc_state: HashMap<PeerId, AggregateLayerCapacity> = HashMap::new();
         let mut twcc_subs: HashMap<
             PeerId,
-            tokio::sync::watch::Receiver<Option<crate::display::twcc_tap::TwccHealth>>,
+            tokio::sync::watch::Receiver<Option<crate::twcc_tap::TwccHealth>>,
         > = HashMap::new();
 
         // Per-RID RR: one per-(peer, RID) state, plus the
@@ -1447,11 +1447,11 @@ mod tests {
 
     // ----- step_aggregate_layer_capacity -----
 
-    fn twcc(loss_fraction: f64) -> crate::display::twcc_tap::TwccHealth {
+    fn twcc(loss_fraction: f64) -> crate::twcc_tap::TwccHealth {
         // Synthetic TwccHealth for state-machine tests. The state
         // machine reads only `loss_fraction`; other fields are
         // present to satisfy the type but irrelevant.
-        crate::display::twcc_tap::TwccHealth {
+        crate::twcc_tap::TwccHealth {
             at: Instant::now(),
             loss_fraction,
             reported_packets: 100,
@@ -1489,8 +1489,8 @@ mod tests {
     /// `None` for empty windows by design), but which the state
     /// machine must defensively treat as "no signal" anyway. Used
     /// by the empty-window-preserves-state suite below.
-    fn twcc_empty() -> crate::display::twcc_tap::TwccHealth {
-        crate::display::twcc_tap::TwccHealth {
+    fn twcc_empty() -> crate::twcc_tap::TwccHealth {
+        crate::twcc_tap::TwccHealth {
             at: Instant::now(),
             loss_fraction: 0.0,
             reported_packets: 0,
@@ -1505,8 +1505,8 @@ mod tests {
     /// non-zero `batches` count with `reported_packets == 0`. Could
     /// arise if a future code path counted "events seen" without
     /// checking whether they carried any reported packets.
-    fn twcc_batches_no_reports() -> crate::display::twcc_tap::TwccHealth {
-        crate::display::twcc_tap::TwccHealth {
+    fn twcc_batches_no_reports() -> crate::twcc_tap::TwccHealth {
+        crate::twcc_tap::TwccHealth {
             at: Instant::now(),
             loss_fraction: 0.0,
             reported_packets: 0,

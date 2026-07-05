@@ -10,7 +10,7 @@
 //! (slower but always works).
 
 use super::{DisplayBackend, Frame, FrameFormat, InputEvent};
-use crate::error::CallerError;
+use intendant_core::error::CallerError;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -779,7 +779,7 @@ mod tests {
 
     #[test]
     fn browser_key_codes_map_to_x11_keycodes() {
-        use crate::display::keymap::dom_code_to_x11_keycode;
+        use crate::keymap::dom_code_to_x11_keycode;
         // Spot-check well-known evdev+8 keycodes across the key classes the
         // browser input path sends; the full table (and its per-row tests)
         // lives in display/keymap.rs.
