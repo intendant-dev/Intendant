@@ -21685,7 +21685,31 @@ function stationHandleSessionAction(action) {
     return;
   }
   if (op === 'interrupt') {
-    stationHandleActivityAction({ action: 'stop' });
+    // Target the session's own turn; the daemon supervisor routes by id
+    // (a bare interrupt would broadcast to the foreground turn instead).
+    const msg = { action: 'interrupt' };
+    if (sessionId) msg.session_id = live?.actionId || sessionId;
+    dispatchSessionControlMsg(msg);
+    showControlToast?.('info', `Interrupt sent to ${shortSessionId(sessionId)}`);
+    return;
+  }
+  if (op === 'steer') {
+    // Make this session the prompt target, then open the composer on it.
+    focusSessionWindow(live?.liveId || sessionId);
+    if (stationRenderedPrimaryActive()) {
+      station?.set_composer?.(true, 'send');
+      stationHandleComposerEvent({ op: 'focus' });
+    }
+    return;
+  }
+  if (op === 'thread-compact') {
+    dispatchCodexThreadAction('compact', {}, live?.actionId || sessionId);
+    showControlToast?.('info', `Compaction requested for ${shortSessionId(sessionId)}`);
+    return;
+  }
+  if (op === 'thread-fork') {
+    dispatchCodexThreadAction('fork', {}, live?.actionId || sessionId);
+    showControlToast?.('info', `Fork requested for ${shortSessionId(sessionId)}`);
     return;
   }
   if (op === 'copy') {
@@ -24006,6 +24030,7 @@ function buildStationSnapshot() {
   if (stationCurrentApproval) {
     agents.push(stationApprovalAgent(selfPeerId, stationCurrentApproval.id, stationCurrentApproval));
   }
+  agents.push(...stationSessionAgents());
 
   const context = stationBuildContextSummary();
   const controls = stationBuildControlsSummary();
@@ -24144,6 +24169,117 @@ function stationApprovalAgent(hostId, approvalId, approval) {
     approvalCommand: approval.command || '',
     approvalCategory: approval.category || '',
   };
+}
+
+// Phase B: project live session windows into the scene — one node per
+// session, wired to its parent by the session_relationship data. The
+// daemon's own main session stays represented by the 'primary-agent'
+// node; everything else (supervisor sessions, fork children, in-band
+// task-* sub-agents) becomes a session node orbiting this host, ringed
+// by its context pressure and glowing when its approval is pending.
+function stationSessionAgents() {
+  try {
+    return stationSessionAgentsInner();
+  } catch (err) {
+    // A feed failure must degrade to "no session nodes", never break the
+    // whole Station update loop (buildStationSnapshot throwing would
+    // freeze every panel).
+    console.warn('Station session-node feed failed:', err);
+    return [];
+  }
+}
+
+function stationSessionAgentsInner() {
+  const out = [];
+  const primaryIds = new Set();
+  if (currentSessionFullId) {
+    primaryIds.add(String(currentSessionFullId));
+    try {
+      for (const id of relatedSessionIdsForSession(currentSessionFullId) || []) {
+        primaryIds.add(String(id));
+      }
+    } catch (_) {}
+  }
+  const liveIds = new Set();
+  for (const [sid, win] of sessionWindows) {
+    const id = String(sid);
+    if (!win || win.ended || sessionWindowIsDetached(id)) continue;
+    if (primaryIds.has(id)) continue;
+    liveIds.add(id);
+  }
+  for (const id of liveIds) {
+    const win = sessionWindows.get(id);
+    const meta = sessionMetadataById.get(id) || {};
+    const usage = (sessionUsageById.get(id) || {}).main || {};
+    const goal = meta.goal && typeof meta.goal === 'object' ? meta.goal : null;
+    const phase = normalizeStationPhase(win.phase || 'idle');
+    const active = isSessionWindowEffectivelyActive(id);
+    const parentSid = String(meta.parentId || '').trim();
+    let parentNodeId = null;
+    if (parentSid) {
+      if (primaryIds.has(parentSid)) parentNodeId = 'primary-agent';
+      else if (liveIds.has(parentSid)) parentNodeId = 'session-' + sanitizeStationId(parentSid);
+    }
+    const kind = String(meta.relationshipKind || '').trim();
+    const source = normalizeAgentId(
+      externalSourceForSessionWindow(id, win) || meta.backendSource || meta.source || ''
+    ) || '';
+    let needsApproval = false;
+    if (pendingApprovalSessionId) {
+      needsApproval = pendingApprovalSessionId === id;
+      if (!needsApproval) {
+        try {
+          needsApproval = (relatedSessionIdsForSession(id) || []).includes(pendingApprovalSessionId);
+        } catch (_) {}
+      }
+    }
+    const name = compactSessionText(
+      meta.name || meta.display_name || meta.displayName || meta.title || ''
+    );
+    const task = name
+      || compactSessionText(meta.initial_message || meta.initialMessage || meta.task || '')
+      || shortSessionId(id);
+    out.push({
+      id: 'session-' + sanitizeStationId(id),
+      hostId: selfPeerId,
+      role: kind === 'subagent'
+        ? 'sub-agent'
+        : (source && source !== 'intendant' ? 'external' : 'session'),
+      phase,
+      status: active ? 'in_progress' : (phase === 'done' ? 'done' : phase),
+      task,
+      provider: usage.provider || '',
+      model: usage.model || '',
+      tokens: Number(usage.tokens_used) || 0,
+      tokenCap: Number(usage.context_window) || 200000,
+      prompt: Number(usage.prompt_tokens) || 0,
+      completion: Number(usage.completion_tokens) || 0,
+      cached: Number(usage.cached_tokens) || 0,
+      cost: 0,
+      turns: 0,
+      turnCap: 0,
+      autonomy: '',
+      worktree: String(meta.projectRoot || meta.cwd || ''),
+      parentId: parentNodeId,
+      needsApproval,
+      approvalId: needsApproval && pendingApprovalId !== null && pendingApprovalId !== undefined
+        ? String(pendingApprovalId)
+        : null,
+      approvalCommand: '',
+      approvalCategory: '',
+      sessionId: id,
+      source,
+      relationshipKind: kind,
+      goalStatus: goal ? String(goal.status || '') : '',
+      goalObjective: goal ? String(goal.objective || '') : '',
+      goalTokens: goal && goal.tokensUsed !== null && goal.tokensUsed !== undefined
+        ? String(goal.tokensUsed)
+        : '',
+      threadActions: sessionThreadActionOps(id) || [],
+      canInterrupt: active,
+    });
+  }
+  return out;
 }
 
 function stationUsageForHost(hostId) {
