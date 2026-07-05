@@ -1938,19 +1938,11 @@ pub(crate) fn status_line_u16(status_line: &str) -> u16 {
 /// Build an HTTP response for an upload endpoint error.
 pub(crate) fn upload_error_response(status: &str, message: &str) -> String {
     let body = serde_json::json!({"error": message}).to_string();
-    format!(
-        "HTTP/1.1 {}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        status,
-        body.len(),
-        body
-    )
+    HttpResponse::with_content(status, "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_string()
 }
 
 pub(crate) async fn handle_fs_write(
@@ -2080,48 +2072,37 @@ pub(crate) async fn handle_fs_read(mut stream: DemuxStream, header_text: &str, r
             } else {
                 format!("X-Content-Sha256: {}\r\n", fs_sha256_hex(&file.bytes))
             };
-            let header = format!(
-                "HTTP/1.1 {}\r\n\
-                 Content-Type: {}\r\n\
-                 Content-Length: {}\r\n\
-                 Accept-Ranges: bytes\r\n\
-                 {}\
-                 {}\
-                 Content-Disposition: attachment; filename=\"{}\"\r\n\
-                 Cache-Control: no-cache\r\n\
-                 Access-Control-Allow-Origin: *\r\n\
-                 Access-Control-Expose-Headers: X-Content-Sha256\r\n\
-                 Connection: close\r\n\
-                 \r\n",
-                status,
-                file.content_type,
-                file.bytes.len(),
-                content_range,
-                sha_header,
-                file.filename.replace('"', ""),
-            );
+            let header = HttpResponse::new(status)
+                .header("Content-Type", &file.content_type)
+                .header("Content-Length", file.bytes.len().to_string())
+                .header("Accept-Ranges", "bytes")
+                .header_segment(&content_range)
+                .header_segment(&sha_header)
+                .header(
+                    "Content-Disposition",
+                    format!(
+                        "attachment; filename=\"{}\"",
+                        file.filename.replace('"', "")
+                    ),
+                )
+                .header("Cache-Control", "no-cache")
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Access-Control-Expose-Headers", "X-Content-Sha256")
+                .header("Connection", "close")
+                .into_string();
             let _ = stream.write_all(header.as_bytes()).await;
             let _ = stream.write_all(&file.bytes).await;
         }
         Err(error) => {
             let response = if let Some(total_size) = error.total_size {
                 let body = serde_json::json!({ "error": error.message }).to_string();
-                format!(
-                    "HTTP/1.1 {}\r\n\
-                     Content-Type: application/json\r\n\
-                     Content-Length: {}\r\n\
-                     Content-Range: bytes */{}\r\n\
-                     Accept-Ranges: bytes\r\n\
-                     Cache-Control: no-cache\r\n\
-                     Access-Control-Allow-Origin: *\r\n\
-                     Connection: close\r\n\
-                     \r\n\
-                     {}",
-                    error.status,
-                    body.len(),
-                    total_size,
-                    body
-                )
+                HttpResponse::with_content(&error.status, "application/json", body)
+                    .header("Content-Range", format!("bytes */{total_size}"))
+                    .header("Accept-Ranges", "bytes")
+                    .header("Cache-Control", "no-cache")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Connection", "close")
+                    .into_string()
             } else {
                 json_error(&error.status, error.message)
             };
@@ -2354,18 +2335,11 @@ pub(crate) async fn handle_current_uploads_post(
                         });
                         let body =
                             serde_json::to_string(&descriptor).unwrap_or_else(|_| "{}".to_string());
-                        format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        )
+                        HttpResponse::with_content("200 OK", "application/json", body)
+                            .header("Cache-Control", "no-cache")
+                            .header("Access-Control-Allow-Origin", "*")
+                            .header("Connection", "close")
+                            .into_string()
                     }
                     Err(e) => upload_error_response(
                         "500 Internal Server Error",
@@ -2414,18 +2388,11 @@ pub(crate) async fn handle_current_uploads_get(
         if suffix.is_empty() {
             let uploads = crate::upload_store::list_uploads(&session_dir, root);
             let body = serde_json::to_string(&uploads).unwrap_or_else(|_| "[]".to_string());
-            format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: application/json\r\n\
-                 Content-Length: {}\r\n\
-                 Cache-Control: no-cache\r\n\
-                 Access-Control-Allow-Origin: *\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {}",
-                body.len(),
-                body
-            )
+            HttpResponse::with_content("200 OK", "application/json", body)
+                .header("Cache-Control", "no-cache")
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Connection", "close")
+                .into_string()
         } else if let Some(id) = suffix.strip_suffix("/raw") {
             // GET raw bytes for one upload.
             match crate::upload_store::find_upload(id, &session_dir, root) {
@@ -2433,19 +2400,17 @@ pub(crate) async fn handle_current_uploads_get(
                 Some(d) => {
                     match std::fs::read(&d.path) {
                         Ok(bytes) => {
-                            let header = format!(
-                                "HTTP/1.1 200 OK\r\n\
-                                 Content-Type: {}\r\n\
-                                 Content-Length: {}\r\n\
-                                 Content-Disposition: inline; filename=\"{}\"\r\n\
-                                 Cache-Control: no-cache\r\n\
-                                 Access-Control-Allow-Origin: *\r\n\
-                                 Connection: close\r\n\
-                                 \r\n",
-                                d.mime,
-                                bytes.len(),
-                                d.name.replace('"', ""),
-                            );
+                            let header = HttpResponse::new("200 OK")
+                                .header("Content-Type", d.mime)
+                                .header("Content-Length", bytes.len().to_string())
+                                .header(
+                                    "Content-Disposition",
+                                    format!("inline; filename=\"{}\"", d.name.replace('"', ""),),
+                                )
+                                .header("Cache-Control", "no-cache")
+                                .header("Access-Control-Allow-Origin", "*")
+                                .header("Connection", "close")
+                                .into_string();
                             let _ = stream.write_all(header.as_bytes()).await;
                             let _ = stream.write_all(&bytes).await;
                             // Skip the trailing write_all below.

@@ -405,7 +405,7 @@ pub(crate) fn initial_body_bytes(initial_request_bytes: &[u8]) -> Result<&[u8], 
 /// the dispatch-side consumption step.
 pub(crate) struct HttpResponse {
     status: String,
-    headers: Vec<(&'static str, String)>,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -420,34 +420,53 @@ impl HttpResponse {
         }
     }
 
+    /// Status + Content-Type + Content-Length + body; every further
+    /// header is appended in call order, so ported hand-rolled sites keep
+    /// their historical header layout.
+    pub(crate) fn with_content(
+        status: impl Into<String>,
+        content_type: impl Into<String>,
+        body: impl Into<Vec<u8>>,
+    ) -> Self {
+        let body = body.into();
+        Self::new(status)
+            .header("Content-Type", content_type.into())
+            .header("Content-Length", body.len().to_string())
+            .with_body(body)
+    }
+
     /// The canonical JSON shape: Content-Type, Content-Length,
     /// `Cache-Control: no-cache`, `Connection: close` — byte-identical to
     /// the historical `json_response` framing.
     pub(crate) fn json(status: impl Into<String>, body: impl Into<Vec<u8>>) -> Self {
-        let body = body.into();
-        Self::new(status)
-            .header("Content-Type", "application/json")
-            .header("Content-Length", body.len().to_string())
+        Self::with_content(status, "application/json", body)
             .header("Cache-Control", "no-cache")
             .header("Connection", "close")
-            .with_body(body)
     }
 
     /// The canonical HTML shape — byte-identical to the historical
     /// `html_response` framing (which bakes a wildcard CORS header in).
     pub(crate) fn html(status: impl Into<String>, body: impl Into<Vec<u8>>) -> Self {
-        let body = body.into();
-        Self::new(status)
-            .header("Content-Type", "text/html; charset=utf-8")
-            .header("Content-Length", body.len().to_string())
+        Self::with_content(status, "text/html; charset=utf-8", body)
             .header("Cache-Control", "no-cache")
             .header("Access-Control-Allow-Origin", "*")
             .header("Connection", "close")
-            .with_body(body)
     }
 
-    pub(crate) fn header(mut self, name: &'static str, value: impl Into<String>) -> Self {
-        self.headers.push((name, value.into()));
+    pub(crate) fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Append a pre-rendered `Name: value\r\n[…]` segment — the bridge for
+    /// helpers that still build header strings (the MCP CORS segment, the
+    /// preflight postures). Empty input is a no-op.
+    pub(crate) fn header_segment(mut self, segment: &str) -> Self {
+        for line in segment.split("\r\n").filter(|l| !l.is_empty()) {
+            if let Some((name, value)) = line.split_once(": ") {
+                self.headers.push((name.to_string(), value.to_string()));
+            }
+        }
         self
     }
 

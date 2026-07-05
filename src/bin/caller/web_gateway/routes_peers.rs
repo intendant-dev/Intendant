@@ -211,19 +211,14 @@ pub(crate) async fn handle_peers_sub_router(
         503 => "Service Unavailable",
         _ => "Error",
     };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
+    let response =
+        HttpResponse::with_content(format!("{} {}", status, reason), "application/json", body)
+            .header("Cache-Control", "no-cache")
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+            .header("Access-Control-Allow-Headers", "Content-Type")
+            .header("Connection", "close")
+            .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
@@ -272,19 +267,14 @@ pub(crate) async fn handle_coordinator_route(
         503 => "Service Unavailable",
         _ => "Error",
     };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
+    let response =
+        HttpResponse::with_content(format!("{} {}", status, reason), "application/json", body)
+            .header("Cache-Control", "no-cache")
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            .header("Access-Control-Allow-Headers", "Content-Type")
+            .header("Connection", "close")
+            .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }

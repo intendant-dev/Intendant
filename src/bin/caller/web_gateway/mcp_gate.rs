@@ -412,17 +412,15 @@ pub(crate) async fn handle_mcp_post(
                     "error": { "code": -32600, "message": message },
                 })
                 .to_string();
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\n\
-                     Content-Type: application/json\r\n\
-                     {mcp_cors}\
-                     Content-Length: {}\r\n\
-                     Cache-Control: no-cache\r\n\
-                     Connection: close\r\n\
-                     \r\n\
-                     {body}",
-                    body.len(),
-                );
+                let response = HttpResponse::with_content(
+                    format!("{status} {reason}"),
+                    "application/json",
+                    body,
+                )
+                .header_segment(&mcp_cors)
+                .header("Cache-Control", "no-cache")
+                .header("Connection", "close")
+                .into_string();
                 let _ = stream.write_all(response.as_bytes()).await;
                 finalize_http_stream(&mut stream).await;
                 return;
@@ -464,37 +462,21 @@ pub(crate) async fn handle_mcp_post(
         let http_response = match outcome {
             McpHttpOutcome::Response(resp) => {
                 let json = serde_json::to_string(&resp).unwrap_or_default();
-                format!(
-                    "HTTP/1.1 200 OK\r\n\
-                     Content-Type: application/json\r\n\
-                     {mcp_cors}\
-                     Content-Length: {}\r\n\
-                     \r\n\
-                     {}",
-                    json.len(),
-                    json,
-                )
+                HttpResponse::with_content("200 OK", "application/json", json)
+                    .header_segment(&mcp_cors)
+                    .into_string()
             }
-            McpHttpOutcome::Accepted => format!(
-                "HTTP/1.1 202 Accepted\r\n\
-                 {mcp_cors}\
-                 Content-Length: 0\r\n\
-                 \r\n"
-            ),
+            McpHttpOutcome::Accepted => HttpResponse::new("202 Accepted")
+                .header_segment(&mcp_cors)
+                .header("Content-Length", "0")
+                .into_string(),
         };
         let _ = stream.write_all(http_response.as_bytes()).await;
     } else {
         let err =
             r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"MCP server not available"}}"#;
-        let http = format!(
-            "HTTP/1.1 503 Service Unavailable\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             \r\n\
-             {}",
-            err.len(),
-            err
-        );
+        let http = HttpResponse::with_content("503 Service Unavailable", "application/json", err)
+            .into_string();
         let _ = stream.write_all(http.as_bytes()).await;
     }
     finalize_http_stream(&mut stream).await;
@@ -505,13 +487,10 @@ pub(crate) async fn handle_mcp_stream(mut stream: DemuxStream, header_text: &str
     // are not supported by our stateless endpoint.  Return 405 so rmcp
     // gracefully falls back (skips SSE / ignores session delete).
     use tokio::io::AsyncWriteExt;
-    let http = format!(
-        "HTTP/1.1 405 Method Not Allowed\r\n\
-         {}\
-         Content-Length: 0\r\n\
-         \r\n",
-        mcp_cors_header_segment(header_text, is_tls)
-    );
+    let http = HttpResponse::new("405 Method Not Allowed")
+        .header_segment(&mcp_cors_header_segment(header_text, is_tls))
+        .header("Content-Length", "0")
+        .into_string();
     let _ = stream.write_all(http.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }

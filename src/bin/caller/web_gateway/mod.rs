@@ -4952,16 +4952,10 @@ pub fn spawn_web_gateway(
                     );
                     let body = "This endpoint requires TLS. Use https:// (or wss://) instead of \
                                 http:// / ws://.\n";
-                    let response = format!(
-                        "HTTP/1.1 426 Upgrade Required\r\n\
-                         Content-Type: text/plain\r\n\
-                         Content-Length: {}\r\n\
-                         Upgrade: TLS/1.2\r\n\
-                         Connection: close\r\n\
-                         \r\n\
-                         {body}",
-                        body.len(),
-                    );
+                    let response = HttpResponse::with_content("426 Upgrade Required", "text/plain", body)
+                        .header("Upgrade", "TLS/1.2")
+                        .header("Connection", "close")
+                        .into_string();
                     let _ = raw_stream.write_all(response.as_bytes()).await;
                     let _ = raw_stream.shutdown().await;
                     return;
@@ -5048,16 +5042,10 @@ pub fn spawn_web_gateway(
                             403 => "Forbidden",
                             _ => "Error",
                         };
-                        let response = format!(
-                            "HTTP/1.1 {status} {reason}\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {body}",
-                            body.len(),
-                        );
+                        let response = HttpResponse::with_content(format!("{} {}", status, reason), "application/json", body)
+                            .header("Cache-Control", "no-cache")
+                            .header("Connection", "close")
+                            .into_string();
                         let _ = stream.write_all(response.as_bytes()).await;
                         finalize_http_stream(&mut stream).await;
                         return;
@@ -5089,16 +5077,10 @@ pub fn spawn_web_gateway(
                             "error": "mTLS client certificate required"
                         })
                         .to_string();
-                        let response = format!(
-                            "HTTP/1.1 401 Unauthorized\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {body}",
-                            body.len(),
-                        );
+                        let response = HttpResponse::with_content("401 Unauthorized", "application/json", body)
+                            .header("Cache-Control", "no-cache")
+                            .header("Connection", "close")
+                            .into_string();
                         let _ = stream.write_all(response.as_bytes()).await;
                         finalize_http_stream(&mut stream).await;
                         return;
@@ -5116,16 +5098,10 @@ pub fn spawn_web_gateway(
                             401 => "Unauthorized",
                             _ => "Error",
                         };
-                        let response = format!(
-                            "HTTP/1.1 {status} {reason}\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             WWW-Authenticate: Bearer\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {body}",
-                            body.len(),
-                        );
+                        let response = HttpResponse::with_content(format!("{} {}", status, reason), "application/json", body)
+                            .header("WWW-Authenticate", "Bearer")
+                            .header("Connection", "close")
+                            .into_string();
                         let _ = stream.write_all(response.as_bytes()).await;
                         // Flush + cleanly shut down before the task returns and
                         // drops the stream. On the TLS path rustls buffers the
@@ -7878,21 +7854,21 @@ pub fn spawn_web_gateway(
                                 is_own_or_app_origin(origin, is_tls, &header_text)
                             });
                             match allowed {
-                                Some(origin) => format!(
-                                    "HTTP/1.1 204 No Content\r\n\
-                                     Access-Control-Allow-Origin: {origin}\r\n\
-                                     Access-Control-Allow-Methods: {methods}\r\n\
-                                     Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
-                                     Access-Control-Max-Age: 86400\r\n\
-                                     Vary: Origin\r\n\
-                                     Connection: close\r\n\
-                                     \r\n"
-                                ),
-                                None => "HTTP/1.1 204 No Content\r\n\
-                                    Vary: Origin\r\n\
-                                    Connection: close\r\n\
-                                    \r\n"
-                                    .to_string(),
+                                Some(origin) => HttpResponse::new("204 No Content")
+                                    .header("Access-Control-Allow-Origin", origin)
+                                    .header("Access-Control-Allow-Methods", methods)
+                                    .header(
+                                        "Access-Control-Allow-Headers",
+                                        "Content-Type, Authorization",
+                                    )
+                                    .header("Access-Control-Max-Age", "86400")
+                                    .header("Vary", "Origin")
+                                    .header("Connection", "close")
+                                    .into_string(),
+                                None => HttpResponse::new("204 No Content")
+                                    .header("Vary", "Origin")
+                                    .header("Connection", "close")
+                                    .into_string(),
                             }
                         } else if fleet_scoped {
                             let methods =
@@ -7908,35 +7884,36 @@ pub fn spawn_web_gateway(
                                 )
                             });
                             match allowed {
-                                Some(origin) => format!(
-                                    "HTTP/1.1 204 No Content\r\n\
-                                     Access-Control-Allow-Origin: {origin}\r\n\
-                                     Access-Control-Allow-Methods: {methods}\r\n\
-                                     Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
-                                     Access-Control-Max-Age: 86400\r\n\
-                                     Vary: Origin\r\n\
-                                     Connection: close\r\n\
-                                     \r\n"
-                                ),
-                                None => "HTTP/1.1 204 No Content\r\n\
-                                    Vary: Origin\r\n\
-                                    Connection: close\r\n\
-                                    \r\n"
-                                    .to_string(),
+                                Some(origin) => HttpResponse::new("204 No Content")
+                                    .header("Access-Control-Allow-Origin", origin)
+                                    .header("Access-Control-Allow-Methods", methods)
+                                    .header(
+                                        "Access-Control-Allow-Headers",
+                                        "Content-Type, Authorization",
+                                    )
+                                    .header("Access-Control-Max-Age", "86400")
+                                    .header("Vary", "Origin")
+                                    .header("Connection", "close")
+                                    .into_string(),
+                                None => HttpResponse::new("204 No Content")
+                                    .header("Vary", "Origin")
+                                    .header("Connection", "close")
+                                    .into_string(),
                             }
                         } else {
                             let methods = table_methods
                                 .as_deref()
                                 .unwrap_or("GET, POST, DELETE, OPTIONS");
-                            format!(
-                                "HTTP/1.1 204 No Content\r\n\
-                                 Access-Control-Allow-Origin: *\r\n\
-                                 Access-Control-Allow-Methods: {methods}\r\n\
-                                 Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
-                                 Access-Control-Max-Age: 86400\r\n\
-                                 Connection: close\r\n\
-                                 \r\n"
-                            )
+                            HttpResponse::new("204 No Content")
+                                .header("Access-Control-Allow-Origin", "*")
+                                .header("Access-Control-Allow-Methods", methods)
+                                .header(
+                                    "Access-Control-Allow-Headers",
+                                    "Content-Type, Authorization",
+                                )
+                                .header("Access-Control-Max-Age", "86400")
+                                .header("Connection", "close")
+                                .into_string()
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
                         finalize_http_stream(&mut stream).await;
@@ -7955,16 +7932,10 @@ pub fn spawn_web_gateway(
                             "error": "mTLS client certificate required"
                         })
                         .to_string();
-                        let response = format!(
-                            "HTTP/1.1 401 Unauthorized\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {body}",
-                            body.len(),
-                        );
+                        let response = HttpResponse::with_content("401 Unauthorized", "application/json", body)
+                            .header("Cache-Control", "no-cache")
+                            .header("Connection", "close")
+                            .into_string();
                         let _ = stream.write_all(response.as_bytes()).await;
                         finalize_http_stream(&mut stream).await;
                         return;
@@ -8028,16 +7999,10 @@ pub fn spawn_web_gateway(
                                     "reason": decision.reason,
                                 })
                                 .to_string();
-                                let response = format!(
-                                    "HTTP/1.1 403 Forbidden\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {body}",
-                                    body.len(),
-                                );
+                                let response = HttpResponse::with_content("403 Forbidden", "application/json", body)
+                                    .header("Cache-Control", "no-cache")
+                                    .header("Connection", "close")
+                                    .into_string();
                                 let _ = stream.write_all(response.as_bytes()).await;
                                 finalize_http_stream(&mut stream).await;
                                 return;
@@ -8051,17 +8016,11 @@ pub fn spawn_web_gateway(
                                 401 => "Unauthorized",
                                 _ => "Error",
                             };
-                            let response = format!(
-                                "HTTP/1.1 {status} {reason}\r\n\
-                                 Content-Type: application/json\r\n\
-                                 Content-Length: {}\r\n\
-                                 Cache-Control: no-cache\r\n\
-                                 WWW-Authenticate: Bearer\r\n\
-                                 Connection: close\r\n\
-                                 \r\n\
-                                 {body}",
-                                body.len(),
-                            );
+                            let response = HttpResponse::with_content(format!("{} {}", status, reason), "application/json", body)
+                                .header("Cache-Control", "no-cache")
+                                .header("WWW-Authenticate", "Bearer")
+                                .header("Connection", "close")
+                                .into_string();
                             let _ = stream.write_all(response.as_bytes()).await;
                             finalize_http_stream(&mut stream).await;
                             return;
@@ -8629,29 +8588,19 @@ pub fn spawn_web_gateway(
                             None
                         };
                         if let Some(jpeg_data) = data {
-                            let header = format!(
-                                "HTTP/1.1 200 OK\r\n\
-                                 Content-Type: image/jpeg\r\n\
-                                 Content-Length: {}\r\n\
-                                 Cache-Control: public, max-age=31536000, immutable\r\n\
-                                 Connection: close\r\n\
-                                 \r\n",
-                                jpeg_data.len()
-                            );
+                            let header = HttpResponse::new("200 OK")
+                                .header("Content-Type", "image/jpeg")
+                                .header("Content-Length", jpeg_data.len().to_string())
+                                .header("Cache-Control", "public, max-age=31536000, immutable")
+                                .header("Connection", "close")
+                                .into_string();
                             let _ = stream.write_all(header.as_bytes()).await;
                             let _ = stream.write_all(&jpeg_data).await;
                         } else {
                             let body = "Frame not found";
-                            let response = format!(
-                                "HTTP/1.1 404 Not Found\r\n\
-                                 Content-Type: text/plain\r\n\
-                                 Content-Length: {}\r\n\
-                                 Connection: close\r\n\
-                                 \r\n\
-                                 {}",
-                                body.len(),
-                                body
-                            );
+                            let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
+                                .header("Connection", "close")
+                                .into_string();
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
                     } else if req_method == "POST" && req_path == "/session" {
@@ -8663,17 +8612,9 @@ pub fn spawn_web_gateway(
                                 serde_json::json!({"error": msg}).to_string(),
                             ),
                         };
-                        let response = format!(
-                            "HTTP/1.1 {}\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            status,
-                            body.len(),
-                            body
-                        );
+                        let response = HttpResponse::with_content(status, "application/json", body)
+                            .header("Connection", "close")
+                            .into_string();
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_path.starts_with("/recordings/") {
@@ -8713,17 +8654,10 @@ pub fn spawn_web_gateway(
                                     })
                                     .collect();
                                 let body = serde_json::to_string(&json).unwrap_or("[]".to_string());
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    body.len(),
-                                    body
-                                );
+                                let response = HttpResponse::with_content("200 OK", "application/json", body)
+                                    .header("Cache-Control", "no-cache")
+                                    .header("Connection", "close")
+                                    .into_string();
                                 let _ = stream.write_all(response.as_bytes()).await;
                             } else if parts.len() == 2 && parts[1] == "playlist.m3u8" {
                                 // GET /recordings/{stream}/playlist.m3u8 — HLS playlist
@@ -8738,17 +8672,10 @@ pub fn spawn_web_gateway(
                                     );
                                 }
                                 let m3u8 = recording_playlist_m3u8(&segments);
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
-                                     Content-Type: application/vnd.apple.mpegurl\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    m3u8.len(),
-                                    m3u8
-                                );
+                                let response = HttpResponse::with_content("200 OK", "application/vnd.apple.mpegurl", m3u8)
+                                    .header("Cache-Control", "no-cache")
+                                    .header("Connection", "close")
+                                    .into_string();
                                 let _ = stream.write_all(response.as_bytes()).await;
                             } else if parts.len() == 2 {
                                 // GET /recordings/{stream}/{filename} — serve segment file
@@ -8781,74 +8708,42 @@ pub fn spawn_web_gateway(
                                     };
                                     match tokio::fs::read(&seg_path).await {
                                         Ok(data) => {
-                                            let header = format!(
-                                                "HTTP/1.1 200 OK\r\n\
-                                                 Content-Type: {}\r\n\
-                                                 Content-Length: {}\r\n\
-                                                 Cache-Control: public, max-age=3600\r\n\
-                                                 Connection: close\r\n\
-                                                 \r\n",
-                                                content_type,
-                                                data.len()
-                                            );
+                                            let header = HttpResponse::new("200 OK")
+                                                .header("Content-Type", content_type)
+                                                .header("Content-Length", data.len().to_string())
+                                                .header("Cache-Control", "public, max-age=3600")
+                                                .header("Connection", "close")
+                                                .into_string();
                                             let _ = stream.write_all(header.as_bytes()).await;
                                             let _ = stream.write_all(&data).await;
                                         }
                                         Err(_) => {
                                             let body = "Segment not found";
-                                            let response = format!(
-                                                "HTTP/1.1 404 Not Found\r\n\
-                                                 Content-Type: text/plain\r\n\
-                                                 Content-Length: {}\r\n\
-                                                 Connection: close\r\n\
-                                                 \r\n\
-                                                 {}",
-                                                body.len(),
-                                                body
-                                            );
+                                            let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
+                                                .header("Connection", "close")
+                                                .into_string();
                                             let _ = stream.write_all(response.as_bytes()).await;
                                         }
                                     }
                                 } else {
                                     let body = "Invalid filename";
-                                    let response = format!(
-                                        "HTTP/1.1 400 Bad Request\r\n\
-                                         Content-Type: text/plain\r\n\
-                                         Content-Length: {}\r\n\
-                                         Connection: close\r\n\
-                                         \r\n\
-                                         {}",
-                                        body.len(),
-                                        body
-                                    );
+                                    let response = HttpResponse::with_content("400 Bad Request", "text/plain", body)
+                                        .header("Connection", "close")
+                                        .into_string();
                                     let _ = stream.write_all(response.as_bytes()).await;
                                 }
                             } else {
                                 let body = "Not found";
-                                let response = format!(
-                                    "HTTP/1.1 404 Not Found\r\n\
-                                     Content-Type: text/plain\r\n\
-                                     Content-Length: {}\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    body.len(),
-                                    body
-                                );
+                                let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
+                                    .header("Connection", "close")
+                                    .into_string();
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
                         } else {
                             let body = "Recording not available";
-                            let response = format!(
-                                "HTTP/1.1 404 Not Found\r\n\
-                                 Content-Type: text/plain\r\n\
-                                 Content-Length: {}\r\n\
-                                 Connection: close\r\n\
-                                 \r\n\
-                                 {}",
-                                body.len(),
-                                body
-                            );
+                            let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
+                                .header("Connection", "close")
+                                .into_string();
                             use tokio::io::AsyncWriteExt;
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
@@ -8857,17 +8752,10 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
 
                         let body = recordings_list_response_body(recording_registry.clone()).await;
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
+                        let response = HttpResponse::with_content("200 OK", "application/json", body)
+                            .header("Cache-Control", "no-cache")
+                            .header("Connection", "close")
+                            .into_string();
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_path == "/debug" {
                         // Debug endpoint: returns agent state + voice connection info
@@ -8892,33 +8780,19 @@ pub fn spawn_web_gateway(
                             "active_connection_id": active_id,
                         })
                         .to_string();
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            debug_json.len(),
-                            debug_json
-                        );
+                        let response = HttpResponse::with_content("200 OK", "application/json", debug_json)
+                            .header("Connection", "close")
+                            .into_string();
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if let Some(response) = dashboard_local_file_response(request_line) {
                         use tokio::io::AsyncWriteExt;
                         match response {
                             DashboardLocalFileResponse::Html { status, body } => {
-                                let response = format!(
-                                    "HTTP/1.1 {status}\r\n\
-                                     Content-Type: text/html; charset=utf-8\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    body.len(),
-                                    body
-                                );
+                                let response = HttpResponse::with_content(status, "text/html; charset=utf-8", body)
+                                    .header("Cache-Control", "no-cache")
+                                    .header("Connection", "close")
+                                    .into_string();
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
                             DashboardLocalFileResponse::Bytes {
@@ -8926,16 +8800,13 @@ pub fn spawn_web_gateway(
                                 content_type,
                                 bytes,
                             } => {
-                                let header = format!(
-                                    "HTTP/1.1 {status}\r\n\
-                                     Content-Type: {content_type}\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     X-Content-Type-Options: nosniff\r\n\
-                                     Connection: close\r\n\
-                                     \r\n",
-                                    bytes.len()
-                                );
+                                let header = HttpResponse::new(status)
+                                    .header("Content-Type", content_type)
+                                    .header("Content-Length", bytes.len().to_string())
+                                    .header("Cache-Control", "no-cache")
+                                    .header("X-Content-Type-Options", "nosniff")
+                                    .header("Connection", "close")
+                                    .into_string();
                                 let _ = stream.write_all(header.as_bytes()).await;
                                 let _ = stream.write_all(&bytes).await;
                             }
@@ -8982,18 +8853,11 @@ pub fn spawn_web_gateway(
                         // on this daemon from a page served by a sibling
                         // daemon (cross-origin). `*` works because our
                         // fetches don't send credentials.
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
+                        let response = HttpResponse::with_content("200 OK", "application/json", body)
+                            .header("Cache-Control", "no-cache")
+                            .header("Access-Control-Allow-Origin", "*")
+                            .header("Connection", "close")
+                            .into_string();
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "GET" || req_method == "HEAD" {
@@ -9033,18 +8897,11 @@ pub fn spawn_web_gateway(
                         let _ = stream.write_all(&response).await;
                     } else {
                         // Non-GET/HEAD fallback: plain app.html, as before.
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: text/html; charset=utf-8\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            app_html.len(),
-                            app_html
-                        );
+                        let response = HttpResponse::with_content("200 OK", "text/html; charset=utf-8", app_html.as_bytes())
+                            .header("Cache-Control", "no-cache")
+                            .header("Access-Control-Allow-Origin", "*")
+                            .header("Connection", "close")
+                            .into_string();
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
                     }
@@ -9099,17 +8956,10 @@ pub fn spawn_web_gateway(
 async fn handle_project_root(mut stream: DemuxStream, project_root: Option<PathBuf>) {
     use tokio::io::AsyncWriteExt;
     let body = project_root_response_body(project_root.as_deref());
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body
-    );
+    let response = HttpResponse::with_content("200 OK", "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "close")
+        .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
@@ -9160,17 +9010,10 @@ async fn handle_settings_get(
     let body =
         settings_get_response_body(project_root.as_deref(), &runtime_settings)
             .await;
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body
-    );
+    let response = HttpResponse::with_content("200 OK", "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "close")
+        .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
@@ -9200,17 +9043,10 @@ async fn handle_api_keys_post(mut stream: DemuxStream, header_text: &str) {
         &body_owned
     };
     let result = handle_set_api_keys(body_text);
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        result.len(),
-        result
-    );
+    let response = HttpResponse::with_content("200 OK", "application/json", result)
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
@@ -9218,17 +9054,10 @@ async fn handle_api_keys_post(mut stream: DemuxStream, header_text: &str) {
 async fn handle_api_key_status(mut stream: DemuxStream) {
     use tokio::io::AsyncWriteExt;
     let body = api_key_status_response_body();
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body
-    );
+    let response = HttpResponse::with_content("200 OK", "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "close")
+        .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
@@ -9236,17 +9065,10 @@ async fn handle_api_key_status(mut stream: DemuxStream) {
 async fn handle_external_agents(mut stream: DemuxStream, project_root: Option<PathBuf>) {
     use tokio::io::AsyncWriteExt;
     let body = external_agents_response_body(project_root.as_deref());
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body
-    );
+    let response = HttpResponse::with_content("200 OK", "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "close")
+        .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
@@ -9307,35 +9129,28 @@ async fn handle_diagnostics_visual_freshness(
         body_owned = full;
         &body_owned
     };
-    let (status_line, body) =
+    let (status, body) =
         match crate::diagnostics::append_visual_freshness_record(
             &session_id_raw,
             body_bytes,
         ) {
             Ok(written) => (
-                "HTTP/1.1 200 OK",
+                "200 OK",
                 serde_json::json!({"ok": true, "written": written}).to_string(),
             ),
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => (
-                "HTTP/1.1 400 Bad Request",
+                "400 Bad Request",
                 serde_json::json!({"error": e.to_string()}).to_string(),
             ),
             Err(e) => (
-                "HTTP/1.1 500 Internal Server Error",
+                "500 Internal Server Error",
                 serde_json::json!({"error": e.to_string()}).to_string(),
             ),
         };
-    let response = format!(
-        "{status_line}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body
-    );
+    let response = HttpResponse::with_content(status, "application/json", body)
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }

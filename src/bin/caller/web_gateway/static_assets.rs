@@ -268,16 +268,13 @@ pub(crate) fn build_static_asset_response(
         ""
     };
     if if_none_match_matches(header_text, asset.etag) {
-        return format!(
-            "HTTP/1.1 304 Not Modified\r\n\
-             ETag: \"{etag}\"\r\n\
-             Cache-Control: {cache_control}\r\n\
-             {vary}Access-Control-Allow-Origin: *\r\n\
-             Connection: close\r\n\
-             \r\n",
-            etag = asset.etag,
-        )
-        .into_bytes();
+        return HttpResponse::new("304 Not Modified")
+            .header("ETag", format!("\"{}\"", asset.etag))
+            .header("Cache-Control", cache_control)
+            .header_segment(vary)
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Connection", "close")
+            .into_bytes();
     }
     let gzip_body = asset
         .gzip
@@ -286,20 +283,16 @@ pub(crate) fn build_static_asset_response(
         Some(gz) => (gz, "Content-Encoding: gzip\r\n"),
         None => (asset.body, ""),
     };
-    let mut response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: {content_type}\r\n\
-         Content-Length: {len}\r\n\
-         {content_encoding}ETag: \"{etag}\"\r\n\
-         Cache-Control: {cache_control}\r\n\
-         {vary}Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n",
-        content_type = asset.content_type,
-        len = payload.len(),
-        etag = asset.etag,
-    )
-    .into_bytes();
+    let mut response = HttpResponse::new("200 OK")
+        .header("Content-Type", asset.content_type)
+        .header("Content-Length", payload.len().to_string())
+        .header_segment(content_encoding)
+        .header("ETag", format!("\"{}\"", asset.etag))
+        .header("Cache-Control", cache_control)
+        .header_segment(vary)
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_bytes();
     if method != "HEAD" {
         response.extend_from_slice(payload);
     }
@@ -348,11 +341,9 @@ const APP_HTML_VERSIONED_ASSETS: [&str; 8] = [
 /// Rewrite every [`APP_HTML_VERSIONED_ASSETS`] URL in an app.html body to
 /// carry the current `?v=` buster.
 pub(crate) fn rewrite_app_html_asset_urls(html: String, version: &str) -> String {
-    APP_HTML_VERSIONED_ASSETS
-        .iter()
-        .fold(html, |html, path| {
-            rewrite_asset_url_with_version(&html, path, version)
-        })
+    APP_HTML_VERSIONED_ASSETS.iter().fold(html, |html, path| {
+        rewrite_asset_url_with_version(&html, path, version)
+    })
 }
 
 /// The `INTENDANT_APP_HTML_PATH` dev override: serve the dashboard entry
@@ -414,17 +405,13 @@ pub(crate) fn app_html_override_response(
                  Fix the path (or unset INTENDANT_APP_HTML_PATH) and refresh.\n",
                 path.display()
             );
-            let mut response = format!(
-                "HTTP/1.1 500 Internal Server Error\r\n\
-                 Content-Type: text/plain; charset=utf-8\r\n\
-                 Content-Length: {}\r\n\
-                 Cache-Control: no-store\r\n\
-                 Access-Control-Allow-Origin: *\r\n\
-                 Connection: close\r\n\
-                 \r\n",
-                body.len()
-            )
-            .into_bytes();
+            let mut response = HttpResponse::new("500 Internal Server Error")
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .header("Content-Length", body.len().to_string())
+                .header("Cache-Control", "no-store")
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Connection", "close")
+                .into_bytes();
             if method != "HEAD" {
                 response.extend_from_slice(body.as_bytes());
             }
@@ -432,7 +419,6 @@ pub(crate) fn app_html_override_response(
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -748,12 +734,8 @@ mod tests {
             .and_then(|rest| rest.split('"').next())
             .expect("override response carries an ETag")
             .to_string();
-        let third = app_html_override_response(
-            "GET",
-            &format!("If-None-Match: \"{etag}\"\r\n"),
-            "",
-            &path,
-        );
+        let third =
+            app_html_override_response("GET", &format!("If-None-Match: \"{etag}\"\r\n"), "", &path);
         assert!(String::from_utf8_lossy(&third).starts_with("HTTP/1.1 304"));
     }
 

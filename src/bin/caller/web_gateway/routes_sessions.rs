@@ -81,18 +81,11 @@ pub(crate) fn current_agent_output_response_for_ids(ids: Vec<String>, log_dir: &
         "missing": missing,
     })
     .to_string();
-    format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body
-    )
+    HttpResponse::with_content("200 OK", "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_string()
 }
 
 pub(crate) fn agent_output_ids_from_json_body(body: &str) -> Result<Vec<String>, String> {
@@ -2211,19 +2204,11 @@ pub(crate) async fn handle_session_current_changes(
         project_root_for_changes.as_deref(),
         &crate::platform::home_dir(),
     );
-    let response = format!(
-        "HTTP/1.1 {}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        status,
-        body.len(),
-        body
-    );
+    let response = HttpResponse::with_content(status, "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
@@ -2235,19 +2220,11 @@ pub(crate) async fn handle_current_history(
     // GET /api/session/current/history — serialized History.
     use tokio::io::AsyncWriteExt;
     let (status, body) = handle_history_get(file_watcher.as_ref()).await;
-    let response = format!(
-        "HTTP/1.1 {}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        status,
-        body.len(),
-        body,
-    );
+    let response = HttpResponse::with_content(status, "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
@@ -2273,19 +2250,11 @@ pub(crate) async fn handle_current_rollback(
         &bus,
     )
     .await;
-    let response = format!(
-        "HTTP/1.1 {}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        status,
-        body.len(),
-        body,
-    );
+    let response = HttpResponse::with_content(status, "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
@@ -2301,19 +2270,11 @@ pub(crate) async fn handle_current_redo(
     let _ = read_post_body(header_text, &mut stream).await;
     let agent_state = query_ctx.as_ref().map(|ctx| ctx.agent_state.clone());
     let (status, body) = handle_history_redo(file_watcher.as_ref(), agent_state.as_ref()).await;
-    let response = format!(
-        "HTTP/1.1 {}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        status,
-        body.len(),
-        body,
-    );
+    let response = HttpResponse::with_content(status, "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
@@ -2327,19 +2288,11 @@ pub(crate) async fn handle_current_prune(
     use tokio::io::AsyncWriteExt;
     let _ = read_post_body(header_text, &mut stream).await;
     let (status, body) = handle_history_prune(file_watcher.as_ref()).await;
-    let response = format!(
-        "HTTP/1.1 {}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        status,
-        body.len(),
-        body,
-    );
+    let response = HttpResponse::with_content(status, "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
@@ -2392,18 +2345,11 @@ pub(crate) async fn handle_sessions_list(mut stream: DemuxStream, request_line: 
         })
         .to_string(),
     };
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body
-    );
+    let response = HttpResponse::with_content("200 OK", "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_string();
     use tokio::io::AsyncWriteExt;
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
@@ -2425,18 +2371,11 @@ pub(crate) async fn handle_session_delete(mut stream: DemuxStream, request_line:
     let session_id = rest_parts.first().copied().unwrap_or("");
     let target = rest_parts.get(1).copied().unwrap_or("session");
     let body = delete_session_data(session_id, target);
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body
-    );
+    let response = HttpResponse::with_content("200 OK", "application/json", body)
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "close")
+        .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
@@ -2501,17 +2440,10 @@ pub(crate) async fn handle_session_sub_router(
             &source,
             request_line,
         );
-        let response = format!(
-            "HTTP/1.1 {status}\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             Cache-Control: no-cache\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {}",
-            body.len(),
-            body
-        );
+        let response = HttpResponse::with_content(status, "application/json", body)
+            .header("Cache-Control", "no-cache")
+            .header("Connection", "close")
+            .into_string();
         let _ = stream.write_all(response.as_bytes()).await;
     } else if rest_parts.len() >= 2 && route_name == "recordings" {
         // Session recording sub-routes: /api/session/{id}/recordings[/...]
@@ -2544,17 +2476,10 @@ pub(crate) async fn handle_session_sub_router(
             } else {
                 "[]".to_string()
             };
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: application/json\r\n\
-                 Content-Length: {}\r\n\
-                 Cache-Control: no-cache\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {}",
-                body.len(),
-                body
-            );
+            let response = HttpResponse::with_content("200 OK", "application/json", body)
+                .header("Cache-Control", "no-cache")
+                .header("Connection", "close")
+                .into_string();
             let _ = stream.write_all(response.as_bytes()).await;
         } else if rec_rest.len() == 2 && rec_rest[1] == "playlist.m3u8" {
             // GET /api/session/{id}/recordings/{stream}/playlist.m3u8
@@ -2569,17 +2494,11 @@ pub(crate) async fn handle_session_sub_router(
                 })
                 .unwrap_or_default();
             let m3u8 = recording_playlist_m3u8(&segments);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: application/vnd.apple.mpegurl\r\n\
-                 Content-Length: {}\r\n\
-                 Cache-Control: no-cache\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {}",
-                m3u8.len(),
-                m3u8
-            );
+            let response =
+                HttpResponse::with_content("200 OK", "application/vnd.apple.mpegurl", m3u8)
+                    .header("Cache-Control", "no-cache")
+                    .header("Connection", "close")
+                    .into_string();
             let _ = stream.write_all(response.as_bytes()).await;
         } else if rec_rest.len() == 2 {
             // GET /api/session/{id}/recordings/{stream}/{filename}
@@ -2600,76 +2519,48 @@ pub(crate) async fn handle_session_sub_router(
                 if let Some(path) = seg_path.filter(|p| p.exists()) {
                     match tokio::fs::read(&path).await {
                         Ok(data) => {
-                            let header = format!(
-                                "HTTP/1.1 200 OK\r\n\
-                                 Content-Type: {}\r\n\
-                                 Content-Length: {}\r\n\
-                                 Cache-Control: public, max-age=3600\r\n\
-                                 Connection: close\r\n\
-                                 \r\n",
-                                seg_ct,
-                                data.len()
-                            );
+                            let header = HttpResponse::new("200 OK")
+                                .header("Content-Type", seg_ct)
+                                .header("Content-Length", data.len().to_string())
+                                .header("Cache-Control", "public, max-age=3600")
+                                .header("Connection", "close")
+                                .into_string();
                             let _ = stream.write_all(header.as_bytes()).await;
                             let _ = stream.write_all(&data).await;
                         }
                         Err(_) => {
                             let body = "Failed to read segment";
-                            let response = format!(
-                                "HTTP/1.1 500 Internal Server Error\r\n\
-                                 Content-Type: text/plain\r\n\
-                                 Content-Length: {}\r\n\
-                                 Connection: close\r\n\
-                                 \r\n\
-                                 {}",
-                                body.len(),
-                                body
-                            );
+                            let response = HttpResponse::with_content(
+                                "500 Internal Server Error",
+                                "text/plain",
+                                body,
+                            )
+                            .header("Connection", "close")
+                            .into_string();
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
                     }
                 } else {
                     let body = "Segment not found";
-                    let response = format!(
-                        "HTTP/1.1 404 Not Found\r\n\
-                         Content-Type: text/plain\r\n\
-                         Content-Length: {}\r\n\
-                         Connection: close\r\n\
-                         \r\n\
-                         {}",
-                        body.len(),
-                        body
-                    );
+                    let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
+                        .header("Connection", "close")
+                        .into_string();
                     let _ = stream.write_all(response.as_bytes()).await;
                 }
             } else {
                 let body = "Invalid filename";
-                let response = format!(
-                    "HTTP/1.1 400 Bad Request\r\n\
-                     Content-Type: text/plain\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\
-                     \r\n\
-                     {}",
-                    body.len(),
-                    body
-                );
+                let response = HttpResponse::with_content("400 Bad Request", "text/plain", body)
+                    .header("Connection", "close")
+                    .into_string();
                 let _ = stream.write_all(response.as_bytes()).await;
             }
         } else {
             // GET /api/session/{id}/recordings — list streams
             let (status, body) = session_recordings_list_response_body(session_id);
-            let response = format!(
-                "HTTP/1.1 {status}\r\n\
-                 Content-Type: application/json\r\n\
-                 Content-Length: {}\r\n\
-                 Cache-Control: no-cache\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {}",
-                body.len(),
-                body
-            );
+            let response = HttpResponse::with_content(status, "application/json", body)
+                .header("Cache-Control", "no-cache")
+                .header("Connection", "close")
+                .into_string();
             let _ = stream.write_all(response.as_bytes()).await;
         }
     } else if rest_parts.len() >= 2 && route_name == "report" {
@@ -2695,47 +2586,36 @@ pub(crate) async fn handle_session_sub_router(
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| "session".to_string());
-                        let header = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/zip\r\n\
-                             Content-Length: {}\r\n\
-                             Content-Disposition: attachment; filename=\"intendant-session-{}.zip\"\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n",
-                            bytes.len(),
-                            fname
-                        );
+                        let header = HttpResponse::new("200 OK")
+                            .header("Content-Type", "application/zip")
+                            .header("Content-Length", bytes.len().to_string())
+                            .header(
+                                "Content-Disposition",
+                                format!("attachment; filename=\"intendant-session-{}.zip\"", fname),
+                            )
+                            .header("Cache-Control", "no-cache")
+                            .header("Connection", "close")
+                            .into_string();
                         let _ = stream.write_all(header.as_bytes()).await;
                         let _ = stream.write_all(&bytes).await;
                     }
                     Err(e) => {
                         let body = format!("Failed to build report: {}", e);
-                        let response = format!(
-                            "HTTP/1.1 500 Internal Server Error\r\n\
-                             Content-Type: text/plain\r\n\
-                             Content-Length: {}\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
+                        let response = HttpResponse::with_content(
+                            "500 Internal Server Error",
+                            "text/plain",
+                            body,
+                        )
+                        .header("Connection", "close")
+                        .into_string();
                         let _ = stream.write_all(response.as_bytes()).await;
                     }
                 },
                 None => {
                     let body = "Session not found";
-                    let response = format!(
-                        "HTTP/1.1 404 Not Found\r\n\
-                         Content-Type: text/plain\r\n\
-                         Content-Length: {}\r\n\
-                         Connection: close\r\n\
-                         \r\n\
-                         {}",
-                        body.len(),
-                        body
-                    );
+                    let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
+                        .header("Connection", "close")
+                        .into_string();
                     let _ = stream.write_all(response.as_bytes()).await;
                 }
             }
@@ -2766,60 +2646,39 @@ pub(crate) async fn handle_session_sub_router(
                 if let Some(path) = frame_path.filter(|p| p.exists()) {
                     match tokio::fs::read(&path).await {
                         Ok(data) => {
-                            let header = format!(
-                                "HTTP/1.1 200 OK\r\n\
-                                 Content-Type: {}\r\n\
-                                 Content-Length: {}\r\n\
-                                 Cache-Control: public, max-age=3600\r\n\
-                                 Connection: close\r\n\
-                                 \r\n",
-                                ct,
-                                data.len()
-                            );
+                            let header = HttpResponse::new("200 OK")
+                                .header("Content-Type", ct)
+                                .header("Content-Length", data.len().to_string())
+                                .header("Cache-Control", "public, max-age=3600")
+                                .header("Connection", "close")
+                                .into_string();
                             let _ = stream.write_all(header.as_bytes()).await;
                             let _ = stream.write_all(&data).await;
                         }
                         Err(_) => {
                             let body = "Failed to read frame";
-                            let response = format!(
-                                "HTTP/1.1 500 Internal Server Error\r\n\
-                                 Content-Type: text/plain\r\n\
-                                 Content-Length: {}\r\n\
-                                 Connection: close\r\n\
-                                 \r\n\
-                                 {}",
-                                body.len(),
-                                body
-                            );
+                            let response = HttpResponse::with_content(
+                                "500 Internal Server Error",
+                                "text/plain",
+                                body,
+                            )
+                            .header("Connection", "close")
+                            .into_string();
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
                     }
                 } else {
                     let body = "Frame not found";
-                    let response = format!(
-                        "HTTP/1.1 404 Not Found\r\n\
-                         Content-Type: text/plain\r\n\
-                         Content-Length: {}\r\n\
-                         Connection: close\r\n\
-                         \r\n\
-                         {}",
-                        body.len(),
-                        body
-                    );
+                    let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
+                        .header("Connection", "close")
+                        .into_string();
                     let _ = stream.write_all(response.as_bytes()).await;
                 }
             } else {
                 let body = "Invalid filename";
-                let response = format!(
-                    "HTTP/1.1 400 Bad Request\r\n\
-                     Content-Type: text/plain\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\
-                     \r\n\
-                     {}",
-                    body.len(),
-                    body
-                );
+                let response = HttpResponse::with_content("400 Bad Request", "text/plain", body)
+                    .header("Connection", "close")
+                    .into_string();
                 let _ = stream.write_all(response.as_bytes()).await;
             }
         } else {
@@ -2842,17 +2701,10 @@ pub(crate) async fn handle_session_sub_router(
             } else {
                 "[]".to_string()
             };
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: application/json\r\n\
-                 Content-Length: {}\r\n\
-                 Cache-Control: no-cache\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {}",
-                body.len(),
-                body
-            );
+            let response = HttpResponse::with_content("200 OK", "application/json", body)
+                .header("Cache-Control", "no-cache")
+                .header("Connection", "close")
+                .into_string();
             let _ = stream.write_all(response.as_bytes()).await;
         }
     } else {
@@ -2906,17 +2758,10 @@ pub(crate) async fn handle_session_sub_router(
         } else {
             session_detail_http_status(&body)
         };
-        let response = format!(
-            "HTTP/1.1 {status}\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             Cache-Control: no-cache\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {}",
-            body.len(),
-            body
-        );
+        let response = HttpResponse::with_content(status, "application/json", body)
+            .header("Cache-Control", "no-cache")
+            .header("Connection", "close")
+            .into_string();
         let _ = stream.write_all(response.as_bytes()).await;
     }
     finalize_http_stream(&mut stream).await;
@@ -3012,12 +2857,12 @@ pub(crate) async fn handle_sessions_stream(mut stream: DemuxStream, request_line
     let stream_task = tokio::task::spawn_blocking(move || {
         stream_sessions_from_request(&request_line_for_stream, tx);
     });
-    let response = "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/x-ndjson\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n";
+    let response = HttpResponse::new("200 OK")
+        .header("Content-Type", "application/x-ndjson")
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_string();
     use tokio::io::AsyncWriteExt;
     if stream.write_all(response.as_bytes()).await.is_ok() {
         while let Some(line) = rx.recv().await {
@@ -3036,18 +2881,11 @@ pub(crate) async fn handle_sessions_search(mut stream: DemuxStream, request_line
     let mode = query_param(request_line, "mode").unwrap_or_default();
     let project_filter = session_project_filter_from_request(request_line);
     let body = sessions_search_response_body(query, source_filter, mode, project_filter).await;
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body
-    );
+    let response = HttpResponse::with_content("200 OK", "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_string();
     use tokio::io::AsyncWriteExt;
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
@@ -3163,18 +3001,11 @@ pub(crate) async fn handle_displays(
     // Display enumeration endpoint
     use tokio::io::AsyncWriteExt;
     let body = displays_response_body(&session_registry).await;
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body
-    );
+    let response = HttpResponse::with_content("200 OK", "application/json", body)
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .into_string();
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
