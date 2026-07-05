@@ -229,6 +229,23 @@ pub enum UiCommand {
         host_id: String,
         id: String,
     },
+    /// One of a peer's sessions was announced or its folded snapshot
+    /// changed. The `session` payload is the wire `SessionInfo` JSON
+    /// unchanged (session_id, label, phase, source, parent, goal,
+    /// vitals, …) — JS upserts it into the peer row's session list by
+    /// `session.session_id` and refreshes the Station scene. Both
+    /// `session_started` and `session_updated` land here: each carries
+    /// the full current snapshot, so folding is idempotent.
+    PeerSessionUpdated {
+        host_id: String,
+        session: serde_json::Value,
+    },
+    /// One of a peer's sessions ended; JS drops it from the peer row's
+    /// session list.
+    PeerSessionEnded {
+        host_id: String,
+        session_id: String,
+    },
     /// One leg of a federation-driven WebRTC signaling exchange
     /// arriving from a peer. JS feeds the `signal` payload to the
     /// matching per-peer `RTCPeerConnection` keyed by
@@ -3333,25 +3350,53 @@ pub fn render_peer_event(host_id: &str, payload: &serde_json::Value) -> Vec<UiCo
             } else {
                 format!("Session started: {label} ({session_id})")
             };
-            vec![UiCommand::PeerLog {
-                host_id: host,
+            let mut cmds = vec![UiCommand::PeerLog {
+                host_id: host.clone(),
                 ts: now,
                 level: "info".to_string(),
                 source: "session".to_string(),
                 content,
+            }];
+            if !session_id.is_empty() {
+                cmds.push(UiCommand::PeerSessionUpdated {
+                    host_id: host,
+                    session: session.clone(),
+                });
+            }
+            cmds
+        }
+
+        // Folded per-session snapshot — store-only (no log line: the
+        // fold re-emits on every phase/tokens/vitals change and would
+        // drown the per-peer log). JS upserts by session.session_id.
+        "session_updated" => {
+            let session = &payload["session"];
+            if session["session_id"].as_str().unwrap_or("").is_empty() {
+                return vec![];
+            }
+            vec![UiCommand::PeerSessionUpdated {
+                host_id: host,
+                session: session.clone(),
             }]
         }
 
         "session_ended" => {
             let session_id = payload["session_id"].as_str().unwrap_or("");
             let reason = payload["reason"].as_str().unwrap_or("");
-            vec![UiCommand::PeerLog {
-                host_id: host,
+            let mut cmds = vec![UiCommand::PeerLog {
+                host_id: host.clone(),
                 ts: now,
                 level: "info".to_string(),
                 source: "session".to_string(),
                 content: format!("Session ended ({reason}): {session_id}"),
-            }]
+            }];
+            if !session_id.is_empty() {
+                cmds.push(UiCommand::PeerSessionEnded {
+                    host_id: host,
+                    session_id: session_id.to_string(),
+                });
+            }
+            cmds
         }
 
         // task_update: not surfaced per-peer yet (no task list UI).
@@ -5500,6 +5545,101 @@ mod tests {
     /// `peer_event_forwarded` carrying a `log` PeerEvent renders as a
     /// host-tagged PeerLog with level/source/content pulled straight
     /// from the inner payload.
+    #[test]
+    fn peer_event_forwarded_session_lifecycle_upserts_and_retires() {
+        let mut s = AppState::new();
+
+        // session_started → PeerLog + PeerSessionUpdated with the
+        // announced snapshot passed through verbatim.
+        let started = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "session_started",
+                "session": {
+                    "session_id": "s1",
+                    "label": "federated task",
+                    "started_at": "2026-07-05T00:00:00Z",
+                },
+            },
+        });
+        let cmds = s.handle_message(&started);
+        let upsert = cmds.iter().find_map(|c| match c {
+            UiCommand::PeerSessionUpdated { host_id, session } => Some((host_id, session)),
+            _ => None,
+        });
+        let (host_id, session) = upsert.expect("PeerSessionUpdated emitted");
+        assert_eq!(host_id, "intendant:alpha");
+        assert_eq!(session["session_id"], "s1");
+        assert_eq!(session["label"], "federated task");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, UiCommand::PeerLog { .. })),
+            "session_started keeps its log line"
+        );
+
+        // session_updated → store-only upsert carrying enrichment.
+        let updated = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "session_updated",
+                "session": {
+                    "session_id": "s1",
+                    "label": "federated task",
+                    "started_at": "2026-07-05T00:00:00Z",
+                    "phase": "working",
+                    "source": "codex",
+                    "tokens_used": 1234,
+                    "vitals": { "git": { "branch": "main", "dirtyFiles": 2, "ahead": 0, "behind": 0 } },
+                },
+            },
+        });
+        let cmds = s.handle_message(&updated);
+        assert_eq!(cmds.len(), 1, "session_updated is store-only (no log)");
+        match &cmds[0] {
+            UiCommand::PeerSessionUpdated { host_id, session } => {
+                assert_eq!(host_id, "intendant:alpha");
+                assert_eq!(session["phase"], "working");
+                assert_eq!(session["vitals"]["git"]["dirtyFiles"], 2);
+            }
+            other => panic!("expected PeerSessionUpdated, got {other:?}"),
+        }
+
+        // session_ended → PeerLog + PeerSessionEnded.
+        let ended = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "session_ended",
+                "session_id": "s1",
+                "reason": "done",
+            },
+        });
+        let cmds = s.handle_message(&ended);
+        let retired = cmds.iter().find_map(|c| match c {
+            UiCommand::PeerSessionEnded {
+                host_id,
+                session_id,
+            } => Some((host_id, session_id)),
+            _ => None,
+        });
+        let (host_id, session_id) = retired.expect("PeerSessionEnded emitted");
+        assert_eq!(host_id, "intendant:alpha");
+        assert_eq!(session_id, "s1");
+    }
+
+    /// A session payload without a session_id (malformed / future
+    /// shape) is dropped rather than upserting an unkeyable row.
+    #[test]
+    fn peer_event_forwarded_session_updated_without_id_drops() {
+        let cmds = render_peer_event(
+            "intendant:alpha",
+            &json!({ "event": "session_updated", "session": { "label": "x" } }),
+        );
+        assert!(cmds.is_empty());
+    }
+
     #[test]
     fn peer_event_forwarded_log_renders_host_tagged_peer_log() {
         let mut s = AppState::new();
