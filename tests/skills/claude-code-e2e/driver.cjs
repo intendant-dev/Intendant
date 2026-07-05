@@ -582,36 +582,13 @@ async function main() {
     check('task-launch-metadata-suppressed', !metadataLeak,
       metadataLeak ? `${metadataLeak.event}: ${(metadataLeak.summary || metadataLeak.content || metadataLeak.stdout || '').slice(0, 80)}` : '');
 
-    // ---- Phase 10: TodoWrite → PlanUpdate --------------------------------
-    // The todo list renders as the drain's "**Plan**" checklist (a
-    // model_response), and the TodoWrite acknowledgment tool_result is
-    // bookkeeping that must never surface as tool output. haiku sometimes
-    // claims TodoWrite is not in its toolkit (it is — the init message
-    // lists it), so the prompt is maximally explicit and one nudge retry
-    // is allowed before the phase fails.
-    const todoPrompt = 'Your tool list includes a tool named TodoWrite (it was in your session init). Call TodoWrite exactly once, now, with this input: {"todos":[{"content":"todo-e2e-alpha","status":"completed","activeForm":"Doing alpha"},{"content":"todo-e2e-beta","status":"pending","activeForm":"Doing beta"}]}. After the tool call returns, reply with exactly: TODODONE. Do NOT delegate to the Agent tool. Do NOT claim the tool is unavailable — call it.';
-    const isPlanChecklist = (e) => e.event === 'model_response' && /\*\*Plan\*\*/.test(e.summary || '')
-      && /\[x\] .*todo-e2e-alpha/.test(e.summary || '')
-      && /\[ \] .*todo-e2e-beta/.test(e.summary || '');
-    run.send({ action: 'follow_up', text: todoPrompt });
-    let planUpdate = await run.waitFor('plan checklist renders', isPlanChecklist, 120000)
-      .catch(() => null);
-    if (!planUpdate) {
-      log('driver', 'plan checklist not seen — one nudge retry');
-      run.send({ action: 'follow_up', text: todoPrompt });
-      planUpdate = await run.waitFor('plan checklist renders (retry)', isPlanChecklist, 120000);
-    }
-    check('todo-plan-renders', Boolean(planUpdate), (planUpdate.summary || '').slice(0, 100));
-    await run.waitFor(
-      'todo turn completes',
-      (e) => e.event === 'model_response' && /TODODONE/.test(e.summary || ''),
-      120000,
-    );
-    const todoAckLeak = run.events.find(
-      (e) => /Todos have been modified/.test(e.summary || e.content || e.stdout || ''),
-    );
-    check('todo-ack-suppressed', !todoAckLeak,
-      todoAckLeak ? `${todoAckLeak.event}: ${(todoAckLeak.summary || todoAckLeak.content || todoAckLeak.stdout || '').slice(0, 80)}` : '');
+    // (No TodoWrite phase: CC 2.1.201 print mode does not enable TodoWrite —
+    // asking for it yields "TodoWrite exists but is not enabled in this
+    // context" and the session exposes the Task tools (TaskCreate /
+    // TaskUpdate / …) instead, verified with a bare `claude -p` probe in the
+    // adapter's exact spawn shape. The TodoWrite → PlanUpdate translation is
+    // pinned by adapter unit tests; live plan surfacing for supervised
+    // sessions arrives with the Task-tools → PlanUpdate mapping.)
   } finally {
     await run.stop();
   }
