@@ -14,10 +14,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::error::CallerError;
 
 use super::{
-    AgentConfig, AgentContextSnapshot, AgentContextTokenCountKind, AgentEvent,
-    AgentImageAttachment, AgentThread, AgentThreadSnapshot, AgentUsageSnapshot, ApprovalCategory,
-    ApprovalDecision, AutonomousGoalPauseResult, ExternalAgent, RollbackAnchorPosition,
-    SubAgentState, ToolCompletionStatus,
+    normalize_plan_status, AgentConfig, AgentContextSnapshot, AgentContextTokenCountKind,
+    AgentEvent, AgentImageAttachment, AgentThread, AgentThreadSnapshot, AgentUsageSnapshot,
+    ApprovalCategory, ApprovalDecision, AutonomousGoalPauseResult, ExternalAgent,
+    RollbackAnchorPosition, SubAgentState, ToolCompletionStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -4617,14 +4617,6 @@ fn codex_collab_agent_tool_call(params: &serde_json::Value) -> Option<AgentEvent
         reasoning_effort,
         agents,
     })
-}
-
-fn normalize_plan_status(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(|ch| ch.to_lowercase())
-        .collect()
 }
 
 fn codex_plan_entries(params: &serde_json::Value) -> Vec<(String, String, String)> {

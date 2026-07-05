@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
@@ -12,8 +12,8 @@ use tokio::sync::{mpsc, Mutex};
 use crate::error::CallerError;
 
 use super::{
-    AgentConfig, AgentEvent, AgentThread, AgentUsageSnapshot, ApprovalCategory, ApprovalDecision,
-    ExternalAgent, SubAgentState, ToolCompletionStatus,
+    normalize_plan_status, AgentConfig, AgentEvent, AgentThread, AgentUsageSnapshot,
+    ApprovalCategory, ApprovalDecision, ExternalAgent, SubAgentState, ToolCompletionStatus,
 };
 
 /// Appended to the first user message when an Intendant web port is
@@ -472,6 +472,31 @@ fn is_task_tool(name: &str) -> bool {
     name == "Agent" || name == "Task"
 }
 
+/// Plan entries from a `TodoWrite` tool_use input, in `PlanUpdate` shape:
+/// `(content, priority, status)` — todos carry no priority, and statuses
+/// normalize to the shared plan vocabulary ("in_progress" → "inprogress").
+fn cc_plan_entries(input: &serde_json::Value) -> Vec<(String, String, String)> {
+    let Some(todos) = input.get("todos").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    todos
+        .iter()
+        .filter_map(|todo| {
+            let content = todo
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            let status = todo
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(normalize_plan_status)
+                .unwrap_or_default();
+            Some((content.to_string(), String::new(), status))
+        })
+        .collect()
+}
+
 /// Terminal summaries ride log lines; keep them one line and short.
 fn task_summary_snippet(text: &str) -> Option<String> {
     let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -523,6 +548,12 @@ struct CcReader {
     /// `task_id` (the key `system:task_*` events use) → spawning
     /// tool_use id.
     task_ids: HashMap<String, String>,
+    /// tool_use ids of `TodoWrite` calls already rendered as `PlanUpdate`,
+    /// so their bookkeeping tool_result ("Todos have been modified
+    /// successfully…") is dropped instead of rendered. Entries are removed
+    /// when the result arrives; ids orphaned by an interrupted turn are
+    /// inert (tool_use ids never recur) and merely idle here.
+    plan_tools: HashSet<String>,
     /// Most recent model name seen (init message / message_start).
     model: String,
     context_window: u64,
@@ -545,6 +576,7 @@ impl CcReader {
             open_tools: HashMap::new(),
             task_children: HashMap::new(),
             task_ids: HashMap::new(),
+            plan_tools: HashSet::new(),
             model: "claude".to_string(),
             context_window: DEFAULT_CONTEXT_WINDOW,
             last_intendant_mcp_status: None,
@@ -1016,6 +1048,18 @@ impl CcReader {
                         self.register_task_child(&tool_id, child_scope, spawn, out);
                         continue;
                     }
+                    if tool_name == "TodoWrite" && !tool_id.is_empty() {
+                        let entries = cc_plan_entries(&input);
+                        if !entries.is_empty() {
+                            // Render the todo list as a plan, not a raw
+                            // tool call; the acknowledgment tool_result is
+                            // dropped in tool_result_events. Malformed
+                            // inputs fall through to the plain-tool path.
+                            self.plan_tools.insert(tool_id);
+                            out.events.push(AgentEvent::PlanUpdate { entries });
+                            continue;
+                        }
+                    }
                     if !tool_id.is_empty() {
                         self.open_tools
                             .insert(tool_id.clone(), child_scope.map(str::to_string));
@@ -1118,6 +1162,16 @@ impl CcReader {
                     task_summary_snippet(&content_text),
                     out,
                 );
+            }
+            return;
+        }
+
+        if self.plan_tools.remove(&tool_id) {
+            // TodoWrite's acknowledgment is bookkeeping — the PlanUpdate
+            // already rendered. Failures still surface.
+            if is_error {
+                let message: String = content_text.chars().take(200).collect();
+                out.log("warn", format!("TodoWrite failed: {}", message.trim()));
             }
             return;
         }
@@ -3043,6 +3097,110 @@ mod tests {
         let long = "x".repeat(500);
         let snippet = task_summary_snippet(&long).unwrap();
         assert!(snippet.chars().count() <= 241 && snippet.ends_with('…'));
+    }
+
+    // ---------------------------------------------------------------
+    // TodoWrite → PlanUpdate
+    // ---------------------------------------------------------------
+
+    const TODO_WRITE_USE: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"td1","name":"TodoWrite","input":{"todos":[{"content":"Survey the code","status":"completed","activeForm":"Surveying the code"},{"content":"Write the fix","status":"in_progress","activeForm":"Writing the fix"},{"content":"Run the tests","status":"pending","activeForm":"Running the tests"}]}}]},"session_id":"s1"}"#;
+
+    #[test]
+    fn todo_write_renders_as_plan_update() {
+        let mut reader = test_reader();
+        let out = reader.process_line(TODO_WRITE_USE);
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolStarted { .. })),
+            "TodoWrite must not double-render as a plain tool"
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PlanUpdate { entries }
+                if entries.len() == 3
+                    && entries[0] == ("Survey the code".into(), String::new(), "completed".into())
+                    && entries[1] == ("Write the fix".into(), String::new(), "inprogress".into())
+                    && entries[2] == ("Run the tests".into(), String::new(), "pending".into())
+        )));
+        // Not an open tool (nothing to force-close at turn end), but marked
+        // so its acknowledgment result is dropped.
+        assert!(reader.open_tools.is_empty());
+        assert!(reader.plan_tools.contains("td1"));
+    }
+
+    #[test]
+    fn todo_write_result_is_suppressed() {
+        let mut reader = test_reader();
+        reader.process_line(TODO_WRITE_USE);
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"td1","content":"Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress.","is_error":false}]},"session_id":"s1"}"#,
+        );
+        assert!(
+            out.events.is_empty(),
+            "acknowledgment must be dropped, got {:?}",
+            out.events
+        );
+        assert!(!reader.plan_tools.contains("td1"));
+    }
+
+    #[test]
+    fn todo_write_error_result_still_warns() {
+        let mut reader = test_reader();
+        reader.process_line(TODO_WRITE_USE);
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"td1","content":"boom","is_error":true}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message } if level == "warn" && message.contains("boom")
+        )));
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolOutputDelta { .. })),
+            "failed TodoWrite must not render as tool output"
+        );
+    }
+
+    #[test]
+    fn todo_write_without_todos_falls_back_to_plain_tool() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"td2","name":"TodoWrite","input":{}}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolStarted { item_id, tool_name, .. }
+                if item_id == "td2" && tool_name == "TodoWrite"
+        )));
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::PlanUpdate { .. })),
+            "an empty todo list is not a plan"
+        );
+        assert!(reader.open_tools.contains_key("td2"));
+        assert!(reader.plan_tools.is_empty());
+    }
+
+    #[test]
+    fn child_scoped_todo_write_scopes_the_plan() {
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"td3","name":"TodoWrite","input":{"todos":[{"content":"Child step","status":"pending","activeForm":"Stepping"}]}}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::PlanUpdate { entries }
+                            if entries.len() == 1 && entries[0].0 == "Child step"
+                    )
+        )));
     }
 
     #[test]

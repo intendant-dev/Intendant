@@ -595,7 +595,7 @@ capability-gated affordances in `app.html`, and `external_wrapper_index`.
 | Per-session persisted launch overlay | `SessionAgentConfig` + `ConfigureSessionAgent` / `Restart` (universal `agent_command` + backend fields, bundled as `LaunchOverrides`) | all `codex_*` fields | **Live.** `claude_model` / `claude_permission_mode` / `claude_allowed_tools` / `claude_effort` pins with inherit-vs-pin sentinels ("default" stays a pinnable permission mode; `all` pins explicitly-unrestricted tools), Launch-config modal rows, and LIVE apply of model + permission on save via the `model` / `permission-mode` thread actions (`set_model` / `set_permission_mode` control requests, verified on 2.1.201) |
 | Global runtime config pane | `Set*` ControlMsgs + `*ConfigChanged` broadcast + Settings/Control panes | 12 knobs | **3 knobs** (model / permission mode / allowed tools) — by design; grows only when CC grows equivalent concepts |
 | Station controls-panel runtime block | the controls panel renders per-backend blocks | approval policy / managed-context / fork-binary warning | **Live.** Model pills (default + the CLI's latest-version aliases fable/opus/sonnet/haiku, with a truthful `custom:` row for out-of-alias pins) and permission pills (default/edits/plan/bypass), gated `backend == "claude-code" \|\| launch_agent == "claude-code"` exactly like the Codex block, dispatching `set_claude_model` / `set_claude_permission_mode` (persisted to `intendant.toml` + broadcast, same as the dashboard Control pane) |
-| Plan / todo display | `AgentEvent::PlanUpdate` exists | emits plan updates | **Missing.** Plan: translate `TodoWrite` tool inputs into `PlanUpdate` |
+| Plan / todo display | `AgentEvent::PlanUpdate` exists | emits plan updates | **Live.** `TodoWrite` tool calls translate into `PlanUpdate` (statuses normalized to the shared plan vocabulary via the `external_agent` helper); the raw tool call and its "Todos have been modified successfully" acknowledgment are suppressed (failures still warn), and a sub-agent's TodoWrite scopes to its `task-*` child session. Malformed/empty todo inputs fall back to rendering as a plain tool call |
 | Managed context / fission / rewind family | managed-context tools + ledgers | patched managed fork only | **Out of scope for parity** — Codex-fork-specific by design; Claude Code manages its own context (`/compact`, auto-compaction) |
 
 Catch-up order (each step unlocks UI in both surfaces at once):
@@ -605,8 +605,8 @@ Catch-up order (each step unlocks UI in both surfaces at once):
    Station session actions render from the advertised ops; e2e phases 6–8);
 2. ~~the wrapper-level goal engine~~ — **landed for Claude Code** (adapter
    engine; the kebab goal submenu and `/goal` slash light up from the
-   advertised ops). Still open: goals for NATIVE sessions and Station goal
-   rendering (plumbed but unrendered);
+   advertised ops; Station renders goal state on the focus panel and
+   command deck since Phase B). Still open: goals for NATIVE sessions;
 3. ~~remaining relationship producers (in-band Task sub-agents)~~ —
    **landed** (async `Agent`-tool children become ephemeral `task-*` child
    sessions with scoped transcripts; `fork` already wired);
@@ -616,10 +616,9 @@ Catch-up order (each step unlocks UI in both surfaces at once):
 5. ~~the Station controls Claude block~~ — **landed** (model + permission
    pill rows in the rendered controls panel).
 
-All five catch-up items have landed; what remains on the Claude side of
-the matrix is the `TodoWrite` → `PlanUpdate` translation and goals for
-native sessions, plus the Station Phase B rendering work tracked in
-[station.md](./station.md).
+All five catch-up items have landed, and the `TodoWrite` → `PlanUpdate`
+translation followed; what remains on the matrix is goals for native
+sessions, plus the Station work tracked in [station.md](./station.md).
 
 ## Approval Routing
 

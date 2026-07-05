@@ -265,6 +265,18 @@ pub(crate) fn parse_goal_token_budget(
     Ok(Some(Some(budget)))
 }
 
+/// Canonicalize a plan-entry status for `AgentEvent::PlanUpdate` so every
+/// backend speaks the same vocabulary ("pending" / "inprogress" /
+/// "completed"): lowercase with separators stripped, mapping Codex's
+/// "in_progress" and Claude Code's TodoWrite statuses alike.
+pub(crate) fn normalize_plan_status(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
 /// One image attachment passed alongside a user message.
 ///
 /// Codex prefers file paths to keep base64 out of the JSON-RPC stream. We keep

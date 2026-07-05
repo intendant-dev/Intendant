@@ -581,6 +581,33 @@ async function main() {
     );
     check('task-launch-metadata-suppressed', !metadataLeak,
       metadataLeak ? `${metadataLeak.event}: ${(metadataLeak.summary || metadataLeak.content || metadataLeak.stdout || '').slice(0, 80)}` : '');
+
+    // ---- Phase 10: TodoWrite → PlanUpdate --------------------------------
+    // The todo list renders as the drain's "**Plan**" checklist (a
+    // model_response), and the TodoWrite acknowledgment tool_result is
+    // bookkeeping that must never surface as tool output.
+    run.send({
+      action: 'follow_up',
+      text: 'Use your TodoWrite tool exactly once to record two todos: "todo-e2e-alpha" with status completed and "todo-e2e-beta" with status pending. Then reply with exactly: TODODONE. Do NOT delegate to the Agent tool.',
+    });
+    const planUpdate = await run.waitFor(
+      'plan checklist renders',
+      (e) => e.event === 'model_response' && /\*\*Plan\*\*/.test(e.summary || '')
+        && /\[x\] .*todo-e2e-alpha/.test(e.summary || '')
+        && /\[ \] .*todo-e2e-beta/.test(e.summary || ''),
+      180000,
+    );
+    check('todo-plan-renders', Boolean(planUpdate), (planUpdate.summary || '').slice(0, 100));
+    await run.waitFor(
+      'todo turn completes',
+      (e) => e.event === 'model_response' && /TODODONE/.test(e.summary || ''),
+      120000,
+    );
+    const todoAckLeak = run.events.find(
+      (e) => /Todos have been modified/.test(e.summary || e.content || e.stdout || ''),
+    );
+    check('todo-ack-suppressed', !todoAckLeak,
+      todoAckLeak ? `${todoAckLeak.event}: ${(todoAckLeak.summary || todoAckLeak.content || todoAckLeak.stdout || '').slice(0, 80)}` : '');
   } finally {
     await run.stop();
   }
