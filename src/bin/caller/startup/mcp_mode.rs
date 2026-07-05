@@ -38,28 +38,15 @@ pub(crate) async fn run_mcp_mode(
         let _human_monitor =
             event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
         let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
-        let _recording_listener = recording::spawn_recording_listener(
-            bus.subscribe(),
-            recording_registry.clone(),
-            bus.clone(),
-            Some(session_registry.clone()),
-        );
-        let _user_display_listener = spawn_user_display_listener(
-            bus.clone(),
-            session_registry.clone(),
-            Some(frame_registry.clone()),
+        let _session_listeners = startup::wiring::spawn_session_listeners(
+            &bus,
+            &recording_registry,
+            &session_registry,
+            &frame_registry,
         );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
-        let _debug_handler = if use_web {
-            Some(debug::spawn_debug_screen_handler(
-                bus.subscribe(),
-                project.config.recording.clone(),
-                web_port,
-                bus.clone(),
-            ))
-        } else {
-            None
-        };
+        let _debug_handler =
+            startup::wiring::spawn_debug_handler(&bus, project, web_port, use_web);
         let mcp_control_tx = if flags.control_socket {
             let (_control_handle, control_tx) = control::spawn_control_server(bus.clone());
             slog(&session_log, |l| {
@@ -93,136 +80,46 @@ pub(crate) async fn run_mcp_mode(
         let _outbound_broadcaster =
             event::spawn_outbound_broadcaster(bus.subscribe(), outbound_tx.clone());
 
-        // Wire session log writer: persists bus events that aren't logged inline.
-        let _session_log_writer =
-            event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
+        let _log_sinks = startup::wiring::spawn_log_sinks(&bus, &session_log);
 
-        let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
-
-        // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) =
-            if !file_watcher::root_is_snapshot_worthy(&project.root) {
-                // Fallback roots (no .git / intendant.toml — e.g. a service's
-                // $HOME WorkingDirectory) must never be baseline-scanned: it
-                // blocks boot for minutes and shadow-copies the whole tree.
-                eprintln!(
-                    "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
-                 intendant.toml) — start intendant inside a project to enable rewind",
-                    project.root.display()
-                );
-                (None, None, None)
-            } else {
-                let snapshot_dir = log_dir.join("file_snapshots");
-                match file_watcher::FileWatcher::new(
-                    project.root.clone(),
-                    snapshot_dir,
-                    bus.clone(),
-                ) {
-                    Ok(watcher) => {
-                        let (fw, wh, rh) = watcher.start_shared();
-                        (Some(fw), Some(wh), Some(rh))
-                    }
-                    Err(e) => {
-                        eprintln!("[file_watcher] Failed to start: {}", e);
-                        (None, None, None)
-                    }
-                }
-            };
+            startup::wiring::start_project_file_watcher(&project.root, &log_dir, &bus);
 
         // Web gateway (WebSocket)
         let _web_handle = if use_web {
-            let broadcast_tx = outbound_tx.clone();
-            let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
-                if project.config.transcription.enabled {
-                    match transcription::WhisperTranscriber::new(&project.config.transcription) {
-                        Ok(t) => Some(std::sync::Arc::new(t)),
-                        Err(e) => {
-                            eprintln!("Transcription init failed: {}", e);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-            let mut config = web_gateway::build_config(
-                project.config.presence.live_provider.as_deref(),
-                project.config.presence.live_model.as_deref(),
-                project.config.transcription.enabled,
-                project.config.webrtc.to_ice_config(),
-                project.config.webrtc.federation_allow_h264,
-            );
-            config.peer_access_requests = project.config.server.peer_access_requests.clone();
-            config.connect = project.config.connect.clone().effective_with_env();
-            config.presence_enabled = runtime_presence_enabled;
-            config.external_agent = initial_agent_backend
-                .as_ref()
-                .map(|backend| backend.as_short_str().to_string());
-            let snapshot_dir = log_dir.join("file_snapshots");
-            let shared_session =
-                Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
-                    daemon_session_id: session_log_id(&session_log),
-                    query_ctx: None,
-                    frame_registry: Some(frame_registry.clone()),
-                    session_log: Some(session_log.clone()),
-                    recording_registry: Some(recording_registry.clone()),
-                    session_registry: Some(session_registry.clone()),
-                    snapshot_dir: Some(snapshot_dir.clone()),
-                    project_root_for_changes: Some(project.root.clone()),
-                    runtime_settings: web_gateway::RuntimeSettingsState {
-                        external_agent: Some(shared_external_agent.clone()),
-                        presence_enabled: Some(runtime_presence_enabled),
-                    },
-                    file_watcher: shared_file_watcher.clone(),
-                }));
-            let mut mcp_http_state = mcp::McpAppState::new(
-                "none".into(),
-                "none".into(),
-                autonomy.clone(),
-                log_dir.clone(),
-            );
-            mcp_http_state.codex_managed_context =
-                project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
-            mcp_http_state.configured_codex_managed_context = mcp_http_state.codex_managed_context;
-            mcp_http_state.frame_registry = Some(frame_registry.clone());
-            mcp_http_state.session_registry = Some(session_registry.clone());
-            mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
-            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
-                Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
-                bus.clone(),
-            )));
-            let peer_registry = build_and_hydrate_peer_registry(&log_dir, &project.config.peers);
-            let advertise_urls = resolve_advertise_urls_from_flags_and_config(flags, project);
-            let handle = web_gateway::spawn_web_gateway(
-                web_listener
-                    .take()
-                    .expect("web listener must exist when use_web"),
-                bus.clone(),
-                broadcast_tx,
-                config,
-                shared_session,
-                transcriber,
-                None, // MCP mode: no WebTui
-                None, // No task_tx in MCP mode
-                Some(project.root.clone()),
-                mcp_http_server,
-                Some(peer_registry),
-                advertise_urls,
-                project.config.server.auth.bearer_token.clone(),
-                build_local_advertised_auth(
-                    &project.config.server.auth,
-                    &access::backend::select_backend().cert_dir(),
-                )?,
+            let (transcriber, transcriber_err) =
+                startup::wiring::build_transcriber(&project.config.transcription);
+            if let Some(err) = transcriber_err {
+                eprintln!("{}", err);
+            }
+            let gateway = startup::wiring::spawn_mode_web_gateway(
+                flags,
+                project,
+                &autonomy,
+                &log_dir,
+                &session_log,
+                &bus,
+                &mut web_listener,
                 web_tls_client_cert_required,
-                web_tls_acceptor.clone(),
-            );
-            slog(&session_log, |l| {
-                l.info(&web_tui_log_line(&web_tls_acceptor, web_port, web_bind_ip))
-            });
-            eprintln!(
-                "{}",
-                web_tui_log_line(&web_tls_acceptor, web_port, web_bind_ip)
-            );
-            Some(handle)
+                &web_tls_acceptor,
+                web_port,
+                web_bind_ip,
+                runtime_presence_enabled,
+                &initial_agent_backend,
+                &shared_external_agent,
+                &frame_registry,
+                &session_registry,
+                &recording_registry,
+                &shared_file_watcher,
+                transcriber,
+                outbound_tx.clone(),
+                None, // query_ctx: MCP mode has no dashboard agent-state queries
+                Some(session_log.clone()),
+                None, // web_tui_tx: MCP mode has no WebTui
+            )?;
+            slog(&session_log, |l| l.info(&gateway.log_line));
+            eprintln!("{}", gateway.log_line);
+            Some(gateway)
         } else {
             None
         };
