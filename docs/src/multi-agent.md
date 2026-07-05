@@ -1,234 +1,168 @@
 # Agent Execution & Multi-Agent Orchestration
 
-Intendant can run a task four different ways. The simplest is a single agent loop;
-the richest is an orchestrator that decomposes a task and delegates pieces to
-specialized child agents, each in its own git worktree. A fourth mode hands the
-whole task to a third-party coding CLI (Codex or Claude Code) and supervises
-it — that path has its own chapter, [External-Agent Orchestration](./external-agent-orchestration.md).
+Intendant runs a task one of three ways. The simplest is a single native agent
+loop; the richest is an orchestration session that decomposes a task and
+delegates pieces to sub-agents, each a fully supervised session of its own. The
+third hands the whole task to a third-party coding CLI (Codex or Claude Code)
+and supervises it — that path has its own chapter,
+[External-Agent Orchestration](./external-agent-orchestration.md).
 
-This chapter covers Intendant's *native* execution: the four modes, how one is
-chosen, and the orchestrator → sub-agent machinery (worktrees, role prompts,
-progress/result IPC, and knowledge routing).
+This chapter covers Intendant's *native* execution: how a session's shape is
+chosen, and the sub-agent machinery (the spawn/wait/submit tools, supervised
+child sessions, worktrees, role prompts, and knowledge routing).
 
-## The Four Execution Modes
+Historically these were separate *process* modes — orchestration ran as a
+subprocess pipeline (`run_user_mode` → `INTENDANT_ROLE=…` child processes →
+result files polled from disk). That February-era pipeline is gone. Everything
+below runs in-process on the session supervisor: one substrate for direct
+sessions, orchestration sessions, sub-agents, and external agents alike.
 
-| Mode | Selected by | What runs | Source entry point |
-|------|-------------|-----------|--------------------|
-| **Direct** | `--direct`, or a "simple" task heuristic | One agent loop, no delegation | `run_direct_mode` (`main.rs`) |
-| **User** | Default for non-trivial tasks (no `--direct`) | A pure-monitor user layer that spawns an **orchestrator** sub-agent which spawns workers | `run_user_mode` (`main.rs`) |
-| **Sub-Agent** | `INTENDANT_ROLE` is set in the environment | A scoped child task with a role-specific prompt, fully autonomous | `run_sub_agent_mode` (`main.rs`) |
-| **External-Agent** | `--agent <backend>` or `[agent] default_backend` | A supervised third-party coding CLI wired to Intendant's MCP server | `run_external_agent_mode` (`main.rs`) — see [External-Agent Orchestration](./external-agent-orchestration.md) |
+## Session shapes
 
-### How the mode is chosen
+| Shape | Selected by | What runs | Source entry point |
+|-------|-------------|-----------|--------------------|
+| **Direct** | `--direct`, a "simple" task heuristic, or any non-daemon CLI path | One supervised agent loop, no delegation | `run_direct_mode` (`main.rs`) |
+| **Orchestrate** | Default for non-trivial tasks under the daemon (no `--direct`); explicit `orchestrate` flag on task submission | The same loop with the orchestration prompt; delegates via `spawn_sub_agent` | `run_direct_mode` with `SubAgentRole::Orchestrator` |
+| **Sub-Agent** | Spawned by another session's `spawn_sub_agent` tool call | A supervised child session with a role prompt; reports back with `submit_result` | `SessionSupervisor::start_sub_agent_session` (`session_supervisor.rs`) |
+| **External-Agent** | `--agent <backend>` or `[agent] default_backend`, or `backend` on `spawn_sub_agent` | A supervised third-party coding CLI wired to Intendant's MCP server | `run_external_agent_mode` (`main.rs`) — see [External-Agent Orchestration](./external-agent-orchestration.md) |
 
-At startup the caller resolves the mode in this order (see the dispatch around the
-end of `src/bin/caller/main.rs`):
+These are configurations of one thing, not modes of different things: every
+native session is `run_direct_mode` with a `NativeSessionConfig` (role,
+optional prompt override, optional sub-agent identity, and — under the daemon —
+the orchestration handle that enables the spawn tools).
 
-```
-                       ┌─ INTENDANT_ROLE set? ──► Sub-Agent mode
-                       │   (this process IS a child agent)
- intendant <task> ─────┤
-                       │   ┌─ --agent / [agent] default_backend? ──► External-Agent mode
-                       └───┤
-                           │   ┌─ --direct, or is_simple_task(task)? ──► Direct mode
-                           └───┤
-                               └─ otherwise ──────────────────────────► User mode (orchestration)
-```
+### How the shape is chosen
 
-- **Sub-Agent** is detected first: `sub_agent::detect_sub_agent_mode()` simply
-  checks whether `INTENDANT_ROLE` is present. Every orchestrator-spawned child is
-  an ordinary `intendant` process with that variable set, so the same binary
-  re-enters as a worker.
 - **External-Agent** is resolved by `resolve_agent_backend_from_config()`: an
-  explicit `--agent` flag wins, otherwise the `[agent] default_backend` TOML key.
-  If neither names a backend, native execution is used.
-- **Direct vs. User**: with `--direct` the worker runs alone. Without it, the
+  explicit `--agent` flag wins, otherwise the `[agent] default_backend` TOML
+  key. If neither names a backend, native execution is used.
+- **Direct vs. Orchestrate** (daemon sessions): an explicit `direct` /
+  `orchestrate` flag on the task submission wins. Otherwise the
   `is_simple_task()` heuristic decides — a task of three lines or fewer that
-  contains none of the "complex" keywords (`research`, `investigate`, `implement`,
-  `build`, `refactor`, `migrate`, `deploy`, `set up`, `analyze`, `compare`,
-  `design`, `create a`) is treated as simple and runs Direct; anything else
-  triggers User-mode orchestration. The TUI and MCP paths use the same heuristic
-  when the caller doesn't force a choice.
+  contains none of the "complex" keywords (`research`, `investigate`,
+  `implement`, `build`, `refactor`, `migrate`, `deploy`, `set up`, `analyze`,
+  `compare`, `design`, `create a`) runs Direct; anything else gets the
+  orchestration prompt.
+- **Non-daemon CLI paths** (TUI mode, headless `--no-web --no-tui`, standalone
+  `--mcp`) always run Direct: sub-agent spawning requires the daemon's session
+  supervisor, so the orchestration prompt would describe tools that cannot
+  work there.
 
-> Note: `--direct` only forces *single-agent* execution of the native worker. It
-> does **not** disable External-Agent mode — if a backend is configured, the
-> supervised CLI still runs.
+Orchestration is a **capability, not a role**: every supervised native session
+carries the spawn tools, whatever prompt it runs. The orchestrate shape just
+adds the prompt section that teaches decomposition and delegation
+(`SysPrompt_orchestrator.md`).
 
-## User Mode and the Orchestrator
+## Sub-agents are supervised sessions
 
-When a complex task is submitted without `--direct`, Intendant enters **User
-Mode**. The user-mode layer is Rust control code that does **not** execute
-commands itself. It starts the orchestrator subprocess, monitors it, and relays
-its progress.
-
-The orchestrator (`SysPrompt_orchestrator.md`) is itself a sub-agent — it is
-spawned with `INTENDANT_ROLE=orchestrator`. It decomposes the task, spawns
-specialized workers, monitors them, routes knowledge between them, and synthesizes
-the result.
+`spawn_sub_agent` starts the child through the same session supervisor that
+owns every dashboard session:
 
 ```
-User (TUI / Web / MCP / CLI)
-    │
+Orchestration session (or any supervised native session)
+    │  spawn_sub_agent { task, role?, system_prompt?, backend?,
+    │                    worktree?, inherit_memory?, name? }
     ▼
-[User Mode monitor]  — Rust subprocess handoff; monitors only
-    │
+SessionSupervisor::start_sub_agent_session
+    ├─ enforces [orchestrator] max_parallel_agents (per parent, default 4)
+    ├─ optional git worktree branched off the parent project's HEAD
+    ├─ records the parent link ("subagent" relationship — the same kind
+    │  Codex-spawned children use, so the dashboard renders both alike)
+    └─ spawns the child session: internal loop, or codex / claude-code
     ▼
-[Orchestrator]  — SysPrompt_orchestrator.md, INTENDANT_ROLE=orchestrator
-    ├──▶ [Research agent]        — INTENDANT_ROLE=research
-    ├──▶ [Implementation agent]  — INTENDANT_ROLE=implementation (git worktree)
-    └──▶ [Testing agent]         — INTENDANT_ROLE=testing
-    │
+Child session — its own dashboard row, live activity, approvals under the
+daemon's autonomy, steerable, stoppable, lineage-tracked
+    │  submit_result { status, summary, brief?, findings?, artifacts? }
+    │  … then signal_done
     ▼
-Results synthesized, knowledge consolidated, BRIEF narrated to the user
+Parent's wait_sub_agents call returns the structured results
 ```
 
-`spawn_orchestrator_spec()` (`user_mode.rs`) builds the orchestrator's
-`SubAgentSpec`: id `orchestrator`, working dir = project root, result/progress
-files under `<sub_agent_dir>/orchestrator/`, and `inherit_memory = true`.
+- **Spawning is non-blocking**: `spawn_sub_agent` returns the child's session
+  id immediately. Independent sub-tasks run in parallel.
+- **Collection is explicit**: `wait_sub_agents` blocks until the requested
+  children finish (`mode: "all"`, default), the first finishes
+  (`mode: "any"`), or `timeout_secs` lapses — then returns each finished
+  child's result and lists what is still running. The wait honors user
+  interrupts and session stop.
+- **Results are structured**: a child reports with `submit_result`
+  (status/summary/brief/findings/artifacts — the `SubAgentResult` shape in
+  `sub_agent.rs`). A child that finishes without submitting gets a result
+  synthesized from its final message and exit state; usage always comes from
+  session accounting, not self-report.
+- **Backends compose**: `backend: "codex"` / `"claude-code"` runs the child as
+  a supervised external agent instead of the internal loop. The
+  orchestrator/worker matrix is fully general — native conducting Codex
+  workers, or (via the MCP `start_task` tool external agents already have)
+  Codex conducting native specialists.
+- **Lifecycle is tied to the parent**: children die with their parent, like
+  Codex subagent threads. A native child is also a managed session in its own
+  right — it can be stopped, interrupted, or steered directly from the
+  dashboard (related *backend threads* inside a parent process, e.g. Codex
+  subagent threads, still route through their parent).
+
+A sub-agent always runs headless (no interactive frontend of its own) with no
+MCP client, under the daemon's shared autonomy — approvals it raises land in
+the dashboard like any other session's.
 
 ## Agent Roles
 
 Roles are the `SubAgentRole` enum in `sub_agent.rs`:
 `Research`, `Implementation`, `Testing`, `Orchestrator`, `LiveAudio`, and
-`Custom(String)`. The string forms (`research`, `implementation`, `testing`,
-`orchestrator`, `live_audio`) round-trip through `INTENDANT_ROLE`; any other value
-becomes `Custom`.
+`Custom(String)`. On `spawn_sub_agent`, the `role` string picks the child's
+prompt preset; any unrecognized string becomes `Custom` (base prompt only).
 
-Prompt resolution (`prompts.rs::resolve_system_prompt[_for_tools]`) always loads
-the base prompt first, then **appends** a role-specific prompt for three roles
-only:
+Prompt resolution (`prompts.rs::resolve_system_prompt[_for_tools]`) always
+loads the base prompt first, then **appends** a role-specific prompt for three
+roles only:
 
 | Role | Role prompt appended | Focus |
 |------|----------------------|-------|
-| `orchestrator` | `SysPrompt_orchestrator.md` | Decomposition, delegation, knowledge routing, checkpointing, synthesis |
+| `orchestrator` | `SysPrompt_orchestrator.md` | Decomposition, delegation via spawn/wait, checkpointing, synthesis |
 | `research` | `SysPrompt_research.md` | Reading, browsing, grep/find, synthesizing findings |
 | `implementation` | `SysPrompt_implementation.md` | Writing code, builds/tests, committing to a worktree branch |
 | `testing` | *(none — base prompt only)* | Validation, test execution, coverage |
 | `live_audio` | *(handled separately)* | Voice/phone sessions ([Computer Use & Live Audio](./computer-use-and-audio.md)) |
-| `custom` | *(none — base prompt only)* | User-supplied prompt via `INTENDANT_SYSTEM_PROMPT` |
+| `custom` | *(none — base prompt only)* | Pair with `system_prompt` to fully customize |
 
-There is intentionally **no `SysPrompt_testing.md`**: the testing role runs on the
-unmodified base prompt. When the provider uses native tool calling (the default),
-the condensed `SysPrompt_tools.md` is the base instead of `SysPrompt.md` (the
-schema-heavy variant); the role addition is identical either way. Prompts also
-have `{{PLATFORM}}` / `{{PLATFORM_DETAILS}}` placeholders substituted for the host
-OS so the worker knows which tools (xdotool vs. cliclick vs. native Windows, etc.)
-are available.
+There is intentionally **no `SysPrompt_testing.md`**: the testing role runs on
+the unmodified base prompt. When the provider uses native tool calling (the
+default), the condensed `SysPrompt_tools.md` is the base instead of
+`SysPrompt.md` (the schema-heavy variant); the role addition is identical
+either way. Prompts also have `{{PLATFORM}}` / `{{PLATFORM_DETAILS}}`
+placeholders substituted for the host OS.
 
-A project may override any prompt by placing a file of the same name at the
-project root; `resolve_prompt()` prefers the project copy and falls back to the
-binary's embedded default.
-
-## Sub-Agent Spawning
-
-The orchestrator spawns a worker by emitting an `exec_command` (`execAsAgent`)
-tool call that runs the **same `intendant` binary** with role environment
-variables prefixed. `build_spawn_command()` (`sub_agent.rs`) produces it,
-shell-escaping every field:
-
-```
-cd <working_dir> && \
-  INTENDANT_ROLE=research \
-  INTENDANT_ID=research-1 \
-  INTENDANT_RESULT_FILE=<.../result.json> \
-  INTENDANT_PROGRESS_FILE=<.../progress.json> \
-  INTENDANT_INHERIT_MEMORY=1 \
-  <intendant_path> '<task>'
-```
-
-| Variable | Purpose |
-|----------|---------|
-| `INTENDANT_ROLE` | Role string; its presence is what triggers Sub-Agent mode |
-| `INTENDANT_ID` | Unique id for this agent (defaults to `unnamed`) |
-| `INTENDANT_RESULT_FILE` | Path the child writes its final `SubAgentResult` JSON to |
-| `INTENDANT_PROGRESS_FILE` | Path the child writes periodic `SubAgentProgress` JSON to |
-| `INTENDANT_INHERIT_MEMORY` | Present (`=1`) → child loads the project knowledge store at start |
-| `INTENDANT_SYSTEM_PROMPT` | Optional inline prompt for a `Custom` role |
-
-The task itself is passed as the trailing CLI argument, not an env var. A
-sub-agent always runs at `AutonomyLevel::Full` with no interactive frontend
-(headless) and no MCP client of its own — it is a leaf worker.
-
-## Progress and Result IPC
-
-Parent and child communicate entirely through **files** on disk (no shared
-memory, no sockets). The shapes are defined in `sub_agent.rs`.
-
-### Progress (`progress.json`)
-
-The child writes `SubAgentProgress` periodically; the parent polls it.
-
-```json
-{
-  "id": "research-1",
-  "turn": 5,
-  "status": "running",
-  "last_action": "Running cargo test",
-  "question": null
-}
-```
-
-`format_progress_for_user()` (`user_mode.rs`) renders this for the user layer as
-`[Status: turn 5, running] Running cargo test`, truncating `last_action` to 100
-chars. If `question` is set, it is appended as a question from the orchestrator —
-this is how a blocked child surfaces a clarification request up the chain.
-
-### Result (`result.json`)
-
-On completion the child writes a `SubAgentResult`:
-
-```json
-{
-  "id": "research-1",
-  "status": "Completed",
-  "summary": "Found 3 relevant API endpoints…",
-  "brief": "Found the API surface; pagination is supported.",
-  "findings": ["endpoint /api/users supports pagination", "…"],
-  "artifacts": ["docs/api-analysis.md"],
-  "usage": { "prompt_tokens": 12000, "completion_tokens": 3000, "total_tokens": 15000 }
-}
-```
-
-`status` is `Completed` or `Failed(reason)`. `brief` is the one-line spoken
-summary the worker emits as its final `BRIEF:` line (narrated by the
-[presence layer](./presence.md)). The orchestrator collects results with
-`scan_completed_results()`, which writes a `.reported` marker beside each
-`result.json` so the same result is surfaced exactly once even across repeated
-polls. `format_result_message()` turns a result into the text injected back into
-the orchestrator's conversation.
+Two ways to replace a child's prompt wholesale: the `system_prompt` parameter
+on `spawn_sub_agent` (session-scoped), or the `INTENDANT_SYSTEM_PROMPT`
+environment variable on a direct CLI invocation (process-scoped escape hatch).
+A project may also override any prompt file by placing a file of the same name
+at the project root; `resolve_prompt()` prefers the project copy and falls
+back to the binary's embedded default.
 
 ## Git Worktree Isolation
 
 Implementation agents work in isolated git worktrees so parallel workers never
-collide in the working tree. The helpers live in `worktree.rs` (with a richer
-inventory/bookkeeping layer in `worktree_inventory.rs`):
+collide in the working tree. `spawn_sub_agent { worktree: true }` creates one
+per child — branch `subagent-<short-id>` off the parent project's HEAD, checked
+out under `.intendant/worktrees/` via `worktree::create` (`worktree.rs`, with a
+richer inventory/bookkeeping layer in `worktree_inventory.rs`).
 
-- **Create** — `worktree::create(root, branch, base)` runs
-  `git worktree add -b <branch> <root>/.intendant/worktrees/<branch> <base>`.
-  Each worker gets its own branch and a checkout under
-  `.intendant/worktrees/<branch>`.
-- **Merge** — `worktree::merge(root, wt, target)` runs
-  `git merge <branch> --no-edit`. On success it returns `MergeResult::Clean`; on
-  failure it runs `git merge --abort` to leave the repo clean and returns
-  `MergeResult::Conflict(details)`. Conflicts are never auto-resolved — they are
-  reported back so the orchestrator can reassign or escalate.
-- **Remove** — `worktree::remove(root, wt)` runs `git worktree remove <path>`
-  then `git branch -D <branch>` to clean up.
+The worktree **persists after the child finishes** — its branch is the work
+product. The parent merges it back (`git merge <branch> --no-edit`, or
+delegates the merge), and conflicts are never auto-resolved — they are
+reported so the orchestrating session can reassign or escalate. The dashboard's
+worktree inventory offers safe cleanup of merged checkouts.
 
 ```
-implementation-1 ─► branch impl-1 ─┐
-implementation-2 ─► branch impl-2 ─┼─► orchestrator merges each (--no-edit)
-                                   │     clean  → keep
-                                   └──► conflict → abort + report
+implementation-1 ─► branch subagent-a1b2c3d4 ─┐
+implementation-2 ─► branch subagent-e5f6a7b8 ─┼─► parent merges each (--no-edit)
+                                              │     clean  → keep
+                                              └──► conflict → abort + report
 ```
-
-This lets several implementation agents develop independent slices of a change at
-once, then fold them back one branch at a time.
 
 > **Native sub-agent worktrees vs. managed-Codex fission branches.** The
-> worktrees above belong to Intendant's *native* orchestration: the orchestrator
-> spawns role-scoped Intendant workers and merges their branches back itself. A
-> managed **Codex** session has a separate, *model-driven* mechanism — the
+> worktrees above belong to Intendant's *native* orchestration. A managed
+> **Codex** session has a separate, *model-driven* mechanism — the
 > `fission_spawn` MCP tool forks the Codex thread into full-context sibling
 > branches that run as supervised sessions, and a branch with an owned write
 > scope gets its own checkout under `.intendant/worktrees/fission/…` via the
@@ -238,47 +172,48 @@ once, then fold them back one branch at a time.
 
 ## Knowledge Routing Between Agents
 
-Agents share findings through the **knowledge store** — a tagged, pub/sub-capable
-JSON file at `<project>/.intendant/memory.json`, manipulated through the runtime's
-`store_memory` / `recall_memory` tools (see
-[Runtime Protocol](./runtime-protocol.md#knowledge-system) for the on-disk format
-and the legacy↔tagged migration).
+Agents share findings through the **knowledge store** — a tagged,
+pub/sub-capable JSON file at `<project>/.intendant/memory.json`, manipulated
+through the runtime's `store_memory` / `recall_memory` tools (see
+[Runtime Protocol](./runtime-protocol.md#knowledge-system) for the on-disk
+format and the legacy↔tagged migration).
 
-- **Publish** — a worker stores a finding on a named *channel* with *tags* and a
-  *source* (e.g. channel `findings`, tags `database,config`, source `research-1`).
-- **Inherit** — a child spawned with `INTENDANT_INHERIT_MEMORY=1` loads the store
-  at session start, so prior findings are already in its context.
-- **Route** — the orchestrator forwards relevant findings to the worker that needs
-  them; recall filters (channel/tags/source/`since`) let an agent pull just the
+- **Publish** — a worker stores a finding on a named *channel* with *tags* and
+  a *source* (e.g. channel `findings`, tags `database,config`, source
+  `research-1`).
+- **Inherit** — a child spawned with `inherit_memory: true` loads the store at
+  session start, so prior findings are already in its context.
+- **Route** — the orchestrating session forwards relevant findings to the
+  worker that needs them (via the task brief at spawn time, or the store);
+  recall filters (channel/tags/source/`since`) let an agent pull just the
   slice it cares about.
-- **Cursor tracking** — the tagged store records per-subscription cursors so an
-  agent only ever sees entries newer than what it has already consumed.
+- **Cursor tracking** — the tagged store records per-subscription cursors so
+  an agent only ever sees entries newer than what it has already consumed.
 
 ### Example flow
 
-1. Research agent discovers the DB config → `store_memory` on channel `findings`,
-   tag `database`, source `research-1`.
-2. Orchestrator routes that finding to the implementation agent.
+1. Research agent discovers the DB config → `store_memory` on channel
+   `findings`, tag `database`, source `research-1`.
+2. Orchestrating session routes that finding to the implementation agent.
 3. Implementation agent `recall_memory` with `channel=findings, tags=database`
    pulls the config and writes code against it.
 
 ## Orchestrator Checkpointing
 
-Long orchestrations outlive their context window. To survive auto-compaction the
-orchestrator writes a **project-state checkpoint** after each worker finishes,
-using `store_memory` on the `project_state` channel (key `project_state`, tag
-`checkpoint`). The checkpoint captures completed tasks, active tasks,
-architectural decisions, and discovered constraints.
+Long orchestrations outlive their context window. To survive auto-compaction
+the orchestration session writes a **project-state checkpoint** after each
+worker finishes, using `store_memory` on the `project_state` channel (key
+`project_state`, tag `checkpoint`). The checkpoint captures completed tasks,
+active tasks, architectural decisions, and discovered constraints.
 
-On a context restart the orchestrator's prompt directs it to `recall_memory` the
-latest `project_state` first, restoring awareness of what is done and what
-remains. The disk helper `write_project_state()` (`sub_agent.rs`) is PARKED and
-unwired: it can write `project_state.json` and `project_state.md`, but the live
-checkpoint path is the knowledge store.
+On a context restart the orchestration prompt directs it to `recall_memory`
+the latest `project_state` first, restoring awareness of what is done and what
+remains. The disk helper `write_project_state()` (`sub_agent.rs`) is PARKED
+and unwired: it can write `project_state.json` and `project_state.md`, but the
+live checkpoint path is the knowledge store.
 
 > The orchestrator prompt instructs checkpointing *before context reaches ~60%
-> usage*. (Earlier docs cited ~90%; the shipped `SysPrompt_orchestrator.md`
-> threshold is 60%.)
+> usage*.
 
 ## Configuration
 
@@ -287,17 +222,16 @@ Orchestration is tuned under `[orchestrator]` in `intendant.toml`
 
 ```toml
 [orchestrator]
-max_parallel_agents = 4                  # cap on concurrent sub-agents (Option; unset = unbounded)
-sub_agent_dir = ".intendant/subagents"   # workspace root for sub-agent result/progress dirs
+max_parallel_agents = 4   # cap on concurrently RUNNING children per parent session (default 4)
 ```
 
-Both keys are optional. When `sub_agent_dir` is unset, `Project::sub_agent_dir()`
-defaults to `<project>/.intendant/subagents`. Knowledge sharing can be disabled
-entirely with `[memory] enabled = false` (see
-[Runtime Protocol](./runtime-protocol.md#knowledge-system)).
+The cap is enforced in code by `start_sub_agent_session`: a spawn beyond it
+returns an error telling the model to `wait_sub_agents` first.
 
-To skip orchestration for a single run, pass `--direct`. For the daemon-managed,
-multi-session story — running and supervising several agents (native or external)
-concurrently from one always-on process — see
+To skip orchestration for a single run, pass `--direct` (or submit the task
+with `direct: true` / `orchestrate: false`). For the daemon-managed,
+multi-session story — running and supervising several agents (native or
+external) concurrently from one always-on process — see
 [External-Agent Orchestration](./external-agent-orchestration.md) and the
-control-plane/daemon chapter ([control plane & daemon](./control-plane-and-daemon.md)).
+control-plane/daemon chapter
+([control plane & daemon](./control-plane-and-daemon.md)).

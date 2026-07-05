@@ -293,11 +293,11 @@ incorrect.
 
 ## Where to Go Next
 
-- [Architecture](./architecture.md) — the EventBus, four execution modes, and
+- [Architecture](./architecture.md) — the EventBus, the execution shapes, and
   the corrected frontend-parity model.
 - [Session Logging](./session-logging.md) — the on-disk layout these components
   read and write, and the cross-backend session naming the supervisor uses.
 - [Web Dashboard](./web-dashboard.md) — the primary consumer of these events
   (activity diffs, rewind UI, session graph, cost).
-- [Multi-Agent Orchestration](./multi-agent.md) — User mode, sub-agents, and
-  external-agent supervision that the supervisor launches.
+- [Multi-Agent Orchestration](./multi-agent.md) — orchestration sessions and
+  supervised sub-agents the supervisor launches.

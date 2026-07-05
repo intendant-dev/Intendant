@@ -1012,8 +1012,6 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::ModelResponseDelta { .. }
         | AppEvent::JsonExtracted { .. }
         | AppEvent::DoneSignal { .. }
-        | AppEvent::OrchestratorProgress { .. }
-        | AppEvent::OrchestratorLog { .. }
         | AppEvent::AutoApproved { .. }
         | AppEvent::ContextManagement { .. }
         | AppEvent::SubAgentResult { .. }
@@ -1254,9 +1252,6 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
         }
         AppEvent::HumanQuestionDetected { .. } => {
             s.phase = "waiting_human".to_string();
-        }
-        AppEvent::OrchestratorProgress { status, .. } => {
-            s.phase = format!("orchestrating: {}", status);
         }
         AppEvent::SubAgentResult { formatted } => {
             s.last_output_summary = truncate(formatted, 500);

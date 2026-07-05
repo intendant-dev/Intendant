@@ -1,0 +1,56 @@
+<script>
+(function() {
+  const el = document.getElementById('voiceOverlay');
+  const handle = document.getElementById('voiceDragHandle');
+  let pointerDown = false, moved = false, startX, startY, startLeft, startBottom;
+  const DRAG_THRESHOLD = 8;
+  function onDown(e) {
+    const pt = e.touches ? e.touches[0] : e;
+    pointerDown = true; moved = false;
+    const rect = el.getBoundingClientRect();
+    startX = pt.clientX; startY = pt.clientY;
+    startLeft = rect.left;
+    startBottom = window.innerHeight - rect.bottom;
+    e.preventDefault();
+  }
+  function onMove(e) {
+    if (!pointerDown) return;
+    const pt = e.touches ? e.touches[0] : e;
+    const dx = pt.clientX - startX, dy = pt.clientY - startY;
+    if (!moved && Math.abs(dx) + Math.abs(dy) < DRAG_THRESHOLD) return;
+    if (!moved) {
+      moved = true;
+      el.classList.add('dragging');
+      el.style.right = 'auto';
+      el.style.left = startLeft + 'px';
+      el.style.bottom = startBottom + 'px';
+    }
+    el.style.left = (startLeft + dx) + 'px';
+    el.style.bottom = (startBottom - dy) + 'px';
+    e.preventDefault();
+  }
+  function onUp(e) {
+    if (!pointerDown) return;
+    pointerDown = false;
+    el.classList.remove('dragging');
+    if (!moved) {
+      // Was a tap/click — find the button underneath and click it
+      const pt = e.changedTouches ? e.changedTouches[0] : e;
+      handle.style.pointerEvents = 'none';
+      const target = document.elementFromPoint(pt.clientX, pt.clientY);
+      handle.style.pointerEvents = '';
+      if (target && target.tagName === 'BUTTON' && !target.disabled && !target.classList.contains('is-disabled')) {
+        target.click();
+      }
+    }
+    moved = false;
+  }
+  handle.addEventListener('dragstart', (e) => e.preventDefault());
+  handle.addEventListener('mousedown', onDown);
+  handle.addEventListener('touchstart', onDown, {passive: false});
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('touchmove', onMove, {passive: false});
+  document.addEventListener('mouseup', onUp);
+  document.addEventListener('touchend', onUp);
+})();
+</script>

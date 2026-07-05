@@ -3,8 +3,12 @@
 The web dashboard is Intendant's **default frontend**. It is a single-page app
 served by the controller's built-in HTTP/WebSocket gateway, running entirely in
 the browser with WASM-powered state management (the `presence-web` crate,
-Catppuccin Mocha theme, mobile-responsive). The static SPA lives in
-`static/app.html`.
+Catppuccin Mocha theme, mobile-responsive). The SPA is served as one
+self-contained file, `static/app.html` — a **generated artifact**: `build.rs`
+assembles it from the ordered fragments in `static/app/` (`manifest.txt` fixes
+the order) via `crates/app-html-assembler`, and CI rejects any drift between
+fragments and artifact. Edit the fragments, never the artifact; see
+`static/app/README.md`.
 
 ## On by default
 

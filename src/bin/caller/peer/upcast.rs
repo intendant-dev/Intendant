@@ -525,21 +525,6 @@ impl AppEventUpcaster {
                 ]
             }
 
-            AppEvent::OrchestratorProgress {
-                turn,
-                status,
-                last_action,
-            } => vec![PeerEvent::ActivityProgress {
-                id: ActivityId(format!("orchestrator-{turn}")),
-                text: Some(format!("{status}: {last_action}")),
-            }],
-
-            AppEvent::OrchestratorLog { message, level } => vec![log_event(
-                upcast_log_level(level),
-                "orchestrator",
-                message.clone(),
-            )],
-
             AppEvent::ContextManagement { turn } => vec![log_event(
                 LogLevel::Debug,
                 "context",
@@ -1668,17 +1653,6 @@ impl WireEventUpcaster {
                     },
                     log_event(LogLevel::Info, "subagent", summary.clone()),
                 ]
-            }
-
-            // OutboundEvent::OrchestratorProgress only carries `status`
-            // — the wire format loses the `turn` and `last_action`
-            // fields that AppEvent carries. The parity test flags
-            // this as intentional loss.
-            OutboundEvent::OrchestratorProgress { status } => {
-                vec![PeerEvent::ActivityProgress {
-                    id: ActivityId("orchestrator".into()),
-                    text: Some(status.clone()),
-                }]
             }
 
             OutboundEvent::ContextManagement { turn } => vec![log_event(
@@ -3580,37 +3554,6 @@ mod tests {
         assert!(
             !msg_b.contains("99"),
             "wire path cannot include display_id because wire variant has no fields: {msg_b}"
-        );
-    }
-
-    /// `OrchestratorProgress` loses `turn` and `last_action` on the
-    /// wire — the wire format only carries `status`.
-    #[test]
-    fn drift_orchestrator_progress_loses_turn_and_last_action() {
-        let app_event = AppEvent::OrchestratorProgress {
-            turn: 5,
-            status: "analyzing".into(),
-            last_action: "parsed response".into(),
-        };
-        let mut app_upcaster = AppEventUpcaster::new();
-        let path_a = app_upcaster.upcast(&app_event);
-        let text_a = match &path_a[0] {
-            PeerEvent::ActivityProgress { text, .. } => text.clone().unwrap_or_default(),
-            _ => panic!("expected ActivityProgress"),
-        };
-        assert!(text_a.contains("analyzing") && text_a.contains("parsed response"));
-
-        let outbound =
-            crate::event::app_event_to_outbound(&app_event).expect("OrchestratorProgress maps");
-        let mut wire_upcaster = WireEventUpcaster::new();
-        let path_b = wire_upcaster.upcast(&outbound);
-        let text_b = match &path_b[0] {
-            PeerEvent::ActivityProgress { text, .. } => text.clone().unwrap_or_default(),
-            _ => panic!("expected ActivityProgress"),
-        };
-        assert_eq!(
-            text_b, "analyzing",
-            "wire path has only `status`, loses `last_action`"
         );
     }
 

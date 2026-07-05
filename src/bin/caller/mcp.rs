@@ -5646,24 +5646,6 @@ pub fn spawn_event_listener(
                         resource_changed = Some("intendant://logs");
                     }
 
-                    AppEvent::OrchestratorProgress {
-                        turn,
-                        status,
-                        last_action,
-                    } => {
-                        s.set_phase(Phase::Orchestrating);
-                        s.push_log(
-                            LogLevel::SubAgent,
-                            format!("[T{}] {} — {}", turn, status, last_action),
-                        );
-                        resource_changed = Some("intendant://status");
-                    }
-
-                    AppEvent::OrchestratorLog { message, level } => {
-                        s.push_log(level, message);
-                        resource_changed = Some("intendant://logs");
-                    }
-
                     AppEvent::ContextManagement { turn } => {
                         s.push_log(LogLevel::Detail, format!("[T{}] Context management", turn));
                     }
@@ -8828,13 +8810,6 @@ enum PersistedStartTarget {
     ExternalMissingResume { source: Option<String> },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ExternalIdentity {
-    wrapper_id: Option<String>,
-    source: String,
-    resume_id: String,
-}
-
 fn resolve_persisted_start_target(
     logs_home: &std::path::Path,
     session_id: &str,
@@ -8851,51 +8826,29 @@ fn resolve_persisted_start_target(
 
     let (canonical_session_id, project_root) = persisted_session_meta(&log_dir);
     let config = crate::session_config::read_log_dir_config(&log_dir);
-    let mut source = config
-        .as_ref()
-        .and_then(|config| config.source.as_deref())
-        .and_then(normalized_external_source);
-    let mut resume_id = None;
 
+    // Preference order for identity facts: a structured event naming this
+    // wrapper (else the log's sole identity), then the launch config's
+    // source, then — pre-2026-07 dirs only — the legacy prose scrape.
     let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap_or_default();
-    let mut exact_identity = None;
-    let mut any_identity = None;
-    let mut identity_count = 0usize;
-    for line in contents.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let event = value.get("event").and_then(|v| v.as_str()).unwrap_or("");
-        let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
-        if event == "session_identity" {
-            if let Some(identity) = persisted_external_identity_from_event(&value) {
-                identity_count += 1;
-                if identity_matches_requested_wrapper(
-                    identity.wrapper_id.as_deref(),
-                    session_id,
-                    canonical_session_id.as_deref(),
-                ) {
-                    exact_identity = Some(identity.clone());
-                }
-                if any_identity.is_none() {
-                    any_identity = Some(identity);
-                }
-            }
-        }
-        if source.is_none() {
-            source = external_agent_source_from_log_message(message);
-        }
-        if resume_id.is_none() {
-            resume_id = external_agent_resume_id_from_log_message(message);
-        }
-    }
-
-    let identity =
-        exact_identity.or_else(|| (identity_count == 1).then_some(any_identity).flatten());
-    if let Some(identity) = identity {
-        source = Some(identity.source);
-        resume_id = Some(identity.resume_id);
-    }
+    let scan = crate::session_identity::scan_session_log(
+        &contents,
+        session_id,
+        canonical_session_id.as_deref(),
+    );
+    let legacy_source = scan.legacy_source.clone();
+    let legacy_resume_id = scan.legacy_resume_id.clone();
+    let (source, mut resume_id) = match scan.matching_or_unique() {
+        Some(identity) => (Some(identity.source), Some(identity.backend_session_id)),
+        None => (
+            config
+                .as_ref()
+                .and_then(|config| config.source.as_deref())
+                .and_then(crate::session_identity::normalized_external_source)
+                .or(legacy_source),
+            legacy_resume_id,
+        ),
+    };
 
     let Some(source) = source else {
         return PersistedStartTarget::NonExternal;
@@ -8955,45 +8908,6 @@ fn persisted_session_meta(log_dir: &std::path::Path) -> (Option<String>, Option<
     (session_id, project_root)
 }
 
-fn persisted_external_identity_from_event(value: &serde_json::Value) -> Option<ExternalIdentity> {
-    let data = value.get("data")?;
-    let source =
-        json_str_field(data, "source").and_then(|source| normalized_external_source(&source))?;
-    let resume_id =
-        json_str_field(data, "backend_session_id").and_then(|id| clean_external_resume_id(&id))?;
-    Some(ExternalIdentity {
-        wrapper_id: json_str_field(data, "session_id"),
-        source,
-        resume_id,
-    })
-}
-
-fn identity_matches_requested_wrapper(
-    identity_session_id: Option<&str>,
-    requested_id: &str,
-    canonical_session_id: Option<&str>,
-) -> bool {
-    let Some(identity_session_id) = identity_session_id
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    else {
-        return false;
-    };
-    identity_session_id == requested_id
-        || identity_session_id.starts_with(requested_id)
-        || canonical_session_id
-            .map(|canonical| {
-                identity_session_id == canonical || canonical.starts_with(requested_id)
-            })
-            .unwrap_or(false)
-}
-
-fn normalized_external_source(source: &str) -> Option<String> {
-    let normalized = crate::session_names::normalize_source(source);
-    crate::external_agent::AgentBackend::from_str_loose(&normalized)
-        .map(|backend| backend.as_short_str().to_string())
-}
-
 fn json_str_field(value: &serde_json::Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -9001,31 +8915,6 @@ fn json_str_field(value: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-}
-
-fn external_agent_source_from_log_message(message: &str) -> Option<String> {
-    let mode = message.strip_prefix("Mode: external agent (")?;
-    let (source, _) = mode.split_once(')')?;
-    normalized_external_source(source)
-}
-
-fn external_agent_resume_id_from_log_message(message: &str) -> Option<String> {
-    if let Some(thread_id) = message.strip_prefix("External agent thread: ") {
-        return clean_external_resume_id(thread_id);
-    }
-    if message.starts_with("Mode: external agent") {
-        if let Some((_, thread_id)) = message.rsplit_once("thread: ") {
-            return clean_external_resume_id(thread_id);
-        }
-    }
-    None
-}
-
-fn clean_external_resume_id(value: &str) -> Option<String> {
-    let value = value
-        .trim()
-        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ',' | ';'));
-    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// Most branches a single `fission_spawn` call may fork.

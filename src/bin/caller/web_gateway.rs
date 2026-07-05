@@ -4043,6 +4043,10 @@ fn apply_external_wrapper_index_to_sessions(home: &Path, sessions: &mut [serde_j
     }
 }
 
+/// LEGACY (pre-2026-07 session dirs): scrape a backend thread id from a
+/// human log line. Identity is recorded as structured `session_identity`
+/// events (see `crate::session_identity`); readers prefer those and fall
+/// back here only for dirs that predate them. Frozen grammar — never extend.
 fn external_agent_thread_id_from_message(message: &str) -> Option<String> {
     let scraped = if let Some(thread_id) = message.strip_prefix("External agent thread: ") {
         clean_external_thread_id(thread_id)
@@ -4062,6 +4066,9 @@ fn external_agent_thread_id_from_message(message: &str) -> Option<String> {
     scraped.filter(|id| scraped_external_thread_id_is_canonical(id))
 }
 
+/// LEGACY (pre-2026-07 session dirs): scrape the backend source from a
+/// `"Mode: external agent (…)"` log line. Structured `session_identity`
+/// events are the source of truth; frozen grammar — never extend.
 fn external_agent_source_from_message(message: &str) -> Option<String> {
     let mode = message.strip_prefix("Mode: external agent (")?;
     let (source, _) = mode.split_once(')')?;
@@ -11897,6 +11904,7 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
     let mut role: Option<String> = None;
     let mut external_resume_id: Option<String> = None;
     let mut external_source: Option<String> = None;
+    let mut canonical_session_id: Option<String> = None;
     let mut capabilities: Option<serde_json::Value> = None;
     let mut session_agent_config = crate::session_config::read_log_dir_config(dir);
     let mut updated_at_secs = file_mtime_secs(dir);
@@ -11929,6 +11937,10 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                 .get("role")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            canonical_session_id = meta
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
         }
     }
 
@@ -11952,6 +11964,40 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                             .get("ts")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string());
+                    }
+                }
+                "session_identity" => {
+                    // Structured identity beats the prose scrape below; later
+                    // events supersede earlier ones (placeholder → native-id
+                    // upgrades append). Wrapper matching keeps identities the
+                    // bus tee copied into the daemon-main log from stamping
+                    // the daemon session's row with a child's backend id, and
+                    // the canonical filter keeps placeholder ids in pre-guard
+                    // logs from conjuring ghost windows (see
+                    // `scraped_external_thread_id_is_canonical`).
+                    if let Some(data) = obj.get("data") {
+                        if crate::session_identity::wrapper_matches(
+                            data.get("session_id").and_then(|v| v.as_str()),
+                            session_id,
+                            canonical_session_id.as_deref(),
+                        ) {
+                            if let Some(source) = data
+                                .get("source")
+                                .and_then(|v| v.as_str())
+                                .map(crate::session_names::normalize_source)
+                                .filter(|s| !s.is_empty() && s != "intendant")
+                            {
+                                external_source = Some(source);
+                            }
+                            if let Some(id) = data
+                                .get("backend_session_id")
+                                .and_then(|v| v.as_str())
+                                .and_then(clean_external_thread_id)
+                                .filter(|id| scraped_external_thread_id_is_canonical(id))
+                            {
+                                external_resume_id = Some(id);
+                            }
+                        }
                     }
                 }
                 "info" | "debug" => {
@@ -18471,6 +18517,15 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// Consecutive "fatal-class" accept failures tolerated on the same socket
+/// before it is dropped and rebound. EINVAL has been observed twice on
+/// macOS (2026-07-04, both times within ~1s of an external-agent spawn)
+/// on a listener that remained LISTEN at the kernel afterwards — treating
+/// the first one as fatal is what actually broke the dashboard. A short
+/// streak (~2s) absorbs the spurious case; a genuinely dead socket fails
+/// every retry and reaches the rebind path.
+pub(crate) const FATAL_ACCEPT_REBIND_THRESHOLD: u32 = 8;
+
 pub(crate) fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
     match error.kind() {
         std::io::ErrorKind::Interrupted
@@ -19385,20 +19440,39 @@ pub fn spawn_web_gateway(
             eprintln!("[web_gateway] ICE-TCP candidates advertise port {p}");
         }
 
+        let mut fatal_accept_streak: u32 = 0;
         loop {
             let (stream, peer_addr) = match listener.accept().await {
-                Ok(conn) => conn,
+                Ok(conn) => {
+                    fatal_accept_streak = 0;
+                    conn
+                }
                 Err(e) => {
                     if should_continue_after_accept_error(&e) {
                         eprintln!("[web_gateway] accept failed on port {port}: {e} (continuing)");
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         continue;
                     }
-                    // The listening socket itself is dead. Exiting here
-                    // leaves the daemon half-alive (established WebSockets
-                    // keep the UI looking healthy while every new request
-                    // fails) — rebind the original address instead, backing
-                    // off up to 30s until the port comes back.
+                    // "Fatal" classifications (EINVAL class) have been
+                    // observed spuriously on macOS: accept() failed while
+                    // the socket remained LISTEN at the kernel (backlog
+                    // still completing handshakes), correlated with
+                    // external-agent spawns. Give the same socket a short
+                    // streak of retries before declaring it dead.
+                    fatal_accept_streak += 1;
+                    if fatal_accept_streak < FATAL_ACCEPT_REBIND_THRESHOLD {
+                        eprintln!(
+                            "[web_gateway] accept failed on port {port}: {e} (retry {fatal_accept_streak}/{FATAL_ACCEPT_REBIND_THRESHOLD} before rebind)"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    fatal_accept_streak = 0;
+                    // Persistent: the listening socket really is dead.
+                    // Exiting here would leave the daemon half-alive
+                    // (established WebSockets keep the UI looking healthy
+                    // while every new request fails) — rebind the original
+                    // address instead, backing off up to 30s.
                     let Some(addr) = bind_addr else {
                         eprintln!(
                             "[web_gateway] accept failed on port {port}: {e} (bind address unknown; listener task exiting)"
@@ -19408,6 +19482,14 @@ pub fn spawn_web_gateway(
                     eprintln!(
                         "[web_gateway] accept failed on port {port}: {e} (rebinding listener)"
                     );
+                    // Drop the dead listener before rebinding: it still owns
+                    // the port at the kernel level, and SO_REUSEADDR only
+                    // bypasses TIME_WAIT — a live (even unusable) LISTEN
+                    // socket makes every rebind fail with EADDRINUSE, so
+                    // holding it across the loop wedged recovery forever.
+                    // Its backlog also keeps completing handshakes for
+                    // requests nothing will ever read.
+                    drop(listener);
                     let mut delay = std::time::Duration::from_millis(250);
                     listener = loop {
                         tokio::time::sleep(delay).await;
@@ -30466,7 +30548,7 @@ fn peer_identity_allows_ws_control(
 
 /// Map a typed `/ws` frame to the `PeerOperation` it exercises — the
 /// direct-WebSocket mirror of `dashboard_control_frame_operation` and
-/// `dashboard_control_method_operation` (dashboard_control.rs), so the same
+/// the `CONTROL_METHODS` table (dashboard_control.rs), so the same
 /// IAM grant answers the same way whichever transport a client speaks.
 /// `None` means the frame carries no authority of its own: replies, pings,
 /// and the `dashboard_control_*` signaling frames (the tunnel they establish
@@ -47210,5 +47292,25 @@ mod tests {
         );
         client.expect("client connects to rebound listener");
         drop(server);
+    }
+
+    /// SO_REUSEADDR does not override an actively bound listener on Unix —
+    /// the accept-loop recovery MUST drop the dead socket before rebinding,
+    /// or every attempt self-inflicts EADDRINUSE (seen live: a daemon whose
+    /// accept loop died spun on rebind for over an hour while its own dead
+    /// listener still owned the port). Windows semantics differ, so the
+    /// still-bound assertion is Unix-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rebind_fails_while_dead_listener_is_still_bound() {
+        let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = holder.local_addr().unwrap();
+
+        let err = rebind_dead_tcp_listener(addr)
+            .expect_err("rebinding must fail while the previous listener still holds the address");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+
+        drop(holder);
+        assert!(rebind_dead_tcp_listener(addr).is_ok());
     }
 }

@@ -737,8 +737,8 @@ shared state (when driven over MCP) → config default → native.
 
 ## See Also
 
-- [Agent Execution & Multi-Agent Orchestration](./multi-agent.md) — the four modes
-  and native sub-agent orchestration.
+- [Agent Execution & Multi-Agent Orchestration](./multi-agent.md) — the execution
+  shapes and native sub-agent orchestration.
 - [MCP Server](./mcp-server.md) — the control surface the external tool's MCP
   client connects back to.
 - [Control plane & daemon](./control-plane-and-daemon.md) — running and supervising
