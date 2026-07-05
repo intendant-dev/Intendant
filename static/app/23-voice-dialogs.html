@@ -1,0 +1,41 @@
+
+<!-- Voice Settings Dialog -->
+<div class="dialog-overlay hidden" id="settingsDialog">
+  <div class="dialog">
+    <h2>Voice Settings</h2>
+    <label for="apiKeyInput" id="apiKeyLabel">API Key</label>
+    <input type="password" id="apiKeyInput" placeholder="Enter API key for voice...">
+    <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px;cursor:pointer;">
+      <input type="checkbox" id="passiveModeCheckbox">
+      Always passive (observe only)
+    </label>
+    <div class="btn-row">
+      <button class="btn-secondary" id="settingsCancel">Cancel</button>
+      <button class="btn-primary" id="settingsSave">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- First-run Voice Dialog -->
+<div class="dialog-overlay hidden" id="firstRunDialog">
+  <div class="dialog">
+    <h2>Voice Setup</h2>
+    <p style="font-size:13px;color:var(--subtext0);margin-bottom:12px">Enter an API key to enable voice interaction with tool support.</p>
+    <label for="firstRunKeyInput" id="firstRunKeyLabel">API Key</label>
+    <input type="password" id="firstRunKeyInput" placeholder="Enter API key for voice...">
+    <div class="btn-row">
+      <button class="btn-secondary" id="firstRunSkip">Skip</button>
+      <button class="btn-primary" id="firstRunSave">Connect Voice</button>
+    </div>
+  </div>
+</div>
+
+<!-- xterm.js (loaded lazily for Terminal tab). Pinned + SRI-verified —
+     bump version and hashes together. Generator: scripts/refresh-xterm-sri.sh
+     (or just re-fetch from jsdelivr and run `openssl dgst -sha384 -binary | openssl base64 -A`). -->
+<link rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css"
+      integrity="sha384-8Xk9wy/gzEDUKrXtrmCFa2bBuK3BpjpDuL/p0SeKQX19Khl/M+lHOgD/CyYf7efP"
+      crossorigin="anonymous"
+      id="xterm-css" disabled>
+

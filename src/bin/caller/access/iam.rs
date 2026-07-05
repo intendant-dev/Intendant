@@ -2650,6 +2650,103 @@ fn set_private_perms(path: &Path) -> AccessResult<()> {
 mod tests {
     use super::*;
 
+    /// The dashboard ships static fallback copies of the IAM catalog
+    /// (rendered when the daemon predates `/api/access/iam` or the call
+    /// fails). Those copies can't derive from this file, so these tests pin
+    /// their ID SETS to the builtin catalog — labels and prose stay free.
+    fn app_html() -> &'static str {
+        include_str!("../../../../static/app.html")
+    }
+
+    fn slice_between<'a>(hay: &'a str, start: &str, end: &str) -> &'a str {
+        let from = hay
+            .find(start)
+            .unwrap_or_else(|| panic!("marker {start:?} not found in app.html"))
+            + start.len();
+        let rest = &hay[from..];
+        let to = rest
+            .find(end)
+            .unwrap_or_else(|| panic!("end marker {end:?} not found after {start:?}"));
+        &rest[..to]
+    }
+
+    fn quoted_role_ids(text: &str) -> std::collections::BTreeSet<String> {
+        let pattern = regex::Regex::new(r"'(role:[a-z-]+)'").unwrap();
+        pattern
+            .captures_iter(text)
+            .map(|caps| caps[1].to_string())
+            .collect()
+    }
+
+    fn quoted_permission_ids(text: &str) -> std::collections::BTreeSet<String> {
+        let pattern = regex::Regex::new(r"'([a-z]+\.[a-z]+)'").unwrap();
+        pattern
+            .captures_iter(text)
+            .map(|caps| caps[1].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn dashboard_fallback_role_catalog_mirrors_builtin_roles() {
+        let app = app_html();
+        let builtin: std::collections::BTreeSet<String> = builtin_role_templates()
+            .into_iter()
+            .map(|role| role.id)
+            .collect();
+
+        let fallback = slice_between(app, "function accessFallbackIamRoles() {", "\nfunction ");
+        assert_eq!(
+            quoted_role_ids(fallback),
+            builtin,
+            "accessFallbackIamRoles (static/app.html) drifted from builtin_role_templates"
+        );
+
+        let meta = slice_between(app, "const ACCESS_ROLE_META = {", "\n};");
+        assert_eq!(
+            quoted_role_ids(meta),
+            builtin,
+            "ACCESS_ROLE_META (static/app.html) drifted from builtin_role_templates"
+        );
+
+        let picker = slice_between(app, "const ACCESS_ROLE_PICKER_ORDER = [", "\n];");
+        let mut pickable = builtin.clone();
+        // The peer-profile role is daemon-peer-only; humans never pick it.
+        assert!(pickable.remove("role:peer-profile"));
+        assert_eq!(
+            quoted_role_ids(picker),
+            pickable,
+            "ACCESS_ROLE_PICKER_ORDER (static/app.html) drifted from builtin_role_templates"
+        );
+    }
+
+    #[test]
+    fn dashboard_fallback_permission_catalog_mirrors_root_permission_ids() {
+        let app = app_html();
+        let root: std::collections::BTreeSet<String> = root_permission_ids().into_iter().collect();
+
+        let root_js = slice_between(app, "const rootPermissions = [", "];");
+        assert_eq!(
+            quoted_permission_ids(root_js),
+            root,
+            "rootPermissions (static/app.html) drifted from root_permission_ids"
+        );
+
+        let summaries = slice_between(
+            app,
+            "function accessFallbackPermissions() {",
+            "return Object.entries",
+        );
+        let mut explained = root;
+        // Legacy aggregate the catalog still explains for old grants; not a
+        // grantable root permission.
+        explained.insert("terminal.use".to_string());
+        assert_eq!(
+            quoted_permission_ids(summaries),
+            explained,
+            "accessFallbackPermissions (static/app.html) drifted from root_permission_ids"
+        );
+    }
+
     /// The peer.manage → manage/use split: grants that predate peer.use and
     /// carry peer.manage keep tunnel access, the reverse never holds, and
     /// the builtin roles divide the two deliberately (operator uses peers

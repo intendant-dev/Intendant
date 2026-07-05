@@ -205,9 +205,13 @@ async fn accept_loop(
 ) {
     let mut listener = listener;
     let bind_addr = listener.local_addr().ok();
+    let mut fatal_accept_streak: u32 = 0;
     loop {
         let (stream, peer) = match listener.accept().await {
-            Ok(c) => c,
+            Ok(c) => {
+                fatal_accept_streak = 0;
+                c
+            }
             Err(e) => {
                 if crate::web_gateway::should_continue_after_accept_error(&e) {
                     // Bare `continue` here would hot-spin at 100% CPU under
@@ -216,6 +220,18 @@ async fn accept_loop(
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     continue;
                 }
+                // Fatal-class errors can be spurious (see the web gateway's
+                // accept loop): retry the same socket briefly before
+                // declaring it dead.
+                fatal_accept_streak += 1;
+                if fatal_accept_streak < crate::web_gateway::FATAL_ACCEPT_REBIND_THRESHOLD {
+                    eprintln!(
+                        "[access/cert-server] accept failed: {e} (retry {fatal_accept_streak} before rebind)"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+                fatal_accept_streak = 0;
                 // The listening socket itself is dead: rebind so the
                 // enrollment page stays reachable mid-ceremony instead of
                 // spinning on a socket that can never accept again.
@@ -226,6 +242,10 @@ async fn accept_loop(
                     return;
                 };
                 eprintln!("[access/cert-server] accept failed: {e} (rebinding listener)");
+                // Drop the dead listener first: it still owns the port, and
+                // SO_REUSEADDR only bypasses TIME_WAIT — holding it across
+                // the loop makes every rebind fail with EADDRINUSE.
+                drop(listener);
                 let mut delay = std::time::Duration::from_millis(250);
                 listener = loop {
                     tokio::time::sleep(delay).await;

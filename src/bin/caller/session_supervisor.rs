@@ -1279,6 +1279,7 @@ impl SessionSupervisor {
             attachments_for_agent,
             session_name,
             None,
+            None,
             emit_session_started_after_identity,
             None,
             codex_service_tier,
@@ -1492,6 +1493,7 @@ impl SessionSupervisor {
                     UserAttachments::default(),
                     None,
                     Some(resume_token.clone()),
+                    (!force_new).then(|| resume_token.clone()),
                     false,
                     Some(ready_tx),
                     codex_service_tier,
@@ -1499,9 +1501,12 @@ impl SessionSupervisor {
                     None,
                 )
                 .await;
-                self.clear_external_attach_request(&external_attach_keys)
-                    .await;
-                self.emit_external_attached_when_ready(resume_token, source_norm, ready_rx);
+                self.emit_external_attached_when_ready(
+                    resume_token,
+                    source_norm,
+                    ready_rx,
+                    external_attach_keys,
+                );
                 return;
             }
 
@@ -1632,11 +1637,12 @@ impl SessionSupervisor {
             project,
             session_log,
             log_dir,
-            external_backend,
+            external_backend.clone(),
             direct.unwrap_or(true),
             UserAttachments::from_items(resolved_attachments),
             None,
-            Some(resume_token),
+            Some(resume_token.clone()),
+            (external_backend.is_some() && !force_new).then(|| resume_token),
             false,
             None,
             codex_service_tier,
@@ -1882,6 +1888,7 @@ impl SessionSupervisor {
         attachments: UserAttachments,
         session_name: Option<String>,
         resume_token: Option<String>,
+        identity_alias: Option<String>,
         emit_session_started_after_identity: bool,
         ready_for_thread_actions: Option<oneshot::Sender<()>>,
         codex_service_tier: Option<String>,
@@ -1907,6 +1914,7 @@ impl SessionSupervisor {
                 approval_registry.clone(),
                 session_name,
                 Some(finished_rx),
+                identity_alias,
             )
             .await;
 
@@ -2092,10 +2100,17 @@ impl SessionSupervisor {
         session_id: String,
         source: String,
         ready_rx: oneshot::Receiver<()>,
+        attach_keys: Vec<String>,
     ) {
         let supervisor = self.clone();
         tokio::spawn(async move {
-            match tokio::time::timeout(EXTERNAL_ATTACH_READY_TIMEOUT, ready_rx).await {
+            // Hold the attach-dedupe keys until the attach actually completes
+            // (or provably fails). Clearing them right after spawn re-opens
+            // the duplicate-attach window for the several seconds the backend
+            // needs to come up and report its thread identity.
+            let outcome = tokio::time::timeout(EXTERNAL_ATTACH_READY_TIMEOUT, ready_rx).await;
+            supervisor.clear_external_attach_request(&attach_keys).await;
+            match outcome {
                 Ok(Ok(())) => {
                     supervisor.emit_attached_status(&session_id, &source).await;
                     supervisor
@@ -2380,13 +2395,27 @@ impl SessionSupervisor {
                         "failed",
                         Some("target session is not accepting input"),
                     );
-                    self.warn(&format!(
+                    let message = format!(
                         "FollowUp dropped: {} session {} in {} is not accepting input",
                         source,
                         short_session(&managed_id),
                         project_root.display()
-                    ));
+                    );
+                    eprintln!("[supervisor] {}", message);
+                    self.warn(&message);
                 } else {
+                    // Queued and delivered are recorded on both sides of the
+                    // channel: this daemon-log line pairs with the session
+                    // log's "Follow-up … delivered" — a queued without a
+                    // delivered means the session loop stopped draining its
+                    // queue. (eprintln reaches the daemon log via the fd tee;
+                    // bus log entries are dashboard-only.)
+                    eprintln!(
+                        "[supervisor] FollowUp {} queued for {} session {}",
+                        follow_up_id.as_deref().unwrap_or("(no id)"),
+                        source,
+                        short_session(&managed_id),
+                    );
                     emit_follow_up_status(
                         &self.config.bus,
                         Some(requested_id),
@@ -2406,10 +2435,12 @@ impl SessionSupervisor {
                     "failed",
                     Some("target session is not managed by this daemon"),
                 );
-                self.warn(&format!(
+                let message = format!(
                     "FollowUp dropped: session {} is not managed by this daemon",
                     short_session(&target_id)
-                ));
+                );
+                eprintln!("[supervisor] {}", message);
+                self.warn(&message);
             }
         }
     }
@@ -3679,6 +3710,10 @@ impl SessionSupervisor {
                 session.session_id = backend_session_id.clone();
                 session.source = source.clone();
                 state.sessions.insert(backend_session_id.clone(), session);
+                // The entry is now directly keyed by the backend id; drop the
+                // pre-identity alias register_session added under that id so
+                // no alias entry shadows a live key.
+                state.session_aliases.remove(&backend_session_id);
                 state
                     .session_aliases
                     .insert(session_id.clone(), backend_session_id.clone());
@@ -3866,6 +3901,7 @@ impl SessionSupervisor {
         approval_registry: event::ApprovalRegistry,
         name: Option<String>,
         finished_rx: Option<oneshot::Receiver<()>>,
+        identity_alias: Option<String>,
     ) -> u64 {
         let rehydrated_related = load_related_sessions_from_log(&session_dir);
         let mut state = self.state.lock().await;
@@ -3876,7 +3912,7 @@ impl SessionSupervisor {
         state.sessions.insert(
             session_id.clone(),
             ManagedSession {
-                session_id,
+                session_id: session_id.clone(),
                 source,
                 name,
                 phase,
@@ -3888,6 +3924,18 @@ impl SessionSupervisor {
                 finished_rx,
             },
         );
+        // Pre-identity alias: a resumed external session is only addressable
+        // by its backend/resume token once the backend reports its identity
+        // (several seconds after spawn). Registering the token as an alias in
+        // the same lock closes that window — concurrent resumes of the same
+        // thread dedupe against this wrapper instead of spawning a duplicate,
+        // and follow-ups targeted at the token queue into this session's
+        // channel instead of failing "not managed by this daemon".
+        // apply_session_identity() drops the alias when the entry is re-keyed
+        // to the backend id itself.
+        if let Some(alias) = identity_alias.filter(|alias| alias != &session_id) {
+            state.session_aliases.insert(alias, session_id);
+        }
         for rel in rehydrated_related {
             state.apply_related_session(
                 &rel.parent_session_id,
@@ -4873,56 +4921,18 @@ fn persisted_external_identity_for_session_in_home(
         return None;
     }
     let log_dir = session_log_dir_for_id_in_home(home, session_id)?;
-    let canonical_session_id = std::fs::read_to_string(log_dir.join("session_meta.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|value| {
-            value
-                .get("session_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        });
-    let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).ok()?;
-    for line in contents.lines().rev() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value.get("event").and_then(serde_json::Value::as_str) != Some("session_identity") {
-            continue;
-        }
-        let Some(data) = value.get("data") else {
-            continue;
-        };
-        let wrapper_id = data
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|id| !id.is_empty());
-        let wrapper_matches = wrapper_id.is_some_and(|id| {
-            id == session_id
-                || id.starts_with(session_id)
-                || canonical_session_id
-                    .as_deref()
-                    .is_some_and(|canonical| id == canonical || canonical.starts_with(session_id))
-        });
-        if !wrapper_matches {
-            continue;
-        }
-        let source = data
-            .get("source")
-            .and_then(serde_json::Value::as_str)
-            .and_then(external_agent::AgentBackend::from_str_loose)
-            .map(|backend| backend.as_short_str().to_string())?;
-        let backend_session_id = data
-            .get("backend_session_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .filter(|id| external_agent::source_session_id_is_canonical(&source, id))?
-            .to_string();
-        return Some((source, backend_session_id));
+    // Resume authority: only the latest wrapper-matching structured event
+    // counts, and only when its backend id has the source's canonical shape
+    // — a placeholder id must not drive resume. The scan's legacy prose
+    // fields are deliberately ignored here; pre-event dirs resolve through
+    // the wrapper index instead (`effective_external_resume_token_in_home`).
+    let identity =
+        crate::session_identity::scan_session_dir(&log_dir, session_id)?.latest_matching?;
+    if !external_agent::source_session_id_is_canonical(&identity.source, &identity.backend_session_id)
+    {
+        return None;
     }
-    None
+    Some((identity.source, identity.backend_session_id))
 }
 
 fn session_log_dir_for_id_in_home(home: &Path, session_id: &str) -> Option<PathBuf> {
@@ -5332,6 +5342,85 @@ mod tests {
         assert_eq!(msg.text, "new prompt");
         assert_eq!(msg.edit_user_turn_index, Some(117));
         assert_eq!(msg.edit_user_turn_revision, Some(1));
+    }
+
+    #[tokio::test]
+    async fn register_session_pre_identity_alias_makes_resume_token_addressable() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        let (tx, _rx) = mpsc::channel(1);
+        supervisor
+            .register_session(
+                "wrapper-1".to_string(),
+                "codex".to_string(),
+                "idle".to_string(),
+                PathBuf::from("/tmp/project"),
+                PathBuf::from("/tmp/session"),
+                tx,
+                event::ApprovalRegistry::default(),
+                None,
+                None,
+                Some("backend-thread".to_string()),
+            )
+            .await;
+
+        let state = supervisor.state.lock().await;
+        // The backend/resume token resolves to the wrapper before the backend
+        // reports identity, so concurrent resumes dedupe against it and
+        // targeted follow-ups queue instead of failing "not managed".
+        assert_eq!(
+            state.resolve_session_id("backend-thread").as_deref(),
+            Some("wrapper-1")
+        );
+        drop(state);
+        assert_eq!(
+            supervisor
+                .find_managed_session_id("codex", "backend-thread", "backend-thread")
+                .await
+                .as_deref(),
+            Some("wrapper-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_rekey_drops_pre_identity_alias_without_shadowing() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        let (tx, _rx) = mpsc::channel(1);
+        supervisor
+            .register_session(
+                "wrapper-1".to_string(),
+                "codex".to_string(),
+                "idle".to_string(),
+                PathBuf::from("/tmp/project"),
+                PathBuf::from("/tmp/session"),
+                tx,
+                event::ApprovalRegistry::default(),
+                None,
+                None,
+                Some("backend-thread".to_string()),
+            )
+            .await;
+        supervisor
+            .apply_session_identity(
+                "wrapper-1".to_string(),
+                "codex".to_string(),
+                "backend-thread".to_string(),
+            )
+            .await;
+
+        let state = supervisor.state.lock().await;
+        // Re-keyed entry is addressable by both ids...
+        assert_eq!(
+            state.resolve_session_id("backend-thread").as_deref(),
+            Some("backend-thread")
+        );
+        assert_eq!(
+            state.resolve_session_id("wrapper-1").as_deref(),
+            Some("backend-thread")
+        );
+        // ...and no alias entry shadows the live backend key.
+        assert!(!state.session_aliases.contains_key("backend-thread"));
     }
 
     #[tokio::test]
