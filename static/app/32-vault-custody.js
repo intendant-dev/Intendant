@@ -2631,7 +2631,7 @@ let shellQueuedInput = '';
 let shellWaitingNoticeShown = false;
 let shellPendingResize = null;
 const SHELL_QUEUED_INPUT_MAX_BYTES = 64 * 1024;
-let activeTermSubtab = 'tui';
+let activeTermSubtab = 'shell';
 
 // Files editor state. Declared here, far above the editor's functions,
 // because a #files deep link applies the route synchronously while the

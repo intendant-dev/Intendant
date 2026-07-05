@@ -7,21 +7,19 @@
 //! of diverged fifth copy. Each block is built once here; the genuine
 //! mode differences ride as parameters:
 //!
-//! - `query_ctx`: only the interactive mode has a WebQueryCtx (agent
-//!   state for dashboard tool queries).
+//! - `query_ctx`: only the foreground (headless) mode has a WebQueryCtx
+//!   (agent state for dashboard tool queries).
 //! - `active_session_log`: None for the daemon — supervised child
 //!   sessions register their own logs; the single-session modes pass
 //!   theirs.
-//! - `web_tui_tx`: only the interactive mode serves a WebTui.
-//! - the gateway log line is *returned*, not printed — the TUI must
-//!   log through the app (never eprintln! over the alternate screen),
-//!   MCP mirrors to the session log, daemon/headless print to stderr.
+//! - the gateway log line is *returned*, not printed — MCP mirrors it
+//!   to the session log (stdout is reserved for JSON-RPC), the other
+//!   modes print to stderr.
 //! - transcriber init errors are returned for the same reason.
 //!
-//! Deliberately NOT unified (real mode differences): tick-timer
-//! intervals (TUI redraws at 100ms, daemon/MCP tick at 1000ms,
-//! headless has none), the human-question monitor and crossterm
-//! reader, outbound-channel sourcing (control-socket reuse), the
+//! Deliberately NOT unified (real mode differences): the tick timer
+//! (daemon/MCP tick at 1000ms, headless has none), the human-question
+//! monitor, outbound-channel sourcing (control-socket reuse), the
 //! Windows desktop auto-activation in the daemon, and MCP mode's
 //! absence of a control plane.
 
@@ -190,7 +188,6 @@ pub(crate) fn spawn_mode_web_gateway(
     broadcast_tx: tokio::sync::broadcast::Sender<String>,
     query_ctx: Option<web_gateway::WebQueryCtx>,
     active_session_log: Option<SharedSessionLog>,
-    web_tui_tx: Option<tokio::sync::mpsc::UnboundedSender<tui::web::WebTuiCommand>>,
 ) -> Result<GatewaySpawn, CallerError> {
     let mut config = web_gateway::build_config(
         project.config.presence.live_provider.as_deref(),
@@ -247,7 +244,6 @@ pub(crate) fn spawn_mode_web_gateway(
         config,
         shared_session.clone(),
         transcriber,
-        web_tui_tx,
         None, // task_tx: browser SubmitTask routes via the EventBus → dispatcher path
         Some(project.root.clone()),
         mcp_http_server,
@@ -264,6 +260,6 @@ pub(crate) fn spawn_mode_web_gateway(
     Ok(GatewaySpawn {
         _handle: handle,
         shared_session,
-        log_line: web_tui_log_line(web_tls_acceptor, web_port, web_bind_ip),
+        log_line: dashboard_log_line(web_tls_acceptor, web_port, web_bind_ip),
     })
 }

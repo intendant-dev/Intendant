@@ -563,15 +563,6 @@ function dashboardTerminalFramesAvailable() {
   );
 }
 
-function dashboardTuiFramesAvailable() {
-  return Boolean(
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.tui_frames_available === true
-  );
-}
-
 async function uploadOneFile(file, destination) {
   if (file.size > UPLOAD_MAX_BYTES) {
     logErrorToActivity(`File too large (${humanBytes(file.size)}): ${file.name}. Cap is ${humanBytes(UPLOAD_MAX_BYTES)}.`);

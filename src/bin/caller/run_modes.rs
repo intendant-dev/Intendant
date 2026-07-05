@@ -31,7 +31,6 @@ pub(crate) fn get_task_from_flags_or_env(flags: &CliFlags) -> Result<String, Cal
 pub(crate) fn resolve_initial_task_for_startup(
     flags: &CliFlags,
     web_daemon_requested: bool,
-    use_tui: bool,
 ) -> Result<Option<String>, CallerError> {
     if web_daemon_requested {
         return Ok(None);
@@ -44,9 +43,6 @@ pub(crate) fn resolve_initial_task_for_startup(
         return Ok(Some(task));
     }
     if flags.mcp {
-        return Ok(flags.task.clone().filter(|t| !t.is_empty()));
-    }
-    if use_tui {
         return Ok(flags.task.clone().filter(|t| !t.is_empty()));
     }
     let task = get_task_from_flags_or_env(flags)?;

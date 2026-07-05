@@ -17,7 +17,7 @@ their own approval prompts, no shared display, and no voice/phone reach. Wrappin
 one in Intendant gives you:
 
 - **One oversight surface.** The supervised agent's command/file approval requests
-  are lifted into Intendant's frontends (TUI, web dashboard, MCP, `--json`) and the
+  are lifted into Intendant's frontends (web dashboard, MCP, `--json`) and the
   same autonomy policy that governs the native agent.
 - **Display & computer use.** Intendant injects an `intendant` MCP server into the
   external tool's config, so the coding agent can call Intendant's MCP tools —
@@ -220,7 +220,7 @@ features it lacks.
   --json` for meaningful headed Station QA instead of scraping the helper's
   temporary DevTools profile, and review the returned screenshot path before
   counting the run as a product pass. With `--launch-dashboard`, it starts the built
-  intendant binary as `--web <port> --no-tui`, waits for HTTP readiness, and
+  intendant binary as `--web <port>`, waits for HTTP readiness, and
   stops the temporary process afterward; use that instead of a separate
   foreground/nohup dashboard launch. For real headed CU/browser E2E that needs
   a temporary dashboard to remain available while separate CU tools run, use
@@ -662,7 +662,7 @@ External agent ─► AgentEvent::ApprovalRequest { request_id, command, categor
 ```
 
 Because the request becomes an ordinary `AppEvent::ApprovalRequired`, every
-frontend that already renders native approvals — the TUI gate, the web dashboard,
+frontend that already renders native approvals — the web dashboard,
 the MCP `approve`/`deny` tools, and `--json` stdin — handles external-agent
 approvals identically. `ApprovalDecision` (re-exported from `crate::approval`) is
 the shared decision vocabulary; `AcceptForSession` is how "approve all" sticks for

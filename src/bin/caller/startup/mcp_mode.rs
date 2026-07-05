@@ -30,341 +30,340 @@ pub(crate) async fn run_mcp_mode(
     session_registry: display::SharedSessionRegistry,
     recording_registry: Arc<tokio::sync::RwLock<recording::RecordingRegistry>>,
 ) -> Result<(), CallerError> {
-        // MCP mode — speaks Model Context Protocol on stdio.
-        // This is architecturally a peer of the TUI: same EventBus, same UserAction contract.
-        let bus = EventBus::new();
-        let event_rx = bus.subscribe();
-        let human_question_path = event::shared_question_path(log_dir.join("human_question"));
-        let _human_monitor =
-            event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
-        let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
-        let _session_listeners = startup::wiring::spawn_session_listeners(
-            &bus,
-            &recording_registry,
-            &session_registry,
-            &frame_registry,
-        );
-        start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
-        let _debug_handler =
-            startup::wiring::spawn_debug_handler(&bus, project, web_port, use_web);
-        let mcp_control_tx = if flags.control_socket {
-            let (_control_handle, control_tx) = control::spawn_control_server(bus.clone());
-            slog(&session_log, |l| {
-                l.info(&format!(
-                    "Control socket: {}",
-                    control::socket_path().display()
-                ))
-            });
-            Some(control_tx)
-        } else {
-            None
-        };
-
-        // Outbound event broadcast channel — shared by control socket, web gateway,
-        // and the outbound broadcaster.  If control socket is active, reuse its
-        // channel; otherwise create a standalone one when web or broadcaster needs it.
-        let outbound_tx = if let Some(ref tx) = mcp_control_tx {
-            tx.clone()
-        } else if use_web {
-            let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
-            tx
-        } else {
-            // No control socket, no web — create a channel anyway so the
-            // outbound broadcaster can still run (receivers just drop events).
-            let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
-            tx
-        };
-
-        // Wire outbound broadcaster: converts AppEvents to OutboundEvents on the
-        // shared broadcast channel.
-        let _outbound_broadcaster =
-            event::spawn_outbound_broadcaster(bus.subscribe(), outbound_tx.clone());
-
-        let _log_sinks = startup::wiring::spawn_log_sinks(&bus, &session_log);
-
-        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) =
-            startup::wiring::start_project_file_watcher(&project.root, &log_dir, &bus);
-
-        // Web gateway (WebSocket)
-        let _web_handle = if use_web {
-            let (transcriber, transcriber_err) =
-                startup::wiring::build_transcriber(&project.config.transcription);
-            if let Some(err) = transcriber_err {
-                eprintln!("{}", err);
-            }
-            let gateway = startup::wiring::spawn_mode_web_gateway(
-                flags,
-                project,
-                &autonomy,
-                &log_dir,
-                &session_log,
-                &bus,
-                &mut web_listener,
-                web_tls_client_cert_required,
-                &web_tls_acceptor,
-                web_port,
-                web_bind_ip,
-                runtime_presence_enabled,
-                &initial_agent_backend,
-                &shared_external_agent,
-                &frame_registry,
-                &session_registry,
-                &recording_registry,
-                &shared_file_watcher,
-                transcriber,
-                outbound_tx.clone(),
-                None, // query_ctx: MCP mode has no dashboard agent-state queries
-                Some(session_log.clone()),
-                None, // web_tui_tx: MCP mode has no WebTui
-            )?;
-            slog(&session_log, |l| l.info(&gateway.log_line));
-            eprintln!("{}", gateway.log_line);
-            Some(gateway)
-        } else {
-            None
-        };
-
-        let mut mcp_app_state = mcp::McpAppState::new(
-            provider
-                .as_ref()
-                .map(|p| p.name().to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            provider
-                .as_ref()
-                .map(|p| p.model().to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            autonomy.clone(),
-            log_dir.clone(),
-        );
-        mcp_app_state.external_agent = initial_agent_backend.clone();
-        mcp_app_state.codex_managed_context =
-            project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
-        mcp_app_state.configured_codex_managed_context = mcp_app_state.codex_managed_context;
-        mcp_app_state.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
-        mcp_app_state.hard_context_window = provider.as_ref().map(|p| p.context_window());
-        mcp_app_state.session_id = session_log
-            .lock()
-            .map(|l| l.session_id().to_string())
-            .unwrap_or_default();
-        mcp_app_state.task_description = task.clone().unwrap_or_default();
-        mcp_app_state.frame_registry = Some(frame_registry.clone());
-        mcp_app_state.session_registry = Some(session_registry.clone());
-        mcp_app_state.screenshot_dir = Some(log_dir.join("screenshots"));
-        let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(mcp_app_state));
-
-        // Build a launcher closure that can spawn the agent loop on demand.
-        // This captures the provider factory parameters (not the provider itself,
-        // since providers are not Clone) so each start_task creates a fresh provider.
-        let project_root = project.root.clone();
-        let autonomy_for_launcher = autonomy.clone();
-        let session_log_for_launcher = session_log.clone();
-        let log_dir_for_launcher = log_dir.clone();
-        let mcp_state_for_launcher = mcp_state.clone();
-        let session_registry_for_launcher = session_registry.clone();
-        #[allow(clippy::async_yields_async)]
-        let launcher: mcp::TaskLauncher = Box::new(move |task_str: String, bus: EventBus| {
-            let project_root = project_root.clone();
-            let autonomy = autonomy_for_launcher.clone();
-            let session_log = session_log_for_launcher.clone();
-            let _parent_log_dir = log_dir_for_launcher.clone();
-            let mcp_state = mcp_state_for_launcher.clone();
-            let session_registry = session_registry_for_launcher.clone();
-            Box::pin(async move {
-                // Each MCP task gets a fresh session directory so conversations
-                // don't bleed between tasks (reasoning items, tool calls, etc.).
-                let task_log_dir = session_log::SessionLog::resolve_path(None);
-                match session_log::SessionLog::open(task_log_dir.clone()) {
-                    Ok(mut l) => {
-                        l.write_meta(Some(&project_root), Some(&task_str));
-                        l.info(&format!("MCP sub-task session: {}", l.session_id()));
-                        // Replace the shared session log with the fresh one
-                        if let Ok(mut guard) = session_log.lock() {
-                            *guard = l;
-                        }
-                        // Notify MCP state of the new session dir so askHuman
-                        // response files are written to the correct location.
-                        bus.send(AppEvent::SessionDirChanged {
-                            path: task_log_dir.clone(),
-                        });
-                    }
-                    Err(e) => {
-                        bus.send(AppEvent::LoopError(format!(
-                            "Failed to create task session: {}",
-                            e
-                        )));
-                        return tokio::spawn(async {});
-                    }
-                }
-                let log_dir = task_log_dir;
-
-                // Create a fresh provider for this task
-                let provider = match provider::select_provider() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        bus.send(AppEvent::LoopError(format!(
-                            "Failed to create provider: {}",
-                            e
-                        )));
-                        return tokio::spawn(async {});
-                    }
-                };
-                let project = match Project::from_root(project_root.clone()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        bus.send(AppEvent::LoopError(format!(
-                            "Failed to load project: {}",
-                            e
-                        )));
-                        return tokio::spawn(async {});
-                    }
-                };
-                // Consume the mode override set by start_task. Orchestration
-                // (sub-agent spawning) needs the daemon's session supervisor;
-                // this standalone MCP task path runs sessions directly, so an
-                // orchestrate request degrades to a direct session.
-                let orchestrate_override = {
-                    let mut s = mcp_state.write().await;
-                    s.next_task_orchestrate.take()
-                };
-                if orchestrate_override == Some(true) {
-                    bus.send(AppEvent::LoopError(
-                        "orchestrate=true requires the web daemon's session supervisor; \
-                         running the task as a direct session"
-                            .to_string(),
-                    ));
-                }
-
-                // Create follow-up channel for multi-round support
-                let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<FollowUpMessage>(1);
-                {
-                    let mut s = mcp_state.write().await;
-                    s.follow_up_tx = Some(follow_up_tx);
-                }
-
-                let approval_registry = mcp_state.read().await.approval_registry.clone();
-                let bus_clone = bus.clone();
-                let task_for_summary = task_str.clone();
-                let session_log_summary = session_log.clone();
-                let mcp_state_cleanup = mcp_state.clone();
-                // Resolve external agent backend: MCP shared state > config default
-                let agent_backend = resolve_agent_backend_from_config(
-                    mcp_state.read().await.external_agent.clone(),
-                    &project,
-                );
-
-                tokio::spawn(async move {
-                    let result = if let Some(backend) = agent_backend {
-                        run_external_agent_mode(
-                            backend,
-                            task_str,
-                            project,
-                            bus_clone.clone(),
-                            autonomy,
-                            session_log,
-                            log_dir,
-                            follow_up_rx,
-                            None,
-                            approval_registry,
-                            event::ContextInjectionQueue::default(),
-                            false,
-                            web_port_for_agent,
-                            UserAttachments::default(),
-                            None,
-                            None,
-                            None,
-                            None,
-                            false,
-                            None,
-                        )
-                        .await
-                    } else {
-                        run_direct_mode(
-                            provider,
-                            task_str,
-                            project,
-                            bus_clone.clone(),
-                            autonomy,
-                            session_log,
-                            log_dir,
-                            None,
-                            follow_up_rx,
-                            None, // no JSON approval in MCP mode
-                            approval_registry,
-                            event::ContextInjectionQueue::default(),
-                            Some(session_registry),
-                            false, // not headless — MCP has interactive approval
-                            UserAttachments::default(),
-                            NativeSessionConfig::direct(),
-                        )
-                        .await
-                    };
-
-                    match result {
-                        Ok(stats) => {
-                            slog(&session_log_summary, |l| {
-                                l.write_summary_with_rounds(
-                                    &task_for_summary,
-                                    "completed",
-                                    stats.turns,
-                                    Some(stats.rounds),
-                                )
-                            });
-                            // Note: TaskComplete is already emitted by run_agent_loop
-                            // when it breaks (done signal, no JSON, etc.)
-                        }
-                        Err(e) => {
-                            slog(&session_log_summary, |l| {
-                                l.write_summary(&task_for_summary, &format!("error: {}", e), 0)
-                            });
-                            bus_clone.send(AppEvent::LoopError(e.to_string()));
-                        }
-                    }
-
-                    // Clean up follow-up sender so MCP knows no task is active
-                    {
-                        let mut s = mcp_state_cleanup.write().await;
-                        s.follow_up_tx = None;
-                    }
-                })
-            })
+    // MCP mode — speaks Model Context Protocol on stdio.
+    // Architecturally a frontend peer of the dashboard: same EventBus,
+    // translating through the UserAction contract.
+    let bus = EventBus::new();
+    let event_rx = bus.subscribe();
+    let human_question_path = event::shared_question_path(log_dir.join("human_question"));
+    let _human_monitor =
+        event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
+    let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
+    let _session_listeners = startup::wiring::spawn_session_listeners(
+        &bus,
+        &recording_registry,
+        &session_registry,
+        &frame_registry,
+    );
+    start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
+    let _debug_handler = startup::wiring::spawn_debug_handler(&bus, project, web_port, use_web);
+    let mcp_control_tx = if flags.control_socket {
+        let (_control_handle, control_tx) = control::spawn_control_server(bus.clone());
+        slog(&session_log, |l| {
+            l.info(&format!(
+                "Control socket: {}",
+                control::socket_path().display()
+            ))
         });
+        Some(control_tx)
+    } else {
+        None
+    };
 
-        // Store the launcher in MCP state
-        {
-            let mut s = mcp_state.write().await;
-            s.launcher = Some(std::sync::Arc::new(launcher));
+    // Outbound event broadcast channel — shared by control socket, web gateway,
+    // and the outbound broadcaster.  If control socket is active, reuse its
+    // channel; otherwise create a standalone one when web or broadcaster needs it.
+    let outbound_tx = if let Some(ref tx) = mcp_control_tx {
+        tx.clone()
+    } else if use_web {
+        let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
+        tx
+    } else {
+        // No control socket, no web — create a channel anyway so the
+        // outbound broadcaster can still run (receivers just drop events).
+        let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
+        tx
+    };
+
+    // Wire outbound broadcaster: converts AppEvents to OutboundEvents on the
+    // shared broadcast channel.
+    let _outbound_broadcaster =
+        event::spawn_outbound_broadcaster(bus.subscribe(), outbound_tx.clone());
+
+    let _log_sinks = startup::wiring::spawn_log_sinks(&bus, &session_log);
+
+    let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) =
+        startup::wiring::start_project_file_watcher(&project.root, &log_dir, &bus);
+
+    // Web gateway (WebSocket)
+    let _web_handle = if use_web {
+        let (transcriber, transcriber_err) =
+            startup::wiring::build_transcriber(&project.config.transcription);
+        if let Some(err) = transcriber_err {
+            eprintln!("{}", err);
         }
+        let gateway = startup::wiring::spawn_mode_web_gateway(
+            flags,
+            project,
+            &autonomy,
+            &log_dir,
+            &session_log,
+            &bus,
+            &mut web_listener,
+            web_tls_client_cert_required,
+            &web_tls_acceptor,
+            web_port,
+            web_bind_ip,
+            runtime_presence_enabled,
+            &initial_agent_backend,
+            &shared_external_agent,
+            &frame_registry,
+            &session_registry,
+            &recording_registry,
+            &shared_file_watcher,
+            transcriber,
+            outbound_tx.clone(),
+            None, // query_ctx: MCP mode has no dashboard agent-state queries
+            Some(session_log.clone()),
+        )?;
+        slog(&session_log, |l| l.info(&gateway.log_line));
+        eprintln!("{}", gateway.log_line);
+        Some(gateway)
+    } else {
+        None
+    };
 
-        // If a task was provided on the CLI, start it immediately
-        if let Some(initial_task) = task {
-            let handle = {
-                let s = mcp_state.read().await;
-                let launcher = s.launcher.as_ref().unwrap().clone();
-                drop(s);
-                (launcher)(initial_task, bus.clone()).await
+    let mut mcp_app_state = mcp::McpAppState::new(
+        provider
+            .as_ref()
+            .map(|p| p.name().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        provider
+            .as_ref()
+            .map(|p| p.model().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        autonomy.clone(),
+        log_dir.clone(),
+    );
+    mcp_app_state.external_agent = initial_agent_backend.clone();
+    mcp_app_state.codex_managed_context =
+        project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
+    mcp_app_state.configured_codex_managed_context = mcp_app_state.codex_managed_context;
+    mcp_app_state.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
+    mcp_app_state.hard_context_window = provider.as_ref().map(|p| p.context_window());
+    mcp_app_state.session_id = session_log
+        .lock()
+        .map(|l| l.session_id().to_string())
+        .unwrap_or_default();
+    mcp_app_state.task_description = task.clone().unwrap_or_default();
+    mcp_app_state.frame_registry = Some(frame_registry.clone());
+    mcp_app_state.session_registry = Some(session_registry.clone());
+    mcp_app_state.screenshot_dir = Some(log_dir.join("screenshots"));
+    let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(mcp_app_state));
+
+    // Build a launcher closure that can spawn the agent loop on demand.
+    // This captures the provider factory parameters (not the provider itself,
+    // since providers are not Clone) so each start_task creates a fresh provider.
+    let project_root = project.root.clone();
+    let autonomy_for_launcher = autonomy.clone();
+    let session_log_for_launcher = session_log.clone();
+    let log_dir_for_launcher = log_dir.clone();
+    let mcp_state_for_launcher = mcp_state.clone();
+    let session_registry_for_launcher = session_registry.clone();
+    #[allow(clippy::async_yields_async)]
+    let launcher: mcp::TaskLauncher = Box::new(move |task_str: String, bus: EventBus| {
+        let project_root = project_root.clone();
+        let autonomy = autonomy_for_launcher.clone();
+        let session_log = session_log_for_launcher.clone();
+        let _parent_log_dir = log_dir_for_launcher.clone();
+        let mcp_state = mcp_state_for_launcher.clone();
+        let session_registry = session_registry_for_launcher.clone();
+        Box::pin(async move {
+            // Each MCP task gets a fresh session directory so conversations
+            // don't bleed between tasks (reasoning items, tool calls, etc.).
+            let task_log_dir = session_log::SessionLog::resolve_path(None);
+            match session_log::SessionLog::open(task_log_dir.clone()) {
+                Ok(mut l) => {
+                    l.write_meta(Some(&project_root), Some(&task_str));
+                    l.info(&format!("MCP sub-task session: {}", l.session_id()));
+                    // Replace the shared session log with the fresh one
+                    if let Ok(mut guard) = session_log.lock() {
+                        *guard = l;
+                    }
+                    // Notify MCP state of the new session dir so askHuman
+                    // response files are written to the correct location.
+                    bus.send(AppEvent::SessionDirChanged {
+                        path: task_log_dir.clone(),
+                    });
+                }
+                Err(e) => {
+                    bus.send(AppEvent::LoopError(format!(
+                        "Failed to create task session: {}",
+                        e
+                    )));
+                    return tokio::spawn(async {});
+                }
+            }
+            let log_dir = task_log_dir;
+
+            // Create a fresh provider for this task
+            let provider = match provider::select_provider() {
+                Ok(p) => p,
+                Err(e) => {
+                    bus.send(AppEvent::LoopError(format!(
+                        "Failed to create provider: {}",
+                        e
+                    )));
+                    return tokio::spawn(async {});
+                }
             };
-            let mut s = mcp_state.write().await;
-            s.phase = types::Phase::Thinking;
-            s.task_handle = Some(handle);
-        }
+            let project = match Project::from_root(project_root.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    bus.send(AppEvent::LoopError(format!(
+                        "Failed to load project: {}",
+                        e
+                    )));
+                    return tokio::spawn(async {});
+                }
+            };
+            // Consume the mode override set by start_task. Orchestration
+            // (sub-agent spawning) needs the daemon's session supervisor;
+            // this standalone MCP task path runs sessions directly, so an
+            // orchestrate request degrades to a direct session.
+            let orchestrate_override = {
+                let mut s = mcp_state.write().await;
+                s.next_task_orchestrate.take()
+            };
+            if orchestrate_override == Some(true) {
+                bus.send(AppEvent::LoopError(
+                    "orchestrate=true requires the web daemon's session supervisor; \
+                         running the task as a direct session"
+                        .to_string(),
+                ));
+            }
 
-        // Run the MCP server on stdio (blocks until client disconnects or quit)
-        if let Err(e) = mcp::run_mcp_server(
-            mcp_state,
-            bus,
-            event_rx,
-            Some(human_question_path),
-            mcp_control_tx,
-        )
-        .await
-        {
-            slog(&session_log, |l| {
-                l.info(&format!("MCP server ended: {}", e))
-            });
-        }
-        if flags.control_socket {
-            control::cleanup();
-        }
+            // Create follow-up channel for multi-round support
+            let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<FollowUpMessage>(1);
+            {
+                let mut s = mcp_state.write().await;
+                s.follow_up_tx = Some(follow_up_tx);
+            }
+
+            let approval_registry = mcp_state.read().await.approval_registry.clone();
+            let bus_clone = bus.clone();
+            let task_for_summary = task_str.clone();
+            let session_log_summary = session_log.clone();
+            let mcp_state_cleanup = mcp_state.clone();
+            // Resolve external agent backend: MCP shared state > config default
+            let agent_backend = resolve_agent_backend_from_config(
+                mcp_state.read().await.external_agent.clone(),
+                &project,
+            );
+
+            tokio::spawn(async move {
+                let result = if let Some(backend) = agent_backend {
+                    run_external_agent_mode(
+                        backend,
+                        task_str,
+                        project,
+                        bus_clone.clone(),
+                        autonomy,
+                        session_log,
+                        log_dir,
+                        follow_up_rx,
+                        None,
+                        approval_registry,
+                        event::ContextInjectionQueue::default(),
+                        false,
+                        web_port_for_agent,
+                        UserAttachments::default(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                    )
+                    .await
+                } else {
+                    run_direct_mode(
+                        provider,
+                        task_str,
+                        project,
+                        bus_clone.clone(),
+                        autonomy,
+                        session_log,
+                        log_dir,
+                        None,
+                        follow_up_rx,
+                        None, // no JSON approval in MCP mode
+                        approval_registry,
+                        event::ContextInjectionQueue::default(),
+                        Some(session_registry),
+                        false, // not headless — MCP has interactive approval
+                        UserAttachments::default(),
+                        NativeSessionConfig::direct(),
+                    )
+                    .await
+                };
+
+                match result {
+                    Ok(stats) => {
+                        slog(&session_log_summary, |l| {
+                            l.write_summary_with_rounds(
+                                &task_for_summary,
+                                "completed",
+                                stats.turns,
+                                Some(stats.rounds),
+                            )
+                        });
+                        // Note: TaskComplete is already emitted by run_agent_loop
+                        // when it breaks (done signal, no JSON, etc.)
+                    }
+                    Err(e) => {
+                        slog(&session_log_summary, |l| {
+                            l.write_summary(&task_for_summary, &format!("error: {}", e), 0)
+                        });
+                        bus_clone.send(AppEvent::LoopError(e.to_string()));
+                    }
+                }
+
+                // Clean up follow-up sender so MCP knows no task is active
+                {
+                    let mut s = mcp_state_cleanup.write().await;
+                    s.follow_up_tx = None;
+                }
+            })
+        })
+    });
+
+    // Store the launcher in MCP state
+    {
+        let mut s = mcp_state.write().await;
+        s.launcher = Some(std::sync::Arc::new(launcher));
+    }
+
+    // If a task was provided on the CLI, start it immediately
+    if let Some(initial_task) = task {
+        let handle = {
+            let s = mcp_state.read().await;
+            let launcher = s.launcher.as_ref().unwrap().clone();
+            drop(s);
+            (launcher)(initial_task, bus.clone()).await
+        };
+        let mut s = mcp_state.write().await;
+        s.phase = types::Phase::Thinking;
+        s.task_handle = Some(handle);
+    }
+
+    // Run the MCP server on stdio (blocks until client disconnects or quit)
+    if let Err(e) = mcp::run_mcp_server(
+        mcp_state,
+        bus,
+        event_rx,
+        Some(human_question_path),
+        mcp_control_tx,
+    )
+    .await
+    {
+        slog(&session_log, |l| {
+            l.info(&format!("MCP server ended: {}", e))
+        });
+    }
+    if flags.control_socket {
+        control::cleanup();
+    }
 
     Ok(())
 }

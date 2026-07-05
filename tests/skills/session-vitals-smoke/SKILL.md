@@ -8,7 +8,7 @@ description: Keyless end-to-end smoke for the session-vitals git + cache segment
 Verifies the vitals rails end-to-end against real binaries: the
 `GitVitalsProber` in `session_vitals.rs` probes the daemon's project root,
 the cache listener folds the mock provider's cache-bearing usage (via the
-native `UsageSnapshot` derivation in `tui/app.rs`), and the hub emits the
+native `UsageSnapshot` derivation in `frontend.rs`), and the hub emits the
 merged `AppEvent::SessionVitals` on change, reaching control-socket
 clients with the expected values in both sections. No API keys, no
 network, ~10 seconds.

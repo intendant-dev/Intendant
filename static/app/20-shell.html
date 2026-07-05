@@ -104,7 +104,7 @@
   <nav class="tab-bar">
     <button class="tab-btn active" data-tab="activity" title="Live agent log plus context, managed-context, changes, and control sub-tabs">Activity<span class="badge" id="badge-activity"></span></button>
     <button class="tab-btn" data-tab="stats" title="Token usage, cost, and provider statistics per host">Stats</button>
-    <button class="tab-btn" data-tab="terminal" title="Agent TUI mirror and an interactive shell">Terminal</button>
+    <button class="tab-btn" data-tab="terminal" title="Interactive shell on this daemon">Terminal</button>
     <button class="tab-btn" data-tab="displays" title="Live display streams — local screens and connected peers">Video</button>
     <button class="tab-btn" data-tab="station" title="Station — the rendered control center (WebGPU canvas)">Station</button>
     <button class="tab-btn" data-tab="sessions" title="Browse, search, resume, and launch sessions">Sessions</button>
@@ -908,27 +908,11 @@
     <!-- Terminal Tab -->
     <div id="tab-terminal" class="tab-pane">
       <div class="subtabs">
-        <button class="subtab-btn active" data-term-tab="tui">TUI</button>
-        <button class="subtab-btn" data-term-tab="shell">Shell</button>
+        <button class="subtab-btn active" data-term-tab="shell">Shell</button>
         <button class="keybar-toggle" id="keybar-toggle" title="Show/hide the special-key bar (Esc, Tab, Ctrl, arrows, …)">Keys</button>
       </div>
       <div class="subtab-panes">
-        <div class="subtab-pane active" id="term-pane-tui">
-          <div class="terminal-container" id="terminal-container"></div>
-          <div class="ui-empty tui-empty-overlay" id="tui-empty-state" aria-hidden="true">
-            <div class="ui-empty-glyph">
-              <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="2.5" y="4" width="19" height="16" rx="2"/>
-                <path d="M6.5 9.5l3.5 3-3.5 3"/>
-                <path d="M12.5 15.5h5"/>
-              </svg>
-            </div>
-            <div class="ui-empty-title">TUI mirror idle</div>
-            <div class="ui-empty-hint">The agent's terminal appears here while a session is active. Use the Shell subtab for an interactive shell on this daemon.</div>
-          </div>
-          <div class="terminal-unavailable hidden" id="terminal-tui-unavailable" role="status" aria-live="polite"></div>
-        </div>
-        <div class="subtab-pane" id="term-pane-shell">
+        <div class="subtab-pane active" id="term-pane-shell">
           <div class="shell-toolbar">
             <label for="shell-host-select">Target</label>
             <select id="shell-host-select" title="Shell target"></select>

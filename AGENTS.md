@@ -11,7 +11,7 @@
 
 ## What Intendant Is
 
-Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. Beyond running its own agent loop, it **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines**. Provider-agnostic (OpenAI, Anthropic, Gemini); cross-platform (macOS, Linux, Windows — all first-class); every capability reachable from any interface (CLI, TUI, web dashboard, MCP, voice).
+Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. Beyond running its own agent loop, it **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines**. Provider-agnostic (OpenAI, Anthropic, Gemini); cross-platform (macOS, Linux, Windows — all first-class); every capability reachable from any interface (CLI, web dashboard, MCP, voice).
 
 Past the single box, the ambition is a **network of agentic networks** — fleets of daemons owned by people and organizations, where owners grant other people and other daemons scoped access to their machines, infrastructure, and resources. Three pillars carry it: the **trust architecture** (authority is only ever minted by the target daemon's local IAM; browser identity keys protected by passkeys; org root keys sign grant documents and revocation lists; the hosted rendezvous is zero-authority and self-hostable), **credential custody** (daemons borrow time-boxed leases from a passkey-sealed vault or relay calls through the owner's browser — a disposable box's disk holds no durable secrets), and the **zero-install client** (the entire client is a browser tab: claim a fresh daemon with a twelve-word phrase, watch every fleet display live, phone included). The name is the thesis: agents perform, orchestrators conduct, the Intendant runs the house — and answers to the owner.
 
@@ -43,7 +43,7 @@ Read the relevant chapter before changing a subsystem:
 | Hosted rendezvous (intendant-connect), claims, self-hosting | `docs/src/self-hosted-rendezvous.md` |
 | Computer use, live audio, phone/voice-call skills | `docs/src/computer-use-and-audio.md` |
 | Presence layer (server text + browser voice) | `docs/src/presence.md` |
-| TUI + the autonomy/approval model | `docs/src/tui.md` |
+| The autonomy/approval model | `docs/src/autonomy.md` |
 | Web dashboard (tabs, sessions, live voice) | `docs/src/web-dashboard.md` |
 | Station (rendered control canvas): architecture + roadmap to immersive 3D/XR | `docs/src/station.md` |
 | MCP server + client (trust model) | `docs/src/mcp-server.md` |
@@ -70,7 +70,7 @@ Common invocations (full flag reference in `docs/src/getting-started.md`):
 
 ```bash
 ./target/release/intendant "task"                  # web dashboard ON by default (port 8765)
-./target/release/intendant --no-web --no-tui "task"  # headless
+./target/release/intendant --no-web "task"         # headless
 ./target/release/intendant --direct "task"         # single agent (skip orchestrator)
 ./target/release/intendant --agent codex "task"    # supervise an external coding CLI
 ./target/release/intendant --mcp "task"            # MCP server on stdio
@@ -91,7 +91,7 @@ src/
 ├── bin/caller/                 # the intendant controller:
 │   ├── main.rs                 # entry: CLI flags/help, panic hook, startup prologue + mode dispatch
 │   ├── agent_loop.rs, run_modes.rs, external_mode.rs, external_supervision.rs, display_glue.rs   # carved from main.rs: the native loop + orchestration handlers; native/external mode runners; external supervision helpers; frame/CU/user-display glue
-│   ├── startup/                # web bind/TLS + peer boot; the four mode branches (daemon, mcp_mode, interactive, headless)
+│   ├── startup/                # web bind/TLS + peer boot; the three mode branches (daemon, mcp_mode, headless)
 │   ├── control_plane.rs, event.rs, frontend.rs   # single-writer state; EventBus; UserAction/ControlMsg
 │   ├── session_supervisor.rs, task_dispatch.rs, file_watcher.rs   # daemon: sessions, dispatch, rewind snapshots
 │   ├── provider.rs, conversation.rs, tools.rs, prompts.rs, skills.rs, autonomy.rs, approval.rs
@@ -110,7 +110,6 @@ src/
 │   ├── transfer_store.rs, upload_store.rs, peer_file_transfer.rs   # transfer jobs; upload/attachment stores
 │   ├── session_log.rs, session_names.rs, knowledge.rs, project.rs, app_state_pricing.rs
 │   ├── sandbox.rs, platform.rs, daemon_log_tee.rs, diagnostics.rs, …
-│   └── tui/                    # ratatui TUI (display-only client of the control plane)
 └── bin/connect/                # intendant-connect: hosted rendezvous (accounts, daemon claims, fleet sync, vault blobs, push, transparency log)
 crates/{presence-core, presence-web, station-web}   # WASM: shared presence types/tools/dispatch, browser presence client, Station renderer
 crates/app-html-assembler   # assembles static/app.html from static/app/ (build.rs + the CI regen gate)

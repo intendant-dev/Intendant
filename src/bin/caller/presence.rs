@@ -1062,7 +1062,6 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SessionAgentConfigResult { .. }
         | AppEvent::ClaudeConfigChanged { .. }
         | AppEvent::ControlCommand(_)
-        | AppEvent::Key(_)
         | AppEvent::Resize(_, _)
         | AppEvent::Tick
         | AppEvent::Quit

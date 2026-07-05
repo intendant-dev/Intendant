@@ -12,10 +12,10 @@ with [Architecture](./architecture.md).
 
 ## Why a Single-Writer Control Plane
 
-Intendant has four frontends (TUI, web dashboard, MCP server, control socket)
+Intendant has three frontends (web dashboard, MCP server, control socket)
 and they can all be live at once against the same daemon. If each frontend wrote
-shared mutable state directly — "the dashboard sets autonomy to High, the TUI
-sets it to Low" — the truth would depend on event ordering and which render loop
+shared mutable state directly — "the dashboard sets autonomy to High, MCP
+sets it to Low" — the truth would depend on event ordering and which handler
 happened to run. Worse, some state (the active external-agent backend, Codex
 sandbox/model config) also has to persist to `intendant.toml`, and you do not
 want three frontends racing to rewrite the same file.
@@ -33,8 +33,7 @@ control plane emits afterward (`AutonomyChanged`, `ExternalAgentChanged`,
 `CodexConfigChanged`, …).
 
 ```
-  TUI ─┐
-  Web ─┤  emit ControlMsg          ┌──────────────┐  write    ┌──────────────┐
+  Web ─┐  emit ControlMsg          ┌──────────────┐  write    ┌──────────────┐
   MCP ─┼───────────────▶ EventBus ─┤ Control Plane │──────────▶│ shared state │
  Sock ─┘                  (bus)    │ (sole writer) │           │  + intendant │
         ◀───── observe ────────────┤               │◀──────────│    .toml     │
@@ -153,9 +152,9 @@ unchanged while multi-session clients address sessions explicitly by id.
 
 ## Task Dispatch
 
-`task_dispatch.rs` decides *which channel* a task goes to. It used to live in the
-TUI's `handle_control_command`; pulling it out is part of making the TUI
-display-only. The `Dispatcher` owns up to three senders — `presence_tx`,
+`task_dispatch.rs` decides *which channel* a task goes to (it was pulled out
+of the TUI frontend back when that existed, as part of making frontends
+display-only). The `Dispatcher` owns up to three senders — `presence_tx`,
 `task_tx`, `follow_up_tx` — and routes a `StartTask`/`FollowUp` like this:
 
 1. If the task is **not** direct and `presence_tx` exists → send the text to the
@@ -239,9 +238,8 @@ fn should_start_idle_web_daemon(use_web: bool, flags: &CliFlags) -> bool {
 }
 ```
 
-When that holds, the controller does **not** start a terminal TUI. Instead it
-runs `run_daemon_loop` (`main.rs`), which simply constructs and runs the session
-supervisor:
+When that holds, the controller runs the daemon arm
+(`startup/daemon.rs`), which constructs and runs the session supervisor:
 
 ```
 run_daemon_loop(DaemonConfig { bus, project_root, autonomy,
@@ -254,21 +252,21 @@ run_daemon_loop(DaemonConfig { bus, project_root, autonomy,
 The daemon then sits idle waiting for `CreateSession` / `StartTask` /
 `ResumeSession` / follow-up intents arriving over the dashboard WebSocket (or the
 control socket). This is the persistent-daemon mode: one long-lived controller,
-many sessions over its lifetime, driven entirely from frontends. Pass `--no-web`
-to keep the interactive terminal TUI instead.
+many sessions over its lifetime, driven entirely from frontends. Passing a task
+on the command line instead runs it as the foreground session under the same
+gateway (the headless arm), which falls through to this daemon loop when the
+session ends.
 
 Ctrl+C in this mode is handled by the global signal handler installed in `main`
 (it marks the session interrupted and exits 130); the daemon loop deliberately
 does not also listen for it, to avoid racing two handlers.
 
-> **Controller stdout/stderr tee.** Whenever the controller does *not* own a real
-> interactive TTY (i.e. web/headless/MCP), `daemon_log_tee::install` tees its
-> stderr and stdout into `~/.intendant/logs/<uuid>/daemon.log` (with per-line
-> timestamps) while still mirroring to the original terminal. This is Unix-only;
-> on Windows `install` is a no-op. It is what lets the dashboard's "Download
-> session report" bundle carry controller-side `eprintln!`/panic/tracing output
-> alongside `session.jsonl`. The tee is *skipped* under the real TUI because
-> ratatui writes escape sequences to stdout and cannot tolerate a pipe.
+> **Controller stdout/stderr tee.** `daemon_log_tee::install` tees the
+> controller's stderr and stdout into `~/.intendant/logs/<uuid>/daemon.log`
+> (with per-line timestamps) while still mirroring to the original terminal.
+> This is Unix-only; on Windows `install` is a no-op. It is what lets the
+> dashboard's "Download session report" bundle carry controller-side
+> `eprintln!`/panic/tracing output alongside `session.jsonl`.
 
 ## Cost Accounting
 

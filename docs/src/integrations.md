@@ -271,13 +271,11 @@ signaling.
 ```
 Browser ──WebSocket──> Intendant web gateway (default port 8765)
   │                              │
-  │  Terminal I/O (ANSI)         │  Events (broadcast to all clients)
-  │  Key/resize input            │  Tool responses (per-connection direct channel)
-  │  Tool requests               │  State snapshot + log replay (on connect)
-  │  presence_connect/disconnect │  Presence welcome (on voice connect)
-  │  Voice logs/checkpoints      │  Per-connection TUI frames
-  │  Audio for transcription     │  WebRTC signaling (SDP, ICE)
-  │  WebRTC signaling            │
+  │  Tool requests               │  Events (broadcast to all clients)
+  │  presence_connect/disconnect │  Tool responses (per-connection direct channel)
+  │  Voice logs/checkpoints      │  State snapshot + log replay (on connect)
+  │  Audio for transcription     │  Presence welcome (on voice connect)
+  │  WebRTC signaling            │  WebRTC signaling (SDP, ICE)
   v                              v
 App dashboard (WASM)        EventBus + AgentStateSnapshot
   +                              │
@@ -289,14 +287,11 @@ live model (Gemini/OpenAI)       │  - broadcast::Receiver (events)
 Intendant agent loop
 ```
 
-The gateway has three layers:
+The gateway has two layers:
 
 1. **App dashboard** — the SPA at `/`, state managed by `presence-web` WASM.
    Events are broadcast; late-connecting browsers get a full log replay.
-2. **Per-connection TUI rendering** — each connection gets its own `WebTui`
-   with independent dimensions; ANSI output goes per-connection on the direct
-   channel, not broadcast.
-3. **Presence bridge** (optional) — a browser-side live model's tool calls
+2. **Presence bridge** (optional) — a browser-side live model's tool calls
    become `tool_request` WebSocket messages handled server-side, with
    `tool_response` returned on the per-connection direct channel.
 
@@ -306,8 +301,6 @@ The gateway has three layers:
 
 | Message | Description |
 |---------|-------------|
-| `{"t":"key","key":"..."}` | Keyboard input (per-connection WebTui) |
-| `{"t":"resize","cols":N,"rows":N}` | Terminal resize (per-connection) |
 | `{"t":"presence_connect",...}` | Presence session protocol — replaces server-side presence |
 | `{"t":"presence_disconnect"}` | Disconnect presence — resumes server-side presence |
 | `{"t":"make_active"}` | Request active voice ownership (handover) |
@@ -327,7 +320,6 @@ The gateway has three layers:
 
 | Message | Description |
 |---------|-------------|
-| `{"t":"term","d":"<base64>"}` | Per-connection TUI ANSI output |
 | `{"t":"state_snapshot","state":{},"connection_id":"...","config":{},"session_id":"..."}` | Bootstrap on connect |
 | `{"t":"log_replay","entries":[...]}` | Historical session events for late joiners |
 | `{"t":"presence_welcome","session_id":"...","state":{},"events":[...],"is_active":bool,"conversation_context":"..."}` | Presence session welcome |
@@ -353,8 +345,7 @@ A browser live model calls presence tools via tagged request/response:
 
 - **Action tools** (`submit_task`, `approve_action`, `deny_action`,
   `skip_action`, `respond_to_question`, `set_autonomy`, `send_message`) dispatch
-  through the EventBus — the same path as TUI key presses and control-socket
-  commands.
+  through the EventBus — the same path as control-socket commands.
 - **Query tools** (`check_status`, `query_detail`, `recall_memory`) are handled
   asynchronously server-side, reading the shared `AgentStateSnapshot`, project
   files, and knowledge store.

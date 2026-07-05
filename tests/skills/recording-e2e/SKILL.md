@@ -129,7 +129,7 @@ cd "$TESTDIR" && source /home/user/projects/intendant/.env && \
     > /dev/null 2>/tmp/intendant-rec-stderr.log &
 sleep 3
 cat /tmp/intendant-rec-stderr.log
-# Should show "Web TUI: http://0.0.0.0:8765"
+# Should show "Dashboard: http://0.0.0.0:8765"
 ```
 
 ### 6. Launch Firefox on display :50

@@ -118,7 +118,7 @@ A release build produces two binaries:
   API keys.
 - `target/release/intendant` — the controller. Manages the LLM conversation,
   calls model APIs, dispatches tool calls to the runtime subprocess, and hosts
-  every frontend (web dashboard, TUI, MCP, control socket).
+  every frontend (web dashboard, MCP, control socket).
 
 The two-binary split is the security boundary; see [Architecture](./architecture.md).
 
@@ -259,24 +259,26 @@ echo "summarize README.md" | ./target/release/intendant
 ./target/release/intendant
 ```
 
-### Frontend selection
+### Mode selection
 
-There is no single "TUI vs web" switch — the controller picks a frontend from
-the flags and whether it owns a real terminal:
+The dashboard is the UI; the controller picks an execution shape from the
+flags:
 
 - **Web dashboard is on by default.** It runs unless you pass `--no-web`,
   `--mcp`, or `--json`. The server binds port **8765**, auto-incrementing
   through 8785 if that port is taken; the chosen port is printed at startup.
-- The terminal **TUI owns the TTY only when the web gateway is off** (`--no-web`)
-  **and** `--no-tui` is not set **and** both stdin and stdout are real
-  terminals. With the dashboard on (the default), the process runs in a
-  headless/daemon posture and the dashboard's embedded terminal tab renders the
-  same TUI.
-- `--mcp` turns the process into an MCP server on stdio (no dashboard, no TUI).
-- `--json` emits JSONL events to stdout and implies `--no-tui`.
+- **Idle start** (`intendant` with no task) runs the persistent daemon: the
+  session supervisor owns every launch, driven from the dashboard.
+- **A task on the command line** runs as the foreground session under the same
+  gateway, then falls through to the daemon loop when it ends.
+- `--mcp` turns the process into an MCP server on stdio (no dashboard).
+- `--json` emits JSONL events to stdout (headless stdio; no dashboard).
+- `--no-web` runs headless in the terminal: a single round, log output to
+  stderr, no UI (`--json` adds scripted stdin follow-ups and approvals).
 
-So a plain `intendant "task"` on a desktop gives you a dashboard URL; if you
-want the classic in-terminal TUI, run `intendant --no-web "task"`.
+So a plain `intendant "task"` on a desktop gives you a dashboard URL; the
+terminal itself is a launcher and log tail. (`--no-tui` from the retired
+terminal UI era is still accepted as a no-op.)
 
 ### Resume and continue
 
@@ -304,7 +306,7 @@ want the classic in-terminal TUI, run `intendant --no-web "task"`.
 # Explicit local/plaintext debug escape
 ./target/release/intendant --no-tls --bind 127.0.0.1
 
-# Classic terminal TUI (dashboard off)
+# Headless single round (dashboard off)
 ./target/release/intendant --no-web "task"
 
 # MCP server on stdio
@@ -337,16 +339,16 @@ value is missing.
 | `--log-file` | `<dir>` | Override the session log directory (default `~/.intendant/logs/<uuid>/`) |
 | `--continue`, `-c` | — | Resume the most recent session for this project |
 | `--resume`, `-r` | `[id]` | Resume a session by id, prefix, or path; with no id behaves like `--continue` |
-| `--no-tui` | — | Disable the terminal TUI; run headless |
-| `--mcp` | — | Run as an MCP server on stdio (disables dashboard/TUI) |
+| `--no-tui` | — | Deprecated no-op (the terminal TUI was removed); headless is `--no-web` |
+| `--mcp` | — | Run as an MCP server on stdio (disables the dashboard) |
 | `--verbose`, `-v` | — | Show debug-level log entries |
 | `--control-socket` | — | Enable the Unix control socket at `/tmp/intendant-<pid>.sock` |
-| `--json` | — | Emit JSONL events to stdout (implies `--no-tui`; disables dashboard) |
+| `--json` | — | Emit JSONL events to stdout (headless stdio; disables the dashboard) |
 | `--sandbox` | — | Enable filesystem sandboxing for the runtime (Landlock on Linux 5.13+, Seatbelt on macOS, restricted tokens on Windows) |
 | `--direct` | — | Force single-agent mode (skip the orchestrator / sub-agent delegation) |
 | `--no-presence` | — | Disable the presence layer (talk to the worker agent directly) |
 | `--web` | `[port]` | Start the web dashboard. **On by default**; optional numeric port (default 8765) |
-| `--no-web` | — | Disable the web dashboard; use the terminal TUI when interactive |
+| `--no-web` | — | Disable the web dashboard; run headless |
 | `--bind` | `<addr>` | IP address for the web dashboard listener. Use `127.0.0.1` for local/plaintext automation |
 | `--owner` | `<fingerprint>` | Pin root authority to a browser client key at startup for the install bootstrap; authority is minted locally and no secrets go on the wire |
 | `--no-tls` | — | Serve the dashboard over plain HTTP. Explicit local/debug escape; wildcard bind refuses startup when a public interface exists |

@@ -23,7 +23,7 @@ There is no opt-in: the gateway starts automatically unless you pass `--no-web`,
 ./target/release/intendant "task"          # dashboard comes up; URL is printed
 ./target/release/intendant --web            # explicitly enable
 ./target/release/intendant --web 9000       # explicit port
-./target/release/intendant --no-web "task"  # disable; use the terminal TUI instead
+./target/release/intendant --no-web "task"  # disable; headless single round
 ```
 
 The server binds port **8765** by default, auto-incrementing through 8785 if it
@@ -72,14 +72,12 @@ Practical rules:
 
 ### Headless daemon posture
 
-When the dashboard is on, the terminal **TUI does not own the TTY**. The
-controller runs in a headless/daemon posture and tees its stdout/stderr to
-`daemon.log` in the session directory (so the dashboard's "Download session
-report" can include controller output). With no task argument the agent simply
-starts idle and waits for tasks submitted from the dashboard.
-
-If you want the classic in-terminal TUI instead, run with `--no-web` on a real
-terminal — then the TUI takes the foreground. See [TUI & Autonomy](./tui.md).
+The controller always runs headless and tees its stdout/stderr to `daemon.log`
+in the session directory (so the dashboard's "Download session report" can
+include controller output). With no task argument the agent starts idle and
+waits for tasks submitted from the dashboard; with a task argument it runs the
+task as the foreground session under the same gateway, then falls through to
+the idle daemon loop.
 
 ## Tabs
 
@@ -257,13 +255,9 @@ Token-consumption and cost tracking:
 
 ### Terminal
 
-An embedded xterm.js terminal. Two subtabs:
-
-- **TUI** — the server-side ratatui TUI, rendered per-connection. Each browser
-  connection gets its own `WebTui` with independent dimensions, so two browsers
-  can size the terminal differently. This is the same status bar / log panel /
-  action panel / approval-and-input UI as the native terminal.
-- **Shell** — an interactive shell session.
+An embedded xterm.js terminal hosting an interactive **Shell** session on the
+daemon (or a selected peer). Session monitoring and control live in the
+Activity/Station tabs, not here.
 
 ### Video
 
@@ -731,7 +725,7 @@ When activated:
 Only one browser can be the **active** voice controller at a time:
 
 - The first browser to connect voice becomes active.
-- Additional browsers are passive observers — they receive events and TUI frames
+- Additional browsers are passive observers — they receive events
   but do not pause server-side presence.
 - A passive browser can request active status, which force-disconnects the
   previous active browser. Handover carries the last checkpoint summary and
@@ -870,14 +864,8 @@ Allowlisted settings-style `ControlMsg`s, such as autonomy, approval-rule,
 external-agent, Codex, and verbosity settings, can also dispatch over
 the DataChannel when it is verified. Display input authority uses dedicated
 DataChannel RPCs and a `display_input` frame rather than the generic
-`ControlMsg` allowlist. The standalone Shell terminal subtab uses dedicated
-`terminal_*` frames over the same verified channel. The server-side ratatui TUI
-subtab uses `tui_subscribe`, `tui_key`, `tui_resize`, `tui_unsubscribe`, and
-`tui_close` frames when the daemon has a live WebTui renderer; idle daemon
-launches that do not run WebTui advertise `tui_frames_available: false`. In
-daemon-origin dashboards the old WebSocket path remains the fallback TUI
-transport; in public-origin Connect mode the browser does not attempt that
-fallback. Session lifecycle,
+`ControlMsg` allowlist. The Shell terminal tab uses dedicated
+`terminal_*` frames over the same verified channel. Session lifecycle,
 steering, approvals, interrupt, resume, stop/restart, rename, and launch-config
 changes use a separate
 `api_session_control_msg` RPC with its own allowlist instead of broadening the
@@ -1229,11 +1217,10 @@ node scripts/validate-connect-hosted-mvp.cjs
 That validator starts `intendant-connect`, launches a daemon with outbound
 Connect enabled, uses a browser virtual authenticator for passkey registration,
 claims the daemon, labels it, opens the real SPA in `connect=1` mode, verifies
-the daemon-signed binding and Connect grant hash, exercises the Shell sub-tab
-over tunneled terminal frames, verifies that a `--no-tui` daemon renders an
-explicit TUI-unavailable state, and runs the SPA's no-legacy-transport probes
+the daemon-signed binding and Connect grant hash, exercises the Shell tab
+over tunneled terminal frames, and runs the SPA's no-legacy-transport probes
 for control actions, media/editor upload, visual-freshness diagnostics, display
-signaling, display input authority, peer mutation fallback, TUI input, presence
+signaling, display input authority, peer mutation fallback, presence
 media, presence server callbacks, the Files tab's ranged download/resume flow,
 the lower-level generic filesystem download probe, and staged upload raw range
 reads. It then revokes the daemon while the tunnel is still open, waits for the
@@ -1408,8 +1395,6 @@ messages. The first useful envelope set is:
 | `upload_start` / `upload_chunk` / `upload_end` | browser -> daemon | Bounded raw-byte upload transfer for a request id |
 | `terminal_open` / `terminal_input` / `terminal_resize` / `terminal_close` | browser -> daemon | Standalone Shell PTY control for one terminal id |
 | `terminal_output` / `terminal_exited` / `terminal_opened` / `terminal_error` | daemon -> browser | Standalone Shell PTY data and lifecycle frames |
-| `tui_subscribe` / `tui_key` / `tui_resize` / `tui_unsubscribe` / `tui_close` | browser -> daemon | Server-side WebTui connection control when a WebTui renderer is available |
-| `tui_term` / `tui_error` | daemon -> browser | WebTui terminal bytes and errors for one dashboard-control connection id |
 | `event` | daemon -> browser | Control-plane event stream entry |
 | `cancel` | browser -> daemon | Cancel an in-flight request or stream |
 | `credit` | browser -> daemon | Backpressure for chunked responses, chunked stream events, or bounded byte streams |
@@ -1421,7 +1406,7 @@ transport layer. The daemon sends a `response_start` header, base64-encoded
 `response_end` marker. The browser reassembles and parses the original frame
 before handing it to existing request or stream code, so API semantics stay
 unchanged. Current browser clients advertise `response_credit`, `byte_streams`,
-`upload_frames`, `terminal_frames`, and `tui_frames` in `hello`; when
+`upload_frames`, and `terminal_frames` in `hello`; when
 `response_credit` is negotiated, the daemon sends an initial chunk window and
 then waits for browser `credit` frames before releasing more chunks. Stream
 chunks carry a `chunk_id` so a large event inside a longer stream can be
@@ -1452,18 +1437,10 @@ ordered frame uploads plus commit/cancel. Older daemons that do not advertise th
 media protocol still receive the legacy `annotation_*` and `clip_*` WebSocket
 messages before any tunneled write is attempted.
 
-The standalone **Terminal -> Shell** subtab uses `terminal_*` frames when the
+The **Terminal** tab's Shell uses `terminal_*` frames when the
 verified tunnel advertises `terminal_frames`. The daemon attaches the tunnel to
 the same PTY registry used by the WebSocket path, so scrollback and reconnect
-behavior stay consistent. The server-side ratatui **TUI** subtab uses `tui_*`
-frames when the verified tunnel advertises `tui_frames`. The daemon creates a
-dashboard-control-owned WebTui connection, forwards WebTui's existing
-`{"t":"term","d":"..."}` output as `tui_term`, and removes the connection on
-`tui_close` or DataChannel cleanup. Idle daemon launches intentionally do not run
-WebTui, so they report `tui_frames_available: false` and the browser leaves that
-subtab on the existing WebSocket/fallback behavior only on daemon-origin pages.
-Public-origin Connect pages have no daemon WebSocket fallback, so TUI key,
-resize, and subscription attempts are dropped until `tui_frames` is advertised.
+behavior stay consistent.
 
 The first streamed API on this substrate is `api_sessions_stream`, which mirrors
 the existing `/api/sessions/stream` NDJSON event shape (`start`, partial
@@ -1755,7 +1732,7 @@ The current implementation has crossed from protocol sketch into hosted MVP:
    dashboard-control WebRTC DataChannel.
 3. The real SPA has a `connect=1` public-origin mode and a
    `DashboardTransport` boundary for tunneled reads, streams, bounded byte
-   transfer, uploads, terminal/WebTui frames, selected control messages, peer
+   transfer, uploads, terminal frames, selected control messages, peer
    pairing actions, local display signaling, and media/editor writes.
 4. The daemon has a disabled-by-default outbound Connect polling client.
 5. `intendant-connect` provides the hosted production alpha: passkey-only
@@ -1831,7 +1808,7 @@ family (sub-routes elided where the family is uniform):
 | `GET /audio-processor.js` | AudioWorklet processor for mic capture |
 | `GET /.well-known/agent-card.json` | Agent card (identity + capabilities) for peers and integrations |
 | `POST /mcp` | Streamable-HTTP MCP server (per-tool IAM; see [MCP server](./mcp-server.md)) |
-| `WS /` or `WS /ws` | Main WebSocket: events, TUI terminal and fallback Shell terminal I/O, presence protocol, WebRTC signaling |
+| `WS /` or `WS /ws` | Main WebSocket: events, fallback Shell terminal I/O, presence protocol, WebRTC signaling |
 | `GET /api/sessions` | List past sessions (`/stream` NDJSON variant, `/search` full-text) |
 | `GET /api/session/{id}/*` | Per-session detail, report, log replay, context snapshots, recordings, frame assets |
 | `POST /api/session/{id}/agent-output` | Append agent output for a historical/session-scoped backend transcript |

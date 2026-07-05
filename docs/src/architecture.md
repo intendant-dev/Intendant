@@ -17,8 +17,7 @@ every session launched at runtime.
         │                     │                                               │
         ▼                     │   Frontends (display-only: render + emit       │
 ┌───────────────────┐         │   intents; never write shared state)           │
-│ intendant-runtime │◀────────┤     ├─ ratatui TUI    ─┐                        │
-│  (sandboxed exec) │  Agent  │     ├─ Web dashboard  ─┤ ControlMsg            │
+│  (sandboxed exec) │  Agent  │     ├─ Web dashboard  ─┐ ControlMsg            │
 │                   │  Input  │     ├─ MCP server      ─┤  (intents)            │
 │  - OS sandbox     │  (JSON) │     └─ Control socket  ─┘     │                 │
 │  - no API keys    │────────▶│                                ▼                 │
@@ -52,7 +51,7 @@ $INTENDANT_LOG_DIR/           │             ▼            ▼             ▼
 
 Two facts about this diagram drive everything below:
 
-1. **Frontends are display-only.** The TUI, web dashboard, MCP server, and
+1. **Frontends are display-only.** The web dashboard, MCP server, and
    control socket all *render* state and *emit intents* (`ControlMsg`) onto the
    EventBus. None of them mutate shared state directly. The single writer is the
    [control plane](./control-plane-and-daemon.md).
@@ -81,7 +80,7 @@ The runtime/controller split is a deliberate security boundary:
 A compromised model conversation therefore cannot reach API keys, and the
 runtime process cannot exfiltrate data through a model API. See
 [Runtime Protocol](./runtime-protocol.md) for the wire format and
-[TUI & Autonomy](./tui.md) plus [Configuration](./configuration.md) for the
+[Autonomy & Approvals](./autonomy.md) plus [Configuration](./configuration.md) for the
 layered approval system that gates what the runtime is even asked to do.
 
 ## Runtime: Process State and Execution Model
@@ -162,8 +161,8 @@ In brief:
 - **Control plane** (`control_plane.rs`) is the *single writer* of shared mutable
   state: autonomy level, the active external-agent backend, and the runtime
   external-agent configuration. It subscribes to the bus and is the only place
-  `ControlMsg` mutations land, so a setting changed from the dashboard, the TUI,
-  or MCP takes effect identically (and persists to `intendant.toml` where
+  `ControlMsg` mutations land, so a setting changed from the dashboard,
+  MCP, or the control socket takes effect identically (and persists to `intendant.toml` where
   relevant).
 - **Session supervisor** (`session_supervisor.rs`) is the long-lived owner of
   every session launched at runtime. It handles `CreateSession`, `StartTask`,
@@ -174,8 +173,8 @@ In brief:
   presence, task envelope, or follow-up — replacing the dispatch logic that used
   to live in the TUI.
 - An **idle `--web` launch starts a headless daemon** (`run_daemon_loop`,
-  gated by `should_start_idle_web_daemon`): no terminal TUI, the supervisor owns
-  all launches, and tasks arrive over WebSocket/control-socket.
+  gated by `should_start_idle_web_daemon`): the supervisor owns all
+  launches, and tasks arrive over WebSocket/control-socket.
 - **Not yet built:** there is no recurring/scheduled-task facility. The only
   scheduling primitive is the one-shot `ScheduleControllerRestart`
   (`event.rs` / `mcp.rs`).
@@ -221,7 +220,7 @@ delegate it. Verified against `main.rs`:
 14. Classifies each command by action category (file read/write/delete, exec,
     network, destructive, display control, live audio, human input) and checks
     autonomy rules.
-15. If approval is required: interactive frontends (TUI/web/MCP via the EventBus)
+15. If approval is required: interactive frontends (web/MCP via the EventBus)
     surface an approval request and wait; headless mode denies (no implicit
     auto-approve).
 16. Pipes the JSON to `intendant-runtime` and waits with a hard timeout (120s
@@ -237,12 +236,12 @@ delegate it. Verified against `main.rs`:
 
 ## Frontend Vocabulary
 
-`ControlMsg` and `AppEvent` are the shared vocabulary across frontends. The TUI,
+`ControlMsg` and `AppEvent` are the shared vocabulary across frontends. The
 web dashboard, MCP server, and control socket render `AppEvent` state and send
 `ControlMsg` intents through the EventBus; the control plane and session
 supervisor are the state writers. The MCP surface additionally maps its
 approval/input tools to `UserAction` and serializes some resource snapshots via
-`StateResult`, but the TUI does not use `UserAction` or `StateQuery`.
+`StateResult` — `UserAction` is MCP-only vocabulary today.
 
 There is no single compile-time exhaustiveness guarantee across all frontends.
 Rust exhaustive matching protects each local handler, and cross-frontend parity
@@ -251,10 +250,10 @@ surface.
 
 ## askHuman Behavior
 
-- In **TUI mode**, `askHuman` opens the input panel and writes your answer to the
-  session-scoped response file. Empty submit is rejected; provide non-empty input
-  or press `Esc` to cancel.
-- In **headless mode** (`--no-tui` or non-interactive stdin), `askHuman` cannot
+- Under the **dashboard**, `askHuman` surfaces as a question card; the answer
+  is written to the session-scoped response file (`--json` accepts an `input`
+  command for the same file).
+- In **headless mode** (no dashboard, non-interactive stdin), `askHuman` cannot
   be answered interactively, so the loop tells the model to continue with
   explicit assumptions rather than wait.
 - In interactive paths, `askHuman` has no effective timeout: the controller

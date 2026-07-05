@@ -3,24 +3,21 @@
 The `--mcp` flag runs Intendant as a [Model Context Protocol](https://modelcontextprotocol.io/)
 server over stdio JSON-RPC (`src/bin/caller/mcp.rs`). It lets an external agent
 (Claude Code, Codex, etc.) observe and control Intendant: every action a human
-can take in the TUI is exposed as an MCP tool, plus display/CU/frame tools, live
-audio, and a controller-orchestration surface.
+can take in the dashboard is exposed as an MCP tool, plus display/CU/frame
+tools, live audio, and a controller-orchestration surface.
 
-Architecturally the MCP server is a **peer of the TUI**: it subscribes to the
-same `EventBus` and produces the same `UserAction` variants, processed by the
-single shared `process_action` handler. Adding a `UserAction` variant forces both
-the TUI key handler and the MCP tool handler to implement it (exhaustive `match`,
-no wildcards).
+Architecturally the MCP server is a **frontend peer of the dashboard**: it
+subscribes to the same `EventBus` and translates its tools through the
+`UserAction` enum (`frontend.rs`), processed by the shared `process_action`
+handler.
 
-> **Parity scope (corrected):** the `UserAction` compile-time contract
-> (`frontend.rs`) binds **the TUI and the MCP server only** — its module doc says
-> exactly that. The web dashboard and the Unix control socket do *not* go through
-> `UserAction`; they dispatch [`ControlMsg`](./integrations.md) values that the
-> centralized `control_plane.rs` applies (see [TUI & Autonomy](./tui.md) for why
-> frontends are display-only). So "all frontends share one action enum" is *not*
-> accurate — there are two dispatch contracts: `UserAction` (TUI/MCP) and
-> `ControlMsg` (web/control-socket). `--mcp` is its own run mode and is **not**
-> implied by `--web`.
+> **Parity scope:** `UserAction` is MCP-only vocabulary today (the retired
+> terminal TUI was its other consumer). The web dashboard and the Unix control
+> socket dispatch [`ControlMsg`](./integrations.md) values that the centralized
+> `control_plane.rs` applies (see [Autonomy & Approvals](./autonomy.md) for why
+> frontends are display-only). So there are two dispatch contracts today:
+> `UserAction` (MCP) and `ControlMsg` (web/control-socket) — a unification
+> candidate. `--mcp` is its own run mode and is **not** implied by `--web`.
 
 ## Running
 
@@ -175,19 +172,19 @@ Full MCP tool groups:
 | `get_pending_approval` | The current pending approval request (or null). | — |
 | `get_pending_input`    | The current pending `askHuman` question (or null). | — |
 
-### Interactive actions (mirror TUI keys → `UserAction`)
+### Interactive actions (→ `UserAction`)
 
 | Tool            | Description | Params |
 |-----------------|-------------|--------|
-| `approve`       | Approve a pending command (TUI `y`). | `id` |
-| `deny`          | Deny and stop (TUI `n`). | `id` |
-| `skip`          | Skip, continue (TUI `s`). | `id` |
-| `approve_all`   | Approve and set autonomy to Full (TUI `a`). | `id` |
-| `respond`       | Answer an `askHuman` question (TUI type + Enter). | `text` |
-| `set_autonomy`  | Set autonomy (TUI `+`/`-`). | `level`: `low`/`medium`/`high`/`full` |
-| `set_verbosity` | Set log verbosity (TUI `v`). | `level`: `quiet`/`normal`/`verbose`/`debug` |
+| `approve`       | Approve a pending command. | `id` |
+| `deny`          | Deny and stop. | `id` |
+| `skip`          | Skip, continue with the next command. | `id` |
+| `approve_all`   | Approve and set autonomy to Full. | `id` |
+| `respond`       | Answer an `askHuman` question. | `text` |
+| `set_autonomy`  | Set autonomy. | `level`: `low`/`medium`/`high`/`full` |
+| `set_verbosity` | Set log verbosity. | `level`: `quiet`/`normal`/`verbose`/`debug` |
 | `start_task`    | Start a new agent task (also used as follow-up when waiting). | `task` |
-| `quit`          | Shut down the agent (TUI `q`). | — |
+| `quit`          | Shut down the agent. | — |
 
 ### Display, computer use & frames
 
@@ -262,7 +259,7 @@ Resources provide push-based observation via subscriptions. The server emits
 |----------------------------------|-------------|
 | `intendant://status`             | Provider, model, turn, budget %, phase, autonomy, session ID, task. |
 | `intendant://usage`              | Per-model token usage (main + optional presence). |
-| `intendant://logs`               | Last 100 chronological log entries (same as the TUI log panel). |
+| `intendant://logs`               | Last 100 chronological log entries (same as the dashboard's activity log). |
 | `intendant://pending-approval`   | The current pending approval, if any. |
 | `intendant://pending-input`      | The current pending `askHuman` question, if any. |
 | `intendant://controller-restart` | Current controller-restart workflow state, if any. |
@@ -396,7 +393,7 @@ you source it.
 
 ## See Also
 
-- [TUI & Autonomy](./tui.md) — the other half of the `UserAction` contract, and
-  the autonomy model that gates approvals.
+- [Autonomy & Approvals](./autonomy.md) — the autonomy model that gates
+  approvals.
 - [Integrations](./integrations.md) — `ControlMsg`, the control socket, and the
   web gateway WebSocket protocol.

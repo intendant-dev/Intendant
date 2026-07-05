@@ -39,14 +39,12 @@ class DashboardControlTransport {
     this.channel.onclose = () => {
       console.info('[dashboard-control] channel closed');
       dashboardUpdateTransportStatus();
-      updateTermSubscription(true);
       this.scheduleReconnect('DataChannel closed', { delayMs: 1000 });
     };
     this.channel.onerror = () => {
       this.lastError = 'DataChannel error';
       dashboardSetControlLastError(this.lastError);
       dashboardUpdateTransportStatus();
-      updateTermSubscription(true);
       this.scheduleReconnect(this.lastError, { delayMs: 1000 });
     };
     this.pc.onicecandidate = ev => {
@@ -163,14 +161,13 @@ class DashboardControlTransport {
     dashboardSetControlLastError('');
     this.refreshIceRoute().catch(() => {});
     dashboardUpdateTransportStatus();
-    this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'upload_frames', 'terminal_frames', 'tui_frames', 'presence_frames', 'presence_active_handoff', 'presence_tool_request'] });
+    this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'upload_frames', 'terminal_frames', 'presence_frames', 'presence_active_handoff', 'presence_tool_request'] });
     this.ping().catch(() => {});
     this.request('status').then(status => {
       if (status && typeof status === 'object') {
         this.lastStatus = status;
         console.info('[dashboard-control] status RPC ok', status.session_id || '');
         dashboardUpdateTransportStatus();
-        updateTermSubscription(true);
       }
     }).catch(err => console.warn('[dashboard-control] status RPC failed', err));
     this.request('config').then(config => {
@@ -222,18 +219,6 @@ class DashboardControlTransport {
     if (msg.t === 'egress_request' || msg.t === 'egress_request_chunk' ||
         msg.t === 'egress_request_end' || msg.t === 'egress_ack' || msg.t === 'egress_cancel') {
       vaultEgressHandleFrame(msg);
-      return;
-    }
-    if (msg.t === 'tui_term' || msg.t === 'tui_error') {
-      try {
-        window.dispatchEvent(new CustomEvent('intendant-dashboard-tui-frame', { detail: msg }));
-      } catch (_) {}
-      if (msg.connection_id !== TUI_CONNECTION_ID) return;
-      if (msg.t === 'tui_term') {
-        handleTermData(msg.base64 || msg.d || '');
-      } else if (msg.error) {
-        console.warn('[dashboard-control] TUI frame error', msg.error);
-      }
       return;
     }
     if (msg.t === 'terminal_output' || msg.t === 'terminal_exited' || msg.t === 'terminal_opened' || msg.t === 'terminal_error' || msg.t === 'terminal_shared') {
@@ -755,12 +740,6 @@ class DashboardControlTransport {
     return true;
   }
 
-  tuiFrame(frame) {
-    if (!this.canUseRpc()) return false;
-    this.sendFrame(frame);
-    return true;
-  }
-
   presenceFrame(frame) {
     if (!this.canUseRpc()) return false;
     this.sendFrame({ t: 'presence_frame', frame });
@@ -1107,7 +1086,6 @@ class DashboardControlTransport {
       byteStreamsAvailable: this.lastStatus?.byte_streams_available ?? null,
       uploadFramesAvailable: this.lastStatus?.upload_frames_available ?? null,
       terminalFramesAvailable: this.lastStatus?.terminal_frames_available ?? null,
-      tuiFramesAvailable: this.lastStatus?.tui_frames_available ?? null,
       presenceFramesAvailable: this.lastStatus?.presence_frames_available ?? null,
       presenceActiveHandoffAvailable: this.lastStatus?.presence_active_handoff_available ?? null,
       presenceToolRequestAvailable: this.lastStatus?.presence_tool_request_available ?? null,

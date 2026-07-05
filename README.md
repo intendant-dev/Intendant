@@ -84,8 +84,8 @@ That is the shape of this system. Agents perform. Orchestrators conduct — the 
   ┌──────────────────────── intendant (controller) ─────────────────────────┐
   │                                                                          │
   │  Frontends ──intents──►  control plane (single writer) ──► EventBus      │
-  │  (TUI · Web ·            session supervisor · task dispatch              │
-  │   MCP · socket)               │                │                         │
+  │  (Web · MCP ·            session supervisor · task dispatch              │
+  │   socket)                     │                │                         │
   │      ▲                        │                │                         │
   │      │ render          ┌──────┴──────┐   ┌─────┴───────────────┐         │
   │   presence ◄───────────┤ native loop │   │ external-agent       │        │
@@ -156,7 +156,7 @@ One-shot and headless invocations, when you want them:
 ./target/release/intendant --direct --no-web --json "t"  # headless single agent, JSONL to stdout
 ```
 
-The full flag reference (providers, models, sandboxing, TUI, resume) lives in [Getting Started](https://lovon-spec.github.io/Intendant/getting-started.html).
+The full flag reference (providers, models, sandboxing, resume) lives in [Getting Started](https://lovon-spec.github.io/Intendant/getting-started.html).
 
 ## Web Dashboard
 
@@ -164,7 +164,7 @@ The web dashboard is the canonical frontend — on by default (port 8765; `--no-
 
 - **Activity** — live event log with context/changes views, approval buttons, follow-up input
 - **Stats** — token usage per model with cost estimates, disk usage
-- **Terminal** — embedded xterm.js for the server-side TUI and live shells
+- **Terminal** — embedded xterm.js live shells on this daemon and peers
 - **Video** — WebRTC display viewers with remote control, annotations, recording replay
 - **Station** — WebGPU mission-control canvas rendering the whole fleet live: sessions, approvals, context budgets, changes, peers, worktrees. Still prototype-stage, but this is the surface the dashboard is growing toward
 - **Sessions** — browse, search, resume, and fork sessions across all backends
@@ -186,7 +186,7 @@ cargo test -- --list      # List all test names
 
 ## Documentation
 
-**[Read the full documentation](https://lovon-spec.github.io/Intendant/)** — covers the architecture, the trust architecture and credential custody, peer federation and the self-hosted rendezvous, multi-agent and external-agent orchestration, the display pipeline, computer use and live audio, the web dashboard and Station, TUI & autonomy, MCP, configuration, session logging, and Windows support.
+**[Read the full documentation](https://lovon-spec.github.io/Intendant/)** — covers the architecture, the trust architecture and credential custody, peer federation and the self-hosted rendezvous, multi-agent and external-agent orchestration, the display pipeline, computer use and live audio, the web dashboard and Station, autonomy & approvals, MCP, configuration, session logging, and Windows support.
 
 Or build locally with [mdBook](https://rust-lang.github.io/mdBook/):
 

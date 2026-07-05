@@ -145,7 +145,7 @@ cd /home/user/projects/intendant && source .env && \
   nohup ./target/release/intendant --direct --autonomy low --web \
   "your task here" > /dev/null 2>/tmp/intendant-web-stderr.log &
 sleep 3
-cat /tmp/intendant-web-stderr.log  # Should show "Web TUI: http://0.0.0.0:8765"
+cat /tmp/intendant-web-stderr.log  # Should show "Dashboard: http://0.0.0.0:8765"
 ```
 
 ### 5. Check the target live provider

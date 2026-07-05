@@ -28,24 +28,6 @@ impl AutonomyLevel {
             _ => Self::Medium,
         }
     }
-
-    pub fn cycle_up(self) -> Self {
-        match self {
-            Self::Low => Self::Medium,
-            Self::Medium => Self::High,
-            Self::High => Self::Full,
-            Self::Full => Self::Full,
-        }
-    }
-
-    pub fn cycle_down(self) -> Self {
-        match self {
-            Self::Low => Self::Low,
-            Self::Medium => Self::Low,
-            Self::High => Self::Medium,
-            Self::Full => Self::High,
-        }
-    }
 }
 
 impl fmt::Display for AutonomyLevel {
@@ -632,19 +614,6 @@ mod tests {
         );
         assert_eq!(AutonomyLevel::from_str_loose("0"), AutonomyLevel::Low);
         assert_eq!(AutonomyLevel::from_str_loose("3"), AutonomyLevel::Full);
-    }
-
-    #[test]
-    fn autonomy_level_cycle() {
-        assert_eq!(AutonomyLevel::Low.cycle_up(), AutonomyLevel::Medium);
-        assert_eq!(AutonomyLevel::Medium.cycle_up(), AutonomyLevel::High);
-        assert_eq!(AutonomyLevel::High.cycle_up(), AutonomyLevel::Full);
-        assert_eq!(AutonomyLevel::Full.cycle_up(), AutonomyLevel::Full);
-
-        assert_eq!(AutonomyLevel::Full.cycle_down(), AutonomyLevel::High);
-        assert_eq!(AutonomyLevel::High.cycle_down(), AutonomyLevel::Medium);
-        assert_eq!(AutonomyLevel::Medium.cycle_down(), AutonomyLevel::Low);
-        assert_eq!(AutonomyLevel::Low.cycle_down(), AutonomyLevel::Low);
     }
 
     #[test]

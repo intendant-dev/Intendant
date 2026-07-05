@@ -118,7 +118,6 @@ function processCommands(cmds) {
       case 'debug_screen_torn_down': onDebugScreenTornDown(); break;
       case 'show_badge': showBadge(c.tab, c.text); break;
       case 'hide_badge': hideBadge(c.tab); break;
-      case 'term_data': handleTermData(c.base64); break;
       case 'set_connected':
         if (dashboardConnectModeEnabled()) {
           setConnectEventStatus(

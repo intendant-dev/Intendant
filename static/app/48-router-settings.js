@@ -3,7 +3,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => routeTo(btn.dataset.tab));
 });
 
-// Terminal sub-tab switching (TUI | Shell).
+// Terminal sub-tab switching (Shell).
 document.querySelectorAll('#tab-terminal .subtab-btn[data-term-tab]').forEach(btn => {
   btn.addEventListener('click', () => routeTo('terminal', btn.dataset.termTab));
 });
@@ -43,7 +43,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 // URL is the source of truth for which tab + sub-tab is active:
 //   #activity
 //   #stats
-//   #terminal           → defaults to TUI sub-tab
+//   #terminal           → the interactive shell
 //   #terminal/shell     → opens the Shell sub-tab directly
 //   #access/overview    → opens unified access administration
 //   #settings/agent     → opens the Settings tab on the Agent sub-tab
@@ -61,7 +61,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 
 const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'debug', 'settings'];
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
-const VALID_TERM_SUBTABS = ['tui', 'shell'];
+const VALID_TERM_SUBTABS = ['shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
 const ACCESS_SUBTAB_ALIASES = {
   targets: 'daemons',
@@ -251,20 +251,12 @@ function switchTab(tabId) {
     switchActivitySubtab('log');
   }
   if (tabId === 'terminal') {
-    if (activeTermSubtab === 'tui') {
-      if (!termInitialized) initTerminal();
-      if (term) requestAnimationFrame(() => fitAddon && fitAddon.fit());
-    } else if (activeTermSubtab === 'shell') {
+    if (activeTermSubtab === 'shell') {
       if (!shellInitialized) initShell();
       if (shellTerm) requestAnimationFrame(() => shellFitAddon && shellFitAddon.fit());
     }
     syncTerminalPaneAccessibility();
   }
-  // Gate the server's ratatui frame stream on whether the user is
-  // actually looking at the TUI terminal. Every other tab keeps the
-  // WebSocket quiet, which is what prevents the render firehose from
-  // back-pressuring outbound control messages.
-  updateTermSubscription();
   if (tabId === 'activity' || tabId === 'displays') {
     relocateDisplays(tabId);
   }

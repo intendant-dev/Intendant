@@ -228,8 +228,8 @@ dashboard's "Download session report" zip includes `daemon.log` so a tester's
 bundle is temporally analyzable by a developer.
 
 This is **Unix-only**: on Windows `install` is a no-op. It is deliberately
-**skipped under the interactive TUI**, because ratatui writes escape sequences to
-stdout and routing stdout through a pipe would corrupt the display.
+**always installed** — no frontend owns the raw TTY, so routing stdout
+through the tee is always safe.
 
 ## How the Dashboard Consumes the Logs
 
