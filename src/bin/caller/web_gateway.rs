@@ -47197,25 +47197,23 @@ mod tests {
         drop(server);
     }
 
-    /// Regression for the wedged-recovery incident: SO_REUSEADDR does NOT
-    /// let a rebind through while the previous listener socket is still
-    /// open (it only bypasses TIME_WAIT), so the accept-error arms must
-    /// drop the dead listener BEFORE entering their rebind loops — holding
-    /// it made every attempt fail with EADDRINUSE forever while its
-    /// backlog kept completing handshakes nothing would ever read.
-    /// Windows SO_REUSEADDR semantics differ (it can bind over an active
-    /// listener), so the still-bound assertion is Unix-only.
+    /// SO_REUSEADDR does not override an actively bound listener on Unix —
+    /// the accept-loop recovery MUST drop the dead socket before rebinding,
+    /// or every attempt self-inflicts EADDRINUSE (seen live: a daemon whose
+    /// accept loop died spun on rebind for over an hour while its own dead
+    /// listener still owned the port). Windows semantics differ, so the
+    /// still-bound assertion is Unix-only.
     #[cfg(unix)]
     #[tokio::test]
-    async fn rebind_fails_until_the_previous_listener_is_dropped() {
-        let original = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = original.local_addr().unwrap();
+    async fn rebind_fails_while_dead_listener_is_still_bound() {
+        let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = holder.local_addr().unwrap();
 
         let err = rebind_dead_tcp_listener(addr)
-            .expect_err("rebind must fail while the old listener still holds the port");
+            .expect_err("rebinding must fail while the previous listener still holds the address");
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
 
-        drop(original);
-        rebind_dead_tcp_listener(addr).expect("rebind succeeds once the old listener is gone");
+        drop(holder);
+        assert!(rebind_dead_tcp_listener(addr).is_ok());
     }
 }
