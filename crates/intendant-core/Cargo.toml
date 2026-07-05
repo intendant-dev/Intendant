@@ -15,8 +15,10 @@ tokio = { version = "1.0", features = ["sync"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "multipart"], default-features = false }
 
 [dev-dependencies]
-# autonomy's approval-config tests parse TOML fixtures.
+# autonomy's approval-config tests parse TOML fixtures; frames' tests
+# write registries into temp dirs.
 toml = "0.8"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
