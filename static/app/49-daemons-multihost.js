@@ -212,7 +212,6 @@ function dashboardUpdateTransportStatus() {
     renderDashboardTargetSummaries();
     refreshFilesDownloadAvailability();
     if (activeTab === 'files') refreshFilesTransferJobs();
-    syncTuiAvailabilityNotice();
     maybeOpenShellAfterTransportReady();
     return;
   }
@@ -229,7 +228,6 @@ function dashboardUpdateTransportStatus() {
   renderDashboardTargetSummaries();
   refreshFilesDownloadAvailability();
   if (activeTab === 'files') refreshFilesTransferJobs();
-  syncTuiAvailabilityNotice();
   maybeOpenShellAfterTransportReady();
 }
 
@@ -325,7 +323,6 @@ function connectHealthState(statusArg = null, summaryArg = null) {
     { id: 'uploads', label: 'Uploads', value: status.uploadFramesAvailable },
     { id: 'fs-read', label: 'Filesystem read', value: status.apiFsReadAvailable },
     { id: 'presence', label: 'Presence frames', value: status.presenceFramesAvailable },
-    { id: 'tui', label: 'TUI frames', value: status.tuiFramesAvailable },
   ];
   const rows = [
     { label: 'Mode', value: modeLabel, kind: connectMode || status.enabled ? 'ok' : 'warn' },
@@ -461,16 +458,6 @@ function connectSelfTestSpecs() {
         result.releaseResult === false &&
         result.requestReplayCount === 0 &&
         result.releaseReplayCount === 0,
-    },
-    {
-      id: 'tui',
-      label: 'TUI controls do not use WebSocket fallback',
-      probe: '_debugProbeTuiConnectNoLegacy',
-      pass: result =>
-        result.keyReplayCount === 0 &&
-        result.resizeReplayCount === 0 &&
-        result.wsReplayCount === 0 &&
-        result.subscriptionSent === false,
     },
     {
       id: 'shell-open-ack',
@@ -748,7 +735,6 @@ class DashboardTransport {
         if (status && typeof status === 'object') {
           dashboardControlTransport.lastStatus = status;
           dashboardUpdateTransportStatus();
-          updateTermSubscription(true);
         }
         return status;
       });
@@ -773,11 +759,6 @@ class DashboardTransport {
   terminalFrame(frame) {
     if (!this.canUseRpc()) return false;
     return dashboardControlTransport.terminalFrame(frame);
-  }
-
-  tuiFrame(frame) {
-    if (!this.canUseRpc()) return false;
-    return dashboardControlTransport.tuiFrame(frame);
   }
 
   presenceFrame(frame) {
@@ -1666,59 +1647,6 @@ window.intendantDashboardControl = {
       releaseReplayCount,
     };
   },
-  _debugProbeTuiConnectNoLegacy() {
-    if (
-      !dashboardConnectModeEnabled() ||
-      typeof sendTuiKey !== 'function' ||
-      typeof sendTuiResize !== 'function' ||
-      typeof sendTuiSubscriptionFrame !== 'function' ||
-      !dashboardControlTransport
-    ) {
-      return {
-        skipped: true,
-        connectMode: dashboardConnectModeEnabled(),
-        sendKeyType: typeof sendTuiKey,
-        sendResizeType: typeof sendTuiResize,
-        subscriptionType: typeof sendTuiSubscriptionFrame,
-        hasControlTransport: Boolean(dashboardControlTransport),
-        keyReplayCount: 0,
-        resizeReplayCount: 0,
-        wsReplayCount: 0,
-        subscriptionSent: false,
-      };
-    }
-    const previousApp = app;
-    const previousStatus = dashboardControlTransport.lastStatus;
-    let keyReplayCount = 0;
-    let resizeReplayCount = 0;
-    let wsReplayCount = 0;
-    app = {
-      send_key() { keyReplayCount += 1; },
-      send_resize() { resizeReplayCount += 1; },
-      send_raw() { wsReplayCount += 1; },
-      send_server_action() { wsReplayCount += 1; },
-    };
-    dashboardControlTransport.lastStatus = {
-      ...(previousStatus || {}),
-      tui_frames_available: false,
-    };
-    let subscriptionSent = false;
-    try {
-      sendTuiKey({ key: 'a', ctrlKey: false, altKey: false, shiftKey: false });
-      sendTuiResize(80, 24);
-      subscriptionSent = sendTuiSubscriptionFrame(true, 'websocket') === true;
-    } finally {
-      dashboardControlTransport.lastStatus = previousStatus;
-      app = previousApp;
-    }
-    return {
-      skipped: false,
-      keyReplayCount,
-      resizeReplayCount,
-      wsReplayCount,
-      subscriptionSent,
-    };
-  },
   _debugProbeShellQueuesUntilOpened() {
     if (
       !dashboardConnectModeEnabled() ||
@@ -2150,9 +2078,6 @@ window.intendantDashboardControl = {
   },
   terminalFrame(frame) {
     return dashboardTransport.terminalFrame(frame);
-  },
-  tuiFrame(frame) {
-    return dashboardTransport.tuiFrame(frame);
   },
   presenceFrame(frame) {
     return dashboardTransport.presenceFrame(frame);

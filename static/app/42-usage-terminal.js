@@ -224,24 +224,6 @@ function base64ToBytes(base64data) {
   return bytes;
 }
 
-// The idle overlay stays until the first mirror frame proves a TUI is
-// attached; it never comes back for the life of the page.
-function hideTuiEmptyState() {
-  document.getElementById('tui-empty-state')?.classList.add('hidden');
-}
-
-function handleTermData(base64data) {
-  hideTuiEmptyState();
-  if (term) {
-    term.write(base64ToBytes(base64data));
-  } else {
-    termBuffer.push(base64data);
-    // Frames buffered before xterm initializes; keep only a recent tail
-    // (xterm's own scrollback caps what a longer buffer could show).
-    if (termBuffer.length > 500) termBuffer.splice(0, termBuffer.length - 500);
-  }
-}
-
 function currentShellHostId() {
   return String(selectedShellHostId || SHELL_HOST_ID).trim() || SHELL_HOST_ID;
 }
@@ -1564,7 +1546,7 @@ function accessFallbackPermissions() {
     'shell.spawn': ['Shell spawn', 'terminal', 'Create new shell sessions on this daemon.'],
     'settings.manage': ['Settings manage', 'settings', 'Read or write daemon settings and API keys.'],
     'credentials.manage': ['Credentials manage', 'credentials', 'Grant, renew, revoke, and inspect credential leases; register client egress.'],
-    'runtime.control': ['Runtime control', 'runtime', 'Use runtime-control surfaces such as TUI, media, and recording controls.'],
+    'runtime.control': ['Runtime control', 'runtime', 'Use runtime-control surfaces such as media and recording controls.'],
     'filesystem.read': ['Filesystem read', 'filesystem', 'Stat, list, and read files through dashboard APIs.'],
     'filesystem.write': ['Filesystem write', 'filesystem', 'Create directories or write uploaded file content.'],
   };

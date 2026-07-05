@@ -289,7 +289,10 @@ pub(crate) fn web_mtls_enabled(
     flags.mtls || mtls_cfg.enabled || web_default_mtls_enabled(flags, server_cfg)
 }
 
-pub(crate) fn web_default_mtls_enabled(flags: &CliFlags, server_cfg: &project::ServerTlsConfig) -> bool {
+pub(crate) fn web_default_mtls_enabled(
+    flags: &CliFlags,
+    server_cfg: &project::ServerTlsConfig,
+) -> bool {
     !flags.no_tls
         && !flags.tls
         && !server_cfg.enabled
@@ -313,7 +316,8 @@ pub(crate) fn installed_access_cert_dir() -> PathBuf {
     access::backend::select_backend().cert_dir()
 }
 
-pub(crate) fn installed_access_tls_cert_source() -> Result<Option<web_tls::TlsCertSource>, CallerError> {
+pub(crate) fn installed_access_tls_cert_source(
+) -> Result<Option<web_tls::TlsCertSource>, CallerError> {
     let cert_dir = installed_access_cert_dir();
     installed_access_tls_cert_source_from_dir(&cert_dir)
 }
@@ -410,7 +414,7 @@ pub(crate) fn installed_access_mtls_ca_path_from_dir(cert_dir: &Path) -> Option<
     ca_path.exists().then_some(ca_path)
 }
 
-pub(crate) fn web_tui_display_url(
+pub(crate) fn dashboard_display_url(
     web_tls_acceptor: &Option<tokio_rustls::TlsAcceptor>,
     web_port: u16,
     web_bind: Option<IpAddr>,
@@ -420,11 +424,11 @@ pub(crate) fn web_tui_display_url(
     } else {
         "http"
     };
-    let host = web_tui_display_host(web_bind);
+    let host = dashboard_display_host(web_bind);
     format!("{scheme}://{host}:{web_port}")
 }
 
-pub(crate) fn web_tui_display_host(web_bind: Option<IpAddr>) -> String {
+pub(crate) fn dashboard_display_host(web_bind: Option<IpAddr>) -> String {
     match web_bind {
         Some(IpAddr::V4(ip)) => ip.to_string(),
         Some(IpAddr::V6(ip)) => format!("[{ip}]"),
@@ -432,14 +436,14 @@ pub(crate) fn web_tui_display_host(web_bind: Option<IpAddr>) -> String {
     }
 }
 
-pub(crate) fn web_tui_log_line(
+pub(crate) fn dashboard_log_line(
     web_tls_acceptor: &Option<tokio_rustls::TlsAcceptor>,
     web_port: u16,
     web_bind: Option<IpAddr>,
 ) -> String {
     format!(
-        "Web TUI: {}",
-        web_tui_display_url(web_tls_acceptor, web_port, web_bind)
+        "Dashboard: {}",
+        dashboard_display_url(web_tls_acceptor, web_port, web_bind)
     )
 }
 
@@ -460,7 +464,10 @@ pub(crate) fn validate_tls_cli_flags(flags: &CliFlags) -> Result<(), CallerError
     Ok(())
 }
 
-pub(crate) fn effective_web_bind_ip(flags: &CliFlags, server_cfg: &project::ServerConfig) -> Option<IpAddr> {
+pub(crate) fn effective_web_bind_ip(
+    flags: &CliFlags,
+    server_cfg: &project::ServerConfig,
+) -> Option<IpAddr> {
     flags.web_bind.or(server_cfg.bind)
 }
 

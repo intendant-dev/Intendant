@@ -69,7 +69,6 @@ mod tool_batch;
 mod tools;
 mod transcription;
 mod transfer_store;
-mod tui;
 mod types;
 mod upload_store;
 mod vision;
@@ -119,7 +118,7 @@ use event::{AppEvent, EventBus};
 use project::Project;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -209,6 +208,9 @@ struct CliFlags {
     provider: Option<String>,
     model: Option<String>,
     verbose: bool,
+    /// --no-tui: accepted for compatibility (the terminal TUI was removed);
+    /// has no effect. Headless output is --no-web; the dashboard is the UI.
+    #[allow(dead_code)]
     no_tui: bool,
     mcp: bool,
     autonomy: AutonomyLevel,
@@ -218,17 +220,17 @@ struct CliFlags {
     /// --resume / -r [id]: resume a specific session by ID or path.
     resume_id: Option<String>,
     control_socket: bool,
-    /// --json: Emit JSONL events to stdout (implies --no-tui).
+    /// --json: Emit JSONL events to stdout (headless stdio; implies --no-web).
     json_output: bool,
     /// --sandbox: Enable Landlock filesystem sandboxing for the runtime.
     #[allow(dead_code)]
     sandbox: bool,
     /// --direct: Force single-agent mode (skip orchestrator/sub-agent delegation).
-    /// Does NOT disable the UI — use --no-web --no-tui for headless output.
+    /// Does NOT disable the UI — use --no-web for headless output.
     direct: bool,
     /// --no-presence: Disable the presence layer (direct agent interaction).
     no_presence: bool,
-    /// --web [PORT]: Serve TUI via web (xterm.js + optional voice).
+    /// --web [PORT]: Serve the web dashboard (on by default).
     web: bool,
     web_port: u16,
     /// --bind <ADDR>: IP address for the web dashboard listener. Defaults
@@ -295,15 +297,15 @@ fn print_help() {
     println!("    --log-file <DIR>      Override session log directory (default: ~/.intendant/logs/<uuid>/)");
     println!("    --continue, -c        Resume the most recent session for this project");
     println!("    --resume, -r [ID]     Resume a specific session by ID, prefix, or path");
-    println!("    --no-tui              Disable terminal TUI; combine with --no-web for headless");
-    println!("    --mcp                 Run as MCP server on stdio (replaces TUI)");
+    println!("    --no-tui              Deprecated no-op (the terminal TUI was removed)");
+    println!("    --mcp                 Run as MCP server on stdio");
     println!("    --verbose, -v         Enable verbose output");
     println!("    --control-socket      Enable Unix control socket");
-    println!("    --json                Emit JSONL events to stdout (implies --no-tui)");
+    println!("    --json                Emit JSONL events to stdout (headless stdio)");
     println!("    --sandbox             Enable Landlock filesystem sandboxing for the runtime");
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
-    println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle starts daemon/no TUI)");
+    println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle start runs the daemon)");
     println!("    --bind <ADDR>         IP address for the web dashboard listener");
     println!("    --owner <FINGERPRINT> Pin root authority to a browser client key at startup (install bootstrap)");
     println!(
@@ -446,6 +448,9 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                 i += 1;
             }
             "--no-tui" => {
+                // Deprecated no-op, accepted for compatibility (the terminal
+                // TUI was removed; the dashboard is the UI, --no-web is
+                // headless).
                 flags.no_tui = true;
                 i += 1;
             }
@@ -1701,7 +1706,7 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn idle_web_defaults_to_daemon_without_no_tui() {
+    fn idle_web_defaults_to_daemon() {
         let flags = cli_flags_for_tests();
         assert!(should_start_idle_web_daemon(true, &flags));
     }
@@ -1742,12 +1747,12 @@ Also: {"source": "bare"}"#;
         flags.mcp = true;
         flags.task_file = Some(task_path.to_string_lossy().into_owned());
 
-        let task = resolve_initial_task_for_startup(&flags, false, false).unwrap();
+        let task = resolve_initial_task_for_startup(&flags, false).unwrap();
         assert_eq!(task.as_deref(), Some("serve this task over mcp"));
     }
 
     #[test]
-    fn web_task_file_is_initial_task_even_when_tui_mode_is_available() {
+    fn web_task_file_is_initial_task() {
         let dir = tempfile::tempdir().unwrap();
         let task_path = dir.path().join("task.txt");
         std::fs::write(&task_path, "resume managed harness\n").unwrap();
@@ -1755,14 +1760,13 @@ Also: {"source": "bare"}"#;
         let mut flags = cli_flags_for_tests();
         flags.task_file = Some(task_path.to_string_lossy().into_owned());
         flags.web = true;
-        flags.no_tui = true;
         flags.no_presence = true;
         flags.agent_backend = Some(external_agent::AgentBackend::Codex);
         flags.resume_id = Some("6036429e-54f9-4f93-b74d-04c060c79054".to_string());
 
         let web_daemon_requested = should_start_idle_web_daemon(true, &flags);
-        let use_tui = !web_daemon_requested;
-        let task = resolve_initial_task_for_startup(&flags, web_daemon_requested, use_tui).unwrap();
+        assert!(!web_daemon_requested);
+        let task = resolve_initial_task_for_startup(&flags, web_daemon_requested).unwrap();
         assert_eq!(task.as_deref(), Some("resume managed harness"));
     }
 
@@ -3150,25 +3154,15 @@ async fn main() -> Result<(), CallerError> {
     // Tee controller stderr/stdout into {session_dir}/daemon.log so the
     // "Download session report" button in Settings → Debug can include
     // controller-side output (eprintln!, panics, tracing) in the zip
-    // alongside session.jsonl and turn files. Skipped when the
-    // controller owns the real interactive TTY, because ratatui writes
-    // escape sequences to stdout and cannot tolerate a pipe.
+    // alongside session.jsonl and turn files.
     {
-        let will_use_web = !flags.no_web && !flags.mcp && !flags.json_output;
-        let owns_real_tty = !will_use_web
-            && !flags.no_tui
-            && !flags.mcp
-            && io::stdin().is_terminal()
-            && io::stdout().is_terminal();
-        if !owns_real_tty {
-            let daemon_log_path = log_dir.join("daemon.log");
-            if let Err(e) = daemon_log_tee::install(&daemon_log_path) {
-                eprintln!(
-                    "daemon_log_tee: could not tee stderr/stdout to {}: {}",
-                    daemon_log_path.display(),
-                    e
-                );
-            }
+        let daemon_log_path = log_dir.join("daemon.log");
+        if let Err(e) = daemon_log_tee::install(&daemon_log_path) {
+            eprintln!(
+                "daemon_log_tee: could not tee stderr/stdout to {}: {}",
+                daemon_log_path.display(),
+                e
+            );
         }
     }
 
@@ -3234,9 +3228,8 @@ async fn main() -> Result<(), CallerError> {
     // Install signal handler to mark session as interrupted before exit.
     // Rust's Drop trait does not run when the process is killed by a signal,
     // so we need an explicit handler to update session_meta.json. We catch
-    // both SIGTERM (external shutdown) and SIGINT (Ctrl+C in terminal or at
-    // the `run_daemon_loop` prompt after TUI quit) so the session doesn't
-    // linger as `"status": "running"` in ~/.intendant/logs/ forever.
+    // both SIGTERM (external shutdown) and SIGINT (Ctrl+C) so the session
+    // doesn't linger as `"status": "running"` in ~/.intendant/logs/ forever.
     {
         let signal_session_log = session_log.clone();
         tokio::spawn(async move {
@@ -3275,12 +3268,6 @@ async fn main() -> Result<(), CallerError> {
                 let _ = credential_leases::revoke(None, "daemon shutdown");
                 // Clean up control socket
                 control::cleanup();
-                // Restore terminal (best-effort) so the shell isn't left in raw mode
-                let _ = crossterm::terminal::disable_raw_mode();
-                let _ = crossterm::execute!(
-                    std::io::stdout(),
-                    crossterm::terminal::LeaveAlternateScreen
-                );
                 std::process::exit(130);
             }
         });
@@ -3410,25 +3397,18 @@ async fn main() -> Result<(), CallerError> {
         l.debug(&format!("Autonomy: {}", flags.autonomy));
     });
 
-    // Determine whether to use TUI (needed early for task resolution).
-    // Idle web/dashboard startup defaults to the daemon path: no terminal TUI,
-    // and the session supervisor owns all launches. `--no-web` keeps the
-    // terminal TUI available for interactive local use.
+    // Idle web/dashboard startup defaults to the daemon path: the session
+    // supervisor owns all launches. A task on the command line runs it as
+    // the foreground (headless) session under the same gateway.
     let web_daemon_requested = should_start_idle_web_daemon(use_web, &flags);
-    let use_tui = !web_daemon_requested
-        && (use_web
-            || (!flags.no_tui
-                && !flags.mcp
-                && io::stdin().is_terminal()
-                && io::stdout().is_terminal()));
 
-    // Task resolution: MCP and TUI modes allow starting without a task.
-    // MCP mode honors an explicit --task-file but must not otherwise call
-    // get_task_from_flags_or_env() because it would print to stdout and read
-    // from stdin, both reserved for JSON-RPC.
-    // TUI mode can accept a task later via the follow-up input panel.
-    // Headless mode still requires a task upfront.
-    let task = resolve_initial_task_for_startup(&flags, web_daemon_requested, use_tui)?;
+    // Task resolution: the daemon starts idle; MCP mode allows starting
+    // without a task (it honors an explicit --task-file but must not
+    // otherwise call get_task_from_flags_or_env() because it would print to
+    // stdout and read from stdin, both reserved for JSON-RPC). The
+    // foreground (headless) mode requires a task upfront — on a terminal,
+    // get_task_from_flags_or_env prompts for one.
+    let task = resolve_initial_task_for_startup(&flags, web_daemon_requested)?;
 
     if let Some(ref t) = task {
         slog(&session_log, |l| l.info(&format!("Task: {}", t)));
@@ -3484,31 +3464,6 @@ async fn main() -> Result<(), CallerError> {
             frame_registry,
             session_registry,
             recording_registry,
-        )
-        .await?;
-    } else if use_tui {
-        startup::interactive::run_interactive_mode(
-            &flags,
-            project,
-            autonomy,
-            session_log,
-            log_dir,
-            task,
-            provider,
-            use_web,
-            web_port,
-            web_bind_ip,
-            web_port_for_agent,
-            web_listener,
-            web_tls_client_cert_required,
-            web_tls_acceptor,
-            runtime_presence_enabled,
-            initial_agent_backend,
-            shared_external_agent,
-            frame_registry,
-            session_registry,
-            recording_registry,
-            startup_external_resume_session,
         )
         .await?;
     } else {

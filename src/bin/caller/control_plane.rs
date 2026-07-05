@@ -651,15 +651,13 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             }
         }
         ControlMsg::GrantUserDisplay { display_id } => {
-            // Moved out of `tui/app.rs::handle_control_command` — the TUI is
-            // now display-only and the display-control path shouldn't depend
-            // on a rendering loop running to process revokes/grants. Before
-            // this, a grant/revoke dispatched to a web-only daemon had to
-            // wait behind `tui::web::WebTui`'s render cadence (one full
-            // redraw per event loop iteration, rendered to every attached
-            // web terminal connection), which is what surfaced as the
-            // asymmetric 60-second lag on revoke that dashboard toggles
-            // experienced. Grant was hitting the same code path but usually
+            // Owned here (not by any frontend) so the display-control path
+            // never depends on a rendering loop to process revokes/grants.
+            // Historically this lived in the TUI's control handler, where a
+            // grant/revoke dispatched to a web-only daemon had to wait
+            // behind the WebTui render cadence — the asymmetric 60-second
+            // lag on revoke that dashboard toggles experienced. Grant was
+            // hitting the same code path but usually
             // appeared instant because the first grant typically arrives
             // before any web terminal connects; subsequent grants after
             // churn would have shown the same lag.

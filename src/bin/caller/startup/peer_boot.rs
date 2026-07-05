@@ -2,8 +2,8 @@
 //! URLs this daemon publishes, and peer-registry construction and
 //! hydration from config.
 
-use crate::error::CallerError;
 use crate::access;
+use crate::error::CallerError;
 use crate::peer;
 use crate::project::{self, Project};
 use crate::CliFlags;

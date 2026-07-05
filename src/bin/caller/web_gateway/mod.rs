@@ -3391,7 +3391,6 @@ pub fn spawn_web_gateway(
     config: WebGatewayConfig,
     shared_session: SharedActiveSession,
     transcriber: Option<Arc<dyn crate::transcription::Transcriber>>,
-    web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
     task_tx: Option<tokio::sync::mpsc::Sender<presence_core::TaskEnvelope>>,
     project_root: Option<std::path::PathBuf>,
     mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
@@ -3782,7 +3781,6 @@ pub fn spawn_web_gateway(
         project_root.clone(),
         worktree_inventory_cache.clone(),
         terminal_registry.clone(),
-        web_tui_tx.clone(),
         task_tx.clone(),
         agent_card_value,
         bootstrap_caches.clone(),
@@ -4175,7 +4173,6 @@ pub fn spawn_web_gateway(
             let attached_external_sessions = attached_external_sessions.clone();
             let last_user_display_json = last_user_display_json.clone();
             let display_ready_cache = display_ready_cache.clone();
-            let web_tui_tx = web_tui_tx.clone();
             let task_tx = task_tx.clone();
             let project_root = project_root.clone();
             let mcp_server = mcp_server.clone();
@@ -4553,16 +4550,6 @@ pub fn spawn_web_gateway(
                     // messages for this specific connection (not broadcast).
                     let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<String>();
 
-                    // Register connection with WebTui for per-connection rendering
-                    if let Some(ref tx) = web_tui_tx {
-                        let _ = tx.send(crate::tui::web::WebTuiCommand::AddConnection {
-                            id: connection_id.clone(),
-                            direct_tx: direct_tx.clone(),
-                            cols: 120,
-                            rows: 40,
-                        });
-                    }
-
                     // Send bootstrap state snapshot on connect (with connection_id).
                     // Include config (provider/model) since AgentStateSnapshot
                     // doesn't carry those. The top-level `session_id` is the
@@ -4822,8 +4809,6 @@ pub fn spawn_web_gateway(
 
                     // Inbound: WebSocket → EventBus
                     // Handles message types:
-                    //   {"t":"key", "key":"Enter", ...}  → AppEvent::Key
-                    //   {"t":"resize", "cols":N, "rows":N} → AppEvent::Resize
                     //   {"t":"presence_connect",...}     → AppEvent::PresenceConnected
                     //   {"t":"presence_disconnect"}      → AppEvent::PresenceDisconnected
                     //   {"t":"voice_log",...}             → AppEvent::VoiceLog
@@ -4847,7 +4832,6 @@ pub fn spawn_web_gateway(
                     let federated_authority_subscribers_inbound =
                         federated_authority_subscribers.clone();
                     let connection_id_inbound = connection_id.clone();
-                    let web_tui_tx_inbound = web_tui_tx.clone();
                     let frame_registry_inbound = frame_registry.clone();
                     let recording_registry_inbound = recording_registry.clone();
                     let session_log_inbound = session_log.clone();
@@ -4931,69 +4915,6 @@ pub fn spawn_web_gateway(
                                         continue;
                                     }
                                     match json.get("t").and_then(|v| v.as_str()) {
-                                        Some("key") => {
-                                            // Route key events to this connection's
-                                            // ViewState via WebTuiCommand (not EventBus).
-                                            if let Some(key_event) =
-                                                crate::tui::web::parse_web_key(&json)
-                                            {
-                                                if let Some(ref tx) = web_tui_tx {
-                                                    let _ = tx.send(
-                                                        crate::tui::web::WebTuiCommand::Key {
-                                                            id: connection_id_inbound.clone(),
-                                                            key: key_event,
-                                                        },
-                                                    );
-                                                } else if is_active {
-                                                    // Fallback: no WebTui (headless web mode)
-                                                    bus_inbound.send(AppEvent::Key(key_event));
-                                                }
-                                            }
-                                        }
-                                        Some("resize") => {
-                                            // Route resize to this connection's terminal
-                                            let cols = json["cols"].as_u64().unwrap_or(80) as u16;
-                                            let rows = json["rows"].as_u64().unwrap_or(24) as u16;
-                                            if let Some(ref tx) = web_tui_tx {
-                                                let _ = tx.send(
-                                                    crate::tui::web::WebTuiCommand::Resize {
-                                                        id: connection_id_inbound.clone(),
-                                                        cols,
-                                                        rows,
-                                                    },
-                                                );
-                                            } else if is_active {
-                                                bus_inbound.send(AppEvent::Resize(cols, rows));
-                                            }
-                                        }
-                                        Some("term_subscribe") => {
-                                            // Dashboard entered the Terminal tab. Start
-                                            // emitting ratatui frames to this connection.
-                                            // Every non-Terminal tab (Activity, Stats,
-                                            // Video, Sessions, Network, Settings, Debug)
-                                            // leaves us unsubscribed, which means WebTui
-                                            // stays idle instead of flooding the socket
-                                            // with frames nobody is watching.
-                                            if let Some(ref tx) = web_tui_tx {
-                                                let _ = tx.send(
-                                                    crate::tui::web::WebTuiCommand::Subscribe {
-                                                        id: connection_id_inbound.clone(),
-                                                    },
-                                                );
-                                            }
-                                        }
-                                        Some("term_unsubscribe") => {
-                                            // Dashboard left the Terminal tab. Stop
-                                            // emitting ratatui frames to this connection
-                                            // until the next term_subscribe.
-                                            if let Some(ref tx) = web_tui_tx {
-                                                let _ = tx.send(
-                                                    crate::tui::web::WebTuiCommand::Unsubscribe {
-                                                        id: connection_id_inbound.clone(),
-                                                    },
-                                                );
-                                            }
-                                        }
                                         Some("presence_connect") => {
                                             is_presence_connected = true;
                                             voice_debug_inbound
@@ -7074,12 +6995,6 @@ pub fn spawn_web_gateway(
                         }
                         for session_id in dashboard_control_session_ids {
                             dashboard_control_inbound.close(&session_id).await;
-                        }
-                        // Unregister from WebTui
-                        if let Some(ref tx) = web_tui_tx_inbound {
-                            let _ = tx.send(crate::tui::web::WebTuiCommand::RemoveConnection {
-                                id: connection_id_inbound.clone(),
-                            });
                         }
                     });
 
@@ -11680,7 +11595,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
@@ -11711,7 +11625,6 @@ mod tests {
             broadcast_tx,
             config,
             ActiveSessionState::empty(),
-            None,
             None,
             None,
             None,
@@ -11773,7 +11686,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
@@ -11827,7 +11739,6 @@ mod tests {
             broadcast_tx,
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
-            None,
             None,
             None,
             None,
@@ -12222,7 +12133,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             peer_registry,
             Vec::new(),
             bearer_token,
@@ -12266,7 +12176,6 @@ mod tests {
             broadcast_tx,
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
-            None,
             None,
             None,
             None,
@@ -14049,7 +13958,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
@@ -14110,7 +14018,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
@@ -14161,7 +14068,6 @@ mod tests {
             broadcast_tx,
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
-            None,
             None,
             None,
             None,
@@ -14241,7 +14147,6 @@ mod tests {
             broadcast_tx,
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
-            None,
             None,
             None,
             None,
@@ -14366,7 +14271,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
@@ -14433,7 +14337,6 @@ mod tests {
             broadcast_tx,
             config,
             ActiveSessionState::empty(),
-            None,
             None,
             None,
             None,
@@ -14516,7 +14419,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
@@ -14567,7 +14469,6 @@ mod tests {
                 broadcast_tx,
                 config,
                 ss,
-                None,
                 None,
                 None,
                 None,
@@ -14632,7 +14533,6 @@ mod tests {
                 broadcast_tx,
                 config,
                 ss,
-                None,
                 None,
                 None,
                 None,
@@ -14711,7 +14611,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
@@ -14770,7 +14669,6 @@ mod tests {
                 broadcast_tx,
                 config,
                 ss,
-                None,
                 None,
                 None,
                 None,
@@ -14844,7 +14742,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
@@ -14901,7 +14798,6 @@ mod tests {
             broadcast_tx,
             config,
             ActiveSessionState::empty(),
-            None,
             None,
             None,
             None,
@@ -14971,7 +14867,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
@@ -15026,7 +14921,6 @@ mod tests {
             broadcast_tx,
             config,
             ActiveSessionState::empty(),
-            None,
             None,
             None,
             None,
@@ -15097,7 +14991,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
@@ -15149,7 +15042,6 @@ mod tests {
             broadcast_tx,
             config,
             ActiveSessionState::empty(),
-            None,
             None,
             None,
             None,
@@ -15241,7 +15133,6 @@ mod tests {
             broadcast_tx,
             config,
             ActiveSessionState::empty(),
-            None,
             None,
             None,
             None,
@@ -15373,7 +15264,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
@@ -15470,7 +15360,6 @@ mod tests {
             broadcast_tx,
             config,
             ActiveSessionState::empty(),
-            None,
             None,
             None,
             None,

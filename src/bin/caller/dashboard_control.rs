@@ -318,7 +318,6 @@ const CONTROL_WIRE_FEATURES: &[&str] = &[
     "byte_streams",
     "upload_frames",
     "terminal_frames",
-    "tui_frames",
     "presence_frames",
     "presence_active_handoff",
     "presence_tool_request",
@@ -383,7 +382,6 @@ pub struct DashboardControlRegistry {
     project_root: Option<PathBuf>,
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
     terminal_registry: Arc<crate::terminal::TerminalRegistry>,
-    web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
     task_tx: Option<mpsc::Sender<presence_core::TaskEnvelope>>,
     agent_card: serde_json::Value,
     bootstrap_caches: DashboardBootstrapCaches,
@@ -671,7 +669,6 @@ impl DashboardControlRegistry {
         project_root: Option<PathBuf>,
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
         terminal_registry: Arc<crate::terminal::TerminalRegistry>,
-        web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
         task_tx: Option<mpsc::Sender<presence_core::TaskEnvelope>>,
         agent_card: serde_json::Value,
         bootstrap_caches: DashboardBootstrapCaches,
@@ -690,7 +687,6 @@ impl DashboardControlRegistry {
             project_root,
             worktree_inventory_cache,
             terminal_registry,
-            web_tui_tx,
             task_tx,
             agent_card,
             bootstrap_caches,
@@ -780,7 +776,6 @@ impl DashboardControlRegistry {
             self.project_root.clone(),
             self.worktree_inventory_cache.clone(),
             self.terminal_registry.clone(),
-            self.web_tui_tx.clone(),
             self.task_tx.clone(),
             self.agent_card.clone(),
             self.bootstrap_caches.clone(),
@@ -943,7 +938,6 @@ impl DashboardControlPeer {
         project_root: Option<PathBuf>,
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
         terminal_registry: Arc<crate::terminal::TerminalRegistry>,
-        web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
         task_tx: Option<mpsc::Sender<presence_core::TaskEnvelope>>,
         agent_card: serde_json::Value,
         bootstrap_caches: DashboardBootstrapCaches,
@@ -1054,7 +1048,6 @@ impl DashboardControlPeer {
             project_root,
             worktree_inventory_cache,
             terminal_registry,
-            web_tui_tx,
             task_tx,
             agent_card,
             bootstrap_caches,
@@ -1133,7 +1126,6 @@ struct ControlRuntime {
     project_root: Option<PathBuf>,
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
     terminal_registry: Arc<crate::terminal::TerminalRegistry>,
-    web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
     task_tx: Option<mpsc::Sender<presence_core::TaskEnvelope>>,
     agent_card: serde_json::Value,
     bootstrap_caches: DashboardBootstrapCaches,
@@ -1196,11 +1188,6 @@ struct InboundUploadState {
     expected_chunks: usize,
     next_seq: usize,
     received_bytes: usize,
-}
-
-struct DashboardTuiConnection {
-    internal_id: String,
-    forwarder: tokio::task::JoinHandle<()>,
 }
 
 struct OutboundControlQueue {
@@ -1372,7 +1359,6 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
     runtime.control_frames_tx = Some(terminal_events_tx.clone());
     let mut terminal_forwarders: HashMap<(String, String), tokio::task::JoinHandle<()>> =
         HashMap::new();
-    let mut tui_connections: HashMap<String, DashboardTuiConnection> = HashMap::new();
     let mut display_authority_rx = runtime
         .display_authority
         .as_ref()
@@ -1391,7 +1377,6 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
             &mut inbound_uploads,
             &terminal_events_tx,
             &mut terminal_forwarders,
-            &mut tui_connections,
         )
         .await
         {
@@ -1628,7 +1613,6 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
         handle.abort();
         let _ = handle.await;
     }
-    close_dashboard_tui_connections(&runtime, &mut tui_connections).await;
     // Egress relays die with their session: no more frames can arrive,
     // so drop the registration and fail any in-flight relayed requests.
     crate::credential_egress::unregister_session(&runtime.session_id);
@@ -1681,7 +1665,6 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
     terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
-    tui_connections: &mut HashMap<String, DashboardTuiConnection>,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
         if t.transport.transport_protocol == TransportProtocol::UDP {
@@ -1747,7 +1730,6 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
             inbound_uploads,
             terminal_events_tx,
             terminal_forwarders,
-            tui_connections,
         ) {
             send_control_frame(
                 rtc,
@@ -2239,9 +2221,6 @@ fn dashboard_control_frame_operation(t: &str) -> Option<crate::peer::access_poli
         "terminal_input" | "terminal_resize" | "terminal_close" | "terminal_share" => {
             Some(PeerOperation::TerminalWrite)
         }
-        "tui_subscribe" | "tui_key" | "tui_resize" | "tui_unsubscribe" | "tui_close" => {
-            Some(PeerOperation::RuntimeControl)
-        }
         "presence_frame" => Some(PeerOperation::Message),
         // Upload frames carry no blanket authority: upload_start is
         // authorized by the operation of the method it delivers (a media
@@ -2442,7 +2421,6 @@ fn control_frame_response(
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
     terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
-    tui_connections: &mut HashMap<String, DashboardTuiConnection>,
 ) -> Option<serde_json::Value> {
     let parsed: serde_json::Value = serde_json::from_str(text).ok()?;
     let t = parsed.get("t").and_then(|v| v.as_str()).unwrap_or("");
@@ -2492,13 +2470,6 @@ fn control_frame_response(
         "terminal_resize" => control_terminal_resize_frame(parsed, runtime),
         "terminal_close" => control_terminal_close_frame(parsed, runtime, terminal_forwarders),
         "terminal_share" => control_terminal_share_frame(parsed, runtime, terminal_events_tx),
-        "tui_subscribe" => {
-            control_tui_subscribe_frame(parsed, runtime, terminal_events_tx, tui_connections)
-        }
-        "tui_key" => control_tui_key_frame(parsed, runtime, tui_connections),
-        "tui_resize" => control_tui_resize_frame(parsed, runtime, tui_connections),
-        "tui_unsubscribe" => control_tui_unsubscribe_frame(parsed, runtime, tui_connections),
-        "tui_close" => control_tui_close_frame(parsed, runtime, tui_connections),
         "presence_frame" => control_presence_frame(parsed, runtime.clone()),
         "egress_response" | "egress_chunk" | "egress_end" | "egress_error" => {
             crate::credential_egress::handle_browser_frame(&runtime.session_id, t, &parsed);
@@ -3578,213 +3549,6 @@ fn control_terminal_share_frame(
     None
 }
 
-fn tui_frame_connection_id(frame: &serde_json::Value) -> String {
-    frame
-        .get("connection_id")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.chars().take(128).collect::<String>())
-        .unwrap_or_else(|| "tui-0".to_string())
-}
-
-fn tui_internal_connection_id(runtime: &ControlRuntime, connection_id: &str) -> String {
-    format!("dashboard-control:{}:{}", runtime.session_id, connection_id)
-}
-
-fn tui_send_error(
-    events_tx: &mpsc::UnboundedSender<serde_json::Value>,
-    connection_id: String,
-    error: impl Into<String>,
-) {
-    let _ = events_tx.send(serde_json::json!({
-        "t": "tui_error",
-        "connection_id": connection_id,
-        "error": error.into(),
-    }));
-}
-
-fn dashboard_tui_output_frame(connection_id: &str, message: &str) -> Option<serde_json::Value> {
-    let mut value = serde_json::from_str::<serde_json::Value>(message).ok()?;
-    let serde_json::Value::Object(ref mut object) = value else {
-        return None;
-    };
-    if object.get("t").and_then(|value| value.as_str()) != Some("term") {
-        return None;
-    }
-    object.insert("t".to_string(), serde_json::json!("tui_term"));
-    object.insert(
-        "connection_id".to_string(),
-        serde_json::json!(connection_id),
-    );
-    if let Some(data) = object.get("d").cloned() {
-        object.insert("base64".to_string(), data);
-    }
-    Some(value)
-}
-
-fn control_tui_subscribe_frame(
-    frame: serde_json::Value,
-    runtime: &ControlRuntime,
-    terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
-    tui_connections: &mut HashMap<String, DashboardTuiConnection>,
-) -> Option<serde_json::Value> {
-    let connection_id = tui_frame_connection_id(&frame);
-    let cols = terminal_frame_dimension(&frame, "cols", 80);
-    let rows = terminal_frame_dimension(&frame, "rows", 24);
-    let Some(web_tui_tx) = runtime.web_tui_tx.as_ref() else {
-        tui_send_error(
-            terminal_events_tx,
-            connection_id,
-            "web tui renderer is not available",
-        );
-        return None;
-    };
-
-    if !tui_connections.contains_key(&connection_id) {
-        let internal_id = tui_internal_connection_id(runtime, &connection_id);
-        let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<String>();
-        let outbound_tx = terminal_events_tx.clone();
-        let outbound_connection_id = connection_id.clone();
-        let forwarder = tokio::spawn(async move {
-            while let Some(message) = direct_rx.recv().await {
-                let Some(frame) = dashboard_tui_output_frame(&outbound_connection_id, &message)
-                else {
-                    continue;
-                };
-                if outbound_tx.send(frame).is_err() {
-                    break;
-                }
-            }
-        });
-        if web_tui_tx
-            .send(crate::tui::web::WebTuiCommand::AddConnection {
-                id: internal_id.clone(),
-                direct_tx,
-                cols,
-                rows,
-            })
-            .is_err()
-        {
-            forwarder.abort();
-            tui_send_error(
-                terminal_events_tx,
-                connection_id,
-                "web tui command loop is closed",
-            );
-            return None;
-        }
-        tui_connections.insert(
-            connection_id.clone(),
-            DashboardTuiConnection {
-                internal_id,
-                forwarder,
-            },
-        );
-    }
-
-    if let Some(conn) = tui_connections.get(&connection_id) {
-        let _ = web_tui_tx.send(crate::tui::web::WebTuiCommand::Resize {
-            id: conn.internal_id.clone(),
-            cols,
-            rows,
-        });
-        let _ = web_tui_tx.send(crate::tui::web::WebTuiCommand::Subscribe {
-            id: conn.internal_id.clone(),
-        });
-    }
-    None
-}
-
-fn control_tui_key_frame(
-    frame: serde_json::Value,
-    runtime: &ControlRuntime,
-    tui_connections: &HashMap<String, DashboardTuiConnection>,
-) -> Option<serde_json::Value> {
-    let connection_id = tui_frame_connection_id(&frame);
-    let conn = tui_connections.get(&connection_id)?;
-    let key = crate::tui::web::parse_web_key(&frame)?;
-    if let Some(web_tui_tx) = runtime.web_tui_tx.as_ref() {
-        let _ = web_tui_tx.send(crate::tui::web::WebTuiCommand::Key {
-            id: conn.internal_id.clone(),
-            key,
-        });
-    }
-    None
-}
-
-fn control_tui_resize_frame(
-    frame: serde_json::Value,
-    runtime: &ControlRuntime,
-    tui_connections: &HashMap<String, DashboardTuiConnection>,
-) -> Option<serde_json::Value> {
-    let connection_id = tui_frame_connection_id(&frame);
-    let conn = tui_connections.get(&connection_id)?;
-    let cols = terminal_frame_dimension(&frame, "cols", 80);
-    let rows = terminal_frame_dimension(&frame, "rows", 24);
-    if let Some(web_tui_tx) = runtime.web_tui_tx.as_ref() {
-        let _ = web_tui_tx.send(crate::tui::web::WebTuiCommand::Resize {
-            id: conn.internal_id.clone(),
-            cols,
-            rows,
-        });
-    }
-    None
-}
-
-fn control_tui_unsubscribe_frame(
-    frame: serde_json::Value,
-    runtime: &ControlRuntime,
-    tui_connections: &HashMap<String, DashboardTuiConnection>,
-) -> Option<serde_json::Value> {
-    let connection_id = tui_frame_connection_id(&frame);
-    let conn = tui_connections.get(&connection_id)?;
-    if let Some(web_tui_tx) = runtime.web_tui_tx.as_ref() {
-        let _ = web_tui_tx.send(crate::tui::web::WebTuiCommand::Unsubscribe {
-            id: conn.internal_id.clone(),
-        });
-    }
-    None
-}
-
-fn control_tui_close_frame(
-    frame: serde_json::Value,
-    runtime: &ControlRuntime,
-    tui_connections: &mut HashMap<String, DashboardTuiConnection>,
-) -> Option<serde_json::Value> {
-    let connection_id = tui_frame_connection_id(&frame);
-    let conn = tui_connections.remove(&connection_id)?;
-    let DashboardTuiConnection {
-        internal_id,
-        forwarder,
-    } = conn;
-    if let Some(web_tui_tx) = runtime.web_tui_tx.as_ref() {
-        let _ =
-            web_tui_tx.send(crate::tui::web::WebTuiCommand::RemoveConnection { id: internal_id });
-    }
-    forwarder.abort();
-    None
-}
-
-async fn close_dashboard_tui_connections(
-    runtime: &ControlRuntime,
-    tui_connections: &mut HashMap<String, DashboardTuiConnection>,
-) {
-    let web_tui_tx = runtime.web_tui_tx.as_ref();
-    for (_, conn) in tui_connections.drain() {
-        let DashboardTuiConnection {
-            internal_id,
-            forwarder,
-        } = conn;
-        if let Some(web_tui_tx) = web_tui_tx {
-            let _ = web_tui_tx
-                .send(crate::tui::web::WebTuiCommand::RemoveConnection { id: internal_id });
-        }
-        forwarder.abort();
-        let _ = forwarder.await;
-    }
-}
-
 fn control_presence_frame(
     frame: serde_json::Value,
     runtime: ControlRuntime,
@@ -4652,7 +4416,6 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
             fs_write || session_manage || runtime_control,
         ),
         ("terminal_frames_available", terminal),
-        ("tui_frames_available", runtime.web_tui_tx.is_some()),
         ("presence_frames_available", message),
         (
             "presence_active_handoff_available",
@@ -10513,7 +10276,6 @@ mod tests {
             terminal_registry: Arc::new(crate::terminal::TerminalRegistry::new(
                 std::env::temp_dir(),
             )),
-            web_tui_tx: None,
             task_tx: None,
             bootstrap_caches: DashboardBootstrapCaches::default(),
             display_authority: None,
@@ -10608,7 +10370,6 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
-        let mut tui_connections: HashMap<String, DashboardTuiConnection> = HashMap::new();
         control_frame_response(
             text,
             runtime,
@@ -10618,7 +10379,6 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
-            &mut tui_connections,
         )
     }
 
@@ -12327,7 +12087,6 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
-        let mut tui_connections = HashMap::new();
         let bytes = b"hello upload";
         let first = &bytes[..6];
         let second = &bytes[6..];
@@ -12354,7 +12113,6 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
-            &mut tui_connections,
         )
         .is_none());
         assert!(pending.contains_key("up1"));
@@ -12375,7 +12133,6 @@ mod tests {
                 &mut inbound_uploads,
                 &terminal_tx,
                 &mut terminal_forwarders,
-                &mut tui_connections,
             )
             .is_none());
         }
@@ -12394,7 +12151,6 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
-            &mut tui_connections,
         )
         .is_none());
 
@@ -12543,7 +12299,6 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
-        let mut tui_connections = HashMap::new();
 
         let start = serde_json::json!({
             "t": "upload_start",
@@ -12567,7 +12322,6 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
-            &mut tui_connections,
         )
         .is_none());
         assert!(pending.contains_key("up-empty"));
@@ -12586,7 +12340,6 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
-            &mut tui_connections,
         )
         .is_none());
 
@@ -12617,7 +12370,6 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, mut terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
-        let mut tui_connections = HashMap::new();
         let terminal_id = "dash-control-test-shell";
 
         let open = serde_json::json!({
@@ -12636,7 +12388,6 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
-            &mut tui_connections,
         )
         .is_none());
 
@@ -12664,7 +12415,6 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
-            &mut tui_connections,
         )
         .is_none());
 
@@ -12706,106 +12456,10 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
-            &mut tui_connections,
         );
         for (_, handle) in terminal_forwarders {
             handle.abort();
         }
-    }
-
-    #[tokio::test]
-    async fn tui_frames_bridge_web_tui_output() {
-        let mut rt = runtime();
-        let (web_tui_tx, mut web_tui_rx) =
-            mpsc::unbounded_channel::<crate::tui::web::WebTuiCommand>();
-        rt.web_tui_tx = Some(web_tui_tx);
-        let (task_tx, _task_rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
-        let mut outbound = OutboundControlQueue::new();
-        let mut inbound_uploads = HashMap::new();
-        let (terminal_tx, mut terminal_rx) = mpsc::unbounded_channel();
-        let mut terminal_forwarders = HashMap::new();
-        let mut tui_connections = HashMap::new();
-        let connection_id = "dashboard-tui-test";
-
-        let status = status_response_frame("status1".to_string(), &rt);
-        assert_eq!(status["result"]["tui_frames_available"], true);
-
-        let subscribe = serde_json::json!({
-            "t": "tui_subscribe",
-            "connection_id": connection_id,
-            "cols": 100,
-            "rows": 30,
-        });
-        assert!(control_frame_response(
-            &subscribe.to_string(),
-            &mut rt,
-            &task_tx,
-            &mut pending,
-            &mut outbound,
-            &mut inbound_uploads,
-            &terminal_tx,
-            &mut terminal_forwarders,
-            &mut tui_connections,
-        )
-        .is_none());
-
-        let command = tokio::time::timeout(Duration::from_secs(1), web_tui_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let direct_tx = match command {
-            crate::tui::web::WebTuiCommand::AddConnection {
-                id,
-                direct_tx,
-                cols,
-                rows,
-            } => {
-                assert_eq!(cols, 100);
-                assert_eq!(rows, 30);
-                assert!(id.contains(connection_id));
-                direct_tx
-            }
-            _ => panic!("expected AddConnection"),
-        };
-        direct_tx
-            .send(
-                serde_json::json!({
-                    "t": "term",
-                    "d": base64::engine::general_purpose::STANDARD.encode(b"tui frame bytes"),
-                })
-                .to_string(),
-            )
-            .unwrap();
-
-        let forwarded = tokio::time::timeout(Duration::from_secs(1), terminal_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(forwarded["t"], "tui_term");
-        assert_eq!(forwarded["connection_id"], connection_id);
-        assert_eq!(forwarded["base64"], forwarded["d"]);
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(forwarded["base64"].as_str().unwrap())
-            .unwrap();
-        assert_eq!(decoded, b"tui frame bytes");
-
-        let close = serde_json::json!({
-            "t": "tui_close",
-            "connection_id": connection_id,
-        });
-        let _ = control_frame_response(
-            &close.to_string(),
-            &mut rt,
-            &task_tx,
-            &mut pending,
-            &mut outbound,
-            &mut inbound_uploads,
-            &terminal_tx,
-            &mut terminal_forwarders,
-            &mut tui_connections,
-        );
-        assert!(tui_connections.is_empty());
     }
 
     #[tokio::test]
@@ -13641,7 +13295,6 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
-        let mut tui_connections: HashMap<String, DashboardTuiConnection> = HashMap::new();
         let mut frame = |text: &str,
                          rt: &mut ControlRuntime,
                          pending: &mut HashMap<String, CancellationToken>,
@@ -13656,7 +13309,6 @@ mod tests {
                 inbound,
                 &terminal_tx,
                 &mut terminal_forwarders,
-                &mut tui_connections,
             )
         };
 

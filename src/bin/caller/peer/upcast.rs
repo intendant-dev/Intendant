@@ -276,8 +276,7 @@ impl AppEventUpcaster {
     pub fn upcast(&mut self, event: &AppEvent) -> Vec<PeerEvent> {
         match event {
             // ---- Dropped internal events ----
-            AppEvent::Key(_)
-            | AppEvent::Resize(_, _)
+            AppEvent::Resize(_, _)
             | AppEvent::Tick
             | AppEvent::ControlCommand(_)
             | AppEvent::DisplayMetrics { .. }

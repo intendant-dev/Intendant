@@ -2891,36 +2891,6 @@
   min-height: 0;
   min-width: 0;
 }
-.terminal-container.terminal-container-disabled {
-  visibility: hidden;
-}
-/* Idle notice for the TUI mirror: absolute overlay so xterm's fit()
-   geometry is untouched; pointer-events none so clicks reach the term.
-   Below .terminal-unavailable (z-index 2), which must stay on top. */
-.tui-empty-overlay {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  align-content: center;
-  pointer-events: none;
-}
-.terminal-unavailable {
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: var(--base);
-  color: var(--subtext0);
-  border: 1px solid var(--surface0);
-  border-radius: 6px;
-  font-family: 'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace;
-  font-size: 13px;
-  line-height: 1.5;
-  text-align: center;
-}
 
 .shell-toolbar {
   flex-shrink: 0;

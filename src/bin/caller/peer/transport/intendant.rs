@@ -644,7 +644,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),

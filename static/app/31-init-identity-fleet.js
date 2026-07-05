@@ -505,10 +505,6 @@ let spinnerIdx = 0;
 let spinnerInterval = null;
 
 // Terminal (lazy)
-let term = null;
-let fitAddon = null;
-let termInitialized = false;
-let termBuffer = [];
 
 // Multi-host: stable identity of the daemon serving this dashboard.
 // Resolved from the Agent Card at startup.

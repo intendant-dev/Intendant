@@ -22,13 +22,17 @@ pub struct SkillConfig {
     pub name: String,
     pub description: String,
     /// Override session autonomy level when this skill is active.
+    /// Parsed frontmatter contract; the TUI skills panel was its last
+    /// reader — enforcement/surfacing is future skills-system work.
     #[serde(default)]
+    #[allow(dead_code)]
     pub autonomy: Option<String>,
     /// If true, the model cannot auto-invoke this skill — user must trigger it.
     #[serde(default, alias = "disable-auto-invocation")]
     pub disable_auto_invocation: bool,
-    /// Override session sandbox setting.
+    /// Override session sandbox setting. Same status as `autonomy` above.
     #[serde(default)]
+    #[allow(dead_code)]
     pub sandbox: Option<bool>,
 }
 
@@ -47,8 +51,11 @@ pub struct Skill {
     pub config: SkillConfig,
     /// Markdown instructions after the frontmatter.
     pub body: String,
-    /// Path to the SKILL.md file.
+    /// Provenance, kept for future surfacing (the TUI skills panel was
+    /// the last display of these).
+    #[allow(dead_code)]
     pub source_path: PathBuf,
+    #[allow(dead_code)]
     pub source: SkillSource,
 }
 

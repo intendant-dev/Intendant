@@ -46,6 +46,24 @@ use crate::FollowUpMessage;
 
 const CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT: f64 = 85.0;
 const DENSITY_MAINTENANCE_ANCHOR_LIST_LIMIT: usize = 1;
+
+/// Formats agent stdout/stderr into one log entry for the MCP log surface.
+///
+/// Delegates parsing to the shared `presence_core::format_agent_output`
+/// (which replaces embedded base64 images with `[mime/type N KB]` markers),
+/// then appends a `[stderr] ...` tail if the raw stderr is non-empty.
+fn format_agent_output_with_stderr(stdout: &str, stderr: &str) -> String {
+    let mut text = presence_core::format_agent_output(stdout).text;
+    if !stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("[stderr] ");
+        text.push_str(stderr.trim());
+    }
+    text
+}
+
 // ---------------------------------------------------------------------------
 // Task launcher: allows MCP to start agent loops on demand
 // ---------------------------------------------------------------------------
@@ -5360,7 +5378,6 @@ pub fn spawn_event_listener(
                 // Exhaustive match — no wildcard. Adding a new AppEvent variant
                 // will cause a compile error here, enforcing parity.
                 match event {
-                    AppEvent::Key(_) => {} // MCP doesn't handle key events
                     AppEvent::Resize(_, _) => {}
                     AppEvent::LogEntry { .. }
                     | AppEvent::UserMessageRewind { .. }
@@ -5640,8 +5657,7 @@ pub fn spawn_event_listener(
                             Phase::RunningAgent,
                             None,
                         );
-                        let formatted =
-                            crate::tui::app::format_agent_output_for_tui(&stdout, &stderr);
+                        let formatted = format_agent_output_with_stderr(&stdout, &stderr);
                         if !formatted.is_empty() {
                             let level = if !stderr.is_empty() {
                                 LogLevel::Warn

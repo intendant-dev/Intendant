@@ -675,20 +675,6 @@ async function main() {
   app.set_on_server_state((connected) => {
     setServerWebSocketStatus(connected);
     dashboardUpdateTransportStatus();
-    if (connected) {
-      // Fresh WS sessions start unsubscribed on the server. Reassert
-      // our local subscription state so reloads / reconnects restore
-      // frame flow to a Terminal-tab view without requiring the user
-      // to toggle tabs. termSubscribed is reset to false first so
-      // updateTermSubscription() sends the message; the server would
-      // otherwise see no-op cycles across reconnect.
-      termSubscribed = false;
-      updateTermSubscription();
-    } else {
-      // Server lost — mark the local state unsubscribed so the next
-      // onopen re-sends.
-      termSubscribed = false;
-    }
   });
 
   // ── Voice Callbacks ──

@@ -127,29 +127,8 @@ function setTerminalPaneAccessible(pane, active) {
   }
 }
 
-function tuiAvailabilityNoticeText() {
-  if (!dashboardConnectModeEnabled() || dashboardTuiFramesAvailable()) return '';
-  if (!dashboardTransport?.canUseRpc?.()) return 'Checking TUI access...';
-  if (dashboardControlTransport?.lastStatus?.tui_frames_available === false) {
-    return 'TUI unavailable for this daemon';
-  }
-  return 'Checking TUI availability...';
-}
-
-function syncTuiAvailabilityNotice() {
-  const notice = document.getElementById('terminal-tui-unavailable');
-  const container = document.getElementById('terminal-container');
-  if (!notice) return;
-  const text = tuiAvailabilityNoticeText();
-  notice.textContent = text;
-  notice.classList.toggle('hidden', !text);
-  if (container) container.classList.toggle('terminal-container-disabled', Boolean(text));
-}
-
 function syncTerminalPaneAccessibility() {
-  setTerminalPaneAccessible(document.getElementById('term-pane-tui'), activeTermSubtab === 'tui');
   setTerminalPaneAccessible(document.getElementById('term-pane-shell'), activeTermSubtab === 'shell');
-  syncTuiAvailabilityNotice();
 }
 
 // Encode a string as base64 (UTF-8 safe).
@@ -582,92 +561,9 @@ function sendShellResize(cols, rows, options = {}) {
   });
 }
 
-const TUI_CONNECTION_ID = `tui-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-
-function sendTuiKey(domEvent) {
-  if (dashboardTuiFramesAvailable() && dashboardTransport.tuiFrame({
-    t: 'tui_key',
-    connection_id: TUI_CONNECTION_ID,
-    key: domEvent.key,
-    ctrl: domEvent.ctrlKey,
-    alt: domEvent.altKey,
-    shift: domEvent.shiftKey,
-  })) {
-    return;
-  }
-  if (dashboardConnectModeEnabled()) return;
-  if (app?.send_key) {
-    app.send_key(domEvent.key, domEvent.ctrlKey, domEvent.altKey, domEvent.shiftKey);
-  }
-}
-
-function sendTuiResize(cols, rows) {
-  if (dashboardTuiFramesAvailable() && dashboardTransport.tuiFrame({
-    t: 'tui_resize',
-    connection_id: TUI_CONNECTION_ID,
-    cols,
-    rows,
-  })) {
-    return;
-  }
-  if (dashboardConnectModeEnabled()) return;
-  if (app?.send_resize) app.send_resize(cols, rows);
-}
-
-function initTerminal() {
-  if (termInitialized) return;
-  termInitialized = true;
-  document.getElementById('xterm-css').removeAttribute('disabled');
-  const script = document.createElement('script');
-  script.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js';
-  script.integrity = 'sha384-J4qzUjBl1FxyLsl/kQPQIOeINsmp17OHYXDOMpMxlKX53ZfYsL+aWHpgArvOuof9';
-  script.crossOrigin = 'anonymous';
-  script.onload = () => {
-    const fitScript = document.createElement('script');
-    fitScript.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js';
-    fitScript.integrity = 'sha384-UwMkGaBqfOcrTjPjXdAPWrGQkhpxTJ21vKtTwLb6wBpBM8HQXKAiUuwVJfgY0Yw6';
-    fitScript.crossOrigin = 'anonymous';
-    fitScript.onload = () => {
-      term = new Terminal({
-        theme: {
-          background: '#1e1e2e', foreground: '#cdd6f4', cursor: '#f5e0dc', cursorAccent: '#1e1e2e',
-          selectionBackground: '#45475a',
-          black: '#45475a', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
-          blue: '#89b4fa', magenta: '#cba6f7', cyan: '#94e2d5', white: '#bac2de',
-          brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
-          brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#cba6f7',
-          brightCyan: '#94e2d5', brightWhite: '#a6adc8',
-        },
-        fontFamily: "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
-        fontSize: 13, allowProposedApi: true,
-      });
-      fitAddon = new FitAddon.FitAddon();
-      term.loadAddon(fitAddon);
-      term.open(document.getElementById('terminal-container'));
-      syncTerminalPaneAccessibility();
-      fitAddon.fit();
-      term.onKey(({ domEvent }) => {
-        sendTuiKey(domEvent);
-      });
-      for (const b64 of termBuffer) {
-        term.write(base64ToBytes(b64));
-      }
-      if (termBuffer.length) hideTuiEmptyState();
-      termBuffer = [];
-      new ResizeObserver(() => {
-        if (fitAddon && activeTab === 'terminal' && activeTermSubtab === 'tui') fitAddon.fit();
-      }).observe(document.getElementById('terminal-container'));
-      term.onResize(({ cols, rows }) => sendTuiResize(cols, rows));
-    };
-    document.head.appendChild(fitScript);
-  };
-  document.head.appendChild(script);
-}
-
-// ── Standalone Shell (lazy xterm.js, separate instance from the TUI) ──
+// ── Standalone Shell (lazy xterm.js) ──
 //
-// Uses the same CDN-hosted xterm.js that the TUI loads, so initShell()
-// only needs to wait if the TUI hasn't loaded the script yet. Sends
+// Loads the CDN-hosted xterm.js on first use. Sends
 // terminal_open / terminal_input / terminal_resize / terminal_close
 // messages to the server; handleShellOutput/handleShellExited receive
 // the reply events.
@@ -675,7 +571,7 @@ function initShell() {
   if (shellInitialized) return;
   shellInitialized = true;
 
-  // Ensure xterm.js is loaded (may already be loaded by initTerminal).
+  // Ensure the xterm.js stylesheet is active.
   document.getElementById('xterm-css').removeAttribute('disabled');
 
   const start = () => {
@@ -724,8 +620,8 @@ function initShell() {
     openShellSessionIfPossible();
   };
 
-  // If xterm.js is already loaded (e.g. TUI tab was opened first), start
-  // immediately. Otherwise load it and its fit addon, then start.
+  // If xterm.js is already loaded, start immediately. Otherwise load it
+  // and its fit addon, then start.
   if (typeof Terminal !== 'undefined' && typeof FitAddon !== 'undefined') {
     start();
     return;
@@ -748,7 +644,6 @@ function initShell() {
 function switchTerminalSubtab(name) {
   if (activeTermSubtab === name) {
     syncTerminalPaneAccessibility();
-    updateTermSubscription();
     return;
   }
   activeTermSubtab = name;
@@ -767,81 +662,8 @@ function switchTerminalSubtab(name) {
       if (shellFitAddon) requestAnimationFrame(() => shellFitAddon.fit());
       openShellSessionIfPossible();
     }
-  } else if (name === 'tui' && fitAddon) {
-    requestAnimationFrame(() => fitAddon.fit());
   }
   syncTerminalPaneAccessibility();
-  // Only the TUI sub-tab consumes ratatui frames. Switching between
-  // TUI and Shell flips the server-side subscription so the Shell
-  // sub-tab doesn't receive term frames it wouldn't render.
-  updateTermSubscription();
-}
-
-// ── Terminal-frame subscription ──
-//
-// The server (intendant's `WebTui`) only emits `{"t":"term",...}` frames
-// when the connection is subscribed. We subscribe exactly when the
-// Terminal tab's TUI sub-tab is visible; otherwise we unsubscribe so
-// WebTui stops rendering for this connection entirely. Disconnecting
-// the WebSocket implicitly unsubscribes (the connection is removed).
-let termSubscribed = false;
-let termSubscriptionTransport = '';
-
-function preferredTuiTransport() {
-  if (dashboardConnectModeEnabled() && !dashboardTuiFramesAvailable()) return 'none';
-  return dashboardTuiFramesAvailable() ? 'webrtc' : 'websocket';
-}
-
-function sendTuiSubscriptionFrame(wantSubscribed, transport) {
-  if (transport === 'webrtc') {
-    return dashboardTransport.tuiFrame({
-      t: wantSubscribed ? 'tui_subscribe' : 'tui_unsubscribe',
-      connection_id: TUI_CONNECTION_ID,
-      cols: term?.cols || 80,
-      rows: term?.rows || 24,
-    });
-  }
-  if (transport === 'websocket') {
-    return sendRawMessage({ t: wantSubscribed ? 'term_subscribe' : 'term_unsubscribe' });
-  }
-  return false;
-}
-
-function updateTermSubscription(force = false) {
-  const wantSubscribed = activeTab === 'terminal' && activeTermSubtab === 'tui';
-  const transport = wantSubscribed
-    ? preferredTuiTransport()
-    : (termSubscriptionTransport || preferredTuiTransport());
-  if (
-    !force &&
-    wantSubscribed === termSubscribed &&
-    (!wantSubscribed || termSubscriptionTransport === transport)
-  ) {
-    return;
-  }
-  if (termSubscribed && termSubscriptionTransport && termSubscriptionTransport !== transport) {
-    sendTuiSubscriptionFrame(false, termSubscriptionTransport);
-  }
-  termSubscribed = wantSubscribed;
-  if (wantSubscribed) {
-    termSubscriptionTransport = transport;
-    const sent = sendTuiSubscriptionFrame(true, transport);
-    if (!sent && transport === 'webrtc') {
-      termSubscriptionTransport = 'websocket';
-      if (!sendTuiSubscriptionFrame(true, 'websocket')) {
-        termSubscribed = false;
-        termSubscriptionTransport = '';
-      }
-    } else if (!sent) {
-      termSubscribed = false;
-      termSubscriptionTransport = '';
-    }
-  } else {
-    if (termSubscriptionTransport) {
-      sendTuiSubscriptionFrame(false, termSubscriptionTransport);
-    }
-    termSubscriptionTransport = '';
-  }
 }
 
 // ── Shell key bar ──

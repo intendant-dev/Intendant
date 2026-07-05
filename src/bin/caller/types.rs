@@ -55,38 +55,12 @@ pub enum Verbosity {
 }
 
 impl Verbosity {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Quiet => Self::Normal,
-            Self::Normal => Self::Verbose,
-            Self::Verbose => Self::Debug,
-            Self::Debug => Self::Quiet,
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Quiet => "Quiet",
             Self::Normal => "Normal",
             Self::Verbose => "Verbose",
             Self::Debug => "Debug",
-        }
-    }
-
-    pub fn includes(self, level: &LogLevel) -> bool {
-        match self {
-            Self::Quiet => matches!(level, LogLevel::Warn | LogLevel::Error),
-            Self::Normal => matches!(
-                level,
-                LogLevel::Info
-                    | LogLevel::Model
-                    | LogLevel::Agent
-                    | LogLevel::Warn
-                    | LogLevel::Error
-                    | LogLevel::SubAgent
-            ),
-            Self::Verbose => !matches!(level, LogLevel::Debug),
-            Self::Debug => true,
         }
     }
 

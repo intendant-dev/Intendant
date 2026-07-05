@@ -9626,36 +9626,6 @@ body.context-focus-active {
   min-height: 0;
   min-width: 0;
 }
-.terminal-container.terminal-container-disabled {
-  visibility: hidden;
-}
-/* Idle notice for the TUI mirror: absolute overlay so xterm's fit()
-   geometry is untouched; pointer-events none so clicks reach the term.
-   Below .terminal-unavailable (z-index 2), which must stay on top. */
-.tui-empty-overlay {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  align-content: center;
-  pointer-events: none;
-}
-.terminal-unavailable {
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: var(--base);
-  color: var(--subtext0);
-  border: 1px solid var(--surface0);
-  border-radius: 6px;
-  font-family: 'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace;
-  font-size: 13px;
-  line-height: 1.5;
-  text-align: center;
-}
 
 .shell-toolbar {
   flex-shrink: 0;
@@ -11742,7 +11712,7 @@ body.display-fullscreen-open {
   <nav class="tab-bar">
     <button class="tab-btn active" data-tab="activity" title="Live agent log plus context, managed-context, changes, and control sub-tabs">Activity<span class="badge" id="badge-activity"></span></button>
     <button class="tab-btn" data-tab="stats" title="Token usage, cost, and provider statistics per host">Stats</button>
-    <button class="tab-btn" data-tab="terminal" title="Agent TUI mirror and an interactive shell">Terminal</button>
+    <button class="tab-btn" data-tab="terminal" title="Interactive shell on this daemon">Terminal</button>
     <button class="tab-btn" data-tab="displays" title="Live display streams — local screens and connected peers">Video</button>
     <button class="tab-btn" data-tab="station" title="Station — the rendered control center (WebGPU canvas)">Station</button>
     <button class="tab-btn" data-tab="sessions" title="Browse, search, resume, and launch sessions">Sessions</button>
@@ -12534,27 +12504,11 @@ body.display-fullscreen-open {
     <!-- Terminal Tab -->
     <div id="tab-terminal" class="tab-pane">
       <div class="subtabs">
-        <button class="subtab-btn active" data-term-tab="tui">TUI</button>
-        <button class="subtab-btn" data-term-tab="shell">Shell</button>
+        <button class="subtab-btn active" data-term-tab="shell">Shell</button>
         <button class="keybar-toggle" id="keybar-toggle" title="Show/hide the special-key bar (Esc, Tab, Ctrl, arrows, …)">Keys</button>
       </div>
       <div class="subtab-panes">
-        <div class="subtab-pane active" id="term-pane-tui">
-          <div class="terminal-container" id="terminal-container"></div>
-          <div class="ui-empty tui-empty-overlay" id="tui-empty-state" aria-hidden="true">
-            <div class="ui-empty-glyph">
-              <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="2.5" y="4" width="19" height="16" rx="2"/>
-                <path d="M6.5 9.5l3.5 3-3.5 3"/>
-                <path d="M12.5 15.5h5"/>
-              </svg>
-            </div>
-            <div class="ui-empty-title">TUI mirror idle</div>
-            <div class="ui-empty-hint">The agent's terminal appears here while a session is active. Use the Shell subtab for an interactive shell on this daemon.</div>
-          </div>
-          <div class="terminal-unavailable hidden" id="terminal-tui-unavailable" role="status" aria-live="polite"></div>
-        </div>
-        <div class="subtab-pane" id="term-pane-shell">
+        <div class="subtab-pane active" id="term-pane-shell">
           <div class="shell-toolbar">
             <label for="shell-host-select">Target</label>
             <select id="shell-host-select" title="Shell target"></select>
@@ -14818,10 +14772,6 @@ let spinnerIdx = 0;
 let spinnerInterval = null;
 
 // Terminal (lazy)
-let term = null;
-let fitAddon = null;
-let termInitialized = false;
-let termBuffer = [];
 
 // Multi-host: stable identity of the daemon serving this dashboard.
 // Resolved from the Agent Card at startup.
@@ -18042,7 +17992,7 @@ let shellQueuedInput = '';
 let shellWaitingNoticeShown = false;
 let shellPendingResize = null;
 const SHELL_QUEUED_INPUT_MAX_BYTES = 64 * 1024;
-let activeTermSubtab = 'tui';
+let activeTermSubtab = 'shell';
 
 // Files editor state. Declared here, far above the editor's functions,
 // because a #files deep link applies the route synchronously while the
@@ -25658,20 +25608,6 @@ async function main() {
   app.set_on_server_state((connected) => {
     setServerWebSocketStatus(connected);
     dashboardUpdateTransportStatus();
-    if (connected) {
-      // Fresh WS sessions start unsubscribed on the server. Reassert
-      // our local subscription state so reloads / reconnects restore
-      // frame flow to a Terminal-tab view without requiring the user
-      // to toggle tabs. termSubscribed is reset to false first so
-      // updateTermSubscription() sends the message; the server would
-      // otherwise see no-op cycles across reconnect.
-      termSubscribed = false;
-      updateTermSubscription();
-    } else {
-      // Server lost — mark the local state unsubscribed so the next
-      // onopen re-sends.
-      termSubscribed = false;
-    }
   });
 
   // ── Voice Callbacks ──
@@ -26193,7 +26129,6 @@ function processCommands(cmds) {
       case 'debug_screen_torn_down': onDebugScreenTornDown(); break;
       case 'show_badge': showBadge(c.tab, c.text); break;
       case 'hide_badge': hideBadge(c.tab); break;
-      case 'term_data': handleTermData(c.base64); break;
       case 'set_connected':
         if (dashboardConnectModeEnabled()) {
           setConnectEventStatus(
@@ -38516,24 +38451,6 @@ function base64ToBytes(base64data) {
   return bytes;
 }
 
-// The idle overlay stays until the first mirror frame proves a TUI is
-// attached; it never comes back for the life of the page.
-function hideTuiEmptyState() {
-  document.getElementById('tui-empty-state')?.classList.add('hidden');
-}
-
-function handleTermData(base64data) {
-  hideTuiEmptyState();
-  if (term) {
-    term.write(base64ToBytes(base64data));
-  } else {
-    termBuffer.push(base64data);
-    // Frames buffered before xterm initializes; keep only a recent tail
-    // (xterm's own scrollback caps what a longer buffer could show).
-    if (termBuffer.length > 500) termBuffer.splice(0, termBuffer.length - 500);
-  }
-}
-
 function currentShellHostId() {
   return String(selectedShellHostId || SHELL_HOST_ID).trim() || SHELL_HOST_ID;
 }
@@ -39856,7 +39773,7 @@ function accessFallbackPermissions() {
     'shell.spawn': ['Shell spawn', 'terminal', 'Create new shell sessions on this daemon.'],
     'settings.manage': ['Settings manage', 'settings', 'Read or write daemon settings and API keys.'],
     'credentials.manage': ['Credentials manage', 'credentials', 'Grant, renew, revoke, and inspect credential leases; register client egress.'],
-    'runtime.control': ['Runtime control', 'runtime', 'Use runtime-control surfaces such as TUI, media, and recording controls.'],
+    'runtime.control': ['Runtime control', 'runtime', 'Use runtime-control surfaces such as media and recording controls.'],
     'filesystem.read': ['Filesystem read', 'filesystem', 'Stat, list, and read files through dashboard APIs.'],
     'filesystem.write': ['Filesystem write', 'filesystem', 'Create directories or write uploaded file content.'],
   };
@@ -43300,29 +43217,8 @@ function setTerminalPaneAccessible(pane, active) {
   }
 }
 
-function tuiAvailabilityNoticeText() {
-  if (!dashboardConnectModeEnabled() || dashboardTuiFramesAvailable()) return '';
-  if (!dashboardTransport?.canUseRpc?.()) return 'Checking TUI access...';
-  if (dashboardControlTransport?.lastStatus?.tui_frames_available === false) {
-    return 'TUI unavailable for this daemon';
-  }
-  return 'Checking TUI availability...';
-}
-
-function syncTuiAvailabilityNotice() {
-  const notice = document.getElementById('terminal-tui-unavailable');
-  const container = document.getElementById('terminal-container');
-  if (!notice) return;
-  const text = tuiAvailabilityNoticeText();
-  notice.textContent = text;
-  notice.classList.toggle('hidden', !text);
-  if (container) container.classList.toggle('terminal-container-disabled', Boolean(text));
-}
-
 function syncTerminalPaneAccessibility() {
-  setTerminalPaneAccessible(document.getElementById('term-pane-tui'), activeTermSubtab === 'tui');
   setTerminalPaneAccessible(document.getElementById('term-pane-shell'), activeTermSubtab === 'shell');
-  syncTuiAvailabilityNotice();
 }
 
 // Encode a string as base64 (UTF-8 safe).
@@ -43755,92 +43651,9 @@ function sendShellResize(cols, rows, options = {}) {
   });
 }
 
-const TUI_CONNECTION_ID = `tui-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-
-function sendTuiKey(domEvent) {
-  if (dashboardTuiFramesAvailable() && dashboardTransport.tuiFrame({
-    t: 'tui_key',
-    connection_id: TUI_CONNECTION_ID,
-    key: domEvent.key,
-    ctrl: domEvent.ctrlKey,
-    alt: domEvent.altKey,
-    shift: domEvent.shiftKey,
-  })) {
-    return;
-  }
-  if (dashboardConnectModeEnabled()) return;
-  if (app?.send_key) {
-    app.send_key(domEvent.key, domEvent.ctrlKey, domEvent.altKey, domEvent.shiftKey);
-  }
-}
-
-function sendTuiResize(cols, rows) {
-  if (dashboardTuiFramesAvailable() && dashboardTransport.tuiFrame({
-    t: 'tui_resize',
-    connection_id: TUI_CONNECTION_ID,
-    cols,
-    rows,
-  })) {
-    return;
-  }
-  if (dashboardConnectModeEnabled()) return;
-  if (app?.send_resize) app.send_resize(cols, rows);
-}
-
-function initTerminal() {
-  if (termInitialized) return;
-  termInitialized = true;
-  document.getElementById('xterm-css').removeAttribute('disabled');
-  const script = document.createElement('script');
-  script.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js';
-  script.integrity = 'sha384-J4qzUjBl1FxyLsl/kQPQIOeINsmp17OHYXDOMpMxlKX53ZfYsL+aWHpgArvOuof9';
-  script.crossOrigin = 'anonymous';
-  script.onload = () => {
-    const fitScript = document.createElement('script');
-    fitScript.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js';
-    fitScript.integrity = 'sha384-UwMkGaBqfOcrTjPjXdAPWrGQkhpxTJ21vKtTwLb6wBpBM8HQXKAiUuwVJfgY0Yw6';
-    fitScript.crossOrigin = 'anonymous';
-    fitScript.onload = () => {
-      term = new Terminal({
-        theme: {
-          background: '#1e1e2e', foreground: '#cdd6f4', cursor: '#f5e0dc', cursorAccent: '#1e1e2e',
-          selectionBackground: '#45475a',
-          black: '#45475a', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
-          blue: '#89b4fa', magenta: '#cba6f7', cyan: '#94e2d5', white: '#bac2de',
-          brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
-          brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#cba6f7',
-          brightCyan: '#94e2d5', brightWhite: '#a6adc8',
-        },
-        fontFamily: "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
-        fontSize: 13, allowProposedApi: true,
-      });
-      fitAddon = new FitAddon.FitAddon();
-      term.loadAddon(fitAddon);
-      term.open(document.getElementById('terminal-container'));
-      syncTerminalPaneAccessibility();
-      fitAddon.fit();
-      term.onKey(({ domEvent }) => {
-        sendTuiKey(domEvent);
-      });
-      for (const b64 of termBuffer) {
-        term.write(base64ToBytes(b64));
-      }
-      if (termBuffer.length) hideTuiEmptyState();
-      termBuffer = [];
-      new ResizeObserver(() => {
-        if (fitAddon && activeTab === 'terminal' && activeTermSubtab === 'tui') fitAddon.fit();
-      }).observe(document.getElementById('terminal-container'));
-      term.onResize(({ cols, rows }) => sendTuiResize(cols, rows));
-    };
-    document.head.appendChild(fitScript);
-  };
-  document.head.appendChild(script);
-}
-
-// ── Standalone Shell (lazy xterm.js, separate instance from the TUI) ──
+// ── Standalone Shell (lazy xterm.js) ──
 //
-// Uses the same CDN-hosted xterm.js that the TUI loads, so initShell()
-// only needs to wait if the TUI hasn't loaded the script yet. Sends
+// Loads the CDN-hosted xterm.js on first use. Sends
 // terminal_open / terminal_input / terminal_resize / terminal_close
 // messages to the server; handleShellOutput/handleShellExited receive
 // the reply events.
@@ -43848,7 +43661,7 @@ function initShell() {
   if (shellInitialized) return;
   shellInitialized = true;
 
-  // Ensure xterm.js is loaded (may already be loaded by initTerminal).
+  // Ensure the xterm.js stylesheet is active.
   document.getElementById('xterm-css').removeAttribute('disabled');
 
   const start = () => {
@@ -43897,8 +43710,8 @@ function initShell() {
     openShellSessionIfPossible();
   };
 
-  // If xterm.js is already loaded (e.g. TUI tab was opened first), start
-  // immediately. Otherwise load it and its fit addon, then start.
+  // If xterm.js is already loaded, start immediately. Otherwise load it
+  // and its fit addon, then start.
   if (typeof Terminal !== 'undefined' && typeof FitAddon !== 'undefined') {
     start();
     return;
@@ -43921,7 +43734,6 @@ function initShell() {
 function switchTerminalSubtab(name) {
   if (activeTermSubtab === name) {
     syncTerminalPaneAccessibility();
-    updateTermSubscription();
     return;
   }
   activeTermSubtab = name;
@@ -43940,81 +43752,8 @@ function switchTerminalSubtab(name) {
       if (shellFitAddon) requestAnimationFrame(() => shellFitAddon.fit());
       openShellSessionIfPossible();
     }
-  } else if (name === 'tui' && fitAddon) {
-    requestAnimationFrame(() => fitAddon.fit());
   }
   syncTerminalPaneAccessibility();
-  // Only the TUI sub-tab consumes ratatui frames. Switching between
-  // TUI and Shell flips the server-side subscription so the Shell
-  // sub-tab doesn't receive term frames it wouldn't render.
-  updateTermSubscription();
-}
-
-// ── Terminal-frame subscription ──
-//
-// The server (intendant's `WebTui`) only emits `{"t":"term",...}` frames
-// when the connection is subscribed. We subscribe exactly when the
-// Terminal tab's TUI sub-tab is visible; otherwise we unsubscribe so
-// WebTui stops rendering for this connection entirely. Disconnecting
-// the WebSocket implicitly unsubscribes (the connection is removed).
-let termSubscribed = false;
-let termSubscriptionTransport = '';
-
-function preferredTuiTransport() {
-  if (dashboardConnectModeEnabled() && !dashboardTuiFramesAvailable()) return 'none';
-  return dashboardTuiFramesAvailable() ? 'webrtc' : 'websocket';
-}
-
-function sendTuiSubscriptionFrame(wantSubscribed, transport) {
-  if (transport === 'webrtc') {
-    return dashboardTransport.tuiFrame({
-      t: wantSubscribed ? 'tui_subscribe' : 'tui_unsubscribe',
-      connection_id: TUI_CONNECTION_ID,
-      cols: term?.cols || 80,
-      rows: term?.rows || 24,
-    });
-  }
-  if (transport === 'websocket') {
-    return sendRawMessage({ t: wantSubscribed ? 'term_subscribe' : 'term_unsubscribe' });
-  }
-  return false;
-}
-
-function updateTermSubscription(force = false) {
-  const wantSubscribed = activeTab === 'terminal' && activeTermSubtab === 'tui';
-  const transport = wantSubscribed
-    ? preferredTuiTransport()
-    : (termSubscriptionTransport || preferredTuiTransport());
-  if (
-    !force &&
-    wantSubscribed === termSubscribed &&
-    (!wantSubscribed || termSubscriptionTransport === transport)
-  ) {
-    return;
-  }
-  if (termSubscribed && termSubscriptionTransport && termSubscriptionTransport !== transport) {
-    sendTuiSubscriptionFrame(false, termSubscriptionTransport);
-  }
-  termSubscribed = wantSubscribed;
-  if (wantSubscribed) {
-    termSubscriptionTransport = transport;
-    const sent = sendTuiSubscriptionFrame(true, transport);
-    if (!sent && transport === 'webrtc') {
-      termSubscriptionTransport = 'websocket';
-      if (!sendTuiSubscriptionFrame(true, 'websocket')) {
-        termSubscribed = false;
-        termSubscriptionTransport = '';
-      }
-    } else if (!sent) {
-      termSubscribed = false;
-      termSubscriptionTransport = '';
-    }
-  } else {
-    if (termSubscriptionTransport) {
-      sendTuiSubscriptionFrame(false, termSubscriptionTransport);
-    }
-    termSubscriptionTransport = '';
-  }
 }
 
 // ── Shell key bar ──
@@ -47321,15 +47060,6 @@ function dashboardTerminalFramesAvailable() {
   );
 }
 
-function dashboardTuiFramesAvailable() {
-  return Boolean(
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.tui_frames_available === true
-  );
-}
-
 async function uploadOneFile(file, destination) {
   if (file.size > UPLOAD_MAX_BYTES) {
     logErrorToActivity(`File too large (${humanBytes(file.size)}): ${file.name}. Cap is ${humanBytes(UPLOAD_MAX_BYTES)}.`);
@@ -48988,7 +48718,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => routeTo(btn.dataset.tab));
 });
 
-// Terminal sub-tab switching (TUI | Shell).
+// Terminal sub-tab switching (Shell).
 document.querySelectorAll('#tab-terminal .subtab-btn[data-term-tab]').forEach(btn => {
   btn.addEventListener('click', () => routeTo('terminal', btn.dataset.termTab));
 });
@@ -49028,7 +48758,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 // URL is the source of truth for which tab + sub-tab is active:
 //   #activity
 //   #stats
-//   #terminal           → defaults to TUI sub-tab
+//   #terminal           → the interactive shell
 //   #terminal/shell     → opens the Shell sub-tab directly
 //   #access/overview    → opens unified access administration
 //   #settings/agent     → opens the Settings tab on the Agent sub-tab
@@ -49046,7 +48776,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 
 const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'debug', 'settings'];
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
-const VALID_TERM_SUBTABS = ['tui', 'shell'];
+const VALID_TERM_SUBTABS = ['shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
 const ACCESS_SUBTAB_ALIASES = {
   targets: 'daemons',
@@ -49236,20 +48966,12 @@ function switchTab(tabId) {
     switchActivitySubtab('log');
   }
   if (tabId === 'terminal') {
-    if (activeTermSubtab === 'tui') {
-      if (!termInitialized) initTerminal();
-      if (term) requestAnimationFrame(() => fitAddon && fitAddon.fit());
-    } else if (activeTermSubtab === 'shell') {
+    if (activeTermSubtab === 'shell') {
       if (!shellInitialized) initShell();
       if (shellTerm) requestAnimationFrame(() => shellFitAddon && shellFitAddon.fit());
     }
     syncTerminalPaneAccessibility();
   }
-  // Gate the server's ratatui frame stream on whether the user is
-  // actually looking at the TUI terminal. Every other tab keeps the
-  // WebSocket quiet, which is what prevents the render firehose from
-  // back-pressuring outbound control messages.
-  updateTermSubscription();
   if (tabId === 'activity' || tabId === 'displays') {
     relocateDisplays(tabId);
   }
@@ -51224,7 +50946,6 @@ function dashboardUpdateTransportStatus() {
     renderDashboardTargetSummaries();
     refreshFilesDownloadAvailability();
     if (activeTab === 'files') refreshFilesTransferJobs();
-    syncTuiAvailabilityNotice();
     maybeOpenShellAfterTransportReady();
     return;
   }
@@ -51241,7 +50962,6 @@ function dashboardUpdateTransportStatus() {
   renderDashboardTargetSummaries();
   refreshFilesDownloadAvailability();
   if (activeTab === 'files') refreshFilesTransferJobs();
-  syncTuiAvailabilityNotice();
   maybeOpenShellAfterTransportReady();
 }
 
@@ -51337,7 +51057,6 @@ function connectHealthState(statusArg = null, summaryArg = null) {
     { id: 'uploads', label: 'Uploads', value: status.uploadFramesAvailable },
     { id: 'fs-read', label: 'Filesystem read', value: status.apiFsReadAvailable },
     { id: 'presence', label: 'Presence frames', value: status.presenceFramesAvailable },
-    { id: 'tui', label: 'TUI frames', value: status.tuiFramesAvailable },
   ];
   const rows = [
     { label: 'Mode', value: modeLabel, kind: connectMode || status.enabled ? 'ok' : 'warn' },
@@ -51473,16 +51192,6 @@ function connectSelfTestSpecs() {
         result.releaseResult === false &&
         result.requestReplayCount === 0 &&
         result.releaseReplayCount === 0,
-    },
-    {
-      id: 'tui',
-      label: 'TUI controls do not use WebSocket fallback',
-      probe: '_debugProbeTuiConnectNoLegacy',
-      pass: result =>
-        result.keyReplayCount === 0 &&
-        result.resizeReplayCount === 0 &&
-        result.wsReplayCount === 0 &&
-        result.subscriptionSent === false,
     },
     {
       id: 'shell-open-ack',
@@ -51760,7 +51469,6 @@ class DashboardTransport {
         if (status && typeof status === 'object') {
           dashboardControlTransport.lastStatus = status;
           dashboardUpdateTransportStatus();
-          updateTermSubscription(true);
         }
         return status;
       });
@@ -51785,11 +51493,6 @@ class DashboardTransport {
   terminalFrame(frame) {
     if (!this.canUseRpc()) return false;
     return dashboardControlTransport.terminalFrame(frame);
-  }
-
-  tuiFrame(frame) {
-    if (!this.canUseRpc()) return false;
-    return dashboardControlTransport.tuiFrame(frame);
   }
 
   presenceFrame(frame) {
@@ -52678,59 +52381,6 @@ window.intendantDashboardControl = {
       releaseReplayCount,
     };
   },
-  _debugProbeTuiConnectNoLegacy() {
-    if (
-      !dashboardConnectModeEnabled() ||
-      typeof sendTuiKey !== 'function' ||
-      typeof sendTuiResize !== 'function' ||
-      typeof sendTuiSubscriptionFrame !== 'function' ||
-      !dashboardControlTransport
-    ) {
-      return {
-        skipped: true,
-        connectMode: dashboardConnectModeEnabled(),
-        sendKeyType: typeof sendTuiKey,
-        sendResizeType: typeof sendTuiResize,
-        subscriptionType: typeof sendTuiSubscriptionFrame,
-        hasControlTransport: Boolean(dashboardControlTransport),
-        keyReplayCount: 0,
-        resizeReplayCount: 0,
-        wsReplayCount: 0,
-        subscriptionSent: false,
-      };
-    }
-    const previousApp = app;
-    const previousStatus = dashboardControlTransport.lastStatus;
-    let keyReplayCount = 0;
-    let resizeReplayCount = 0;
-    let wsReplayCount = 0;
-    app = {
-      send_key() { keyReplayCount += 1; },
-      send_resize() { resizeReplayCount += 1; },
-      send_raw() { wsReplayCount += 1; },
-      send_server_action() { wsReplayCount += 1; },
-    };
-    dashboardControlTransport.lastStatus = {
-      ...(previousStatus || {}),
-      tui_frames_available: false,
-    };
-    let subscriptionSent = false;
-    try {
-      sendTuiKey({ key: 'a', ctrlKey: false, altKey: false, shiftKey: false });
-      sendTuiResize(80, 24);
-      subscriptionSent = sendTuiSubscriptionFrame(true, 'websocket') === true;
-    } finally {
-      dashboardControlTransport.lastStatus = previousStatus;
-      app = previousApp;
-    }
-    return {
-      skipped: false,
-      keyReplayCount,
-      resizeReplayCount,
-      wsReplayCount,
-      subscriptionSent,
-    };
-  },
   _debugProbeShellQueuesUntilOpened() {
     if (
       !dashboardConnectModeEnabled() ||
@@ -53163,9 +52813,6 @@ window.intendantDashboardControl = {
   terminalFrame(frame) {
     return dashboardTransport.terminalFrame(frame);
   },
-  tuiFrame(frame) {
-    return dashboardTransport.tuiFrame(frame);
-  },
   presenceFrame(frame) {
     return dashboardTransport.presenceFrame(frame);
   },
@@ -53348,14 +52995,12 @@ class DashboardControlTransport {
     this.channel.onclose = () => {
       console.info('[dashboard-control] channel closed');
       dashboardUpdateTransportStatus();
-      updateTermSubscription(true);
       this.scheduleReconnect('DataChannel closed', { delayMs: 1000 });
     };
     this.channel.onerror = () => {
       this.lastError = 'DataChannel error';
       dashboardSetControlLastError(this.lastError);
       dashboardUpdateTransportStatus();
-      updateTermSubscription(true);
       this.scheduleReconnect(this.lastError, { delayMs: 1000 });
     };
     this.pc.onicecandidate = ev => {
@@ -53472,14 +53117,13 @@ class DashboardControlTransport {
     dashboardSetControlLastError('');
     this.refreshIceRoute().catch(() => {});
     dashboardUpdateTransportStatus();
-    this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'upload_frames', 'terminal_frames', 'tui_frames', 'presence_frames', 'presence_active_handoff', 'presence_tool_request'] });
+    this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'upload_frames', 'terminal_frames', 'presence_frames', 'presence_active_handoff', 'presence_tool_request'] });
     this.ping().catch(() => {});
     this.request('status').then(status => {
       if (status && typeof status === 'object') {
         this.lastStatus = status;
         console.info('[dashboard-control] status RPC ok', status.session_id || '');
         dashboardUpdateTransportStatus();
-        updateTermSubscription(true);
       }
     }).catch(err => console.warn('[dashboard-control] status RPC failed', err));
     this.request('config').then(config => {
@@ -53531,18 +53175,6 @@ class DashboardControlTransport {
     if (msg.t === 'egress_request' || msg.t === 'egress_request_chunk' ||
         msg.t === 'egress_request_end' || msg.t === 'egress_ack' || msg.t === 'egress_cancel') {
       vaultEgressHandleFrame(msg);
-      return;
-    }
-    if (msg.t === 'tui_term' || msg.t === 'tui_error') {
-      try {
-        window.dispatchEvent(new CustomEvent('intendant-dashboard-tui-frame', { detail: msg }));
-      } catch (_) {}
-      if (msg.connection_id !== TUI_CONNECTION_ID) return;
-      if (msg.t === 'tui_term') {
-        handleTermData(msg.base64 || msg.d || '');
-      } else if (msg.error) {
-        console.warn('[dashboard-control] TUI frame error', msg.error);
-      }
       return;
     }
     if (msg.t === 'terminal_output' || msg.t === 'terminal_exited' || msg.t === 'terminal_opened' || msg.t === 'terminal_error' || msg.t === 'terminal_shared') {
@@ -54064,12 +53696,6 @@ class DashboardControlTransport {
     return true;
   }
 
-  tuiFrame(frame) {
-    if (!this.canUseRpc()) return false;
-    this.sendFrame(frame);
-    return true;
-  }
-
   presenceFrame(frame) {
     if (!this.canUseRpc()) return false;
     this.sendFrame({ t: 'presence_frame', frame });
@@ -54416,7 +54042,6 @@ class DashboardControlTransport {
       byteStreamsAvailable: this.lastStatus?.byte_streams_available ?? null,
       uploadFramesAvailable: this.lastStatus?.upload_frames_available ?? null,
       terminalFramesAvailable: this.lastStatus?.terminal_frames_available ?? null,
-      tuiFramesAvailable: this.lastStatus?.tui_frames_available ?? null,
       presenceFramesAvailable: this.lastStatus?.presence_frames_available ?? null,
       presenceActiveHandoffAvailable: this.lastStatus?.presence_active_handoff_available ?? null,
       presenceToolRequestAvailable: this.lastStatus?.presence_tool_request_available ?? null,

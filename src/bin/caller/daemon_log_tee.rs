@@ -7,10 +7,7 @@
 //! (eprintln!, panics, tracing) travels with the rest of the session
 //! artifacts when a tester sends a bundle back to the dev.
 //!
-//! Callers must only invoke [`install`] once per process, and only
-//! when the controller does NOT own a real interactive TTY (ratatui
-//! writes escape sequences to stdout, so redirecting it through a
-//! pipe would break the interactive TUI).
+//! Callers must only invoke [`install`] once per process.
 
 #[cfg(unix)]
 use std::fs::OpenOptions;

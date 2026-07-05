@@ -1,13 +1,9 @@
-//! Shared event infrastructure used across all frontends.
-//!
-//! `EventBus`, `AppEvent`, `ControlMsg`, and `ApprovalResponse` were extracted
-//! from `tui/event.rs` so that non-TUI modules (MCP, control socket, web gateway,
-//! presence) no longer depend on the `tui` module.
+//! Shared event infrastructure used across all frontends
+//! (MCP, control socket, web gateway, presence, dashboard control).
 
 use crate::autonomy::ActionCategory;
 use crate::provider::TokenUsage;
 use crate::types::{LogLevel, SessionCapabilities, SessionGoal};
-use crossterm::event::KeyEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -126,8 +122,6 @@ pub type ApprovalRegistry =
 /// All events flowing through the system.
 #[derive(Debug, Clone)]
 pub enum AppEvent {
-    // Terminal input
-    Key(KeyEvent),
     #[allow(dead_code)]
     Resize(u16, u16),
 
@@ -2500,9 +2494,8 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         }),
         // Input event for the agent loop — not broadcast to browsers.
         AppEvent::ConversationRollbackRequested { .. } => None,
-        // Terminal-only / internal events — not broadcast to external consumers
-        AppEvent::Key(_)
-        | AppEvent::Resize(_, _)
+        // Internal events — not broadcast to external consumers
+        AppEvent::Resize(_, _)
         | AppEvent::Tick
         | AppEvent::Quit
         | AppEvent::JsonExtracted { .. }
@@ -4349,12 +4342,8 @@ mod tests {
     }
 
     #[test]
-    fn outbound_skips_key() {
-        let event = AppEvent::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        assert!(app_event_to_outbound(&event).is_none());
+    fn outbound_skips_resize() {
+        assert!(app_event_to_outbound(&AppEvent::Resize(80, 24)).is_none());
     }
 
     #[test]
