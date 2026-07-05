@@ -49,17 +49,7 @@ pub(crate) async fn finalize_http_stream(stream: &mut DemuxStream) {
 }
 
 pub(crate) fn json_response_body(body: String) -> String {
-    format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body
-    )
+    HttpResponse::json("200 OK", body).into_string()
 }
 
 /// Gzip-compress `data` (pure-Rust miniz_oxide backend via flate2).
@@ -406,19 +396,107 @@ pub(crate) fn initial_body_bytes(initial_request_bytes: &[u8]) -> Result<&[u8], 
         .ok_or_else(|| "incomplete HTTP headers".to_string())
 }
 
+/// One buffered HTTP/1.1 response under construction: status line, ordered
+/// headers, full body. This is the single place the gateway's `\r\n`
+/// framing is emitted — the string helpers below and ported hand-rolled
+/// `format!("HTTP/1.1 …")` sites all serialize through it. Streaming
+/// responses (session NDJSON, MCP notification drains, recording segments)
+/// keep writing by hand; `BodyPolicy`-driven request-body reads land with
+/// the dispatch-side consumption step.
+pub(crate) struct HttpResponse {
+    status: String,
+    headers: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// Start from a status line ("200 OK", "404 Not Found", …). Headers
+    /// are emitted in insertion order; nothing is implicit.
+    pub(crate) fn new(status: impl Into<String>) -> Self {
+        Self {
+            status: status.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// The canonical JSON shape: Content-Type, Content-Length,
+    /// `Cache-Control: no-cache`, `Connection: close` — byte-identical to
+    /// the historical `json_response` framing.
+    pub(crate) fn json(status: impl Into<String>, body: impl Into<Vec<u8>>) -> Self {
+        let body = body.into();
+        Self::new(status)
+            .header("Content-Type", "application/json")
+            .header("Content-Length", body.len().to_string())
+            .header("Cache-Control", "no-cache")
+            .header("Connection", "close")
+            .with_body(body)
+    }
+
+    /// The canonical HTML shape — byte-identical to the historical
+    /// `html_response` framing (which bakes a wildcard CORS header in).
+    pub(crate) fn html(status: impl Into<String>, body: impl Into<Vec<u8>>) -> Self {
+        let body = body.into();
+        Self::new(status)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .header("Content-Length", body.len().to_string())
+            .header("Cache-Control", "no-cache")
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Connection", "close")
+            .with_body(body)
+    }
+
+    pub(crate) fn header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
+        self
+    }
+
+    fn with_body(mut self, body: Vec<u8>) -> Self {
+        self.body = body;
+        self
+    }
+
+    /// Append the wildcard CORS header — same position (last) as the
+    /// historical `with_public_cors` post-processor.
+    pub(crate) fn public_cors(self) -> Self {
+        self.header("Access-Control-Allow-Origin", "*")
+    }
+
+    /// Fleet-allowlist CORS posture: strip any wildcard, echo the origin
+    /// only when it passed the allowlist, and mark `Vary: Origin` — the
+    /// builder form of `with_fleet_cors`.
+    pub(crate) fn fleet_cors(mut self, allowed_origin: Option<&str>) -> Self {
+        self.headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case("access-control-allow-origin"));
+        if let Some(origin) = allowed_origin {
+            self = self.header("Access-Control-Allow-Origin", origin.to_string());
+        }
+        self.header("Vary", "Origin")
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        let mut head = format!("HTTP/1.1 {}\r\n", self.status);
+        for (name, value) in &self.headers {
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(value);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        let mut out = head.into_bytes();
+        out.extend_from_slice(&self.body);
+        out
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        // The gateway's buffered responses are all valid UTF-8 today; the
+        // lossy conversion is a guard rail, not an expected path.
+        String::from_utf8_lossy(&self.into_bytes()).into_owned()
+    }
+}
+
 pub(crate) fn json_response(status: &str, body: String) -> String {
-    format!(
-        "HTTP/1.1 {}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        status,
-        body.len(),
-        body
-    )
+    HttpResponse::json(status, body).into_string()
 }
 
 pub(crate) fn json_ok(value: serde_json::Value) -> String {
@@ -433,19 +511,7 @@ pub(crate) fn json_error(status: &str, message: impl AsRef<str>) -> String {
 }
 
 pub(crate) fn html_response(status: &str, body: String) -> String {
-    format!(
-        "HTTP/1.1 {}\r\n\
-         Content-Type: text/html; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        status,
-        body.len(),
-        body
-    )
+    HttpResponse::html(status, body).into_string()
 }
 
 pub(crate) fn request_query_param(request_line: &str, key: &str) -> Option<String> {
@@ -758,6 +824,55 @@ pub(crate) fn extract_token_query_param(request_line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_response_builder_reproduces_legacy_framing_byte_for_byte() {
+        // The five string helpers now serialize through HttpResponse; pin
+        // the exact historical bytes so the rebase stays byte-identical.
+        assert_eq!(
+            json_response("200 OK", "{\"ok\":true}".to_string()),
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 11\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {\"ok\":true}"
+        );
+        assert_eq!(
+            html_response("404 Not Found", "<h1>gone</h1>".to_string()),
+            "HTTP/1.1 404 Not Found\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             Content-Length: 13\r\n\
+             Cache-Control: no-cache\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Connection: close\r\n\
+             \r\n\
+             <h1>gone</h1>"
+        );
+        // The builder's CORS postures match the string post-processors.
+        assert_eq!(
+            HttpResponse::json("200 OK", "{}")
+                .public_cors()
+                .into_string(),
+            with_public_cors(json_response("200 OK", "{}".to_string()))
+        );
+        assert_eq!(
+            HttpResponse::json("200 OK", "{}")
+                .fleet_cors(Some("https://fleet.example"))
+                .into_string(),
+            with_fleet_cors(
+                json_response("200 OK", "{}".to_string()),
+                Some("https://fleet.example")
+            )
+        );
+        assert_eq!(
+            HttpResponse::json("200 OK", "{}")
+                .fleet_cors(None)
+                .into_string(),
+            with_fleet_cors(json_response("200 OK", "{}".to_string()), None)
+        );
+    }
 
     #[tokio::test]
     async fn read_request_body_capped_truncates_peeked_body_on_char_boundary() {

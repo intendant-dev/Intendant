@@ -8522,27 +8522,16 @@ pub fn spawn_web_gateway(
                             "allow": allow,
                         })
                         .to_string();
-                        let base = format!(
-                            "HTTP/1.1 405 Method Not Allowed\r\n\
-                             Allow: {allow}\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {body}",
-                            body.len(),
-                        );
+                        let base = HttpResponse::json("405 Method Not Allowed", body)
+                            .header("Allow", &allow);
                         let response = match crate::gateway_routes::preflight_posture(req_path) {
-                            Some(crate::gateway_routes::CorsPosture::Public) => {
-                                with_public_cors(base)
-                            }
+                            Some(crate::gateway_routes::CorsPosture::Public) => base.public_cors(),
                             Some(crate::gateway_routes::CorsPosture::FleetAllowlist) => {
-                                with_fleet_cors(base, fleet_cors_origin.as_deref())
+                                base.fleet_cors(fleet_cors_origin.as_deref())
                             }
                             _ => base,
                         };
-                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.write_all(&response.into_bytes()).await;
                     } else if req_method == "GET" && req_path == "/connect/bootstrap" {
                         use tokio::io::AsyncWriteExt;
                         let body = connect_bootstrap_html();
