@@ -23246,397 +23246,42 @@ pub fn spawn_web_gateway(
                                 .await;
                             }
                             RouteHandlerId::PeersSubRouter => {
-                                // Peer registry endpoints. Dispatch:
-                                //   GET    /api/peers                  → list
-                                //   POST   /api/peers                  → add
-                                //   DELETE /api/peers                  → remove
-                                //   POST   /api/peers/pairing/invite   → issue pairing invite
-                                //   POST   /api/peers/pairing/join     → import pairing invite
-                                //   POST   /api/peers/{id}/message     → send message
-                                //   POST   /api/peers/{id}/task        → delegate task
-                                //   POST   /api/peers/{id}/approval    → resolve approval
-                                //
-                                // When no registry is wired in (test call sites
-                                // that pass None), every request returns 503 so
-                                // the dashboard can render "peers unavailable"
-                                // instead of the empty list that a working-but-
-                                // empty registry would produce.
-                                use tokio::io::AsyncWriteExt;
-
-                                // Extract subpath after `/api/peers`. The list/
-                                // add/remove ops have an empty subpath; per-peer
-                                // ops have `/{id}/{op}`. Extract the *path*
-                                // token from the request line first (the second
-                                // whitespace-separated word) — splitting on
-                                // `/api/peers` directly would walk into the
-                                // ` HTTP/1.1` suffix and mistake `HTTP` and `1.1`
-                                // for path segments.
-                                let path_token = request_line.split_whitespace().nth(1).unwrap_or("");
-                                // Split path from query string. `/api/peers/eligible
-                                // ?capability=display` needs the query stripped before
-                                // we extract subpath segments.
-                                let (path, query_str) = match path_token.find('?') {
-                                    Some(i) => (&path_token[..i], &path_token[i + 1..]),
-                                    None => (path_token, ""),
-                                };
-                                let subpath = path
-                                    .strip_prefix("/api/peers")
-                                    .unwrap_or("")
-                                    .trim_start_matches('/');
-                                let segments: Vec<&str> =
-                                    subpath.split('/').filter(|s| !s.is_empty()).collect();
-
-                                let (status, body) = if segments == ["pairing", "invite"]
-                                    && req_method == "POST"
-                                {
-                                    let body_text = read_request_body(&mut stream, &header_text).await;
-                                    peers_pairing_invite(&body_text)
-                                } else if segments == ["pairing", "request-access"] && req_method == "POST"
-                                {
-                                    let body_text = read_request_body(&mut stream, &header_text).await;
-                                    peers_pairing_request_access(&body_text).await
-                                } else if segments == ["pairing", "request-access", "poll"]
-                                    && req_method == "POST"
-                                {
-                                    let body_text = read_request_body(&mut stream, &header_text).await;
-                                    peers_pairing_request_access_poll(
-                                        peer_registry.as_ref(),
-                                        project_root.as_deref(),
-                                        &body_text,
-                                    )
-                                    .await
-                                } else if segments == ["pairing", "requests"] && req_method == "GET" {
-                                    peers_pairing_requests_list()
-                                } else if segments == ["pairing", "identities"] && req_method == "GET" {
-                                    peers_pairing_identities_list()
-                                } else if segments == ["pairing", "identities", "revoke"]
-                                    && req_method == "POST"
-                                {
-                                    let body_text = read_request_body(&mut stream, &header_text).await;
-                                    peers_pairing_identity_revoke(&body_text)
-                                } else if segments.len() == 4
-                                    && segments[0] == "pairing"
-                                    && segments[1] == "requests"
-                                    && req_method == "POST"
-                                {
-                                    let body_text = read_request_body(&mut stream, &header_text).await;
-                                    peers_pairing_request_decision(segments[2], segments[3], &body_text)
-                                } else {
-                                    match peer_registry.as_ref() {
-                                        None => (
-                                            503,
-                                            serde_json::json!({
-                                                "error": "peer registry not configured"
-                                            })
-                                            .to_string(),
-                                        ),
-                                        Some(registry) if segments.is_empty() && req_method == "GET" => {
-                                            (200, peers_list_response_body(registry))
-                                        }
-                                        Some(registry)
-                                            if segments.is_empty()
-                                                && (req_method == "POST" || req_method == "DELETE") =>
-                                        {
-                                            let body_text =
-                                                read_request_body(&mut stream, &header_text).await;
-                                            if req_method == "POST" {
-                                                peers_add(registry, project_root.as_deref(), &body_text)
-                                                    .await
-                                            } else {
-                                                peers_remove(registry, &body_text).await
-                                            }
-                                        }
-                                        Some(registry)
-                                            if segments == ["eligible"] && req_method == "GET" =>
-                                        {
-                                            // GET /api/peers/eligible?capability=display
-                                            // — list peers that satisfy all listed
-                                            // capabilities. The `eligible` segment is
-                                            // a reserved sub-path on /api/peers; an
-                                            // actual peer with that bare id would be
-                                            // shadowed here, but PeerId values always
-                                            // carry a `<kind>:` prefix so that's not
-                                            // a real collision.
-                                            peers_eligible(registry, query_str)
-                                        }
-                                        Some(registry)
-                                            if segments == ["pairing", "join"] && req_method == "POST" =>
-                                        {
-                                            let body_text =
-                                                read_request_body(&mut stream, &header_text).await;
-                                            peers_pairing_join(
-                                                registry,
-                                                project_root.as_deref(),
-                                                &body_text,
-                                            )
-                                            .await
-                                        }
-                                        Some(registry) if segments.len() == 2 && req_method == "POST" => {
-                                            let id = url_path_decode(segments[0]);
-                                            let op = segments[1];
-                                            let body_text =
-                                                read_request_body(&mut stream, &header_text).await;
-                                            match op {
-                                                "message" => {
-                                                    peers_send_message(registry, &id, &body_text).await
-                                                }
-                                                "task" => {
-                                                    peers_delegate_task(registry, &id, &body_text).await
-                                                }
-                                                "approval" => {
-                                                    peers_resolve_approval(registry, &id, &body_text).await
-                                                }
-                                                "webrtc" => {
-                                                    peers_webrtc_signal(registry, &id, &body_text, &bus)
-                                                        .await
-                                                }
-                                                "file-transfer-webrtc" => {
-                                                    peers_file_transfer_signal(
-                                                        registry, &id, &body_text, &bus,
-                                                    )
-                                                    .await
-                                                }
-                                                "dashboard-control-webrtc" => {
-                                                    peers_dashboard_control_signal(
-                                                        registry, &id, &body_text, &bus,
-                                                    )
-                                                    .await
-                                                }
-                                                other => (
-                                                    404,
-                                                    serde_json::json!({
-                                                        "error": format!(
-                                                            "unknown peer op: {other}"
-                                                        )
-                                                    })
-                                                    .to_string(),
-                                                ),
-                                            }
-                                        }
-                                        Some(_) => (
-                                            405,
-                                            serde_json::json!({
-                                                "error": "method not allowed"
-                                            })
-                                            .to_string(),
-                                        ),
-                                    }
-                                };
-                                let reason = match status {
-                                    200 => "OK",
-                                    400 => "Bad Request",
-                                    404 => "Not Found",
-                                    405 => "Method Not Allowed",
-                                    500 => "Internal Server Error",
-                                    502 => "Bad Gateway",
-                                    503 => "Service Unavailable",
-                                    _ => "Error",
-                                };
-                                let response = format!(
-                                    "HTTP/1.1 {status} {reason}\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Access-Control-Allow-Origin: *\r\n\
-                                     Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
-                                     Access-Control-Allow-Headers: Content-Type\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {body}",
-                                    body.len(),
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_peers_sub_router(
+                                    stream,
+                                    &header_text,
+                                    request_line,
+                                    req_method,
+                                    bus,
+                                    project_root,
+                                    peer_registry,
+                                )
+                                .await;
                             }
                             RouteHandlerId::CoordinatorRoute => {
-                                // POST /api/coordinator/route — capability-based
-                                // task routing through the Coordinator primitive.
-                                // Body shape: {"required_capabilities": ["display",
-                                // ...], "task": {"instructions": "...", "context":
-                                // ..., "client_correlation_id": "..."}}.
-                                // Response: {"peer_id": "...", "task_id": "..."}
-                                // on success, structured error otherwise.
-                                use tokio::io::AsyncWriteExt;
-                                let (status, body) = match peer_registry.as_ref() {
-                                    None => (
-                                        503,
-                                        serde_json::json!({
-                                            "error": "peer registry not configured"
-                                        })
-                                        .to_string(),
-                                    ),
-                                    Some(_) if req_method != "POST" => (
-                                        405,
-                                        serde_json::json!({
-                                            "error": "method not allowed"
-                                        })
-                                        .to_string(),
-                                    ),
-                                    Some(registry) => {
-                                        let body_text = read_request_body(&mut stream, &header_text).await;
-                                        coordinator_route(registry, &body_text).await
-                                    }
-                                };
-                                let reason = match status {
-                                    200 => "OK",
-                                    400 => "Bad Request",
-                                    404 => "Not Found",
-                                    405 => "Method Not Allowed",
-                                    500 => "Internal Server Error",
-                                    502 => "Bad Gateway",
-                                    503 => "Service Unavailable",
-                                    _ => "Error",
-                                };
-                                let response = format!(
-                                    "HTTP/1.1 {status} {reason}\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Access-Control-Allow-Origin: *\r\n\
-                                     Access-Control-Allow-Methods: POST, OPTIONS\r\n\
-                                     Access-Control-Allow-Headers: Content-Type\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {body}",
-                                    body.len(),
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_coordinator_route(
+                                    stream,
+                                    &header_text,
+                                    req_method,
+                                    peer_registry,
+                                )
+                                .await;
                             }
                             RouteHandlerId::McpPost => {
-                                // MCP Streamable HTTP endpoint.
-                                //
-                                // rmcp expects:
-                                //   - Requests (has `id`):   200 OK + Content-Type: application/json
-                                //   - Notifications (no `id`): 202 Accepted + empty body
-                                //   - GET for SSE stream:    405 Method Not Allowed (we don't support SSE push)
-                                //   - DELETE for session:    405 Method Not Allowed (stateless)
-                                use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
-                                if let Some(ref mcp) = mcp_server {
-                                    let mcp_cors = mcp_cors_header_segment(&header_text, is_tls);
-                                    // Bind the request to an access principal before
-                                    // touching the body. Loopback reachability or a
-                                    // shared token alone no longer authorizes the
-                                    // tool surface — see `mcp_http_access_context`.
-                                    let cert_dir = crate::access::backend::select_backend().cert_dir();
-                                    let mcp_access = match mcp_http_access_context(
-                                        &cert_dir,
-                                        peer_connection_identity.as_ref(),
-                                        tls_client_cert_fingerprint.as_deref(),
-                                        tls_client_cert_present,
-                                        is_tls,
-                                        peer_addr,
-                                        &header_text,
-                                    ) {
-                                        Ok(access) => access,
-                                        Err((status, message)) => {
-                                            let reason = match status {
-                                                401 => "Unauthorized",
-                                                403 => "Forbidden",
-                                                _ => "Error",
-                                            };
-                                            let body = serde_json::json!({
-                                                "jsonrpc": "2.0",
-                                                "id": serde_json::Value::Null,
-                                                "error": { "code": -32600, "message": message },
-                                            })
-                                            .to_string();
-                                            let response = format!(
-                                                "HTTP/1.1 {status} {reason}\r\n\
-                                                 Content-Type: application/json\r\n\
-                                                 {mcp_cors}\
-                                                 Content-Length: {}\r\n\
-                                                 Cache-Control: no-cache\r\n\
-                                                 Connection: close\r\n\
-                                                 \r\n\
-                                                 {body}",
-                                                body.len(),
-                                            );
-                                            let _ = stream.write_all(response.as_bytes()).await;
-                                            finalize_http_stream(&mut stream).await;
-                                            return;
-                                        }
-                                    };
-                                    let content_length: usize = header_text
-                                        .lines()
-                                        .find(|l| l.to_lowercase().starts_with("content-length:"))
-                                        .and_then(|l| l.split(':').nth(1))
-                                        .and_then(|v| v.trim().parse().ok())
-                                        .unwrap_or(0);
-                                    let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-                                    let body_owned;
-                                    let body_text = if peeked_body.len() >= content_length {
-                                        crate::types::truncate_str(peeked_body, content_length)
-                                    } else {
-                                        let remaining = content_length.saturating_sub(peeked_body.len());
-                                        let mut full = peeked_body.to_string();
-                                        if remaining > 0 {
-                                            let mut rest = vec![0u8; remaining];
-                                            if stream.read_exact(&mut rest).await.is_ok() {
-                                                full.push_str(&String::from_utf8_lossy(&rest));
-                                            }
-                                        }
-                                        body_owned = full;
-                                        &body_owned
-                                    };
-                                    let (mcp_session_id, codex_managed_context, tool_profile) =
-                                        mcp_context_from_request_line(request_line);
-                                    let outcome = handle_mcp_http_request(
-                                        body_text,
-                                        mcp,
-                                        mcp_session_id.as_deref(),
-                                        codex_managed_context,
-                                        tool_profile.as_deref(),
-                                        &mcp_access,
-                                    )
-                                    .await;
-                                    let http_response = match outcome {
-                                        McpHttpOutcome::Response(resp) => {
-                                            let json = serde_json::to_string(&resp).unwrap_or_default();
-                                            format!(
-                                                "HTTP/1.1 200 OK\r\n\
-                                                 Content-Type: application/json\r\n\
-                                                 {mcp_cors}\
-                                                 Content-Length: {}\r\n\
-                                                 \r\n\
-                                                 {}",
-                                                json.len(),
-                                                json,
-                                            )
-                                        }
-                                        McpHttpOutcome::Accepted => format!(
-                                            "HTTP/1.1 202 Accepted\r\n\
-                                             {mcp_cors}\
-                                             Content-Length: 0\r\n\
-                                             \r\n"
-                                        ),
-                                    };
-                                    let _ = stream.write_all(http_response.as_bytes()).await;
-                                } else {
-                                    let err = r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"MCP server not available"}}"#;
-                                    let http = format!(
-                                        "HTTP/1.1 503 Service Unavailable\r\n\
-                                         Content-Type: application/json\r\n\
-                                         Content-Length: {}\r\n\
-                                         \r\n\
-                                         {}",
-                                        err.len(),
-                                        err
-                                    );
-                                    let _ = stream.write_all(http.as_bytes()).await;
-                                }
+                                return handle_mcp_post(
+                                    stream,
+                                    &header_text,
+                                    request_line,
+                                    peer_connection_identity,
+                                    mcp_server,
+                                    is_tls,
+                                    tls_client_cert_present,
+                                    tls_client_cert_fingerprint,
+                                    peer_addr,
+                                )
+                                .await;
                             }
                             RouteHandlerId::McpStream => {
-                                // MCP Streamable HTTP: GET (SSE stream) and DELETE (session cleanup)
-                                // are not supported by our stateless endpoint.  Return 405 so rmcp
-                                // gracefully falls back (skips SSE / ignores session delete).
-                                use tokio::io::AsyncWriteExt;
-                                let http = format!(
-                                    "HTTP/1.1 405 Method Not Allowed\r\n\
-                                     {}\
-                                     Content-Length: 0\r\n\
-                                     \r\n",
-                                    mcp_cors_header_segment(&header_text, is_tls)
-                                );
-                                let _ = stream.write_all(http.as_bytes()).await;
+                                return handle_mcp_stream(stream, &header_text, is_tls).await;
                             }
                         }
                     } else if req_method == "GET" && req_path == "/connect/bootstrap" {
@@ -24155,9 +23800,10 @@ pub fn spawn_web_gateway(
                     // final ciphertext records reach the socket (rustls buffers
                     // them; dropping mid-buffer truncates large bodies); a
                     // harmless pass-through on plain TCP. Covers every
-                    // fall-through dispatch arm above in one place; the early
+                    // fall-through chain arm above in one place; the early
                     // `return`s (OPTIONS / failed federation auth) finalize
-                    // inline before returning.
+                    // inline before returning, and every table-dispatched
+                    // handler owns its stream and finalizes it itself.
                     finalize_http_stream(&mut stream).await;
                 }
             });
@@ -26411,6 +26057,433 @@ async fn handle_access_overview(
         fleet_cors_origin.as_deref(),
     );
     let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_peers_sub_router(
+    mut stream: DemuxStream,
+    header_text: &str,
+    request_line: &str,
+    req_method: &str,
+    bus: EventBus,
+    project_root: Option<PathBuf>,
+    peer_registry: Option<crate::peer::PeerRegistry>,
+) {
+    // Peer registry endpoints. Dispatch:
+    //   GET    /api/peers                  → list
+    //   POST   /api/peers                  → add
+    //   DELETE /api/peers                  → remove
+    //   POST   /api/peers/pairing/invite   → issue pairing invite
+    //   POST   /api/peers/pairing/join     → import pairing invite
+    //   POST   /api/peers/{id}/message     → send message
+    //   POST   /api/peers/{id}/task        → delegate task
+    //   POST   /api/peers/{id}/approval    → resolve approval
+    //
+    // When no registry is wired in (test call sites
+    // that pass None), every request returns 503 so
+    // the dashboard can render "peers unavailable"
+    // instead of the empty list that a working-but-
+    // empty registry would produce.
+    use tokio::io::AsyncWriteExt;
+
+    // Extract subpath after `/api/peers`. The list/
+    // add/remove ops have an empty subpath; per-peer
+    // ops have `/{id}/{op}`. Extract the *path*
+    // token from the request line first (the second
+    // whitespace-separated word) — splitting on
+    // `/api/peers` directly would walk into the
+    // ` HTTP/1.1` suffix and mistake `HTTP` and `1.1`
+    // for path segments.
+    let path_token = request_line.split_whitespace().nth(1).unwrap_or("");
+    // Split path from query string. `/api/peers/eligible
+    // ?capability=display` needs the query stripped before
+    // we extract subpath segments.
+    let (path, query_str) = match path_token.find('?') {
+        Some(i) => (&path_token[..i], &path_token[i + 1..]),
+        None => (path_token, ""),
+    };
+    let subpath = path
+        .strip_prefix("/api/peers")
+        .unwrap_or("")
+        .trim_start_matches('/');
+    let segments: Vec<&str> =
+        subpath.split('/').filter(|s| !s.is_empty()).collect();
+
+    let (status, body) = if segments == ["pairing", "invite"]
+        && req_method == "POST"
+    {
+        let body_text = read_request_body(&mut stream, header_text).await;
+        peers_pairing_invite(&body_text)
+    } else if segments == ["pairing", "request-access"] && req_method == "POST"
+    {
+        let body_text = read_request_body(&mut stream, header_text).await;
+        peers_pairing_request_access(&body_text).await
+    } else if segments == ["pairing", "request-access", "poll"]
+        && req_method == "POST"
+    {
+        let body_text = read_request_body(&mut stream, header_text).await;
+        peers_pairing_request_access_poll(
+            peer_registry.as_ref(),
+            project_root.as_deref(),
+            &body_text,
+        )
+        .await
+    } else if segments == ["pairing", "requests"] && req_method == "GET" {
+        peers_pairing_requests_list()
+    } else if segments == ["pairing", "identities"] && req_method == "GET" {
+        peers_pairing_identities_list()
+    } else if segments == ["pairing", "identities", "revoke"]
+        && req_method == "POST"
+    {
+        let body_text = read_request_body(&mut stream, header_text).await;
+        peers_pairing_identity_revoke(&body_text)
+    } else if segments.len() == 4
+        && segments[0] == "pairing"
+        && segments[1] == "requests"
+        && req_method == "POST"
+    {
+        let body_text = read_request_body(&mut stream, header_text).await;
+        peers_pairing_request_decision(segments[2], segments[3], &body_text)
+    } else {
+        match peer_registry.as_ref() {
+            None => (
+                503,
+                serde_json::json!({
+                    "error": "peer registry not configured"
+                })
+                .to_string(),
+            ),
+            Some(registry) if segments.is_empty() && req_method == "GET" => {
+                (200, peers_list_response_body(registry))
+            }
+            Some(registry)
+                if segments.is_empty()
+                    && (req_method == "POST" || req_method == "DELETE") =>
+            {
+                let body_text =
+                    read_request_body(&mut stream, header_text).await;
+                if req_method == "POST" {
+                    peers_add(registry, project_root.as_deref(), &body_text)
+                        .await
+                } else {
+                    peers_remove(registry, &body_text).await
+                }
+            }
+            Some(registry)
+                if segments == ["eligible"] && req_method == "GET" =>
+            {
+                // GET /api/peers/eligible?capability=display
+                // — list peers that satisfy all listed
+                // capabilities. The `eligible` segment is
+                // a reserved sub-path on /api/peers; an
+                // actual peer with that bare id would be
+                // shadowed here, but PeerId values always
+                // carry a `<kind>:` prefix so that's not
+                // a real collision.
+                peers_eligible(registry, query_str)
+            }
+            Some(registry)
+                if segments == ["pairing", "join"] && req_method == "POST" =>
+            {
+                let body_text =
+                    read_request_body(&mut stream, header_text).await;
+                peers_pairing_join(
+                    registry,
+                    project_root.as_deref(),
+                    &body_text,
+                )
+                .await
+            }
+            Some(registry) if segments.len() == 2 && req_method == "POST" => {
+                let id = url_path_decode(segments[0]);
+                let op = segments[1];
+                let body_text =
+                    read_request_body(&mut stream, header_text).await;
+                match op {
+                    "message" => {
+                        peers_send_message(registry, &id, &body_text).await
+                    }
+                    "task" => {
+                        peers_delegate_task(registry, &id, &body_text).await
+                    }
+                    "approval" => {
+                        peers_resolve_approval(registry, &id, &body_text).await
+                    }
+                    "webrtc" => {
+                        peers_webrtc_signal(registry, &id, &body_text, &bus)
+                            .await
+                    }
+                    "file-transfer-webrtc" => {
+                        peers_file_transfer_signal(
+                            registry, &id, &body_text, &bus,
+                        )
+                        .await
+                    }
+                    "dashboard-control-webrtc" => {
+                        peers_dashboard_control_signal(
+                            registry, &id, &body_text, &bus,
+                        )
+                        .await
+                    }
+                    other => (
+                        404,
+                        serde_json::json!({
+                            "error": format!(
+                                "unknown peer op: {other}"
+                            )
+                        })
+                        .to_string(),
+                    ),
+                }
+            }
+            Some(_) => (
+                405,
+                serde_json::json!({
+                    "error": "method not allowed"
+                })
+                .to_string(),
+            ),
+        }
+    };
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Content-Type\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len(),
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_coordinator_route(
+    mut stream: DemuxStream,
+    header_text: &str,
+    req_method: &str,
+    peer_registry: Option<crate::peer::PeerRegistry>,
+) {
+    // POST /api/coordinator/route — capability-based
+    // task routing through the Coordinator primitive.
+    // Body shape: {"required_capabilities": ["display",
+    // ...], "task": {"instructions": "...", "context":
+    // ..., "client_correlation_id": "..."}}.
+    // Response: {"peer_id": "...", "task_id": "..."}
+    // on success, structured error otherwise.
+    use tokio::io::AsyncWriteExt;
+    let (status, body) = match peer_registry.as_ref() {
+        None => (
+            503,
+            serde_json::json!({
+                "error": "peer registry not configured"
+            })
+            .to_string(),
+        ),
+        Some(_) if req_method != "POST" => (
+            405,
+            serde_json::json!({
+                "error": "method not allowed"
+            })
+            .to_string(),
+        ),
+        Some(registry) => {
+            let body_text = read_request_body(&mut stream, header_text).await;
+            coordinator_route(registry, &body_text).await
+        }
+    };
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: POST, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Content-Type\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len(),
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+// Parameter count rides until the GatewayRequestCtx bundle planned for the
+// serializer step of phase 4 collapses the shared request context.
+#[allow(clippy::too_many_arguments)]
+async fn handle_mcp_post(
+    mut stream: DemuxStream,
+    header_text: &str,
+    request_line: &str,
+    peer_connection_identity: Option<PeerConnectionIdentity>,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    is_tls: bool,
+    tls_client_cert_present: bool,
+    tls_client_cert_fingerprint: Option<String>,
+    peer_addr: std::net::SocketAddr,
+) {
+    // MCP Streamable HTTP endpoint.
+    //
+    // rmcp expects:
+    //   - Requests (has `id`):   200 OK + Content-Type: application/json
+    //   - Notifications (no `id`): 202 Accepted + empty body
+    //   - GET for SSE stream:    405 Method Not Allowed (we don't support SSE push)
+    //   - DELETE for session:    405 Method Not Allowed (stateless)
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+    if let Some(ref mcp) = mcp_server {
+        let mcp_cors = mcp_cors_header_segment(header_text, is_tls);
+        // Bind the request to an access principal before
+        // touching the body. Loopback reachability or a
+        // shared token alone no longer authorizes the
+        // tool surface — see `mcp_http_access_context`.
+        let cert_dir = crate::access::backend::select_backend().cert_dir();
+        let mcp_access = match mcp_http_access_context(
+            &cert_dir,
+            peer_connection_identity.as_ref(),
+            tls_client_cert_fingerprint.as_deref(),
+            tls_client_cert_present,
+            is_tls,
+            peer_addr,
+            header_text,
+        ) {
+            Ok(access) => access,
+            Err((status, message)) => {
+                let reason = match status {
+                    401 => "Unauthorized",
+                    403 => "Forbidden",
+                    _ => "Error",
+                };
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": serde_json::Value::Null,
+                    "error": { "code": -32600, "message": message },
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\n\
+                     Content-Type: application/json\r\n\
+                     {mcp_cors}\
+                     Content-Length: {}\r\n\
+                     Cache-Control: no-cache\r\n\
+                     Connection: close\r\n\
+                     \r\n\
+                     {body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
+        };
+        let content_length: usize = header_text
+            .lines()
+            .find(|l| l.to_lowercase().starts_with("content-length:"))
+            .and_then(|l| l.split(':').nth(1))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+        let body_owned;
+        let body_text = if peeked_body.len() >= content_length {
+            crate::types::truncate_str(peeked_body, content_length)
+        } else {
+            let remaining = content_length.saturating_sub(peeked_body.len());
+            let mut full = peeked_body.to_string();
+            if remaining > 0 {
+                let mut rest = vec![0u8; remaining];
+                if stream.read_exact(&mut rest).await.is_ok() {
+                    full.push_str(&String::from_utf8_lossy(&rest));
+                }
+            }
+            body_owned = full;
+            &body_owned
+        };
+        let (mcp_session_id, codex_managed_context, tool_profile) =
+            mcp_context_from_request_line(request_line);
+        let outcome = handle_mcp_http_request(
+            body_text,
+            mcp,
+            mcp_session_id.as_deref(),
+            codex_managed_context,
+            tool_profile.as_deref(),
+            &mcp_access,
+        )
+        .await;
+        let http_response = match outcome {
+            McpHttpOutcome::Response(resp) => {
+                let json = serde_json::to_string(&resp).unwrap_or_default();
+                format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/json\r\n\
+                     {mcp_cors}\
+                     Content-Length: {}\r\n\
+                     \r\n\
+                     {}",
+                    json.len(),
+                    json,
+                )
+            }
+            McpHttpOutcome::Accepted => format!(
+                "HTTP/1.1 202 Accepted\r\n\
+                 {mcp_cors}\
+                 Content-Length: 0\r\n\
+                 \r\n"
+            ),
+        };
+        let _ = stream.write_all(http_response.as_bytes()).await;
+    } else {
+        let err = r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"MCP server not available"}}"#;
+        let http = format!(
+            "HTTP/1.1 503 Service Unavailable\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             \r\n\
+             {}",
+            err.len(),
+            err
+        );
+        let _ = stream.write_all(http.as_bytes()).await;
+    }
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_mcp_stream(mut stream: DemuxStream, header_text: &str, is_tls: bool) {
+    // MCP Streamable HTTP: GET (SSE stream) and DELETE (session cleanup)
+    // are not supported by our stateless endpoint.  Return 405 so rmcp
+    // gracefully falls back (skips SSE / ignores session delete).
+    use tokio::io::AsyncWriteExt;
+    let http = format!(
+        "HTTP/1.1 405 Method Not Allowed\r\n\
+         {}\
+         Content-Length: 0\r\n\
+         \r\n",
+        mcp_cors_header_segment(header_text, is_tls)
+    );
+    let _ = stream.write_all(http.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
 
