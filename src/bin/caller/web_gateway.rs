@@ -23113,239 +23113,44 @@ pub fn spawn_web_gateway(
                                 return handle_sessions_search(stream, request_line).await;
                             }
                             RouteHandlerId::ProjectRoot => {
-                                use tokio::io::AsyncWriteExt;
-                                let body = project_root_response_body(project_root.as_deref());
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    body.len(),
-                                    body
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_project_root(stream, project_root).await;
                             }
                             RouteHandlerId::SettingsPost => {
-                                use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
-                                // Read POST body — may be partially or fully outside the peek buffer
-                                let content_length: usize = header_text
-                                    .lines()
-                                    .find(|l| l.to_lowercase().starts_with("content-length:"))
-                                    .and_then(|l| l.split(':').nth(1))
-                                    .and_then(|v| v.trim().parse().ok())
-                                    .unwrap_or(0);
-                                let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-                                let body_owned;
-                                let body_text = if peeked_body.len() >= content_length {
-                                    crate::types::truncate_str(peeked_body, content_length)
-                                } else {
-                                    let remaining = content_length.saturating_sub(peeked_body.len());
-                                    let mut full = peeked_body.to_string();
-                                    if remaining > 0 {
-                                        let mut rest = vec![0u8; remaining];
-                                        if stream.read_exact(&mut rest).await.is_ok() {
-                                            full.push_str(&String::from_utf8_lossy(&rest));
-                                        }
-                                    }
-                                    body_owned = full;
-                                    &body_owned
-                                };
-                                let (status, result) =
-                                    settings_post_result(body_text, project_root.as_deref(), &bus);
-                                let response = json_response(status, result);
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_settings_post(
+                                    stream,
+                                    &header_text,
+                                    bus,
+                                    project_root,
+                                )
+                                .await;
                             }
                             RouteHandlerId::SettingsGet => {
-                                use tokio::io::AsyncWriteExt;
-                                let body =
-                                    settings_get_response_body(project_root.as_deref(), &runtime_settings)
-                                        .await;
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    body.len(),
-                                    body
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_settings_get(
+                                    stream,
+                                    project_root,
+                                    runtime_settings,
+                                )
+                                .await;
                             }
                             RouteHandlerId::ApiKeysPost => {
-                                use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
-                                let content_length: usize = header_text
-                                    .lines()
-                                    .find(|l| l.to_lowercase().starts_with("content-length:"))
-                                    .and_then(|l| l.split(':').nth(1))
-                                    .and_then(|v| v.trim().parse().ok())
-                                    .unwrap_or(0);
-                                let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-                                let body_owned;
-                                let body_text = if peeked_body.len() >= content_length {
-                                    crate::types::truncate_str(peeked_body, content_length)
-                                } else {
-                                    let remaining = content_length.saturating_sub(peeked_body.len());
-                                    let mut full = peeked_body.to_string();
-                                    if remaining > 0 {
-                                        let mut rest = vec![0u8; remaining];
-                                        if stream.read_exact(&mut rest).await.is_ok() {
-                                            full.push_str(&String::from_utf8_lossy(&rest));
-                                        }
-                                    }
-                                    body_owned = full;
-                                    &body_owned
-                                };
-                                let result = handle_set_api_keys(body_text);
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Access-Control-Allow-Origin: *\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    result.len(),
-                                    result
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_api_keys_post(stream, &header_text).await;
                             }
                             RouteHandlerId::ApiKeyStatus => {
-                                use tokio::io::AsyncWriteExt;
-                                let body = api_key_status_response_body();
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    body.len(),
-                                    body
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_api_key_status(stream).await;
                             }
                             RouteHandlerId::ExternalAgents => {
-                                use tokio::io::AsyncWriteExt;
-                                let body = external_agents_response_body(project_root.as_deref());
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    body.len(),
-                                    body
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_external_agents(stream, project_root).await;
                             }
                             RouteHandlerId::DiagnosticsVisualFreshness => {
-                                // **Phase 0 visual-freshness transcript sink** (task #83).
-                                // Body is browser-emitted NDJSON (one JSON record per
-                                // `\n`-terminated line); server appends verbatim to
-                                // `~/.intendant/diagnostics/visual-freshness/<session>.ndjson`.
-                                // No parsing or schema validation here — that's
-                                // browser-side or post-hoc analysis on the
-                                // transcript. Session id arrives via `?session_id=…`
-                                // query param; we sanitize aggressively (alnum + `-`
-                                // + `_` only) and reject anything that collapses
-                                // empty so a missing param can't accidentally
-                                // produce a bare-`.ndjson` write.
-                                use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
-                                let session_id_raw: String = request_line
-                                    .split('?')
-                                    .nth(1)
-                                    .and_then(|qs| qs.split_whitespace().next())
-                                    .map(|qs| {
-                                        qs.split('&')
-                                            .find_map(|kv| {
-                                                let (k, v) = kv.split_once('=')?;
-                                                if k == "session_id" {
-                                                    Some(v.to_string())
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                            .unwrap_or_default()
-                                    })
-                                    .unwrap_or_default();
-                                let content_length: usize = header_text
-                                    .lines()
-                                    .find(|l| l.to_lowercase().starts_with("content-length:"))
-                                    .and_then(|l| l.split(':').nth(1))
-                                    .and_then(|v| v.trim().parse().ok())
-                                    .unwrap_or(0);
-                                let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-                                let body_owned;
-                                let body_bytes: &[u8] = if peeked_body.len() >= content_length {
-                                    &peeked_body.as_bytes()[..content_length]
-                                } else {
-                                    let remaining = content_length.saturating_sub(peeked_body.len());
-                                    let mut full: Vec<u8> = peeked_body.as_bytes().to_vec();
-                                    if remaining > 0 {
-                                        let mut rest = vec![0u8; remaining];
-                                        if stream.read_exact(&mut rest).await.is_ok() {
-                                            full.extend_from_slice(&rest);
-                                        }
-                                    }
-                                    body_owned = full;
-                                    &body_owned
-                                };
-                                let (status_line, body) =
-                                    match crate::diagnostics::append_visual_freshness_record(
-                                        &session_id_raw,
-                                        body_bytes,
-                                    ) {
-                                        Ok(written) => (
-                                            "HTTP/1.1 200 OK",
-                                            serde_json::json!({"ok": true, "written": written}).to_string(),
-                                        ),
-                                        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => (
-                                            "HTTP/1.1 400 Bad Request",
-                                            serde_json::json!({"error": e.to_string()}).to_string(),
-                                        ),
-                                        Err(e) => (
-                                            "HTTP/1.1 500 Internal Server Error",
-                                            serde_json::json!({"error": e.to_string()}).to_string(),
-                                        ),
-                                    };
-                                let response = format!(
-                                    "{status_line}\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Access-Control-Allow-Origin: *\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    body.len(),
-                                    body
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_diagnostics_visual_freshness(
+                                    stream,
+                                    &header_text,
+                                    request_line,
+                                )
+                                .await;
                             }
                             RouteHandlerId::Displays => {
-                                // Display enumeration endpoint
-                                use tokio::io::AsyncWriteExt;
-                                let body = displays_response_body(&session_registry).await;
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
-                                     Content-Type: application/json\r\n\
-                                     Content-Length: {}\r\n\
-                                     Cache-Control: no-cache\r\n\
-                                     Access-Control-Allow-Origin: *\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    body.len(),
-                                    body
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_displays(stream, session_registry).await;
                             }
                             RouteHandlerId::Doorbell => {
                                 use tokio::io::AsyncWriteExt;
@@ -23658,13 +23463,12 @@ pub fn spawn_web_gateway(
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
                             RouteHandlerId::DashboardTargets => {
-                                use tokio::io::AsyncWriteExt;
-                                let body = dashboard_targets_response_body(
-                                    &agent_card_value_for_targets,
-                                    peer_registry.as_ref(),
-                                );
-                                let response = json_response("200 OK", body);
-                                let _ = stream.write_all(response.as_bytes()).await;
+                                return handle_dashboard_targets(
+                                    stream,
+                                    peer_registry,
+                                    agent_card_value_for_targets,
+                                )
+                                .await;
                             }
                             RouteHandlerId::PeersSubRouter => {
                                 // Peer registry endpoints. Dispatch:
@@ -26172,6 +25976,288 @@ async fn handle_worktrees_list(
         .unwrap_or_else(empty_worktree_inventory_response);
     let response = json_response("200 OK", body);
     use tokio::io::AsyncWriteExt;
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_project_root(mut stream: DemuxStream, project_root: Option<PathBuf>) {
+    use tokio::io::AsyncWriteExt;
+    let body = project_root_response_body(project_root.as_deref());
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_settings_post(
+    mut stream: DemuxStream,
+    header_text: &str,
+    bus: EventBus,
+    project_root: Option<PathBuf>,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+    // Read POST body — may be partially or fully outside the peek buffer
+    let content_length: usize = header_text
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+    let body_owned;
+    let body_text = if peeked_body.len() >= content_length {
+        crate::types::truncate_str(peeked_body, content_length)
+    } else {
+        let remaining = content_length.saturating_sub(peeked_body.len());
+        let mut full = peeked_body.to_string();
+        if remaining > 0 {
+            let mut rest = vec![0u8; remaining];
+            if stream.read_exact(&mut rest).await.is_ok() {
+                full.push_str(&String::from_utf8_lossy(&rest));
+            }
+        }
+        body_owned = full;
+        &body_owned
+    };
+    let (status, result) =
+        settings_post_result(body_text, project_root.as_deref(), &bus);
+    let response = json_response(status, result);
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_settings_get(
+    mut stream: DemuxStream,
+    project_root: Option<PathBuf>,
+    runtime_settings: RuntimeSettingsState,
+) {
+    use tokio::io::AsyncWriteExt;
+    let body =
+        settings_get_response_body(project_root.as_deref(), &runtime_settings)
+            .await;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_api_keys_post(mut stream: DemuxStream, header_text: &str) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+    let content_length: usize = header_text
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+    let body_owned;
+    let body_text = if peeked_body.len() >= content_length {
+        crate::types::truncate_str(peeked_body, content_length)
+    } else {
+        let remaining = content_length.saturating_sub(peeked_body.len());
+        let mut full = peeked_body.to_string();
+        if remaining > 0 {
+            let mut rest = vec![0u8; remaining];
+            if stream.read_exact(&mut rest).await.is_ok() {
+                full.push_str(&String::from_utf8_lossy(&rest));
+            }
+        }
+        body_owned = full;
+        &body_owned
+    };
+    let result = handle_set_api_keys(body_text);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        result.len(),
+        result
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_api_key_status(mut stream: DemuxStream) {
+    use tokio::io::AsyncWriteExt;
+    let body = api_key_status_response_body();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_external_agents(mut stream: DemuxStream, project_root: Option<PathBuf>) {
+    use tokio::io::AsyncWriteExt;
+    let body = external_agents_response_body(project_root.as_deref());
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_diagnostics_visual_freshness(
+    mut stream: DemuxStream,
+    header_text: &str,
+    request_line: &str,
+) {
+    // **Phase 0 visual-freshness transcript sink** (task #83).
+    // Body is browser-emitted NDJSON (one JSON record per
+    // `\n`-terminated line); server appends verbatim to
+    // `~/.intendant/diagnostics/visual-freshness/<session>.ndjson`.
+    // No parsing or schema validation here — that's
+    // browser-side or post-hoc analysis on the
+    // transcript. Session id arrives via `?session_id=…`
+    // query param; we sanitize aggressively (alnum + `-`
+    // + `_` only) and reject anything that collapses
+    // empty so a missing param can't accidentally
+    // produce a bare-`.ndjson` write.
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+    let session_id_raw: String = request_line
+        .split('?')
+        .nth(1)
+        .and_then(|qs| qs.split_whitespace().next())
+        .map(|qs| {
+            qs.split('&')
+                .find_map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    if k == "session_id" {
+                        Some(v.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let content_length: usize = header_text
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+    let body_owned;
+    let body_bytes: &[u8] = if peeked_body.len() >= content_length {
+        &peeked_body.as_bytes()[..content_length]
+    } else {
+        let remaining = content_length.saturating_sub(peeked_body.len());
+        let mut full: Vec<u8> = peeked_body.as_bytes().to_vec();
+        if remaining > 0 {
+            let mut rest = vec![0u8; remaining];
+            if stream.read_exact(&mut rest).await.is_ok() {
+                full.extend_from_slice(&rest);
+            }
+        }
+        body_owned = full;
+        &body_owned
+    };
+    let (status_line, body) =
+        match crate::diagnostics::append_visual_freshness_record(
+            &session_id_raw,
+            body_bytes,
+        ) {
+            Ok(written) => (
+                "HTTP/1.1 200 OK",
+                serde_json::json!({"ok": true, "written": written}).to_string(),
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => (
+                "HTTP/1.1 400 Bad Request",
+                serde_json::json!({"error": e.to_string()}).to_string(),
+            ),
+            Err(e) => (
+                "HTTP/1.1 500 Internal Server Error",
+                serde_json::json!({"error": e.to_string()}).to_string(),
+            ),
+        };
+    let response = format!(
+        "{status_line}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_displays(
+    mut stream: DemuxStream,
+    session_registry: Option<crate::display::SharedSessionRegistry>,
+) {
+    // Display enumeration endpoint
+    use tokio::io::AsyncWriteExt;
+    let body = displays_response_body(&session_registry).await;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+async fn handle_dashboard_targets(
+    mut stream: DemuxStream,
+    peer_registry: Option<crate::peer::PeerRegistry>,
+    agent_card_value_for_targets: serde_json::Value,
+) {
+    use tokio::io::AsyncWriteExt;
+    let body = dashboard_targets_response_body(
+        &agent_card_value_for_targets,
+        peer_registry.as_ref(),
+    );
+    let response = json_response("200 OK", body);
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
 }
