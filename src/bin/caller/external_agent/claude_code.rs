@@ -198,12 +198,6 @@ impl CcShared {
         self.cumulative_fresh_tokens.load(Ordering::Relaxed)
     }
 
-    /// Current goal as the wire type (elapsed + budget spend computed now).
-    fn goal_snapshot(&self) -> Option<crate::types::SessionGoal> {
-        let fresh = self.fresh_tokens();
-        self.lock_goal().snapshot(fresh)
-    }
-
     /// Refresh the goal after a turn result: recompute spend, flip an
     /// `active` goal to `budgetLimited` when the budget is exhausted, and
     /// return the updated snapshot for a `GoalUpdated` emission.

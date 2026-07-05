@@ -72,6 +72,11 @@ struct SupervisorState {
     /// fallback responder stays silent for these: their owning drain
     /// answers, and a false "not attached" here would race a real result.
     known_external_sessions: std::collections::HashSet<String>,
+    /// Thread-action ops each session's live loop advertised via
+    /// `SessionCapabilities` (native sessions advertise the goal* family).
+    /// The fallback responder defers to the advertising loop for exactly
+    /// these ops instead of false-rejecting non-external sessions.
+    advertised_thread_actions: HashMap<String, std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -948,28 +953,43 @@ impl SessionSupervisor {
                     op
                 ))
             };
-            match state.resolve_session_id(target_id) {
-                Some(managed_id) => match state.sessions.get(&managed_id) {
-                    // Any live external backend: the owning drain dispatches
-                    // (and answers) the action — stay silent here.
-                    Some(session)
-                        if external_agent::AgentBackend::from_str_loose(&session.source)
-                            .is_some() =>
-                    {
-                        None
-                    }
-                    Some(session) => Some(format!(
-                        "target session {} is a {} session — thread actions need an external-agent session",
-                        short_session(target_id),
-                        session.source
-                    )),
+            // A live loop advertised this exact op for this session (e.g.
+            // the native presence loop's goal* family): it answers; a
+            // failure here would race a real result.
+            let op_advertised = |id: &str| {
+                state
+                    .advertised_thread_actions
+                    .get(id)
+                    .is_some_and(|ops| ops.contains(&op))
+            };
+            if op_advertised(target_id) {
+                None
+            } else {
+                match state.resolve_session_id(target_id) {
+                    Some(managed_id) if op_advertised(&managed_id) => None,
+                    Some(managed_id) => match state.sessions.get(&managed_id) {
+                        // Any live external backend: the owning drain dispatches
+                        // (and answers) the action — stay silent here.
+                        Some(session)
+                            if external_agent::AgentBackend::from_str_loose(&session.source)
+                                .is_some() =>
+                        {
+                            None
+                        }
+                        Some(session) => Some(format!(
+                            "target session {} is a {} session that does not advertise /{} — thread actions need a loop that answers them",
+                            short_session(target_id),
+                            session.source,
+                            op
+                        )),
+                        None => unattached(),
+                    },
+                    // Not supervisor-managed, but a live session on this bus
+                    // announced this id (e.g. the CLI main loop's own agent):
+                    // its drain answers; a failure here would race a real result.
+                    None if state.known_external_sessions.contains(target_id) => None,
                     None => unattached(),
-                },
-                // Not supervisor-managed, but a live session on this bus
-                // announced this id (e.g. the CLI main loop's own agent):
-                // its drain answers; a failure here would race a real result.
-                None if state.known_external_sessions.contains(target_id) => None,
-                None => unattached(),
+                }
             }
         };
 
@@ -2318,42 +2338,39 @@ impl SessionSupervisor {
                 if let Some(parsed) = parse_codex_slash_command(&text) {
                     match parsed {
                         Ok(command) => {
-                            if source == "codex" {
-                                if relation
+                            // Dispatch for every source — the attached loop
+                            // (or the unattached-session responder) reports
+                            // per-backend support honestly, so /goal works
+                            // wherever a goal engine answers.
+                            if source == "codex"
+                                && relation
                                     .as_ref()
                                     .is_some_and(|rel| rel.relationship == "subagent")
-                                {
-                                    self.warn(&format!(
-                                        "Slash command /{} is not supported for Codex subagent session {}",
-                                        command.op,
-                                        short_session(&requested_id)
-                                    ));
-                                    return;
-                                }
-                                if !attachments.is_empty() {
-                                    self.warn(&format!(
-                                        "Slash command /{} for Codex session {} ignored {} attachment(s)",
-                                        command.op,
-                                        short_session(&managed_id),
-                                        attachments.len()
-                                    ));
-                                }
-                                self.config.bus.send(AppEvent::ControlCommand(
-                                    event::ControlMsg::CodexThreadAction {
-                                        session_id: Some(managed_id),
-                                        op: command.op,
-                                        params: command.params,
-                                        origin: None,
-                                    },
-                                ));
-                            } else {
+                            {
                                 self.warn(&format!(
-                                    "Slash command /{} is only supported for Codex sessions; target {} session {}",
+                                    "Slash command /{} is not supported for Codex subagent session {}",
+                                    command.op,
+                                    short_session(&requested_id)
+                                ));
+                                return;
+                            }
+                            if !attachments.is_empty() {
+                                self.warn(&format!(
+                                    "Slash command /{} for {} session {} ignored {} attachment(s)",
                                     command.op,
                                     source,
-                                    short_session(&managed_id)
+                                    short_session(&managed_id),
+                                    attachments.len()
                                 ));
                             }
+                            self.config.bus.send(AppEvent::ControlCommand(
+                                event::ControlMsg::CodexThreadAction {
+                                    session_id: Some(managed_id),
+                                    op: command.op,
+                                    params: command.params,
+                                    origin: None,
+                                },
+                            ));
                         }
                         Err(message) => self.warn(&message),
                     }
@@ -3132,48 +3149,45 @@ impl SessionSupervisor {
         if let Some(parsed) = parse_codex_slash_command(&text) {
             match parsed {
                 Ok(command) => {
-                    if source == "codex" {
-                        if relation
+                    // Dispatch for every source — the attached loop (or the
+                    // unattached-session responder) reports per-backend
+                    // support honestly, so /goal works wherever a goal
+                    // engine answers.
+                    if source == "codex"
+                        && relation
                             .as_ref()
                             .is_some_and(|rel| rel.relationship == "side")
-                        {
-                            self.warn(&format!(
-                                "Slash command /{} is not supported for Codex side session {}; use the parent thread instead",
-                                command.op,
-                                short_session(requested_id.as_deref().unwrap_or(&managed_id))
-                            ));
-                            return;
-                        }
-                        if !attachments.is_empty() {
-                            self.warn(&format!(
-                                "Slash command /{} for Codex session {} ignored {} steer attachment(s)",
-                                command.op,
-                                short_session(&managed_id),
-                                attachments.len()
-                            ));
-                        }
-                        self.config.bus.send(AppEvent::ControlCommand(
-                            event::ControlMsg::CodexThreadAction {
-                                session_id: Some(managed_id),
-                                op: command.op,
-                                params: command.params,
-                                origin: None,
-                            },
-                        ));
-                        if !steer_id.trim().is_empty() {
-                            self.config.bus.send(AppEvent::SteerDelivered {
-                                session_id: event_session_id,
-                                id: steer_id,
-                                mid_turn: false,
-                            });
-                        }
-                    } else {
+                    {
                         self.warn(&format!(
-                            "Slash command /{} is only supported for Codex sessions; target {} session {}",
+                            "Slash command /{} is not supported for Codex side session {}; use the parent thread instead",
+                            command.op,
+                            short_session(requested_id.as_deref().unwrap_or(&managed_id))
+                        ));
+                        return;
+                    }
+                    if !attachments.is_empty() {
+                        self.warn(&format!(
+                            "Slash command /{} for {} session {} ignored {} steer attachment(s)",
                             command.op,
                             source,
-                            short_session(&managed_id)
+                            short_session(&managed_id),
+                            attachments.len()
                         ));
+                    }
+                    self.config.bus.send(AppEvent::ControlCommand(
+                        event::ControlMsg::CodexThreadAction {
+                            session_id: Some(managed_id),
+                            op: command.op,
+                            params: command.params,
+                            origin: None,
+                        },
+                    ));
+                    if !steer_id.trim().is_empty() {
+                        self.config.bus.send(AppEvent::SteerDelivered {
+                            session_id: event_session_id,
+                            id: steer_id,
+                            mid_turn: false,
+                        });
                     }
                 }
                 Err(message) => self.warn(&message),
@@ -3810,6 +3824,28 @@ impl SessionSupervisor {
             } => {
                 self.update_session_phase(Some(session_id), phase).await;
             }
+            AppEvent::SessionCapabilities {
+                session_id,
+                capabilities,
+            } => {
+                // Remember which ops a live loop serves for this session so
+                // the thread-action fallback defers to it (see
+                // report_unattached_codex_thread_action).
+                let ops: std::collections::HashSet<String> = capabilities
+                    .thread_actions
+                    .iter()
+                    .map(|op| op.trim().to_string())
+                    .filter(|op| !op.is_empty())
+                    .collect();
+                let mut state = self.state.lock().await;
+                if ops.is_empty() {
+                    state.advertised_thread_actions.remove(session_id);
+                } else {
+                    state
+                        .advertised_thread_actions
+                        .insert(session_id.clone(), ops);
+                }
+            }
             _ => {}
         }
     }
@@ -3833,6 +3869,7 @@ impl SessionSupervisor {
         state.session_aliases.remove(session_id);
         state.related_sessions.remove(session_id);
         state.known_external_sessions.remove(session_id);
+        state.advertised_thread_actions.remove(session_id);
     }
 
     async fn update_session_phase(&self, session_id: Option<&str>, phase: &str) {
@@ -5261,6 +5298,91 @@ mod tests {
         assert!(removed.is_some());
         assert!(!state.session_is_managed("wrapper"));
         assert!(!state.session_is_managed("backend"));
+    }
+
+    #[tokio::test]
+    async fn thread_action_fallback_defers_to_advertised_ops() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+
+        let drain_results = |rx: &mut tokio::sync::broadcast::Receiver<AppEvent>| {
+            let mut results = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if let AppEvent::CodexThreadActionResult {
+                    action, message, ..
+                } = event
+                {
+                    results.push((action, message));
+                }
+            }
+            results
+        };
+
+        // The native presence loop advertised the goal family for its
+        // session: the fallback must stay silent for those ops (the loop
+        // answers; a failure here would race the real result).
+        supervisor
+            .observe_lifecycle_event(&AppEvent::SessionCapabilities {
+                session_id: "native-1".to_string(),
+                capabilities: crate::thread_actions::native_session_capabilities(),
+            })
+            .await;
+        supervisor
+            .report_unattached_codex_thread_action(
+                Some("native-1".to_string()),
+                "goal-set".to_string(),
+            )
+            .await;
+        assert!(
+            drain_results(&mut rx).is_empty(),
+            "advertised op must not be false-rejected"
+        );
+
+        // An op the loop did NOT advertise still fails honestly for a
+        // managed non-external session.
+        {
+            let mut state = supervisor.state.lock().await;
+            state
+                .sessions
+                .insert("native-1".to_string(), managed_session("native-1", "intendant"));
+        }
+        supervisor
+            .report_unattached_codex_thread_action(
+                Some("native-1".to_string()),
+                "side".to_string(),
+            )
+            .await;
+        let results = drain_results(&mut rx);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "side");
+        assert!(
+            results[0].1.contains("does not advertise /side"),
+            "got: {}",
+            results[0].1
+        );
+
+        // Session end clears the advertisement: the goal op now reports
+        // (the managed entry still resolves, so the source-shaped message
+        // fires instead of silence).
+        supervisor.remove_session_alias("native-1").await;
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.remove("native-1");
+        }
+        supervisor
+            .report_unattached_codex_thread_action(
+                Some("native-1".to_string()),
+                "goal-set".to_string(),
+            )
+            .await;
+        let results = drain_results(&mut rx);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].1.contains("not attached"),
+            "got: {}",
+            results[0].1
+        );
     }
 
     #[tokio::test]
