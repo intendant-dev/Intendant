@@ -4489,56 +4489,18 @@ fn persisted_external_identity_for_session_in_home(
         return None;
     }
     let log_dir = session_log_dir_for_id_in_home(home, session_id)?;
-    let canonical_session_id = std::fs::read_to_string(log_dir.join("session_meta.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|value| {
-            value
-                .get("session_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        });
-    let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).ok()?;
-    for line in contents.lines().rev() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value.get("event").and_then(serde_json::Value::as_str) != Some("session_identity") {
-            continue;
-        }
-        let Some(data) = value.get("data") else {
-            continue;
-        };
-        let wrapper_id = data
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|id| !id.is_empty());
-        let wrapper_matches = wrapper_id.is_some_and(|id| {
-            id == session_id
-                || id.starts_with(session_id)
-                || canonical_session_id
-                    .as_deref()
-                    .is_some_and(|canonical| id == canonical || canonical.starts_with(session_id))
-        });
-        if !wrapper_matches {
-            continue;
-        }
-        let source = data
-            .get("source")
-            .and_then(serde_json::Value::as_str)
-            .and_then(external_agent::AgentBackend::from_str_loose)
-            .map(|backend| backend.as_short_str().to_string())?;
-        let backend_session_id = data
-            .get("backend_session_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .filter(|id| external_agent::source_session_id_is_canonical(&source, id))?
-            .to_string();
-        return Some((source, backend_session_id));
+    // Resume authority: only the latest wrapper-matching structured event
+    // counts, and only when its backend id has the source's canonical shape
+    // — a placeholder id must not drive resume. The scan's legacy prose
+    // fields are deliberately ignored here; pre-event dirs resolve through
+    // the wrapper index instead (`effective_external_resume_token_in_home`).
+    let identity =
+        crate::session_identity::scan_session_dir(&log_dir, session_id)?.latest_matching?;
+    if !external_agent::source_session_id_is_canonical(&identity.source, &identity.backend_session_id)
+    {
+        return None;
     }
-    None
+    Some((identity.source, identity.backend_session_id))
 }
 
 fn session_log_dir_for_id_in_home(home: &Path, session_id: &str) -> Option<PathBuf> {
