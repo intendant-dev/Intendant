@@ -434,6 +434,13 @@ async function main() {
     // --fork-session. The child announces its own native id on its first
     // turn, which also emits the fork relationship.
     const sessionsBefore = await listSessions(PORT);
+    // The parent's own aliases (its Intendant log id) can surface in the
+    // sessions list LATE — after this baseline — and masquerade as the
+    // fork child. Anything that already appeared as an event session_id
+    // belongs to the pre-fork world.
+    const knownSessionIds = new Set(
+      run.events.map((e) => e.session_id).filter(Boolean),
+    );
     run.send({ action: 'thread_action', op: 'fork', session_id: backendSessionId });
     const forkResult = await run.waitFor(
       'fork result',
@@ -448,6 +455,7 @@ async function main() {
       lastRows = await listSessions(PORT);
       const fresh = lastRows.filter((row) => /claude/.test(row.source)
         && !sessionsBefore.some((old) => old.id === row.id)
+        && !knownSessionIds.has(row.id)
         && row.id !== backendSessionId);
       if (fresh.length) childWrapperId = fresh[0].id;
     }

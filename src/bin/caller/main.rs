@@ -8834,6 +8834,76 @@ async fn run_with_presence(
                     external_agent::AgentEvent::GoalCleared => {
                         emit_external_session_goal(&idle_drain_config, event_thread_id, None);
                     }
+                    // Passive housekeeping renders directly — it must NOT
+                    // open a spontaneous round. A lone log (e.g. "Compacting
+                    // context…" from an idle /compact whose free result the
+                    // adapter absorbs) would otherwise open a round that
+                    // nothing ever completes, wedging the loop while queued
+                    // tasks rot in task_rx.
+                    external_agent::AgentEvent::Log { level, message } => {
+                        bus.send(AppEvent::LogEntry {
+                            session_id: session_log_id(&session_log),
+                            level,
+                            source: external_agent_log_source(
+                                idle_drain_config.agent_source.as_deref(),
+                            ),
+                            content: message,
+                            turn: None,
+                        });
+                    }
+                    external_agent::AgentEvent::Usage { usage } => {
+                        bus.send(AppEvent::UsageSnapshot {
+                            session_id: session_log_id(&session_log),
+                            main: frontend::ModelUsageSnapshot {
+                                provider: usage.provider,
+                                model: usage.model,
+                                tokens_used: usage.tokens_used,
+                                context_window: usage.context_window,
+                                hard_context_window: usage.hard_context_window,
+                                usage_pct: usage.usage_pct,
+                                prompt_tokens: usage.prompt_tokens,
+                                completion_tokens: usage.completion_tokens,
+                                cached_tokens: usage.cached_tokens,
+                            },
+                            presence: None,
+                        });
+                    }
+                    external_agent::AgentEvent::BackendError {
+                        message,
+                        code,
+                        details,
+                        will_retry,
+                        ..
+                    } => {
+                        let label = external_agent_log_source(
+                            idle_drain_config.agent_source.as_deref(),
+                        );
+                        let mut content = if let Some(code) = code.as_deref() {
+                            format!("{label} backend error while idle ({code}): {message}")
+                        } else {
+                            format!("{label} backend error while idle: {message}")
+                        };
+                        if let Some(details) =
+                            details.as_deref().filter(|s| !s.trim().is_empty())
+                        {
+                            content.push('\n');
+                            content.push_str(details.trim());
+                        }
+                        slog(&session_log, |l| {
+                            if will_retry {
+                                l.warn(&content)
+                            } else {
+                                l.error(&content)
+                            }
+                        });
+                        bus.send(AppEvent::LogEntry {
+                            session_id: session_log_id(&session_log),
+                            level: if will_retry { "warn" } else { "error" }.to_string(),
+                            source: label,
+                            content,
+                            turn: None,
+                        });
+                    }
                     external_agent::AgentEvent::Terminated { reason, exit_code } => {
                         slog(&session_log, |l| {
                             l.warn(&format!(
