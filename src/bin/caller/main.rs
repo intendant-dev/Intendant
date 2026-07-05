@@ -31,7 +31,7 @@ mod external_wrapper_index;
 mod file_watcher;
 mod fission_ledger;
 mod fission_lifecycle;
-mod frames;
+pub(crate) use intendant_core::frames;
 mod frontend;
 mod gateway_routes;
 mod knowledge;

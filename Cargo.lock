@@ -2495,6 +2495,9 @@ dependencies = [
 name = "intendant-core"
 version = "0.1.0"
 dependencies = [
+ "if-addrs",
+ "libc",
+ "presence-core",
  "reqwest",
  "serde",
  "serde_json",
