@@ -37,19 +37,12 @@ on:
       - "tests/skills/native-goal-smoke/**"
       - "tests/skills/peer-sessions-smoke/**"
       - ".github/workflows/smokes.yml"
+  # Required-check triggers — unfiltered on purpose: a paths-skipped
+  # required check blocks queue entry (PRs) or wedges the group
+  # (merge_group). See windows.yml for the full rationale; the push
+  # trigger keeps its paths for cache warming only.
   pull_request:
     branches: [main]
-    paths:
-      - "**/*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**/Cargo.toml"
-      - "tests/skills/session-vitals-smoke/**"
-      - "tests/skills/native-goal-smoke/**"
-      - "tests/skills/peer-sessions-smoke/**"
-      - ".github/workflows/smokes.yml"
-  # Merge-queue gate — unconditional (see windows.yml: a paths-skipped
-  # required check wedges the queue).
   merge_group:
 
 permissions:

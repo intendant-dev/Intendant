@@ -19,16 +19,11 @@ on:
       - "crates/app-html-assembler/**"
       - "build.rs"
       - ".github/workflows/app-html.yml"
+  # Required-check triggers — unfiltered on purpose: a paths-skipped
+  # required check blocks queue entry (PRs) or wedges the group
+  # (merge_group); see windows.yml. The assembler runs in seconds.
   pull_request:
     branches: [main]
-    paths:
-      - "static/app/**"
-      - "static/app.html"
-      - "crates/app-html-assembler/**"
-      - "build.rs"
-      - ".github/workflows/app-html.yml"
-  # Merge-queue gate — unconditional (see windows.yml: a paths-skipped
-  # required check wedges the queue). The assembler runs in seconds.
   merge_group:
 
 permissions:

@@ -36,20 +36,19 @@ on:
       - "Cargo.lock"
       - "crates/**/Cargo.toml"
       - ".github/workflows/windows.yml"
+  # Required-check trigger #1 — deliberately unfiltered. This job is a
+  # required status check, and GitHub only lets a PR *enter* the merge
+  # queue once its own required checks have passed: a paths-skipped
+  # required check leaves the PR BLOCKED at "Expected" forever (verified
+  # live on the first docs-only PR through this repo's queue). Every PR
+  # pays the full matrix; that is the price of a required check. The push
+  # trigger above keeps its paths — its job is warming the main-branch
+  # cache, not gating.
   pull_request:
     branches: [main]
-    paths:
-      - "**/*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**/Cargo.toml"
-      - ".github/workflows/windows.yml"
-  # Merge-queue gate. Deliberately unconditional: this job is a required
-  # status check, and a required check that never starts leaves a queue
-  # entry stuck at "Expected" until it times out — merge_group events
-  # don't support paths filtering, and skipped-but-required is the classic
-  # queue wedge. Every queued landing pays the full matrix; the queue's
-  # speculative batching validates entries in parallel, so throughput holds.
+  # Required-check trigger #2 — the merge-queue revalidation against the
+  # speculative merge state (main + everything queued ahead). merge_group
+  # events don't support paths filtering anyway.
   merge_group:
 
 permissions:

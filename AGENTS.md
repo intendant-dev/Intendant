@@ -275,8 +275,11 @@ queue itself is wedged, that is an operator (org-owner) decision.
 ## CI/CD
 
 GitHub Actions on push / PR to `main`, and — for the required checks — on every
-`merge_group` (the merge-queue gate; those triggers are deliberately
-unconditional because a paths-skipped required check wedges the queue):
+`merge_group`. The required-check workflows run **unfiltered on `pull_request`
+and `merge_group`**: GitHub only lets a PR enter the merge queue after its own
+required checks pass, so a paths-skipped required check blocks queue entry
+(and on the group side wedges the entry at "Expected"). Only the push-to-main
+triggers keep paths filters — they exist for cache warming, not gating:
 - **`windows.yml`** — cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Headless-safe: needs no display or API keys. **Required check.**
 - **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real release binaries on Linux + macOS. **Required check.**
 - **`app-html.yml`** — the `static/app/` fragments ↔ generated `static/app.html` regen gate. **Required check.**

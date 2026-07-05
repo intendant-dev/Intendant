@@ -10,12 +10,10 @@ on:
       - "CLAUDE.md"
       - "AGENTS.md"
       - ".github/workflows/agents-md-sync.yml"
+  # Required-check triggers — unfiltered on purpose: a paths-skipped
+  # required check blocks queue entry (PRs) or wedges the group
+  # (merge_group); see windows.yml. `cmp` runs in seconds.
   pull_request:
-    paths:
-      - "CLAUDE.md"
-      - "AGENTS.md"
-  # Merge-queue gate — unconditional (see windows.yml: a paths-skipped
-  # required check wedges the queue). `cmp` runs in seconds.
   merge_group:
   workflow_dispatch:
 
