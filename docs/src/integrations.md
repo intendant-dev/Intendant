@@ -176,15 +176,38 @@ managed browser cache used by CDP browser workspaces.
 
 ### CI (`.github/workflows/`)
 
+`main` on `github.com/intendant-dev/Intendant` is ruleset-protected: every
+landing is a pull request validated by **GitHub's merge queue**, and the
+checks marked *required* below gate it. The required-check workflows run
+**unfiltered on `pull_request` and `merge_group`** on purpose: GitHub only
+adds a PR to the queue once the PR's own required checks pass, so a
+`paths:`-skipped required check blocks queue entry (and a skipped group check
+wedges the entry at "Expected"). Their push-to-main triggers keep paths
+filters — those runs warm the main-branch caches, they don't gate.
+
+The Linux and macOS legs run on a **self-hosted fleet** (`dell-206` /
+`intendant-linux`, `macbook-vm` / `intendant-macos`) whose persistent
+incremental `target/` dirs make warm gate runs a few minutes; the Windows leg
+stays on GitHub-hosted runners until a Windows box joins the fleet.
+Self-hosted hardening: jobs carry a same-repo guard so fork-PR code never
+executes on the fleet (fork PRs are handled manually behind the Actions
+fork-approval gate — only maintainers can enqueue anyway), the Dell runner
+runs as a dedicated sudo-less `ci` user, runners are registered per-repo,
+and the default `GITHUB_TOKEN` is read-only.
+
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
-| `windows.yml` | push/PR to `main` (Rust/Cargo paths) | Cross-platform `cargo test -p intendant --bins` on Windows (`x86_64-pc-windows-msvc`), macOS (`aarch64-apple-darwin`), and Linux (`x86_64-unknown-linux-gnu`) to catch platform-specific build breaks and Unix-only test assumptions |
-| `audit.yml` | push/PR (Cargo paths) + weekly cron (Mon 08:00 UTC) | `cargo audit` against the RustSec advisory DB |
-| `docs.yml` | docs changes | Build and deploy this mdBook |
-| `agents-md-sync.yml` | push/PR touching `CLAUDE.md` or `AGENTS.md`, plus manual dispatch | Fails when tracked `AGENTS.md` differs byte-for-byte from `CLAUDE.md` |
+| `windows.yml` | every PR + merge group; push to `main` (Rust/Cargo paths, cache warming) | **Required.** Cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` plus the headless mock-provider e2e on Windows (`x86_64-pc-windows-msvc`), macOS (`aarch64-apple-darwin`), and Linux (`x86_64-unknown-linux-gnu`) to catch platform-specific build breaks and Unix-only test assumptions |
+| `smokes.yml` | every PR + merge group; push to `main` (Rust/Cargo/smoke paths, cache warming) | **Required.** The keyless smokes (`session-vitals`, `native-goal`, `peer-sessions`) driving real release binaries with the scripted mock provider on Linux + macOS |
+| `app-html.yml` | every PR + merge group; push to `main` (fragment/assembler paths) | **Required.** Reruns the assembler and fails when the committed `static/app.html` doesn't match the fragments |
+| `agents-md-sync.yml` | every PR + merge group; push touching `CLAUDE.md`/`AGENTS.md`; manual dispatch | **Required.** Fails when tracked `AGENTS.md` differs byte-for-byte from `CLAUDE.md` |
+| `audit.yml` | push/PR (Cargo paths) + weekly cron (Mon 08:00 UTC) | Advisory: `cargo audit` against the RustSec advisory DB — new upstream advisories must not block unrelated landings |
+| `docs.yml` | docs changes on `main` | Build and deploy this mdBook to GitHub Pages |
 
-The E2E scenarios under `tests/skills/` make real API calls / need a display and
-are **not** in CI.
+The `tests/skills/` scenarios that make real API calls or need a display (the
+live claude-code-e2e battery, browser/Station probes, the peer smoke's
+`--browser` leg) are **not** in CI — they run on operator hardware as the
+post-landing battery.
 Run `cargo test --bins` and `cargo clippy` locally before committing. The TLS
 stack is pure-Rust `ring` / `rustls` / `rcgen` (no OpenSSL), which is why the
 Windows CI job installs NASM (for `ring`'s assembly) but no `libssl`.
