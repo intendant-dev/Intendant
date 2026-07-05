@@ -1859,6 +1859,7 @@ impl SessionSupervisor {
             UserAttachments::default(),
             session_name,
             None,
+            None,
             emit_session_started_after_identity,
             None,
             None,
@@ -5931,6 +5932,7 @@ mod tests {
                 false, // orchestrate
                 UserAttachments::default(),
                 Some("mock-orchestrator".to_string()),
+                None,
                 None,
                 false,
                 None,
