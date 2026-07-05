@@ -78,6 +78,7 @@ fn output_with_exit_status(
 pub async fn run_agent(
     json_input: &str,
     log_dir: &std::path::Path,
+    workdir: &std::path::Path,
 ) -> Result<AgentOutput, CallerError> {
     // Linux enforces this via Landlock inside the runtime; macOS wraps the
     // runtime in sandbox-exec; Windows re-execs inside the runtime under a
@@ -92,10 +93,10 @@ pub async fn run_agent(
                 write_paths,
                 enabled: true,
             };
-            return run_agent_inner(json_input, log_dir, Some(&sandbox)).await;
+            return run_agent_inner(json_input, log_dir, Some(workdir), Some(&sandbox)).await;
         }
     }
-    run_agent_inner(json_input, log_dir, None).await
+    run_agent_inner(json_input, log_dir, Some(workdir), None).await
 }
 
 /// Run the agent with optional Landlock sandbox configuration.
@@ -105,12 +106,13 @@ pub async fn run_agent_sandboxed(
     log_dir: &std::path::Path,
     sandbox: &crate::sandbox::SandboxConfig,
 ) -> Result<AgentOutput, CallerError> {
-    run_agent_inner(json_input, log_dir, Some(sandbox)).await
+    run_agent_inner(json_input, log_dir, None, Some(sandbox)).await
 }
 
 async fn run_agent_inner(
     json_input: &str,
     log_dir: &std::path::Path,
+    workdir: Option<&std::path::Path>,
     sandbox: Option<&crate::sandbox::SandboxConfig>,
 ) -> Result<AgentOutput, CallerError> {
     let agent_path = std::env::current_exe()
@@ -147,6 +149,17 @@ async fn run_agent_inner(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Run the runtime from the session's project root so relative paths in
+    // commands resolve where the conversation says they do ("Working
+    // directory: <project root>"). Without this the runtime inherited the
+    // controller's cwd, which diverges for any session whose project_root
+    // differs from the daemon's launch directory — sub-agent children and
+    // dashboard sessions targeting other projects. (The retired subprocess
+    // pipeline got this via `cd <dir> &&` in its spawn shell string.)
+    if let Some(workdir) = workdir.filter(|dir| dir.is_dir()) {
+        cmd.current_dir(workdir);
+    }
 
     // If sandbox config is provided, serialize it as an env var. The
     // runtime applies the restriction itself at startup — Landlock on

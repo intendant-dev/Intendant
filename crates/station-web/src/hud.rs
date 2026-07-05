@@ -514,7 +514,8 @@ impl StationInner {
         } else {
             "idle"
         };
-        let session_line = format!(
+        let goal_status = controls.session_goal_status.trim();
+        let mut session_line = format!(
             "{} / {} / {} / {}",
             nonempty(&controls.backend, "agent"),
             if controls.direct_mode {
@@ -525,6 +526,13 @@ impl StationInner {
             nonempty(&controls.approval_policy, "approval"),
             session_state
         );
+        // The prompt target's standing order belongs on the command deck:
+        // a full goal line when the tall deck has room, a short marker in
+        // the session line otherwise.
+        let tall_deck = h >= 90.0;
+        if !goal_status.is_empty() && !tall_deck {
+            session_line.push_str(&format!(" / goal {goal_status}"));
+        }
         self.text(
             &truncate(&session_line, ((w * 0.46) / 6.2).max(42.0) as usize),
             x + 18.0,
@@ -533,6 +541,33 @@ impl StationInner {
             C_SUBTEXT0_CSS,
             "normal",
         );
+        if !goal_status.is_empty() && tall_deck {
+            let goal_color = match goal_status {
+                "active" => C_GREEN_CSS,
+                "paused" | "budgetLimited" | "budget-limited" => C_YELLOW_CSS,
+                "completed" | "complete" => C_BLUE_CSS,
+                _ => C_LAVENDER_CSS,
+            };
+            let mut goal_line = format!(
+                "goal {}: {}",
+                goal_status,
+                nonempty(&controls.session_goal_objective, "(no objective)")
+            );
+            if !controls.session_goal_tokens.trim().is_empty() {
+                goal_line.push_str(&format!(
+                    " ({} tok)",
+                    controls.session_goal_tokens.trim()
+                ));
+            }
+            self.text(
+                &truncate(&goal_line, ((w * 0.46) / 5.6).max(46.0) as usize),
+                x + 18.0,
+                y + 84.0,
+                9.5,
+                goal_color,
+                "normal",
+            );
+        }
 
         let context_pct = percent(
             self.snapshot.context.tokens,
@@ -2856,14 +2891,28 @@ impl StationInner {
                     .approval_id
                     .as_deref()
                     .is_some_and(|id| !id.is_empty()));
-        let rows =
-            5 + usize::from(!agent.worktree.trim().is_empty()) + if approval { 2 } else { 0 };
-        let panel_h = 74.0 + rows as f32 * 17.0 + if approval { 30.0 } else { 6.0 };
+        let is_session = !agent.session_id.trim().is_empty();
+        let has_goal =
+            !agent.goal_objective.trim().is_empty() || !agent.goal_status.trim().is_empty();
+        let rows = 5
+            + usize::from(!agent.worktree.trim().is_empty())
+            + usize::from(has_goal)
+            + usize::from(!agent.relationship_kind.trim().is_empty())
+            + if approval { 2 } else { 0 };
+        let panel_h = 74.0
+            + rows as f32 * 17.0
+            + if approval { 30.0 } else { 6.0 }
+            + if is_session { 34.0 } else { 0.0 };
         let y = (activity_lane_y - panel_h - 12.0).max(58.0);
         let phase = phase_color_css(&agent.phase);
         self.focus_panel_frame(x, y, panel_w, panel_h, &agent.id, phase);
+        let subtitle = if is_session {
+            format!("{} session", nonempty(&agent.source, "intendant"))
+        } else {
+            format!("{} agent", nonempty(&agent.role, "agent"))
+        };
         self.text(
-            &truncate(&format!("{} agent", nonempty(&agent.role, "agent")), 30),
+            &truncate(&subtitle, 30),
             x + 96.0,
             y + 23.0,
             9.0,
@@ -2927,6 +2976,42 @@ impl StationInner {
             &nonempty(&agent.task, "idle"),
             C_TEAL_CSS,
         );
+        if !agent.relationship_kind.trim().is_empty() {
+            let parent = agent
+                .parent_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(|p| p.strip_prefix("session-").unwrap_or(p))
+                .map(|p| truncate(p, 12))
+                .unwrap_or_default();
+            let lineage = if parent.is_empty() {
+                agent.relationship_kind.trim().to_string()
+            } else {
+                format!("{} of {}", agent.relationship_kind.trim(), parent)
+            };
+            row_y = self.focus_row(x, row_y, panel_w, "lineage", &lineage, C_MAUVE_CSS);
+        }
+        if has_goal {
+            let status = agent.goal_status.trim();
+            let goal_color = match status {
+                "active" => C_GREEN_CSS,
+                "paused" | "budgetLimited" | "budget-limited" => C_YELLOW_CSS,
+                "completed" | "complete" => C_BLUE_CSS,
+                _ => C_LAVENDER_CSS,
+            };
+            let mut goal_text = if status.is_empty() {
+                agent.goal_objective.trim().to_string()
+            } else if agent.goal_objective.trim().is_empty() {
+                status.to_string()
+            } else {
+                format!("{}: {}", status, agent.goal_objective.trim())
+            };
+            if !agent.goal_tokens.trim().is_empty() {
+                goal_text.push_str(&format!(" ({} tok)", agent.goal_tokens.trim()));
+            }
+            row_y = self.focus_row(x, row_y, panel_w, "goal", &goal_text, goal_color);
+        }
         let budget_pct = percent(agent.tokens, agent.token_cap);
         row_y = self.focus_row(
             x,
@@ -2973,6 +3058,48 @@ impl StationInner {
                 agent.worktree.trim(),
                 C_MAUVE_CSS,
             );
+        }
+
+        if is_session {
+            // Per-node action pills at session-window-kebab parity: the
+            // universal basics plus whatever thread-action ops the session
+            // advertises. Every pill dispatches through the dashboard's
+            // real session-action handler.
+            let sid = agent.session_id.trim().to_string();
+            let ops = &agent.thread_actions;
+            let py = row_y - 2.0;
+            let mut px = x + 96.0;
+            let mut pills: Vec<(&str, &str, &str)> =
+                vec![("log", C_BLUE_CSS, "station-log"), ("target", C_TEAL_CSS, "target")];
+            pills.push(("steer", C_LAVENDER_CSS, "steer"));
+            if agent.can_interrupt {
+                pills.push(("stop", C_RED_CSS, "interrupt"));
+            }
+            if ops.iter().any(|op| op == "compact") {
+                pills.push(("compact", C_MAUVE_CSS, "thread-compact"));
+            }
+            if ops.iter().any(|op| op == "fork") {
+                pills.push(("fork", C_PEACH_CSS, "thread-fork"));
+            }
+            for (label, color, action) in pills {
+                let pw = label.chars().count() as f32 * 6.1 + 18.0;
+                if px + pw > x + panel_w - 16.0 {
+                    break;
+                }
+                self.pill_at(px, py, pw, 23.0, label, color, false);
+                self.hit_zones.push(HitZone::new(
+                    px,
+                    py,
+                    pw,
+                    23.0,
+                    HitAction::SessionAction {
+                        action: action.to_string(),
+                        id: sid.clone(),
+                    },
+                ));
+                px += pw + 8.0;
+            }
+            row_y += 32.0;
         }
 
         if approval {

@@ -4304,7 +4304,7 @@ async fn handle_spawn_sub_agent_call(
     };
     match orchestration
         .supervisor
-        .start_sub_agent_session(&orchestration.session_id, project, params)
+        .start_sub_agent_session(&orchestration.session_id, project, orchestration.depth, params)
         .await
     {
         Ok(started) => {
@@ -4624,7 +4624,10 @@ async fn run_agent_loop(
     provider: &dyn provider::ChatProvider,
     conversation: &mut Conversation,
     project: &Project,
-    sub_agent_mode: Option<&(String, sub_agent::SubAgentRole)>,
+    // Consumed by run_round_loop (children end at task end instead of
+    // idling for follow-ups); unused inside the loop itself since the
+    // progress-file writes were retired.
+    _sub_agent_mode: Option<&(String, sub_agent::SubAgentRole)>,
     bus: &EventBus,
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
@@ -5699,7 +5702,7 @@ async fn run_agent_loop(
                 source: None,
             });
 
-            let output = agent_runner::run_agent(&json_str, log_dir).await?;
+            let output = agent_runner::run_agent(&json_str, log_dir, &project.root).await?;
             let output_id = event::next_agent_output_id();
 
             // Log agent output
@@ -6131,7 +6134,7 @@ Proceed with explicit assumptions and continue without additional questions."
                 source: None,
             });
 
-            let output = agent_runner::run_agent(&json_str, log_dir).await?;
+            let output = agent_runner::run_agent(&json_str, log_dir, &project.root).await?;
             let output_id = event::next_agent_output_id();
 
             // Log agent output
@@ -6232,6 +6235,17 @@ async fn run_round_loop(
         cumulative_stats.usage.completion_tokens += stats.usage.completion_tokens;
         cumulative_stats.usage.total_tokens += stats.usage.total_tokens;
         cumulative_stats.rounds = round;
+        // Carry the per-round terminal fields forward — the latest round's
+        // values win. Sub-agent completion synthesis reads these off the
+        // returned stats; dropping them here delivered content-free child
+        // results ("Task completed") whenever a child ended without an
+        // explicit submit_result.
+        if stats.last_response.is_some() {
+            cumulative_stats.last_response = stats.last_response.clone();
+        }
+        if stats.terminal_outcome.is_some() {
+            cumulative_stats.terminal_outcome = stats.terminal_outcome.clone();
+        }
 
         // Sub-agent mode: never wait for follow-up
         if sub_agent_mode.is_some() {
@@ -9237,6 +9251,21 @@ async fn run_direct_mode(
             prompts::resolve_system_prompt_for_tools(&role, Some(&project.root))?
         }
         None => prompts::resolve_system_prompt(&role, Some(&project.root))?,
+    };
+    // Sub-agent children get an unconditional identity section. The role
+    // files' conditional "when you run as a sub-agent" phrasing left the
+    // model guessing, and a wrong guess either strands the result or
+    // re-delegates the task downward — both observed in live runs.
+    let system_prompt = match native.sub_agent_identity.as_ref() {
+        Some((name, _)) => format!(
+            "{system_prompt}\n\n## Sub-Agent Context\n\nYou ARE running as a sub-agent named \
+             \"{name}\", spawned by another session. Do the assigned task yourself — do not \
+             delegate it onward with spawn_sub_agent. When the task is done (or has \
+             definitively failed), call submit_result with a complete summary and discrete \
+             findings, then call signal_done. Your submitted result is everything your parent \
+             sees."
+        ),
+        None => system_prompt,
     };
 
     let mode_label = if native.sub_agent_identity.is_some() {

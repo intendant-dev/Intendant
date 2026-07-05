@@ -4627,22 +4627,24 @@ pub fn spawn_web_gateway(
         });
     }
 
-    let app_html = Arc::new(
-        [
-            "/wasm-web/presence_web.js",
-            "/wasm-web/presence_web_bg.wasm",
-            "/wasm-station/station_web.js",
-            "/wasm-station/station_web_bg.wasm",
-            "/three.module.min.js",
-            "/codemirror-bundle.js",
-            "/codemirror-bundle.css",
-            "/icon-128.png",
-        ]
-        .iter()
-        .fold(APP_HTML.to_string(), |html, path| {
-            rewrite_asset_url_with_version(&html, path, &v)
-        }),
-    );
+    let app_html = Arc::new(rewrite_app_html_asset_urls(APP_HTML.to_string(), &v));
+    // INTENDANT_APP_HTML_PATH (dev override): read once at spawn; when
+    // set, every dashboard request re-reads that path instead of serving
+    // the embedded `app_html` above.
+    let app_html_override: Option<Arc<std::path::Path>> =
+        app_html_override_path().map(Arc::from);
+    if let Some(path) = &app_html_override {
+        eprintln!(
+            "[web_gateway] INTENDANT_APP_HTML_PATH: serving the dashboard from {} \
+             (re-read per request; the embedded copy is ignored)",
+            path.display()
+        );
+        if let Err(err) = std::fs::metadata(path) {
+            eprintln!(
+                "[web_gateway] WARNING: INTENDANT_APP_HTML_PATH is not readable right now: {err}"
+            );
+        }
+    }
     // Lazily computed (ETag token, gzipped body) for the rewritten
     // app.html — once per gateway spawn, on the first page load. The
     // rewritten HTML is gateway-scoped (unlike the `include_*!` constants
@@ -4749,6 +4751,7 @@ pub fn spawn_web_gateway(
             let session_model = session_model.clone();
             let app_html = app_html.clone();
             let app_html_cache = app_html_cache.clone();
+            let app_html_override = app_html_override.clone();
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
             let display_input_authority = display_input_authority.clone();
@@ -9012,25 +9015,31 @@ pub fn spawn_web_gateway(
                         // gzip are computed once per gateway spawn, on first
                         // page load: the rewritten HTML is gateway-scoped,
                         // unlike the constants behind `embedded_static_asset`.
-                        let (etag, gzip) = app_html_cache.get_or_init(|| {
-                            (
-                                asset_etag(app_html.as_bytes()),
-                                gzip_compress(app_html.as_bytes()),
+                        // Under INTENDANT_APP_HTML_PATH the disk copy is
+                        // re-read (and re-tagged) on every request instead.
+                        let response = if let Some(path) = app_html_override.as_deref() {
+                            app_html_override_response(req_method, &header_text, req_query, path)
+                        } else {
+                            let (etag, gzip) = app_html_cache.get_or_init(|| {
+                                (
+                                    asset_etag(app_html.as_bytes()),
+                                    gzip_compress(app_html.as_bytes()),
+                                )
+                            });
+                            build_static_asset_response(
+                                req_method,
+                                &header_text,
+                                req_query,
+                                asset_version(),
+                                StaticAssetView {
+                                    content_type: "text/html; charset=utf-8",
+                                    body: app_html.as_bytes(),
+                                    etag,
+                                    gzip: Some(gzip),
+                                    cache_control: Some("no-cache"),
+                                },
                             )
-                        });
-                        let response = build_static_asset_response(
-                            req_method,
-                            &header_text,
-                            req_query,
-                            asset_version(),
-                            StaticAssetView {
-                                content_type: "text/html; charset=utf-8",
-                                body: app_html.as_bytes(),
-                                etag,
-                                gzip: Some(gzip),
-                                cache_control: Some("no-cache"),
-                            },
-                        );
+                        };
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(&response).await;
                     } else {

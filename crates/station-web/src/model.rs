@@ -102,6 +102,23 @@ pub(crate) struct StationAgent {
     pub(crate) approval_id: Option<String>,
     pub(crate) approval_command: String,
     pub(crate) approval_category: String,
+    /// Live session this node projects (empty for the synthetic nodes:
+    /// the primary agent, peer daemons, approval markers). Session nodes
+    /// are the Phase B constellation — one per live session window,
+    /// wired to their parent by `session_relationship` data.
+    pub(crate) session_id: String,
+    /// Backend source for session nodes ("codex", "claude-code", …).
+    pub(crate) source: String,
+    /// Relationship to the parent node ("subagent", "fork", "side", …);
+    /// colors the parent edge.
+    pub(crate) relationship_kind: String,
+    pub(crate) goal_status: String,
+    pub(crate) goal_objective: String,
+    pub(crate) goal_tokens: String,
+    /// Advertised thread-action ops for this session (the kebab
+    /// vocabulary); gates the focus panel's action pills.
+    pub(crate) thread_actions: Vec<String>,
+    pub(crate) can_interrupt: bool,
 }
 
 impl Default for StationAgent {
@@ -130,6 +147,14 @@ impl Default for StationAgent {
             approval_id: None,
             approval_command: String::new(),
             approval_category: String::new(),
+            session_id: String::new(),
+            source: String::new(),
+            relationship_kind: String::new(),
+            goal_status: String::new(),
+            goal_objective: String::new(),
+            goal_tokens: String::new(),
+            thread_actions: Vec::new(),
+            can_interrupt: false,
         }
     }
 }
@@ -897,6 +922,41 @@ mod tests {
         assert_eq!(snapshot.sessions.worktree_dirty, 2);
         // Sections absent from the payload fall back wholesale.
         assert_eq!(snapshot.context.replay_mode, "live");
+        // Pre-Phase-B feeds omit the session-node fields entirely.
+        assert!(agent.session_id.is_empty());
+        assert!(agent.thread_actions.is_empty());
+        assert!(!agent.can_interrupt);
+    }
+
+    #[test]
+    fn session_node_agents_deserialize_their_phase_b_fields() {
+        let snapshot: StationSnapshot = serde_json::from_value(serde_json::json!({
+            "agents": [{
+                "id": "session-abc",
+                "hostId": "local",
+                "role": "sub-agent",
+                "parentId": "session-parent",
+                "sessionId": "abc",
+                "source": "claude-code",
+                "relationshipKind": "subagent",
+                "goalStatus": "active",
+                "goalObjective": "keep replies short",
+                "goalTokens": "1234",
+                "threadActions": ["compact", "fork"],
+                "canInterrupt": true
+            }]
+        }))
+        .expect("session node should deserialize");
+        let agent = &snapshot.agents[0];
+        assert_eq!(agent.session_id, "abc");
+        assert_eq!(agent.source, "claude-code");
+        assert_eq!(agent.relationship_kind, "subagent");
+        assert_eq!(agent.goal_status, "active");
+        assert_eq!(agent.goal_objective, "keep replies short");
+        assert_eq!(agent.goal_tokens, "1234");
+        assert_eq!(agent.thread_actions, vec!["compact", "fork"]);
+        assert!(agent.can_interrupt);
+        assert_eq!(agent.parent_id.as_deref(), Some("session-parent"));
     }
 
     #[test]

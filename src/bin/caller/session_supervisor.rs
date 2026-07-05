@@ -91,6 +91,13 @@ struct RelatedSessionRecord {
 /// session when `[orchestrator] max_parallel_agents` is not set.
 const DEFAULT_MAX_PARALLEL_SUB_AGENTS: usize = 4;
 
+/// Maximum delegation depth below a root session: a root (depth 0) can
+/// spawn workers (depth 1), which may themselves delegate once more
+/// (depth 2); deeper spawns are refused. Uncapped depth let confused
+/// children re-delegate their own task in an unbounded chain (observed
+/// live before the cap).
+const MAX_SUB_AGENT_DEPTH: usize = 2;
+
 /// Launch parameters for a supervised sub-agent session (the
 /// `spawn_sub_agent` tool).
 pub struct SubAgentSpawnParams {
@@ -149,6 +156,9 @@ pub struct SubAgentChild {
 pub struct SessionOrchestration {
     pub supervisor: SessionSupervisor,
     pub session_id: String,
+    /// How many spawn generations below a root session this session sits
+    /// (0 = root). Spawns beyond `MAX_SUB_AGENT_DEPTH` are refused.
+    pub depth: usize,
     /// `Some` when this session was spawned as a sub-agent: the structured
     /// result the child submits via the submit_result tool.
     pub submitted_result: Option<Arc<std::sync::Mutex<Option<sub_agent::SubAgentResult>>>>,
@@ -166,6 +176,8 @@ pub(crate) struct SubAgentWiring {
     role: sub_agent::SubAgentRole,
     system_prompt: Option<String>,
     inherit_memory: bool,
+    /// The child's delegation depth (parent depth + 1).
+    depth: usize,
 }
 
 struct ManagedSession {
@@ -1710,19 +1722,34 @@ impl SessionSupervisor {
         &'a self,
         parent_session_id: &'a str,
         parent_project: &'a Project,
+        parent_depth: usize,
         params: SubAgentSpawnParams,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<SubAgentSpawnStarted, String>> + Send + 'a>,
     > {
-        Box::pin(self.start_sub_agent_session_inner(parent_session_id, parent_project, params))
+        Box::pin(self.start_sub_agent_session_inner(
+            parent_session_id,
+            parent_project,
+            parent_depth,
+            params,
+        ))
     }
 
     async fn start_sub_agent_session_inner(
         &self,
         parent_session_id: &str,
         parent_project: &Project,
+        parent_depth: usize,
         params: SubAgentSpawnParams,
     ) -> Result<SubAgentSpawnStarted, String> {
+        let child_depth = parent_depth.saturating_add(1);
+        if child_depth > MAX_SUB_AGENT_DEPTH {
+            return Err(format!(
+                "sub-agent depth cap reached: this session is already {parent_depth} delegation \
+                 level(s) below the root and cannot spawn further sub-agents. Do the task \
+                 yourself and report with submit_result."
+            ));
+        }
         let cap = parent_project
             .config
             .orchestrator
@@ -1841,6 +1868,7 @@ impl SessionSupervisor {
             role: params.role,
             system_prompt: params.system_prompt,
             inherit_memory: params.inherit_memory,
+            depth: child_depth,
         };
         let source = params
             .backend
@@ -1995,6 +2023,7 @@ impl SessionSupervisor {
                     orchestration: Some(SessionOrchestration {
                         supervisor: supervisor.clone(),
                         session_id: session_id.clone(),
+                        depth: sub_agent_wiring.as_ref().map(|w| w.depth).unwrap_or(0),
                         submitted_result: sub_agent_wiring
                             .as_ref()
                             .map(|w| w.submitted_result.clone()),
@@ -5820,6 +5849,36 @@ mod tests {
         );
         let state = supervisor.state.lock().await;
         assert!(state.sessions.contains_key("parent"));
+    }
+
+    #[tokio::test]
+    async fn sub_agent_spawn_refuses_beyond_depth_cap() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let project = Project {
+            root: PathBuf::from("/tmp/project"),
+            config: crate::project::ProjectConfig::default(),
+        };
+        let result = supervisor
+            .start_sub_agent_session(
+                "parent",
+                &project,
+                MAX_SUB_AGENT_DEPTH,
+                SubAgentSpawnParams {
+                    task: "recurse further".to_string(),
+                    role: sub_agent::SubAgentRole::Custom("worker".to_string()),
+                    system_prompt: None,
+                    backend: None,
+                    worktree: false,
+                    inherit_memory: false,
+                    name: None,
+                },
+            )
+            .await;
+        match result {
+            Err(err) => assert!(err.contains("depth cap"), "unexpected error: {err}"),
+            Ok(_) => panic!("spawn beyond the depth cap must be refused"),
+        }
     }
 
     #[tokio::test]

@@ -60,7 +60,22 @@ pub(crate) fn role_color(role: &str) -> Color {
         "orchestrator" => C_BLUE,
         "sub-agent" => C_MAUVE,
         "direct" => C_TEAL,
+        "session" => C_SAPPHIRE,
+        "external" => C_PEACH,
         _ => C_TEAL,
+    }
+}
+
+/// Edge tint for a parent/child session relationship. Falls back to the
+/// child's role color for unknown/absent kinds so pre-Phase-B nodes keep
+/// their look.
+pub(crate) fn relationship_color(kind: &str, role: &str) -> Color {
+    match kind {
+        "subagent" => C_MAUVE,
+        "fork" => C_PEACH,
+        "side" => C_TEAL,
+        "fission-branch" => C_LAVENDER,
+        _ => role_color(role),
     }
 }
 
@@ -374,5 +389,23 @@ mod tests {
         let think: [f32; 4] = phase_color("thinking").into();
         let lavender: [f32; 4] = C_LAVENDER.into();
         assert_eq!(think, lavender);
+    }
+
+    #[test]
+    fn relationship_colors_key_edge_kinds_and_fall_back_to_role() {
+        let sub: [f32; 4] = relationship_color("subagent", "session").into();
+        let mauve: [f32; 4] = C_MAUVE.into();
+        assert_eq!(sub, mauve);
+        let fork: [f32; 4] = relationship_color("fork", "session").into();
+        let peach: [f32; 4] = C_PEACH.into();
+        assert_eq!(fork, peach);
+        // Unknown kinds keep the node's role color, so pre-Phase-B nodes
+        // (which never set a kind) render exactly as before.
+        let unknown: [f32; 4] = relationship_color("", "orchestrator").into();
+        let blue: [f32; 4] = C_BLUE.into();
+        assert_eq!(unknown, blue);
+        let session: [f32; 4] = role_color("session").into();
+        let sapphire: [f32; 4] = C_SAPPHIRE.into();
+        assert_eq!(session, sapphire);
     }
 }

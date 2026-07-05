@@ -78,20 +78,19 @@ replay, changes/diff, peer/display lanes, and view settings
 
 Known seams — the honest gap between the vision and the pixels:
 
-- **Sessions are not in the scene.** The constellation renders one agent
-  node for the local daemon, one per peer daemon, and synthetic approval
-  nodes — real sessions, sub-agents, and forks never become 3D entities.
-  The parent/child edge machinery in `scene.rs` exists but is exercised
-  only by the approval nodes.
-- **Goals are plumbed, not rendered.** `StationSnapshot` carries per-session
-  goal fields end-to-end; the renderer never reads them.
+- **Live local sessions ARE in the scene** (Phase B first cut): one node
+  per live session window, parent edges from `session_relationship` data,
+  context-pressure rings, approval glow, and per-node action pills on the
+  focus panel. Still outside the scene: *recent* (closed-window) sessions
+  and peer daemons' sessions — peers render as one node each because they
+  publish no per-session data into the snapshot yet.
+- **Goals render on the focus panel and command deck**; nothing else reads
+  them yet (no goal ring on the node itself).
 - **The scene is a backdrop.** All operational UI is screen-space 2D HUD
   paint; nothing interactive lives in world space yet.
-- **Codex is the only backend with a rendered runtime block** in the
-  controls panel (approval policy, managed-context mode, fork-binary
-  warning). Claude Code is a selectable label with no options block, even
-  though its runtime config (model / permission mode / allowed tools)
-  already exists in the control plane.
+- **Both backends have rendered runtime blocks** in the controls panel
+  (Codex: approval policy / managed-context / fork-binary warning;
+  Claude Code: model aliases / permission modes).
 - **Wireframe-only rendering** (no depth buffer or shading), plus a stack of
   WebGPU-reliability fallbacks (auto Canvas-2D, scene-on-HUD underlay, a
   liveness watchdog) that reflect real-world driver flakiness.
@@ -103,23 +102,34 @@ concrete; C and D set the trajectory.
 
 ### Phase A — backend parity through the universal rails
 
-The per-session operational features (goal chips, per-window action menus,
-relationship wiring) were built against Codex first. The transports are
-already backend-neutral; Claude Code — and any future backend, including
-native sessions — catches up by *producing into those rails*, not by growing
-parallel `claude_*` UI paths. The concrete matrix and catch-up order live in
+**Landed.** The per-session operational features (goal chips, per-window
+action menus, relationship wiring) were built against Codex first. The
+transports are already backend-neutral; Claude Code caught up by
+*producing into those rails* — thread actions, the wrapper goal engine,
+in-band Task sub-agents as `task-*` child sessions, the per-session launch
+overlay, and the controls-panel Claude runtime block. Native sessions
+remain the open producer. The concrete matrix lives in
 [Dashboard and Station parity](./external-agent-orchestration.md#dashboard-and-station-parity-codex-vs-claude-code).
 
 ### Phase B — the session graph becomes real
 
-Project real sessions into the scene: one node per live/recent session,
-orbiting its host, wired to its parent by the existing
-`session_relationship` data (sub-agent / fork / side), ringed by context
-pressure, glowing on pending approval. The latent edge machinery lights up;
-goal state renders on the agent focus panel and the command deck; per-node
-action menus reach parity with the session-window kebab. At the end of
-Phase B, Station shows the *actual* multi-agent topology — the constellation
-stops being a metaphor.
+**Landed (first cut).** Project real sessions into the scene: one node per
+live session window, orbiting its host, wired to its parent by the
+existing `session_relationship` data (sub-agent / fork / side edges tinted
+by kind), ringed by context pressure, glowing on pending approval. The
+snapshot's `agents` array now carries session nodes
+(`stationSessionAgents()` in the dashboard feed → `session-<id>` node ids,
+`sessionId`/`source`/`relationshipKind`/goal fields/`threadActions` on
+`StationAgent`); the daemon's own main session stays the `primary-agent`
+node. Goal state renders on the agent focus panel (a `goal` row) and the
+command deck (a goal line under the session line, or a short marker on
+narrow decks); the focus panel for a session node carries per-node action
+pills at session-window-kebab parity — log / target / steer / stop plus
+the session's advertised thread-action ops (compact, fork) — all
+dispatching through the dashboard's real session-action handler. Still
+open in this phase: nodes for *recent* (non-live) sessions, and session
+nodes for peer daemons' sessions (peers publish no per-session data into
+the snapshot yet).
 
 ### Phase C — panes move into the scene
 

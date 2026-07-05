@@ -982,7 +982,31 @@ function stationHandleSessionAction(action) {
     return;
   }
   if (op === 'interrupt') {
-    stationHandleActivityAction({ action: 'stop' });
+    // Target the session's own turn; the daemon supervisor routes by id
+    // (a bare interrupt would broadcast to the foreground turn instead).
+    const msg = { action: 'interrupt' };
+    if (sessionId) msg.session_id = live?.actionId || sessionId;
+    dispatchSessionControlMsg(msg);
+    showControlToast?.('info', `Interrupt sent to ${shortSessionId(sessionId)}`);
+    return;
+  }
+  if (op === 'steer') {
+    // Make this session the prompt target, then open the composer on it.
+    focusSessionWindow(live?.liveId || sessionId);
+    if (stationRenderedPrimaryActive()) {
+      station?.set_composer?.(true, 'send');
+      stationHandleComposerEvent({ op: 'focus' });
+    }
+    return;
+  }
+  if (op === 'thread-compact') {
+    dispatchCodexThreadAction('compact', {}, live?.actionId || sessionId);
+    showControlToast?.('info', `Compaction requested for ${shortSessionId(sessionId)}`);
+    return;
+  }
+  if (op === 'thread-fork') {
+    dispatchCodexThreadAction('fork', {}, live?.actionId || sessionId);
+    showControlToast?.('info', `Fork requested for ${shortSessionId(sessionId)}`);
     return;
   }
   if (op === 'copy') {

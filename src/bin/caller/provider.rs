@@ -3519,19 +3519,14 @@ pub mod mock {
             }
 
             if transcript.contains("MOCK-RESEARCH") {
+                // Ends WITHOUT submit_result: a pure text answer. The
+                // supervisor synthesizes this child's result from the loop's
+                // last_response — regression coverage for the round-loop
+                // stats propagation (a dropped last_response turned these
+                // results into a content-free "Task completed").
                 return Ok(Self::response(
-                    "Submitting research result.",
-                    vec![
-                        Self::tool_call(
-                            "submit_result",
-                            serde_json::json!({
-                                "status": "completed",
-                                "summary": "research findings ABC",
-                                "findings": ["schema has 3 tables"],
-                            }),
-                        ),
-                        Self::tool_call("signal_done", serde_json::json!({})),
-                    ],
+                    "research findings ABC: the schema has 3 tables.\n\nBRIEF: Research done.",
+                    vec![],
                 ));
             }
             if transcript.contains("MOCK-FAILING") {
