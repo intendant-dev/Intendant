@@ -1468,6 +1468,22 @@ impl App {
                     format!("New session requested: {}", truncate_str(task, 80)),
                 );
             }
+            ControlMsg::SpawnSubAgent {
+                ref session_id,
+                ref task,
+                ..
+            } => {
+                // Routing is handled by `session_supervisor::SessionSupervisor`.
+                // The TUI only reflects that a delegation was requested.
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Sub-agent delegation requested for session {}: {}",
+                        truncate_str(session_id, 12),
+                        truncate_str(task, 80)
+                    ),
+                );
+            }
             ControlMsg::ResumeSession {
                 ref source,
                 ref session_id,

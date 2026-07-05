@@ -18,6 +18,10 @@ function runSessionWindowAction(sessionId, op) {
     });
     return;
   }
+  if (op === 'delegate-sub-agent') {
+    openSessionDelegateModal(sid);
+    return;
+  }
   if (op === 'configure-launch') {
     openSessionConfigModal(sid);
     return;

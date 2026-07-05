@@ -47,7 +47,11 @@ pub(crate) enum SegmentSpec {
     /// This exact segment.
     Literal(&'static str),
     /// One of these exact segments; the matched value is also captured.
-    #[allow(dead_code)] // constructed from phase 2 (peer quick-control routes)
+    /// Vocabulary reserved for future multi-leaf declarations. The peers
+    /// and doorbell sub-routers deliberately did NOT adopt it (phase 4d):
+    /// their `Any` catch-all rows preserve handler-owned JSON 404s for
+    /// garbage subpaths that per-leaf rows would drop to the SPA shell.
+    #[allow(dead_code)]
     OneOf(&'static [&'static str]),
 }
 
@@ -146,16 +150,34 @@ pub(crate) enum CorsPosture {
 /// into dispatch so handlers can't forget caps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyPolicy {
-    /// No body is read.
+    /// No body is consumed for this route.
     None,
-    /// Read with the shared bounded reader (`read_request_body` /
-    /// `read_post_body`).
+    /// Dispatch reads the body before the handler runs, capped at
+    /// [`DEFAULT_BODY_CAP_BYTES`]; over-cap requests get a 413 with the
+    /// route's CORS posture.
     Default,
-    /// Read with a route-specific cap (e.g. the fs-write envelope cap).
-    Capped,
-    /// The handler drives the stream itself (uploads, NDJSON streams).
+    /// Dispatch reads the body with this route-specific cap.
+    Capped(usize),
+    /// The handler owns the stream: uploads spool to a tempfile, and the
+    /// doorbell's cap comes from runtime config
+    /// (`peer_access_requests`), which the table cannot carry.
     Streaming,
 }
+
+/// Body cap for [`BodyPolicy::Default`] routes — JSON command bodies
+/// (settings, session ops, access administration, peer quick controls).
+/// Before dispatch-side consumption these reads were UNBOUNDED: any
+/// authenticated caller could allocate arbitrary memory with one huge
+/// Content-Length. Generous headroom over every legitimate payload.
+pub(crate) const DEFAULT_BODY_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+/// Body cap for `POST /mcp` — JSON-RPC tool calls can legitimately carry
+/// file-sized arguments (fs tools, upload-adjacent flows).
+pub(crate) const MCP_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
+
+/// Body cap for the visual-freshness diagnostics sink (NDJSON transcript
+/// batches).
+pub(crate) const DIAGNOSTICS_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
 
 /// Links a table row to its dispatch arm in `web_gateway.rs`. The match
 /// there is exhaustive, so a declared route without an arm — or an arm
@@ -376,7 +398,11 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteMethod::Post,
         PathPattern::Exact("/api/fs/write"),
         PeerOperation::FilesystemWrite,
-        BodyPolicy::Capped,
+        // The JSON envelope adds base64/escaping overhead on top of the
+        // content cap apply_dashboard_fs_write enforces; allow half again.
+        BodyPolicy::Capped(
+            crate::web_gateway::UPLOAD_MAX_BYTES + crate::web_gateway::UPLOAD_MAX_BYTES / 2,
+        ),
         RouteHandlerId::FsWrite,
         "Write file bytes (scope-checked; sha256-guarded overwrite)",
     ),
@@ -650,7 +676,7 @@ pub(crate) static ROUTES: &[Route] = &[
     //    by federation_http_operation). Declaring the operation here is
     //    the fail-closed fix; the differential test allowlists it.
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/sessions/stream"),
         PeerOperation::SessionInspect,
         BodyPolicy::None,
@@ -658,29 +684,27 @@ pub(crate) static ROUTES: &[Route] = &[
         "NDJSON stream of the session list",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/sessions/search"),
         PeerOperation::SessionInspect,
         BodyPolicy::None,
         RouteHandlerId::SessionsSearch,
         "Search sessions (q, source, mode, project filters)",
     ),
-    // Method-agnostic in the legacy chain (see RouteMethod::Any).
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/sessions"),
         PeerOperation::SessionInspect,
         BodyPolicy::None,
         RouteHandlerId::SessionsList,
         "List sessions (id filter, limit, usage view; response CORS * for the fleet Stats tab)",
     ),
-    // ── Settings / info endpoints. `Any` rows port arms that were
-    //    method-blind in the legacy chain; their single declared
-    //    operation now classifies every method (fail-closed vs the
-    //    residual classifier's method-specific holes — allowlisted in
-    //    the differential test).
+    // ── Settings / info endpoints. Ported method-blind from the legacy
+    //    chain as `Any` rows, then tightened to their real methods: an
+    //    undeclared method on a declared path now gets the dispatch-level
+    //    405-with-Allow instead of reaching a read handler.
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/project-root"),
         PeerOperation::Settings,
         BodyPolicy::None,
@@ -696,7 +720,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Update runtime settings",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/settings"),
         PeerOperation::Settings,
         BodyPolicy::None,
@@ -712,7 +736,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Store provider API keys in the project .env",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/api-key-status"),
         PeerOperation::Settings,
         BodyPolicy::None,
@@ -720,7 +744,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Which provider keys are configured (presence only)",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/external-agents"),
         PeerOperation::SessionInspect,
         BodyPolicy::None,
@@ -731,12 +755,12 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteMethod::Post,
         PathPattern::Exact("/api/diagnostics/visual-freshness"),
         PeerOperation::DisplayInput,
-        BodyPolicy::Default,
+        BodyPolicy::Capped(DIAGNOSTICS_BODY_CAP_BYTES),
         RouteHandlerId::DiagnosticsVisualFreshness,
         "Visual-freshness diagnostics transcript sink (NDJSON body)",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/displays"),
         PeerOperation::DisplayView,
         BodyPolicy::None,
@@ -747,17 +771,21 @@ pub(crate) static ROUTES: &[Route] = &[
     //    signature/shape is the authority; RouteAuthz::Public makes the
     //    no-IAM-gate decision explicit (these paths are also exempted by
     //    the mTLS and origin gates, which match on the same constants).
+    //    The doorbell stays a method-`Any` catch-all row on purpose:
+    //    its handler routes POST-knock vs GET-poll internally and answers
+    //    garbage subpaths with a public-CORS JSON 404 — per-shape rows
+    //    would drop those to the SPA-shell fallback instead.
     public_route(
         RouteMethod::Any,
         PathPattern::Under(crate::peer::access_request::PUBLIC_REQUEST_PATH),
-        BodyPolicy::Capped,
+        BodyPolicy::Streaming,
         RouteHandlerId::Doorbell,
         "Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath)",
     ),
     public_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants"),
-        BodyPolicy::Capped,
+        BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES),
         RouteHandlerId::AccessOrgGrantPresent,
         "Present a signed org grant document (verified against locally trusted org keys)",
     ),
@@ -775,23 +803,23 @@ pub(crate) static ROUTES: &[Route] = &[
         "Org revocation list (ORL) for a trusted org",
     ),
     public_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/orgs/revocations/apply"),
-        BodyPolicy::Capped,
+        BodyPolicy::Capped(crate::access::org::MAX_ORG_ORL_BYTES),
         RouteHandlerId::AccessOrgApplyRenew,
         "Apply a signed org revocation list",
     ),
     public_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/renew"),
-        BodyPolicy::Capped,
+        BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES),
         RouteHandlerId::AccessOrgApplyRenew,
         "Renew an org grant document (signed payload)",
     ),
     // ── Access administration (fleet-CORS where the anchor page needs
     //    to read responses; own-origin otherwise).
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/iam/user-client-grants"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -799,7 +827,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Upsert a user-client grant",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/iam/grants/update"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -807,7 +835,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Update an IAM grant",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/orgs/trust"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -815,7 +843,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Trust an org root key on this daemon",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/orgs/revoke"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -823,7 +851,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Withdraw trust in an org root key",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/issue"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -831,7 +859,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Issue an org grant (org root/issuer key on this daemon)",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/revoke-member"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -839,7 +867,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Revoke an org member (appends to the ORL)",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/issuers/init"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -847,7 +875,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Initialize an org issuer key",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/issuers/delegate"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -855,7 +883,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Delegate to an org issuer",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/issuers/install"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -863,7 +891,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Install a delegated org issuer key",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/access/enrollment-requests/decide"),
         PeerOperation::AccessManage,
         BodyPolicy::Default,
@@ -871,7 +899,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Approve or deny a pending enrollment request",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/access/enrollment-requests"),
         PeerOperation::AccessInspect,
         BodyPolicy::None,
@@ -879,7 +907,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Pending enrollment requests",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/access/iam/state"),
         PeerOperation::AccessInspect,
         BodyPolicy::None,
@@ -887,7 +915,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Local IAM state (roles, grants, bindings)",
     ),
     fleet_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/access/overview"),
         PeerOperation::AccessInspect,
         BodyPolicy::None,
@@ -895,7 +923,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Access overview for the calling principal",
     ),
     op_route(
-        RouteMethod::Any,
+        RouteMethod::Get,
         PathPattern::Exact("/api/dashboard/targets"),
         PeerOperation::AccessInspect,
         BodyPolicy::None,
@@ -903,9 +931,12 @@ pub(crate) static ROUTES: &[Route] = &[
         "Dashboard target list (this daemon + connected peers)",
     ),
     // ── Federation surface: registry, pairing, quick controls,
-    //    capability routing. One verbatim sub-router row per family;
-    //    IAM delegates to federation_http_operation (see
-    //    RouteAuthz::PeerFederation).
+    //    capability routing. The peers sub-router keeps its method-`Any`
+    //    catch-all row on purpose: IAM already classifies per leaf through
+    //    federation_http_operation (see RouteAuthz::PeerFederation), the
+    //    handler routes methods per leaf internally, and unknown subpaths
+    //    get its JSON 404 — per-leaf rows would either drop garbage to the
+    //    SPA-shell fallback or need a catch-all that neuters them.
     federation_route(
         RouteMethod::Any,
         PathPattern::Under("/api/peers"),
@@ -914,7 +945,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Peer registry (list/add/remove), pairing (invite/join/requests/identities), eligibility, and per-peer quick controls + signaling relays",
     ),
     federation_route(
-        RouteMethod::Any,
+        RouteMethod::Post,
         PathPattern::Exact("/api/coordinator/route"),
         BodyPolicy::Default,
         RouteHandlerId::CoordinatorRoute,
@@ -927,7 +958,7 @@ pub(crate) static ROUTES: &[Route] = &[
         pattern: PathPattern::Exact("/mcp"),
         authz: RouteAuthz::McpToken,
         cors: CorsPosture::OwnOrigin,
-        body: BodyPolicy::Default,
+        body: BodyPolicy::Capped(MCP_BODY_CAP_BYTES),
         handler: RouteHandlerId::McpPost,
         doc: "MCP Streamable HTTP endpoint (JSON-RPC requests + notifications)",
     },
@@ -1151,10 +1182,16 @@ pub(crate) fn render_endpoint_docs() -> String {
             CorsPosture::Public => "public",
         };
         let body = match route.body {
-            BodyPolicy::None => "none",
-            BodyPolicy::Default => "bounded",
-            BodyPolicy::Capped => "capped",
-            BodyPolicy::Streaming => "streaming",
+            BodyPolicy::None => "none".to_string(),
+            BodyPolicy::Default => "bounded".to_string(),
+            BodyPolicy::Capped(cap) => {
+                if cap % (1024 * 1024) == 0 {
+                    format!("\u{2264} {} MiB", cap / (1024 * 1024))
+                } else {
+                    format!("\u{2264} {} KiB", cap.div_ceil(1024))
+                }
+            }
+            BodyPolicy::Streaming => "streaming".to_string(),
         };
         out.push_str(&format!(
             "| {} | `{}` | {} | {} | {} | {} |\n",
@@ -1366,7 +1403,9 @@ mod tests {
     #[test]
     fn exact_match_honors_boundaries() {
         assert!(match_route("GET", "/api/sessions").is_some());
-        assert!(match_route("POST", "/api/sessions").is_some()); // Any-method legacy arm
+        // Method tightening: the session list is GET-only; other methods
+        // fall to the dispatch-level 405-with-Allow.
+        assert!(match_route("POST", "/api/sessions").is_none());
         assert!(match_route("GET", "/api/sessionsfoo").is_none());
         assert!(match_route("GET", "/api/sessions/").is_none());
         assert!(match_route("GET", "/api/sessions/stream").is_some());
@@ -1375,6 +1414,120 @@ mod tests {
         assert!(match_route("POST", "/api/worktrees/inspect").is_some());
         assert!(match_route("GET", "/api/worktrees/inspect").is_none());
         assert!(match_route("POST", "/api/worktrees/inspect-old").is_none());
+    }
+
+    #[test]
+    fn method_tightening_rejects_undeclared_methods_with_allow_union() {
+        // Tightened read rows: only GET matches; the dispatch layer turns
+        // the miss into 405 with this Allow union (previously the
+        // method-blind arm served any method, or the request fell through
+        // to the SPA shell).
+        for path in [
+            "/api/sessions",
+            "/api/sessions/stream",
+            "/api/sessions/search",
+            "/api/project-root",
+            "/api/api-key-status",
+            "/api/external-agents",
+            "/api/displays",
+            "/api/access/enrollment-requests",
+            "/api/access/iam/state",
+            "/api/access/overview",
+            "/api/dashboard/targets",
+        ] {
+            assert!(match_route("GET", path).is_some(), "{path}");
+            assert!(match_route("DELETE", path).is_none(), "{path}");
+            assert_eq!(
+                allowed_methods_for_path(path).as_deref(),
+                Some("GET, OPTIONS"),
+                "{path}"
+            );
+        }
+        // Tightened admin/present rows: POST-only.
+        for path in [
+            "/api/access/org-grants",
+            "/api/access/orgs/revocations/apply",
+            "/api/access/org-grants/renew",
+            "/api/access/iam/user-client-grants",
+            "/api/access/iam/grants/update",
+            "/api/access/orgs/trust",
+            "/api/access/orgs/revoke",
+            "/api/access/org-grants/issue",
+            "/api/access/org-grants/revoke-member",
+            "/api/access/org-grants/issuers/init",
+            "/api/access/org-grants/issuers/delegate",
+            "/api/access/org-grants/issuers/install",
+            "/api/access/enrollment-requests/decide",
+            "/api/coordinator/route",
+        ] {
+            assert!(match_route("POST", path).is_some(), "{path}");
+            assert!(match_route("GET", path).is_none(), "{path}");
+            assert_eq!(
+                allowed_methods_for_path(path).as_deref(),
+                Some("POST, OPTIONS"),
+                "{path}"
+            );
+        }
+        // Mixed-method path: the Allow union spans both rows, and an
+        // undeclared method (PUT here) matches neither.
+        assert_eq!(
+            allowed_methods_for_path("/api/settings").as_deref(),
+            Some("GET, POST, OPTIONS")
+        );
+        assert!(match_route("PUT", "/api/settings").is_none());
+        // The two deliberate `Any` catch-alls keep matching every method:
+        // their handlers route methods per leaf internally and answer
+        // garbage with JSON 404s a per-shape row split would forfeit.
+        assert!(match_route("DELETE", "/api/peers").is_some());
+        assert!(match_route("DELETE", crate::peer::access_request::PUBLIC_REQUEST_PATH).is_some());
+        // Undeclared paths still fall through to the legacy chain / SPA
+        // shell rather than the 405 arm.
+        assert_eq!(allowed_methods_for_path("/api/no-such-endpoint"), None);
+    }
+
+    #[test]
+    fn body_policies_pin_their_caps() {
+        let policy = |method: &str, path: &str| match_route(method, path).unwrap().0.body;
+        // Route-specific caps.
+        assert_eq!(
+            policy("POST", "/api/fs/write"),
+            BodyPolicy::Capped(
+                crate::web_gateway::UPLOAD_MAX_BYTES + crate::web_gateway::UPLOAD_MAX_BYTES / 2
+            )
+        );
+        assert_eq!(
+            policy("POST", "/mcp"),
+            BodyPolicy::Capped(MCP_BODY_CAP_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/diagnostics/visual-freshness"),
+            BodyPolicy::Capped(DIAGNOSTICS_BODY_CAP_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/access/org-grants"),
+            BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/access/orgs/revocations/apply"),
+            BodyPolicy::Capped(crate::access::org::MAX_ORG_ORL_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/access/org-grants/renew"),
+            BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES)
+        );
+        // Handler-owned streams: uploads spool to a tempfile; the doorbell's
+        // cap is runtime config the table cannot carry.
+        assert_eq!(
+            policy("POST", "/api/session/current/uploads"),
+            BodyPolicy::Streaming
+        );
+        assert_eq!(
+            policy("POST", crate::peer::access_request::PUBLIC_REQUEST_PATH),
+            BodyPolicy::Streaming
+        );
+        // Everything else that takes a body rides the shared default cap.
+        assert_eq!(policy("POST", "/api/settings"), BodyPolicy::Default);
+        assert_eq!(policy("POST", "/api/peers"), BodyPolicy::Default);
     }
 
     #[test]

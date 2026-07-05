@@ -1365,6 +1365,15 @@
                       <option value="claude-code">Claude Code</option>
                     </select>
                   </label>
+                  <label class="sessions-new-session-field" for="new-session-execution" id="new-session-execution-wrap"
+                         title="Internal agent only. Auto lets the daemon decide from the task; Orchestrate starts a coordinator that delegates to supervised sub-agents; Direct runs a single agent.">
+                    Execution
+                    <select id="new-session-execution" class="sessions-agent-select">
+                      <option value="">Auto</option>
+                      <option value="orchestrate">Orchestrate &mdash; delegate to sub-agents</option>
+                      <option value="direct">Direct &mdash; single agent</option>
+                    </select>
+                  </label>
                 </div>
                 <details class="ui-fold sessions-new-external-fold" id="new-session-external-fold">
                   <summary>External agent options</summary>

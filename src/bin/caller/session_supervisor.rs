@@ -153,6 +153,13 @@ pub struct SubAgentChild {
     pub delivered: bool,
 }
 
+/// Per-session registry of spawned sub-agent children, keyed by child
+/// session id. One instance is shared between the session's in-loop
+/// orchestration handle (the spawn/wait tool handlers) and the
+/// supervisor's `ManagedSession` entry, so dashboard-delegated children
+/// land in the same registry the model's wait_sub_agents reads.
+pub type SubAgentChildrenMap = Arc<std::sync::Mutex<HashMap<String, SubAgentChild>>>;
+
 /// Orchestration handle carried by every supervised native session. Grants
 /// the in-process loop the spawn capability — any supervised internal
 /// session may delegate; orchestration is a capability, not a role — and,
@@ -168,7 +175,9 @@ pub struct SessionOrchestration {
     /// result the child submits via the submit_result tool.
     pub submitted_result: Option<Arc<std::sync::Mutex<Option<sub_agent::SubAgentResult>>>>,
     /// Children this session has spawned, keyed by child session id.
-    pub children: Arc<std::sync::Mutex<HashMap<String, SubAgentChild>>>,
+    /// Shared with the supervisor's `ManagedSession` entry (dashboard
+    /// delegation inserts here too).
+    pub children: SubAgentChildrenMap,
 }
 
 /// Internal wiring `spawn_agent_session` needs to run a session as a
@@ -196,6 +205,15 @@ struct ManagedSession {
     approval_registry: event::ApprovalRegistry,
     instance_id: u64,
     finished_rx: Option<oneshot::Receiver<()>>,
+    /// How many delegation levels below a root session this session runs
+    /// (0 = root); dashboard delegation enforces the same depth cap the
+    /// spawn_sub_agent tool does.
+    depth: usize,
+    /// Native sessions: the same children registry the session's in-loop
+    /// wait_sub_agents reads (dashboard delegation inserts into it).
+    /// `None` for external-agent sessions — they manage their own
+    /// sub-agents through their injected start_task tool.
+    sub_agent_children: Option<SubAgentChildrenMap>,
 }
 
 struct StoppedManagedSession {
@@ -700,6 +718,17 @@ impl SessionSupervisor {
                 )
                 .await;
             }
+            event::ControlMsg::SpawnSubAgent {
+                session_id,
+                task,
+                name,
+                role,
+                agent,
+                worktree,
+            } => {
+                self.delegate_sub_agent(session_id, task, name, role, agent, worktree)
+                    .await;
+            }
             event::ControlMsg::ResumeSession {
                 source,
                 session_id,
@@ -918,6 +947,9 @@ impl SessionSupervisor {
     async fn should_handle_session_control(&self, msg: &event::ControlMsg) -> bool {
         match msg {
             event::ControlMsg::CreateSession { .. } => true,
+            // Always claimed so an unmanaged parent gets an explicit
+            // "Delegate failed" instead of a silently dropped message.
+            event::ControlMsg::SpawnSubAgent { .. } => true,
             event::ControlMsg::ResumeSession { .. } => true,
             event::ControlMsg::RestartSession { .. } => true,
             event::ControlMsg::StopSession { .. } => true,
@@ -1728,6 +1760,134 @@ impl SessionSupervisor {
             .count()
     }
 
+    /// Dashboard "delegate" action (`ControlMsg::SpawnSubAgent`): spawn a
+    /// sub-agent under a managed native session on the user's behalf. The
+    /// child lands in the same children registry the parent's
+    /// wait_sub_agents tool reads, and the parent is woken with a
+    /// notification follow-up so the model knows the delegation happened
+    /// and can collect the result exactly like one of its own spawns.
+    async fn delegate_sub_agent(
+        &self,
+        parent_session_id: String,
+        task: String,
+        name: Option<String>,
+        role: Option<String>,
+        agent: Option<String>,
+        worktree: Option<bool>,
+    ) {
+        let parent = {
+            let state = self.state.lock().await;
+            state.resolve_session_id(&parent_session_id).map(|id| {
+                let session = state
+                    .sessions
+                    .get(&id)
+                    .expect("resolve_session_id returns live keys");
+                (
+                    id.clone(),
+                    session.project_root.clone(),
+                    session.depth,
+                    session.sub_agent_children.clone(),
+                )
+            })
+        };
+        let Some((parent_id, parent_root, parent_depth, children)) = parent else {
+            self.loop_error(format!(
+                "Delegate failed: session {} is not managed by this daemon",
+                short_session(&parent_session_id)
+            ));
+            return;
+        };
+        let Some(children) = children else {
+            self.loop_error(format!(
+                "Delegate failed: session {} runs an external agent, which manages its \
+                 own sub-agents — send it a follow-up asking it to delegate instead",
+                short_session(&parent_id)
+            ));
+            return;
+        };
+        let backend = match agent.as_deref().map(str::trim).unwrap_or("internal") {
+            "internal" | "" | "intendant" => None,
+            "codex" => Some(external_agent::AgentBackend::Codex),
+            "claude-code" | "claude_code" => Some(external_agent::AgentBackend::ClaudeCode),
+            other => {
+                self.loop_error(format!(
+                    "Delegate failed: unknown sub-agent backend `{other}`; use internal, \
+                     codex, or claude-code"
+                ));
+                return;
+            }
+        };
+        let parent_project = match Project::from_root(parent_root) {
+            Ok(project) => project,
+            Err(e) => {
+                self.loop_error(format!("Delegate failed: parent project load failed: {e}"));
+                return;
+            }
+        };
+        let params = SubAgentSpawnParams {
+            task: task.clone(),
+            role: sub_agent::SubAgentRole::from_str(
+                role.as_deref()
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or("worker"),
+            ),
+            system_prompt: None,
+            backend,
+            worktree: worktree.unwrap_or(false),
+            inherit_memory: false,
+            name,
+        };
+        let started = match self
+            .start_sub_agent_session(&parent_id, &parent_project, parent_depth, params)
+            .await
+        {
+            Ok(started) => started,
+            Err(e) => {
+                self.loop_error(format!("Delegate failed: {e}"));
+                return;
+            }
+        };
+        {
+            let mut children = children.lock().unwrap_or_else(|e| e.into_inner());
+            children.insert(
+                started.child_session_id.clone(),
+                SubAgentChild {
+                    name: started.child_name.clone(),
+                    rx: Some(started.completion_rx),
+                    completed: None,
+                    delivered: false,
+                },
+            );
+        }
+        self.config.bus.send(AppEvent::LogEntry {
+            session_id: Some(parent_id.clone()),
+            level: "info".to_string(),
+            source: "session-supervisor".to_string(),
+            content: format!(
+                "Delegated sub-agent {} (session {}) under session {}",
+                started.child_name,
+                short_session(&started.child_session_id),
+                short_session(&parent_id)
+            ),
+            turn: None,
+        });
+        let mut notice = format!(
+            "[dashboard] The user delegated a task to a new sub-agent of this session:\n\
+             - name: {}\n- child_session_id: {}\n- task: {}",
+            started.child_name, started.child_session_id, task
+        );
+        if let Some(path) = &started.worktree_path {
+            notice.push_str(&format!("\n- worktree: {}", path.display()));
+        }
+        notice.push_str(
+            "\nIt is already running as its own supervised session. Collect its result \
+             with wait_sub_agents when you need it and fold it into your work.",
+        );
+        self.route_follow_up(Some(parent_id), notice, None, Vec::new(), None)
+            .await;
+    }
+
     /// Spawn a supervised child session on behalf of `parent_session_id`
     /// (the spawn_sub_agent tool). The child is a full managed session —
     /// dashboard row, approvals, steering, lineage — linked to its parent
@@ -1948,6 +2108,13 @@ impl SessionSupervisor {
         let (finished_tx, finished_rx) = oneshot::channel();
         let approval_registry = event::ApprovalRegistry::default();
         let context_injection = event::ContextInjectionQueue::default();
+        let depth = sub_agent_wiring.as_ref().map(|w| w.depth).unwrap_or(0);
+        // Native sessions share one children registry between the loop's
+        // orchestration handle and the supervisor entry, so dashboard
+        // delegation and the model's own spawns land in the same map.
+        let sub_agent_children: Option<SubAgentChildrenMap> = backend
+            .is_none()
+            .then(|| Arc::new(std::sync::Mutex::new(HashMap::new())));
         let session_instance_id = self
             .register_session(
                 session_id.clone(),
@@ -1964,6 +2131,8 @@ impl SessionSupervisor {
                 session_name,
                 Some(finished_rx),
                 identity_alias,
+                depth,
+                sub_agent_children.clone(),
             )
             .await;
 
@@ -2043,11 +2212,13 @@ impl SessionSupervisor {
                     orchestration: Some(SessionOrchestration {
                         supervisor: supervisor.clone(),
                         session_id: session_id.clone(),
-                        depth: sub_agent_wiring.as_ref().map(|w| w.depth).unwrap_or(0),
+                        depth,
                         submitted_result: sub_agent_wiring
                             .as_ref()
                             .map(|w| w.submitted_result.clone()),
-                        children: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                        children: sub_agent_children
+                            .clone()
+                            .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(HashMap::new()))),
                     }),
                     sub_agent_identity: sub_agent_wiring
                         .as_ref()
@@ -3969,6 +4140,8 @@ impl SessionSupervisor {
         name: Option<String>,
         finished_rx: Option<oneshot::Receiver<()>>,
         identity_alias: Option<String>,
+        depth: usize,
+        sub_agent_children: Option<SubAgentChildrenMap>,
     ) -> u64 {
         let rehydrated_related = load_related_sessions_from_log(&session_dir);
         let mut state = self.state.lock().await;
@@ -3989,6 +4162,8 @@ impl SessionSupervisor {
                 approval_registry,
                 instance_id,
                 finished_rx,
+                depth,
+                sub_agent_children,
             },
         );
         // Pre-identity alias: a resumed external session is only addressable
@@ -4811,6 +4986,7 @@ fn control_target_session_id(msg: &event::ControlMsg) -> Option<&str> {
         | event::ControlMsg::CancelFollowUp { session_id, .. } => session_id.as_deref(),
         event::ControlMsg::RenameSession { session_id, .. } => Some(session_id.as_str()),
         event::ControlMsg::ConfigureSessionAgent { session_id, .. } => Some(session_id.as_str()),
+        event::ControlMsg::SpawnSubAgent { session_id, .. } => Some(session_id.as_str()),
         event::ControlMsg::StopSession { session_id } => Some(session_id.as_str()),
         event::ControlMsg::ResumeSession { .. } | event::ControlMsg::RestartSession { .. } => None,
         _ => None,
@@ -5204,6 +5380,11 @@ mod tests {
             approval_registry: event::ApprovalRegistry::default(),
             instance_id: 0,
             finished_rx: None,
+            depth: 0,
+            // Mirror registration: native sessions carry a children
+            // registry, external ones do not.
+            sub_agent_children: (source == "intendant")
+                .then(|| Arc::new(std::sync::Mutex::new(HashMap::new()))),
         }
     }
 
@@ -5513,6 +5694,8 @@ mod tests {
                 None,
                 None,
                 Some("backend-thread".to_string()),
+                0,
+                None,
             )
             .await;
 
@@ -5551,6 +5734,8 @@ mod tests {
                 None,
                 None,
                 Some("backend-thread".to_string()),
+                0,
+                None,
             )
             .await;
         supervisor
@@ -6191,6 +6376,153 @@ mod tests {
             .expect("parent should stop");
     }
 
+    /// Dashboard delegation (`ControlMsg::SpawnSubAgent`), keyless: the
+    /// child lands in the same children registry the parent's
+    /// wait_sub_agents reads, the relationship is recorded, the parent is
+    /// woken with a notification follow-up, and the completion resolves
+    /// through the registry like a model-spawned child's would.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dashboard_delegate_tracks_child_in_parent_registry_and_wakes_parent() {
+        let bus = EventBus::new();
+        let project_dir = tempfile::tempdir().unwrap();
+        let supervisor =
+            test_supervisor_with_mock_provider(project_dir.path().to_path_buf(), bus.clone());
+        let (follow_up_tx, mut follow_up_rx) = mpsc::channel(4);
+        let children: SubAgentChildrenMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "parent".to_string(),
+                ManagedSession {
+                    session_id: "parent".to_string(),
+                    source: "intendant".to_string(),
+                    name: None,
+                    phase: "idle".to_string(),
+                    project_root: project_dir.path().to_path_buf(),
+                    session_dir: PathBuf::from("/tmp/session"),
+                    follow_up_tx,
+                    approval_registry: event::ApprovalRegistry::default(),
+                    instance_id: 0,
+                    finished_rx: None,
+                    depth: 0,
+                    sub_agent_children: Some(children.clone()),
+                },
+            );
+        }
+
+        supervisor
+            .handle_control_msg(event::ControlMsg::SpawnSubAgent {
+                session_id: "parent".to_string(),
+                task: "MOCK-RESEARCH: inspect the schema".to_string(),
+                name: Some("delegated-researcher".to_string()),
+                role: Some("research".to_string()),
+                agent: Some("internal".to_string()),
+                worktree: None,
+            })
+            .await;
+
+        // The child is tracked in the parent's registry and linked.
+        let (child_id, completion_rx) = {
+            let mut map = children.lock().unwrap();
+            assert_eq!(map.len(), 1, "delegated child must land in the registry");
+            let (id, child) = map.iter_mut().next().unwrap();
+            assert_eq!(child.name, "delegated-researcher");
+            (
+                id.clone(),
+                child.rx.take().expect("completion receiver present"),
+            )
+        };
+        {
+            let state = supervisor.state.lock().await;
+            let rel = state
+                .related_sessions
+                .get(&child_id)
+                .expect("relationship recorded");
+            assert_eq!(rel.relationship, "subagent");
+            assert_eq!(rel.parent_session_id, "parent");
+        }
+
+        // The parent was woken with a notification naming the child.
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(5), follow_up_rx.recv())
+            .await
+            .expect("notification follow-up should arrive")
+            .expect("follow-up channel open");
+        assert!(
+            notice.text.contains("delegated-researcher") && notice.text.contains(&child_id),
+            "notice should identify the child: {}",
+            notice.text
+        );
+        assert!(
+            notice.text.contains("wait_sub_agents"),
+            "notice should point the model at wait_sub_agents: {}",
+            notice.text
+        );
+
+        // The completion resolves through the registry exactly like a
+        // model-spawned child's (mock research child ends text-only; the
+        // supervisor synthesizes its result from last_response).
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(60), completion_rx)
+            .await
+            .expect("delegated child should finish")
+            .expect("completion delivered");
+        assert_eq!(completion.name, "delegated-researcher");
+        assert!(
+            sub_agent::format_result_message(&completion.result).contains("research findings ABC"),
+            "unexpected result: {:?}",
+            completion.result
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_delegate_refuses_external_parent_and_depth_cap() {
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        {
+            let mut state = supervisor.state.lock().await;
+            state
+                .sessions
+                .insert("codex-parent".to_string(), managed_session("codex-parent", "codex"));
+            let mut deep = managed_session("deep-parent", "intendant");
+            deep.depth = MAX_SUB_AGENT_DEPTH;
+            state.sessions.insert("deep-parent".to_string(), deep);
+        }
+
+        for (parent, expect) in [
+            ("codex-parent", "external agent"),
+            ("deep-parent", "depth cap"),
+            ("missing-parent", "not managed"),
+        ] {
+            supervisor
+                .delegate_sub_agent(
+                    parent.to_string(),
+                    "do something".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            let mut seen = None;
+            while let Ok(event) = bus_rx.try_recv() {
+                if let AppEvent::LoopError(message) = event {
+                    seen = Some(message);
+                    break;
+                }
+            }
+            let message = seen.unwrap_or_else(|| panic!("no LoopError for parent {parent}"));
+            assert!(
+                message.contains("Delegate failed") && message.contains(expect),
+                "parent {parent}: unexpected error {message}"
+            );
+        }
+        let state = supervisor.state.lock().await;
+        assert!(
+            state.related_sessions.is_empty(),
+            "refused delegations must not record relationships"
+        );
+    }
+
     #[tokio::test]
     async fn finish_session_writes_terminal_outcome_to_summary() {
         let dir = tempfile::tempdir().unwrap();
@@ -6240,6 +6572,8 @@ mod tests {
                     approval_registry: event::ApprovalRegistry::default(),
                     instance_id: 0,
                     finished_rx: None,
+                    depth: 0,
+                    sub_agent_children: None,
                 },
             );
         }
@@ -6291,6 +6625,8 @@ mod tests {
                     approval_registry: event::ApprovalRegistry::default(),
                     instance_id: 0,
                     finished_rx: None,
+                    depth: 0,
+                    sub_agent_children: None,
                 },
             );
         }
@@ -6430,6 +6766,8 @@ mod tests {
                     approval_registry: event::ApprovalRegistry::default(),
                     instance_id: 0,
                     finished_rx: None,
+                    depth: 0,
+                    sub_agent_children: None,
                 },
             );
         }
@@ -6470,6 +6808,8 @@ mod tests {
                     approval_registry: event::ApprovalRegistry::default(),
                     instance_id: 0,
                     finished_rx: None,
+                    depth: 0,
+                    sub_agent_children: None,
                 },
             );
         }
@@ -6546,6 +6886,8 @@ mod tests {
                     approval_registry: event::ApprovalRegistry::default(),
                     instance_id: 0,
                     finished_rx: None,
+                    depth: 0,
+                    sub_agent_children: None,
                 },
             );
         }
@@ -6617,6 +6959,8 @@ mod tests {
                     approval_registry: event::ApprovalRegistry::default(),
                     instance_id: 0,
                     finished_rx: None,
+                    depth: 0,
+                    sub_agent_children: None,
                 },
             );
             assert!(state.apply_related_session("parent-thread", "side-thread", "side"));
@@ -6673,6 +7017,8 @@ mod tests {
                     approval_registry: event::ApprovalRegistry::default(),
                     instance_id: 0,
                     finished_rx: None,
+                    depth: 0,
+                    sub_agent_children: None,
                 },
             );
             assert!(state.apply_related_session("parent-thread", "side-thread", "side"));
@@ -6736,6 +7082,8 @@ mod tests {
                     approval_registry: event::ApprovalRegistry::default(),
                     instance_id: 0,
                     finished_rx: None,
+                    depth: 0,
+                    sub_agent_children: None,
                 },
             );
             state
@@ -6791,6 +7139,8 @@ mod tests {
                     approval_registry: event::ApprovalRegistry::default(),
                     instance_id: 0,
                     finished_rx: None,
+                    depth: 0,
+                    sub_agent_children: None,
                 },
             );
         }
@@ -6864,6 +7214,8 @@ mod tests {
                     approval_registry: event::ApprovalRegistry::default(),
                     instance_id: 0,
                     finished_rx: None,
+                    depth: 0,
+                    sub_agent_children: None,
                 },
             );
         }
@@ -6936,6 +7288,8 @@ mod tests {
                     approval_registry: event::ApprovalRegistry::default(),
                     instance_id: 0,
                     finished_rx: None,
+                    depth: 0,
+                    sub_agent_children: None,
                 },
             );
         }

@@ -4816,6 +4816,19 @@ async fn handle_control_command_mcp(
             }
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::SpawnSubAgent { .. } => {
+            // Sub-agent delegation targets the web daemon's session
+            // supervisor; the standalone MCP loop has no supervised
+            // sessions to delegate under.
+            emit_control_result(
+                control_tx,
+                "spawn_sub_agent",
+                false,
+                "spawn_sub_agent requires the web daemon's session supervisor".to_string(),
+                None,
+            );
+            None
+        }
         ControlMsg::ResumeSession {
             source,
             session_id,

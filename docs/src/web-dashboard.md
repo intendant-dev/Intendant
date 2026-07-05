@@ -326,6 +326,11 @@ directory is safe to delete; it rebuilds on the next scan.
 - **Worktrees** — the git worktrees in use by sub-agents (same card +
   Show-more treatment).
 - **New Session** — start a fresh session from the dashboard.
+  Internal-agent launches get an **Execution** control — *Auto* (the
+  task-size heuristic decides), *Orchestrate* (delegates to supervised
+  sub-agents), or *Direct* (single agent); an explicit choice beats the
+  global *Direct* header toggle, and the control disables when an
+  external backend is selected.
   External Codex sessions can choose both the binary path and the
   `managed_context` mode (`vanilla` or `managed`) for that session; the
   external-agent options sit in a fold that opens when an external
@@ -334,6 +339,12 @@ directory is safe to delete; it rebuilds on the next scan.
   that the CLI resolves to the latest release, with a Custom-id escape
   for full model names), the permission mode, and the reasoning effort
   (`low` … `max`).
+
+Internal sessions' window menus additionally expose **Delegate…** — spawn a
+supervised sub-agent (task, optional name, role, backend, worktree isolation)
+under that session on the model's behalf. The parent is notified with a
+follow-up and collects the result with its `wait_sub_agents` tool; see
+[Native Multi-Agent Orchestration](./multi-agent.md#delegating-from-the-dashboard).
 
 External-agent session cards and Activity windows also expose **Launch config**
 for per-session binary and managed-context settings. Use **Save** to update the
@@ -1843,7 +1854,7 @@ its operation per method/path from `federation_http_operation`.
 | GET | `/api/fs/list` | FilesystemRead | own origin | none | List a directory (scope-checked) |
 | GET | `/api/fs/read` | FilesystemRead | own origin | none | Read file bytes (scope-checked; supports byte ranges) |
 | POST | `/api/fs/mkdir` | FilesystemWrite | own origin | bounded | Create a directory (scope-checked) |
-| POST | `/api/fs/write` | FilesystemWrite | own origin | capped | Write file bytes (scope-checked; sha256-guarded overwrite) |
+| POST | `/api/fs/write` | FilesystemWrite | own origin | ≤ 150 MiB | Write file bytes (scope-checked; sha256-guarded overwrite) |
 | POST | `/api/fs/rename` | FilesystemWrite | own origin | bounded | Move/rename a file or directory (scope-checked) |
 | POST | `/api/fs/delete` | FilesystemWrite | own origin | bounded | Delete a file or directory (scope-checked) |
 | GET | `/api/session/current/changes[/…]` | SessionManage | own origin | none | List the session's changed files, or the unified diff for one file (subpath) |
@@ -1872,39 +1883,39 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/worktrees/remove` | SessionManage | own origin | bounded | Remove a worktree from the inventory |
 | POST | `/api/worktrees/scan` | SessionManage | own origin | none | Rescan the worktree inventory (refreshes the cache) |
 | GET | `/api/worktrees` | SessionInspect | own origin | none | Cached worktree inventory |
-| any | `/api/sessions/stream` | SessionInspect | own origin | none | NDJSON stream of the session list |
-| any | `/api/sessions/search` | SessionInspect | own origin | none | Search sessions (q, source, mode, project filters) |
-| any | `/api/sessions` | SessionInspect | own origin | none | List sessions (id filter, limit, usage view; response CORS * for the fleet Stats tab) |
-| any | `/api/project-root` | Settings | own origin | none | Project root path this daemon serves |
+| GET | `/api/sessions/stream` | SessionInspect | own origin | none | NDJSON stream of the session list |
+| GET | `/api/sessions/search` | SessionInspect | own origin | none | Search sessions (q, source, mode, project filters) |
+| GET | `/api/sessions` | SessionInspect | own origin | none | List sessions (id filter, limit, usage view; response CORS * for the fleet Stats tab) |
+| GET | `/api/project-root` | Settings | own origin | none | Project root path this daemon serves |
 | POST | `/api/settings` | Settings | own origin | bounded | Update runtime settings |
-| any | `/api/settings` | Settings | own origin | none | Current runtime settings |
+| GET | `/api/settings` | Settings | own origin | none | Current runtime settings |
 | POST | `/api/api-keys` | Settings | own origin | bounded | Store provider API keys in the project .env |
-| any | `/api/api-key-status` | Settings | own origin | none | Which provider keys are configured (presence only) |
-| any | `/api/external-agents` | SessionInspect | own origin | none | Detected external coding agents (codex, claude) |
-| POST | `/api/diagnostics/visual-freshness` | DisplayInput | own origin | bounded | Visual-freshness diagnostics transcript sink (NDJSON body) |
-| any | `/api/displays` | DisplayView | own origin | none | Enumerate active displays |
-| any | `/api/peer-pairing/requests[/…]` | public | public | capped | Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath) |
-| any | `/api/access/org-grants` | public | public | capped | Present a signed org grant document (verified against locally trusted org keys) |
+| GET | `/api/api-key-status` | Settings | own origin | none | Which provider keys are configured (presence only) |
+| GET | `/api/external-agents` | SessionInspect | own origin | none | Detected external coding agents (codex, claude) |
+| POST | `/api/diagnostics/visual-freshness` | DisplayInput | own origin | ≤ 16 MiB | Visual-freshness diagnostics transcript sink (NDJSON body) |
+| GET | `/api/displays` | DisplayView | own origin | none | Enumerate active displays |
+| any | `/api/peer-pairing/requests[/…]` | public | public | streaming | Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath) |
+| POST | `/api/access/org-grants` | public | public | ≤ 16 KiB | Present a signed org grant document (verified against locally trusted org keys) |
 | GET | `/api/access/orgs/{org_handle}/revocations` | public | public | none | Org revocation list (ORL) for a trusted org |
-| any | `/api/access/orgs/revocations/apply` | public | public | capped | Apply a signed org revocation list |
-| any | `/api/access/org-grants/renew` | public | public | capped | Renew an org grant document (signed payload) |
-| any | `/api/access/iam/user-client-grants` | AccessManage | fleet allowlist | bounded | Upsert a user-client grant |
-| any | `/api/access/iam/grants/update` | AccessManage | fleet allowlist | bounded | Update an IAM grant |
-| any | `/api/access/orgs/trust` | AccessManage | fleet allowlist | bounded | Trust an org root key on this daemon |
-| any | `/api/access/orgs/revoke` | AccessManage | fleet allowlist | bounded | Withdraw trust in an org root key |
-| any | `/api/access/org-grants/issue` | AccessManage | own origin | bounded | Issue an org grant (org root/issuer key on this daemon) |
-| any | `/api/access/org-grants/revoke-member` | AccessManage | own origin | bounded | Revoke an org member (appends to the ORL) |
-| any | `/api/access/org-grants/issuers/init` | AccessManage | own origin | bounded | Initialize an org issuer key |
-| any | `/api/access/org-grants/issuers/delegate` | AccessManage | own origin | bounded | Delegate to an org issuer |
-| any | `/api/access/org-grants/issuers/install` | AccessManage | own origin | bounded | Install a delegated org issuer key |
-| any | `/api/access/enrollment-requests/decide` | AccessManage | fleet allowlist | bounded | Approve or deny a pending enrollment request |
-| any | `/api/access/enrollment-requests` | AccessInspect | fleet allowlist | none | Pending enrollment requests |
-| any | `/api/access/iam/state` | AccessInspect | fleet allowlist | none | Local IAM state (roles, grants, bindings) |
-| any | `/api/access/overview` | AccessInspect | fleet allowlist | none | Access overview for the calling principal |
-| any | `/api/dashboard/targets` | AccessInspect | own origin | none | Dashboard target list (this daemon + connected peers) |
+| POST | `/api/access/orgs/revocations/apply` | public | public | ≤ 64 KiB | Apply a signed org revocation list |
+| POST | `/api/access/org-grants/renew` | public | public | ≤ 16 KiB | Renew an org grant document (signed payload) |
+| POST | `/api/access/iam/user-client-grants` | AccessManage | fleet allowlist | bounded | Upsert a user-client grant |
+| POST | `/api/access/iam/grants/update` | AccessManage | fleet allowlist | bounded | Update an IAM grant |
+| POST | `/api/access/orgs/trust` | AccessManage | fleet allowlist | bounded | Trust an org root key on this daemon |
+| POST | `/api/access/orgs/revoke` | AccessManage | fleet allowlist | bounded | Withdraw trust in an org root key |
+| POST | `/api/access/org-grants/issue` | AccessManage | own origin | bounded | Issue an org grant (org root/issuer key on this daemon) |
+| POST | `/api/access/org-grants/revoke-member` | AccessManage | own origin | bounded | Revoke an org member (appends to the ORL) |
+| POST | `/api/access/org-grants/issuers/init` | AccessManage | own origin | bounded | Initialize an org issuer key |
+| POST | `/api/access/org-grants/issuers/delegate` | AccessManage | own origin | bounded | Delegate to an org issuer |
+| POST | `/api/access/org-grants/issuers/install` | AccessManage | own origin | bounded | Install a delegated org issuer key |
+| POST | `/api/access/enrollment-requests/decide` | AccessManage | fleet allowlist | bounded | Approve or deny a pending enrollment request |
+| GET | `/api/access/enrollment-requests` | AccessInspect | fleet allowlist | none | Pending enrollment requests |
+| GET | `/api/access/iam/state` | AccessInspect | fleet allowlist | none | Local IAM state (roles, grants, bindings) |
+| GET | `/api/access/overview` | AccessInspect | fleet allowlist | none | Access overview for the calling principal |
+| GET | `/api/dashboard/targets` | AccessInspect | own origin | none | Dashboard target list (this daemon + connected peers) |
 | any | `/api/peers[/…]` | federation (per method/path) | own origin | bounded | Peer registry (list/add/remove), pairing (invite/join/requests/identities), eligibility, and per-peer quick controls + signaling relays |
-| any | `/api/coordinator/route` | federation (per method/path) | own origin | bounded | Capability-based task routing through the Coordinator |
-| POST | `/mcp` | MCP token | own origin | bounded | MCP Streamable HTTP endpoint (JSON-RPC requests + notifications) |
+| POST | `/api/coordinator/route` | federation (per method/path) | own origin | bounded | Capability-based task routing through the Coordinator |
+| POST | `/mcp` | MCP token | own origin | ≤ 16 MiB | MCP Streamable HTTP endpoint (JSON-RPC requests + notifications) |
 | GET | `/mcp` | MCP token | own origin | none | MCP SSE stream (405: stateless server) |
 | DELETE | `/mcp` | MCP token | own origin | none | MCP session delete (405: stateless server) |
 <!-- gateway-route-table:end -->

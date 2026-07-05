@@ -531,9 +531,87 @@ window.saveSessionConfigModal = saveSessionConfigModal;
 window.closeSessionDeleteModal = closeSessionDeleteModal;
 window.confirmSessionDeleteModal = confirmSessionDeleteModal;
 
+// ── Delegate to a sub-agent (internal sessions) ──
+// Sends ControlMsg::SpawnSubAgent; the daemon spawns a supervised child
+// under the parent, tracks it in the parent's wait_sub_agents registry,
+// and wakes the parent with a notification follow-up.
+
+let sessionDelegateTarget = '';
+
+function sessionWindowIsInternal(sessionId, win = null) {
+  return !externalSourceForSessionWindow(sessionId, win);
+}
+
+function openSessionDelegateModal(sessionOrId) {
+  const sid = String(sessionOrId || '').trim();
+  if (!sid) return false;
+  if (!sessionWindowIsInternal(sid)) {
+    showControlToast('error', 'Delegate targets internal-agent sessions; ask an external agent to delegate via a follow-up instead');
+    return false;
+  }
+  sessionDelegateTarget = sid;
+  const parent = document.getElementById('session-delegate-parent');
+  if (parent) {
+    parent.value = sid;
+    parent.title = sid;
+  }
+  const task = document.getElementById('session-delegate-task');
+  if (task) task.value = '';
+  const name = document.getElementById('session-delegate-name');
+  if (name) name.value = '';
+  const role = document.getElementById('session-delegate-role');
+  if (role) role.value = '';
+  const agent = document.getElementById('session-delegate-agent');
+  if (agent) agent.value = '';
+  const worktree = document.getElementById('session-delegate-worktree');
+  if (worktree) worktree.checked = false;
+  const modal = document.getElementById('session-delegate-modal');
+  if (modal) modal.style.display = 'flex';
+  task?.focus();
+  return true;
+}
+
+function closeSessionDelegateModal() {
+  sessionDelegateTarget = '';
+  const modal = document.getElementById('session-delegate-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+function confirmSessionDelegateModal() {
+  const sid = sessionDelegateTarget;
+  if (!sid) {
+    closeSessionDelegateModal();
+    return;
+  }
+  const task = document.getElementById('session-delegate-task')?.value.trim() || '';
+  if (!task) {
+    showControlToast('error', 'Describe the task to delegate first');
+    return;
+  }
+  const msg = { action: 'spawn_sub_agent', session_id: sid, task };
+  const name = document.getElementById('session-delegate-name')?.value.trim() || '';
+  if (name) msg.name = name;
+  const role = document.getElementById('session-delegate-role')?.value || '';
+  if (role) msg.role = role;
+  const agent = document.getElementById('session-delegate-agent')?.value || '';
+  if (agent) msg.agent = agent;
+  if (document.getElementById('session-delegate-worktree')?.checked) msg.worktree = true;
+  if (!dispatchSessionControlMsg(msg)) {
+    showControlToast('error', 'Dashboard is not connected to the server.');
+    return;
+  }
+  showControlToast('info', `Delegating to a sub-agent under ${shortSessionId(sid)}...`);
+  closeSessionDelegateModal();
+}
+
+window.openSessionDelegateModal = openSessionDelegateModal;
+window.closeSessionDelegateModal = closeSessionDelegateModal;
+window.confirmSessionDelegateModal = confirmSessionDelegateModal;
+
 const SESSION_WINDOW_GENERIC_ACTIONS = [
   { op: 'copy-session-id', label: 'Copy full session ID', title: 'Copy the full session ID' },
   { op: 'rename-session', label: 'Rename session...', title: 'Rename this session' },
+  { op: 'delegate-sub-agent', label: 'Delegate...', title: 'Spawn a supervised sub-agent under this session' },
   { op: 'configure-launch', label: 'Launch config...', title: 'Configure the binary and managed-context mode used on next attach/resume' },
   { op: 'attach-session', label: 'Attach session', title: 'Attach this backend without sending a prompt' },
   { op: 'restart-session', label: 'Restart with saved config', title: 'Stop this backend and resume it with saved launch config' },
@@ -1644,6 +1722,22 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
   win.actionMenuButton.setAttribute('aria-label', win.actionMenuButton.title);
   win.actionMenu?.querySelectorAll('[data-session-window-generic-action]').forEach(item => {
     const op = item.dataset.sessionWindowAction || '';
+    if (op === 'delegate-sub-agent') {
+      // Internal sessions only; external agents delegate through their
+      // own start_task tool. A detached session has no live loop to
+      // notify, so the item disables with the reason.
+      const internal = sessionWindowIsInternal(sid, win);
+      const detached = sessionWindowIsDetached(sid);
+      item.classList.toggle('hidden', !internal);
+      item.disabled = !internal || detached;
+      item.title = !internal
+        ? 'Delegate targets internal-agent sessions'
+        : detached
+          ? 'Session is not attached; send it a message first'
+          : 'Spawn a supervised sub-agent under this session';
+      item.setAttribute('aria-disabled', item.disabled ? 'true' : 'false');
+      return;
+    }
     if (op === 'attach-session') {
       const visible = canAttachSessionWindow(sid, win);
       item.classList.toggle('hidden', !visible);

@@ -102,7 +102,8 @@ src/
 │   ├── display/                # WebRTC: encode/{pool,vp8,h264_*}, tile/, capture/, webrtc, {x11,wayland,macos,windows}
 │   ├── computer_use.rs, ax.rs, vision.rs, recording.rs, frames.rs
 │   ├── presence.rs, live_audio.rs, audio_routing.rs, transcription.rs, quarantine.rs, schema_validator.rs
-│   ├── web_gateway.rs, dashboard_control.rs, terminal.rs, browser_workspace.rs   # HTTP/WS gateway; dashboard tunnel; PTY registry; agent browser
+│   ├── web_gateway/                # HTTP/WS gateway: mod (listener/WS/dispatch), http, session_catalog, routes_{sessions,files,peers,access}, mcp_gate, static_assets
+│   ├── dashboard_control.rs, terminal.rs, browser_workspace.rs   # dashboard tunnel; PTY registry; agent browser
 │   ├── mcp.rs, mcp_client.rs, control.rs
 │   ├── transfer_store.rs, upload_store.rs, peer_file_transfer.rs   # transfer jobs; upload/attachment stores
 │   ├── session_log.rs, session_names.rs, knowledge.rs, project.rs, app_state_pricing.rs
@@ -153,9 +154,11 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   (`ROUTES`): dispatch, the pre-dispatch IAM classification, the OPTIONS
   preflight, and the docs endpoint table in `docs/src/web-dashboard.md` all
   derive from the declaration (the HTTP instance of "derive, don't mirror").
-  Never add an HTTP route by editing `web_gateway.rs`'s dispatch chain — add a
-  table row plus a `RouteHandlerId` match arm; unit tests enforce the table
-  invariants and pin the docs chapter.
+  Never add an HTTP route by editing `web_gateway/mod.rs`'s dispatch chain —
+  add a table row plus a `RouteHandlerId` match arm; the row also declares the
+  request-body policy (dispatch reads and caps the body before the handler
+  runs). Unit tests enforce the table invariants, pin the docs chapter, and
+  pin every route-specific body cap.
 - `static/app.html` is **generated** from the `static/app/` fragments (order =
   `static/app/manifest.txt`; assembled by `build.rs` via
   `crates/app-html-assembler`; CI enforces the match). Edit the fragments,
