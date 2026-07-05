@@ -9,8 +9,8 @@ use crate::gpu::GpuFrame;
 use crate::model::{StationAgent, StationHost, StationSnapshot};
 use crate::util::phase_color;
 use crate::util::{
-    css_rgba, role_color, stable_angle, stable_unit, Color, C_BLUE, C_GREEN, C_MAUVE, C_PEACH,
-    C_RED, C_SAPPHIRE, C_SURFACE0, C_TEAL, C_YELLOW,
+    css_rgba, relationship_color, role_color, stable_angle, stable_unit, Color, C_BLUE, C_GREEN,
+    C_PEACH, C_RED, C_SAPPHIRE, C_SURFACE0, C_TEAL, C_YELLOW,
 };
 use crate::StationInner;
 
@@ -76,7 +76,7 @@ impl StationInner {
                         &mut project,
                         p_pos,
                         a_pos,
-                        role_color(&agent.role).with_alpha(0.54),
+                        relationship_color(&agent.relationship_kind, &agent.role).with_alpha(0.54),
                     );
                     continue;
                 }
@@ -299,7 +299,12 @@ impl StationInner {
         }
         if let Some(parent_id) = agent.parent_id.as_ref().filter(|s| !s.is_empty()) {
             if let Some(parent) = self.layout_cache.get(parent_id).copied() {
-                frame.add_line_projected(project, parent, pos, C_MAUVE.with_alpha(0.5));
+                frame.add_line_projected(
+                    project,
+                    parent,
+                    pos,
+                    relationship_color(&agent.relationship_kind, &agent.role).with_alpha(0.5),
+                );
             }
         }
         if let Some((p, _)) = project(pos) {
