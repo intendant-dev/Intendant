@@ -460,6 +460,16 @@ pub(crate) async fn run_headless_mode(
     } else {
         None
     };
+    // Native usage rail: derive per-session UsageSnapshots from
+    // ModelResponse events (dashboard meter + cache/limits vitals).
+    let _usage_rail = if use_web {
+        Some(crate::usage_rail::spawn_native_usage_rail(
+            bus.clone(),
+            crate::usage_rail::ProviderIdentity::from_provider(provider.as_deref()),
+        ))
+    } else {
+        None
+    };
 
     // Rehydrate the resumed session's persisted per-session agent config
     // (managed context, sandbox, approval policy, agent command, …) for a

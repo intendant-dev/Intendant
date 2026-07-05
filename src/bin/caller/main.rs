@@ -60,6 +60,7 @@ mod session_log;
 mod session_names;
 mod session_supervisor;
 mod session_vitals;
+mod usage_rail;
 mod setup;
 mod skills;
 mod sub_agent;
@@ -3441,6 +3442,7 @@ async fn main() -> Result<(), CallerError> {
             session_registry,
             recording_registry,
             daemon_startup_resume_dir,
+            usage_rail::ProviderIdentity::from_provider(provider.as_deref()),
         )
         .await;
     }

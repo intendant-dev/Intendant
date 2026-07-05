@@ -73,6 +73,7 @@ pub(crate) async fn run_daemon(
     session_registry: display::SharedSessionRegistry,
     recording_registry: Arc<tokio::sync::RwLock<recording::RecordingRegistry>>,
     daemon_startup_resume_dir: Option<PathBuf>,
+    provider_identity: crate::usage_rail::ProviderIdentity,
 ) -> Result<(), CallerError> {
     let bus = EventBus::new();
     let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
@@ -161,6 +162,11 @@ pub(crate) async fn run_daemon(
     } else {
         None
     };
+    // Native usage rail: derive per-session UsageSnapshots from
+    // ModelResponse events (dashboard meter + cache/limits vitals).
+    // Covers supervisor-spawned native children too.
+    let _usage_rail =
+        crate::usage_rail::spawn_native_usage_rail(bus.clone(), provider_identity);
 
     let startup_bus = bus.clone();
     let supervisor_handle =
