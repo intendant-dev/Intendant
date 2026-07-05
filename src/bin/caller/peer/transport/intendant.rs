@@ -385,13 +385,40 @@ async fn drain_ws(
                 // peer daemon's own primary session — feed that to the
                 // upcaster so folded session snapshots can stamp
                 // `is_primary` (renderers merge that session into the peer
-                // node instead of drawing it twice). Other `t`-tagged
-                // frames (log_replay, cached usage/status) stay dropped.
+                // node instead of drawing it twice).
                 if text.contains("\"t\":\"state_snapshot\"") {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                         if value["t"] == "state_snapshot" {
                             if let Some(sid) = value["session_id"].as_str() {
                                 upcaster.set_primary_session_id(sid);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // The bootstrap `log_replay` frame carries the peer's recent
+                // outbound history. Fold its session-state effects through
+                // the replay lane (never the live arms — replayed messages
+                // and activities must not re-fire as current), so a
+                // late-joining consumer converges on session state whose
+                // change-detected emissions predate this connection (e.g. an
+                // idle repo's git vitals). Same convergence a refreshed
+                // browser gets from the same frame. Other `t`-tagged frames
+                // (cached usage/status) stay dropped.
+                if text.contains("\"t\":\"log_replay\"") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if value["t"] == "log_replay" {
+                            for entry in value["entries"].as_array().into_iter().flatten() {
+                                let Ok(outbound) =
+                                    serde_json::from_value::<OutboundEvent>(entry.clone())
+                                else {
+                                    continue;
+                                };
+                                for event in upcaster.upcast_replayed(&outbound) {
+                                    if events_tx.send(event).await.is_err() {
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }

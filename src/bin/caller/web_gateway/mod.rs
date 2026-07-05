@@ -3868,6 +3868,12 @@ pub fn spawn_web_gateway(
     // the user has actually granted access. Cleared on user_display_revoked
     // so a stale grant doesn't get replayed after the user revokes.
     let last_user_display_json = bootstrap_caches.last_user_display_json.clone();
+    // Cache the latest change-detected per-session state (session_vitals /
+    // session_goal). Those emit only on change — an idle session never
+    // repeats them — so late joiners (browser refresh on an idle daemon, a
+    // peer transport attaching) would otherwise never see state that last
+    // changed before they connected. Pruned on session_ended.
+    let session_state_lines = bootstrap_caches.session_state_lines.clone();
     // Cache display_ready JSON per display_id for late-connecting browsers.
     // Using a HashMap so multiple concurrent display sessions are all replayed.
     let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> =
@@ -3880,6 +3886,7 @@ pub fn spawn_web_gateway(
         let external_agent_cache = last_external_agent_json.clone();
         let session_attached_cache = attached_external_sessions.clone();
         let user_display_cache = last_user_display_json.clone();
+        let session_state_cache = session_state_lines.clone();
         let display_cache = display_ready_cache.clone();
         let mut usage_rx = broadcast_tx.subscribe();
         tokio::spawn(async move {
@@ -3954,9 +3961,47 @@ pub fn spawn_web_gateway(
                                 update_external_attached_sessions_from_wire(&mut guard, &line);
                             }
                         }
+                        if line.contains("\"event\":\"session_vitals\"")
+                            || line.contains("\"event\":\"session_goal\"")
+                        {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
+                                let kind = match parsed["event"].as_str() {
+                                    Some("session_vitals") => Some("session_vitals"),
+                                    Some("session_goal") => Some("session_goal"),
+                                    _ => None,
+                                };
+                                if let (Some(kind), Some(sid)) =
+                                    (kind, parsed["session_id"].as_str())
+                                {
+                                    if let Ok(mut guard) = session_state_cache.lock() {
+                                        guard
+                                            .entry(sid.to_string())
+                                            .or_default()
+                                            .insert(kind, line.clone());
+                                        // Bound the cache against a runaway
+                                        // session-id source. session_ended is
+                                        // the normal prune; this evicts the
+                                        // lexicographically first key, which
+                                        // is arbitrary but keeps it finite.
+                                        if guard.len() > 256 {
+                                            if let Some(first) = guard.keys().next().cloned() {
+                                                guard.remove(&first);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if line.contains("\"event\":\"session_ended\"") {
                             if let Ok(mut guard) = session_attached_cache.lock() {
                                 update_external_attached_sessions_from_wire(&mut guard, &line);
+                            }
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
+                                if let Some(sid) = parsed["session_id"].as_str() {
+                                    if let Ok(mut guard) = session_state_cache.lock() {
+                                        guard.remove(sid);
+                                    }
+                                }
                             }
                         }
                     }
@@ -4174,6 +4219,7 @@ pub fn spawn_web_gateway(
             let last_external_agent_json = last_external_agent_json.clone();
             let attached_external_sessions = attached_external_sessions.clone();
             let last_user_display_json = last_user_display_json.clone();
+            let session_state_lines = session_state_lines.clone();
             let display_ready_cache = display_ready_cache.clone();
             let web_tui_tx = web_tui_tx.clone();
             let task_tx = task_tx.clone();
@@ -4617,6 +4663,25 @@ pub fn spawn_web_gateway(
                         if let Some(ref status_json) = *guard {
                             let _ = direct_tx.send(status_json.clone());
                         }
+                    }
+
+                    // Re-send the latest change-detected per-session state
+                    // (session_vitals / session_goal). These fire on change
+                    // only, so without this a late joiner — a refreshed
+                    // browser on an idle daemon, or a peer transport
+                    // attaching — would never see state that last changed
+                    // before this connection existed.
+                    let session_state_replay: Vec<String> = session_state_lines
+                        .lock()
+                        .map(|guard| {
+                            guard
+                                .values()
+                                .flat_map(|kinds| kinds.values().cloned())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for line in session_state_replay {
+                        let _ = direct_tx.send(line);
                     }
 
                     // Send cached autonomy after cached status so it wins

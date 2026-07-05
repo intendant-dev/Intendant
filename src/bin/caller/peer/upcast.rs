@@ -274,6 +274,20 @@ impl PeerSessionFold {
         self.pending_approvals.retain(|_, sid| sid != session_id);
     }
 
+    /// Phase transition from a session-scoped lifecycle event
+    /// (TurnStarted/AgentStarted → working, DoneSignal/TaskComplete →
+    /// done). These are the signals native daemon-lane sessions
+    /// actually emit — dedicated per-session `status` events exist
+    /// only on the primary rail — so folding them is what gives
+    /// remote native sessions live phases at all.
+    fn phase(&mut self, session_id: Option<&str>, phase: &str) -> Option<SessionInfo> {
+        let session_id = session_id.unwrap_or("");
+        if session_id.trim().is_empty() {
+            return None;
+        }
+        self.update(session_id, |s| s.phase = phase.to_string())
+    }
+
     fn entry(&mut self, session_id: &str) -> &mut SessionInfo {
         let is_primary = self.primary_session_id.as_deref() == Some(session_id);
         self.sessions
@@ -491,7 +505,9 @@ impl AppEventUpcaster {
             )],
 
             // ---- Turn lifecycle ----
-            AppEvent::TurnStarted { turn, .. } => {
+            AppEvent::TurnStarted {
+                session_id, turn, ..
+            } => {
                 // Defensive cleanup: if a previous turn/agent never
                 // closed explicitly (because the source dropped
                 // DoneSignal, or emitted TurnStarted without a prior
@@ -514,6 +530,9 @@ impl AppEventUpcaster {
                     kind: ActivityKind::ModelTurn,
                     label: format!("turn {turn}"),
                 });
+                out.extend(session_updated_events(
+                    self.sessions.phase(session_id.as_deref(), "working"),
+                ));
                 out
             }
 
@@ -570,7 +589,11 @@ impl AppEventUpcaster {
                 out
             }
 
-            AppEvent::DoneSignal { message, .. } => {
+            AppEvent::DoneSignal {
+                session_id,
+                message,
+                ..
+            } => {
                 self.current_message_id = None;
                 let mut out = vec![];
                 // Close the in-flight agent first (if any), then the
@@ -595,6 +618,9 @@ impl AppEventUpcaster {
                 if let Some(msg) = message {
                     out.push(log_event(LogLevel::Info, "agent", format!("done: {msg}")));
                 }
+                out.extend(session_updated_events(
+                    self.sessions.phase(session_id.as_deref(), "done"),
+                ));
                 out
             }
 
@@ -610,6 +636,7 @@ impl AppEventUpcaster {
 
             // ---- Sub-agent / tool execution ----
             AppEvent::AgentStarted {
+                session_id,
                 turn,
                 commands_preview,
                 source,
@@ -630,6 +657,9 @@ impl AppEventUpcaster {
                     kind: ActivityKind::ToolCall,
                     label: format!("{label}: {commands_preview}"),
                 });
+                out.extend(session_updated_events(
+                    self.sessions.phase(session_id.as_deref(), "working"),
+                ));
                 out
             }
 
@@ -683,7 +713,9 @@ impl AppEventUpcaster {
             )],
 
             AppEvent::TaskComplete {
-                reason, summary, ..
+                session_id,
+                reason,
+                summary,
             } => {
                 let outcome = match reason.as_str() {
                     "success" | "done" | "completed" => ActivityOutcome::Success,
@@ -719,6 +751,9 @@ impl AppEventUpcaster {
                 if let Some(s) = summary {
                     out.push(log_event(LogLevel::Info, "task", s.clone()));
                 }
+                out.extend(session_updated_events(
+                    self.sessions.phase(session_id.as_deref(), "done"),
+                ));
                 out
             }
 
@@ -1550,6 +1585,102 @@ impl WireEventUpcaster {
         self.sessions.set_primary_session_id(session_id);
     }
 
+    /// Replay-lane upcast for the `/ws` bootstrap `log_replay` frame:
+    /// fold ONLY the session-state effects of a replayed wire event,
+    /// suppressing everything the live arms would re-fire as if it
+    /// were happening now (messages, activities, logs, approval
+    /// events, host status). This is how a late-joining consumer
+    /// converges on the peer's current session state — including
+    /// change-detected emissions that fired before the connection
+    /// existed (an idle repo's git vitals never recur) — the same way
+    /// a refreshed browser converges via the same replay. Wire-only:
+    /// the in-process `AppEventUpcaster` never sees a replay.
+    ///
+    /// The live-stream correlation state (turn ids, message ids) is
+    /// deliberately untouched so replayed turns can't corrupt the
+    /// correlation of live events that follow.
+    pub fn upcast_replayed(&mut self, event: &OutboundEvent) -> Vec<PeerEvent> {
+        match event {
+            OutboundEvent::SessionStarted { session_id, task } => {
+                vec![PeerEvent::SessionStarted {
+                    session: self.sessions.started(session_id, task.as_deref()),
+                }]
+            }
+            OutboundEvent::SessionIdentity {
+                session_id, source, ..
+            } => session_updated_events(
+                self.sessions
+                    .update(session_id, |s| s.source = source.clone()),
+            ),
+            OutboundEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ephemeral,
+            } => session_updated_events(self.sessions.update(child_session_id, |s| {
+                s.parent_session_id = Some(parent_session_id.clone());
+                s.relationship = relationship.clone();
+                s.ephemeral = *ephemeral;
+            })),
+            OutboundEvent::SessionGoal { session_id, goal } => session_updated_events(
+                self.sessions.update(session_id, |s| s.goal = goal.clone()),
+            ),
+            OutboundEvent::SessionVitals { session_id, vitals } => session_updated_events(
+                self.sessions
+                    .update(session_id, |s| s.vitals = Some(vitals.clone())),
+            ),
+            OutboundEvent::Status {
+                phase,
+                session_id,
+                task,
+                ..
+            } => session_updated_events(self.sessions.update(session_id, |s| {
+                s.phase = phase.clone();
+                if s.label.as_deref().unwrap_or("").is_empty() && !task.is_empty() {
+                    s.label = Some(task.clone());
+                }
+            })),
+            OutboundEvent::TurnStarted { session_id, .. }
+            | OutboundEvent::AgentStarted { session_id, .. } => session_updated_events(
+                self.sessions.phase(session_id.as_deref(), "working"),
+            ),
+            OutboundEvent::DoneSignal { session_id, .. }
+            | OutboundEvent::TaskComplete { session_id, .. } => {
+                session_updated_events(self.sessions.phase(session_id.as_deref(), "done"))
+            }
+            OutboundEvent::Usage {
+                session_id, main, ..
+            }
+            | OutboundEvent::UsageUpdate {
+                session_id, main, ..
+            } => match session_id.as_deref() {
+                Some(sid) => {
+                    let tokens = main.prompt_tokens + main.completion_tokens;
+                    session_updated_events(
+                        self.sessions.update(sid, |s| s.tokens_used = Some(tokens)),
+                    )
+                }
+                None => vec![],
+            },
+            OutboundEvent::ApprovalRequired {
+                session_id, id, ..
+            } => session_updated_events(
+                self.sessions.approval_requested(*id, session_id.as_deref()),
+            ),
+            OutboundEvent::ApprovalResolved { id, .. } => {
+                session_updated_events(self.sessions.approval_resolved(*id))
+            }
+            OutboundEvent::SessionEnded { session_id, reason } => {
+                self.sessions.ended(session_id);
+                vec![PeerEvent::SessionEnded {
+                    session_id: session_id.clone(),
+                    reason: reason.clone(),
+                }]
+            }
+            _ => vec![],
+        }
+    }
+
     fn next_seq(&mut self) -> u64 {
         self.seq = self.seq.saturating_add(1);
         self.seq
@@ -1713,7 +1844,9 @@ impl WireEventUpcaster {
             )],
 
             // ---- Turn lifecycle ----
-            OutboundEvent::TurnStarted { turn, .. } => {
+            OutboundEvent::TurnStarted {
+                session_id, turn, ..
+            } => {
                 let mut out = vec![];
                 if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
@@ -1728,6 +1861,9 @@ impl WireEventUpcaster {
                     kind: ActivityKind::ModelTurn,
                     label: format!("turn {turn}"),
                 });
+                out.extend(session_updated_events(
+                    self.sessions.phase(session_id.as_deref(), "working"),
+                ));
                 out
             }
 
@@ -1811,7 +1947,10 @@ impl WireEventUpcaster {
                 out
             }
 
-            OutboundEvent::DoneSignal { message, .. } => {
+            OutboundEvent::DoneSignal {
+                session_id,
+                message,
+            } => {
                 self.current_message_id = None;
                 let mut out = vec![];
                 if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
@@ -1829,6 +1968,9 @@ impl WireEventUpcaster {
                 if let Some(msg) = message {
                     out.push(log_event(LogLevel::Info, "agent", format!("done: {msg}")));
                 }
+                out.extend(session_updated_events(
+                    self.sessions.phase(session_id.as_deref(), "done"),
+                ));
                 out
             }
 
@@ -1844,6 +1986,7 @@ impl WireEventUpcaster {
 
             // ---- Sub-agent / tool execution ----
             OutboundEvent::AgentStarted {
+                session_id,
                 turn,
                 commands_preview,
                 source,
@@ -1860,6 +2003,9 @@ impl WireEventUpcaster {
                     kind: ActivityKind::ToolCall,
                     label: format!("{label}: {commands_preview}"),
                 });
+                out.extend(session_updated_events(
+                    self.sessions.phase(session_id.as_deref(), "working"),
+                ));
                 out
             }
 
@@ -1907,7 +2053,9 @@ impl WireEventUpcaster {
             )],
 
             OutboundEvent::TaskComplete {
-                reason, summary, ..
+                session_id,
+                reason,
+                summary,
             } => {
                 let outcome = match reason.as_str() {
                     "success" | "done" | "completed" => ActivityOutcome::Success,
@@ -1936,6 +2084,9 @@ impl WireEventUpcaster {
                 if let Some(s) = summary {
                     out.push(log_event(LogLevel::Info, "task", s.clone()));
                 }
+                out.extend(session_updated_events(
+                    self.sessions.phase(session_id.as_deref(), "done"),
+                ));
                 out
             }
 
@@ -4059,6 +4210,166 @@ mod tests {
         assert!(matches!(out[0], PeerEvent::SessionEnded { .. }));
         assert!(u.sessions.sessions.is_empty());
         assert!(u.sessions.pending_approvals.is_empty());
+    }
+
+    /// Native daemon-lane sessions have no per-session `status` rail —
+    /// their phases fold from the lifecycle events they do emit:
+    /// TurnStarted/AgentStarted → working, DoneSignal/TaskComplete →
+    /// done. (This is what makes remote native sessions show live
+    /// phases at all; see the two-daemon rig.)
+    #[test]
+    fn wire_session_fold_derives_phase_from_lifecycle_events() {
+        let mut u = WireEventUpcaster::new();
+        let _ = u.upcast(&OutboundEvent::SessionStarted {
+            session_id: "s1".into(),
+            task: Some("delegated".into()),
+        });
+
+        let out = u.upcast(&OutboundEvent::TurnStarted {
+            session_id: Some("s1".into()),
+            turn: 1,
+            budget_pct: 0.1,
+        });
+        let updated = out.iter().find_map(|e| match e {
+            PeerEvent::SessionUpdated { session } => Some(session.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            updated.expect("TurnStarted folds phase").phase,
+            "working"
+        );
+
+        // Same-phase repeat (AgentStarted while already working) must
+        // not re-emit.
+        let out = u.upcast(&OutboundEvent::AgentStarted {
+            session_id: Some("s1".into()),
+            turn: 1,
+            commands_preview: "echo hi".into(),
+            item_id: None,
+            source: None,
+        });
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, PeerEvent::SessionUpdated { .. })),
+            "no duplicate SessionUpdated for an unchanged phase"
+        );
+
+        let out = u.upcast(&OutboundEvent::TaskComplete {
+            session_id: Some("s1".into()),
+            reason: "success".into(),
+            summary: None,
+        });
+        let updated = out.iter().find_map(|e| match e {
+            PeerEvent::SessionUpdated { session } => Some(session.clone()),
+            _ => None,
+        });
+        assert_eq!(updated.expect("TaskComplete folds phase").phase, "done");
+    }
+
+    /// The replay lane and the live lane must fold to the SAME
+    /// session state for the same wire stream — the drift guard for
+    /// `upcast_replayed`'s duplicated fold closures. The replay lane
+    /// must also emit no live-activity events at all.
+    #[test]
+    fn replay_lane_folds_identically_to_live_lane() {
+        let stream = [
+            OutboundEvent::SessionStarted {
+                session_id: "s1".into(),
+                task: Some("delegated".into()),
+            },
+            OutboundEvent::SessionIdentity {
+                session_id: "s1".into(),
+                source: "codex".into(),
+                backend_session_id: "b".into(),
+            },
+            OutboundEvent::SessionRelationship {
+                parent_session_id: "s0".into(),
+                child_session_id: "s1".into(),
+                relationship: "subagent".into(),
+                ephemeral: false,
+            },
+            OutboundEvent::SessionVitals {
+                session_id: "s1".into(),
+                vitals: vitals_with_git(),
+            },
+            OutboundEvent::TurnStarted {
+                session_id: Some("s1".into()),
+                turn: 1,
+                budget_pct: 0.1,
+            },
+            OutboundEvent::Usage {
+                session_id: Some("s1".into()),
+                main: crate::frontend::ModelUsageSnapshot {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    ..Default::default()
+                },
+                presence: None,
+            },
+            OutboundEvent::ApprovalRequired {
+                session_id: Some("s1".into()),
+                id: 3,
+                command: "x".into(),
+            },
+            OutboundEvent::TaskComplete {
+                session_id: Some("s1".into()),
+                reason: "success".into(),
+                summary: None,
+            },
+        ];
+
+        let mut live = WireEventUpcaster::new();
+        let mut replay = WireEventUpcaster::new();
+        for event in &stream {
+            let _ = live.upcast(event);
+            for out in replay.upcast_replayed(event) {
+                assert!(
+                    matches!(
+                        out,
+                        PeerEvent::SessionStarted { .. }
+                            | PeerEvent::SessionUpdated { .. }
+                            | PeerEvent::SessionEnded { .. }
+                    ),
+                    "replay lane leaked a live-activity event: {out:?}"
+                );
+            }
+        }
+
+        let normalize = |u: &WireEventUpcaster| {
+            u.sessions
+                .sessions
+                .values()
+                .map(|s| {
+                    let mut v = serde_json::to_value(s).unwrap();
+                    v["started_at"] = serde_json::Value::String("NORM".into());
+                    v
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            normalize(&live),
+            normalize(&replay),
+            "replay fold diverged from live fold"
+        );
+    }
+
+    #[test]
+    fn parity_turn_started_with_session_folds_phase() {
+        assert_parity(AppEvent::TurnStarted {
+            session_id: Some("s1".into()),
+            turn: 7,
+            budget_pct: 0.5,
+            remaining: 100,
+        });
+    }
+
+    #[test]
+    fn parity_task_complete_with_session_folds_phase() {
+        assert_parity(AppEvent::TaskComplete {
+            session_id: Some("s1".into()),
+            reason: "success".into(),
+            summary: Some("all done".into()),
+        });
     }
 
     /// Chatty sources (per-tick status) must not spam SessionUpdated:

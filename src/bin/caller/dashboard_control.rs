@@ -26,7 +26,7 @@ use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::net::SocketAddr;
@@ -513,6 +513,15 @@ pub struct DashboardBootstrapCaches {
     pub(crate) last_external_agent_json: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) last_user_display_json: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) attached_external_sessions: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Latest change-detected per-session state lines (`session_vitals`,
+    /// `session_goal`), replayed to every new connection. These
+    /// emissions fire on change only — an idle session never repeats
+    /// them — so a late joiner (browser refresh on an idle daemon, a
+    /// peer transport attaching) would otherwise never learn state that
+    /// last changed before it connected. Keyed session id → event kind
+    /// → serialized wire line; pruned on `session_ended`.
+    pub(crate) session_state_lines:
+        Arc<std::sync::Mutex<BTreeMap<String, BTreeMap<&'static str, String>>>>,
 }
 
 type DashboardPresenceFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -4457,6 +4466,18 @@ fn cached_bootstrap_events_response_frame(
         "user_display",
         &caches.last_user_display_json,
     );
+    // Per-session change-detected state (vitals/goal) — same rationale
+    // as the singleton caches above, but keyed per session.
+    if let Ok(guard) = caches.session_state_lines.lock() {
+        for kinds in guard.values() {
+            for line in kinds.values() {
+                match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(v) => events.push(v),
+                    Err(_) => malformed.push("session_state"),
+                }
+            }
+        }
+    }
     let event_count = events.len();
 
     serde_json::json!({
@@ -10889,6 +10910,16 @@ mod tests {
             let mut guard = rt.bootstrap_caches.last_autonomy_json.lock().unwrap();
             *guard = Some(r#"{"event":"autonomy_changed","mode":"ask"}"#.to_string());
         }
+        {
+            // Per-session change-detected state joins the bootstrap so a
+            // late-joining tunnel client sees vitals/goals that last
+            // changed before it connected.
+            let mut guard = rt.bootstrap_caches.session_state_lines.lock().unwrap();
+            guard.entry("s-1".to_string()).or_default().insert(
+                "session_vitals",
+                r#"{"event":"session_vitals","session_id":"s-1","vitals":{"git":{"branch":"main","dirtyFiles":1,"ahead":0,"behind":0}}}"#.to_string(),
+            );
+        }
         let cached_bootstrap = test_control_frame_response(
             r#"{"t":"request","id":"b1","method":"api_cached_bootstrap_events"}"#,
             &mut rt,
@@ -10899,11 +10930,19 @@ mod tests {
         .unwrap();
         assert_eq!(cached_bootstrap["t"], "response");
         assert_eq!(cached_bootstrap["ok"], true);
-        assert_eq!(cached_bootstrap["result"]["event_count"], 2);
+        assert_eq!(cached_bootstrap["result"]["event_count"], 3);
         assert_eq!(cached_bootstrap["result"]["events"][0]["event"], "status");
         assert_eq!(
             cached_bootstrap["result"]["events"][1]["event"],
             "autonomy_changed"
+        );
+        assert_eq!(
+            cached_bootstrap["result"]["events"][2]["event"],
+            "session_vitals"
+        );
+        assert_eq!(
+            cached_bootstrap["result"]["events"][2]["vitals"]["git"]["dirtyFiles"],
+            1
         );
 
         let status = test_control_frame_response(

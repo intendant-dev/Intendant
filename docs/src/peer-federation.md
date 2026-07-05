@@ -178,13 +178,25 @@ evolves, `SessionEnded` retires; consumers fold the first two identically by
 `session_id`, so the stream is idempotent and loss-tolerant.
 
 Because fold updates **upsert**, a primary that connects (or reconnects) while
-the peer's sessions are already running learns them from their next live event
-— no replay protocol needed. The transport also peeks the `/ws` bootstrap
-`state_snapshot` frame to learn the peer daemon's own primary session id and
-stamps that session `is_primary`; renderers merge it into the peer's daemon
-node instead of drawing it twice. The fold is bounded
-(`MAX_TRACKED_PEER_SESSIONS`, oldest-started evicted) since a peer could
-announce sessions forever without ending them.
+the peer's sessions are already running learns them from their next live event.
+Three bootstrap channels close the remaining late-join gaps: the transport
+peeks the `/ws` `state_snapshot` frame to learn the peer daemon's own primary
+session id (stamped `is_primary`; renderers merge that session into the peer's
+daemon node instead of drawing it twice); the gateway re-sends the latest
+change-detected per-session state lines (`session_vitals` / `session_goal` —
+which fire on change only, so an idle repo's git vitals would otherwise never
+recur for a late joiner; this also fixes browser refresh on an idle daemon,
+tunnel clients included via `api_cached_bootstrap_events`); and when the peer
+serves a `log_replay` frame, the transport folds it through a replay-only lane
+(`upcast_replayed`) that updates session state without re-firing historical
+messages or activities as live events. Phases fold from the lifecycle events
+sessions actually emit (`TurnStarted`/`AgentStarted` → working,
+`DoneSignal`/`TaskComplete` → done) — native daemon-lane sessions have no
+per-session `status` rail, and a completed session **lingers as done** rather
+than retiring, because the persistent daemon keeps it resumable (same
+semantics as local session windows); `SessionEnded` arrives on explicit stop.
+The fold is bounded (`MAX_TRACKED_PEER_SESSIONS`, oldest-started evicted)
+since a peer could announce sessions forever without ending them.
 
 The per-peer actor mirrors the folded stream into a watch-published sessions
 view (cleared on disconnect — the fold is connection-scoped, and stale entries
