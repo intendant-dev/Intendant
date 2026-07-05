@@ -1061,6 +1061,8 @@ function stationBuildControlsSummary() {
     writableRoots: Array.isArray(controlCodexConfig.writable_roots)
       ? controlCodexConfig.writable_roots.length
       : 0,
+    claudeModel: controlClaudeConfig.model || '',
+    claudePermissionMode: controlClaudeConfig.permission_mode || 'default',
     newSessionAgent: newSessionConfiguredAgent || backend || '',
     sessionId,
     sessionLabel: stationSessionShortLabel(sessionId),

@@ -1325,33 +1325,15 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     }
                 }
 
-                for child_thread_id in &subagent_thread_ids {
-                    let child_thread_id = child_thread_id.trim();
-                    if child_thread_id.is_empty() || child_thread_id == sender_thread_id.trim() {
-                        continue;
-                    }
-                    let sender_thread_id = sender_thread_id.trim();
-                    if !sender_thread_id.is_empty() {
-                        stats
-                            .codex_subagent_parent_threads
-                            .entry(child_thread_id.to_string())
-                            .or_insert_with(|| sender_thread_id.to_string());
-                    }
-                    if stats
-                        .codex_subagent_sessions
-                        .insert(child_thread_id.to_string())
-                    {
-                        emit_codex_subagent_started(
-                            config,
-                            sender_thread_id,
-                            child_thread_id,
-                            prompt_ref,
-                            model.as_deref(),
-                            reasoning_effort.as_deref(),
-                        );
-                    }
-                    emit_codex_subagent_transcript_updates(config, stats, child_thread_id);
-                }
+                register_external_subagent_children(
+                    config,
+                    stats,
+                    &sender_thread_id,
+                    &subagent_thread_ids,
+                    prompt_ref,
+                    model.as_deref(),
+                    reasoning_effort.as_deref(),
+                );
 
                 if status == "failed" {
                     let item_id = item_id.trim();
@@ -1361,7 +1343,8 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         format!(" ({item_id})")
                     };
                     let content = format!(
-                        "Codex subagent tool {}{} failed{}",
+                        "{} subagent tool {}{} failed{}",
+                        external_agent_log_source(config.agent_source.as_deref()),
                         tool,
                         item_suffix,
                         prompt_ref
@@ -1381,8 +1364,8 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 }
 
                 for state in &agents {
-                    emit_codex_subagent_state(config, state);
-                    emit_codex_subagent_terminal(config, stats, state);
+                    emit_external_subagent_state(config, state);
+                    emit_external_subagent_terminal(config, stats, state);
                 }
 
                 emit_external_context_snapshot_if_changed(

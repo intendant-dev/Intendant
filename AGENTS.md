@@ -128,7 +128,8 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
 - tokio (full features), `Arc<RwLock/Mutex<T>>` for shared state, `mpsc` for channels
 - TLS/cert code is **pure-Rust `ring`/`rcgen`/`rustls`** (`web_tls.rs`, `access/certs.rs`) — no OpenSSL; prefer that path when touching crypto/cert code
 - Tests live in inline `#[cfg(test)]` modules only
-- **File size budget:** keep a source file under ~3k lines (4k absolute ceiling;
+- **File size budget:** keep a source file under ~3k lines of non-test code
+  (4k absolute ceiling; inline `#[cfg(test)]` modules don't count against it;
   the remaining god-files are legacy being carved down, not precedents). When a
   file outgrows its seams, split along domain boundaries as **pure-move
   commits**: relocate code *and its tests* verbatim into a new module, add

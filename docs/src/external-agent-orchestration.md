@@ -114,6 +114,7 @@ loop.
 | Reasoning trace | Yes | Yes (`thinking` blocks) |
 | Rollback turns | Yes (`thread/rollback`) | No → session reset |
 | Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | `compact`, `fork` (respawns via `--resume <id> --fork-session`), the full `goal*` family (wrapper goal engine), and live `model` / `permission-mode` — all via universal `thread_actions`. No side/fast/review/memory-reset — see [Dashboard and Station parity](#dashboard-and-station-parity-codex-vs-claude-code) |
+| Native sub-agents | Yes — collab tools spawn real attachable threads (`SubAgentToolCall`) | Yes — the in-band `Agent`/`Task` tool; async children stream `parent_tool_use_id`-tagged envelopes, surfaced as ephemeral `task-*` child sessions on the same `SubAgentToolCall`/relationship rail |
 
 Both spawn through `crate::platform::spawn_command(&cfg.command)` with the
 working dir set to the project root and stdin/stdout/stderr piped; stderr is
@@ -526,9 +527,34 @@ Protocol details that are load-bearing (verified against Claude Code 2.1.200):
   identity and emits the `fork` relationship from the persisted
   `forked_from` lineage. Until that first prompt the forked window has no
   native identity yet — expected, not a bug.
-- **Live reconfig** (probed, not yet wired): `control_request` subtypes
-  `set_model` and `set_permission_mode` exist and succeed on 2.1.201; the
-  per-session overlay slice will use them for live apply.
+- **Live reconfig** (wired): `control_request` subtypes `set_model` and
+  `set_permission_mode` (verified on 2.1.201) back the `model` /
+  `permission-mode` thread actions; the Launch-config modal applies both
+  live on save.
+- **In-band sub-agents** (the `Agent` tool; `Task` pre-2.1): **async by
+  default** on 2.1.201 — the Agent tool_result returns launch metadata
+  immediately (`tool_use_result.status: "async_launched"`, suppressed by
+  the adapter) and the child keeps working, potentially past the parent
+  turn's `result`. The spawn emits `AgentEvent::SubAgentToolCall`
+  (`inProgress`), which the drain turns into an ephemeral child session
+  (`task-<tool_use_id suffix>`): identity (`claude-code` source), a
+  `subagent` `session_relationship`, a no-follow-up capability ceiling, and
+  a started log line. Child activity arrives ONLY as complete
+  assistant/user envelopes tagged with top-level `parent_tool_use_id` (no
+  stream deltas) — the adapter scopes them to the child window, including
+  per-child open-tool tracking so a parent turn's end doesn't cancel a
+  live child's tools. `system:task_started` supplies the `task_id`
+  correlation key; `system:task_notification` (status + summary) is the
+  authoritative end and emits the scoped terminal state (child window ends;
+  duplicate notifications are absorbed; EOF shuts down any still-open
+  children). An unrecognized `parent_tool_use_id` (resume replay)
+  lazily materializes its child from the envelope's `task_description`.
+  After an async child completes, the CLI **spontaneously starts a
+  notification turn** (fresh `init` → the model reports the outcome → its
+  own `result`); while idle the drain absorbs it as a normal spontaneous
+  round. Known race (accepted): if that notification turn lands while a
+  real turn is being drained, its `result` can complete the round early —
+  same class as Codex's spontaneous rounds.
 - The init message's `mcp_servers` status for the injected `intendant`
   server is logged (warn on `failed`/missing) so a broken loopback MCP is
   visible from frontends instead of silently running without CU tools.
@@ -565,10 +591,10 @@ capability-gated affordances in `app.html`, and `external_wrapper_index`.
 | Usage / context meter | `AgentEvent::Usage` → `UsageSnapshot` / `ContextSnapshot` | `token_count` notifications | **Parity** (`message_delta` + `result` usage) |
 | Goal chip in the agent-window header (`/goal`) | `SessionGoal` type; `AgentEvent::GoalUpdated/GoalCleared`; `session_goal` outbound + log replay; the window chip renderer is backend-neutral; goal wire conventions (statuses, budget shape, objective limit) shared via `external_agent` helpers | native `thread/goal/*` RPCs | **Live — wrapper goal engine in the adapter.** The full `goal*` op family is advertised and dispatched; goal state lives in `CcShared`, notices reach the model as mid-turn steers (absorbed) or as a prelude on the next prompt (idle updates never buy a turn), and budget spend is measured in FRESH tokens (uncached input + cache creation + output — cache reads excluded), flipping `active` → `budgetLimited` at exhaustion. Engine state is per-process: after a resume the chip rehydrates from the log but the engine starts empty (re-set the goal) |
 | Per-window action menu (fork / compact / goals / …) | **Universal (landed):** `SessionCapabilities.thread_actions` op vocabulary + the `thread_action` control message (`codex_thread_action` stays a wire alias); the kebab and Station session actions render from the advertised op list, with the codex heuristic as legacy-replay fallback | full op set | **`compact` + `fork` live.** `compact` sends the native `/compact` user message (status → `compact_boundary` → free result); `fork` respawns via `ForkHandling::RespawnResume` → `ResumeSession { fork: true }` → `--resume <parent> --fork-session` (the child binds its own native id + the `fork` relationship on its first prompt). No Claude analog planned: side / fast / review / memory-reset |
-| Relationship wiring (parent/sub/fork header chips + SVG wires; Station edges) | `session_relationship` event + lineage ledger + `/api` serving + both renderers — all backend-neutral | side / subagent / fork / fission / rewind emitters | **`fork` emitted** (on the forked child's first identity announcement, from the persisted `forked_from` lineage). Still planned: surface in-band Task sub-agents (`parent_tool_use_id` on stream messages) via `SubAgentToolCall` / relationship events |
+| Relationship wiring (parent/sub/fork header chips + SVG wires; Station edges) | `session_relationship` event + lineage ledger + `/api` serving + both renderers — all backend-neutral | side / subagent / fork / fission / rewind emitters | **`fork` + `subagent` emitted.** Fork on the forked child's first identity announcement (persisted `forked_from` lineage); in-band Task sub-agents ride `SubAgentToolCall` → ephemeral `task-*` child sessions with `subagent` relationships (fission observations stay Codex-only by design) |
 | Per-session persisted launch overlay | `SessionAgentConfig` + `ConfigureSessionAgent` / `Restart` (universal `agent_command` + backend fields, bundled as `LaunchOverrides`) | all `codex_*` fields | **Live.** `claude_model` / `claude_permission_mode` / `claude_allowed_tools` / `claude_effort` pins with inherit-vs-pin sentinels ("default" stays a pinnable permission mode; `all` pins explicitly-unrestricted tools), Launch-config modal rows, and LIVE apply of model + permission on save via the `model` / `permission-mode` thread actions (`set_model` / `set_permission_mode` control requests, verified on 2.1.201) |
 | Global runtime config pane | `Set*` ControlMsgs + `*ConfigChanged` broadcast + Settings/Control panes | 12 knobs | **3 knobs** (model / permission mode / allowed tools) — by design; grows only when CC grows equivalent concepts |
-| Station controls-panel runtime block | the controls panel renders per-backend blocks | approval policy / managed-context / fork-binary warning | **Missing.** Plan: a Claude block (model + permission mode) riding the existing `ClaudeRuntimeConfig` + `set_claude_*` messages, gated on backend selection exactly like the Codex block |
+| Station controls-panel runtime block | the controls panel renders per-backend blocks | approval policy / managed-context / fork-binary warning | **Live.** Model pills (default + the CLI's latest-version aliases fable/opus/sonnet/haiku, with a truthful `custom:` row for out-of-alias pins) and permission pills (default/edits/plan/bypass), gated `backend == "claude-code" \|\| launch_agent == "claude-code"` exactly like the Codex block, dispatching `set_claude_model` / `set_claude_permission_mode` (persisted to `intendant.toml` + broadcast, same as the dashboard Control pane) |
 | Plan / todo display | `AgentEvent::PlanUpdate` exists | emits plan updates | **Missing.** Plan: translate `TodoWrite` tool inputs into `PlanUpdate` |
 | Managed context / fission / rewind family | managed-context tools + ledgers | patched managed fork only | **Out of scope for parity** — Codex-fork-specific by design; Claude Code manages its own context (`/compact`, auto-compaction) |
 
@@ -581,12 +607,19 @@ Catch-up order (each step unlocks UI in both surfaces at once):
    engine; the kebab goal submenu and `/goal` slash light up from the
    advertised ops). Still open: goals for NATIVE sessions and Station goal
    rendering (plumbed but unrendered);
-3. remaining relationship producers (in-band Task sub-agents) — `fork`
-   already wires;
+3. ~~remaining relationship producers (in-band Task sub-agents)~~ —
+   **landed** (async `Agent`-tool children become ephemeral `task-*` child
+   sessions with scoped transcripts; `fork` already wired);
 4. ~~per-session Claude overlay fields + Launch-config modal rows + live
    apply~~ — **landed** (drafted by an unattended session, adopted after
    review, finished with the modal UI and live model/permission apply);
-5. the Station controls Claude block.
+5. ~~the Station controls Claude block~~ — **landed** (model + permission
+   pill rows in the rendered controls panel).
+
+All five catch-up items have landed; what remains on the Claude side of
+the matrix is the `TodoWrite` → `PlanUpdate` translation and goals for
+native sessions, plus the Station Phase B rendering work tracked in
+[station.md](./station.md).
 
 ## Approval Routing
 
