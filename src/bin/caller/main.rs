@@ -4,7 +4,7 @@ mod app_state_pricing;
 mod approval;
 mod atspi_read;
 mod audio_routing;
-mod autonomy;
+pub(crate) use intendant_core::autonomy;
 #[cfg(target_os = "macos")]
 mod ax;
 mod browser_workspace;
@@ -24,7 +24,7 @@ mod dashboard_control;
 mod debug;
 mod diagnostics;
 mod display;
-mod error;
+pub(crate) use intendant_core::error;
 mod event;
 mod external_agent;
 mod external_wrapper_index;

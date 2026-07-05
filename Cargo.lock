@@ -2443,6 +2443,7 @@ dependencies = [
  "html2text",
  "if-addrs",
  "image",
+ "intendant-core",
  "landlock",
  "libc",
  "notify",
@@ -2488,6 +2489,17 @@ dependencies = [
  "x11rb",
  "x509-parser 0.18.1",
  "zip",
+]
+
+[[package]]
+name = "intendant-core"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
