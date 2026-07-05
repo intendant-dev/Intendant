@@ -176,15 +176,26 @@ managed browser cache used by CDP browser workspaces.
 
 ### CI (`.github/workflows/`)
 
+`main` on `github.com/intendant-dev/Intendant` is ruleset-protected: every
+landing is a pull request validated by **GitHub's merge queue**, and the
+checks marked *required* below gate it. Their workflows carry an
+**unconditional `merge_group:` trigger** on purpose — a required check that a
+`paths:` filter skips leaves the queue entry stuck at "Expected" until it
+times out, so queue runs never path-filter.
+
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
-| `windows.yml` | push/PR to `main` (Rust/Cargo paths) | Cross-platform `cargo test -p intendant --bins` on Windows (`x86_64-pc-windows-msvc`), macOS (`aarch64-apple-darwin`), and Linux (`x86_64-unknown-linux-gnu`) to catch platform-specific build breaks and Unix-only test assumptions |
-| `audit.yml` | push/PR (Cargo paths) + weekly cron (Mon 08:00 UTC) | `cargo audit` against the RustSec advisory DB |
-| `docs.yml` | docs changes | Build and deploy this mdBook |
-| `agents-md-sync.yml` | push/PR touching `CLAUDE.md` or `AGENTS.md`, plus manual dispatch | Fails when tracked `AGENTS.md` differs byte-for-byte from `CLAUDE.md` |
+| `windows.yml` | push/PR to `main` (Rust/Cargo paths) + every merge group | **Required.** Cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` plus the headless mock-provider e2e on Windows (`x86_64-pc-windows-msvc`), macOS (`aarch64-apple-darwin`), and Linux (`x86_64-unknown-linux-gnu`) to catch platform-specific build breaks and Unix-only test assumptions |
+| `smokes.yml` | push/PR to `main` (Rust/Cargo/smoke paths) + every merge group | **Required.** The keyless smokes (`session-vitals`, `native-goal`, `peer-sessions`) driving real release binaries with the scripted mock provider on Linux + macOS |
+| `app-html.yml` | push/PR touching `static/app/**` or the assembler + every merge group | **Required.** Reruns the assembler and fails when the committed `static/app.html` doesn't match the fragments |
+| `agents-md-sync.yml` | push/PR touching `CLAUDE.md` or `AGENTS.md`, manual dispatch + every merge group | **Required.** Fails when tracked `AGENTS.md` differs byte-for-byte from `CLAUDE.md` |
+| `audit.yml` | push/PR (Cargo paths) + weekly cron (Mon 08:00 UTC) | Advisory: `cargo audit` against the RustSec advisory DB — new upstream advisories must not block unrelated landings |
+| `docs.yml` | docs changes on `main` | Build and deploy this mdBook to GitHub Pages |
 
-The E2E scenarios under `tests/skills/` make real API calls / need a display and
-are **not** in CI.
+The `tests/skills/` scenarios that make real API calls or need a display (the
+live claude-code-e2e battery, browser/Station probes, the peer smoke's
+`--browser` leg) are **not** in CI — they run on operator hardware as the
+post-landing battery.
 Run `cargo test --bins` and `cargo clippy` locally before committing. The TLS
 stack is pure-Rust `ring` / `rustls` / `rcgen` (no OpenSSL), which is why the
 Windows CI job installs NASM (for `ring`'s assembly) but no `libssl`.
