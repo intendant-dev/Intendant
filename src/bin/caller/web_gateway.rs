@@ -4198,6 +4198,108 @@ fn gzip_compress(data: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap_or_default()
 }
 
+/// Asset URLs inside app.html that carry `?v=` cache busters. The
+/// spawn-time rewrite of the embedded copy and the
+/// `INTENDANT_APP_HTML_PATH` per-request override apply the same set.
+const APP_HTML_VERSIONED_ASSETS: [&str; 8] = [
+    "/wasm-web/presence_web.js",
+    "/wasm-web/presence_web_bg.wasm",
+    "/wasm-station/station_web.js",
+    "/wasm-station/station_web_bg.wasm",
+    "/three.module.min.js",
+    "/codemirror-bundle.js",
+    "/codemirror-bundle.css",
+    "/icon-128.png",
+];
+
+/// Rewrite every [`APP_HTML_VERSIONED_ASSETS`] URL in an app.html body to
+/// carry the current `?v=` buster.
+fn rewrite_app_html_asset_urls(html: String, version: &str) -> String {
+    APP_HTML_VERSIONED_ASSETS
+        .iter()
+        .fold(html, |html, path| {
+            rewrite_asset_url_with_version(&html, path, version)
+        })
+}
+
+/// The `INTENDANT_APP_HTML_PATH` dev override: serve the dashboard entry
+/// point from this disk path instead of the embedded copy, re-reading it
+/// on every request — a fragment edit shows up on browser refresh after
+/// `cargo run -p app-html-assembler`, with no daemon rebuild or restart.
+/// Read once at gateway spawn; a whitespace-only value counts as unset.
+fn app_html_override_path() -> Option<std::path::PathBuf> {
+    app_html_override_from(std::env::var("INTENDANT_APP_HTML_PATH").ok())
+}
+
+fn app_html_override_from(raw: Option<String>) -> Option<std::path::PathBuf> {
+    let raw = raw?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(trimmed))
+}
+
+/// Serve one dashboard request under the `INTENDANT_APP_HTML_PATH`
+/// override: fresh disk read, the same `?v=` rewrite as the embedded
+/// copy, a fresh strong ETag (an unchanged file still revalidates to
+/// 304), no gzip. A read failure is a loud 500 naming the override —
+/// falling back to the embedded copy would silently mask the broken
+/// path the developer is trying to iterate on.
+fn app_html_override_response(
+    method: &str,
+    header_text: &str,
+    query: &str,
+    path: &std::path::Path,
+) -> Vec<u8> {
+    match std::fs::read_to_string(path) {
+        Ok(html) => {
+            let html = rewrite_app_html_asset_urls(html, asset_version());
+            let etag = asset_etag(html.as_bytes());
+            build_static_asset_response(
+                method,
+                header_text,
+                query,
+                asset_version(),
+                StaticAssetView {
+                    content_type: "text/html; charset=utf-8",
+                    body: html.as_bytes(),
+                    etag: &etag,
+                    gzip: None,
+                    cache_control: Some("no-cache"),
+                },
+            )
+        }
+        Err(err) => {
+            eprintln!(
+                "[web_gateway] INTENDANT_APP_HTML_PATH read failed ({}): {err}",
+                path.display()
+            );
+            let body = format!(
+                "INTENDANT_APP_HTML_PATH override is active but unreadable.\n\n\
+                 path: {}\nerror: {err}\n\n\
+                 Fix the path (or unset INTENDANT_APP_HTML_PATH) and refresh.\n",
+                path.display()
+            );
+            let mut response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\
+                 Content-Length: {}\r\n\
+                 Cache-Control: no-store\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
+                 Connection: close\r\n\
+                 \r\n",
+                body.len()
+            )
+            .into_bytes();
+            if method != "HEAD" {
+                response.extend_from_slice(body.as_bytes());
+            }
+            response
+        }
+    }
+}
+
 /// Below this size gzip isn't worth the header bytes + CPU — the response
 /// fits in a packet or two either way (e.g. audio-processor.js, ~1.4 KB).
 const GZIP_MIN_BYTES: usize = 4096;
@@ -19408,22 +19510,24 @@ pub fn spawn_web_gateway(
         });
     }
 
-    let app_html = Arc::new(
-        [
-            "/wasm-web/presence_web.js",
-            "/wasm-web/presence_web_bg.wasm",
-            "/wasm-station/station_web.js",
-            "/wasm-station/station_web_bg.wasm",
-            "/three.module.min.js",
-            "/codemirror-bundle.js",
-            "/codemirror-bundle.css",
-            "/icon-128.png",
-        ]
-        .iter()
-        .fold(APP_HTML.to_string(), |html, path| {
-            rewrite_asset_url_with_version(&html, path, &v)
-        }),
-    );
+    let app_html = Arc::new(rewrite_app_html_asset_urls(APP_HTML.to_string(), &v));
+    // INTENDANT_APP_HTML_PATH (dev override): read once at spawn; when
+    // set, every dashboard request re-reads that path instead of serving
+    // the embedded `app_html` above.
+    let app_html_override: Option<Arc<std::path::Path>> =
+        app_html_override_path().map(Arc::from);
+    if let Some(path) = &app_html_override {
+        eprintln!(
+            "[web_gateway] INTENDANT_APP_HTML_PATH: serving the dashboard from {} \
+             (re-read per request; the embedded copy is ignored)",
+            path.display()
+        );
+        if let Err(err) = std::fs::metadata(path) {
+            eprintln!(
+                "[web_gateway] WARNING: INTENDANT_APP_HTML_PATH is not readable right now: {err}"
+            );
+        }
+    }
     // Lazily computed (ETag token, gzipped body) for the rewritten
     // app.html — once per gateway spawn, on the first page load. The
     // rewritten HTML is gateway-scoped (unlike the `include_*!` constants
@@ -19530,6 +19634,7 @@ pub fn spawn_web_gateway(
             let session_model = session_model.clone();
             let app_html = app_html.clone();
             let app_html_cache = app_html_cache.clone();
+            let app_html_override = app_html_override.clone();
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
             let display_input_authority = display_input_authority.clone();
@@ -25764,25 +25869,31 @@ pub fn spawn_web_gateway(
                         // gzip are computed once per gateway spawn, on first
                         // page load: the rewritten HTML is gateway-scoped,
                         // unlike the constants behind `embedded_static_asset`.
-                        let (etag, gzip) = app_html_cache.get_or_init(|| {
-                            (
-                                asset_etag(app_html.as_bytes()),
-                                gzip_compress(app_html.as_bytes()),
+                        // Under INTENDANT_APP_HTML_PATH the disk copy is
+                        // re-read (and re-tagged) on every request instead.
+                        let response = if let Some(path) = app_html_override.as_deref() {
+                            app_html_override_response(req_method, &header_text, req_query, path)
+                        } else {
+                            let (etag, gzip) = app_html_cache.get_or_init(|| {
+                                (
+                                    asset_etag(app_html.as_bytes()),
+                                    gzip_compress(app_html.as_bytes()),
+                                )
+                            });
+                            build_static_asset_response(
+                                req_method,
+                                &header_text,
+                                req_query,
+                                asset_version(),
+                                StaticAssetView {
+                                    content_type: "text/html; charset=utf-8",
+                                    body: app_html.as_bytes(),
+                                    etag,
+                                    gzip: Some(gzip),
+                                    cache_control: Some("no-cache"),
+                                },
                             )
-                        });
-                        let response = build_static_asset_response(
-                            req_method,
-                            &header_text,
-                            req_query,
-                            asset_version(),
-                            StaticAssetView {
-                                content_type: "text/html; charset=utf-8",
-                                body: app_html.as_bytes(),
-                                etag,
-                                gzip: Some(gzip),
-                                cache_control: Some("no-cache"),
-                            },
-                        );
+                        };
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(&response).await;
                     } else {
@@ -38081,6 +38192,72 @@ mod tests {
         assert!(APP_HTML.contains("tab-displays"));
         assert!(APP_HTML.contains("/three.module.min.js"));
         assert!(THREE_MODULE_JS.contains("Three.js Authors"));
+    }
+
+    #[test]
+    fn app_html_override_blank_values_count_as_unset() {
+        assert_eq!(app_html_override_from(None), None);
+        assert_eq!(app_html_override_from(Some(String::new())), None);
+        assert_eq!(app_html_override_from(Some("   ".into())), None);
+        assert_eq!(
+            app_html_override_from(Some(" /tmp/app.html ".into())),
+            Some(std::path::PathBuf::from("/tmp/app.html"))
+        );
+    }
+
+    #[test]
+    fn app_html_override_rereads_per_request_and_revalidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.html");
+        std::fs::write(
+            &path,
+            "<!DOCTYPE html><script src=\"/three.module.min.js\"></script>one",
+        )
+        .unwrap();
+        let first = app_html_override_response("GET", "", "", &path);
+        let first = String::from_utf8_lossy(&first);
+        assert!(first.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(first.contains("Content-Type: text/html"));
+        // The disk copy gets the same `?v=` rewrite as the embedded copy.
+        assert!(first.contains(&format!("/three.module.min.js?v={}", asset_version())));
+        assert!(first.ends_with("one"));
+
+        // An edit is visible on the very next request — nothing caches it.
+        std::fs::write(&path, "<!DOCTYPE html>two").unwrap();
+        let second = app_html_override_response("GET", "", "", &path);
+        let second = String::from_utf8_lossy(&second);
+        assert!(second.ends_with("two"));
+
+        // Unchanged content still revalidates to a 304 via its fresh ETag.
+        let etag = second
+            .split("ETag: \"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("override response carries an ETag")
+            .to_string();
+        let third = app_html_override_response(
+            "GET",
+            &format!("If-None-Match: \"{etag}\"\r\n"),
+            "",
+            &path,
+        );
+        assert!(String::from_utf8_lossy(&third).starts_with("HTTP/1.1 304"));
+    }
+
+    #[test]
+    fn app_html_override_read_failure_is_a_loud_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.html");
+        let resp = app_html_override_response("GET", "", "", &path);
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 500"));
+        assert!(text.contains("INTENDANT_APP_HTML_PATH"));
+        assert!(text.contains("missing.html"));
+        // HEAD keeps the status but sends headers only.
+        let head = app_html_override_response("HEAD", "", "", &path);
+        let head = String::from_utf8_lossy(&head);
+        assert!(head.starts_with("HTTP/1.1 500"));
+        assert!(head.ends_with("\r\n\r\n"));
     }
 
     #[test]

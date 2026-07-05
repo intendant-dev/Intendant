@@ -25,3 +25,8 @@ Rules:
 - **Merge conflicts:** resolve them in the fragments, run
   `cargo run -p app-html-assembler`, then `git add static/app.html`. Never
   hand-reconcile the generated file.
+- **Fast iteration** (skip the daemon rebuild): launch the daemon with
+  `INTENDANT_APP_HTML_PATH=$PWD/static/app.html` and the gateway re-reads
+  that file on every request — edit a fragment, run
+  `cargo run -p app-html-assembler`, refresh the browser. WASM and vendored
+  assets stay embedded; those still need a normal build.
