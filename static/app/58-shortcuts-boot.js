@@ -44,6 +44,41 @@ window.sendHumanResponse = function() {
   input.value = '';
 };
 
+// Submit (or skip) the structured user-question panel. Answers ride the
+// approval rail as {action:'answer_question', id, answers}; Skip sends
+// {action:'skip', id}, which the backend maps to a dismissal the agent
+// handles gracefully.
+window.sendQuestionAnswer = function(opts) {
+  if (!app || !pendingQuestion) return;
+  const id = pendingQuestion.id;
+  const sessionId = pendingQuestion.sessionId;
+  if (sessionId && sessionWindowIsDetached(sessionId)) {
+    showControlToast('error', 'Question is no longer live; attach the session and retry if needed');
+    approvalSessionIds.delete(String(id));
+    clearPendingQuestion();
+    hidePanel('question-panel');
+    return;
+  }
+  let msg;
+  if (opts && opts.skip) {
+    msg = { action: 'skip', id };
+  } else {
+    const collected = collectQuestionAnswers();
+    if (!collected) return;
+    if (collected.missing) {
+      showControlToast('error', `Answer "${collected.missing}" first (or Skip)`);
+      return;
+    }
+    msg = { action: 'answer_question', id, answers: collected.answers };
+  }
+  if (sessionId) msg.session_id = sessionId;
+  dispatchSessionControlMsg(msg);
+  approvalSessionIds.delete(String(id));
+  clearPendingQuestion();
+  hidePanel('question-panel');
+  setPhase('running');
+};
+
 // Request interruption of the current agent turn. Disables the button and
 // flips the label to "Interrupting..." until the phase leaves `interrupting`
 // — updateStopButtonVisibility resets the label when it hides/re-enables.

@@ -252,6 +252,98 @@ fn approval_category_for_tool(tool_name: &str) -> ApprovalCategory {
     }
 }
 
+/// Parse an `AskUserQuestion` tool input into structured questions.
+///
+/// Returns `None` when the input doesn't carry at least one question with
+/// text, so a malformed call degrades to the generic approval prompt
+/// instead of being dropped.
+fn parse_user_questions(input: &serde_json::Value) -> Option<Vec<crate::types::UserQuestion>> {
+    let questions: Vec<crate::types::UserQuestion> = input
+        .get("questions")?
+        .as_array()?
+        .iter()
+        .filter_map(|q| {
+            let text = q.get("question")?.as_str()?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let options = q
+                .get("options")
+                .and_then(|o| o.as_array())
+                .map(|opts| {
+                    opts.iter()
+                        .filter_map(|opt| {
+                            // The schema says `{label, description}`, but older
+                            // CLIs sent plain strings — accept both.
+                            let (label, description) = match opt {
+                                serde_json::Value::String(s) => (s.trim(), ""),
+                                _ => (
+                                    opt.get("label").and_then(|l| l.as_str())?.trim(),
+                                    opt.get("description")
+                                        .and_then(|d| d.as_str())
+                                        .unwrap_or(""),
+                                ),
+                            };
+                            if label.is_empty() {
+                                return None;
+                            }
+                            Some(crate::types::UserQuestionOption {
+                                label: label.to_string(),
+                                description: description.trim().to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(crate::types::UserQuestion {
+                question: text.to_string(),
+                header: q
+                    .get("header")
+                    .and_then(|h| h.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                options,
+                multi_select: q
+                    .get("multiSelect")
+                    .and_then(|m| m.as_bool())
+                    .unwrap_or(false),
+            })
+        })
+        .collect();
+    if questions.is_empty() {
+        None
+    } else {
+        Some(questions)
+    }
+}
+
+/// PermissionResult payload answering an `AskUserQuestion` request with the
+/// human's answers. Echoes the original input (Claude Code validates
+/// `updatedInput` against the tool's strict schema — only `questions`,
+/// `answers`, `annotations`, `metadata` are legal keys) and adds
+/// `answers: {question text → answer}`, exactly what the CLI's own
+/// interactive picker returns.
+fn question_answer_payload(
+    pending: &PendingCcApproval,
+    answers: &std::collections::HashMap<String, String>,
+) -> serde_json::Value {
+    let mut updated = pending.tool_input.clone();
+    if !updated.is_object() {
+        updated = serde_json::json!({});
+    }
+    if let Some(obj) = updated.as_object_mut() {
+        obj.insert(
+            "answers".into(),
+            serde_json::to_value(answers).unwrap_or_else(|_| serde_json::json!({})),
+        );
+    }
+    serde_json::json!({
+        "behavior": "allow",
+        "updatedInput": updated,
+    })
+}
+
 /// Extract the `addRules`/allow suggestions from a `can_use_tool` request,
 /// retargeted at the `session` destination. Claude Code's own suggestions
 /// default to `localSettings`, which would persist policy into the
@@ -1329,6 +1421,17 @@ impl CcReader {
                 .unwrap_or("unknown")
                 .to_string();
             let input = request.get("input").cloned().unwrap_or_default();
+
+            // AskUserQuestion is not a permission request — it's the model
+            // asking the human something, with the answer riding back on
+            // `updatedInput.answers`. Surface it as a structured question
+            // (a malformed input falls through to the generic approval so
+            // the request is never dropped on the floor).
+            let questions = if tool_name == "AskUserQuestion" {
+                parse_user_questions(&input)
+            } else {
+                None
+            };
             let preview = tool_input_preview(&input);
 
             self.approval_counter += 1;
@@ -1343,10 +1446,16 @@ impl CcReader {
                 },
             );
 
-            out.events.push(AgentEvent::ApprovalRequest {
-                request_id: our_id,
-                command: format!("{}: {}", tool_name, preview),
-                category: approval_category_for_tool(&tool_name),
+            out.events.push(match questions {
+                Some(questions) => AgentEvent::UserQuestionRequest {
+                    request_id: our_id,
+                    questions,
+                },
+                None => AgentEvent::ApprovalRequest {
+                    request_id: our_id,
+                    command: format!("{}: {}", tool_name, preview),
+                    category: approval_category_for_tool(&tool_name),
+                },
             });
         } else {
             // Fail closed: never auto-approve a control request Intendant
@@ -2056,6 +2165,35 @@ impl ExternalAgent for ClaudeCodeAgent {
                 subtype: "success".into(),
                 request_id: pending.cc_request_id.clone(),
                 response: Some(approval_response_payload(&pending, &decision)),
+                error: None,
+            },
+        };
+
+        let line = serde_json::to_string(&response)?;
+        self.write_line(&line).await
+    }
+
+    async fn resolve_user_question(
+        &mut self,
+        request_id: &str,
+        answers: &std::collections::HashMap<String, String>,
+    ) -> Result<(), CallerError> {
+        let pending = {
+            let mut map = lock_pending(&self.pending_approvals);
+            map.remove(request_id).ok_or_else(|| {
+                CallerError::ExternalAgent(format!(
+                    "No pending question for request_id '{}'",
+                    request_id
+                ))
+            })?
+        };
+
+        let response = CcControlResponse {
+            msg_type: "control_response".into(),
+            response: CcControlResponseInner {
+                subtype: "success".into(),
+                request_id: pending.cc_request_id.clone(),
+                response: Some(question_answer_payload(&pending, answers)),
                 error: None,
             },
         };
@@ -3113,6 +3251,100 @@ mod tests {
         assert_eq!(pending.tool_input["command"], "echo hi > f.txt");
         assert_eq!(pending.session_rules.len(), 1);
         assert_eq!(pending.session_rules[0]["destination"], "session");
+    }
+
+    #[test]
+    fn reader_ask_user_question_surfaces_structured_questions() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"control_request","request_id":"cc-q1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Which DB?","header":"Database","multiSelect":false,"options":[{"label":"PostgreSQL","description":"Relational"},{"label":"SQLite","description":"Embedded"}]}]}},"session_id":"s1"}"#,
+        );
+        let request_id = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::UserQuestionRequest {
+                    request_id,
+                    questions,
+                } => {
+                    assert_eq!(questions.len(), 1);
+                    assert_eq!(questions[0].question, "Which DB?");
+                    assert_eq!(questions[0].header, "Database");
+                    assert!(!questions[0].multi_select);
+                    assert_eq!(questions[0].options.len(), 2);
+                    assert_eq!(questions[0].options[0].label, "PostgreSQL");
+                    assert_eq!(questions[0].options[0].description, "Relational");
+                    Some(request_id.clone())
+                }
+                _ => None,
+            })
+            .expect("user question event");
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ApprovalRequest { .. })),
+            "a parsed question must not double-emit as an approval"
+        );
+        let map = lock_pending(&reader.pending_approvals);
+        let pending = map.get(&request_id).expect("pending entry stored");
+        assert_eq!(pending.cc_request_id, "cc-q1");
+    }
+
+    #[test]
+    fn reader_malformed_ask_user_question_degrades_to_approval() {
+        // No parsable questions → the request must still surface (as the
+        // generic approval prompt), never be dropped.
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"control_request","request_id":"cc-q2","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[]}},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ApprovalRequest { command, .. } if command.starts_with("AskUserQuestion")
+        )));
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UserQuestionRequest { .. })));
+    }
+
+    #[test]
+    fn parse_user_questions_accepts_plain_string_options() {
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "Pick one",
+                "options": ["alpha", "beta"],
+                "multiSelect": true
+            }]
+        });
+        let questions = parse_user_questions(&input).expect("parsed");
+        assert_eq!(questions[0].options.len(), 2);
+        assert_eq!(questions[0].options[0].label, "alpha");
+        assert_eq!(questions[0].options[0].description, "");
+        assert!(questions[0].multi_select);
+        assert_eq!(questions[0].header, "");
+    }
+
+    #[test]
+    fn question_answer_payload_echoes_input_and_adds_answers() {
+        let pending = PendingCcApproval {
+            cc_request_id: "cc-q1".into(),
+            tool_input: serde_json::json!({
+                "questions": [{"question": "Which DB?", "options": []}]
+            }),
+            session_rules: Vec::new(),
+        };
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("Which DB?".to_string(), "PostgreSQL".to_string());
+        let payload = question_answer_payload(&pending, &answers);
+        assert_eq!(payload["behavior"], "allow");
+        // The original input must survive (CC validates updatedInput against
+        // the tool schema) with the answers grafted on.
+        assert_eq!(
+            payload["updatedInput"]["questions"][0]["question"],
+            "Which DB?"
+        );
+        assert_eq!(payload["updatedInput"]["answers"]["Which DB?"], "PostgreSQL");
     }
 
     #[test]

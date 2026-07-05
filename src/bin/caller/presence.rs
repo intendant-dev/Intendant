@@ -950,6 +950,15 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
                 question: question.clone(),
             })
         }
+        // Structured questions narrate through the same human-question
+        // channel; the preview inlines the options so presence can voice
+        // them. Answering still happens in a frontend (dashboard/TUI).
+        AppEvent::UserQuestionRequired { questions, .. } => {
+            *last_phase = "waiting_human".to_string();
+            Some(PresenceEvent::HumanQuestion {
+                question: crate::external_output::user_question_preview(questions),
+            })
+        }
         AppEvent::BudgetWarning { pct, remaining } => Some(PresenceEvent::BudgetWarning {
             pct: *pct,
             remaining: *remaining,
@@ -1209,6 +1218,7 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             s.phase = "running_agent".to_string();
             s.last_command_preview = commands_preview.clone();
             s.pending_approval = None;
+            s.pending_question = None;
         }
         AppEvent::AgentOutput { stdout, stderr, .. } => {
             // Keep a truncated summary
@@ -1245,6 +1255,7 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
         }
         AppEvent::ApprovalResolved { action, .. } => {
             s.pending_approval = None;
+            s.pending_question = None;
             if action == "deny" {
                 s.phase = "done".to_string();
             } else {
@@ -1253,6 +1264,14 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
         }
         AppEvent::HumanQuestionDetected { .. } => {
             s.phase = "waiting_human".to_string();
+        }
+        AppEvent::UserQuestionRequired { id, questions, .. } => {
+            s.phase = "waiting_human".to_string();
+            s.pending_question = Some(presence_core::PendingQuestionSnapshot {
+                id: *id,
+                questions: serde_json::to_value(questions)
+                    .unwrap_or(serde_json::Value::Null),
+            });
         }
         AppEvent::SubAgentResult { formatted } => {
             s.last_output_summary = truncate(formatted, 500);

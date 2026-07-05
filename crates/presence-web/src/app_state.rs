@@ -84,6 +84,15 @@ pub enum UiCommand {
         session_id: Option<String>,
     },
     HideApproval,
+    /// Structured user question: JS renders the option buttons and free-text
+    /// input, and answers with `{action: "answer_question", id, answers}`.
+    /// `questions` is the raw `UserQuestion[]` JSON from the wire event.
+    ShowUserQuestion {
+        id: u64,
+        questions: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
     ShowHumanInput {
         question: String,
     },
@@ -1012,6 +1021,7 @@ pub struct AppState {
 
     // Approval
     pending_approval_id: Option<u64>,
+    pending_question_id: Option<u64>,
 
     // Logs
     log_buffer: Vec<LogEntry>,
@@ -1075,6 +1085,7 @@ impl AppState {
             session_id: String::new(),
             phase: "idle".to_string(),
             pending_approval_id: None,
+            pending_question_id: None,
             log_buffer: Vec::new(),
             verbosity: "normal".to_string(),
             replay_ts: None,
@@ -1292,6 +1303,21 @@ impl AppState {
                         None,
                         "worker",
                     ));
+                }
+            }
+        }
+
+        // Restore pending structured question (questions routinely outlive
+        // page loads — the panel must come back for a late-joining browser).
+        if let Some(pq) = s.get("pending_question") {
+            if let Some(id) = pq["id"].as_u64() {
+                if id > 0 {
+                    self.pending_question_id = Some(id);
+                    cmds.push(UiCommand::ShowUserQuestion {
+                        id,
+                        questions: pq["questions"].clone(),
+                        session_id: None,
+                    });
                 }
             }
         }
@@ -1651,6 +1677,41 @@ impl AppState {
                 }
             }
 
+            "user_question" => {
+                let id = msg["id"].as_u64().unwrap_or(0);
+                let questions = msg["questions"].clone();
+                self.pending_question_id = Some(id);
+                self.phase = "waiting".to_string();
+
+                cmds.push(UiCommand::ShowUserQuestion {
+                    id,
+                    questions: questions.clone(),
+                    session_id: self.event_session_id.clone(),
+                });
+                cmds.push(UiCommand::SetPhase {
+                    phase: "waiting".into(),
+                });
+                let preview = questions
+                    .as_array()
+                    .and_then(|qs| qs.first())
+                    .and_then(|q| q["question"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Question: {}", preview),
+                    None,
+                    "worker",
+                ));
+
+                if self.active_tab != "activity" {
+                    cmds.push(UiCommand::ShowBadge {
+                        tab: "activity".into(),
+                        text: "?".into(),
+                    });
+                }
+            }
+
             "task_complete" => {
                 let reason = msg["reason"].as_str().unwrap_or("");
                 let summary = msg["summary"].as_str();
@@ -1662,6 +1723,7 @@ impl AppState {
                 if current_session_event {
                     self.phase = "done".to_string();
                     self.pending_approval_id = None;
+                    self.pending_question_id = None;
                     cmds.push(UiCommand::HideAllPanels);
                     cmds.push(UiCommand::SetPhase {
                         phase: "done".into(),
@@ -1693,6 +1755,7 @@ impl AppState {
                 if current_session_event {
                     self.phase = "interrupted".to_string();
                     self.pending_approval_id = None;
+                    self.pending_question_id = None;
                     cmds.push(UiCommand::HideAllPanels);
                     cmds.push(UiCommand::SetPhase {
                         phase: "interrupted".into(),
@@ -3049,6 +3112,27 @@ impl AppState {
     pub fn pending_approval_id(&self) -> Option<u64> {
         self.pending_approval_id
     }
+
+    /// Get the current pending structured-question id.
+    pub fn pending_question_id(&self) -> Option<u64> {
+        self.pending_question_id
+    }
+
+    /// Build the `answer_question` control message for the pending
+    /// question. `answers` is the `{question text → answer}` JSON object
+    /// assembled by the panel. Clears the pending id.
+    pub fn process_question_answer(
+        &mut self,
+        answers: serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let id = self.pending_question_id.take()?;
+        self.phase = "running_agent".to_string();
+        Some(serde_json::json!({
+            "action": "answer_question",
+            "id": id,
+            "answers": answers,
+        }))
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -3762,6 +3846,67 @@ mod tests {
             c,
             UiCommand::ShowApproval { id: 9, session_id, .. }
                 if session_id.as_deref() == Some("sess-b")
+        )));
+    }
+
+    #[test]
+    fn handle_event_user_question_shows_panel_and_tracks_id() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "user_question",
+            "id": 11,
+            "session_id": "sess-q",
+            "questions": [{
+                "question": "Which DB?",
+                "header": "Database",
+                "options": [
+                    {"label": "PostgreSQL", "description": "Relational"},
+                    {"label": "SQLite"}
+                ],
+                "multi_select": false
+            }]
+        });
+        let cmds = s.handle_message(&msg);
+        assert_eq!(s.pending_question_id, Some(11));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::ShowUserQuestion { id: 11, questions, session_id }
+                if questions[0]["question"] == "Which DB?"
+                    && session_id.as_deref() == Some("sess-q")
+        )));
+        // The panel answer produces the answer_question control message
+        // and clears the pending id.
+        let msg = s
+            .process_question_answer(json!({"Which DB?": "PostgreSQL"}))
+            .expect("pending question");
+        assert_eq!(msg["action"], "answer_question");
+        assert_eq!(msg["id"], 11);
+        assert_eq!(msg["answers"]["Which DB?"], "PostgreSQL");
+        assert!(s.pending_question_id.is_none());
+    }
+
+    #[test]
+    fn state_snapshot_restores_pending_question() {
+        let mut s = AppState::new();
+        let snapshot = json!({
+            "state": {
+                "phase": "waiting_human",
+                "turn": 2,
+                "budget_pct": 10.0,
+                "last_output_summary": "",
+                "last_command_preview": "",
+                "active_workers": [],
+                "pending_question": {
+                    "id": 4,
+                    "questions": [{"question": "Q?", "options": []}]
+                }
+            }
+        });
+        let cmds = s.handle_state_snapshot(&snapshot);
+        assert_eq!(s.pending_question_id, Some(4));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::ShowUserQuestion { id: 4, .. }
         )));
     }
 

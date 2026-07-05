@@ -3222,6 +3222,7 @@ pub(crate) fn handle_idle_codex_subagent_event(
         external_agent::AgentEvent::PlanUpdate { .. }
         | external_agent::AgentEvent::ApprovalRequest { .. }
         | external_agent::AgentEvent::FileApprovalRequest { .. }
+        | external_agent::AgentEvent::UserQuestionRequest { .. }
         | external_agent::AgentEvent::DiffUpdated { .. }
         | external_agent::AgentEvent::Terminated { .. }
         | external_agent::AgentEvent::Scoped { .. } => {}

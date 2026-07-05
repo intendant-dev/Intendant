@@ -484,6 +484,17 @@ async function main() {
       if (d.event === 'approval_required' && d.id !== undefined && d.session_id) {
         approvalSessionIds.set(String(d.id), d.session_id);
       }
+      if (d.event === 'user_question' && d.id !== undefined && d.session_id) {
+        approvalSessionIds.set(String(d.id), d.session_id);
+      }
+      if (d.event === 'approval_resolved' && d.id !== undefined
+          && typeof pendingQuestion !== 'undefined' && pendingQuestion
+          && String(pendingQuestion.id) === String(d.id)
+          && (!d.session_id || !pendingQuestion.sessionId || d.session_id === pendingQuestion.sessionId)) {
+        // Another frontend answered/dismissed this question — drop our panel.
+        clearPendingQuestion();
+        hidePanel('question-panel');
+      }
       if (d.event === 'autonomy_changed') {
         updateStatusBar({ autonomy: d.autonomy });
         return;

@@ -356,7 +356,8 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         ControlMsg::Approve { .. }
         | ControlMsg::Deny { .. }
         | ControlMsg::Skip { .. }
-        | ControlMsg::ApproveAll { .. } => PeerOperation::Approval,
+        | ControlMsg::ApproveAll { .. }
+        | ControlMsg::AnswerQuestion { .. } => PeerOperation::Approval,
         ControlMsg::SetAutonomy { .. }
         | ControlMsg::SetApprovalRule { .. }
         | ControlMsg::SetExternalAgent { .. }

@@ -615,6 +615,21 @@ impl AppEventUpcaster {
                 },
             }],
 
+            // Structured questions flatten to the approval vocabulary for
+            // peers (same treatment as askHuman below): the preview names
+            // the options, and a peer-side Accept/Decline maps to the
+            // question's proceed-without-answer / dismiss paths.
+            AppEvent::UserQuestionRequired { id, questions, .. } => {
+                vec![PeerEvent::ApprovalRequested {
+                    request: ApprovalRequest {
+                        request_id: id.to_string(),
+                        category: "human_question".to_string(),
+                        preview: crate::external_output::user_question_preview(questions),
+                        auto_resolvable: false,
+                    },
+                }]
+            }
+
             AppEvent::ApprovalResolved { id, action, .. } => vec![PeerEvent::ApprovalResolved {
                 request_id: id.to_string(),
                 decision: approval_decision_from_action(action),
@@ -1772,6 +1787,20 @@ impl WireEventUpcaster {
                         request_id: format!("human-{seq}"),
                         category: "human_question".to_string(),
                         preview: question.clone(),
+                        auto_resolvable: false,
+                    },
+                }]
+            }
+
+            // Structured questions flatten to the approval vocabulary the
+            // same way askHuman does, but keep their real id so a peer's
+            // Accept/Decline resolves the actual prompt.
+            OutboundEvent::UserQuestion { id, questions, .. } => {
+                vec![PeerEvent::ApprovalRequested {
+                    request: ApprovalRequest {
+                        request_id: id.to_string(),
+                        category: "human_question".to_string(),
+                        preview: crate::external_output::user_question_preview(questions),
                         auto_resolvable: false,
                     },
                 }]

@@ -127,6 +127,9 @@ pub fn render_frame(f: &mut ratatui::Frame, app: &mut App, view: &app::ViewState
                     );
                 }
             }
+            app::AppMode::Question => {
+                widgets::render_question_panel(f, bottom_area, app);
+            }
             app::AppMode::AskHuman => {
                 let question = app.human_question.clone().unwrap_or_default();
                 widgets::render_input_panel(f, bottom_area, &question, app);

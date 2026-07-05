@@ -412,6 +412,21 @@ export class PresenceWeb {
         wasm.presenceweb_send_presence_checkpoint(this.__wbg_ptr, ptr0, len0);
     }
     /**
+     * Answer the pending structured user question. `answers_json` is a
+     * `{question text → answer}` JSON object. Fallback sender for
+     * surfaces without session-scoped dispatch (Station); the main
+     * dashboard panel dispatches `answer_question` itself with a
+     * session id.
+     * @param {string} answers_json
+     * @returns {any}
+     */
+    send_question_answers(answers_json) {
+        const ptr0 = passStringToWasm0(answers_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.presenceweb_send_question_answers(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
      * Send a raw JSON string through the server WebSocket.
      * Use this for transport-level messages (WebRTC signaling) that don't
      * need to go through the WASM state machine or serde conversion.
@@ -1234,17 +1249,17 @@ function __wbg_get_imports() {
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { dtor_idx: 107, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 110, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h2bbc3efb9fa169ba, wasm_bindgen__convert__closures_____invoke__h60cc6b2ac5050cb0);
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h28a9a63aa3ddc246, wasm_bindgen__convert__closures_____invoke__h03ee4e0dc48c1851);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { dtor_idx: 107, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 110, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h2bbc3efb9fa169ba, wasm_bindgen__convert__closures_____invoke__h60cc6b2ac5050cb0);
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h28a9a63aa3ddc246, wasm_bindgen__convert__closures_____invoke__h03ee4e0dc48c1851);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { dtor_idx: 107, function: Function { arguments: [], shim_idx: 108, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h2bbc3efb9fa169ba, wasm_bindgen__convert__closures_____invoke__hae6cb4f6677cde4f);
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h28a9a63aa3ddc246, wasm_bindgen__convert__closures_____invoke__ha5d8664ce0aa7add);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0) {
@@ -1283,12 +1298,12 @@ function __wbg_get_imports() {
     };
 }
 
-function wasm_bindgen__convert__closures_____invoke__hae6cb4f6677cde4f(arg0, arg1) {
-    wasm.wasm_bindgen__convert__closures_____invoke__hae6cb4f6677cde4f(arg0, arg1);
+function wasm_bindgen__convert__closures_____invoke__ha5d8664ce0aa7add(arg0, arg1) {
+    wasm.wasm_bindgen__convert__closures_____invoke__ha5d8664ce0aa7add(arg0, arg1);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h60cc6b2ac5050cb0(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h60cc6b2ac5050cb0(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h03ee4e0dc48c1851(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h03ee4e0dc48c1851(arg0, arg1, arg2);
 }
 
 

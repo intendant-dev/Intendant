@@ -238,7 +238,7 @@ pub fn render_log_panel(f: &mut Frame, area: Rect, app: &App, view: &ViewState) 
         let expand_hint = match app.mode {
             AppMode::Approval => Some("Right to expand"),
             AppMode::Normal | AppMode::Help | AppMode::Inspect => Some("Enter/Right to expand"),
-            AppMode::AskHuman | AppMode::FollowUp => None,
+            AppMode::AskHuman | AppMode::FollowUp | AppMode::Question => None,
         };
         let entry_lines = format_log_entry_with_turn(
             entry,
@@ -625,6 +625,112 @@ pub fn render_approval_panel(f: &mut Frame, area: Rect, command: &str, category:
     )]);
     let hint_widget = Paragraph::new(hint).style(Style::default().bg(theme::APPROVAL_BG));
     f.render_widget(hint_widget, chunks[1]);
+}
+
+/// Render the structured user-question panel (conditional, at bottom):
+/// header/question, numbered options, the free-text answer being typed,
+/// and key hints. Multi-question prompts advance one question at a time.
+pub fn render_question_panel(f: &mut Frame, area: Rect, app: &App) {
+    let Some(pending) = app.pending_questions.front() else {
+        return;
+    };
+    let Some(question) = pending.current_question() else {
+        return;
+    };
+
+    let progress = if pending.questions.len() > 1 {
+        format!(" {}/{}", pending.current + 1, pending.questions.len())
+    } else {
+        String::new()
+    };
+    let title = if question.header.is_empty() {
+        format!(" Question{} ", progress)
+    } else {
+        format!(" Question{} [{}] ", progress, question.header)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::APPROVAL_FG))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme::APPROVAL_FG)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme::APPROVAL_BG));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height < 3 {
+        return;
+    }
+
+    let chunks = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            ratatui::layout::Constraint::Min(1),
+            ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        format!(" {}", question.question),
+        Style::default()
+            .fg(theme::APPROVAL_CMD_FG)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    for (i, option) in question.options.iter().enumerate() {
+        let marker = if pending.selections.contains(&i) {
+            "\u{25CF}"
+        } else {
+            "\u{25CB}"
+        };
+        let text = if option.description.is_empty() {
+            format!(" {} {}. {}", marker, i + 1, option.label)
+        } else {
+            format!(
+                " {} {}. {} \u{2014} {}",
+                marker,
+                i + 1,
+                option.label,
+                option.description
+            )
+        };
+        lines.push(Line::from(Span::styled(
+            text,
+            Style::default().fg(theme::APPROVAL_CMD_FG),
+        )));
+    }
+    let question_widget = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().bg(theme::APPROVAL_BG));
+    f.render_widget(question_widget, chunks[0]);
+
+    let input_line = Line::from(vec![Span::styled(
+        format!(" custom answer: {}_", pending.input),
+        Style::default().fg(theme::APPROVAL_CMD_FG),
+    )]);
+    f.render_widget(
+        Paragraph::new(input_line).style(Style::default().bg(theme::APPROVAL_BG)),
+        chunks[1],
+    );
+
+    let hint_text = if question.multi_select {
+        " [1-9]toggle  [type]custom  [Enter]submit  [Esc]dismiss"
+    } else {
+        " [1-9]pick  [type]custom  [Enter]submit  [Esc]dismiss"
+    };
+    let hint = Line::from(vec![Span::styled(
+        hint_text,
+        Style::default()
+            .fg(theme::APPROVAL_HINT_FG)
+            .add_modifier(Modifier::BOLD),
+    )]);
+    f.render_widget(
+        Paragraph::new(hint).style(Style::default().bg(theme::APPROVAL_BG)),
+        chunks[2],
+    );
 }
 
 /// Render the human input panel (conditional, at bottom).

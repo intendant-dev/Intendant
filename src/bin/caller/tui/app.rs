@@ -19,6 +19,8 @@ pub enum AppMode {
     #[allow(dead_code)]
     Help,
     Approval,
+    /// Structured user question (options + free text), external backends.
+    Question,
     #[allow(dead_code)]
     Inspect,
     FollowUp,
@@ -84,6 +86,30 @@ pub struct PendingApproval {
     pub id: u64,
     pub command_preview: String,
     pub category: String,
+}
+
+/// A structured user question awaiting answers (external backends'
+/// ask-the-user tool). Questions are answered one at a time; committed
+/// answers accumulate in `answers` and the whole set resolves through the
+/// approval registry as `ApprovalResponse::Answer` once the last question
+/// is committed.
+pub struct PendingUserQuestion {
+    pub id: u64,
+    pub questions: Vec<crate::types::UserQuestion>,
+    /// Index of the question currently being answered.
+    pub current: usize,
+    /// question text → committed answer.
+    pub answers: std::collections::HashMap<String, String>,
+    /// Toggled option indices for the current question (multi-select).
+    pub selections: std::collections::BTreeSet<usize>,
+    /// Free-text answer being typed for the current question.
+    pub input: String,
+}
+
+impl PendingUserQuestion {
+    pub fn current_question(&self) -> Option<&crate::types::UserQuestion> {
+        self.questions.get(self.current)
+    }
 }
 
 /// Per-connection view state: scroll position, verbosity, inspect mode, etc.
@@ -324,7 +350,8 @@ impl ViewState {
                 }
                 self.handle_normal_view_key(key, app)
             }
-            AppMode::AskHuman | AppMode::FollowUp => false,
+            // Question mode owns typing (free-text answers), like AskHuman.
+            AppMode::AskHuman | AppMode::FollowUp | AppMode::Question => false,
             AppMode::Normal | AppMode::Help | AppMode::Inspect => {
                 self.handle_normal_view_key(key, app)
             }
@@ -476,6 +503,9 @@ pub struct App {
     // Approval queue (FIFO)
     pub pending_approvals: VecDeque<PendingApproval>,
 
+    // Structured user questions (FIFO, external backends)
+    pub pending_questions: VecDeque<PendingUserQuestion>,
+
     // Shared autonomy state
     pub autonomy: SharedAutonomy,
     pub control_tx: Option<tokio::sync::broadcast::Sender<String>>,
@@ -615,6 +645,7 @@ impl App {
             human_question: None,
             human_textarea: None,
             pending_approvals: VecDeque::new(),
+            pending_questions: VecDeque::new(),
             autonomy,
             control_tx: None,
             approval_registry: ApprovalRegistry::default(),
@@ -851,6 +882,16 @@ impl App {
                 height.clamp(6, 20)
             }
             AppMode::AskHuman => 5,
+            AppMode::Question => {
+                // Question text + options + input line + hint + borders.
+                let option_lines = self
+                    .pending_questions
+                    .front()
+                    .and_then(|q| q.current_question())
+                    .map(|q| q.options.len())
+                    .unwrap_or(0);
+                ((option_lines + 6) as u16).clamp(7, 16)
+            }
             AppMode::FollowUp => 5,
             _ => {
                 // Show a slim reminder bar when browsing during follow-up or after task done
@@ -875,6 +916,7 @@ impl App {
         match self.mode {
             AppMode::Approval => self.handle_approval_key(key),
             AppMode::AskHuman => self.handle_human_key(key),
+            AppMode::Question => self.handle_question_key(key),
             AppMode::FollowUp => self.handle_follow_up_key(key),
             AppMode::Normal | AppMode::Help | AppMode::Inspect => {
                 // Shared-state keys in Normal mode
@@ -962,12 +1004,56 @@ impl App {
                 self.resolve_approval(pending.id, resp);
             }
             if self.pending_approvals.is_empty() {
-                self.mode = AppMode::Normal;
-                self.current_phase = Phase::RunningAgent;
+                self.restore_mode_after_approvals(Phase::RunningAgent);
             }
             true
         } else {
             false
+        }
+    }
+
+    /// After the approval queue drains, hand the bottom panel to any queued
+    /// structured question; otherwise return to Normal with `phase`.
+    fn restore_mode_after_approvals(&mut self, phase: Phase) {
+        if self.pending_questions.is_empty() {
+            self.mode = AppMode::Normal;
+            self.current_phase = phase;
+        } else {
+            self.mode = AppMode::Question;
+            self.current_phase = Phase::WaitingHuman;
+        }
+    }
+
+    /// After the question queue drains, hand the bottom panel back to any
+    /// queued approval; otherwise return to Normal.
+    fn restore_mode_after_questions(&mut self) {
+        if self.pending_approvals.is_empty() {
+            self.mode = AppMode::Normal;
+            self.current_phase = Phase::RunningAgent;
+        } else {
+            self.mode = AppMode::Approval;
+            self.current_phase = Phase::WaitingApproval;
+        }
+    }
+
+    /// An approval verb (approve/deny/skip/approve-all) aimed at a pending
+    /// QUESTION id: resolve the question with that response — the drain maps
+    /// approve verbs to "proceed without a choice" and deny/skip to a
+    /// dismissal. Keeps bare control-socket/MCP clients (which only speak
+    /// the approval vocabulary) able to unblock a question prompt.
+    fn resolve_question_via_approval_verb(&mut self, id: u64, response: ApprovalResponse) {
+        let Some(pos) = self.pending_questions.iter().position(|q| q.id == id) else {
+            return;
+        };
+        self.pending_questions.remove(pos);
+        let via = self.approval_source();
+        self.log(
+            LogLevel::Info,
+            format!("Question resolved via {} (id {})", via, id),
+        );
+        self.resolve_approval(id, response);
+        if self.pending_questions.is_empty() && self.mode == AppMode::Question {
+            self.restore_mode_after_questions();
         }
     }
 
@@ -978,6 +1064,7 @@ impl App {
             ApprovalResponse::Deny => "deny",
             ApprovalResponse::Skip => "skip",
             ApprovalResponse::ApproveAll => "approve_all",
+            ApprovalResponse::Answer { .. } => "answer",
         };
         self.pending_derived.push(AppEvent::ApprovalResolved {
             session_id: Some(self.session_id.clone()).filter(|id| !id.is_empty()),
@@ -1042,6 +1129,97 @@ impl App {
                 }
                 true
             }
+        }
+    }
+
+    /// Keys for a structured user question: `1`–`9` pick (or toggle, when
+    /// multi-select) an option, any other typing builds a free-text answer,
+    /// `Enter` commits the current question and advances (resolving the
+    /// prompt after the last one), `Esc` dismisses the whole prompt.
+    fn handle_question_key(&mut self, key: KeyEvent) -> bool {
+        let Some(pending) = self.pending_questions.front_mut() else {
+            self.mode = AppMode::Normal;
+            return false;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                let id = pending.id;
+                self.pending_questions.pop_front();
+                self.log(LogLevel::Info, "Question dismissed".to_string());
+                self.resolve_approval(id, ApprovalResponse::Deny);
+                if self.pending_questions.is_empty() {
+                    self.restore_mode_after_questions();
+                }
+                true
+            }
+            KeyCode::Char(c @ '1'..='9') if pending.input.is_empty() => {
+                let index = (c as usize) - ('1' as usize);
+                let Some(question) = pending.current_question() else {
+                    return true;
+                };
+                if index >= question.options.len() {
+                    return true;
+                }
+                if question.multi_select {
+                    if !pending.selections.remove(&index) {
+                        pending.selections.insert(index);
+                    }
+                } else {
+                    pending.selections.clear();
+                    pending.selections.insert(index);
+                }
+                true
+            }
+            KeyCode::Backspace => {
+                pending.input.pop();
+                true
+            }
+            KeyCode::Enter => {
+                let Some(question) = pending.current_question().cloned() else {
+                    return true;
+                };
+                let typed = pending.input.trim().to_string();
+                let answer = if !typed.is_empty() {
+                    typed
+                } else {
+                    let labels: Vec<String> = pending
+                        .selections
+                        .iter()
+                        .filter_map(|&i| question.options.get(i))
+                        .map(|o| o.label.clone())
+                        .collect();
+                    if labels.is_empty() {
+                        self.log(
+                            LogLevel::Warn,
+                            "Pick an option (1-9) or type an answer first (Esc dismisses)."
+                                .to_string(),
+                        );
+                        return true;
+                    }
+                    labels.join(", ")
+                };
+                pending.answers.insert(question.question.clone(), answer);
+                pending.selections.clear();
+                pending.input.clear();
+                pending.current += 1;
+                if pending.current >= pending.questions.len() {
+                    let id = pending.id;
+                    let answers = std::mem::take(&mut pending.answers);
+                    self.pending_questions.pop_front();
+                    self.log(LogLevel::Info, "Answer sent".to_string());
+                    self.resolve_approval(id, ApprovalResponse::Answer { answers });
+                    if self.pending_questions.is_empty() {
+                        self.mode = AppMode::Normal;
+                        self.current_phase = Phase::RunningAgent;
+                    }
+                }
+                true
+            }
+            KeyCode::Char(c) => {
+                pending.input.push(c);
+                true
+            }
+            _ => true,
         }
     }
 
@@ -1179,9 +1357,12 @@ impl App {
                     );
                     self.resolve_approval(id, ApprovalResponse::Approve);
                     if self.pending_approvals.is_empty() {
-                        self.mode = AppMode::Normal;
-                        self.current_phase = Phase::RunningAgent;
+                        self.restore_mode_after_approvals(Phase::RunningAgent);
                     }
+                } else {
+                    // Approve on a question id = let it through without a
+                    // choice (the drain answers "proceed on your judgment").
+                    self.resolve_question_via_approval_verb(id, ApprovalResponse::Approve);
                 }
             }
             ControlMsg::Deny { id, .. } => {
@@ -1191,9 +1372,10 @@ impl App {
                     self.log(LogLevel::Info, format!("Denied via {} (turn {})", via, id));
                     self.resolve_approval(id, ApprovalResponse::Deny);
                     if self.pending_approvals.is_empty() {
-                        self.mode = AppMode::Normal;
-                        self.current_phase = Phase::Done;
+                        self.restore_mode_after_approvals(Phase::Done);
                     }
+                } else {
+                    self.resolve_question_via_approval_verb(id, ApprovalResponse::Deny);
                 }
             }
             ControlMsg::Skip { id, .. } => {
@@ -1203,9 +1385,10 @@ impl App {
                     self.log(LogLevel::Info, format!("Skipped via {} (turn {})", via, id));
                     self.resolve_approval(id, ApprovalResponse::Skip);
                     if self.pending_approvals.is_empty() {
-                        self.mode = AppMode::Normal;
-                        self.current_phase = Phase::RunningAgent;
+                        self.restore_mode_after_approvals(Phase::RunningAgent);
                     }
+                } else {
+                    self.resolve_question_via_approval_verb(id, ApprovalResponse::Skip);
                 }
             }
             ControlMsg::ApproveAll { id, .. } => {
@@ -1219,8 +1402,22 @@ impl App {
                     self.resolve_approval(id, ApprovalResponse::ApproveAll);
                     self.set_autonomy_level("full");
                     if self.pending_approvals.is_empty() {
-                        self.mode = AppMode::Normal;
-                        self.current_phase = Phase::RunningAgent;
+                        self.restore_mode_after_approvals(Phase::RunningAgent);
+                    }
+                } else {
+                    // Approve-all on a question must NOT flip autonomy —
+                    // answering a question never widens command grants.
+                    self.resolve_question_via_approval_verb(id, ApprovalResponse::ApproveAll);
+                }
+            }
+            ControlMsg::AnswerQuestion { id, answers, .. } => {
+                if let Some(pos) = self.pending_questions.iter().position(|q| q.id == id) {
+                    self.pending_questions.remove(pos);
+                    let via = self.approval_source();
+                    self.log(LogLevel::Info, format!("Question answered via {}", via));
+                    self.resolve_approval(id, ApprovalResponse::Answer { answers });
+                    if self.pending_questions.is_empty() && self.mode == AppMode::Question {
+                        self.restore_mode_after_questions();
                     }
                 }
             }
@@ -2182,6 +2379,38 @@ impl App {
                         "Approval needed [{}]: {}",
                         category,
                         truncate_str(&command_preview, 80)
+                    ),
+                    LogSource::Agent,
+                    if t > 0 { Some(t) } else { None },
+                );
+            }
+            AppEvent::UserQuestionRequired {
+                session_id: _,
+                id,
+                ref questions,
+            } => {
+                self.current_phase = Phase::WaitingHuman;
+                // An open approval keeps priority; the question panel takes
+                // over once the approval queue drains.
+                if self.mode != AppMode::Approval {
+                    self.mode = AppMode::Question;
+                }
+                self.pending_questions.push_back(PendingUserQuestion {
+                    id,
+                    questions: questions.clone(),
+                    current: 0,
+                    answers: std::collections::HashMap::new(),
+                    selections: std::collections::BTreeSet::new(),
+                    input: String::new(),
+                });
+                let t = self.turn;
+                // Local-only: OutboundEvent::UserQuestion already reaches
+                // external consumers.
+                self.log_local_only(
+                    LogLevel::Warn,
+                    format!(
+                        "Question: {}",
+                        truncate_str(&crate::external_output::user_question_preview(questions), 100)
                     ),
                     LogSource::Agent,
                     if t > 0 { Some(t) } else { None },

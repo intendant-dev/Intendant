@@ -893,6 +893,19 @@ impl SessionSupervisor {
                 )
                 .await;
             }
+            event::ControlMsg::AnswerQuestion {
+                session_id,
+                id,
+                answers,
+            } => {
+                self.resolve_approval(
+                    session_id,
+                    id,
+                    event::ApprovalResponse::Answer { answers },
+                    "answer",
+                )
+                .await;
+            }
             event::ControlMsg::RenameSession {
                 session_id,
                 backend_session_id,
@@ -4977,6 +4990,7 @@ fn control_target_session_id(msg: &event::ControlMsg) -> Option<&str> {
         | event::ControlMsg::Deny { session_id, .. }
         | event::ControlMsg::Skip { session_id, .. }
         | event::ControlMsg::ApproveAll { session_id, .. }
+        | event::ControlMsg::AnswerQuestion { session_id, .. }
         | event::ControlMsg::Interrupt { session_id, .. }
         | event::ControlMsg::Steer { session_id, .. }
         | event::ControlMsg::CancelSteer { session_id, .. }

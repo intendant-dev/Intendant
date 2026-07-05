@@ -1256,7 +1256,10 @@ async fn apply_user_approval(
     match response {
         event::ApprovalResponse::Approve => state.record_approved_command(preview),
         event::ApprovalResponse::ApproveAll => state.level = AutonomyLevel::Full,
-        event::ApprovalResponse::Skip | event::ApprovalResponse::Deny => return,
+        // Answer resolves question prompts; it grants nothing.
+        event::ApprovalResponse::Skip
+        | event::ApprovalResponse::Deny
+        | event::ApprovalResponse::Answer { .. } => return,
     }
     if cat == autonomy::ActionCategory::DisplayControl && !state.user_display_granted {
         state.user_display_granted = true;

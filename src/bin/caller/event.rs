@@ -375,6 +375,16 @@ pub enum AppEvent {
         command_preview: String,
         category: ActionCategory,
     },
+    /// The agent asks the human structured question(s). Shares the approval
+    /// id space and registry, but is a request for *input*, not permission:
+    /// autonomy policy never auto-resolves it. Resolved by
+    /// `ControlMsg::AnswerQuestion` (or deny/skip to dismiss), reported back
+    /// as `ApprovalResolved`.
+    UserQuestionRequired {
+        session_id: Option<String>,
+        id: u64,
+        questions: Vec<crate::types::UserQuestion>,
+    },
     ApprovalResolved {
         session_id: Option<String>,
         id: u64,
@@ -936,12 +946,19 @@ fn compact_context_snapshot_raw_for_outbound(
 }
 
 /// Response from the approval system.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalResponse {
     Approve,
     Skip,
     Deny,
     ApproveAll,
+    /// Structured reply to a `UserQuestionRequired` prompt: question text →
+    /// chosen option label(s) (multi-select joined with ", ") or free text.
+    /// Only meaningful for question ids; a command approval receiving this
+    /// fails closed (denied).
+    Answer {
+        answers: std::collections::HashMap<String, String>,
+    },
 }
 
 /// Commands received from the Unix control socket, MCP, and web gateway.
@@ -972,6 +989,16 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         id: u64,
+    },
+    /// Answer a pending `user_question` prompt: question text → chosen
+    /// option label(s) (multi-select joined with ", ") or free text.
+    /// Routes through the approval registry under the same `id`.
+    AnswerQuestion {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: u64,
+        #[serde(default)]
+        answers: std::collections::HashMap<String, String>,
     },
     Input {
         text: String,
@@ -2024,6 +2051,15 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             id: *id,
             command: command_preview.clone(),
+        }),
+        AppEvent::UserQuestionRequired {
+            session_id,
+            id,
+            questions,
+        } => Some(OutboundEvent::UserQuestion {
+            session_id: session_id.clone(),
+            id: *id,
+            questions: questions.clone(),
         }),
         AppEvent::AutoApproved { preview } => Some(OutboundEvent::AutoApproved {
             preview: preview.clone(),
@@ -3231,6 +3267,58 @@ mod tests {
                 assert_eq!(id, 7);
             }
             _ => panic!("expected Deny"),
+        }
+    }
+
+    #[test]
+    fn control_msg_answer_question_deserialize() {
+        let json = r#"{"action":"answer_question","id":3,"session_id":"sess-1","answers":{"Which DB?":"PostgreSQL"}}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::AnswerQuestion {
+                session_id,
+                id,
+                answers,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(id, 3);
+                assert_eq!(answers["Which DB?"], "PostgreSQL");
+            }
+            _ => panic!("expected AnswerQuestion"),
+        }
+    }
+
+    #[test]
+    fn user_question_required_maps_to_outbound_user_question() {
+        let event = AppEvent::UserQuestionRequired {
+            session_id: Some("sess-1".into()),
+            id: 5,
+            questions: vec![crate::types::UserQuestion {
+                question: "Which DB?".into(),
+                header: "Database".into(),
+                options: vec![crate::types::UserQuestionOption {
+                    label: "PostgreSQL".into(),
+                    description: "Relational".into(),
+                }],
+                multi_select: false,
+            }],
+        };
+        match app_event_to_outbound(&event).unwrap() {
+            crate::types::OutboundEvent::UserQuestion {
+                session_id,
+                id,
+                questions,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(id, 5);
+                assert_eq!(questions.len(), 1);
+                // Wire shape the dashboard renders from.
+                let json = serde_json::to_value(&questions[0]).unwrap();
+                assert_eq!(json["question"], "Which DB?");
+                assert_eq!(json["header"], "Database");
+                assert_eq!(json["options"][0]["label"], "PostgreSQL");
+            }
+            other => panic!("expected UserQuestion, got {:?}", other),
         }
     }
 

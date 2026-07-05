@@ -269,6 +269,15 @@ pub(crate) async fn run_headless_mode(
                                         let _ = tx.send(event::ApprovalResponse::ApproveAll);
                                     }
                                 }
+                                event::ControlMsg::AnswerQuestion { answers, .. } => {
+                                    // Structured question prompts share the
+                                    // approval slot in JSON mode.
+                                    let mut guard = approval_slot.lock().unwrap();
+                                    if let Some((_id, tx)) = guard.take() {
+                                        let _ =
+                                            tx.send(event::ApprovalResponse::Answer { answers });
+                                    }
+                                }
                                 event::ControlMsg::Input { text } => {
                                     // Write human_response file for askHuman IPC.
                                     // The agent polls for this file; a swallowed

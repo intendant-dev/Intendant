@@ -2405,9 +2405,162 @@ function showHumanInput(question) {
   stationScheduleUpdate();
 }
 
+// ── Structured user question (external agents' ask-the-user tool) ──
+//
+// pendingQuestion = { id, sessionId, questions: UserQuestion[] } while the
+// panel is up. Selections/free text live in the DOM; sendQuestionAnswer()
+// collects them into {question text → answer} and dispatches
+// {action:'answer_question', id, answers} (session-scoped like approvals).
+let pendingQuestion = null;
+
+function questionOptionClicked(qIndex, optIndex) {
+  if (!pendingQuestion) return;
+  const q = pendingQuestion.questions[qIndex];
+  if (!q) return;
+  const block = document.querySelector(`#question-content .question-block[data-q="${qIndex}"]`);
+  if (!block) return;
+  const buttons = block.querySelectorAll('.question-option');
+  const btn = buttons[optIndex];
+  if (!btn) return;
+  if (q.multi_select) {
+    btn.classList.toggle('selected');
+  } else {
+    buttons.forEach((b) => b.classList.remove('selected'));
+    btn.classList.add('selected');
+  }
+}
+
+function collectQuestionAnswers() {
+  if (!pendingQuestion) return null;
+  const answers = {};
+  for (let i = 0; i < pendingQuestion.questions.length; i++) {
+    const q = pendingQuestion.questions[i];
+    const block = document.querySelector(`#question-content .question-block[data-q="${i}"]`);
+    if (!block) continue;
+    const typed = (block.querySelector('.question-free-text')?.value || '').trim();
+    const picked = Array.from(block.querySelectorAll('.question-option.selected'))
+      .map((b) => b.dataset.label)
+      .filter(Boolean);
+    // Free text wins when both are present (mirrors the CLI's own picker,
+    // where typing into "Other" overrides the highlighted option).
+    const answer = typed || picked.join(', ');
+    if (!answer) return { missing: q.question };
+    answers[q.question] = answer;
+  }
+  return { answers };
+}
+
+function showUserQuestion(id, questions, sessionId) {
+  if (processingLogReplay) return;
+  const list = Array.isArray(questions) ? questions : [];
+  if (!list.length) return;
+  hideAllPanels();
+  pendingQuestion = {
+    id,
+    sessionId:
+      sessionId
+      || approvalSessionIds.get(String(id))
+      || currentSessionFullId
+      || '',
+    questions: list,
+  };
+  if (pendingQuestion.sessionId) {
+    ensureSessionWindow(pendingQuestion.sessionId, { phase: 'waiting' });
+    focusSessionWindow(pendingQuestion.sessionId);
+  }
+
+  const content = document.getElementById('question-content');
+  content.innerHTML = '';
+  const title = document.createElement('div');
+  title.className = 'approval-title';
+  title.textContent = 'The agent has a question';
+  content.appendChild(title);
+
+  list.forEach((q, qIndex) => {
+    const block = document.createElement('div');
+    block.className = 'question-block';
+    block.dataset.q = String(qIndex);
+
+    if (q.header) {
+      const chip = document.createElement('span');
+      chip.className = 'question-header-chip';
+      chip.textContent = q.header;
+      block.appendChild(chip);
+    }
+    const text = document.createElement('div');
+    text.className = 'question-text';
+    text.textContent = q.question;
+    block.appendChild(text);
+
+    const options = document.createElement('div');
+    options.className = 'question-options';
+    (q.options || []).forEach((opt, optIndex) => {
+      const btn = document.createElement('button');
+      btn.className = 'question-option';
+      btn.type = 'button';
+      btn.dataset.label = opt.label;
+      btn.addEventListener('click', () => questionOptionClicked(qIndex, optIndex));
+      const label = document.createElement('span');
+      label.className = 'question-option-label';
+      label.textContent = opt.label;
+      btn.appendChild(label);
+      if (opt.description) {
+        const desc = document.createElement('span');
+        desc.className = 'question-option-desc';
+        desc.textContent = opt.description;
+        btn.appendChild(desc);
+      }
+      options.appendChild(btn);
+    });
+    block.appendChild(options);
+
+    const free = document.createElement('input');
+    free.className = 'question-free-text';
+    free.type = 'text';
+    free.placeholder = q.multi_select
+      ? 'Or type your own answer…'
+      : 'Or type your own answer…';
+    free.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); sendQuestionAnswer(); }
+    });
+    block.appendChild(free);
+    content.appendChild(block);
+  });
+
+  const actions = document.createElement('div');
+  actions.className = 'approval-actions';
+  const submit = document.createElement('button');
+  submit.className = 'approve';
+  submit.textContent = 'Submit answer';
+  submit.addEventListener('click', () => sendQuestionAnswer());
+  actions.appendChild(submit);
+  const skip = document.createElement('button');
+  skip.textContent = 'Skip';
+  skip.title = 'Dismiss without answering (the agent proceeds on its own judgment)';
+  skip.addEventListener('click', () => sendQuestionAnswer({ skip: true }));
+  actions.appendChild(skip);
+  content.appendChild(actions);
+
+  // Station surfaces the question through the existing human-question rail.
+  const extra = list.length > 1 ? ` [+${list.length - 1} more]` : '';
+  stationCurrentHumanQuestion = `${list[0].question}${extra}`;
+  stationScheduleUpdate();
+  revealActivityLogPanel();
+  document.getElementById('question-panel').classList.add('visible');
+  setApprovalIndicator(true);
+}
+
+function clearPendingQuestion() {
+  pendingQuestion = null;
+  stationCurrentHumanQuestion = '';
+  stationScheduleUpdate();
+  setApprovalIndicator(false);
+}
+
 function showPanel(id) { hideAllPanels(); document.getElementById(id).classList.add('visible'); }
 function hidePanel(id) {
   if (id === 'approval-panel') clearPendingApproval();
+  if (id === 'question-panel') clearPendingQuestion();
   if (id === 'human-panel') {
     stationCurrentHumanQuestion = '';
     stationScheduleUpdate();
@@ -2416,6 +2569,7 @@ function hidePanel(id) {
 }
 function hideAllPanels() {
   clearPendingApproval();
+  clearPendingQuestion();
   stationCurrentHumanQuestion = '';
   document.querySelectorAll('.bottom-panel').forEach(p => p.classList.remove('visible'));
   stationScheduleUpdate();
