@@ -22537,17 +22537,39 @@ pub fn spawn_web_gateway(
                     if req_method == "OPTIONS" {
                         use tokio::io::AsyncWriteExt;
                         let opt_path = req_path;
-                        let response = if (opt_path.starts_with("/api/")
-                            && !is_fleet_cors_access_path(opt_path)
-                            && !is_public_peer_access_request_path(request_line))
-                            || opt_path == "/mcp"
-                        {
-                            // Non-fleet APIs and /mcp are same-origin (or
+                        // Table-declared paths take their posture and method
+                        // union from the same route declarations that drive
+                        // dispatch and IAM — a preflight can no longer be
+                        // looser (or tighter) than its endpoint. Undeclared
+                        // paths keep the legacy prefix rules: /api/* look-
+                        // alikes stay own-origin-scoped, everything else gets
+                        // the permissive wildcard (needed when the page is
+                        // served from the macOS app's intendant:// scheme).
+                        let table_posture = crate::gateway_routes::preflight_posture(opt_path);
+                        let table_methods =
+                            crate::gateway_routes::allowed_methods_for_path(opt_path);
+                        let own_origin_scoped = match table_posture {
+                            Some(crate::gateway_routes::CorsPosture::OwnOrigin) => true,
+                            Some(_) => false,
+                            None => {
+                                (opt_path.starts_with("/api/")
+                                    && !is_fleet_cors_access_path(opt_path)
+                                    && !is_public_peer_access_request_path(request_line))
+                                    || opt_path == "/mcp"
+                            }
+                        };
+                        let fleet_scoped = matches!(
+                            table_posture,
+                            Some(crate::gateway_routes::CorsPosture::FleetAllowlist)
+                        ) || (table_posture.is_none()
+                            && is_fleet_cors_access_path(opt_path));
+                        let response = if own_origin_scoped {
+                            // Own-origin APIs (and /mcp) are same-origin (or
                             // app-scheme) only; a cross-origin preflight gets
-                            // no ACAO and the browser stops there. (/mcp
-                            // responses use the same own/app-origin rule via
-                            // mcp_cors_header_segment — the preflight must not
-                            // be looser than the endpoint.)
+                            // no ACAO and the browser stops there.
+                            let methods = table_methods
+                                .as_deref()
+                                .unwrap_or("GET, POST, DELETE, OPTIONS");
                             let allowed = extract_origin_header(&header_text).filter(|origin| {
                                 is_own_or_app_origin(origin, is_tls, &header_text)
                             });
@@ -22555,7 +22577,7 @@ pub fn spawn_web_gateway(
                                 Some(origin) => format!(
                                     "HTTP/1.1 204 No Content\r\n\
                                      Access-Control-Allow-Origin: {origin}\r\n\
-                                     Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
+                                     Access-Control-Allow-Methods: {methods}\r\n\
                                      Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
                                      Access-Control-Max-Age: 86400\r\n\
                                      Vary: Origin\r\n\
@@ -22568,7 +22590,9 @@ pub fn spawn_web_gateway(
                                     \r\n"
                                     .to_string(),
                             }
-                        } else if is_fleet_cors_access_path(opt_path) {
+                        } else if fleet_scoped {
+                            let methods =
+                                table_methods.as_deref().unwrap_or("GET, POST, OPTIONS");
                             let cert_dir = crate::access::backend::select_backend().cert_dir();
                             let allowed = extract_origin_header(&header_text).filter(|origin| {
                                 fleet_access_origin_allowed(
@@ -22583,7 +22607,7 @@ pub fn spawn_web_gateway(
                                 Some(origin) => format!(
                                     "HTTP/1.1 204 No Content\r\n\
                                      Access-Control-Allow-Origin: {origin}\r\n\
-                                     Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+                                     Access-Control-Allow-Methods: {methods}\r\n\
                                      Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
                                      Access-Control-Max-Age: 86400\r\n\
                                      Vary: Origin\r\n\
@@ -22597,14 +22621,18 @@ pub fn spawn_web_gateway(
                                     .to_string(),
                             }
                         } else {
-                            "HTTP/1.1 204 No Content\r\n\
-                                Access-Control-Allow-Origin: *\r\n\
-                                Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
-                                Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
-                                Access-Control-Max-Age: 86400\r\n\
-                                Connection: close\r\n\
-                                \r\n"
-                                .to_string()
+                            let methods = table_methods
+                                .as_deref()
+                                .unwrap_or("GET, POST, DELETE, OPTIONS");
+                            format!(
+                                "HTTP/1.1 204 No Content\r\n\
+                                 Access-Control-Allow-Origin: *\r\n\
+                                 Access-Control-Allow-Methods: {methods}\r\n\
+                                 Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
+                                 Access-Control-Max-Age: 86400\r\n\
+                                 Connection: close\r\n\
+                                 \r\n"
+                            )
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
                         finalize_http_stream(&mut stream).await;
@@ -24230,6 +24258,953 @@ pub fn spawn_web_gateway(
                                 use tokio::io::AsyncWriteExt;
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
+                            RouteHandlerId::ProjectRoot => {
+                                use tokio::io::AsyncWriteExt;
+                                let body = project_root_response_body(project_root.as_deref());
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::SettingsPost => {
+                                use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                                // Read POST body — may be partially or fully outside the peek buffer
+                                let content_length: usize = header_text
+                                    .lines()
+                                    .find(|l| l.to_lowercase().starts_with("content-length:"))
+                                    .and_then(|l| l.split(':').nth(1))
+                                    .and_then(|v| v.trim().parse().ok())
+                                    .unwrap_or(0);
+                                let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+                                let body_owned;
+                                let body_text = if peeked_body.len() >= content_length {
+                                    crate::types::truncate_str(peeked_body, content_length)
+                                } else {
+                                    let remaining = content_length.saturating_sub(peeked_body.len());
+                                    let mut full = peeked_body.to_string();
+                                    if remaining > 0 {
+                                        let mut rest = vec![0u8; remaining];
+                                        if stream.read_exact(&mut rest).await.is_ok() {
+                                            full.push_str(&String::from_utf8_lossy(&rest));
+                                        }
+                                    }
+                                    body_owned = full;
+                                    &body_owned
+                                };
+                                let (status, result) =
+                                    settings_post_result(body_text, project_root.as_deref(), &bus);
+                                let response = json_response(status, result);
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::SettingsGet => {
+                                use tokio::io::AsyncWriteExt;
+                                let body =
+                                    settings_get_response_body(project_root.as_deref(), &runtime_settings)
+                                        .await;
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::ApiKeysPost => {
+                                use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                                let content_length: usize = header_text
+                                    .lines()
+                                    .find(|l| l.to_lowercase().starts_with("content-length:"))
+                                    .and_then(|l| l.split(':').nth(1))
+                                    .and_then(|v| v.trim().parse().ok())
+                                    .unwrap_or(0);
+                                let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+                                let body_owned;
+                                let body_text = if peeked_body.len() >= content_length {
+                                    crate::types::truncate_str(peeked_body, content_length)
+                                } else {
+                                    let remaining = content_length.saturating_sub(peeked_body.len());
+                                    let mut full = peeked_body.to_string();
+                                    if remaining > 0 {
+                                        let mut rest = vec![0u8; remaining];
+                                        if stream.read_exact(&mut rest).await.is_ok() {
+                                            full.push_str(&String::from_utf8_lossy(&rest));
+                                        }
+                                    }
+                                    body_owned = full;
+                                    &body_owned
+                                };
+                                let result = handle_set_api_keys(body_text);
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    result.len(),
+                                    result
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::ApiKeyStatus => {
+                                use tokio::io::AsyncWriteExt;
+                                let body = api_key_status_response_body();
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::ExternalAgents => {
+                                use tokio::io::AsyncWriteExt;
+                                let body = external_agents_response_body(project_root.as_deref());
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::DiagnosticsVisualFreshness => {
+                                // **Phase 0 visual-freshness transcript sink** (task #83).
+                                // Body is browser-emitted NDJSON (one JSON record per
+                                // `\n`-terminated line); server appends verbatim to
+                                // `~/.intendant/diagnostics/visual-freshness/<session>.ndjson`.
+                                // No parsing or schema validation here — that's
+                                // browser-side or post-hoc analysis on the
+                                // transcript. Session id arrives via `?session_id=…`
+                                // query param; we sanitize aggressively (alnum + `-`
+                                // + `_` only) and reject anything that collapses
+                                // empty so a missing param can't accidentally
+                                // produce a bare-`.ndjson` write.
+                                use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                                let session_id_raw: String = request_line
+                                    .split('?')
+                                    .nth(1)
+                                    .and_then(|qs| qs.split_whitespace().next())
+                                    .map(|qs| {
+                                        qs.split('&')
+                                            .find_map(|kv| {
+                                                let (k, v) = kv.split_once('=')?;
+                                                if k == "session_id" {
+                                                    Some(v.to_string())
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .unwrap_or_default()
+                                    })
+                                    .unwrap_or_default();
+                                let content_length: usize = header_text
+                                    .lines()
+                                    .find(|l| l.to_lowercase().starts_with("content-length:"))
+                                    .and_then(|l| l.split(':').nth(1))
+                                    .and_then(|v| v.trim().parse().ok())
+                                    .unwrap_or(0);
+                                let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+                                let body_owned;
+                                let body_bytes: &[u8] = if peeked_body.len() >= content_length {
+                                    &peeked_body.as_bytes()[..content_length]
+                                } else {
+                                    let remaining = content_length.saturating_sub(peeked_body.len());
+                                    let mut full: Vec<u8> = peeked_body.as_bytes().to_vec();
+                                    if remaining > 0 {
+                                        let mut rest = vec![0u8; remaining];
+                                        if stream.read_exact(&mut rest).await.is_ok() {
+                                            full.extend_from_slice(&rest);
+                                        }
+                                    }
+                                    body_owned = full;
+                                    &body_owned
+                                };
+                                let (status_line, body) =
+                                    match crate::diagnostics::append_visual_freshness_record(
+                                        &session_id_raw,
+                                        body_bytes,
+                                    ) {
+                                        Ok(written) => (
+                                            "HTTP/1.1 200 OK",
+                                            serde_json::json!({"ok": true, "written": written}).to_string(),
+                                        ),
+                                        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => (
+                                            "HTTP/1.1 400 Bad Request",
+                                            serde_json::json!({"error": e.to_string()}).to_string(),
+                                        ),
+                                        Err(e) => (
+                                            "HTTP/1.1 500 Internal Server Error",
+                                            serde_json::json!({"error": e.to_string()}).to_string(),
+                                        ),
+                                    };
+                                let response = format!(
+                                    "{status_line}\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::Displays => {
+                                // Display enumeration endpoint
+                                use tokio::io::AsyncWriteExt;
+                                let body = displays_response_body(&session_registry).await;
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::Doorbell => {
+                                use tokio::io::AsyncWriteExt;
+                                let path_token = request_line.split_whitespace().nth(1).unwrap_or("");
+                                let path = path_token.split('?').next().unwrap_or(path_token);
+                                let subpath = path
+                                    .strip_prefix(crate::peer::access_request::PUBLIC_REQUEST_PATH)
+                                    .unwrap_or("")
+                                    .trim_start_matches('/');
+                                let segments: Vec<&str> =
+                                    subpath.split('/').filter(|s| !s.is_empty()).collect();
+                                let (status, body) = if segments.is_empty() && req_method == "POST" {
+                                    match read_request_body_capped(
+                                        &mut stream,
+                                        &header_text,
+                                        crate::peer::access_request::effective_body_limit_bytes(
+                                            &peer_access_request_config,
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        Ok(body_text) => peer_access_request_create(
+                                            &body_text,
+                                            &header_text,
+                                            is_tls,
+                                            Some(source_hint.clone()),
+                                            &peer_access_request_config,
+                                        ),
+                                        Err((status, body)) => (status, body),
+                                    }
+                                } else if segments.len() == 1 && req_method == "GET" {
+                                    peer_access_request_status(segments[0])
+                                } else {
+                                    (
+                                        404,
+                                        serde_json::json!({"error": "unknown peer access request endpoint"})
+                                            .to_string(),
+                                    )
+                                };
+                                let response = with_public_cors(json_response(status_reason(status), body));
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::AccessOrgGrantPresent => {
+                                use tokio::io::AsyncWriteExt;
+                                let response = if req_method != "POST" {
+                                    json_response(
+                                        "405 Method Not Allowed",
+                                        serde_json::json!({"error": "method not allowed"}).to_string(),
+                                    )
+                                } else {
+                                    match read_request_body_capped(&mut stream, &header_text, 16 * 1024)
+                                        .await
+                                    {
+                                        Ok(body_text) => {
+                                            let (status, body) =
+                                                match serde_json::from_str::<serde_json::Value>(&body_text)
+                                                    .map_err(|e| format!("invalid JSON: {e}"))
+                                                    .and_then(|params| {
+                                                        access_org_present_response_value(
+                                                            params,
+                                                            &agent_card_value_for_targets,
+                                                        )
+                                                    }) {
+                                                    Ok(value) => (200, value.to_string()),
+                                                    Err(error) => (
+                                                        400,
+                                                        serde_json::json!({"error": error}).to_string(),
+                                                    ),
+                                                };
+                                            with_public_cors(json_response(status_reason(status), body))
+                                        }
+                                        Err((status, body)) => json_response(status_reason(status), body),
+                                    }
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::AccessOrgRevocations => {
+                                use tokio::io::AsyncWriteExt;
+                                let handle = req_path
+                                    .strip_prefix("/api/access/orgs/")
+                                    .and_then(|rest| rest.strip_suffix("/revocations"))
+                                    .unwrap_or("");
+                                let (status, body) = match access_org_orl_response_value(handle) {
+                                    Ok(value) => (200, value.to_string()),
+                                    Err(error) => (404, serde_json::json!({"error": error}).to_string()),
+                                };
+                                let response = with_public_cors(json_response(status_reason(status), body));
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::AccessOrgApplyRenew => {
+                                use tokio::io::AsyncWriteExt;
+                                let response = if req_method != "POST" {
+                                    json_response(
+                                        "405 Method Not Allowed",
+                                        serde_json::json!({"error": "method not allowed"}).to_string(),
+                                    )
+                                } else {
+                                    let cap = if req_path == "/api/access/orgs/revocations/apply" {
+                                        crate::access::org::MAX_ORG_ORL_BYTES
+                                    } else {
+                                        crate::access::org::MAX_ORG_GRANT_DOC_BYTES
+                                    };
+                                    match read_request_body_capped(&mut stream, &header_text, cap).await {
+                                        Ok(body_text) => {
+                                            let handler =
+                                                if req_path == "/api/access/orgs/revocations/apply" {
+                                                    access_org_orl_apply_response_value
+                                                        as fn(
+                                                            serde_json::Value,
+                                                        )
+                                                            -> Result<serde_json::Value, String>
+                                                } else {
+                                                    access_org_renew_response_value
+                                                };
+                                            let (status, body) =
+                                                match serde_json::from_str::<serde_json::Value>(&body_text)
+                                                    .map_err(|e| format!("invalid JSON: {e}"))
+                                                    .and_then(handler)
+                                                {
+                                                    Ok(value) => (200, value.to_string()),
+                                                    Err(error) => (
+                                                        400,
+                                                        serde_json::json!({"error": error}).to_string(),
+                                                    ),
+                                                };
+                                            with_public_cors(json_response(status_reason(status), body))
+                                        }
+                                        Err((status, body)) => json_response(status_reason(status), body),
+                                    }
+                                };
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::AccessIamGrants => {
+                                use tokio::io::AsyncWriteExt;
+                                if req_method != "POST" {
+                                    let response = json_response(
+                                        "405 Method Not Allowed",
+                                        serde_json::json!({"error": "method not allowed"}).to_string(),
+                                    );
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                } else {
+                                    let decision = http_access_context
+                                        .decision(crate::peer::access_policy::PeerOperation::AccessManage);
+                                    if !decision.allowed {
+                                        let response = json_response(
+                                            "403 Forbidden",
+                                            serde_json::json!({
+                                                "error": "principal does not allow this operation",
+                                                "principal": http_access_context.principal.as_value(),
+                                                "permission": decision.permission,
+                                                "reason": decision.reason,
+                                            })
+                                            .to_string(),
+                                        );
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    } else {
+                                        let body_text = read_request_body(&mut stream, &header_text).await;
+                                        let (status, body) = if req_path == "/api/access/iam/grants/update"
+                                        {
+                                            access_iam_update_grant_response_body(
+                                                &body_text,
+                                                &http_access_context.principal,
+                                            )
+                                        } else {
+                                            access_iam_upsert_user_client_grant_response_body(
+                                                &body_text,
+                                                &http_access_context.principal,
+                                            )
+                                        };
+                                        let response = with_fleet_cors(
+                                            json_response(status_reason(status), body),
+                                            fleet_cors_origin.as_deref(),
+                                        );
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    }
+                                }
+                            }
+                            RouteHandlerId::AccessOrgManage => {
+                                use tokio::io::AsyncWriteExt;
+                                if req_method != "POST" {
+                                    let response = json_response(
+                                        "405 Method Not Allowed",
+                                        serde_json::json!({"error": "method not allowed"}).to_string(),
+                                    );
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                } else {
+                                    let decision = http_access_context
+                                        .decision(crate::peer::access_policy::PeerOperation::AccessManage);
+                                    if !decision.allowed {
+                                        let response = json_response(
+                                            "403 Forbidden",
+                                            serde_json::json!({
+                                                "error": "principal does not allow this operation",
+                                                "principal": http_access_context.principal.as_value(),
+                                                "permission": decision.permission,
+                                                "reason": decision.reason,
+                                            })
+                                            .to_string(),
+                                        );
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    } else {
+                                        let body_text = read_request_body(&mut stream, &header_text).await;
+                                        let handler = match req_path {
+                                            "/api/access/orgs/trust" => {
+                                                access_org_trust_response_value
+                                                    as fn(
+                                                        serde_json::Value,
+                                                    )
+                                                        -> Result<serde_json::Value, String>
+                                            }
+                                            "/api/access/orgs/revoke" => access_org_revoke_response_value,
+                                            "/api/access/org-grants/revoke-member" => {
+                                                access_org_revoke_member_response_value
+                                            }
+                                            "/api/access/org-grants/issuers/init" => {
+                                                access_org_issuer_init_response_value
+                                            }
+                                            "/api/access/org-grants/issuers/delegate" => {
+                                                access_org_issuer_delegate_response_value
+                                            }
+                                            "/api/access/org-grants/issuers/install" => {
+                                                access_org_issuer_install_response_value
+                                            }
+                                            _ => access_org_issue_response_value,
+                                        };
+                                        let (status, body) =
+                                            match serde_json::from_str::<serde_json::Value>(&body_text)
+                                                .map_err(|e| format!("invalid request body: {e}"))
+                                                .and_then(handler)
+                                            {
+                                                Ok(value) => (200, value.to_string()),
+                                                Err(error) => {
+                                                    (400, serde_json::json!({"error": error}).to_string())
+                                                }
+                                            };
+                                        let response = with_fleet_cors(
+                                            json_response(status_reason(status), body),
+                                            fleet_cors_origin.as_deref(),
+                                        );
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    }
+                                }
+                            }
+                            RouteHandlerId::AccessEnrollmentDecide => {
+                                use tokio::io::AsyncWriteExt;
+                                if req_method != "POST" {
+                                    let response = json_response(
+                                        "405 Method Not Allowed",
+                                        serde_json::json!({"error": "method not allowed"}).to_string(),
+                                    );
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                } else {
+                                    let decision = http_access_context
+                                        .decision(crate::peer::access_policy::PeerOperation::AccessManage);
+                                    if !decision.allowed {
+                                        let response = json_response(
+                                            "403 Forbidden",
+                                            serde_json::json!({
+                                                "error": "principal does not allow this operation",
+                                                "principal": http_access_context.principal.as_value(),
+                                                "permission": decision.permission,
+                                                "reason": decision.reason,
+                                            })
+                                            .to_string(),
+                                        );
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    } else {
+                                        let body_text = read_request_body(&mut stream, &header_text).await;
+                                        let (status, body) = access_enrollment_decide_response_body(
+                                            &body_text,
+                                            &http_access_context.principal,
+                                        );
+                                        let response = with_fleet_cors(
+                                            json_response(status_reason(status), body),
+                                            fleet_cors_origin.as_deref(),
+                                        );
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    }
+                                }
+                            }
+                            RouteHandlerId::AccessEnrollmentRequests => {
+                                use tokio::io::AsyncWriteExt;
+                                let body = access_enrollment_requests_response_body();
+                                let response = with_fleet_cors(
+                                    json_response("200 OK", body),
+                                    fleet_cors_origin.as_deref(),
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::AccessIamState => {
+                                use tokio::io::AsyncWriteExt;
+                                let body = access_iam_state_response_body();
+                                let response = with_fleet_cors(
+                                    json_response("200 OK", body),
+                                    fleet_cors_origin.as_deref(),
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::AccessOverview => {
+                                use tokio::io::AsyncWriteExt;
+                                let body = access_overview_response_body_for_principal(
+                                    &agent_card_value_for_targets,
+                                    peer_registry.as_ref(),
+                                    &http_access_context.principal,
+                                );
+                                let response = with_fleet_cors(
+                                    json_response("200 OK", body),
+                                    fleet_cors_origin.as_deref(),
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::DashboardTargets => {
+                                use tokio::io::AsyncWriteExt;
+                                let body = dashboard_targets_response_body(
+                                    &agent_card_value_for_targets,
+                                    peer_registry.as_ref(),
+                                );
+                                let response = json_response("200 OK", body);
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::PeersSubRouter => {
+                                // Peer registry endpoints. Dispatch:
+                                //   GET    /api/peers                  → list
+                                //   POST   /api/peers                  → add
+                                //   DELETE /api/peers                  → remove
+                                //   POST   /api/peers/pairing/invite   → issue pairing invite
+                                //   POST   /api/peers/pairing/join     → import pairing invite
+                                //   POST   /api/peers/{id}/message     → send message
+                                //   POST   /api/peers/{id}/task        → delegate task
+                                //   POST   /api/peers/{id}/approval    → resolve approval
+                                //
+                                // When no registry is wired in (test call sites
+                                // that pass None), every request returns 503 so
+                                // the dashboard can render "peers unavailable"
+                                // instead of the empty list that a working-but-
+                                // empty registry would produce.
+                                use tokio::io::AsyncWriteExt;
+
+                                // Extract subpath after `/api/peers`. The list/
+                                // add/remove ops have an empty subpath; per-peer
+                                // ops have `/{id}/{op}`. Extract the *path*
+                                // token from the request line first (the second
+                                // whitespace-separated word) — splitting on
+                                // `/api/peers` directly would walk into the
+                                // ` HTTP/1.1` suffix and mistake `HTTP` and `1.1`
+                                // for path segments.
+                                let path_token = request_line.split_whitespace().nth(1).unwrap_or("");
+                                // Split path from query string. `/api/peers/eligible
+                                // ?capability=display` needs the query stripped before
+                                // we extract subpath segments.
+                                let (path, query_str) = match path_token.find('?') {
+                                    Some(i) => (&path_token[..i], &path_token[i + 1..]),
+                                    None => (path_token, ""),
+                                };
+                                let subpath = path
+                                    .strip_prefix("/api/peers")
+                                    .unwrap_or("")
+                                    .trim_start_matches('/');
+                                let segments: Vec<&str> =
+                                    subpath.split('/').filter(|s| !s.is_empty()).collect();
+
+                                let (status, body) = if segments == ["pairing", "invite"]
+                                    && req_method == "POST"
+                                {
+                                    let body_text = read_request_body(&mut stream, &header_text).await;
+                                    peers_pairing_invite(&body_text)
+                                } else if segments == ["pairing", "request-access"] && req_method == "POST"
+                                {
+                                    let body_text = read_request_body(&mut stream, &header_text).await;
+                                    peers_pairing_request_access(&body_text).await
+                                } else if segments == ["pairing", "request-access", "poll"]
+                                    && req_method == "POST"
+                                {
+                                    let body_text = read_request_body(&mut stream, &header_text).await;
+                                    peers_pairing_request_access_poll(
+                                        peer_registry.as_ref(),
+                                        project_root.as_deref(),
+                                        &body_text,
+                                    )
+                                    .await
+                                } else if segments == ["pairing", "requests"] && req_method == "GET" {
+                                    peers_pairing_requests_list()
+                                } else if segments == ["pairing", "identities"] && req_method == "GET" {
+                                    peers_pairing_identities_list()
+                                } else if segments == ["pairing", "identities", "revoke"]
+                                    && req_method == "POST"
+                                {
+                                    let body_text = read_request_body(&mut stream, &header_text).await;
+                                    peers_pairing_identity_revoke(&body_text)
+                                } else if segments.len() == 4
+                                    && segments[0] == "pairing"
+                                    && segments[1] == "requests"
+                                    && req_method == "POST"
+                                {
+                                    let body_text = read_request_body(&mut stream, &header_text).await;
+                                    peers_pairing_request_decision(segments[2], segments[3], &body_text)
+                                } else {
+                                    match peer_registry.as_ref() {
+                                        None => (
+                                            503,
+                                            serde_json::json!({
+                                                "error": "peer registry not configured"
+                                            })
+                                            .to_string(),
+                                        ),
+                                        Some(registry) if segments.is_empty() && req_method == "GET" => {
+                                            (200, peers_list_response_body(registry))
+                                        }
+                                        Some(registry)
+                                            if segments.is_empty()
+                                                && (req_method == "POST" || req_method == "DELETE") =>
+                                        {
+                                            let body_text =
+                                                read_request_body(&mut stream, &header_text).await;
+                                            if req_method == "POST" {
+                                                peers_add(registry, project_root.as_deref(), &body_text)
+                                                    .await
+                                            } else {
+                                                peers_remove(registry, &body_text).await
+                                            }
+                                        }
+                                        Some(registry)
+                                            if segments == ["eligible"] && req_method == "GET" =>
+                                        {
+                                            // GET /api/peers/eligible?capability=display
+                                            // — list peers that satisfy all listed
+                                            // capabilities. The `eligible` segment is
+                                            // a reserved sub-path on /api/peers; an
+                                            // actual peer with that bare id would be
+                                            // shadowed here, but PeerId values always
+                                            // carry a `<kind>:` prefix so that's not
+                                            // a real collision.
+                                            peers_eligible(registry, query_str)
+                                        }
+                                        Some(registry)
+                                            if segments == ["pairing", "join"] && req_method == "POST" =>
+                                        {
+                                            let body_text =
+                                                read_request_body(&mut stream, &header_text).await;
+                                            peers_pairing_join(
+                                                registry,
+                                                project_root.as_deref(),
+                                                &body_text,
+                                            )
+                                            .await
+                                        }
+                                        Some(registry) if segments.len() == 2 && req_method == "POST" => {
+                                            let id = url_path_decode(segments[0]);
+                                            let op = segments[1];
+                                            let body_text =
+                                                read_request_body(&mut stream, &header_text).await;
+                                            match op {
+                                                "message" => {
+                                                    peers_send_message(registry, &id, &body_text).await
+                                                }
+                                                "task" => {
+                                                    peers_delegate_task(registry, &id, &body_text).await
+                                                }
+                                                "approval" => {
+                                                    peers_resolve_approval(registry, &id, &body_text).await
+                                                }
+                                                "webrtc" => {
+                                                    peers_webrtc_signal(registry, &id, &body_text, &bus)
+                                                        .await
+                                                }
+                                                "file-transfer-webrtc" => {
+                                                    peers_file_transfer_signal(
+                                                        registry, &id, &body_text, &bus,
+                                                    )
+                                                    .await
+                                                }
+                                                "dashboard-control-webrtc" => {
+                                                    peers_dashboard_control_signal(
+                                                        registry, &id, &body_text, &bus,
+                                                    )
+                                                    .await
+                                                }
+                                                other => (
+                                                    404,
+                                                    serde_json::json!({
+                                                        "error": format!(
+                                                            "unknown peer op: {other}"
+                                                        )
+                                                    })
+                                                    .to_string(),
+                                                ),
+                                            }
+                                        }
+                                        Some(_) => (
+                                            405,
+                                            serde_json::json!({
+                                                "error": "method not allowed"
+                                            })
+                                            .to_string(),
+                                        ),
+                                    }
+                                };
+                                let reason = match status {
+                                    200 => "OK",
+                                    400 => "Bad Request",
+                                    404 => "Not Found",
+                                    405 => "Method Not Allowed",
+                                    500 => "Internal Server Error",
+                                    502 => "Bad Gateway",
+                                    503 => "Service Unavailable",
+                                    _ => "Error",
+                                };
+                                let response = format!(
+                                    "HTTP/1.1 {status} {reason}\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
+                                     Access-Control-Allow-Headers: Content-Type\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {body}",
+                                    body.len(),
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::CoordinatorRoute => {
+                                // POST /api/coordinator/route — capability-based
+                                // task routing through the Coordinator primitive.
+                                // Body shape: {"required_capabilities": ["display",
+                                // ...], "task": {"instructions": "...", "context":
+                                // ..., "client_correlation_id": "..."}}.
+                                // Response: {"peer_id": "...", "task_id": "..."}
+                                // on success, structured error otherwise.
+                                use tokio::io::AsyncWriteExt;
+                                let (status, body) = match peer_registry.as_ref() {
+                                    None => (
+                                        503,
+                                        serde_json::json!({
+                                            "error": "peer registry not configured"
+                                        })
+                                        .to_string(),
+                                    ),
+                                    Some(_) if req_method != "POST" => (
+                                        405,
+                                        serde_json::json!({
+                                            "error": "method not allowed"
+                                        })
+                                        .to_string(),
+                                    ),
+                                    Some(registry) => {
+                                        let body_text = read_request_body(&mut stream, &header_text).await;
+                                        coordinator_route(registry, &body_text).await
+                                    }
+                                };
+                                let reason = match status {
+                                    200 => "OK",
+                                    400 => "Bad Request",
+                                    404 => "Not Found",
+                                    405 => "Method Not Allowed",
+                                    500 => "Internal Server Error",
+                                    502 => "Bad Gateway",
+                                    503 => "Service Unavailable",
+                                    _ => "Error",
+                                };
+                                let response = format!(
+                                    "HTTP/1.1 {status} {reason}\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Access-Control-Allow-Methods: POST, OPTIONS\r\n\
+                                     Access-Control-Allow-Headers: Content-Type\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {body}",
+                                    body.len(),
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            RouteHandlerId::McpPost => {
+                                // MCP Streamable HTTP endpoint.
+                                //
+                                // rmcp expects:
+                                //   - Requests (has `id`):   200 OK + Content-Type: application/json
+                                //   - Notifications (no `id`): 202 Accepted + empty body
+                                //   - GET for SSE stream:    405 Method Not Allowed (we don't support SSE push)
+                                //   - DELETE for session:    405 Method Not Allowed (stateless)
+                                use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                                if let Some(ref mcp) = mcp_server {
+                                    let mcp_cors = mcp_cors_header_segment(&header_text, is_tls);
+                                    // Bind the request to an access principal before
+                                    // touching the body. Loopback reachability or a
+                                    // shared token alone no longer authorizes the
+                                    // tool surface — see `mcp_http_access_context`.
+                                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                                    let mcp_access = match mcp_http_access_context(
+                                        &cert_dir,
+                                        peer_connection_identity.as_ref(),
+                                        tls_client_cert_fingerprint.as_deref(),
+                                        tls_client_cert_present,
+                                        is_tls,
+                                        peer_addr,
+                                        &header_text,
+                                    ) {
+                                        Ok(access) => access,
+                                        Err((status, message)) => {
+                                            let reason = match status {
+                                                401 => "Unauthorized",
+                                                403 => "Forbidden",
+                                                _ => "Error",
+                                            };
+                                            let body = serde_json::json!({
+                                                "jsonrpc": "2.0",
+                                                "id": serde_json::Value::Null,
+                                                "error": { "code": -32600, "message": message },
+                                            })
+                                            .to_string();
+                                            let response = format!(
+                                                "HTTP/1.1 {status} {reason}\r\n\
+                                                 Content-Type: application/json\r\n\
+                                                 {mcp_cors}\
+                                                 Content-Length: {}\r\n\
+                                                 Cache-Control: no-cache\r\n\
+                                                 Connection: close\r\n\
+                                                 \r\n\
+                                                 {body}",
+                                                body.len(),
+                                            );
+                                            let _ = stream.write_all(response.as_bytes()).await;
+                                            finalize_http_stream(&mut stream).await;
+                                            return;
+                                        }
+                                    };
+                                    let content_length: usize = header_text
+                                        .lines()
+                                        .find(|l| l.to_lowercase().starts_with("content-length:"))
+                                        .and_then(|l| l.split(':').nth(1))
+                                        .and_then(|v| v.trim().parse().ok())
+                                        .unwrap_or(0);
+                                    let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+                                    let body_owned;
+                                    let body_text = if peeked_body.len() >= content_length {
+                                        crate::types::truncate_str(peeked_body, content_length)
+                                    } else {
+                                        let remaining = content_length.saturating_sub(peeked_body.len());
+                                        let mut full = peeked_body.to_string();
+                                        if remaining > 0 {
+                                            let mut rest = vec![0u8; remaining];
+                                            if stream.read_exact(&mut rest).await.is_ok() {
+                                                full.push_str(&String::from_utf8_lossy(&rest));
+                                            }
+                                        }
+                                        body_owned = full;
+                                        &body_owned
+                                    };
+                                    let (mcp_session_id, codex_managed_context, tool_profile) =
+                                        mcp_context_from_request_line(request_line);
+                                    let outcome = handle_mcp_http_request(
+                                        body_text,
+                                        mcp,
+                                        mcp_session_id.as_deref(),
+                                        codex_managed_context,
+                                        tool_profile.as_deref(),
+                                        &mcp_access,
+                                    )
+                                    .await;
+                                    let http_response = match outcome {
+                                        McpHttpOutcome::Response(resp) => {
+                                            let json = serde_json::to_string(&resp).unwrap_or_default();
+                                            format!(
+                                                "HTTP/1.1 200 OK\r\n\
+                                                 Content-Type: application/json\r\n\
+                                                 {mcp_cors}\
+                                                 Content-Length: {}\r\n\
+                                                 \r\n\
+                                                 {}",
+                                                json.len(),
+                                                json,
+                                            )
+                                        }
+                                        McpHttpOutcome::Accepted => format!(
+                                            "HTTP/1.1 202 Accepted\r\n\
+                                             {mcp_cors}\
+                                             Content-Length: 0\r\n\
+                                             \r\n"
+                                        ),
+                                    };
+                                    let _ = stream.write_all(http_response.as_bytes()).await;
+                                } else {
+                                    let err = r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"MCP server not available"}}"#;
+                                    let http = format!(
+                                        "HTTP/1.1 503 Service Unavailable\r\n\
+                                         Content-Type: application/json\r\n\
+                                         Content-Length: {}\r\n\
+                                         \r\n\
+                                         {}",
+                                        err.len(),
+                                        err
+                                    );
+                                    let _ = stream.write_all(http.as_bytes()).await;
+                                }
+                            }
+                            RouteHandlerId::McpStream => {
+                                // MCP Streamable HTTP: GET (SSE stream) and DELETE (session cleanup)
+                                // are not supported by our stateless endpoint.  Return 405 so rmcp
+                                // gracefully falls back (skips SSE / ignores session delete).
+                                use tokio::io::AsyncWriteExt;
+                                let http = format!(
+                                    "HTTP/1.1 405 Method Not Allowed\r\n\
+                                     {}\
+                                     Content-Length: 0\r\n\
+                                     \r\n",
+                                    mcp_cors_header_segment(&header_text, is_tls)
+                                );
+                                let _ = stream.write_all(http.as_bytes()).await;
+                            }
                         }
                     } else if req_method == "GET" && req_path == "/connect/bootstrap" {
                         use tokio::io::AsyncWriteExt;
@@ -24353,218 +25328,6 @@ pub fn spawn_web_gateway(
                             );
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
-                    } else if req_path == "/api/project-root" {
-                        use tokio::io::AsyncWriteExt;
-                        let body = project_root_response_body(project_root.as_deref());
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/settings" {
-                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
-                        // Read POST body — may be partially or fully outside the peek buffer
-                        let content_length: usize = header_text
-                            .lines()
-                            .find(|l| l.to_lowercase().starts_with("content-length:"))
-                            .and_then(|l| l.split(':').nth(1))
-                            .and_then(|v| v.trim().parse().ok())
-                            .unwrap_or(0);
-                        let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-                        let body_owned;
-                        let body_text = if peeked_body.len() >= content_length {
-                            crate::types::truncate_str(peeked_body, content_length)
-                        } else {
-                            let remaining = content_length.saturating_sub(peeked_body.len());
-                            let mut full = peeked_body.to_string();
-                            if remaining > 0 {
-                                let mut rest = vec![0u8; remaining];
-                                if stream.read_exact(&mut rest).await.is_ok() {
-                                    full.push_str(&String::from_utf8_lossy(&rest));
-                                }
-                            }
-                            body_owned = full;
-                            &body_owned
-                        };
-                        let (status, result) =
-                            settings_post_result(body_text, project_root.as_deref(), &bus);
-                        let response = json_response(status, result);
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST"
-                        && req_path == "/api/diagnostics/visual-freshness"
-                    {
-                        // **Phase 0 visual-freshness transcript sink** (task #83).
-                        // Body is browser-emitted NDJSON (one JSON record per
-                        // `\n`-terminated line); server appends verbatim to
-                        // `~/.intendant/diagnostics/visual-freshness/<session>.ndjson`.
-                        // No parsing or schema validation here — that's
-                        // browser-side or post-hoc analysis on the
-                        // transcript. Session id arrives via `?session_id=…`
-                        // query param; we sanitize aggressively (alnum + `-`
-                        // + `_` only) and reject anything that collapses
-                        // empty so a missing param can't accidentally
-                        // produce a bare-`.ndjson` write.
-                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
-                        let session_id_raw: String = request_line
-                            .split('?')
-                            .nth(1)
-                            .and_then(|qs| qs.split_whitespace().next())
-                            .map(|qs| {
-                                qs.split('&')
-                                    .find_map(|kv| {
-                                        let (k, v) = kv.split_once('=')?;
-                                        if k == "session_id" {
-                                            Some(v.to_string())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or_default()
-                            })
-                            .unwrap_or_default();
-                        let content_length: usize = header_text
-                            .lines()
-                            .find(|l| l.to_lowercase().starts_with("content-length:"))
-                            .and_then(|l| l.split(':').nth(1))
-                            .and_then(|v| v.trim().parse().ok())
-                            .unwrap_or(0);
-                        let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-                        let body_owned;
-                        let body_bytes: &[u8] = if peeked_body.len() >= content_length {
-                            &peeked_body.as_bytes()[..content_length]
-                        } else {
-                            let remaining = content_length.saturating_sub(peeked_body.len());
-                            let mut full: Vec<u8> = peeked_body.as_bytes().to_vec();
-                            if remaining > 0 {
-                                let mut rest = vec![0u8; remaining];
-                                if stream.read_exact(&mut rest).await.is_ok() {
-                                    full.extend_from_slice(&rest);
-                                }
-                            }
-                            body_owned = full;
-                            &body_owned
-                        };
-                        let (status_line, body) =
-                            match crate::diagnostics::append_visual_freshness_record(
-                                &session_id_raw,
-                                body_bytes,
-                            ) {
-                                Ok(written) => (
-                                    "HTTP/1.1 200 OK",
-                                    serde_json::json!({"ok": true, "written": written}).to_string(),
-                                ),
-                                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => (
-                                    "HTTP/1.1 400 Bad Request",
-                                    serde_json::json!({"error": e.to_string()}).to_string(),
-                                ),
-                                Err(e) => (
-                                    "HTTP/1.1 500 Internal Server Error",
-                                    serde_json::json!({"error": e.to_string()}).to_string(),
-                                ),
-                            };
-                        let response = format!(
-                            "{status_line}\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path == "/api/settings" {
-                        use tokio::io::AsyncWriteExt;
-                        let body =
-                            settings_get_response_body(project_root.as_deref(), &runtime_settings)
-                                .await;
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/api/api-keys" {
-                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
-                        let content_length: usize = header_text
-                            .lines()
-                            .find(|l| l.to_lowercase().starts_with("content-length:"))
-                            .and_then(|l| l.split(':').nth(1))
-                            .and_then(|v| v.trim().parse().ok())
-                            .unwrap_or(0);
-                        let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-                        let body_owned;
-                        let body_text = if peeked_body.len() >= content_length {
-                            crate::types::truncate_str(peeked_body, content_length)
-                        } else {
-                            let remaining = content_length.saturating_sub(peeked_body.len());
-                            let mut full = peeked_body.to_string();
-                            if remaining > 0 {
-                                let mut rest = vec![0u8; remaining];
-                                if stream.read_exact(&mut rest).await.is_ok() {
-                                    full.push_str(&String::from_utf8_lossy(&rest));
-                                }
-                            }
-                            body_owned = full;
-                            &body_owned
-                        };
-                        let result = handle_set_api_keys(body_text);
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            result.len(),
-                            result
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path == "/api/api-key-status" {
-                        use tokio::io::AsyncWriteExt;
-                        let body = api_key_status_response_body();
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path == "/api/external-agents" {
-                        use tokio::io::AsyncWriteExt;
-                        let body = external_agents_response_body(project_root.as_deref());
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/session" {
                         let result = mint_session_token(&session_provider, &session_model).await;
                         let (status, body) = match result {
@@ -24780,601 +25543,6 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path == "/api/displays" {
-                        // Display enumeration endpoint
-                        use tokio::io::AsyncWriteExt;
-                        let body = displays_response_body(&session_registry).await;
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if is_public_peer_access_request_path(request_line) {
-                        use tokio::io::AsyncWriteExt;
-                        let path_token = request_line.split_whitespace().nth(1).unwrap_or("");
-                        let path = path_token.split('?').next().unwrap_or(path_token);
-                        let subpath = path
-                            .strip_prefix(crate::peer::access_request::PUBLIC_REQUEST_PATH)
-                            .unwrap_or("")
-                            .trim_start_matches('/');
-                        let segments: Vec<&str> =
-                            subpath.split('/').filter(|s| !s.is_empty()).collect();
-                        let (status, body) = if segments.is_empty() && req_method == "POST" {
-                            match read_request_body_capped(
-                                &mut stream,
-                                &header_text,
-                                crate::peer::access_request::effective_body_limit_bytes(
-                                    &peer_access_request_config,
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(body_text) => peer_access_request_create(
-                                    &body_text,
-                                    &header_text,
-                                    is_tls,
-                                    Some(source_hint.clone()),
-                                    &peer_access_request_config,
-                                ),
-                                Err((status, body)) => (status, body),
-                            }
-                        } else if segments.len() == 1 && req_method == "GET" {
-                            peer_access_request_status(segments[0])
-                        } else {
-                            (
-                                404,
-                                serde_json::json!({"error": "unknown peer access request endpoint"})
-                                    .to_string(),
-                            )
-                        };
-                        let response = with_public_cors(json_response(status_reason(status), body));
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path == "/api/access/iam/user-client-grants"
-                        || req_path == "/api/access/iam/grants/update"
-                    {
-                        use tokio::io::AsyncWriteExt;
-                        if req_method != "POST" {
-                            let response = json_response(
-                                "405 Method Not Allowed",
-                                serde_json::json!({"error": "method not allowed"}).to_string(),
-                            );
-                            let _ = stream.write_all(response.as_bytes()).await;
-                        } else {
-                            let decision = http_access_context
-                                .decision(crate::peer::access_policy::PeerOperation::AccessManage);
-                            if !decision.allowed {
-                                let response = json_response(
-                                    "403 Forbidden",
-                                    serde_json::json!({
-                                        "error": "principal does not allow this operation",
-                                        "principal": http_access_context.principal.as_value(),
-                                        "permission": decision.permission,
-                                        "reason": decision.reason,
-                                    })
-                                    .to_string(),
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            } else {
-                                let body_text = read_request_body(&mut stream, &header_text).await;
-                                let (status, body) = if req_path == "/api/access/iam/grants/update"
-                                {
-                                    access_iam_update_grant_response_body(
-                                        &body_text,
-                                        &http_access_context.principal,
-                                    )
-                                } else {
-                                    access_iam_upsert_user_client_grant_response_body(
-                                        &body_text,
-                                        &http_access_context.principal,
-                                    )
-                                };
-                                let response = with_fleet_cors(
-                                    json_response(status_reason(status), body),
-                                    fleet_cors_origin.as_deref(),
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            }
-                        }
-                    } else if req_path == "/api/access/org-grants" {
-                        use tokio::io::AsyncWriteExt;
-                        let response = if req_method != "POST" {
-                            json_response(
-                                "405 Method Not Allowed",
-                                serde_json::json!({"error": "method not allowed"}).to_string(),
-                            )
-                        } else {
-                            match read_request_body_capped(&mut stream, &header_text, 16 * 1024)
-                                .await
-                            {
-                                Ok(body_text) => {
-                                    let (status, body) =
-                                        match serde_json::from_str::<serde_json::Value>(&body_text)
-                                            .map_err(|e| format!("invalid JSON: {e}"))
-                                            .and_then(|params| {
-                                                access_org_present_response_value(
-                                                    params,
-                                                    &agent_card_value_for_targets,
-                                                )
-                                            }) {
-                                            Ok(value) => (200, value.to_string()),
-                                            Err(error) => (
-                                                400,
-                                                serde_json::json!({"error": error}).to_string(),
-                                            ),
-                                        };
-                                    with_public_cors(json_response(status_reason(status), body))
-                                }
-                                Err((status, body)) => json_response(status_reason(status), body),
-                            }
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "GET"
-                        && req_path
-                            .strip_prefix("/api/access/orgs/")
-                            .and_then(|rest| rest.strip_suffix("/revocations"))
-                            .is_some()
-                    {
-                        use tokio::io::AsyncWriteExt;
-                        let handle = req_path
-                            .strip_prefix("/api/access/orgs/")
-                            .and_then(|rest| rest.strip_suffix("/revocations"))
-                            .unwrap_or("");
-                        let (status, body) = match access_org_orl_response_value(handle) {
-                            Ok(value) => (200, value.to_string()),
-                            Err(error) => (404, serde_json::json!({"error": error}).to_string()),
-                        };
-                        let response = with_public_cors(json_response(status_reason(status), body));
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path == "/api/access/orgs/revocations/apply"
-                        || req_path == "/api/access/org-grants/renew"
-                    {
-                        use tokio::io::AsyncWriteExt;
-                        let response = if req_method != "POST" {
-                            json_response(
-                                "405 Method Not Allowed",
-                                serde_json::json!({"error": "method not allowed"}).to_string(),
-                            )
-                        } else {
-                            let cap = if req_path == "/api/access/orgs/revocations/apply" {
-                                crate::access::org::MAX_ORG_ORL_BYTES
-                            } else {
-                                crate::access::org::MAX_ORG_GRANT_DOC_BYTES
-                            };
-                            match read_request_body_capped(&mut stream, &header_text, cap).await {
-                                Ok(body_text) => {
-                                    let handler =
-                                        if req_path == "/api/access/orgs/revocations/apply" {
-                                            access_org_orl_apply_response_value
-                                                as fn(
-                                                    serde_json::Value,
-                                                )
-                                                    -> Result<serde_json::Value, String>
-                                        } else {
-                                            access_org_renew_response_value
-                                        };
-                                    let (status, body) =
-                                        match serde_json::from_str::<serde_json::Value>(&body_text)
-                                            .map_err(|e| format!("invalid JSON: {e}"))
-                                            .and_then(handler)
-                                        {
-                                            Ok(value) => (200, value.to_string()),
-                                            Err(error) => (
-                                                400,
-                                                serde_json::json!({"error": error}).to_string(),
-                                            ),
-                                        };
-                                    with_public_cors(json_response(status_reason(status), body))
-                                }
-                                Err((status, body)) => json_response(status_reason(status), body),
-                            }
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path == "/api/access/orgs/trust"
-                        || req_path == "/api/access/orgs/revoke"
-                        || req_path == "/api/access/org-grants/issue"
-                        || req_path == "/api/access/org-grants/revoke-member"
-                        || req_path == "/api/access/org-grants/issuers/init"
-                        || req_path == "/api/access/org-grants/issuers/delegate"
-                        || req_path == "/api/access/org-grants/issuers/install"
-                    {
-                        use tokio::io::AsyncWriteExt;
-                        if req_method != "POST" {
-                            let response = json_response(
-                                "405 Method Not Allowed",
-                                serde_json::json!({"error": "method not allowed"}).to_string(),
-                            );
-                            let _ = stream.write_all(response.as_bytes()).await;
-                        } else {
-                            let decision = http_access_context
-                                .decision(crate::peer::access_policy::PeerOperation::AccessManage);
-                            if !decision.allowed {
-                                let response = json_response(
-                                    "403 Forbidden",
-                                    serde_json::json!({
-                                        "error": "principal does not allow this operation",
-                                        "principal": http_access_context.principal.as_value(),
-                                        "permission": decision.permission,
-                                        "reason": decision.reason,
-                                    })
-                                    .to_string(),
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            } else {
-                                let body_text = read_request_body(&mut stream, &header_text).await;
-                                let handler = match req_path {
-                                    "/api/access/orgs/trust" => {
-                                        access_org_trust_response_value
-                                            as fn(
-                                                serde_json::Value,
-                                            )
-                                                -> Result<serde_json::Value, String>
-                                    }
-                                    "/api/access/orgs/revoke" => access_org_revoke_response_value,
-                                    "/api/access/org-grants/revoke-member" => {
-                                        access_org_revoke_member_response_value
-                                    }
-                                    "/api/access/org-grants/issuers/init" => {
-                                        access_org_issuer_init_response_value
-                                    }
-                                    "/api/access/org-grants/issuers/delegate" => {
-                                        access_org_issuer_delegate_response_value
-                                    }
-                                    "/api/access/org-grants/issuers/install" => {
-                                        access_org_issuer_install_response_value
-                                    }
-                                    _ => access_org_issue_response_value,
-                                };
-                                let (status, body) =
-                                    match serde_json::from_str::<serde_json::Value>(&body_text)
-                                        .map_err(|e| format!("invalid request body: {e}"))
-                                        .and_then(handler)
-                                    {
-                                        Ok(value) => (200, value.to_string()),
-                                        Err(error) => {
-                                            (400, serde_json::json!({"error": error}).to_string())
-                                        }
-                                    };
-                                let response = with_fleet_cors(
-                                    json_response(status_reason(status), body),
-                                    fleet_cors_origin.as_deref(),
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            }
-                        }
-                    } else if req_path == "/api/access/enrollment-requests/decide" {
-                        use tokio::io::AsyncWriteExt;
-                        if req_method != "POST" {
-                            let response = json_response(
-                                "405 Method Not Allowed",
-                                serde_json::json!({"error": "method not allowed"}).to_string(),
-                            );
-                            let _ = stream.write_all(response.as_bytes()).await;
-                        } else {
-                            let decision = http_access_context
-                                .decision(crate::peer::access_policy::PeerOperation::AccessManage);
-                            if !decision.allowed {
-                                let response = json_response(
-                                    "403 Forbidden",
-                                    serde_json::json!({
-                                        "error": "principal does not allow this operation",
-                                        "principal": http_access_context.principal.as_value(),
-                                        "permission": decision.permission,
-                                        "reason": decision.reason,
-                                    })
-                                    .to_string(),
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            } else {
-                                let body_text = read_request_body(&mut stream, &header_text).await;
-                                let (status, body) = access_enrollment_decide_response_body(
-                                    &body_text,
-                                    &http_access_context.principal,
-                                );
-                                let response = with_fleet_cors(
-                                    json_response(status_reason(status), body),
-                                    fleet_cors_origin.as_deref(),
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            }
-                        }
-                    } else if req_path == "/api/access/enrollment-requests" {
-                        use tokio::io::AsyncWriteExt;
-                        let body = access_enrollment_requests_response_body();
-                        let response = with_fleet_cors(
-                            json_response("200 OK", body),
-                            fleet_cors_origin.as_deref(),
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path == "/api/access/iam/state" {
-                        use tokio::io::AsyncWriteExt;
-                        let body = access_iam_state_response_body();
-                        let response = with_fleet_cors(
-                            json_response("200 OK", body),
-                            fleet_cors_origin.as_deref(),
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path == "/api/access/overview" {
-                        use tokio::io::AsyncWriteExt;
-                        let body = access_overview_response_body_for_principal(
-                            &agent_card_value_for_targets,
-                            peer_registry.as_ref(),
-                            &http_access_context.principal,
-                        );
-                        let response = with_fleet_cors(
-                            json_response("200 OK", body),
-                            fleet_cors_origin.as_deref(),
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path == "/api/dashboard/targets" {
-                        use tokio::io::AsyncWriteExt;
-                        let body = dashboard_targets_response_body(
-                            &agent_card_value_for_targets,
-                            peer_registry.as_ref(),
-                        );
-                        let response = json_response("200 OK", body);
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if path_is_or_under(req_path, "/api/peers") {
-                        // Peer registry endpoints. Dispatch:
-                        //   GET    /api/peers                  → list
-                        //   POST   /api/peers                  → add
-                        //   DELETE /api/peers                  → remove
-                        //   POST   /api/peers/pairing/invite   → issue pairing invite
-                        //   POST   /api/peers/pairing/join     → import pairing invite
-                        //   POST   /api/peers/{id}/message     → send message
-                        //   POST   /api/peers/{id}/task        → delegate task
-                        //   POST   /api/peers/{id}/approval    → resolve approval
-                        //
-                        // When no registry is wired in (test call sites
-                        // that pass None), every request returns 503 so
-                        // the dashboard can render "peers unavailable"
-                        // instead of the empty list that a working-but-
-                        // empty registry would produce.
-                        use tokio::io::AsyncWriteExt;
-
-                        // Extract subpath after `/api/peers`. The list/
-                        // add/remove ops have an empty subpath; per-peer
-                        // ops have `/{id}/{op}`. Extract the *path*
-                        // token from the request line first (the second
-                        // whitespace-separated word) — splitting on
-                        // `/api/peers` directly would walk into the
-                        // ` HTTP/1.1` suffix and mistake `HTTP` and `1.1`
-                        // for path segments.
-                        let path_token = request_line.split_whitespace().nth(1).unwrap_or("");
-                        // Split path from query string. `/api/peers/eligible
-                        // ?capability=display` needs the query stripped before
-                        // we extract subpath segments.
-                        let (path, query_str) = match path_token.find('?') {
-                            Some(i) => (&path_token[..i], &path_token[i + 1..]),
-                            None => (path_token, ""),
-                        };
-                        let subpath = path
-                            .strip_prefix("/api/peers")
-                            .unwrap_or("")
-                            .trim_start_matches('/');
-                        let segments: Vec<&str> =
-                            subpath.split('/').filter(|s| !s.is_empty()).collect();
-
-                        let (status, body) = if segments == ["pairing", "invite"]
-                            && req_method == "POST"
-                        {
-                            let body_text = read_request_body(&mut stream, &header_text).await;
-                            peers_pairing_invite(&body_text)
-                        } else if segments == ["pairing", "request-access"] && req_method == "POST"
-                        {
-                            let body_text = read_request_body(&mut stream, &header_text).await;
-                            peers_pairing_request_access(&body_text).await
-                        } else if segments == ["pairing", "request-access", "poll"]
-                            && req_method == "POST"
-                        {
-                            let body_text = read_request_body(&mut stream, &header_text).await;
-                            peers_pairing_request_access_poll(
-                                peer_registry.as_ref(),
-                                project_root.as_deref(),
-                                &body_text,
-                            )
-                            .await
-                        } else if segments == ["pairing", "requests"] && req_method == "GET" {
-                            peers_pairing_requests_list()
-                        } else if segments == ["pairing", "identities"] && req_method == "GET" {
-                            peers_pairing_identities_list()
-                        } else if segments == ["pairing", "identities", "revoke"]
-                            && req_method == "POST"
-                        {
-                            let body_text = read_request_body(&mut stream, &header_text).await;
-                            peers_pairing_identity_revoke(&body_text)
-                        } else if segments.len() == 4
-                            && segments[0] == "pairing"
-                            && segments[1] == "requests"
-                            && req_method == "POST"
-                        {
-                            let body_text = read_request_body(&mut stream, &header_text).await;
-                            peers_pairing_request_decision(segments[2], segments[3], &body_text)
-                        } else {
-                            match peer_registry.as_ref() {
-                                None => (
-                                    503,
-                                    serde_json::json!({
-                                        "error": "peer registry not configured"
-                                    })
-                                    .to_string(),
-                                ),
-                                Some(registry) if segments.is_empty() && req_method == "GET" => {
-                                    (200, peers_list_response_body(registry))
-                                }
-                                Some(registry)
-                                    if segments.is_empty()
-                                        && (req_method == "POST" || req_method == "DELETE") =>
-                                {
-                                    let body_text =
-                                        read_request_body(&mut stream, &header_text).await;
-                                    if req_method == "POST" {
-                                        peers_add(registry, project_root.as_deref(), &body_text)
-                                            .await
-                                    } else {
-                                        peers_remove(registry, &body_text).await
-                                    }
-                                }
-                                Some(registry)
-                                    if segments == ["eligible"] && req_method == "GET" =>
-                                {
-                                    // GET /api/peers/eligible?capability=display
-                                    // — list peers that satisfy all listed
-                                    // capabilities. The `eligible` segment is
-                                    // a reserved sub-path on /api/peers; an
-                                    // actual peer with that bare id would be
-                                    // shadowed here, but PeerId values always
-                                    // carry a `<kind>:` prefix so that's not
-                                    // a real collision.
-                                    peers_eligible(registry, query_str)
-                                }
-                                Some(registry)
-                                    if segments == ["pairing", "join"] && req_method == "POST" =>
-                                {
-                                    let body_text =
-                                        read_request_body(&mut stream, &header_text).await;
-                                    peers_pairing_join(
-                                        registry,
-                                        project_root.as_deref(),
-                                        &body_text,
-                                    )
-                                    .await
-                                }
-                                Some(registry) if segments.len() == 2 && req_method == "POST" => {
-                                    let id = url_path_decode(segments[0]);
-                                    let op = segments[1];
-                                    let body_text =
-                                        read_request_body(&mut stream, &header_text).await;
-                                    match op {
-                                        "message" => {
-                                            peers_send_message(registry, &id, &body_text).await
-                                        }
-                                        "task" => {
-                                            peers_delegate_task(registry, &id, &body_text).await
-                                        }
-                                        "approval" => {
-                                            peers_resolve_approval(registry, &id, &body_text).await
-                                        }
-                                        "webrtc" => {
-                                            peers_webrtc_signal(registry, &id, &body_text, &bus)
-                                                .await
-                                        }
-                                        "file-transfer-webrtc" => {
-                                            peers_file_transfer_signal(
-                                                registry, &id, &body_text, &bus,
-                                            )
-                                            .await
-                                        }
-                                        "dashboard-control-webrtc" => {
-                                            peers_dashboard_control_signal(
-                                                registry, &id, &body_text, &bus,
-                                            )
-                                            .await
-                                        }
-                                        other => (
-                                            404,
-                                            serde_json::json!({
-                                                "error": format!(
-                                                    "unknown peer op: {other}"
-                                                )
-                                            })
-                                            .to_string(),
-                                        ),
-                                    }
-                                }
-                                Some(_) => (
-                                    405,
-                                    serde_json::json!({
-                                        "error": "method not allowed"
-                                    })
-                                    .to_string(),
-                                ),
-                            }
-                        };
-                        let reason = match status {
-                            200 => "OK",
-                            400 => "Bad Request",
-                            404 => "Not Found",
-                            405 => "Method Not Allowed",
-                            500 => "Internal Server Error",
-                            502 => "Bad Gateway",
-                            503 => "Service Unavailable",
-                            _ => "Error",
-                        };
-                        let response = format!(
-                            "HTTP/1.1 {status} {reason}\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
-                             Access-Control-Allow-Headers: Content-Type\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {body}",
-                            body.len(),
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_path == "/api/coordinator/route" {
-                        // POST /api/coordinator/route — capability-based
-                        // task routing through the Coordinator primitive.
-                        // Body shape: {"required_capabilities": ["display",
-                        // ...], "task": {"instructions": "...", "context":
-                        // ..., "client_correlation_id": "..."}}.
-                        // Response: {"peer_id": "...", "task_id": "..."}
-                        // on success, structured error otherwise.
-                        use tokio::io::AsyncWriteExt;
-                        let (status, body) = match peer_registry.as_ref() {
-                            None => (
-                                503,
-                                serde_json::json!({
-                                    "error": "peer registry not configured"
-                                })
-                                .to_string(),
-                            ),
-                            Some(_) if req_method != "POST" => (
-                                405,
-                                serde_json::json!({
-                                    "error": "method not allowed"
-                                })
-                                .to_string(),
-                            ),
-                            Some(registry) => {
-                                let body_text = read_request_body(&mut stream, &header_text).await;
-                                coordinator_route(registry, &body_text).await
-                            }
-                        };
-                        let reason = match status {
-                            200 => "OK",
-                            400 => "Bad Request",
-                            404 => "Not Found",
-                            405 => "Method Not Allowed",
-                            500 => "Internal Server Error",
-                            502 => "Bad Gateway",
-                            503 => "Service Unavailable",
-                            _ => "Error",
-                        };
-                        let response = format!(
-                            "HTTP/1.1 {status} {reason}\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Access-Control-Allow-Methods: POST, OPTIONS\r\n\
-                             Access-Control-Allow-Headers: Content-Type\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {body}",
-                            body.len(),
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_path == "/debug" {
                         // Debug endpoint: returns agent state + voice connection info
                         let state = query_ctx.as_ref().map(|ctx| {
@@ -25410,142 +25578,6 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if req_method == "POST" && req_path == "/mcp" {
-                        // MCP Streamable HTTP endpoint.
-                        //
-                        // rmcp expects:
-                        //   - Requests (has `id`):   200 OK + Content-Type: application/json
-                        //   - Notifications (no `id`): 202 Accepted + empty body
-                        //   - GET for SSE stream:    405 Method Not Allowed (we don't support SSE push)
-                        //   - DELETE for session:    405 Method Not Allowed (stateless)
-                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
-                        if let Some(ref mcp) = mcp_server {
-                            let mcp_cors = mcp_cors_header_segment(&header_text, is_tls);
-                            // Bind the request to an access principal before
-                            // touching the body. Loopback reachability or a
-                            // shared token alone no longer authorizes the
-                            // tool surface — see `mcp_http_access_context`.
-                            let cert_dir = crate::access::backend::select_backend().cert_dir();
-                            let mcp_access = match mcp_http_access_context(
-                                &cert_dir,
-                                peer_connection_identity.as_ref(),
-                                tls_client_cert_fingerprint.as_deref(),
-                                tls_client_cert_present,
-                                is_tls,
-                                peer_addr,
-                                &header_text,
-                            ) {
-                                Ok(access) => access,
-                                Err((status, message)) => {
-                                    let reason = match status {
-                                        401 => "Unauthorized",
-                                        403 => "Forbidden",
-                                        _ => "Error",
-                                    };
-                                    let body = serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "id": serde_json::Value::Null,
-                                        "error": { "code": -32600, "message": message },
-                                    })
-                                    .to_string();
-                                    let response = format!(
-                                        "HTTP/1.1 {status} {reason}\r\n\
-                                         Content-Type: application/json\r\n\
-                                         {mcp_cors}\
-                                         Content-Length: {}\r\n\
-                                         Cache-Control: no-cache\r\n\
-                                         Connection: close\r\n\
-                                         \r\n\
-                                         {body}",
-                                        body.len(),
-                                    );
-                                    let _ = stream.write_all(response.as_bytes()).await;
-                                    finalize_http_stream(&mut stream).await;
-                                    return;
-                                }
-                            };
-                            let content_length: usize = header_text
-                                .lines()
-                                .find(|l| l.to_lowercase().starts_with("content-length:"))
-                                .and_then(|l| l.split(':').nth(1))
-                                .and_then(|v| v.trim().parse().ok())
-                                .unwrap_or(0);
-                            let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-                            let body_owned;
-                            let body_text = if peeked_body.len() >= content_length {
-                                crate::types::truncate_str(peeked_body, content_length)
-                            } else {
-                                let remaining = content_length.saturating_sub(peeked_body.len());
-                                let mut full = peeked_body.to_string();
-                                if remaining > 0 {
-                                    let mut rest = vec![0u8; remaining];
-                                    if stream.read_exact(&mut rest).await.is_ok() {
-                                        full.push_str(&String::from_utf8_lossy(&rest));
-                                    }
-                                }
-                                body_owned = full;
-                                &body_owned
-                            };
-                            let (mcp_session_id, codex_managed_context, tool_profile) =
-                                mcp_context_from_request_line(request_line);
-                            let outcome = handle_mcp_http_request(
-                                body_text,
-                                mcp,
-                                mcp_session_id.as_deref(),
-                                codex_managed_context,
-                                tool_profile.as_deref(),
-                                &mcp_access,
-                            )
-                            .await;
-                            let http_response = match outcome {
-                                McpHttpOutcome::Response(resp) => {
-                                    let json = serde_json::to_string(&resp).unwrap_or_default();
-                                    format!(
-                                        "HTTP/1.1 200 OK\r\n\
-                                         Content-Type: application/json\r\n\
-                                         {mcp_cors}\
-                                         Content-Length: {}\r\n\
-                                         \r\n\
-                                         {}",
-                                        json.len(),
-                                        json,
-                                    )
-                                }
-                                McpHttpOutcome::Accepted => format!(
-                                    "HTTP/1.1 202 Accepted\r\n\
-                                     {mcp_cors}\
-                                     Content-Length: 0\r\n\
-                                     \r\n"
-                                ),
-                            };
-                            let _ = stream.write_all(http_response.as_bytes()).await;
-                        } else {
-                            let err = r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"MCP server not available"}}"#;
-                            let http = format!(
-                                "HTTP/1.1 503 Service Unavailable\r\n\
-                                 Content-Type: application/json\r\n\
-                                 Content-Length: {}\r\n\
-                                 \r\n\
-                                 {}",
-                                err.len(),
-                                err
-                            );
-                            let _ = stream.write_all(http.as_bytes()).await;
-                        }
-                    } else if (req_method == "GET" || req_method == "DELETE") && req_path == "/mcp"
-                    {
-                        // MCP Streamable HTTP: GET (SSE stream) and DELETE (session cleanup)
-                        // are not supported by our stateless endpoint.  Return 405 so rmcp
-                        // gracefully falls back (skips SSE / ignores session delete).
-                        use tokio::io::AsyncWriteExt;
-                        let http = format!(
-                            "HTTP/1.1 405 Method Not Allowed\r\n\
-                             {}\
-                             Content-Length: 0\r\n\
-                             \r\n",
-                            mcp_cors_header_segment(&header_text, is_tls)
-                        );
-                        let _ = stream.write_all(http.as_bytes()).await;
                     } else if let Some(response) = dashboard_local_file_response(request_line) {
                         use tokio::io::AsyncWriteExt;
                         match response {
@@ -29791,13 +29823,13 @@ fn dashboard_http_operation(
     use crate::peer::access_policy::PeerOperation;
 
     // Routes declared in the gateway route table carry their own IAM
-    // operation; the hand-written residual below only covers families
-    // that have not been ported yet (it shrinks as they move and is
-    // deleted in the final migration phase). A residual rule may still
-    // answer for a ported path on a method the table doesn't declare —
-    // that keeps method-blind legacy classifications (e.g. GET
-    // /api/worktrees/inspect, which dispatch never served) byte-stable
-    // until the family's reckoning.
+    // operation — every dispatched route is declared there. The residual
+    // rules below cover only (method, path) combinations the table does
+    // NOT declare but this classifier historically gated anyway: method-
+    // blind subtree/exact rules whose non-served methods were still
+    // classified. They keep those answers byte-stable and are retired
+    // wholesale (with an explicit divergence review) in the final
+    // migration phase.
     match crate::gateway_routes::classify(req_method, req_path) {
         crate::gateway_routes::TableClassification::Matched(op) => return op,
         crate::gateway_routes::TableClassification::NoMatch => {}
@@ -29805,40 +29837,6 @@ fn dashboard_http_operation(
 
     if !req_path.starts_with("/api/") {
         return None;
-    }
-
-    match (req_method, req_path) {
-        ("POST", "/api/access/enrollment-requests/decide")
-        | ("POST", "/api/access/orgs/trust")
-        | ("POST", "/api/access/orgs/revoke")
-        | ("POST", "/api/access/org-grants/issue")
-        | ("POST", "/api/access/org-grants/revoke-member")
-        | ("POST", "/api/access/org-grants/issuers/init")
-        | ("POST", "/api/access/org-grants/issuers/delegate")
-        | ("POST", "/api/access/org-grants/issuers/install") => {
-            return Some(PeerOperation::AccessManage)
-        }
-        ("GET", "/api/access/enrollment-requests") => return Some(PeerOperation::AccessInspect),
-        ("GET", "/api/access/overview")
-        | ("GET", "/api/access/iam/state")
-        | ("GET", "/api/dashboard/targets") => return Some(PeerOperation::AccessInspect),
-        ("POST", "/api/access/iam/user-client-grants")
-        | ("POST", "/api/access/iam/grants/update") => return Some(PeerOperation::AccessManage),
-        ("GET", "/api/project-root") => return Some(PeerOperation::Settings),
-        ("GET", "/api/settings") | ("GET", "/api/api-key-status") => {
-            return Some(PeerOperation::Settings);
-        }
-        ("GET", "/api/external-agents") => return Some(PeerOperation::SessionInspect),
-        ("POST", "/api/settings") | ("POST", "/api/api-keys") => {
-            return Some(PeerOperation::Settings);
-        }
-        // The /api/fs/* family is table-declared (method-exact there and
-        // here, so no residual rule is needed).
-        ("POST", "/api/diagnostics/visual-freshness") => {
-            return Some(PeerOperation::DisplayInput);
-        }
-        ("GET", "/api/displays") => return Some(PeerOperation::DisplayView),
-        _ => {}
     }
 
     // Boundary rule matches dispatch: exact path or a real `/` segment
@@ -29860,9 +29858,7 @@ fn dashboard_http_operation(
     }
     // Worktree routes are table-declared with their real (exact) methods;
     // these residual rules only fire for OTHER methods, which dispatch
-    // never served but this classifier always gated. Kept so ported
-    // families stay classification-identical until the residual is
-    // retired wholesale in the final migration phase.
+    // never served but this classifier always gated.
     if req_path == "/api/worktrees/inspect" {
         return Some(PeerOperation::SessionInspect);
     }
@@ -29871,10 +29867,6 @@ fn dashboard_http_operation(
     }
     if req_path == "/api/worktrees" {
         return Some(PeerOperation::SessionInspect);
-    }
-    // /api/sessions (any method) is table-declared.
-    if path_is_or_under(req_path, "/api/peers") {
-        return crate::peer::access_policy::federation_http_operation(req_method, req_path);
     }
 
     None
@@ -41720,9 +41712,12 @@ mod tests {
         assert_eq!(dashboard_http_operation("GET", "/api/fs/delete"), None);
         assert_eq!(dashboard_http_operation("POST", "/api/fs/writeable"), None);
         assert_eq!(dashboard_http_operation("POST", "/api/fs/deleted"), None);
+        // Historically unclassified (browsers ungated); the table row
+        // delegates to federation_http_operation, closing the gap the
+        // federation bearer gate already closed for peers.
         assert_eq!(
             dashboard_http_operation("POST", "/api/coordinator/route"),
-            None
+            Some(PeerOperation::Task)
         );
         assert_eq!(dashboard_http_operation("GET", "/config"), None);
         // The prefix families use the same boundary rule as dispatch:
@@ -41925,7 +41920,16 @@ mod tests {
             "/api/dashboard/targets",
             "/api/peers",
             "/api/peers/p1/message",
+            "/api/peers/eligible",
+            "/api/peers/pairing/invite",
+            "/api/peers/pairing/join",
             "/api/peers/pairing/requests",
+            "/api/peers/pairing/requests/r1/approve",
+            "/api/peers/pairing/identities",
+            "/api/peers/pairing/identities/revoke",
+            "/api/peers/pairing/request-access",
+            "/api/peer-pairing/requests",
+            "/api/peer-pairing/requests/req1",
             "/api/peersfoo",
             "/api/coordinator/route",
             "/api/",
@@ -41943,37 +41947,75 @@ mod tests {
     /// The differential migration test: the live (table-first) classifier
     /// must answer exactly like the frozen legacy snapshot for the whole
     /// corpus. When porting a family deliberately tightens a method-blind
-    /// legacy rule, add the (method, path) here with a justification —
-    /// never weaken silently.
+    /// legacy rule, add the (method, path) to a divergence class here with
+    /// a justification — never weaken silently.
     #[test]
     fn dashboard_http_operation_matches_frozen_legacy_reference() {
-        // (method, path) pairs where the table deliberately diverges from
-        // the legacy snapshot, each a fail-closed tightening:
-        //
-        // /api/sessions/stream and /api/sessions/search were served by
-        // method-agnostic dispatch arms but never classified — browser
-        // principals hit them with no IAM gate at all (peers were already
-        // SessionInspect-gated by federation_http_operation). Their table
-        // rows declare SessionInspect, so they now classify on every
-        // method instead of never.
-        let allowed_divergences: &[(&str, &str)] = &[
-            ("GET", "/api/sessions/stream"),
-            ("POST", "/api/sessions/stream"),
-            ("DELETE", "/api/sessions/stream"),
-            ("PUT", "/api/sessions/stream"),
-            ("PATCH", "/api/sessions/stream"),
-            ("HEAD", "/api/sessions/stream"),
-            ("GET", "/api/sessions/search"),
-            ("POST", "/api/sessions/search"),
-            ("DELETE", "/api/sessions/search"),
-            ("PUT", "/api/sessions/search"),
-            ("PATCH", "/api/sessions/search"),
-            ("HEAD", "/api/sessions/search"),
-        ];
+        const ALL_METHODS: [&str; 6] = ["GET", "POST", "DELETE", "PUT", "PATCH", "HEAD"];
+        let mut allowed: std::collections::HashSet<(&str, &str)> = Default::default();
 
-        for method in ["GET", "POST", "DELETE", "PUT", "PATCH", "HEAD"] {
+        // Class 1 — served but never classified: dispatch answered these
+        // while the hand classifier returned None, so browser principals
+        // were entirely ungated (peers were already gated by
+        // federation_http_operation, which the table rows now delegate to
+        // or mirror). Fail-closed fix.
+        for path in [
+            "/api/sessions/stream",
+            "/api/sessions/search",
+            "/api/coordinator/route",
+        ] {
+            for method in ALL_METHODS {
+                allowed.insert((method, path));
+            }
+        }
+
+        // Class 2 — method-blind admin arms: the legacy arms answered 405
+        // JSON for non-POST methods but only POST was classified. The
+        // `Any` table rows now classify every method with the arm's
+        // operation — a narrow principal gets 403 where it used to see
+        // the unauthenticated 405. Fail-closed cosmetic.
+        for path in [
+            "/api/access/iam/user-client-grants",
+            "/api/access/iam/grants/update",
+            "/api/access/orgs/trust",
+            "/api/access/orgs/revoke",
+            "/api/access/org-grants/issue",
+            "/api/access/org-grants/revoke-member",
+            "/api/access/org-grants/issuers/init",
+            "/api/access/org-grants/issuers/delegate",
+            "/api/access/org-grants/issuers/install",
+            "/api/access/enrollment-requests/decide",
+        ] {
+            for method in ["GET", "DELETE", "PUT", "PATCH", "HEAD"] {
+                allowed.insert((method, path));
+            }
+        }
+
+        // Class 3 — method-blind read arms: served every method, but only
+        // GET was classified (e.g. DELETE /api/settings returned the
+        // settings body with no IAM gate at all). Same fail-closed
+        // direction as class 2.
+        for path in [
+            "/api/access/enrollment-requests",
+            "/api/access/iam/state",
+            "/api/access/overview",
+            "/api/dashboard/targets",
+            "/api/displays",
+            "/api/project-root",
+            "/api/api-key-status",
+            "/api/external-agents",
+        ] {
+            for method in ["POST", "DELETE", "PUT", "PATCH", "HEAD"] {
+                allowed.insert((method, path));
+            }
+        }
+        for method in ["DELETE", "PUT", "PATCH", "HEAD"] {
+            allowed.insert((method, "/api/settings"));
+        }
+
+        for method in ALL_METHODS {
             for path in classifier_corpus_paths() {
-                if allowed_divergences.contains(&(method, path)) {
+                if allowed.contains(&(method, path)) {
                     continue;
                 }
                 assert_eq!(
@@ -41998,42 +42040,10 @@ mod tests {
             ("POST", "/connect/dashboard/ice"),
             ("POST", "/connect/dashboard/close"),
             ("GET", "/frames/f1"),
-            ("GET", "/api/project-root"),
-            ("POST", "/api/settings"),
-            ("GET", "/api/settings"),
-            ("POST", "/api/diagnostics/visual-freshness"),
-            ("POST", "/api/api-keys"),
-            ("GET", "/api/api-key-status"),
-            ("GET", "/api/external-agents"),
             ("POST", "/session"),
             ("GET", "/recordings"),
             ("GET", "/recordings/stream1/meta"),
-            ("GET", "/api/displays"),
-            ("GET", "/api/access/overview"),
-            ("GET", "/api/access/iam/state"),
-            ("POST", "/api/access/iam/user-client-grants"),
-            ("POST", "/api/access/iam/grants/update"),
-            ("GET", "/api/access/enrollment-requests"),
-            ("POST", "/api/access/enrollment-requests/decide"),
-            ("POST", "/api/access/orgs/trust"),
-            ("POST", "/api/access/orgs/revoke"),
-            ("GET", "/api/access/orgs/acme/revocations"),
-            ("POST", "/api/access/orgs/revocations/apply"),
-            ("POST", "/api/access/org-grants"),
-            ("POST", "/api/access/org-grants/renew"),
-            ("POST", "/api/access/org-grants/issue"),
-            ("POST", "/api/access/org-grants/revoke-member"),
-            ("GET", "/api/dashboard/targets"),
-            ("GET", "/api/peers"),
-            ("POST", "/api/peers"),
-            ("POST", "/api/peers/p1/message"),
-            ("POST", "/api/peers/pairing/request-access"),
-            ("GET", "/api/peers/pairing/requests"),
-            ("POST", "/api/coordinator/route"),
             ("GET", "/debug"),
-            ("POST", "/mcp"),
-            ("GET", "/mcp"),
-            ("DELETE", "/mcp"),
             ("GET", "/config"),
             ("GET", "/.well-known/agent-card.json"),
             ("GET", "/index.html"),

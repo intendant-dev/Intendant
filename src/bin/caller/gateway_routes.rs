@@ -109,15 +109,20 @@ pub(crate) enum RouteAuthz {
     Operation(PeerOperation),
     /// Deliberately public: no IAM gate; the payload's own
     /// signature/shape is the authority (the peer access-request
-    /// doorbell, the org-revocation apply endpoint). Forces a route to
-    /// SAY it is public instead of falling through a match.
-    #[allow(dead_code)] // declared from phase 2 (doorbell/org-grant routes)
+    /// doorbell, the signed org-grant/revocation endpoints). Forces a
+    /// route to SAY it is public instead of falling through a match.
     Public,
     /// `/mcp`: token-bound inside the handler, with the scoped
     /// own/app-origin CORS echo. Classifies as no `PeerOperation` (the
     /// MCP layer enforces per-tool IAM itself).
-    #[allow(dead_code)] // declared from phase 2 (/mcp routes)
     McpToken,
+    /// The federation surface (`/api/peers`, `/api/coordinator/*`):
+    /// the IAM operation is method-and-path dependent and already
+    /// canonically defined by `federation_http_operation` — the same
+    /// function the pre-dispatch federation bearer gate consults.
+    /// Delegating keeps one source of truth instead of transcribing its
+    /// ladder into rows that would drift from the gate.
+    PeerFederation,
 }
 
 /// Which CORS/preflight posture the route gets.
@@ -128,10 +133,8 @@ pub(crate) enum CorsPosture {
     /// ACAO header.
     OwnOrigin,
     /// The fleet Access APIs: echo only fleet-allowlisted origins.
-    #[allow(dead_code)] // declared from phase 2 (Access family)
     FleetAllowlist,
     /// The public doorbell class: open by design.
-    #[allow(dead_code)] // declared from phase 2 (doorbell routes)
     Public,
 }
 
@@ -198,6 +201,41 @@ pub(crate) enum RouteHandlerId {
     SessionsStream,
     SessionsSearch,
     SessionsList,
+    ProjectRoot,
+    SettingsPost,
+    SettingsGet,
+    ApiKeysPost,
+    ApiKeyStatus,
+    ExternalAgents,
+    DiagnosticsVisualFreshness,
+    Displays,
+    /// The public peer access-request doorbell (create + status poll).
+    Doorbell,
+    /// Shared by the user-client-grants / grants-update pair (one legacy
+    /// arm served both paths).
+    AccessIamGrants,
+    AccessOrgGrantPresent,
+    AccessOrgRevocations,
+    /// Shared by the signed public org endpoints (ORL apply + grant
+    /// renew) — one legacy arm, per-path body caps inside.
+    AccessOrgApplyRenew,
+    /// Shared by the seven org administration paths (trust, revoke,
+    /// issue, revoke-member, issuers init/delegate/install).
+    AccessOrgManage,
+    AccessEnrollmentDecide,
+    AccessEnrollmentRequests,
+    AccessIamState,
+    AccessOverview,
+    DashboardTargets,
+    /// The whole /api/peers registry + pairing sub-router, moved
+    /// verbatim (its internal shapes stay as they were; leaf-shape
+    /// declarations are a deliberate follow-up, not part of the
+    /// mechanical migration).
+    PeersSubRouter,
+    CoordinatorRoute,
+    McpPost,
+    /// Shared by the GET/DELETE /mcp rows (stateless 405 responder).
+    McpStream,
 }
 
 pub(crate) struct Route {
@@ -213,8 +251,7 @@ pub(crate) struct Route {
 }
 
 /// Compact constructor for the common row shape: IAM-gated via a
-/// `PeerOperation`, own-origin CORS. Fleet-CORS / public / MCP rows
-/// (phase 2) get their own constructors or explicit literals.
+/// `PeerOperation`, own-origin CORS.
 const fn op_route(
     method: RouteMethod,
     pattern: PathPattern,
@@ -227,6 +264,65 @@ const fn op_route(
         method,
         pattern,
         authz: RouteAuthz::Operation(op),
+        cors: CorsPosture::OwnOrigin,
+        body,
+        handler,
+        doc,
+    }
+}
+
+/// Fleet Access API rows: IAM-gated, fleet-allowlisted CORS.
+const fn fleet_route(
+    method: RouteMethod,
+    pattern: PathPattern,
+    op: PeerOperation,
+    body: BodyPolicy,
+    handler: RouteHandlerId,
+    doc: &'static str,
+) -> Route {
+    Route {
+        method,
+        pattern,
+        authz: RouteAuthz::Operation(op),
+        cors: CorsPosture::FleetAllowlist,
+        body,
+        handler,
+        doc,
+    }
+}
+
+/// Deliberately public rows (doorbell class): no IAM gate, public CORS.
+const fn public_route(
+    method: RouteMethod,
+    pattern: PathPattern,
+    body: BodyPolicy,
+    handler: RouteHandlerId,
+    doc: &'static str,
+) -> Route {
+    Route {
+        method,
+        pattern,
+        authz: RouteAuthz::Public,
+        cors: CorsPosture::Public,
+        body,
+        handler,
+        doc,
+    }
+}
+
+/// Federation-surface rows: the IAM operation delegates to
+/// `federation_http_operation` (see `RouteAuthz::PeerFederation`).
+const fn federation_route(
+    method: RouteMethod,
+    pattern: PathPattern,
+    body: BodyPolicy,
+    handler: RouteHandlerId,
+    doc: &'static str,
+) -> Route {
+    Route {
+        method,
+        pattern,
+        authz: RouteAuthz::PeerFederation,
         cors: CorsPosture::OwnOrigin,
         body,
         handler,
@@ -575,6 +671,281 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::SessionsList,
         "List sessions (id filter, limit, usage view; response CORS * for the fleet Stats tab)",
     ),
+    // ── Settings / info endpoints. `Any` rows port arms that were
+    //    method-blind in the legacy chain; their single declared
+    //    operation now classifies every method (fail-closed vs the
+    //    residual classifier's method-specific holes — allowlisted in
+    //    the differential test).
+    op_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/project-root"),
+        PeerOperation::Settings,
+        BodyPolicy::None,
+        RouteHandlerId::ProjectRoot,
+        "Project root path this daemon serves",
+    ),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/settings"),
+        PeerOperation::Settings,
+        BodyPolicy::Default,
+        RouteHandlerId::SettingsPost,
+        "Update runtime settings",
+    ),
+    op_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/settings"),
+        PeerOperation::Settings,
+        BodyPolicy::None,
+        RouteHandlerId::SettingsGet,
+        "Current runtime settings",
+    ),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/api-keys"),
+        PeerOperation::Settings,
+        BodyPolicy::Default,
+        RouteHandlerId::ApiKeysPost,
+        "Store provider API keys in the project .env",
+    ),
+    op_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/api-key-status"),
+        PeerOperation::Settings,
+        BodyPolicy::None,
+        RouteHandlerId::ApiKeyStatus,
+        "Which provider keys are configured (presence only)",
+    ),
+    op_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/external-agents"),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::ExternalAgents,
+        "Detected external coding agents (codex, claude)",
+    ),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/diagnostics/visual-freshness"),
+        PeerOperation::DisplayInput,
+        BodyPolicy::Default,
+        RouteHandlerId::DiagnosticsVisualFreshness,
+        "Visual-freshness diagnostics transcript sink (NDJSON body)",
+    ),
+    op_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/displays"),
+        PeerOperation::DisplayView,
+        BodyPolicy::None,
+        RouteHandlerId::Displays,
+        "Enumerate active displays",
+    ),
+    // ── Public doorbell + signed org endpoints. The payload's own
+    //    signature/shape is the authority; RouteAuthz::Public makes the
+    //    no-IAM-gate decision explicit (these paths are also exempted by
+    //    the mTLS and origin gates, which match on the same constants).
+    public_route(
+        RouteMethod::Any,
+        PathPattern::Under(crate::peer::access_request::PUBLIC_REQUEST_PATH),
+        BodyPolicy::Capped,
+        RouteHandlerId::Doorbell,
+        "Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath)",
+    ),
+    public_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/org-grants"),
+        BodyPolicy::Capped,
+        RouteHandlerId::AccessOrgGrantPresent,
+        "Present a signed org grant document (verified against locally trusted org keys)",
+    ),
+    public_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/access/orgs",
+            &[
+                SegmentSpec::Capture("org_handle"),
+                SegmentSpec::Literal("revocations"),
+            ],
+        ),
+        BodyPolicy::None,
+        RouteHandlerId::AccessOrgRevocations,
+        "Org revocation list (ORL) for a trusted org",
+    ),
+    public_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/orgs/revocations/apply"),
+        BodyPolicy::Capped,
+        RouteHandlerId::AccessOrgApplyRenew,
+        "Apply a signed org revocation list",
+    ),
+    public_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/org-grants/renew"),
+        BodyPolicy::Capped,
+        RouteHandlerId::AccessOrgApplyRenew,
+        "Renew an org grant document (signed payload)",
+    ),
+    // ── Access administration (fleet-CORS where the anchor page needs
+    //    to read responses; own-origin otherwise).
+    fleet_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/iam/user-client-grants"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessIamGrants,
+        "Upsert a user-client grant",
+    ),
+    fleet_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/iam/grants/update"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessIamGrants,
+        "Update an IAM grant",
+    ),
+    fleet_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/orgs/trust"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessOrgManage,
+        "Trust an org root key on this daemon",
+    ),
+    fleet_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/orgs/revoke"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessOrgManage,
+        "Withdraw trust in an org root key",
+    ),
+    op_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/org-grants/issue"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessOrgManage,
+        "Issue an org grant (org root/issuer key on this daemon)",
+    ),
+    op_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/org-grants/revoke-member"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessOrgManage,
+        "Revoke an org member (appends to the ORL)",
+    ),
+    op_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/org-grants/issuers/init"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessOrgManage,
+        "Initialize an org issuer key",
+    ),
+    op_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/org-grants/issuers/delegate"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessOrgManage,
+        "Delegate to an org issuer",
+    ),
+    op_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/org-grants/issuers/install"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessOrgManage,
+        "Install a delegated org issuer key",
+    ),
+    fleet_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/enrollment-requests/decide"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessEnrollmentDecide,
+        "Approve or deny a pending enrollment request",
+    ),
+    fleet_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/enrollment-requests"),
+        PeerOperation::AccessInspect,
+        BodyPolicy::None,
+        RouteHandlerId::AccessEnrollmentRequests,
+        "Pending enrollment requests",
+    ),
+    fleet_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/iam/state"),
+        PeerOperation::AccessInspect,
+        BodyPolicy::None,
+        RouteHandlerId::AccessIamState,
+        "Local IAM state (roles, grants, bindings)",
+    ),
+    fleet_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/access/overview"),
+        PeerOperation::AccessInspect,
+        BodyPolicy::None,
+        RouteHandlerId::AccessOverview,
+        "Access overview for the calling principal",
+    ),
+    op_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/dashboard/targets"),
+        PeerOperation::AccessInspect,
+        BodyPolicy::None,
+        RouteHandlerId::DashboardTargets,
+        "Dashboard target list (this daemon + connected peers)",
+    ),
+    // ── Federation surface: registry, pairing, quick controls,
+    //    capability routing. One verbatim sub-router row per family;
+    //    IAM delegates to federation_http_operation (see
+    //    RouteAuthz::PeerFederation).
+    federation_route(
+        RouteMethod::Any,
+        PathPattern::Under("/api/peers"),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Peer registry (list/add/remove), pairing (invite/join/requests/identities), eligibility, and per-peer quick controls + signaling relays",
+    ),
+    federation_route(
+        RouteMethod::Any,
+        PathPattern::Exact("/api/coordinator/route"),
+        BodyPolicy::Default,
+        RouteHandlerId::CoordinatorRoute,
+        "Capability-based task routing through the Coordinator",
+    ),
+    // ── MCP Streamable HTTP (token-bound inside the handler; the
+    //    per-tool IAM gate lives in the MCP layer).
+    Route {
+        method: RouteMethod::Post,
+        pattern: PathPattern::Exact("/mcp"),
+        authz: RouteAuthz::McpToken,
+        cors: CorsPosture::OwnOrigin,
+        body: BodyPolicy::Default,
+        handler: RouteHandlerId::McpPost,
+        doc: "MCP Streamable HTTP endpoint (JSON-RPC requests + notifications)",
+    },
+    Route {
+        method: RouteMethod::Get,
+        pattern: PathPattern::Exact("/mcp"),
+        authz: RouteAuthz::McpToken,
+        cors: CorsPosture::OwnOrigin,
+        body: BodyPolicy::None,
+        handler: RouteHandlerId::McpStream,
+        doc: "MCP SSE stream (405: stateless server)",
+    },
+    Route {
+        method: RouteMethod::Delete,
+        pattern: PathPattern::Exact("/mcp"),
+        authz: RouteAuthz::McpToken,
+        cors: CorsPosture::OwnOrigin,
+        body: BodyPolicy::None,
+        handler: RouteHandlerId::McpStream,
+        doc: "MCP session delete (405: stateless server)",
+    },
 ];
 
 fn segments_match<'p>(
@@ -661,9 +1032,63 @@ pub(crate) fn classify(req_method: &str, req_path: &str) -> TableClassification 
         Some((route, _)) => TableClassification::Matched(match route.authz {
             RouteAuthz::Operation(op) => Some(op),
             RouteAuthz::Public | RouteAuthz::McpToken => None,
+            RouteAuthz::PeerFederation => {
+                crate::peer::access_policy::federation_http_operation(req_method, req_path)
+            }
         }),
         None => TableClassification::NoMatch,
     }
+}
+
+/// CORS/preflight posture for a path: the first row matching it on any
+/// method. The posture-consistency invariant test guarantees every row
+/// sharing a path agrees, so "first" is well-defined — and preflight
+/// deriving from the same declaration as dispatch is what makes the
+/// preflight-looser-than-endpoint bug class unrepresentable.
+pub(crate) fn preflight_posture(req_path: &str) -> Option<CorsPosture> {
+    ROUTES.iter().find_map(|route| {
+        let mut scratch = Vec::new();
+        pattern_matches(&route.pattern, req_path, &mut scratch).then_some(route.cors)
+    })
+}
+
+/// `Access-Control-Allow-Methods` value for a path: the union of
+/// declared methods across all rows matching it, plus OPTIONS. `None`
+/// when no route matches (callers fall back to the legacy fixed lists).
+pub(crate) fn allowed_methods_for_path(req_path: &str) -> Option<String> {
+    let (mut get, mut post, mut delete, mut matched) = (false, false, false, false);
+    for route in ROUTES {
+        let mut scratch = Vec::new();
+        if !pattern_matches(&route.pattern, req_path, &mut scratch) {
+            continue;
+        }
+        matched = true;
+        match route.method {
+            RouteMethod::Get => get = true,
+            RouteMethod::Post => post = true,
+            RouteMethod::Delete => delete = true,
+            RouteMethod::Any => {
+                get = true;
+                post = true;
+                delete = true;
+            }
+        }
+    }
+    if !matched {
+        return None;
+    }
+    let mut methods: Vec<&str> = Vec::new();
+    if get {
+        methods.push("GET");
+    }
+    if post {
+        methods.push("POST");
+    }
+    if delete {
+        methods.push("DELETE");
+    }
+    methods.push("OPTIONS");
+    Some(methods.join(", "))
 }
 
 // Live through render_endpoint_docs (see its note on call sites).
@@ -702,6 +1127,7 @@ fn authz_doc_label(authz: &RouteAuthz) -> String {
         RouteAuthz::Operation(op) => format!("{op:?}"),
         RouteAuthz::Public => "public".to_string(),
         RouteAuthz::McpToken => "MCP token".to_string(),
+        RouteAuthz::PeerFederation => "federation (per method/path)".to_string(),
     }
 }
 
@@ -783,8 +1209,14 @@ mod tests {
         }
     }
 
-    fn methods_overlap(a: RouteMethod, b: RouteMethod) -> bool {
-        a == RouteMethod::Any || b == RouteMethod::Any || a == b
+    /// True when every method `later` accepts is also accepted by
+    /// `earlier` — the condition under which an earlier row can actually
+    /// starve a later one. A method-specific row before an `Any` row on
+    /// the same path is fine (the `Any` row still serves the remaining
+    /// methods, exactly like the legacy specific-arm-then-blind-arm
+    /// pattern it ports).
+    fn method_covers(earlier: RouteMethod, later: RouteMethod) -> bool {
+        earlier == RouteMethod::Any || earlier == later
     }
 
     fn pattern_base(pattern: &PathPattern) -> &'static str {
@@ -799,7 +1231,7 @@ mod tests {
     fn every_route_is_reachable_no_shadowing() {
         for (j, later) in ROUTES.iter().enumerate() {
             for (i, earlier) in ROUTES[..j].iter().enumerate() {
-                if !methods_overlap(earlier.method, later.method) {
+                if !method_covers(earlier.method, later.method) {
                     continue;
                 }
                 let mut scratch = Vec::new();
@@ -829,6 +1261,61 @@ mod tests {
     }
 
     #[test]
+    fn rows_sharing_a_path_agree_on_cors_posture() {
+        // preflight_posture answers per path (OPTIONS carries no target
+        // method), so every row matching a given path must declare the
+        // same posture.
+        for route in ROUTES {
+            for path in representative_paths(&route.pattern) {
+                let mut scratch = Vec::new();
+                for other in ROUTES {
+                    scratch.clear();
+                    if pattern_matches(&other.pattern, &path, &mut scratch) {
+                        assert_eq!(
+                            other.cors, route.cors,
+                            "rows matching {path} disagree on CORS posture \
+                             ({:?} vs {:?})",
+                            other.pattern, route.pattern,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preflight_derivations_answer_for_declared_paths() {
+        assert_eq!(preflight_posture("/mcp"), Some(CorsPosture::OwnOrigin));
+        assert_eq!(
+            preflight_posture("/api/access/overview"),
+            Some(CorsPosture::FleetAllowlist)
+        );
+        assert_eq!(
+            preflight_posture(crate::peer::access_request::PUBLIC_REQUEST_PATH),
+            Some(CorsPosture::Public)
+        );
+        assert_eq!(
+            preflight_posture("/api/fs/write"),
+            Some(CorsPosture::OwnOrigin)
+        );
+        assert_eq!(preflight_posture("/api/sessionsfoo"), None);
+
+        assert_eq!(
+            allowed_methods_for_path("/mcp").as_deref(),
+            Some("GET, POST, DELETE, OPTIONS")
+        );
+        assert_eq!(
+            allowed_methods_for_path("/api/fs/write").as_deref(),
+            Some("POST, OPTIONS")
+        );
+        assert_eq!(
+            allowed_methods_for_path("/api/session/current/uploads").as_deref(),
+            Some("GET, POST, DELETE, OPTIONS")
+        );
+        assert_eq!(allowed_methods_for_path("/api/sessionsfoo"), None);
+    }
+
+    #[test]
     fn pattern_bases_are_normalized() {
         for route in ROUTES {
             let base = pattern_base(&route.pattern);
@@ -847,6 +1334,10 @@ mod tests {
         let shared: &[RouteHandlerId] = &[
             RouteHandlerId::SessionDelete,
             RouteHandlerId::SessionSubRouter,
+            RouteHandlerId::AccessIamGrants,
+            RouteHandlerId::AccessOrgApplyRenew,
+            RouteHandlerId::AccessOrgManage,
+            RouteHandlerId::McpStream,
         ];
         let mut seen: HashSet<RouteHandlerId> = HashSet::new();
         let mut previous: Option<RouteHandlerId> = None;
