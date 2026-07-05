@@ -3775,6 +3775,15 @@ fn codex_usage_snapshot(value: &serde_json::Value, model: &str) -> Option<AgentU
         0.0
     };
 
+    // Latest-request cache sample from the `last` bucket, for the vitals
+    // hit receipt. OpenAI has no cache-write concept and an undocumented
+    // TTL, so creation stays 0 and no flavor is stated.
+    let last_cache_read_tokens = last.and_then(codex_usage_cached_tokens).unwrap_or(0);
+    let last_uncached_input_tokens = last
+        .and_then(codex_usage_input_tokens)
+        .unwrap_or(0)
+        .saturating_sub(last_cache_read_tokens);
+
     Some(AgentUsageSnapshot {
         provider: "openai".to_string(),
         model: model.to_string(),
@@ -3785,6 +3794,12 @@ fn codex_usage_snapshot(value: &serde_json::Value, model: &str) -> Option<AgentU
         prompt_tokens,
         completion_tokens,
         cached_tokens,
+        last_cache_read_tokens,
+        last_cache_creation_tokens: 0,
+        last_uncached_input_tokens,
+        cache_ttl_seconds: None,
+        // Attached by the notification pump from its rate-limit state.
+        limits: Vec::new(),
     })
 }
 
@@ -4055,7 +4070,8 @@ async fn reader_task(
                 usage
             };
             let snapshot = codex_usage_snapshot(&usage, model.as_deref().unwrap_or("codex"));
-            if let Some(snapshot) = snapshot {
+            if let Some(mut snapshot) = snapshot {
+                snapshot.limits = notification_state.limit_windows.clone();
                 notification_state.latest_usage = Some(snapshot.clone());
                 send_scoped_agent_event(
                     &event_tx,
@@ -4063,6 +4079,26 @@ async fn reader_task(
                     turn_id.as_deref(),
                     AgentEvent::Usage { usage: snapshot },
                 );
+            }
+        }
+
+        if method == "account/rateLimits/updated" {
+            let windows = codex_rate_limit_windows(&params);
+            if !windows.is_empty() && windows != notification_state.limit_windows {
+                notification_state.limit_windows = windows;
+                // Refresh the gauges between turns by re-emitting the last
+                // usage snapshot with the new windows — never a bare
+                // zero-usage event, which would stomp the dashboard meter.
+                if let Some(mut latest) = notification_state.latest_usage.clone() {
+                    latest.limits = notification_state.limit_windows.clone();
+                    notification_state.latest_usage = Some(latest.clone());
+                    send_scoped_agent_event(
+                        &event_tx,
+                        thread_id.as_deref(),
+                        turn_id.as_deref(),
+                        AgentEvent::Usage { usage: latest },
+                    );
+                }
             }
         }
 
@@ -4652,7 +4688,59 @@ fn codex_plan_entries(params: &serde_json::Value) -> Vec<(String, String, String
 struct CodexNotificationState {
     goal_known_active: bool,
     latest_usage: Option<AgentUsageSnapshot>,
+    /// Latest windows from `account/rateLimits/updated`, attached to
+    /// outgoing usage snapshots for the vitals limit gauges.
+    limit_windows: Vec<crate::types::SessionLimitWindow>,
     command_output_hygiene: HashMap<String, CodexCommandOutputHygiene>,
+}
+
+/// Parse an `account/rateLimits/updated` payload (app-server v2 shape:
+/// `rateLimits.{primary,secondary}.{usedPercent,windowDurationMins,
+/// resetsAt}`, camelCase with snake_case tolerated) into vitals windows.
+fn codex_rate_limit_windows(params: &serde_json::Value) -> Vec<crate::types::SessionLimitWindow> {
+    let snapshot = params
+        .get("rateLimits")
+        .or_else(|| params.get("rate_limits"))
+        .unwrap_or(params);
+    let mut windows = Vec::new();
+    for key in ["primary", "secondary"] {
+        let Some(window) = snapshot.get(key) else {
+            continue;
+        };
+        let Some(used) = window
+            .get("usedPercent")
+            .or_else(|| window.get("used_percent"))
+            .and_then(|v| v.as_f64())
+        else {
+            continue;
+        };
+        let minutes = window
+            .get("windowDurationMins")
+            .or_else(|| window.get("window_duration_mins"))
+            .or_else(|| window.get("window_minutes"))
+            .and_then(|v| v.as_u64());
+        windows.push(crate::types::SessionLimitWindow {
+            label: codex_rate_limit_label(minutes, key),
+            used_pct: used.round().clamp(0.0, 100.0) as u8,
+            resets_at_epoch: window
+                .get("resetsAt")
+                .or_else(|| window.get("resets_at"))
+                .and_then(|v| v.as_u64()),
+        });
+    }
+    windows
+}
+
+/// Compact gauge label for a Codex rate-limit window duration.
+fn codex_rate_limit_label(minutes: Option<u64>, bucket: &str) -> String {
+    match minutes {
+        Some(300) => "5h".to_string(),
+        Some(10080) => "7d".to_string(),
+        Some(m) if m > 0 && m % 1440 == 0 => format!("{}d", m / 1440),
+        Some(m) if m > 0 && m % 60 == 0 => format!("{}h", m / 60),
+        Some(m) if m > 0 => format!("{m}m"),
+        _ => bucket.to_string(),
+    }
 }
 
 const CODEX_WARNING_DIAGNOSTIC_INLINE_LIMIT: usize = 3;
@@ -8104,7 +8192,7 @@ mod tests {
                 "outputTokens": 200,
                 "totalTokens": 1200
             },
-            "last": {"inputTokens": 100, "outputTokens": 25, "totalTokens": 125},
+            "last": {"inputTokens": 100, "cachedInputTokens": 60, "outputTokens": 25, "totalTokens": 125},
             "modelContextWindow": 128000,
             "modelHardContextWindow": 272000
         });
@@ -8125,6 +8213,12 @@ mod tests {
         assert_eq!(snapshot.completion_tokens, 200);
         assert_eq!(snapshot.cached_tokens, 300);
         assert!((snapshot.usage_pct - (125.0 / 128000.0 * 100.0)).abs() < 1e-12);
+        // Cache-vitals sample comes from the `last` bucket; OpenAI states
+        // no TTL flavor.
+        assert_eq!(snapshot.last_cache_read_tokens, 60);
+        assert_eq!(snapshot.last_uncached_input_tokens, 40);
+        assert_eq!(snapshot.last_cache_creation_tokens, 0);
+        assert_eq!(snapshot.cache_ttl_seconds, None);
     }
 
     #[test]
@@ -8234,6 +8328,41 @@ mod tests {
 
         let merged = codex_usage_preserving_hard_context_window(expanded, Some(&previous));
         assert_eq!(codex_usage_hard_context_window(&merged), Some(200));
+    }
+
+    #[test]
+    fn codex_rate_limit_windows_parse_app_server_shape() {
+        // App-server v2 wire shape (camelCase; snake_case tolerated).
+        let params = serde_json::json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 34, "windowDurationMins": 300, "resetsAt": 1783300000},
+                "secondary": {"usedPercent": 12, "windowDurationMins": 10080}
+            }
+        });
+        let windows = codex_rate_limit_windows(&params);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "5h");
+        assert_eq!(windows[0].used_pct, 34);
+        assert_eq!(windows[0].resets_at_epoch, Some(1_783_300_000));
+        assert_eq!(windows[1].label, "7d");
+        assert_eq!(windows[1].used_pct, 12);
+        assert_eq!(windows[1].resets_at_epoch, None);
+
+        let snake = serde_json::json!({
+            "rate_limits": {
+                "primary": {"used_percent": 91.4, "window_minutes": 60}
+            }
+        });
+        let windows = codex_rate_limit_windows(&snake);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "1h");
+        assert_eq!(windows[0].used_pct, 91);
+
+        assert!(codex_rate_limit_windows(&serde_json::json!({})).is_empty());
+        assert_eq!(codex_rate_limit_label(Some(2880), "primary"), "2d");
+        assert_eq!(codex_rate_limit_label(Some(45), "primary"), "45m");
+        assert_eq!(codex_rate_limit_label(None, "secondary"), "secondary");
     }
 
     #[test]
@@ -10120,6 +10249,7 @@ error: build failed
                 prompt_tokens: 97_000,
                 completion_tokens: 3_000,
                 cached_tokens: 0,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -10175,6 +10305,7 @@ error: build failed
                 prompt_tokens: 83_000,
                 completion_tokens: 3_000,
                 cached_tokens: 0,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -10218,6 +10349,7 @@ error: build failed
                 prompt_tokens: 18_000,
                 completion_tokens: 2_000,
                 cached_tokens: 0,
+                ..Default::default()
             }),
             ..Default::default()
         };

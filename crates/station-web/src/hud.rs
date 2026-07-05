@@ -10,11 +10,11 @@ use crate::input::{HitAction, HitZone, ViewSliderKey};
 use crate::model::activity_retained_count;
 use crate::scene::{ndc_to_screen, LayoutName, Mood, NodeKind, ProjectedNode, Vec2};
 use crate::util::{
-    attention_level_color_css, css_rgba, fmt_compact, goal_status_color_css, hex_color,
-    level_color_css, nonempty, pct_label, percent, phase_color_css, pressure_color,
-    tone_color_css, truncate, Color, C_BLUE, C_BLUE_CSS, C_GREEN_CSS, C_LAVENDER, C_LAVENDER_CSS,
-    C_MAUVE_CSS, C_OVERLAY1, C_OVERLAY1_CSS, C_PEACH, C_PEACH_CSS, C_RED_CSS, C_SUBTEXT0_CSS,
-    C_TEAL, C_TEAL_CSS, C_TEXT_CSS, C_YELLOW_CSS,
+    attention_level_color_css, css_rgba, epoch_seconds_now, fmt_compact, fmt_countdown,
+    goal_status_color_css, hex_color, level_color_css, nonempty, pct_label, percent,
+    phase_color_css, pressure_color, tone_color_css, truncate, Color, C_BLUE, C_BLUE_CSS,
+    C_GREEN_CSS, C_LAVENDER, C_LAVENDER_CSS, C_MAUVE_CSS, C_OVERLAY1, C_OVERLAY1_CSS, C_PEACH,
+    C_PEACH_CSS, C_RED_CSS, C_SUBTEXT0_CSS, C_TEAL, C_TEAL_CSS, C_TEXT_CSS, C_YELLOW_CSS,
 };
 use crate::StationInner;
 
@@ -2915,10 +2915,15 @@ impl StationInner {
         let is_session = !agent.session_id.trim().is_empty();
         let has_goal =
             !agent.goal_objective.trim().is_empty() || !agent.goal_status.trim().is_empty();
+        let has_cache_vitals = agent.cache_hit_pct >= 0.0
+            || (agent.cache_ttl_seconds > 0.0 && agent.cache_last_activity_epoch > 0.0);
         let rows = 5
             + usize::from(!agent.worktree.trim().is_empty())
             + usize::from(has_goal)
             + usize::from(!agent.relationship_kind.trim().is_empty())
+            + usize::from(!agent.vitals_git.trim().is_empty())
+            + usize::from(has_cache_vitals)
+            + usize::from(!agent.vitals_limits.trim().is_empty())
             + if approval { 2 } else { 0 };
         let panel_h = 74.0
             + rows as f32 * 17.0
@@ -3067,6 +3072,61 @@ impl StationInner {
             usage.push_str(&format!(" / turn {}", agent.turns));
         }
         row_y = self.focus_row(x, row_y, panel_w, "usage", &usage, C_LAVENDER_CSS);
+        if !agent.vitals_git.trim().is_empty() {
+            let color = if agent.vitals_git_conflict {
+                C_RED_CSS
+            } else {
+                C_TEAL_CSS
+            };
+            row_y = self.focus_row(x, row_y, panel_w, "git", agent.vitals_git.trim(), color);
+        }
+        if agent.cache_hit_pct >= 0.0 || agent.cache_ttl_seconds > 0.0 {
+            // Same tiers as the dashboard chip (fragment 39): hit green
+            // ≥90 / yellow ≥50 / red, countdown red in its final minute,
+            // cold dimmed.
+            let mut text = String::new();
+            let mut color = C_SUBTEXT0_CSS;
+            if agent.cache_hit_pct >= 0.0 {
+                let hit = agent.cache_hit_pct.clamp(0.0, 100.0);
+                text.push_str(&format!("⚡{}%", hit.round() as u32));
+                color = if hit >= 90.0 {
+                    C_GREEN_CSS
+                } else if hit >= 50.0 {
+                    C_YELLOW_CSS
+                } else {
+                    C_PEACH_CSS
+                };
+            }
+            let now = epoch_seconds_now();
+            if agent.cache_ttl_seconds > 0.0 && agent.cache_last_activity_epoch > 0.0 && now > 0.0
+            {
+                let remaining =
+                    agent.cache_ttl_seconds - (now - agent.cache_last_activity_epoch);
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                if remaining > 0.0 {
+                    text.push_str(&format!("⏳{}", fmt_countdown(remaining)));
+                    if remaining <= 60.0 {
+                        color = C_RED_CSS;
+                    }
+                } else {
+                    text.push_str("✗ cold");
+                    color = C_SUBTEXT0_CSS;
+                }
+            }
+            if !text.is_empty() {
+                row_y = self.focus_row(x, row_y, panel_w, "cache", &text, color);
+            }
+        }
+        if !agent.vitals_limits.trim().is_empty() {
+            let color = match agent.vitals_limits_state.trim() {
+                "crit" => C_RED_CSS,
+                "warn" => C_YELLOW_CSS,
+                _ => C_SUBTEXT0_CSS,
+            };
+            row_y = self.focus_row(x, row_y, panel_w, "limits", agent.vitals_limits.trim(), color);
+        }
         if !agent.worktree.trim().is_empty() {
             row_y = self.focus_row(
                 x,

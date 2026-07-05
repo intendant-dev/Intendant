@@ -903,6 +903,32 @@ pub(crate) fn shared_claude_config_from_project(project: &Project) -> control_pl
     ))
 }
 
+/// Live Codex config for the control plane — seeded from TOML, updated
+/// by SetCodex* ControlMsgs. The daemon loop and mode branches read
+/// this at the start of each task so a Control-tab toggle takes effect
+/// on the next task without a restart. (Twin of
+/// shared_claude_config_from_project above; was four inline copies in
+/// the mode branches before the wiring dedup.)
+pub(crate) fn shared_codex_config_from_project(
+    project: &Project,
+) -> control_plane::SharedCodexConfig {
+    let cfg = &project.config.agent.codex;
+    Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
+        command: cfg.command.clone(),
+        managed_command: cfg.managed_command.clone(),
+        sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
+        approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
+        model: cfg.model.clone(),
+        reasoning_effort: project::normalize_reasoning_effort(cfg.reasoning_effort.as_deref()),
+        service_tier: project::normalize_codex_service_tier(cfg.service_tier.as_deref()),
+        web_search: cfg.web_search,
+        network_access: cfg.network_access,
+        writable_roots: cfg.writable_roots.clone(),
+        managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
+        context_archive: project::normalize_codex_context_archive(&cfg.context_archive),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -441,6 +441,23 @@ fn usage_snapshot_from_api_usage(
     } else {
         0.0
     };
+    // TTL flavor for the cache-vitals countdown: only cache writes make a
+    // flavor statement (the per-TTL split rides a `cache_creation` object
+    // when the extended-TTL beta is active; a flat write defaults to 5 min).
+    let ephemeral = |key: &str| {
+        usage
+            .get("cache_creation")
+            .and_then(|c| c.get(key))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+    let cache_ttl_seconds = if ephemeral("ephemeral_1h_input_tokens") > 0 {
+        Some(3600)
+    } else if ephemeral("ephemeral_5m_input_tokens") > 0 || cache_creation > 0 {
+        Some(300)
+    } else {
+        None
+    };
     Some(AgentUsageSnapshot {
         provider: "anthropic".to_string(),
         model: model.to_string(),
@@ -451,6 +468,12 @@ fn usage_snapshot_from_api_usage(
         prompt_tokens,
         completion_tokens: output,
         cached_tokens: cache_read,
+        last_cache_read_tokens: cache_read,
+        last_cache_creation_tokens: cache_creation,
+        last_uncached_input_tokens: input,
+        cache_ttl_seconds,
+        // Attached by the reader from its rate-limit gauge state.
+        limits: Vec::new(),
     })
 }
 
@@ -617,6 +640,10 @@ struct CcReader {
     /// when the result arrives; ids orphaned by an interrupted turn are
     /// inert (tool_use ids never recur) and merely idle here.
     plan_tools: HashSet<String>,
+    /// Latest rate-limit window per `rateLimitType` (`five_hour`,
+    /// `seven_day`) from `rate_limit_event` — attached to outgoing usage
+    /// snapshots for the vitals limit gauges. BTreeMap for stable order.
+    limit_windows: std::collections::BTreeMap<String, crate::types::SessionLimitWindow>,
     /// Most recent model name seen (init message / message_start).
     model: String,
     context_window: u64,
@@ -646,6 +673,7 @@ impl CcReader {
             task_children: HashMap::new(),
             task_ids: HashMap::new(),
             plan_tools: HashSet::new(),
+            limit_windows: std::collections::BTreeMap::new(),
             model: "claude".to_string(),
             context_window: DEFAULT_CONTEXT_WINDOW,
             last_call_usage: None,
@@ -1303,10 +1331,11 @@ impl CcReader {
                 // Final usage for one API call within the turn — the live
                 // context-footprint signal during long multi-tool turns.
                 if let Some(usage) = event.get("usage") {
-                    if let Some(snapshot) =
+                    if let Some(mut snapshot) =
                         usage_snapshot_from_api_usage(usage, &self.model, self.context_window)
                     {
                         self.last_call_usage = Some(usage.clone());
+                        snapshot.limits = self.current_limit_windows();
                         out.events.push(AgentEvent::Usage { usage: snapshot });
                     }
                 }
@@ -1362,9 +1391,10 @@ impl CcReader {
             // result usage only when no per-call usage was streamed (then
             // the turn had a single call and the sum IS that call).
             let meter_usage = last_call_usage.as_ref().unwrap_or(usage);
-            if let Some(snapshot) =
+            if let Some(mut snapshot) =
                 usage_snapshot_from_api_usage(meter_usage, &self.model, self.context_window)
             {
+                snapshot.limits = self.current_limit_windows();
                 out.events.push(AgentEvent::Usage { usage: snapshot });
             }
         }
@@ -1535,18 +1565,47 @@ impl CcReader {
         let Some(info) = msg.get("rate_limit_info") else {
             return;
         };
-        let status = info.get("status").and_then(|s| s.as_str()).unwrap_or("");
-        if status.is_empty() || status == "allowed" {
-            return;
-        }
         let kind = info
             .get("rateLimitType")
             .and_then(|t| t.as_str())
             .unwrap_or("unknown");
+        // Vitals gauge: every event with a utilization updates the window
+        // (live wire: {"status":"allowed_warning","resetsAt":…,
+        // "rateLimitType":"seven_day","utilization":0.49}). Attached to
+        // the next usage snapshot rather than emitted on its own — an
+        // all-zero usage event would stomp the dashboard meter.
+        if let Some(utilization) = info.get("utilization").and_then(|v| v.as_f64()) {
+            self.limit_windows.insert(
+                kind.to_string(),
+                crate::types::SessionLimitWindow {
+                    label: cc_rate_limit_label(kind),
+                    used_pct: (utilization * 100.0).round().clamp(0.0, 100.0) as u8,
+                    resets_at_epoch: info.get("resetsAt").and_then(|v| v.as_u64()),
+                },
+            );
+        }
+        let status = info.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        if status.is_empty() || status == "allowed" {
+            return;
+        }
         out.log(
             "warn",
             format!("Claude Code rate limit: status {status} ({kind} window)"),
         );
+    }
+
+    /// Current rate-limit windows for attaching to usage snapshots.
+    fn current_limit_windows(&self) -> Vec<crate::types::SessionLimitWindow> {
+        self.limit_windows.values().cloned().collect()
+    }
+}
+
+/// Compact gauge label for a Claude Code `rateLimitType`.
+fn cc_rate_limit_label(kind: &str) -> String {
+    match kind {
+        "five_hour" => "5h".to_string(),
+        "seven_day" => "7d".to_string(),
+        other => other.replace('_', " "),
     }
 }
 
@@ -3475,6 +3534,44 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_windows_attach_to_usage_snapshots() {
+        let mut reader = test_reader();
+        // Live wire shape (probed on 2.1.201): utilization is a fraction,
+        // resetsAt unix seconds. An "allowed" status still updates the
+        // gauge without warning.
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1783807200,"rateLimitType":"seven_day","utilization":0.49,"isUsingOverage":false},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1783300000,"rateLimitType":"five_hour","utilization":0.121},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"cache_read_input_tokens":90,"output_tokens":5}},"session_id":"s1"}"#,
+        );
+        let usage = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Usage { usage } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("usage snapshot");
+        assert_eq!(usage.limits.len(), 2);
+        // BTreeMap order: five_hour before seven_day.
+        assert_eq!(usage.limits[0].label, "5h");
+        assert_eq!(usage.limits[0].used_pct, 12);
+        assert_eq!(usage.limits[0].resets_at_epoch, Some(1_783_300_000));
+        assert_eq!(usage.limits[1].label, "7d");
+        assert_eq!(usage.limits[1].used_pct, 49);
+        // Events without a utilization leave the gauges untouched.
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        assert!(reader.current_limit_windows().is_empty());
+    }
+
+    #[test]
     fn interrupt_control_request_serialization() {
         let request = CcControlRequest {
             msg_type: "control_request".into(),
@@ -3825,6 +3922,57 @@ mod tests {
             200000,
         )
         .is_some());
+    }
+
+    #[test]
+    fn usage_snapshot_carries_cache_sample_and_ttl_flavor() {
+        let snapshot = usage_snapshot_from_api_usage(
+            &serde_json::json!({
+                "input_tokens": 10,
+                "output_tokens": 37,
+                "cache_read_input_tokens": 25028,
+                "cache_creation_input_tokens": 62,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 62
+                }
+            }),
+            "claude-haiku-4-5-20251001",
+            200000,
+        )
+        .expect("usage present");
+        assert_eq!(snapshot.prompt_tokens, 25100);
+        assert_eq!(snapshot.cached_tokens, 25028);
+        assert_eq!(snapshot.last_cache_read_tokens, 25028);
+        assert_eq!(snapshot.last_cache_creation_tokens, 62);
+        assert_eq!(snapshot.last_uncached_input_tokens, 10);
+        assert_eq!(snapshot.cache_ttl_seconds, Some(3600), "1h split wins");
+
+        // Flat creation without the split object → the 5-minute default.
+        let flat = usage_snapshot_from_api_usage(
+            &serde_json::json!({
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 40
+            }),
+            "claude-haiku-4-5-20251001",
+            200000,
+        )
+        .expect("usage present");
+        assert_eq!(flat.cache_ttl_seconds, Some(300));
+
+        // Read-only responses make no flavor statement.
+        let read_only = usage_snapshot_from_api_usage(
+            &serde_json::json!({
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 900
+            }),
+            "claude-haiku-4-5-20251001",
+            200000,
+        )
+        .expect("usage present");
+        assert_eq!(read_only.cache_ttl_seconds, None);
     }
 
     #[test]

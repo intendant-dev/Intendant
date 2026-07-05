@@ -64,7 +64,7 @@ pub struct StatusSnapshot {
 }
 
 /// Token usage snapshot for a single model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelUsageSnapshot {
     pub provider: String,
     pub model: String,
@@ -84,6 +84,27 @@ pub struct ModelUsageSnapshot {
     /// Cumulative cached tokens (subset of prompt_tokens, cheaper pricing).
     #[serde(default)]
     pub cached_tokens: u64,
+    /// Latest request's prompt-cache sample (reads / writes / uncached
+    /// input) — feeds the cache-vitals hit receipt. All-zero when the
+    /// backend reports no per-request split.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub last_cache_read_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub last_cache_creation_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub last_uncached_input_tokens: u64,
+    /// Prompt-cache TTL implied by the latest cache write, seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_seconds: Option<u32>,
+    /// Latest known provider rate-limit windows (subscription 5h/7d,
+    /// per-minute API windows) — feeds the vitals limit gauges. Empty when
+    /// the backend has reported none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<crate::types::SessionLimitWindow>,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// Combined usage snapshot for all models.

@@ -389,6 +389,22 @@ window.stationProbe = Object.assign(window.stationProbe || {}, {
   },
   openTranscript: (sessionId, source) => stationOpenTranscript(sessionId, source ? { source } : {}),
   openDiff: (path) => stationOpenDiff(path),
+  // Read-only session-store accessors for probes: the app script is
+  // module-scoped, so validators cannot reach these directly.
+  sessionMeta: (sid) => {
+    try {
+      return JSON.parse(JSON.stringify(sessionMetadataById.get(String(sid)) || null));
+    } catch (_) {
+      return null;
+    }
+  },
+  primarySessionId: () => {
+    try {
+      return String(currentSessionFullId || '');
+    } catch (_) {
+      return '';
+    }
+  },
   select: (target) => {
     station?.select_by_id?.(target ? String(target) : null);
     return station?.debug_state?.() || '';

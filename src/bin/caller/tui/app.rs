@@ -527,6 +527,10 @@ pub struct App {
     pub session_prompt_tokens: u64,
     pub session_completion_tokens: u64,
     pub session_cached_tokens: u64,
+    /// Usage of the latest native model response — the per-request
+    /// prompt-cache sample (reads / writes / uncached / TTL) forwarded on
+    /// derived usage snapshots for the cache vitals.
+    last_response_usage: Option<crate::provider::TokenUsage>,
     pub context_window: u64,
     /// Freshest main-model usage observed on the bus. External backends
     /// (Codex, Claude Code) report usage through `AppEvent::UsageSnapshot`
@@ -656,6 +660,7 @@ impl App {
             session_prompt_tokens: 0,
             session_completion_tokens: 0,
             session_cached_tokens: 0,
+            last_response_usage: None,
             context_window: 0,
             last_main_usage: None,
             session_id: String::new(),
@@ -719,6 +724,7 @@ impl App {
         if let Some(observed) = &self.last_main_usage {
             return observed.clone();
         }
+        let last = self.last_response_usage.as_ref();
         crate::frontend::ModelUsageSnapshot {
             provider: self.provider_name.clone(),
             model: self.model_name.clone(),
@@ -729,6 +735,18 @@ impl App {
             prompt_tokens: self.session_prompt_tokens,
             completion_tokens: self.session_completion_tokens,
             cached_tokens: self.session_cached_tokens,
+            last_cache_read_tokens: last.map(|u| u.cached_tokens).unwrap_or(0),
+            last_cache_creation_tokens: last.map(|u| u.cache_creation_tokens).unwrap_or(0),
+            last_uncached_input_tokens: last
+                .map(|u| {
+                    u.prompt_tokens
+                        .saturating_sub(u.cached_tokens + u.cache_creation_tokens)
+                })
+                .unwrap_or(0),
+            cache_ttl_seconds: last.and_then(|u| u.cache_ttl_seconds),
+            limits: last
+                .map(|u| u.rate_limit_windows.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -746,6 +764,7 @@ impl App {
                 prompt_tokens: self.presence_prompt_tokens,
                 completion_tokens: self.presence_completion_tokens,
                 cached_tokens: self.presence_cached_tokens,
+                ..Default::default()
             })
     }
 
@@ -2122,6 +2141,7 @@ impl App {
                     self.session_prompt_tokens += usage.prompt_tokens;
                     self.session_completion_tokens += usage.completion_tokens;
                     self.session_cached_tokens += usage.cached_tokens;
+                    self.last_response_usage = Some(usage.clone());
                     // Locally accumulated counters are the authoritative
                     // freshest data now — don't let an older observed
                     // snapshot shadow them.

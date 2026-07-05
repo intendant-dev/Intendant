@@ -294,6 +294,25 @@ pub(crate) fn now_ms() -> f64 {
     0.0
 }
 
+/// Wall-clock unix seconds (`Date.now()`), for countdowns anchored to
+/// server-stamped epochs (the cache-TTL vitals row). Native tests get 0 —
+/// callers treat 0 as "no clock" and skip live countdowns.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn epoch_seconds_now() -> f64 {
+    js_sys::Date::now() / 1000.0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn epoch_seconds_now() -> f64 {
+    0.0
+}
+
+/// `m:ss` for a cache-TTL countdown.
+pub(crate) fn fmt_countdown(seconds: f64) -> String {
+    let s = seconds.max(0.0) as u64;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

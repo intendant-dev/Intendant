@@ -3199,17 +3199,7 @@ pub(crate) fn handle_idle_codex_subagent_event(
         external_agent::AgentEvent::Usage { usage } => {
             config.bus.send(AppEvent::UsageSnapshot {
                 session_id,
-                main: frontend::ModelUsageSnapshot {
-                    provider: usage.provider,
-                    model: usage.model,
-                    tokens_used: usage.tokens_used,
-                    context_window: usage.context_window,
-                    hard_context_window: usage.hard_context_window,
-                    usage_pct: usage.usage_pct,
-                    prompt_tokens: usage.prompt_tokens,
-                    completion_tokens: usage.completion_tokens,
-                    cached_tokens: usage.cached_tokens,
-                },
+                main: usage.into_model_snapshot(),
                 presence: None,
             });
         }
@@ -3335,6 +3325,7 @@ mod tests {
             completion_tokens: 200,
             total_tokens: 1_200,
             cached_tokens: 900,
+            ..Default::default()
         };
         assert_eq!(goal_fresh_tokens(&usage), 300);
         // Degenerate provider reports (cached > prompt) saturate at output.
@@ -3343,6 +3334,7 @@ mod tests {
             completion_tokens: 50,
             total_tokens: 150,
             cached_tokens: 400,
+            ..Default::default()
         };
         assert_eq!(goal_fresh_tokens(&weird), 50);
     }

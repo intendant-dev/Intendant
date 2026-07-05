@@ -36,28 +36,15 @@ pub(crate) async fn run_headless_mode(
 
         // Headless mode: no WebTui or terminal TUI is active.
         let bus = EventBus::new();
-        let _recording_listener = recording::spawn_recording_listener(
-            bus.subscribe(),
-            recording_registry.clone(),
-            bus.clone(),
-            Some(session_registry.clone()),
-        );
-        let _user_display_listener = spawn_user_display_listener(
-            bus.clone(),
-            session_registry.clone(),
-            Some(frame_registry.clone()),
+        let _session_listeners = startup::wiring::spawn_session_listeners(
+            &bus,
+            &recording_registry,
+            &session_registry,
+            &frame_registry,
         );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
-        let _debug_handler = if use_web {
-            Some(debug::spawn_debug_screen_handler(
-                bus.subscribe(),
-                project.config.recording.clone(),
-                web_port,
-                bus.clone(),
-            ))
-        } else {
-            None
-        };
+        let _debug_handler =
+            startup::wiring::spawn_debug_handler(&bus, &project, web_port, use_web);
 
         // Outbound broadcast channel — shared by web gateway and JSON stdout subscriber
         let (outbound_tx, _) = tokio::sync::broadcast::channel::<String>(256);
@@ -66,41 +53,10 @@ pub(crate) async fn run_headless_mode(
         let _outbound_broadcaster =
             event::spawn_outbound_broadcaster(bus.subscribe(), outbound_tx.clone());
 
-        // Wire session log writer: persists bus events that aren't logged inline.
-        let _session_log_writer =
-            event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
+        let _log_sinks = startup::wiring::spawn_log_sinks(&bus, &session_log);
 
-        let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
-
-        // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) =
-            if !file_watcher::root_is_snapshot_worthy(&project.root) {
-                // Fallback roots (no .git / intendant.toml — e.g. a service's
-                // $HOME WorkingDirectory) must never be baseline-scanned: it
-                // blocks boot for minutes and shadow-copies the whole tree.
-                eprintln!(
-                    "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
-                 intendant.toml) — start intendant inside a project to enable rewind",
-                    project.root.display()
-                );
-                (None, None, None)
-            } else {
-                let snapshot_dir = log_dir.join("file_snapshots");
-                match file_watcher::FileWatcher::new(
-                    project.root.clone(),
-                    snapshot_dir,
-                    bus.clone(),
-                ) {
-                    Ok(watcher) => {
-                        let (fw, wh, rh) = watcher.start_shared();
-                        (Some(fw), Some(wh), Some(rh))
-                    }
-                    Err(e) => {
-                        eprintln!("[file_watcher] Failed to start: {}", e);
-                        (None, None, None)
-                    }
-                }
-            };
+            startup::wiring::start_project_file_watcher(&project.root, &log_dir, &bus);
 
         // JSON stdout subscriber: prints OutboundEvents as JSONL to stdout
         if flags.json_output {
@@ -120,94 +76,38 @@ pub(crate) async fn run_headless_mode(
 
         // Web gateway in headless mode
         let headless_shared_session: Option<web_gateway::SharedActiveSession> = if use_web {
-            let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
-                if project.config.transcription.enabled {
-                    match transcription::WhisperTranscriber::new(&project.config.transcription) {
-                        Ok(t) => Some(std::sync::Arc::new(t)),
-                        Err(e) => {
-                            eprintln!("Transcription init failed: {}", e);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-            let mut config = web_gateway::build_config(
-                project.config.presence.live_provider.as_deref(),
-                project.config.presence.live_model.as_deref(),
-                project.config.transcription.enabled,
-                project.config.webrtc.to_ice_config(),
-                project.config.webrtc.federation_allow_h264,
-            );
-            config.peer_access_requests = project.config.server.peer_access_requests.clone();
-            config.connect = project.config.connect.clone().effective_with_env();
-            config.presence_enabled = runtime_presence_enabled;
-            config.external_agent = initial_agent_backend
-                .as_ref()
-                .map(|backend| backend.as_short_str().to_string());
-            let snapshot_dir = log_dir.join("file_snapshots");
-            let shared_session =
-                Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
-                    daemon_session_id: session_log_id(&session_log),
-                    query_ctx: None,
-                    frame_registry: Some(frame_registry.clone()),
-                    session_log: Some(session_log.clone()),
-                    recording_registry: Some(recording_registry.clone()),
-                    session_registry: Some(session_registry.clone()),
-                    snapshot_dir: Some(snapshot_dir.clone()),
-                    project_root_for_changes: Some(project.root.clone()),
-                    runtime_settings: web_gateway::RuntimeSettingsState {
-                        external_agent: Some(shared_external_agent.clone()),
-                        presence_enabled: Some(runtime_presence_enabled),
-                    },
-                    file_watcher: shared_file_watcher.clone(),
-                }));
-            let mut mcp_http_state = mcp::McpAppState::new(
-                "none".into(),
-                "none".into(),
-                autonomy.clone(),
-                log_dir.clone(),
-            );
-            mcp_http_state.codex_managed_context =
-                project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
-            mcp_http_state.configured_codex_managed_context = mcp_http_state.codex_managed_context;
-            mcp_http_state.frame_registry = Some(frame_registry.clone());
-            mcp_http_state.session_registry = Some(session_registry.clone());
-            mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
-            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
-                Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
-                bus.clone(),
-            )));
-            let peer_registry = build_and_hydrate_peer_registry(&log_dir, &project.config.peers);
-            let advertise_urls = resolve_advertise_urls_from_flags_and_config(flags, &project);
-            let _web_handle = web_gateway::spawn_web_gateway(
-                web_listener
-                    .take()
-                    .expect("web listener must exist when use_web"),
-                bus.clone(),
-                outbound_tx.clone(),
-                config,
-                shared_session.clone(),
-                transcriber,
-                None, // Headless mode: no WebTui
-                None, // No task_tx in headless mode
-                Some(project.root.clone()),
-                mcp_http_server,
-                Some(peer_registry),
-                advertise_urls,
-                project.config.server.auth.bearer_token.clone(),
-                build_local_advertised_auth(
-                    &project.config.server.auth,
-                    &access::backend::select_backend().cert_dir(),
-                )?,
+            let (transcriber, transcriber_err) =
+                startup::wiring::build_transcriber(&project.config.transcription);
+            if let Some(err) = transcriber_err {
+                eprintln!("{}", err);
+            }
+            let gateway = startup::wiring::spawn_mode_web_gateway(
+                flags,
+                &project,
+                &autonomy,
+                &log_dir,
+                &session_log,
+                &bus,
+                &mut web_listener,
                 web_tls_client_cert_required,
-                web_tls_acceptor.clone(),
-            );
-            eprintln!(
-                "{}",
-                web_tui_log_line(&web_tls_acceptor, web_port, web_bind_ip)
-            );
-            Some(shared_session)
+                &web_tls_acceptor,
+                web_port,
+                web_bind_ip,
+                runtime_presence_enabled,
+                &initial_agent_backend,
+                &shared_external_agent,
+                &frame_registry,
+                &session_registry,
+                &recording_registry,
+                &shared_file_watcher,
+                transcriber,
+                outbound_tx.clone(),
+                None, // query_ctx: headless has no dashboard agent-state queries
+                Some(session_log.clone()),
+                None, // web_tui_tx: headless has no WebTui
+            )?;
+            eprintln!("{}", gateway.log_line);
+            Some(gateway.shared_session)
         } else {
             None
         };
@@ -345,29 +245,7 @@ pub(crate) async fn run_headless_mode(
         // External agent backend resolved at startup; the shared runtime handle
         // above is kept in sync by ControlPlane SetExternalAgent messages.
         let agent_backend = initial_agent_backend.clone();
-        let shared_codex_config: control_plane::SharedCodexConfig = {
-            let cfg = &project.config.agent.codex;
-            Arc::new(tokio::sync::RwLock::new(
-                control_plane::CodexRuntimeConfig {
-                    command: cfg.command.clone(),
-                    managed_command: cfg.managed_command.clone(),
-                    sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
-                    approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
-                    model: cfg.model.clone(),
-                    reasoning_effort: project::normalize_reasoning_effort(
-                        cfg.reasoning_effort.as_deref(),
-                    ),
-                    service_tier: project::normalize_codex_service_tier(
-                        cfg.service_tier.as_deref(),
-                    ),
-                    web_search: cfg.web_search,
-                    network_access: cfg.network_access,
-                    writable_roots: cfg.writable_roots.clone(),
-                    managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
-                    context_archive: project::normalize_codex_context_archive(&cfg.context_archive),
-                },
-            ))
-        };
+        let shared_codex_config = shared_codex_config_from_project(&project);
         let shared_claude_config = shared_claude_config_from_project(&project);
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),

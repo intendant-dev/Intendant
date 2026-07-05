@@ -72,12 +72,67 @@ const STREAM_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
+    /// Full prompt-side context of the request, including cache reads and
+    /// cache writes. Every provider parser normalizes to this convention —
+    /// `cached_tokens` and `cache_creation_tokens` are subsets.
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
     /// Tokens served from cache (subset of prompt_tokens, cheaper pricing).
     #[serde(default)]
     pub cached_tokens: u64,
+    /// Tokens written to cache this request (subset of prompt_tokens;
+    /// Anthropic bills these at a premium — providers without a write
+    /// concept leave 0).
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    /// Prompt-cache TTL implied by this response's cache writes (Anthropic
+    /// 300s default, 3600s with the extended-TTL beta). `None` when the
+    /// response makes no flavor statement — consumers keep the last known
+    /// value or fall back to a provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_seconds: Option<u32>,
+    /// Provider rate-limit windows read from this response's headers
+    /// (Anthropic `anthropic-ratelimit-*`; empty for providers or
+    /// transports that expose none — the credential-egress relay strips
+    /// headers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rate_limit_windows: Vec<crate::types::SessionLimitWindow>,
+}
+
+/// Parse Anthropic's per-minute rate-limit headers into vitals windows.
+/// `-reset` is RFC 3339; a missing or unparsable header degrades to a
+/// gauge without a countdown.
+fn anthropic_rate_limit_windows_from_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Vec<crate::types::SessionLimitWindow> {
+    let read = |name: String| headers.get(name).and_then(|v| v.to_str().ok());
+    let mut windows = Vec::new();
+    for (label, prefix) in [
+        ("req/min", "anthropic-ratelimit-requests"),
+        ("tok/min", "anthropic-ratelimit-tokens"),
+    ] {
+        let limit = read(format!("{prefix}-limit")).and_then(|s| s.parse::<f64>().ok());
+        let remaining = read(format!("{prefix}-remaining")).and_then(|s| s.parse::<f64>().ok());
+        let (Some(limit), Some(remaining)) = (limit, remaining) else {
+            continue;
+        };
+        if limit <= 0.0 {
+            continue;
+        }
+        let used_pct = (((limit - remaining) / limit) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+        let resets_at_epoch = read(format!("{prefix}-reset"))
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp().max(0) as u64);
+        windows.push(crate::types::SessionLimitWindow {
+            label: label.to_string(),
+            used_pct,
+            resets_at_epoch,
+        });
+    }
+    windows
 }
 
 /// A tool call returned by the model.
@@ -189,6 +244,17 @@ impl ProviderHttpResponse {
                     .map(|chunk| chunk.map(|bytes| bytes.to_vec()).map_err(|e| e.to_string())),
             ),
             ProviderHttpResponse::Egress(response) => Box::pin(response.bytes_stream()),
+        }
+    }
+
+    /// Anthropic rate-limit windows from the response headers; empty for
+    /// egress-relayed calls (the relay strips headers).
+    fn anthropic_rate_limit_windows(&self) -> Vec<crate::types::SessionLimitWindow> {
+        match self {
+            ProviderHttpResponse::Direct(response) => {
+                anthropic_rate_limit_windows_from_headers(response.headers())
+            }
+            ProviderHttpResponse::Egress(_) => Vec::new(),
         }
     }
 }
@@ -702,6 +768,9 @@ impl ChatProvider for OpenAIProvider {
                     completion_tokens: u.output_tokens,
                     total_tokens: u.total_tokens,
                     cached_tokens: cached,
+                    // OpenAI has no cache-write concept and an undocumented
+                    // (~5–10 min) TTL — no flavor statement.
+                    ..Default::default()
                 }
             })
             .unwrap_or_default();
@@ -1274,11 +1343,72 @@ struct AnthropicContent {
 
 #[derive(Deserialize)]
 struct AnthropicUsage {
+    /// Uncached prompt tokens only — Anthropic reports cache reads and
+    /// writes as separate counters, unlike OpenAI where `cached` is a
+    /// subset of the prompt total.
     input_tokens: u64,
     output_tokens: u64,
-    /// Tokens read from Anthropic prompt cache (subset of input_tokens).
+    /// Tokens read from Anthropic prompt cache.
     #[serde(default)]
     cache_read_input_tokens: u64,
+    /// Tokens written to the prompt cache this request.
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    /// Per-TTL breakdown of cache writes (present when the extended-TTL
+    /// beta is active).
+    #[serde(default)]
+    cache_creation: Option<AnthropicCacheCreation>,
+}
+
+#[derive(Default, Deserialize)]
+struct AnthropicCacheCreation {
+    #[serde(default)]
+    ephemeral_5m_input_tokens: u64,
+    #[serde(default)]
+    ephemeral_1h_input_tokens: u64,
+}
+
+/// The TTL flavor a response's cache writes imply. Only creation makes a
+/// flavor statement — read-only responses return `None` and consumers keep
+/// the last known flavor.
+fn anthropic_cache_ttl_seconds(
+    cache_creation_input_tokens: u64,
+    cache_creation: Option<&AnthropicCacheCreation>,
+) -> Option<u32> {
+    if let Some(split) = cache_creation {
+        if split.ephemeral_1h_input_tokens > 0 {
+            return Some(3600);
+        }
+        if split.ephemeral_5m_input_tokens > 0 {
+            return Some(300);
+        }
+    }
+    (cache_creation_input_tokens > 0).then_some(300)
+}
+
+impl AnthropicUsage {
+    /// Normalize to the [`TokenUsage`] convention: `prompt_tokens` is the
+    /// full context footprint (uncached + cache reads + cache writes), with
+    /// the cache counters as subsets. Anthropic's raw `input_tokens`
+    /// excludes cache traffic, which used to make cached sessions underread
+    /// context pressure and misprice input tokens.
+    fn to_token_usage(&self) -> TokenUsage {
+        let prompt_tokens =
+            self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens;
+        TokenUsage {
+            prompt_tokens,
+            completion_tokens: self.output_tokens,
+            total_tokens: prompt_tokens + self.output_tokens,
+            cached_tokens: self.cache_read_input_tokens,
+            cache_creation_tokens: self.cache_creation_input_tokens,
+            cache_ttl_seconds: anthropic_cache_ttl_seconds(
+                self.cache_creation_input_tokens,
+                self.cache_creation.as_ref(),
+            ),
+            // Header-derived; attached by the transport paths.
+            rate_limit_windows: Vec::new(),
+        }
+    }
 }
 
 pub struct AnthropicProvider {
@@ -1522,6 +1652,7 @@ impl ChatProvider for AnthropicProvider {
             )));
         }
 
+        let rate_limit_windows = response.anthropic_rate_limit_windows();
         let chat_response: AnthropicChatResponse = response.json().await?;
 
         // Extract text content, tool_use blocks, and CU blocks
@@ -1570,15 +1701,11 @@ impl ChatProvider for AnthropicProvider {
 
         let content = text_parts.join("");
 
-        let usage = chat_response
+        let mut usage = chat_response
             .usage
-            .map(|u| TokenUsage {
-                prompt_tokens: u.input_tokens,
-                completion_tokens: u.output_tokens,
-                total_tokens: u.input_tokens + u.output_tokens,
-                cached_tokens: u.cache_read_input_tokens,
-            })
+            .map(|u| u.to_token_usage())
             .unwrap_or_default();
+        usage.rate_limit_windows = rate_limit_windows;
 
         Ok(ChatResponse {
             content,
@@ -1700,7 +1827,10 @@ impl ChatProvider for AnthropicProvider {
         let mut current_tool_json = String::new();
         let mut current_tool_id = String::new();
         let mut current_tool_name = String::new();
-        let mut usage = TokenUsage::default();
+        let mut usage = TokenUsage {
+            rate_limit_windows: response.anthropic_rate_limit_windows(),
+            ..Default::default()
+        };
         let mut line_buf = String::new();
 
         let mut stream = response.bytes_stream();
@@ -1808,16 +1938,21 @@ impl ChatProvider for AnthropicProvider {
                             }
                             "message_start" => {
                                 if let Some(msg) = event.get("message") {
-                                    if let Some(u) = msg.get("usage") {
-                                        let input = u
-                                            .get("input_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0);
-                                        usage.prompt_tokens = input;
-                                        usage.cached_tokens = u
-                                            .get("cache_read_input_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0);
+                                    if let Some(parsed) = msg
+                                        .get("usage")
+                                        .cloned()
+                                        .and_then(|u| {
+                                            serde_json::from_value::<AnthropicUsage>(u).ok()
+                                        })
+                                    {
+                                        // Prompt-side counters only; output
+                                        // arrives later via message_delta.
+                                        let prompt_side = parsed.to_token_usage();
+                                        usage.prompt_tokens = prompt_side.prompt_tokens;
+                                        usage.cached_tokens = prompt_side.cached_tokens;
+                                        usage.cache_creation_tokens =
+                                            prompt_side.cache_creation_tokens;
+                                        usage.cache_ttl_seconds = prompt_side.cache_ttl_seconds;
                                     }
                                 }
                             }
@@ -2384,6 +2519,7 @@ impl ChatProvider for GeminiProvider {
                     completion_tokens: completion,
                     total_tokens: total,
                     cached_tokens: cached,
+                    ..Default::default()
                 }
             })
             .unwrap_or_default();
@@ -2579,6 +2715,7 @@ impl ChatProvider for GeminiProvider {
                             completion_tokens: completion,
                             total_tokens: total,
                             cached_tokens: cached,
+                            ..Default::default()
                         };
                     }
                 }
@@ -4540,6 +4677,69 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("stream"));
+    }
+
+    #[test]
+    fn anthropic_usage_normalizes_cache_counters() {
+        // Anthropic reports cache reads/writes OUTSIDE input_tokens; the
+        // normalized TokenUsage folds them into prompt_tokens (context
+        // footprint, cached ⊆ prompt — the same convention as OpenAI and
+        // the external adapters).
+        let parsed: AnthropicUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 100,
+            "cache_creation_input_tokens": 20,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 20
+            }
+        }))
+        .unwrap();
+        let usage = parsed.to_token_usage();
+        assert_eq!(usage.prompt_tokens, 130);
+        assert_eq!(usage.total_tokens, 135);
+        assert_eq!(usage.cached_tokens, 100);
+        assert_eq!(usage.cache_creation_tokens, 20);
+        assert_eq!(usage.cache_ttl_seconds, Some(3600));
+
+        // Flat creation (no split object) → the 5-minute default; pure
+        // reads make no flavor statement.
+        assert_eq!(anthropic_cache_ttl_seconds(40, None), Some(300));
+        assert_eq!(anthropic_cache_ttl_seconds(0, None), None);
+        let five_minute = AnthropicCacheCreation {
+            ephemeral_5m_input_tokens: 8,
+            ephemeral_1h_input_tokens: 0,
+        };
+        assert_eq!(anthropic_cache_ttl_seconds(8, Some(&five_minute)), Some(300));
+    }
+
+    #[test]
+    fn anthropic_rate_limit_headers_become_windows() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut set = |k: &'static str, v: &str| {
+            headers.insert(k, v.parse().unwrap());
+        };
+        set("anthropic-ratelimit-requests-limit", "4000");
+        set("anthropic-ratelimit-requests-remaining", "3999");
+        set("anthropic-ratelimit-requests-reset", "2026-07-05T12:00:00Z");
+        set("anthropic-ratelimit-tokens-limit", "400000");
+        set("anthropic-ratelimit-tokens-remaining", "80000");
+        let windows = anthropic_rate_limit_windows_from_headers(&headers);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "req/min");
+        assert_eq!(windows[0].used_pct, 0);
+        assert!(windows[0].resets_at_epoch.is_some());
+        assert_eq!(windows[1].label, "tok/min");
+        assert_eq!(windows[1].used_pct, 80);
+        // Missing reset degrades to a gauge without a countdown.
+        assert_eq!(windows[1].resets_at_epoch, None);
+
+        // No headers → no windows (e.g. the egress relay strips them).
+        assert!(
+            anthropic_rate_limit_windows_from_headers(&reqwest::header::HeaderMap::new())
+                .is_empty()
+        );
     }
 
     #[test]

@@ -73,6 +73,16 @@ struct MockStep {
     content: String,
     #[serde(default)]
     tool_calls: Vec<MockScriptToolCall>,
+    /// Prompt-cache TTL stated by this step's usage (default 300). Smokes
+    /// use short TTLs to walk the cache countdown → expiry-alert → cold
+    /// pipeline on real timing.
+    #[serde(default)]
+    cache_ttl_seconds: Option<u32>,
+    /// When set, this step's usage carries a "5h" rate-limit window at
+    /// this used percentage (resets two hours out) — exercises the vitals
+    /// limit gauges keyless.
+    #[serde(default)]
+    limit_used_pct: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,15 +210,37 @@ impl ChatProvider for MockProvider {
         *cursor = Some((profile_index, step_index + 1));
 
         // Plausible non-zero usage so budget and usage accounting run.
+        // Cache counters emulate a warm prompt cache (first request writes,
+        // later requests read half) so cache-vitals plumbing runs keyless.
         let prompt_tokens = (transcript.len() as u64 / 4).max(1);
         let completion_tokens = (step.content.len() as u64 / 4).max(1);
+        let cached_tokens = if step_index == 0 { 0 } else { prompt_tokens / 2 };
+        let rate_limit_windows = step
+            .limit_used_pct
+            .map(|used_pct| {
+                vec![crate::types::SessionLimitWindow {
+                    label: "5h".to_string(),
+                    used_pct,
+                    resets_at_epoch: Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                            + 7200,
+                    ),
+                }]
+            })
+            .unwrap_or_default();
         Ok(ChatResponse {
             content: step.content.clone(),
             usage: TokenUsage {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
-                cached_tokens: 0,
+                cached_tokens,
+                cache_creation_tokens: prompt_tokens / 4,
+                cache_ttl_seconds: Some(step.cache_ttl_seconds.unwrap_or(300)),
+                rate_limit_windows,
             },
             reasoning_summary: None,
             reasoning_content: None,

@@ -5195,9 +5195,10 @@ body.context-focus-active {
 .session-window-vitals {
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 280px;
+  max-width: 320px;
   display: inline-flex;
   align-items: center;
+  gap: 7px;
   padding: 2px 7px;
   border: 1px solid rgba(148, 226, 213, 0.22);
   border-radius: 999px;
@@ -5214,7 +5215,44 @@ body.context-focus-active {
 .session-window-vitals.conflict {
   border-color: rgba(243, 139, 168, 0.38);
   background: rgba(243, 139, 168, 0.08);
+}
+.session-window-vitals.conflict .vit-git {
   color: var(--red);
+}
+.session-window-vitals .vit-git,
+.session-window-vitals .vit-cache {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-window-vitals .vit-cache.cache-ok {
+  color: var(--green);
+}
+.session-window-vitals .vit-cache.cache-warn {
+  color: var(--yellow);
+}
+.session-window-vitals .vit-cache.cache-crit {
+  color: var(--peach);
+}
+.session-window-vitals .vit-cache.cache-expiring {
+  color: var(--red);
+}
+.session-window-vitals .vit-cache.cache-cold {
+  opacity: 0.55;
+}
+.session-window-vitals .vit-limits {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.85;
+}
+.session-window-vitals .vit-limits.limits-warn {
+  color: var(--yellow);
+  opacity: 1;
+}
+.session-window-vitals .vit-limits.limits-crit {
+  color: var(--red);
+  opacity: 1;
 }
 @container (max-width: 560px) {
   .session-window-vitals {
@@ -14805,6 +14843,10 @@ let dashboardProjectRoot = '';
 let sessionRelationshipRenderHandle = 0;
 let sessionWindowGridFitRenderHandle = 0;
 let sessionGoalTicker = null;
+let sessionVitalsTicker = null;
+// Cache-expiry alert dedupe: session id → the lastActivityEpoch already
+// alerted for (one alert per idle period).
+const sessionCacheExpiryAlerts = new Map();
 const SESSION_WINDOW_RENDER_LIMIT = 600;
 const SESSION_WINDOW_PREPEND_CHUNK = 300;
 // In-memory history behind the render window. Long-running sessions used
@@ -18699,6 +18741,22 @@ window.stationProbe = Object.assign(window.stationProbe || {}, {
   },
   openTranscript: (sessionId, source) => stationOpenTranscript(sessionId, source ? { source } : {}),
   openDiff: (path) => stationOpenDiff(path),
+  // Read-only session-store accessors for probes: the app script is
+  // module-scoped, so validators cannot reach these directly.
+  sessionMeta: (sid) => {
+    try {
+      return JSON.parse(JSON.stringify(sessionMetadataById.get(String(sid)) || null));
+    } catch (_) {
+      return null;
+    }
+  },
+  primarySessionId: () => {
+    try {
+      return String(currentSessionFullId || '');
+    } catch (_) {
+      return '';
+    }
+  },
   select: (target) => {
     station?.select_by_id?.(target ? String(target) : null);
     return station?.debug_state?.() || '';
@@ -24233,19 +24291,55 @@ function stationDisplayRunwaySnapshot(controls = null) {
   };
 }
 
+// StationAgent vitals fields from a session's normalized vitals: git and
+// limits reuse the chip formatters (single source of truth for the text);
+// the cache section passes raw numbers so the wasm HUD renders the TTL
+// countdown live per frame.
+function stationVitalsFields(vitals) {
+  const out = {};
+  if (!vitals || typeof vitals !== 'object') return out;
+  try {
+    const git = sessionVitalsGitSegment(vitals.git);
+    if (git) {
+      out.vitalsGit = git.text;
+      out.vitalsGitConflict = !!git.conflict;
+    }
+    const cache = vitals.cache;
+    if (cache && typeof cache === 'object') {
+      out.cacheHitPct = cache.hitPct === null || cache.hitPct === undefined || !Number.isFinite(Number(cache.hitPct))
+        ? -1
+        : Number(cache.hitPct);
+      out.cacheLastActivityEpoch = Number(cache.lastActivityEpoch) || 0;
+      out.cacheTtlSeconds = Number(cache.ttlSeconds) || 0;
+    }
+    const limits = sessionVitalsLimitsSegment(vitals.limits);
+    if (limits) {
+      out.vitalsLimits = limits.text;
+      out.vitalsLimitsState = limits.severity || '';
+    }
+  } catch (_) {}
+  return out;
+}
+
 function stationAgentForSelf(usage) {
   const phase = normalizeStationPhase(currentPhase);
   // Goal fields light the scene's goal ring + the focus-panel goal row for
   // the primary session too (session_id stays unset on purpose: the
   // primary node keeps the classic agent focus panel, not session pills).
+  // currentSessionFullId is only set once a window is focused — the
+  // daemon's own session is the primary node's identity until then.
   let goal = null;
-  if (currentSessionFullId) {
+  let vitals = null;
+  const selfSessionId = String(currentSessionFullId || daemonSessionFullId || '').trim();
+  if (selfSessionId) {
     try {
-      const meta = sessionMetadataById.get(String(currentSessionFullId)) || {};
+      const meta = sessionMetadataById.get(selfSessionId) || {};
       goal = normalizeSessionGoal(meta.goal || meta.session_goal || meta.sessionGoal || null);
+      vitals = meta.vitals || null;
     } catch (_) {}
   }
   return {
+    ...stationVitalsFields(vitals),
     id: 'primary-agent',
     hostId: selfPeerId,
     role: 'direct',
@@ -24405,6 +24499,7 @@ function stationSessionAgentsInner() {
       || compactSessionText(meta.initial_message || meta.initialMessage || meta.task || '')
       || shortSessionId(id);
     out.push({
+      ...stationVitalsFields(meta.vitals || null),
       id: 'session-' + sanitizeStationId(id),
       hostId: selfPeerId,
       role: kind === 'subagent'
@@ -31416,15 +31511,8 @@ function applySessionGoalsFromReplayEntries(entries) {
 
 // ── Session vitals (git / cache / limits chips — the statusline port) ──
 
-function renderSessionWindowVitals(win, vitals) {
-  if (!win?.vitals) return;
-  const git = vitals && typeof vitals === 'object' ? vitals.git : null;
-  if (!git || typeof git !== 'object') {
-    win.vitals.className = 'session-window-vitals hidden';
-    win.vitals.textContent = '';
-    win.vitals.title = '';
-    return;
-  }
+function sessionVitalsGitSegment(git) {
+  if (!git || typeof git !== 'object') return null;
   const parts = [];
   const titleLines = [];
   const branch = String(git.branch || '').trim();
@@ -31461,15 +31549,164 @@ function renderSessionWindowVitals(win, vitals) {
     parts.push(`${primaryName}⇡${git.primaryUnpushed}`);
     titleLines.push(`Unpushed on ${primaryName}: ${git.primaryUnpushed}`);
   }
-  if (!parts.length) {
-    win.vitals.className = 'session-window-vitals hidden';
-    win.vitals.textContent = '';
-    win.vitals.title = '';
-    return;
+  if (!parts.length) return null;
+  return { text: parts.join(' '), titleLines, conflict: parity === 'conflict' };
+}
+
+// Seconds until the prompt cache goes cold, from the server-stamped
+// activity anchor; null when the provider's TTL is unknown (receipt-only).
+function sessionCacheCountdownSeconds(cache) {
+  const ttl = Number(cache?.ttlSeconds);
+  const anchor = Number(cache?.lastActivityEpoch);
+  if (!ttl || !anchor) return null;
+  return Math.round(ttl - (Date.now() / 1000 - anchor));
+}
+
+function formatCacheCountdown(seconds) {
+  const s = Math.max(0, Number(seconds) || 0);
+  return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+}
+
+function sessionVitalsCacheSegment(cache) {
+  if (!cache || typeof cache !== 'object') return null;
+  const parts = [];
+  const titleLines = [];
+  let cls = 'vit-cache';
+  const hit = Number.isFinite(Number(cache.hitPct)) && cache.hitPct !== null && cache.hitPct !== undefined
+    ? Math.max(0, Math.min(100, Number(cache.hitPct)))
+    : null;
+  if (hit !== null) {
+    parts.push(`⚡${hit}%`);
+    titleLines.push(`Prompt-cache hit (latest request): ${hit}%`);
+    cls += hit >= 90 ? ' cache-ok' : hit >= 50 ? ' cache-warn' : ' cache-crit';
   }
-  win.vitals.className = `session-window-vitals${parity === 'conflict' ? ' conflict' : ''}`;
-  win.vitals.textContent = parts.join(' ');
-  win.vitals.title = titleLines.join('\n');
+  const remaining = sessionCacheCountdownSeconds(cache);
+  let ticking = false;
+  if (remaining !== null) {
+    if (remaining > 0) {
+      parts.push(`⏳${formatCacheCountdown(remaining)}`);
+      titleLines.push(`Cache expires in ${formatCacheCountdown(remaining)} (TTL ${formatCacheCountdown(cache.ttlSeconds)})`);
+      if (remaining <= 60) cls += ' cache-expiring';
+      ticking = true;
+    } else {
+      parts.push('✗');
+      titleLines.push('Prompt cache is cold — the next request rebuilds it');
+      cls += ' cache-cold';
+    }
+  }
+  if (!parts.length) return null;
+  return { text: parts.join(' '), titleLines, cls, ticking };
+}
+
+function formatLimitReset(resetsAtEpoch) {
+  const remaining = Number(resetsAtEpoch) - Date.now() / 1000;
+  if (!Number.isFinite(remaining) || remaining <= 0) return '';
+  if (remaining >= 86400) return `${Math.round(remaining / 86400)}d`;
+  if (remaining >= 3600) return `${Math.round(remaining / 3600)}h`;
+  return `${Math.max(1, Math.round(remaining / 60))}m`;
+}
+
+// The gauge shows the most-used window; the tooltip lists them all.
+function sessionVitalsLimitsSegment(limits) {
+  if (!Array.isArray(limits) || !limits.length) return null;
+  const windows = limits
+    .map((w) => ({
+      label: String(w?.label || '').trim() || 'window',
+      usedPct: Math.max(0, Math.min(100, Number(w?.usedPct) || 0)),
+      resetsAtEpoch: Number(w?.resetsAtEpoch) || null,
+    }));
+  const top = windows.reduce((a, b) => (b.usedPct > a.usedPct ? b : a));
+  let text = `▮${top.usedPct}% ${top.label}`;
+  let cls = 'vit-limits';
+  let severity = '';
+  if (top.usedPct >= 90) {
+    severity = 'crit';
+    cls += ' limits-crit';
+    const reset = top.resetsAtEpoch ? formatLimitReset(top.resetsAtEpoch) : '';
+    if (reset) text += ` ↻${reset}`;
+  } else if (top.usedPct >= 70) {
+    severity = 'warn';
+    cls += ' limits-warn';
+  }
+  const titleLines = windows.map((w) => {
+    const reset = w.resetsAtEpoch ? ` — resets in ${formatLimitReset(w.resetsAtEpoch) || 'moments'}` : '';
+    return `Rate limit ${w.label}: ${w.usedPct}% used${reset}`;
+  });
+  return { text, titleLines, cls, severity };
+}
+
+// Renders the chip; returns true while a cache countdown is live (the
+// vitals ticker keeps re-rendering until everything is cold or gone).
+function renderSessionWindowVitals(win, vitals) {
+  if (!win?.vitals) return false;
+  const git = sessionVitalsGitSegment(vitals && typeof vitals === 'object' ? vitals.git : null);
+  const cache = sessionVitalsCacheSegment(vitals && typeof vitals === 'object' ? vitals.cache : null);
+  const limits = sessionVitalsLimitsSegment(vitals && typeof vitals === 'object' ? vitals.limits : null);
+  if (!git && !cache && !limits) {
+    win.vitals.className = 'session-window-vitals hidden';
+    win.vitals.replaceChildren();
+    win.vitals.title = '';
+    return false;
+  }
+  const segments = [];
+  for (const seg of [
+    git && { cls: 'vit-git', text: git.text },
+    cache && { cls: cache.cls, text: cache.text },
+    limits && { cls: limits.cls, text: limits.text },
+  ]) {
+    if (!seg) continue;
+    const span = document.createElement('span');
+    span.className = seg.cls;
+    span.textContent = seg.text;
+    segments.push(span);
+  }
+  win.vitals.className = `session-window-vitals${git?.conflict ? ' conflict' : ''}`;
+  win.vitals.replaceChildren(...segments);
+  win.vitals.title = [
+    ...(git?.titleLines || []),
+    ...(cache?.titleLines || []),
+    ...(limits?.titleLines || []),
+  ].join('\n');
+  return !!cache?.ticking;
+}
+
+// One toast (plus a browser notification when permission is already
+// granted and the tab is hidden) per idle period, keyed by the activity
+// anchor — new provider activity re-arms it. Fires only while there is
+// still time to act, never after the cache went cold.
+function maybeAlertCacheExpiry(sid, win, vitals) {
+  const cache = vitals && typeof vitals === 'object' ? vitals.cache : null;
+  if (!cache) return;
+  const remaining = sessionCacheCountdownSeconds(cache);
+  if (remaining === null || remaining <= 0 || remaining > 60) return;
+  const key = String(cache.lastActivityEpoch);
+  if (sessionCacheExpiryAlerts.get(sid) === key) return;
+  sessionCacheExpiryAlerts.set(sid, key);
+  if (sessionCacheExpiryAlerts.size > 200) {
+    sessionCacheExpiryAlerts.delete(sessionCacheExpiryAlerts.keys().next().value);
+  }
+  const identity = sessionIdentityParts(sid);
+  const label = identity.name || identity.shortId || 'session';
+  const text = `Prompt cache for ${label} expires in ${formatCacheCountdown(remaining)} — a follow-up now reuses it`;
+  if (typeof showControlToast === 'function') showControlToast('info', text);
+  if (typeof Notification !== 'undefined' && Notification.permission === 'granted' && document.hidden) {
+    try { new Notification('Intendant', { body: text }); } catch (_) { /* notification blocked */ }
+  }
+}
+
+function refreshSessionVitalsTicker() {
+  let ticking = false;
+  for (const [sid, win] of sessionWindows) {
+    const vitals = (sessionMetadataById.get(sid) || {}).vitals || null;
+    if (renderSessionWindowVitals(win, vitals)) ticking = true;
+    maybeAlertCacheExpiry(sid, win, vitals);
+  }
+  if (ticking && !sessionVitalsTicker) {
+    sessionVitalsTicker = setInterval(refreshSessionVitalsTicker, 1000);
+  } else if (!ticking && sessionVitalsTicker) {
+    clearInterval(sessionVitalsTicker);
+    sessionVitalsTicker = null;
+  }
 }
 
 function normalizeSessionVitals(raw) {
@@ -31494,6 +31731,7 @@ function applySessionVitals(raw = {}) {
       renderSessionWindowVitals(sessionWindows.get(id), vitals);
     }
   }
+  refreshSessionVitalsTicker();
 }
 
 function applySessionVitalsFromReplayEntries(entries) {

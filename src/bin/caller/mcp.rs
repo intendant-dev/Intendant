@@ -369,6 +369,7 @@ impl McpAppState {
                 prompt_tokens: self.session_prompt_tokens,
                 completion_tokens: self.session_completion_tokens,
                 cached_tokens: self.session_cached_tokens,
+                ..Default::default()
             },
             presence: self.presence_provider_name.as_ref().map(|p| {
                 crate::frontend::ModelUsageSnapshot {
@@ -378,9 +379,7 @@ impl McpAppState {
                     context_window: self.presence_context_window,
                     hard_context_window: Some(self.presence_context_window),
                     usage_pct: self.presence_usage_pct,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    cached_tokens: 0,
+                    ..Default::default()
                 }
             }),
         }
@@ -1778,8 +1777,7 @@ fn usage_snapshot_from_context_snapshot_event(
         hard_context_window,
         usage_pct: tokens_used as f64 / context_window as f64 * 100.0,
         prompt_tokens: tokens_used,
-        completion_tokens: 0,
-        cached_tokens: 0,
+        ..Default::default()
     })
 }
 
@@ -11839,6 +11837,7 @@ mod tests {
                 prompt_tokens: 80_000,
                 completion_tokens: 6_000,
                 cached_tokens: 10_000,
+                ..Default::default()
             });
             let usage = s.usage_snapshot();
             assert_eq!(usage.main.tokens_used, 86_000);
@@ -11921,6 +11920,7 @@ mod tests {
                     prompt_tokens: 220_000,
                     completion_tokens: 385,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
                 presence: None,
             },
@@ -11976,6 +11976,7 @@ mod tests {
                     prompt_tokens: 220_781,
                     completion_tokens: 385,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
                 presence: None,
             },
@@ -12005,6 +12006,7 @@ mod tests {
                     prompt_tokens: 258_000,
                     completion_tokens: 400,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
                 presence: None,
             },
@@ -12058,6 +12060,7 @@ mod tests {
                     prompt_tokens: 220_000,
                     completion_tokens: 385,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
                 presence: None,
             },
@@ -12112,6 +12115,7 @@ mod tests {
             prompt_tokens: 40_000,
             completion_tokens: 2_000,
             cached_tokens: 0,
+            ..Default::default()
         });
 
         let pressure = s.context_pressure_snapshot();
@@ -12151,6 +12155,7 @@ mod tests {
                 prompt_tokens: 245_915,
                 completion_tokens: 0,
                 cached_tokens: 0,
+                ..Default::default()
             });
             s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
                 provider: "openai".to_string(),
@@ -12162,6 +12167,7 @@ mod tests {
                 prompt_tokens: 258_400,
                 completion_tokens: 0,
                 cached_tokens: 0,
+                ..Default::default()
             });
 
             let pressure = s.context_pressure_snapshot();
@@ -12197,6 +12203,7 @@ mod tests {
                 prompt_tokens: 80_000,
                 completion_tokens: 20_000,
                 cached_tokens: 10_000,
+                ..Default::default()
             });
             let pressure = s.context_pressure_snapshot();
             assert_eq!(pressure["rewind_only"], true);
@@ -12225,6 +12232,7 @@ mod tests {
                 prompt_tokens: 100_001,
                 completion_tokens: 0,
                 cached_tokens: 0,
+                ..Default::default()
             });
 
             assert!(s.rewind_anchor_recovery_candidates_only_for(None, Some(false), false));
@@ -12254,6 +12262,7 @@ mod tests {
                 prompt_tokens: 99_999,
                 completion_tokens: 0,
                 cached_tokens: 0,
+                ..Default::default()
             });
 
             assert!(s.rewind_anchor_recovery_candidates_only_for(None, Some(false), false));
@@ -12283,6 +12292,7 @@ mod tests {
                 prompt_tokens: 80_000,
                 completion_tokens: 20_000,
                 cached_tokens: 0,
+                ..Default::default()
             });
 
             let message = s
@@ -12334,6 +12344,7 @@ mod tests {
                 prompt_tokens: 70_000,
                 completion_tokens: 20_000,
                 cached_tokens: 0,
+                ..Default::default()
             });
 
             assert!(
@@ -12380,6 +12391,7 @@ mod tests {
                 prompt_tokens: 258_000,
                 completion_tokens: 400,
                 cached_tokens: 0,
+                ..Default::default()
             });
 
             assert!(s.rewind_only_gate_message("get_logs").is_none());
@@ -12417,6 +12429,7 @@ mod tests {
                     prompt_tokens: 258_000,
                     completion_tokens: 400,
                     cached_tokens: 0,
+                    ..Default::default()
                 });
                 s.push_log(
                     LogLevel::Info,
@@ -12477,6 +12490,7 @@ mod tests {
                 prompt_tokens: 90_000,
                 completion_tokens: 5_000,
                 cached_tokens: 0,
+                ..Default::default()
             });
 
             assert!(s.rewind_only_gate_message("take_screenshot").is_none());
@@ -12503,6 +12517,7 @@ mod tests {
                 prompt_tokens: 90_000,
                 completion_tokens: 5_000,
                 cached_tokens: 0,
+                ..Default::default()
             });
 
             assert!(s.rewind_only_gate_message("take_screenshot").is_none());
@@ -14609,6 +14624,7 @@ mod tests {
                     prompt_tokens: 253_000,
                     completion_tokens: 793,
                     cached_tokens: 0,
+                    ..Default::default()
                 });
             }
 
@@ -14860,6 +14876,7 @@ mod tests {
                     prompt_tokens: 96_000,
                     completion_tokens: 5_000,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
                 presence: None,
             },
@@ -14938,6 +14955,7 @@ mod tests {
                     prompt_tokens: 68_000,
                     completion_tokens: 2_000,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
                 presence: None,
             },
@@ -14975,6 +14993,7 @@ mod tests {
             prompt_tokens: 225_500,
             completion_tokens: 500,
             cached_tokens: 0,
+            ..Default::default()
         });
         let pressure = s.context_pressure_snapshot();
         assert_eq!(pressure["status"], "watch");
@@ -15045,6 +15064,7 @@ mod tests {
                     prompt_tokens: 211_000,
                     completion_tokens: 178,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
                 presence: None,
             },
@@ -15098,6 +15118,7 @@ mod tests {
                     prompt_tokens: 88_000,
                     completion_tokens: 2_000,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
                 presence: None,
             },
@@ -15125,6 +15146,7 @@ mod tests {
             prompt_tokens: 96_000,
             completion_tokens: 3_000,
             cached_tokens: 0,
+            ..Default::default()
         });
 
         let pressure = s.context_pressure_snapshot();
@@ -15174,6 +15196,7 @@ mod tests {
                 prompt_tokens: 97_000,
                 completion_tokens: 4_000,
                 cached_tokens: 0,
+                ..Default::default()
             },
         );
         s.complete_pending_rewind_pressure_check_for(Some("session-b"));
@@ -15246,6 +15269,7 @@ mod tests {
                 prompt_tokens: 97_000,
                 completion_tokens: 4_000,
                 cached_tokens: 0,
+                ..Default::default()
             },
         );
         s.complete_pending_rewind_pressure_check_for(Some("codex-thread"));
@@ -15305,6 +15329,7 @@ mod tests {
                     prompt_tokens: 96_000,
                     completion_tokens: 5_000,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
                 presence: None,
             });
@@ -15389,6 +15414,7 @@ mod tests {
                     prompt_tokens: 259_000,
                     completion_tokens: 1_000,
                     cached_tokens: 10_000,
+                    ..Default::default()
                 },
                 presence: None,
             });
@@ -15404,6 +15430,7 @@ mod tests {
                     prompt_tokens: 69_000,
                     completion_tokens: 1_046,
                     cached_tokens: 50_000,
+                    ..Default::default()
                 },
                 presence: None,
             });
@@ -15495,6 +15522,7 @@ mod tests {
                     prompt_tokens: 95_000,
                     completion_tokens: 5_000,
                     cached_tokens: 0,
+                    ..Default::default()
                 },
                 presence: None,
             },
@@ -15587,6 +15615,7 @@ mod tests {
                     prompt_tokens: 100,
                     completion_tokens: 25,
                     cached_tokens: 50,
+                    ..Default::default()
                 });
             }
             let server = IntendantServer::new(state, EventBus::new());
@@ -15633,6 +15662,7 @@ mod tests {
                         prompt_tokens: 900,
                         completion_tokens: 100,
                         cached_tokens: 250,
+                        ..Default::default()
                     },
                 );
                 s.session_codex_managed_context
@@ -15685,6 +15715,7 @@ mod tests {
                     prompt_tokens: 900,
                     completion_tokens: 50,
                     cached_tokens: 400,
+                    ..Default::default()
                 });
             }
             let server = IntendantServer::new(state, EventBus::new());
@@ -15772,6 +15803,7 @@ mod tests {
                             prompt_tokens: 950,
                             completion_tokens: 40,
                             cached_tokens: 500,
+                            ..Default::default()
                         },
                         presence: None,
                     },
@@ -15855,6 +15887,7 @@ mod tests {
                             prompt_tokens: 224_000,
                             completion_tokens: 1_000,
                             cached_tokens: 10_000,
+                            ..Default::default()
                         },
                         presence: None,
                     },
@@ -15873,6 +15906,7 @@ mod tests {
                             prompt_tokens: 69_000,
                             completion_tokens: 1_046,
                             cached_tokens: 50_000,
+                            ..Default::default()
                         },
                         presence: None,
                     },
@@ -16361,6 +16395,7 @@ mod tests {
                             prompt_tokens: 250_000,
                             completion_tokens: 8_400,
                             cached_tokens: 0,
+                            ..Default::default()
                         },
                         presence: None,
                     },
@@ -16419,6 +16454,7 @@ mod tests {
                     prompt_tokens: 900,
                     completion_tokens: 100,
                     cached_tokens: 400,
+                    ..Default::default()
                 });
             }
             let server = IntendantServer::new(state, EventBus::new());
@@ -16469,6 +16505,7 @@ mod tests {
                             prompt_tokens: 800,
                             completion_tokens: 50,
                             cached_tokens: 200,
+                            ..Default::default()
                         },
                         presence: None,
                     },

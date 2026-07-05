@@ -2356,6 +2356,7 @@ mod tests {
             completion_tokens: completion,
             total_tokens: prompt + completion,
             cached_tokens: 0,
+            ..Default::default()
         }
     }
 
@@ -3498,6 +3499,7 @@ mod tests {
                 completion_tokens: 20,
                 total_tokens: 30,
                 cached_tokens: 2,
+                ..Default::default()
             },
             reasoning: None,
             source: None,
