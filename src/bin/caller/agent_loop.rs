@@ -1,7 +1,8 @@
-//! Agent-loop types: budget constants, LoopExitReason/LoopStats,
-//! user attachments, and the follow-up message plumbing shared by the
-//! native loop and the external-agent drain. run_agent_loop itself
-//! stays in main.rs until the internal-agent unification re-homes it.
+//! The native agent loop: run_agent_loop/run_round_loop, their budget
+//! constants and LoopExitReason/LoopStats types, the follow-up message
+//! plumbing shared with the external-agent drain, and the loop-local
+//! orchestration tool handlers (spawn_sub_agent / wait_sub_agents /
+//! submit_result).
 
 use crate::conversation;
 use crate::external_agent;
