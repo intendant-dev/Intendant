@@ -1188,7 +1188,10 @@ function stationBuildControlsSummary() {
     launchCommand: launchReadiness.command || '',
     launchTaskChars: stationNum(launchReadiness.taskChars),
     launchProject: launchReadiness.project ? compactPathLabel(launchReadiness.project, true) : '',
-    launchMode: launchReadiness.direct ? 'direct' : 'orchestrated',
+    // 'auto' | 'orchestrate' | 'direct' for the internal agent; empty when
+    // execution does not apply (external agent) so the canvas hides the
+    // pills.
+    launchMode: launchReadiness.executionApplies ? (launchReadiness.execution || 'auto') : '',
     launchAttachments: stationNum(launchReadiness.attachments),
     launchNotice: launchReadiness.notice || '',
   };

@@ -120,7 +120,9 @@ Both halves of the delegation surface are exposed in the web dashboard:
   **Execution** control (internal agent only) — *Auto* leaves the choice to
   the `is_simple_task` heuristic, *Orchestrate* / *Direct* set the
   corresponding flag on `create_session`. An explicit choice beats the global
-  *Direct* header toggle.
+  *Direct* header toggle. Station's launch composer carries the same
+  three-state control as pills (*auto* / *orch* / *direct*), hidden when an
+  external agent is selected.
 - **Delegate on a live session**: every internal session's window menu has
   **Delegate…** — task, optional name, role, backend (internal / Codex /
   Claude Code), and worktree isolation. It sends
