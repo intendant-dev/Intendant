@@ -48116,7 +48116,7 @@ document.getElementById('clip-save-btn').addEventListener('click', () => submitC
 document.getElementById('clip-attach-btn').addEventListener('click', () => submitClip('attach'));
 document.getElementById('clip-send-btn').addEventListener('click', () => submitClip('send'));
 
-// ��─ Clip toolbar event wiring ──
+// ── Clip toolbar event wiring ──
 
 document.getElementById('rec-clip-btn').addEventListener('click', enterClipMode);
 document.getElementById('clip-close').addEventListener('click', exitClipMode);
@@ -64268,7 +64268,10 @@ function filesIdeHostLabel(hostId) {
 }
 
 function filesIdeBufferKey(hostId, path) {
-  return `${hostId || ''} ${path}`;
+  // The separator must never occur in a host id and must survive the
+  // innerHTML → dataset.key round-trip in filesIdeRenderTabs — an HTML
+  // attribute value cannot hold a NUL (the parser substitutes U+FFFD).
+  return `${hostId || ''}\uFFFD${path}`;
 }
 
 function filesIdeTreeState(hostId) {
