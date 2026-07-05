@@ -1498,7 +1498,10 @@ mod tests {
         let chapter_path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/src/web-dashboard.md");
         let rendered = render_endpoint_docs();
         let chapter = std::fs::read_to_string(chapter_path)
-            .unwrap_or_else(|e| panic!("read {chapter_path}: {e}"));
+            .unwrap_or_else(|e| panic!("read {chapter_path}: {e}"))
+            // Windows checkouts materialize the chapter with CRLF
+            // (autocrlf); the rendered table is always LF.
+            .replace("\r\n", "\n");
         let block = chapter
             .split_once(BEGIN)
             .and_then(|(_, rest)| rest.split_once(END))
