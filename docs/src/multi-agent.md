@@ -112,6 +112,33 @@ A sub-agent always runs headless (no interactive frontend of its own) with no
 MCP client, under the daemon's shared autonomy — approvals it raises land in
 the dashboard like any other session's.
 
+## Delegating from the dashboard
+
+Both halves of the delegation surface are exposed in the web dashboard:
+
+- **Execution shape at launch**: the Sessions tab's *New Session* pane has an
+  **Execution** control (internal agent only) — *Auto* leaves the choice to
+  the `is_simple_task` heuristic, *Orchestrate* / *Direct* set the
+  corresponding flag on `create_session`. An explicit choice beats the global
+  *Direct* header toggle.
+- **Delegate on a live session**: every internal session's window menu has
+  **Delegate…** — task, optional name, role, backend (internal / Codex /
+  Claude Code), and worktree isolation. It sends
+  `ControlMsg::SpawnSubAgent { session_id, task, name?, role?, agent?,
+  worktree? }`, and the supervisor (`delegate_sub_agent`) runs the same
+  `start_sub_agent_session` path the tool uses: same relationship kind, same
+  width and depth caps (the parent's depth is tracked on its supervisor
+  entry).
+
+A dashboard-delegated child is indistinguishable from a model-spawned one on
+the parent side: the supervisor retains each native session's children
+registry (shared with the loop's orchestration handle), inserts the child
+there, and wakes the parent with a notification follow-up naming the child —
+so the model knows the delegation happened and collects the result with
+`wait_sub_agents` exactly like one of its own spawns. External-agent sessions
+are refused with a pointer to send them a follow-up instead — they delegate
+through their own injected `start_task` tool.
+
 ## Agent Roles
 
 Roles are the `SubAgentRole` enum in `sub_agent.rs`:

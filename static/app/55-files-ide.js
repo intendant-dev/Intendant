@@ -2307,6 +2307,18 @@ function renderNewSessionAgentControls(options = {}) {
     externalFold.open = hasExternalAgent ||
       (!!effectiveAgent && effectiveAgent !== 'internal' && effectiveAgent !== 'intendant');
   }
+  // Execution shape (auto / orchestrate / direct) only applies to the
+  // internal agent — external CLIs run their own loops.
+  const executionSel = document.getElementById('new-session-execution');
+  if (executionSel) {
+    const appliesToInternal =
+      !effectiveAgent || effectiveAgent === 'internal' || effectiveAgent === 'intendant';
+    executionSel.disabled = !appliesToInternal;
+    if (!appliesToInternal) executionSel.value = '';
+    document
+      .getElementById('new-session-execution-wrap')
+      ?.classList.toggle('disabled', !appliesToInternal);
+  }
   commandInput.disabled = !hasExternalAgent;
   if (browseBtn) browseBtn.disabled = !hasExternalAgent;
   commandInput.placeholder = hasExternalAgent
@@ -2636,7 +2648,16 @@ async function startNewSession() {
       }
     }
   }
-  if (direct) msg.direct = true;
+  // Execution shape: an explicit per-launch choice beats the global Direct
+  // toggle; Auto (or an external agent — the select is disabled and cleared
+  // then) preserves the old behavior of the toggle forcing direct.
+  const executionSel = document.getElementById('new-session-execution');
+  const execution = executionSel && !executionSel.disabled ? executionSel.value : '';
+  if (execution === 'orchestrate') {
+    msg.orchestrate = true;
+  } else if (execution === 'direct' || direct) {
+    msg.direct = true;
+  }
   if (attachments.length > 0) msg.attachments = attachments;
 
   try {

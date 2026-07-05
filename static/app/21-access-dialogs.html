@@ -794,6 +794,58 @@
   </div>
 </div>
 
+<div id="session-delegate-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog session-delegate-dialog">
+    <button class="modal-close" type="button" title="Close" onclick="closeSessionDelegateModal()">x</button>
+    <h3>Delegate to a sub-agent</h3>
+    <p class="modal-description">
+      Spawn a supervised sub-agent under this session. The session is notified and
+      collects the result itself; the child shows up in Sessions like any other
+      sub-agent.
+    </p>
+    <div class="session-config-row">
+      <label>Parent</label>
+      <input id="session-delegate-parent" type="text" readonly>
+    </div>
+    <div class="session-config-row">
+      <label for="session-delegate-task">Task</label>
+      <textarea id="session-delegate-task" class="session-delegate-task" rows="4" placeholder="What should the sub-agent do?"></textarea>
+    </div>
+    <div class="session-config-row">
+      <label for="session-delegate-name">Name</label>
+      <input id="session-delegate-name" type="text" maxlength="180" autocomplete="off" spellcheck="false" placeholder="Optional display name">
+    </div>
+    <div class="session-config-row">
+      <label for="session-delegate-role">Role</label>
+      <select id="session-delegate-role">
+        <option value="">worker (default)</option>
+        <option value="research">research</option>
+        <option value="implementation">implementation</option>
+        <option value="testing">testing</option>
+      </select>
+    </div>
+    <div class="session-config-row">
+      <label for="session-delegate-agent">Backend</label>
+      <select id="session-delegate-agent">
+        <option value="">Internal agent</option>
+        <option value="codex">Codex</option>
+        <option value="claude-code">Claude Code</option>
+      </select>
+    </div>
+    <div class="session-config-row">
+      <label for="session-delegate-worktree">Worktree</label>
+      <label class="session-delegate-worktree" title="Isolate the sub-agent in a fresh git worktree branched off the parent project's HEAD">
+        <input id="session-delegate-worktree" type="checkbox">
+        Isolate in a git worktree
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button class="modal-cancel" type="button" onclick="closeSessionDelegateModal()">Cancel</button>
+      <button class="modal-confirm" type="button" id="session-delegate-confirm" onclick="confirmSessionDelegateModal()">Delegate</button>
+    </div>
+  </div>
+</div>
+
 <div id="worktree-inspect-modal" class="modal-backdrop" style="display:none">
   <div class="modal-dialog worktree-inspect-dialog">
     <button class="modal-close" type="button" onclick="closeWorktreeInspectModal()" aria-label="Close">&times;</button>

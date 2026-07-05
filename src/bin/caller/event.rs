@@ -1337,6 +1337,32 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<String>,
     },
+    /// Delegate a task to a new supervised sub-agent under an existing
+    /// internal session (the dashboard "delegate" action). The child is
+    /// tracked in the same registry the parent's wait_sub_agents tool
+    /// reads, and the parent is woken with a notification follow-up so the
+    /// model knows the delegation happened. External-agent parents are
+    /// refused — they spawn managed sessions through their own start_task
+    /// tool.
+    SpawnSubAgent {
+        /// Parent session the child runs under.
+        session_id: String,
+        task: String,
+        /// Optional display name for the child session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// Role guidance prompt for the child (research / implementation /
+        /// testing / …); unknown values fall back to the base prompt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        /// Child backend: "internal" (default), "codex", or "claude-code".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        /// Isolate the child in a fresh git worktree off the parent
+        /// project's HEAD.
+        #[serde(default)]
+        worktree: Option<bool>,
+    },
     StartTask {
         /// Optional target session. When omitted, daemon supervisors start a
         /// new managed session; when present, they route the text as a new
@@ -3681,6 +3707,48 @@ mod tests {
                 assert_eq!(attachments, vec!["upload:u1"]);
             }
             _ => panic!("expected CreateSession"),
+        }
+    }
+
+    #[test]
+    fn control_msg_spawn_sub_agent_deserialize() {
+        let json = r#"{"action":"spawn_sub_agent","session_id":"parent-1","task":"survey the schema","name":"schema-scout","role":"research","agent":"internal","worktree":true}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::SpawnSubAgent {
+                session_id,
+                task,
+                name,
+                role,
+                agent,
+                worktree,
+            } => {
+                assert_eq!(session_id, "parent-1");
+                assert_eq!(task, "survey the schema");
+                assert_eq!(name.as_deref(), Some("schema-scout"));
+                assert_eq!(role.as_deref(), Some("research"));
+                assert_eq!(agent.as_deref(), Some("internal"));
+                assert_eq!(worktree, Some(true));
+            }
+            _ => panic!("expected SpawnSubAgent"),
+        }
+
+        // Minimal form: everything but the parent and the task defaults.
+        let json = r#"{"action":"spawn_sub_agent","session_id":"parent-1","task":"t"}"#;
+        match serde_json::from_str(json).unwrap() {
+            ControlMsg::SpawnSubAgent {
+                name,
+                role,
+                agent,
+                worktree,
+                ..
+            } => {
+                assert!(name.is_none());
+                assert!(role.is_none());
+                assert!(agent.is_none());
+                assert!(worktree.is_none());
+            }
+            _ => panic!("expected SpawnSubAgent"),
         }
     }
 

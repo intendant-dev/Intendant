@@ -9535,6 +9535,7 @@ fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::StopSession { .. }
             | ControlMsg::RestartSession { .. }
             | ControlMsg::CreateSession { .. }
+            | ControlMsg::SpawnSubAgent { .. }
             | ControlMsg::StartTask { .. }
             | ControlMsg::ResumeSession { .. }
             | ControlMsg::FollowUp { .. }
@@ -9612,6 +9613,7 @@ fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::InterveneControllerLoop { .. } => "intervene_controller_loop",
         ControlMsg::GetControllerLoopStatus => "get_controller_loop_status",
         ControlMsg::CreateSession { .. } => "create_session",
+        ControlMsg::SpawnSubAgent { .. } => "spawn_sub_agent",
         ControlMsg::StartTask { .. } => "start_task",
         ControlMsg::FollowUp { .. } => "follow_up",
         ControlMsg::CancelFollowUp { .. } => "cancel_follow_up",

@@ -350,6 +350,7 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::CancelFollowUp { .. } => PeerOperation::Message,
         ControlMsg::StartTask { .. }
         | ControlMsg::CreateSession { .. }
+        | ControlMsg::SpawnSubAgent { .. }
         | ControlMsg::ResumeSession { .. }
         | ControlMsg::EditUserMessage { .. } => PeerOperation::Task,
         ControlMsg::Approve { .. }
