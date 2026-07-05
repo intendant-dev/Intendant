@@ -259,6 +259,160 @@ pub(crate) fn dashboard_local_file_response(
     }
 }
 
+pub(crate) fn effective_upload_destination(
+    requested: crate::upload_store::UploadDestination,
+    _has_active_session: bool,
+) -> crate::upload_store::UploadDestination {
+    requested
+}
+
+/// Decode percent escapes in an HTTP path segment. Unlike query-string
+/// decoding, `+` is a literal plus in paths.
+pub(crate) fn url_path_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let h = &bytes[i + 1..i + 3];
+                match std::str::from_utf8(h)
+                    .ok()
+                    .and_then(|hs| u8::from_str_radix(hs, 16).ok())
+                {
+                    Some(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DashboardSourceRequest {
+    path: PathBuf,
+    line: Option<usize>,
+}
+
+pub(crate) enum DashboardLocalFileResponse {
+    Html {
+        status: &'static str,
+        body: String,
+    },
+    Bytes {
+        status: &'static str,
+        content_type: &'static str,
+        bytes: Vec<u8>,
+    },
+}
+
+pub(crate) fn dashboard_url_path_to_fs_path(decoded: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = decoded.strip_prefix('/') {
+            if looks_like_windows_drive_path(rest) {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    PathBuf::from(decoded)
+}
+
+#[cfg(windows)]
+pub(crate) fn looks_like_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+        && bytes[0].is_ascii_alphabetic()
+}
+
+pub(crate) fn split_source_line_suffix(raw: &str) -> Option<(&str, usize)> {
+    let (path, line_raw) = raw.rsplit_once(':')?;
+    if path.is_empty() || line_raw.is_empty() || !line_raw.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let line = line_raw.parse::<usize>().ok()?;
+    if line == 0 {
+        return None;
+    }
+    Some((path, line))
+}
+
+pub(crate) fn render_dashboard_image_file_response(
+    request: DashboardSourceRequest,
+    content_type: &'static str,
+) -> DashboardLocalFileResponse {
+    let display_path = std::fs::canonicalize(&request.path).unwrap_or(request.path.clone());
+    let display_path_str = display_path.to_string_lossy().to_string();
+    let metadata = match std::fs::metadata(&display_path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => {
+            return DashboardLocalFileResponse::Html {
+                status: "404 Not Found",
+                body: render_dashboard_source_error_html(
+                    &display_path_str,
+                    "Not a file",
+                    "The requested path is not a regular file.",
+                ),
+            }
+        }
+        Err(err) => {
+            return DashboardLocalFileResponse::Html {
+                status: "404 Not Found",
+                body: render_dashboard_source_error_html(
+                    &display_path_str,
+                    "File not found",
+                    &format!("Could not read file metadata: {err}"),
+                ),
+            }
+        }
+    };
+
+    if metadata.len() > DASHBOARD_IMAGE_MAX_BYTES {
+        return DashboardLocalFileResponse::Html {
+            status: "413 Payload Too Large",
+            body: render_dashboard_source_error_html(
+                &display_path_str,
+                "Image too large",
+                &format!(
+                    "Image preview is limited to {} bytes; this file is {} bytes.",
+                    DASHBOARD_IMAGE_MAX_BYTES,
+                    metadata.len()
+                ),
+            ),
+        };
+    }
+
+    match std::fs::read(&display_path) {
+        Ok(bytes) => DashboardLocalFileResponse::Bytes {
+            status: "200 OK",
+            content_type,
+            bytes,
+        },
+        Err(err) => DashboardLocalFileResponse::Html {
+            status: "500 Internal Server Error",
+            body: render_dashboard_source_error_html(
+                &display_path_str,
+                "Read failed",
+                &format!("Could not read the file: {err}"),
+            ),
+        },
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn dashboard_source_viewer_response(
     request_line: &str,
@@ -2830,5 +2984,21 @@ mod tests {
             inspect_dashboard_fs_path(&dir.path().join("nope").to_string_lossy()).unwrap();
         assert_eq!(missing.size, None);
         assert_eq!(missing.modified_ms, None);
+    }
+
+    #[test]
+    fn upload_destination_is_not_rewritten_without_active_session() {
+        assert_eq!(
+            effective_upload_destination(crate::upload_store::UploadDestination::Task, false,),
+            crate::upload_store::UploadDestination::Task
+        );
+        assert_eq!(
+            effective_upload_destination(crate::upload_store::UploadDestination::Workspace, false,),
+            crate::upload_store::UploadDestination::Workspace
+        );
+        assert_eq!(
+            effective_upload_destination(crate::upload_store::UploadDestination::Task, true,),
+            crate::upload_store::UploadDestination::Task
+        );
     }
 }
