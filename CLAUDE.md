@@ -148,6 +148,13 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   change that forgets the mirror fails the suite instead of shipping as
   drift.
 - WASM boundary: `serde_wasm_bindgen` with `serialize_maps_as_objects(true)`
+- **Gateway API routes are declared once** in `src/bin/caller/gateway_routes.rs`
+  (`ROUTES`): dispatch, the pre-dispatch IAM classification, the OPTIONS
+  preflight, and the docs endpoint table in `docs/src/web-dashboard.md` all
+  derive from the declaration (the HTTP instance of "derive, don't mirror").
+  Never add an HTTP route by editing `web_gateway.rs`'s dispatch chain — add a
+  table row plus a `RouteHandlerId` match arm; unit tests enforce the table
+  invariants and pin the docs chapter.
 - `static/app.html` is **generated** from the `static/app/` fragments (order =
   `static/app/manifest.txt`; assembled by `build.rs` via
   `crates/app-html-assembler`; CI enforces the match). Edit the fragments,

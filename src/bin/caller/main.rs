@@ -33,6 +33,7 @@ mod fission_ledger;
 mod fission_lifecycle;
 mod frames;
 mod frontend;
+mod gateway_routes;
 mod knowledge;
 mod lineage_ledger;
 mod linux_display_env;

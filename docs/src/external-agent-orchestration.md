@@ -723,6 +723,32 @@ shared state (when driven over MCP) → config default → native.
   (Codex, Claude Code) steer natively, so the fallback is dormant — but it is
   the contract any future backend inherits. Don't reword those strings without
   checking the drain logic.
+- **Only turn-implying events wake an idle session into the observe drain.**
+  While idle, messages/reasoning/tool/plan/diff/turn events are treated as a
+  backend-initiated turn and drained; ambient events — stderr `Log` lines,
+  `Usage` snapshots, out-of-turn `BackendError`s — are recorded inline and the
+  loop stays idle. The distinction is load-bearing: entering the drain on an
+  ambient event wedges the session (no real turn ⇒ no terminal event ⇒ queued
+  follow-ups never picked up again; codex-cli 0.142's connector stderr made
+  this deterministic on every resume). Classify new `AgentEvent` variants
+  deliberately.
+- **Interrupt twice to escape a wedged drain.** The first interrupt forwards
+  `interrupt_turn()` (time-bounded so an unresponsive backend can't freeze the
+  drain's select loop) and keeps waiting for the backend's terminal event; a
+  second interrupt while one is pending force-returns the drain to idle, where
+  queued follow-ups flow again. Stop Session also exits a drain immediately.
+- **Resume tokens are addressable from spawn.** A non-fork external resume
+  registers `resume_token → wrapper` as a session alias in the same lock as
+  registration, so concurrent resumes of one thread dedupe against the
+  in-flight wrapper (no duplicate app-servers on one rollout) and follow-ups
+  targeted at the thread id during the attach window queue into the wrapper's
+  channel instead of failing "not managed by this daemon". The attach-dedupe
+  keys are held until the attach completes or provably fails (30s ceiling).
+- **Follow-up routing is logged on both sides of the channel.** The
+  supervisor prints `[supervisor] FollowUp <id> queued …` to the daemon log
+  when it enqueues; the session loop writes `Follow-up <id> delivered` to the
+  session log when it picks the message up. A queued line without a matching
+  delivered line means the session loop stopped draining its queue.
 - **`--direct` does not bypass external mode.** It only forces single-agent
   execution of the *native* worker. If a backend is configured, the supervised CLI
   still runs.
