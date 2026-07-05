@@ -22825,12 +22825,16 @@ pub fn spawn_web_gateway(
                     if let Some((route, _route_captures)) =
                         crate::gateway_routes::match_route(req_method, req_path)
                     {
-                        // Table-dispatched routes: declared once in
-                        // gateway_routes::ROUTES (which the IAM gate above already
-                        // consulted through dashboard_http_operation). The legacy
-                        // chain below shrinks as route families port — a route is
-                        // served by the table or the chain, never both. Handler
-                        // bodies moved here verbatim from their chain arms.
+                        // Table-dispatched routes: every /api/* and /mcp route is
+                        // declared once in gateway_routes::ROUTES (which the IAM
+                        // gate above already consulted through
+                        // dashboard_http_operation). The if/else chain below serves
+                        // only the non-API surface (connect bootstrap, recordings,
+                        // frames, debug, config, static assets, SPA fallback) — a
+                        // route is served by the table or the chain, never both.
+                        // Handler bodies moved here verbatim from their chain arms;
+                        // never add an API route to the chain, declare it in the
+                        // table instead.
                         use crate::gateway_routes::RouteHandlerId;
                         match route.handler {
                             RouteHandlerId::FsWrite => {
@@ -29820,56 +29824,15 @@ fn dashboard_http_operation(
     req_method: &str,
     req_path: &str,
 ) -> Option<crate::peer::access_policy::PeerOperation> {
-    use crate::peer::access_policy::PeerOperation;
-
-    // Routes declared in the gateway route table carry their own IAM
-    // operation — every dispatched route is declared there. The residual
-    // rules below cover only (method, path) combinations the table does
-    // NOT declare but this classifier historically gated anyway: method-
-    // blind subtree/exact rules whose non-served methods were still
-    // classified. They keep those answers byte-stable and are retired
-    // wholesale (with an explicit divergence review) in the final
-    // migration phase.
+    // Pure table lookup: every dispatched route is declared in
+    // gateway_routes::ROUTES with its IAM operation, and an undeclared
+    // (method, path) is not a route — nothing to gate. (The hand-written
+    // match this function used to be lived and died with the route-table
+    // migration; the invariants in gateway_routes.rs hold in its place.)
     match crate::gateway_routes::classify(req_method, req_path) {
-        crate::gateway_routes::TableClassification::Matched(op) => return op,
-        crate::gateway_routes::TableClassification::NoMatch => {}
+        crate::gateway_routes::TableClassification::Matched(op) => op,
+        crate::gateway_routes::TableClassification::NoMatch => None,
     }
-
-    if !req_path.starts_with("/api/") {
-        return None;
-    }
-
-    // Boundary rule matches dispatch: exact path or a real `/` segment
-    // under it — a look-alike longer path (`/api/sessionsfoo`,
-    // `/api/worktrees/inspect-old`) is not a route there and must not be
-    // classified as one here.
-    if path_is_or_under(req_path, "/api/managed-context") {
-        return Some(PeerOperation::SessionInspect);
-    }
-    if path_is_or_under(req_path, "/api/session/current") {
-        return Some(PeerOperation::SessionManage);
-    }
-    if path_is_or_under(req_path, "/api/session") {
-        return match req_method {
-            "GET" => Some(PeerOperation::SessionInspect),
-            "POST" | "DELETE" => Some(PeerOperation::SessionManage),
-            _ => None,
-        };
-    }
-    // Worktree routes are table-declared with their real (exact) methods;
-    // these residual rules only fire for OTHER methods, which dispatch
-    // never served but this classifier always gated.
-    if req_path == "/api/worktrees/inspect" {
-        return Some(PeerOperation::SessionInspect);
-    }
-    if req_path == "/api/worktrees/scan" || req_path == "/api/worktrees/remove" {
-        return Some(PeerOperation::SessionManage);
-    }
-    if req_path == "/api/worktrees" {
-        return Some(PeerOperation::SessionInspect);
-    }
-
-    None
 }
 
 fn http_access_forbidden_response(
@@ -41741,296 +41704,61 @@ mod tests {
             dashboard_http_operation("GET", "/api/session/current/changes/src/main.rs"),
             Some(PeerOperation::SessionManage)
         );
+        // Methods a route does not declare are not routes and carry no
+        // operation (the retired hand classifier used to gate some of
+        // these method-blind; dispatch never served them).
+        assert_eq!(dashboard_http_operation("GET", "/api/worktrees/inspect"), None);
+        assert_eq!(
+            dashboard_http_operation("PUT", "/api/session/current/history"),
+            None
+        );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/managed-context/anchors"),
+            None
+        );
+        // Deliberately public routes classify as no operation: the
+        // payload's own signature/shape is the authority.
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/peer-pairing/requests"),
+            None
+        );
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/peer-pairing/requests/req1"),
+            None
+        );
+        assert_eq!(dashboard_http_operation("POST", "/api/access/org-grants"), None);
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/access/orgs/revocations/apply"),
+            None
+        );
+        // The federation surface delegates to federation_http_operation —
+        // the same ladder the federation bearer gate enforces.
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/peers"),
+            Some(PeerOperation::PeerInspect)
+        );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/peers/p1/message"),
+            Some(PeerOperation::PeerUse)
+        );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/peers/pairing/invite"),
+            Some(PeerOperation::AccessManage)
+        );
+        // /mcp is token-bound inside the handler, not operation-gated.
+        assert_eq!(dashboard_http_operation("POST", "/mcp"), None);
+        // The Any-method settings row closed a method-blind hole: DELETE
+        // /api/settings used to serve the settings body with no gate.
+        assert_eq!(
+            dashboard_http_operation("DELETE", "/api/settings"),
+            Some(PeerOperation::Settings)
+        );
     }
 
-    /// Frozen copy of `dashboard_http_operation` as it stood when the
-    /// gateway route table landed (phase 0 of the migration). The
-    /// differential test below pins the live table-first classifier to
-    /// this snapshot across the whole route corpus, so porting a family
-    /// can never silently change an IAM answer. Deliberate divergences
-    /// (fail-closed tightenings of method-blind legacy rules) get an
-    /// explicit allowlist entry there instead of an edit here. Deleted
-    /// together with the residual classifier in the final phase.
-    fn legacy_reference_dashboard_http_operation(
-        req_method: &str,
-        req_path: &str,
-    ) -> Option<crate::peer::access_policy::PeerOperation> {
-        use crate::peer::access_policy::PeerOperation;
-
-        if !req_path.starts_with("/api/") {
-            return None;
-        }
-
-        match (req_method, req_path) {
-            ("POST", "/api/access/enrollment-requests/decide")
-            | ("POST", "/api/access/orgs/trust")
-            | ("POST", "/api/access/orgs/revoke")
-            | ("POST", "/api/access/org-grants/issue")
-            | ("POST", "/api/access/org-grants/revoke-member")
-            | ("POST", "/api/access/org-grants/issuers/init")
-            | ("POST", "/api/access/org-grants/issuers/delegate")
-            | ("POST", "/api/access/org-grants/issuers/install") => {
-                return Some(PeerOperation::AccessManage)
-            }
-            ("GET", "/api/access/enrollment-requests") => {
-                return Some(PeerOperation::AccessInspect)
-            }
-            ("GET", "/api/access/overview")
-            | ("GET", "/api/access/iam/state")
-            | ("GET", "/api/dashboard/targets") => return Some(PeerOperation::AccessInspect),
-            ("POST", "/api/access/iam/user-client-grants")
-            | ("POST", "/api/access/iam/grants/update") => {
-                return Some(PeerOperation::AccessManage)
-            }
-            ("GET", "/api/project-root") => return Some(PeerOperation::Settings),
-            ("GET", "/api/settings") | ("GET", "/api/api-key-status") => {
-                return Some(PeerOperation::Settings);
-            }
-            ("GET", "/api/external-agents") => return Some(PeerOperation::SessionInspect),
-            ("POST", "/api/settings") | ("POST", "/api/api-keys") => {
-                return Some(PeerOperation::Settings);
-            }
-            ("GET", "/api/fs/stat") | ("GET", "/api/fs/list") | ("GET", "/api/fs/read") => {
-                return Some(PeerOperation::FilesystemRead);
-            }
-            ("POST", "/api/fs/mkdir")
-            | ("POST", "/api/fs/write")
-            | ("POST", "/api/fs/rename")
-            | ("POST", "/api/fs/delete") => return Some(PeerOperation::FilesystemWrite),
-            ("POST", "/api/diagnostics/visual-freshness") => {
-                return Some(PeerOperation::DisplayInput);
-            }
-            ("GET", "/api/displays") => return Some(PeerOperation::DisplayView),
-            _ => {}
-        }
-
-        if path_is_or_under(req_path, "/api/managed-context") {
-            return Some(PeerOperation::SessionInspect);
-        }
-        if path_is_or_under(req_path, "/api/session/current") {
-            return Some(PeerOperation::SessionManage);
-        }
-        if path_is_or_under(req_path, "/api/session") {
-            return match req_method {
-                "GET" => Some(PeerOperation::SessionInspect),
-                "POST" | "DELETE" => Some(PeerOperation::SessionManage),
-                _ => None,
-            };
-        }
-        if req_path == "/api/worktrees/inspect" {
-            return Some(PeerOperation::SessionInspect);
-        }
-        if req_path == "/api/worktrees/scan" || req_path == "/api/worktrees/remove" {
-            return Some(PeerOperation::SessionManage);
-        }
-        if req_path == "/api/worktrees" {
-            return Some(PeerOperation::SessionInspect);
-        }
-        if req_path == "/api/sessions" {
-            return Some(PeerOperation::SessionInspect);
-        }
-        if path_is_or_under(req_path, "/api/peers") {
-            return crate::peer::access_policy::federation_http_operation(req_method, req_path);
-        }
-
-        None
-    }
-
-    /// Every (method, path) the classifier can be asked about: all served
-    /// routes, the audit's look-alike regression cases, subtree probes,
-    /// and non-API paths — crossed with more methods than any route
-    /// declares.
-    fn classifier_corpus_paths() -> &'static [&'static str] {
-        &[
-            "/api/project-root",
-            "/api/fs/stat",
-            "/api/fs/list",
-            "/api/fs/read",
-            "/api/fs/mkdir",
-            "/api/fs/write",
-            "/api/fs/writeable",
-            "/api/fs/rename",
-            "/api/fs/delete",
-            "/api/fs/deleted",
-            "/api/settings",
-            "/api/api-keys",
-            "/api/api-key-status",
-            "/api/external-agents",
-            "/api/diagnostics/visual-freshness",
-            "/api/session/current/agent-output",
-            "/api/session/current/uploads",
-            "/api/session/current/uploads/u1",
-            "/api/session/current/changes",
-            "/api/session/current/changes/src/main.rs",
-            "/api/session/current/changesx",
-            "/api/session/current/history",
-            "/api/session/current/rollback",
-            "/api/session/current/redo",
-            "/api/session/current/prune",
-            "/api/session/abc123/log",
-            "/api/session/abc123/delete",
-            "/api/session/abc123/agent-output",
-            "/api/session/abc123/x/agent-output",
-            "/api/session/abc123/recordings",
-            "/api/session/abc123/recordings/s1/segments",
-            "/api/session/abc123/recordings/s1/playlist.m3u8",
-            "/api/session/abc123/frames",
-            "/api/session/abc123/frames/f1.jpg",
-            "/api/session/abc123/context-snapshot",
-            "/api/session/abc123/report",
-            "/api/session/abc123",
-            "/api/session/a/b/c/delete",
-            "/api/session/current",
-            "/api/session/current/delete",
-            "/api/session/current/uploads/u1/raw",
-            "/api/session",
-            "/api/sessionx",
-            "/api/sessions",
-            "/api/sessions/stream",
-            "/api/sessions/search",
-            "/api/sessionsfoo",
-            "/api/managed-context/anchors",
-            "/api/managed-context/records",
-            "/api/managed-context/fission",
-            "/api/managed-contextx",
-            "/api/worktrees",
-            "/api/worktrees/inspect",
-            "/api/worktrees/inspect-old",
-            "/api/worktrees/remove",
-            "/api/worktrees/scan",
-            "/api/worktreesx",
-            "/api/displays",
-            "/api/access/overview",
-            "/api/access/iam/state",
-            "/api/access/iam/user-client-grants",
-            "/api/access/iam/grants/update",
-            "/api/access/enrollment-requests",
-            "/api/access/enrollment-requests/decide",
-            "/api/access/orgs/trust",
-            "/api/access/orgs/revoke",
-            "/api/access/orgs/acme/revocations",
-            "/api/access/orgs/revocations/apply",
-            "/api/access/org-grants",
-            "/api/access/org-grants/renew",
-            "/api/access/org-grants/issue",
-            "/api/access/org-grants/revoke-member",
-            "/api/access/org-grants/issuers/init",
-            "/api/access/org-grants/issuers/delegate",
-            "/api/access/org-grants/issuers/install",
-            "/api/dashboard/targets",
-            "/api/peers",
-            "/api/peers/p1/message",
-            "/api/peers/eligible",
-            "/api/peers/pairing/invite",
-            "/api/peers/pairing/join",
-            "/api/peers/pairing/requests",
-            "/api/peers/pairing/requests/r1/approve",
-            "/api/peers/pairing/identities",
-            "/api/peers/pairing/identities/revoke",
-            "/api/peers/pairing/request-access",
-            "/api/peer-pairing/requests",
-            "/api/peer-pairing/requests/req1",
-            "/api/peersfoo",
-            "/api/coordinator/route",
-            "/api/",
-            "/api",
-            "/mcp",
-            "/debug",
-            "/config",
-            "/connect/status",
-            "/session",
-            "/recordings",
-            "/",
-        ]
-    }
-
-    /// The differential migration test: the live (table-first) classifier
-    /// must answer exactly like the frozen legacy snapshot for the whole
-    /// corpus. When porting a family deliberately tightens a method-blind
-    /// legacy rule, add the (method, path) to a divergence class here with
-    /// a justification — never weaken silently.
-    #[test]
-    fn dashboard_http_operation_matches_frozen_legacy_reference() {
-        const ALL_METHODS: [&str; 6] = ["GET", "POST", "DELETE", "PUT", "PATCH", "HEAD"];
-        let mut allowed: std::collections::HashSet<(&str, &str)> = Default::default();
-
-        // Class 1 — served but never classified: dispatch answered these
-        // while the hand classifier returned None, so browser principals
-        // were entirely ungated (peers were already gated by
-        // federation_http_operation, which the table rows now delegate to
-        // or mirror). Fail-closed fix.
-        for path in [
-            "/api/sessions/stream",
-            "/api/sessions/search",
-            "/api/coordinator/route",
-        ] {
-            for method in ALL_METHODS {
-                allowed.insert((method, path));
-            }
-        }
-
-        // Class 2 — method-blind admin arms: the legacy arms answered 405
-        // JSON for non-POST methods but only POST was classified. The
-        // `Any` table rows now classify every method with the arm's
-        // operation — a narrow principal gets 403 where it used to see
-        // the unauthenticated 405. Fail-closed cosmetic.
-        for path in [
-            "/api/access/iam/user-client-grants",
-            "/api/access/iam/grants/update",
-            "/api/access/orgs/trust",
-            "/api/access/orgs/revoke",
-            "/api/access/org-grants/issue",
-            "/api/access/org-grants/revoke-member",
-            "/api/access/org-grants/issuers/init",
-            "/api/access/org-grants/issuers/delegate",
-            "/api/access/org-grants/issuers/install",
-            "/api/access/enrollment-requests/decide",
-        ] {
-            for method in ["GET", "DELETE", "PUT", "PATCH", "HEAD"] {
-                allowed.insert((method, path));
-            }
-        }
-
-        // Class 3 — method-blind read arms: served every method, but only
-        // GET was classified (e.g. DELETE /api/settings returned the
-        // settings body with no IAM gate at all). Same fail-closed
-        // direction as class 2.
-        for path in [
-            "/api/access/enrollment-requests",
-            "/api/access/iam/state",
-            "/api/access/overview",
-            "/api/dashboard/targets",
-            "/api/displays",
-            "/api/project-root",
-            "/api/api-key-status",
-            "/api/external-agents",
-        ] {
-            for method in ["POST", "DELETE", "PUT", "PATCH", "HEAD"] {
-                allowed.insert((method, path));
-            }
-        }
-        for method in ["DELETE", "PUT", "PATCH", "HEAD"] {
-            allowed.insert((method, "/api/settings"));
-        }
-
-        for method in ALL_METHODS {
-            for path in classifier_corpus_paths() {
-                if allowed.contains(&(method, path)) {
-                    continue;
-                }
-                assert_eq!(
-                    dashboard_http_operation(method, path),
-                    legacy_reference_dashboard_http_operation(method, path),
-                    "classification for {method} {path} diverged from the \
-                     frozen legacy reference",
-                );
-            }
-        }
-    }
-
-    /// Routes still served by the legacy dispatch chain must never match
-    /// the table — a route is served by exactly one of the two. Entries
-    /// leave this list as their families port.
+    /// Routes served by the legacy dispatch chain (the non-API surface:
+    /// connect bootstrap, recordings, frames, debug, config, static/SPA)
+    /// must never match the table — a route is served by exactly one of
+    /// the two.
     #[test]
     fn route_table_does_not_shadow_legacy_chain_routes() {
         let legacy_served: &[(&str, &str)] = &[

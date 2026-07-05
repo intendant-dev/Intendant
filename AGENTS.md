@@ -128,6 +128,12 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
 - TLS/cert code is **pure-Rust `ring`/`rcgen`/`rustls`** (`web_tls.rs`, `access/certs.rs`) — no OpenSSL; prefer that path when touching crypto/cert code
 - Tests live in inline `#[cfg(test)]` modules only
 - WASM boundary: `serde_wasm_bindgen` with `serialize_maps_as_objects(true)`
+- **Gateway API routes are declared once** in `src/bin/caller/gateway_routes.rs`
+  (`ROUTES`): dispatch, the pre-dispatch IAM classification, the OPTIONS
+  preflight, and the docs endpoint table in `docs/src/web-dashboard.md` all
+  derive from the declaration. Never add an HTTP route by editing
+  `web_gateway.rs`'s dispatch chain — add a table row plus a `RouteHandlerId`
+  match arm; unit tests enforce the table invariants and pin the docs chapter.
 - Pure-safe Rust by default. The Unix (macOS / Linux) code paths keep `unsafe`
   confined to documented islands: small platform probes/signals and display or
   identity queries in `platform.rs`; macOS Accessibility bindings in `ax.rs`

@@ -1815,6 +1815,93 @@ family (sub-routes elided where the family is uniform):
 | `GET /api/worktrees`, `POST /api/worktrees/{inspect,scan,remove}` | Agent worktree inventory and lifecycle |
 | `GET /connect/{bootstrap,status}`, `POST /connect/dashboard/{offer,ice,close}` | Intendant Connect tunnel: bootstrap metadata and dashboard-control WebRTC signaling |
 
+### Declared API routes
+
+Every `/api/*` and `/mcp` route is declared exactly once in
+`gateway_routes::ROUTES` (`src/bin/caller/gateway_routes.rs`); dispatch, the
+pre-dispatch IAM classification, and the OPTIONS preflight (CORS posture +
+allowed-method union) all derive from those declarations, and the table below
+is rendered from them. A unit test (`endpoint_docs_match_chapter`) fails when
+the chapter and the code drift; regenerate with
+`cargo test --bin intendant endpoint_docs_match_chapter -- --nocapture` and
+paste the printed block between the markers. Authorization names the
+`PeerOperation` the IAM gate evaluates; `public` routes carry their authority
+in the payload itself (signature/shape), and the federation surface derives
+its operation per method/path from `federation_http_operation`.
+
+<!-- gateway-route-table:begin (generated; do not edit by hand) -->
+| Method | Path | Authorization | CORS | Body | Description |
+|---|---|---|---|---|---|
+| GET | `/api/fs/stat` | FilesystemRead | own origin | none | Stat a filesystem path (scope-checked) |
+| GET | `/api/fs/list` | FilesystemRead | own origin | none | List a directory (scope-checked) |
+| GET | `/api/fs/read` | FilesystemRead | own origin | none | Read file bytes (scope-checked; supports byte ranges) |
+| POST | `/api/fs/mkdir` | FilesystemWrite | own origin | bounded | Create a directory (scope-checked) |
+| POST | `/api/fs/write` | FilesystemWrite | own origin | capped | Write file bytes (scope-checked; sha256-guarded overwrite) |
+| POST | `/api/fs/rename` | FilesystemWrite | own origin | bounded | Move/rename a file or directory (scope-checked) |
+| POST | `/api/fs/delete` | FilesystemWrite | own origin | bounded | Delete a file or directory (scope-checked) |
+| GET | `/api/session/current/changes[/…]` | SessionManage | own origin | none | List the session's changed files, or the unified diff for one file (subpath) |
+| GET | `/api/session/current/history` | SessionManage | own origin | none | Serialized rollback History for the current session |
+| POST | `/api/session/current/rollback` | SessionManage | own origin | bounded | Roll the current session back to a round (optionally reverting files) |
+| POST | `/api/session/current/redo` | SessionManage | own origin | bounded | Redo the last rolled-back round |
+| POST | `/api/session/current/prune` | SessionManage | own origin | bounded | Prune rollback state for the current session |
+| POST | `/api/session/current/agent-output` | SessionManage | own origin | bounded | Append agent output to the current session's log |
+| POST | `/api/session/current/uploads` | SessionManage | own origin | streaming | Upload a file attachment (raw streamed body; name/destination in query) |
+| GET | `/api/session/current/uploads[/…]` | SessionManage | own origin | none | List uploads, or fetch one (subpath {id}/raw) |
+| DELETE | `/api/session/current/uploads/{upload_id}` | SessionManage | own origin | none | Delete one upload (file + sidecar) |
+| DELETE | `/api/session/{id}` | SessionManage | own origin | none | Delete a session's data |
+| DELETE | `/api/session/{id}/{target}` | SessionManage | own origin | none | Delete one data kind for a session (recordings, frames, …) |
+| DELETE | `/api/session/{id}/{target}/delete` | SessionManage | own origin | none | Delete one data kind for a session (suffix form) |
+| POST | `/api/session/{id}/delete` | SessionManage | own origin | none | Delete a session's data (POST fallback for WKWebView) |
+| POST | `/api/session/{id}/{target}/delete` | SessionManage | own origin | none | Delete one data kind for a session (POST fallback) |
+| POST | `/api/session/{id}/agent-output` | SessionManage | own origin | bounded | Append agent output to a session's log by id |
+| GET | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail and artifact sub-routes |
+| POST | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail sub-routes (POST fallback callers) |
+| GET | `/api/session[/…]` | SessionInspect | own origin | none | Session detail; context-snapshot, recordings (+segments/playlist), report zip, frames |
+| POST | `/api/session[/…]` | SessionManage | own origin | none | Session detail sub-routes (POST fallback callers) |
+| GET | `/api/managed-context/anchors` | SessionInspect | own origin | none | Managed-context anchor catalog |
+| GET | `/api/managed-context/records` | SessionInspect | own origin | none | Managed-context record index |
+| GET | `/api/managed-context/fission` | SessionInspect | own origin | none | Managed-context fission state |
+| POST | `/api/worktrees/inspect` | SessionInspect | own origin | bounded | Inspect one worktree (branch, ahead/behind, dirty state) |
+| POST | `/api/worktrees/remove` | SessionManage | own origin | bounded | Remove a worktree from the inventory |
+| POST | `/api/worktrees/scan` | SessionManage | own origin | none | Rescan the worktree inventory (refreshes the cache) |
+| GET | `/api/worktrees` | SessionInspect | own origin | none | Cached worktree inventory |
+| any | `/api/sessions/stream` | SessionInspect | own origin | none | NDJSON stream of the session list |
+| any | `/api/sessions/search` | SessionInspect | own origin | none | Search sessions (q, source, mode, project filters) |
+| any | `/api/sessions` | SessionInspect | own origin | none | List sessions (id filter, limit, usage view; response CORS * for the fleet Stats tab) |
+| any | `/api/project-root` | Settings | own origin | none | Project root path this daemon serves |
+| POST | `/api/settings` | Settings | own origin | bounded | Update runtime settings |
+| any | `/api/settings` | Settings | own origin | none | Current runtime settings |
+| POST | `/api/api-keys` | Settings | own origin | bounded | Store provider API keys in the project .env |
+| any | `/api/api-key-status` | Settings | own origin | none | Which provider keys are configured (presence only) |
+| any | `/api/external-agents` | SessionInspect | own origin | none | Detected external coding agents (codex, claude) |
+| POST | `/api/diagnostics/visual-freshness` | DisplayInput | own origin | bounded | Visual-freshness diagnostics transcript sink (NDJSON body) |
+| any | `/api/displays` | DisplayView | own origin | none | Enumerate active displays |
+| any | `/api/peer-pairing/requests[/…]` | public | public | capped | Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath) |
+| any | `/api/access/org-grants` | public | public | capped | Present a signed org grant document (verified against locally trusted org keys) |
+| GET | `/api/access/orgs/{org_handle}/revocations` | public | public | none | Org revocation list (ORL) for a trusted org |
+| any | `/api/access/orgs/revocations/apply` | public | public | capped | Apply a signed org revocation list |
+| any | `/api/access/org-grants/renew` | public | public | capped | Renew an org grant document (signed payload) |
+| any | `/api/access/iam/user-client-grants` | AccessManage | fleet allowlist | bounded | Upsert a user-client grant |
+| any | `/api/access/iam/grants/update` | AccessManage | fleet allowlist | bounded | Update an IAM grant |
+| any | `/api/access/orgs/trust` | AccessManage | fleet allowlist | bounded | Trust an org root key on this daemon |
+| any | `/api/access/orgs/revoke` | AccessManage | fleet allowlist | bounded | Withdraw trust in an org root key |
+| any | `/api/access/org-grants/issue` | AccessManage | own origin | bounded | Issue an org grant (org root/issuer key on this daemon) |
+| any | `/api/access/org-grants/revoke-member` | AccessManage | own origin | bounded | Revoke an org member (appends to the ORL) |
+| any | `/api/access/org-grants/issuers/init` | AccessManage | own origin | bounded | Initialize an org issuer key |
+| any | `/api/access/org-grants/issuers/delegate` | AccessManage | own origin | bounded | Delegate to an org issuer |
+| any | `/api/access/org-grants/issuers/install` | AccessManage | own origin | bounded | Install a delegated org issuer key |
+| any | `/api/access/enrollment-requests/decide` | AccessManage | fleet allowlist | bounded | Approve or deny a pending enrollment request |
+| any | `/api/access/enrollment-requests` | AccessInspect | fleet allowlist | none | Pending enrollment requests |
+| any | `/api/access/iam/state` | AccessInspect | fleet allowlist | none | Local IAM state (roles, grants, bindings) |
+| any | `/api/access/overview` | AccessInspect | fleet allowlist | none | Access overview for the calling principal |
+| any | `/api/dashboard/targets` | AccessInspect | own origin | none | Dashboard target list (this daemon + connected peers) |
+| any | `/api/peers[/…]` | federation (per method/path) | own origin | bounded | Peer registry (list/add/remove), pairing (invite/join/requests/identities), eligibility, and per-peer quick controls + signaling relays |
+| any | `/api/coordinator/route` | federation (per method/path) | own origin | bounded | Capability-based task routing through the Coordinator |
+| POST | `/mcp` | MCP token | own origin | bounded | MCP Streamable HTTP endpoint (JSON-RPC requests + notifications) |
+| GET | `/mcp` | MCP token | own origin | none | MCP SSE stream (405: stateless server) |
+| DELETE | `/mcp` | MCP token | own origin | none | MCP session delete (405: stateless server) |
+<!-- gateway-route-table:end -->
+
 The full WebSocket message protocol (inbound key/resize/presence/WebRTC frames,
 outbound term/state/log-replay/tool-response frames) and the gateway's internal
 layering are documented in [Integrations → Web Gateway](./integrations.md#web-gateway).

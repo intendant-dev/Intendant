@@ -1,32 +1,35 @@
 //! Declarative route table for the web gateway.
 //!
-//! One declaration per HTTP API route. The gateway derives from this table
-//! everything that used to be hand-synchronized across four places in
-//! `web_gateway.rs` (the dispatch chain, the IAM classifier, the OPTIONS
-//! preflight, and the docs endpoint table):
+//! One declaration per HTTP API route (`/api/*` and `/mcp`). Four things
+//! that used to be hand-synchronized across distant regions of
+//! `web_gateway.rs` all derive from this table, so they cannot drift:
 //!
-//! 1. **Dispatch** — the request loop consults [`match_route`] before the
-//!    legacy if/else chain and serves a matching route through its
-//!    [`RouteHandlerId`] arm. The legacy chain shrinks as families port.
-//! 2. **IAM classification** — `dashboard_http_operation` consults
-//!    [`classify`] first and only falls back to its residual hand-written
-//!    match for routes that have not been ported yet.
-//! 3. **Preflight** — `OPTIONS` answers derive method unions and CORS
-//!    posture from the table (phase 2 of the migration).
-//! 4. **Docs** — [`render_endpoint_docs`] renders the endpoint table for
-//!    `docs/src/web-dashboard.md`; a drift test pins the chapter to it
-//!    (phase 3).
+//! 1. **Dispatch** — the request loop consults [`match_route`] and serves
+//!    a matching route through its [`RouteHandlerId`] arm. The remaining
+//!    if/else chain covers only the non-API surface (connect bootstrap,
+//!    recordings, frames, debug, config, static assets, the SPA
+//!    fallback).
+//! 2. **IAM classification** — `dashboard_http_operation` is a pure
+//!    [`classify`] lookup: a declared route carries its operation; an
+//!    undeclared (method, path) is not a route and carries none.
+//! 3. **Preflight** — `OPTIONS` answers derive the CORS posture and the
+//!    `Access-Control-Allow-Methods` union from the same declarations,
+//!    so a preflight can never disagree with its endpoint.
+//! 4. **Docs** — [`render_endpoint_docs`] renders the endpoint table in
+//!    `docs/src/web-dashboard.md`; the `endpoint_docs_match_chapter`
+//!    drift test pins the chapter to it.
 //!
 //! **Never add an API route by editing the dispatch chain**: declare it
 //! here and give it a handler arm in `web_gateway.rs`'s table-dispatch
 //! match. Table invariants (no shadowed routes, non-empty docs, pattern
-//! hygiene) are enforced by unit tests in this module.
+//! hygiene, posture consistency) are enforced by unit tests in this
+//! module.
 //!
-//! During the migration, `BodyPolicy` and `CorsPosture` are declarative:
-//! handlers keep reading their own bodies and stamping their own response
-//! headers exactly as the legacy chain did (byte-identical behavior), and
-//! the enums document the contract that phase 4's response/body
-//! consolidation will enforce mechanically.
+//! `BodyPolicy` (and response-header emission generally) is still
+//! declarative: handlers read their own bodies exactly as their legacy
+//! arms did. Moving body consumption and response serialization into
+//! dispatch is the planned follow-up (phase 4 of the route-table
+//! design), not yet mechanical.
 
 use crate::peer::access_policy::PeerOperation;
 use crate::web_gateway::path_is_or_under;
@@ -1482,6 +1485,37 @@ mod tests {
             classify("GET", "/api/definitely-not-a-route"),
             TableClassification::NoMatch
         ));
+    }
+
+    /// The docs chapter's generated endpoint table must equal the one
+    /// rendered from ROUTES. The chapter may say more around it — never
+    /// less or different between the markers. Regenerate by running this
+    /// test with `-- --nocapture` and pasting the printed block.
+    #[test]
+    fn endpoint_docs_match_chapter() {
+        const BEGIN: &str = "<!-- gateway-route-table:begin (generated; do not edit by hand) -->";
+        const END: &str = "<!-- gateway-route-table:end -->";
+        let chapter_path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/src/web-dashboard.md");
+        let rendered = render_endpoint_docs();
+        let chapter = std::fs::read_to_string(chapter_path)
+            .unwrap_or_else(|e| panic!("read {chapter_path}: {e}"));
+        let block = chapter
+            .split_once(BEGIN)
+            .and_then(|(_, rest)| rest.split_once(END))
+            .map(|(block, _)| block.trim_matches('\n'));
+        let expected = rendered.trim_matches('\n');
+        if block != Some(expected) {
+            println!(
+                "--- paste between the markers in docs/src/web-dashboard.md ---\n\
+                 {expected}\n\
+                 --- end ---"
+            );
+            panic!(
+                "docs/src/web-dashboard.md endpoint table is out of date \
+                 (or the markers are missing); regenerate with \
+                 `cargo test --bin intendant endpoint_docs_match_chapter -- --nocapture`"
+            );
+        }
     }
 
     #[test]
