@@ -93,9 +93,15 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install pkg-config libvpx
 
-      # peer-rig.py drives stop_session over a raw WebSocket.
+      # peer-rig.py drives stop_session over a raw WebSocket. A venv
+      # sidesteps PEP 668 (the macos runner's python is
+      # externally-managed and rejects bare pip installs); prepending
+      # its bin to GITHUB_PATH makes it the `python3` later steps get.
       - name: Install python websockets
-        run: python3 -m pip install --user websockets
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pyws"
+          "$RUNNER_TEMP/pyws/bin/pip" install --quiet websockets
+          echo "$RUNNER_TEMP/pyws/bin" >> "$GITHUB_PATH"
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
