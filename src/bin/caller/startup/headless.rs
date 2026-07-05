@@ -329,6 +329,48 @@ pub(crate) async fn run_headless_mode(
                 }
             }
         });
+
+        // Approval / question resolutions from the dashboard and the
+        // control socket: resolve the foreground session's pending
+        // oneshot in the approval registry (the TUI's ControlCommand
+        // arms used to do this; the session supervisor covers only
+        // daemon-managed sessions, so without this a foreground
+        // approval_required blocks its turn forever). Matches by id
+        // only, exactly like the TUI-era resolver. The waiter that
+        // receives the response emits ApprovalResolved itself.
+        let approval_registry_for_controls = approval_registry.clone();
+        let mut approvals_rx = bus.subscribe();
+        tokio::spawn(async move {
+            loop {
+                let ctrl = match approvals_rx.recv().await {
+                    Ok(AppEvent::ControlCommand(ctrl)) => ctrl,
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let (id, response) = match ctrl {
+                    event::ControlMsg::Approve { id, .. } => {
+                        (id, event::ApprovalResponse::Approve)
+                    }
+                    event::ControlMsg::ApproveAll { id, .. } => {
+                        (id, event::ApprovalResponse::ApproveAll)
+                    }
+                    event::ControlMsg::Deny { id, .. } => (id, event::ApprovalResponse::Deny),
+                    event::ControlMsg::Skip { id, .. } => (id, event::ApprovalResponse::Skip),
+                    event::ControlMsg::AnswerQuestion { id, answers, .. } => {
+                        (id, event::ApprovalResponse::Answer { answers })
+                    }
+                    _ => continue,
+                };
+                let responder = approval_registry_for_controls
+                    .lock()
+                    .ok()
+                    .and_then(|mut registry| registry.remove(&id));
+                if let Some(tx) = responder {
+                    let _ = tx.send(response);
+                }
+            }
+        });
     }
     // Only the dispatcher / stdin reader hold senders now (if any).
     drop(follow_up_tx);
