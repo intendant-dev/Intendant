@@ -585,18 +585,22 @@ async function main() {
     // ---- Phase 10: TodoWrite → PlanUpdate --------------------------------
     // The todo list renders as the drain's "**Plan**" checklist (a
     // model_response), and the TodoWrite acknowledgment tool_result is
-    // bookkeeping that must never surface as tool output.
-    run.send({
-      action: 'follow_up',
-      text: 'Use your TodoWrite tool exactly once to record two todos: "todo-e2e-alpha" with status completed and "todo-e2e-beta" with status pending. Then reply with exactly: TODODONE. Do NOT delegate to the Agent tool.',
-    });
-    const planUpdate = await run.waitFor(
-      'plan checklist renders',
-      (e) => e.event === 'model_response' && /\*\*Plan\*\*/.test(e.summary || '')
-        && /\[x\] .*todo-e2e-alpha/.test(e.summary || '')
-        && /\[ \] .*todo-e2e-beta/.test(e.summary || ''),
-      180000,
-    );
+    // bookkeeping that must never surface as tool output. haiku sometimes
+    // claims TodoWrite is not in its toolkit (it is — the init message
+    // lists it), so the prompt is maximally explicit and one nudge retry
+    // is allowed before the phase fails.
+    const todoPrompt = 'Your tool list includes a tool named TodoWrite (it was in your session init). Call TodoWrite exactly once, now, with this input: {"todos":[{"content":"todo-e2e-alpha","status":"completed","activeForm":"Doing alpha"},{"content":"todo-e2e-beta","status":"pending","activeForm":"Doing beta"}]}. After the tool call returns, reply with exactly: TODODONE. Do NOT delegate to the Agent tool. Do NOT claim the tool is unavailable — call it.';
+    const isPlanChecklist = (e) => e.event === 'model_response' && /\*\*Plan\*\*/.test(e.summary || '')
+      && /\[x\] .*todo-e2e-alpha/.test(e.summary || '')
+      && /\[ \] .*todo-e2e-beta/.test(e.summary || '');
+    run.send({ action: 'follow_up', text: todoPrompt });
+    let planUpdate = await run.waitFor('plan checklist renders', isPlanChecklist, 120000)
+      .catch(() => null);
+    if (!planUpdate) {
+      log('driver', 'plan checklist not seen — one nudge retry');
+      run.send({ action: 'follow_up', text: todoPrompt });
+      planUpdate = await run.waitFor('plan checklist renders (retry)', isPlanChecklist, 120000);
+    }
     check('todo-plan-renders', Boolean(planUpdate), (planUpdate.summary || '').slice(0, 100));
     await run.waitFor(
       'todo turn completes',
