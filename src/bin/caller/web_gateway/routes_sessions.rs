@@ -2231,7 +2231,7 @@ pub(crate) async fn handle_current_history(
 
 pub(crate) async fn handle_current_rollback(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     bus: EventBus,
     query_ctx: Option<WebQueryCtx>,
     file_watcher: Option<crate::file_watcher::SharedFileWatcher>,
@@ -2241,7 +2241,6 @@ pub(crate) async fn handle_current_rollback(
     //    "revert_files": bool (default true),
     //    "revert_conversation": bool (default false)}
     use tokio::io::AsyncWriteExt;
-    let body_text = read_post_body(header_text, &mut stream).await;
     let agent_state = query_ctx.as_ref().map(|ctx| ctx.agent_state.clone());
     let (status, body) = handle_history_rollback(
         &body_text,
@@ -2261,13 +2260,12 @@ pub(crate) async fn handle_current_rollback(
 
 pub(crate) async fn handle_current_redo(
     mut stream: DemuxStream,
-    header_text: &str,
     query_ctx: Option<WebQueryCtx>,
     file_watcher: Option<crate::file_watcher::SharedFileWatcher>,
 ) {
-    // POST /api/session/current/redo — no body required.
+    // POST /api/session/current/redo — no body required (dispatch
+    // drains any body sent anyway).
     use tokio::io::AsyncWriteExt;
-    let _ = read_post_body(header_text, &mut stream).await;
     let agent_state = query_ctx.as_ref().map(|ctx| ctx.agent_state.clone());
     let (status, body) = handle_history_redo(file_watcher.as_ref(), agent_state.as_ref()).await;
     let response = HttpResponse::with_content(status, "application/json", body)
@@ -2281,12 +2279,11 @@ pub(crate) async fn handle_current_redo(
 
 pub(crate) async fn handle_current_prune(
     mut stream: DemuxStream,
-    header_text: &str,
     file_watcher: Option<crate::file_watcher::SharedFileWatcher>,
 ) {
-    // POST /api/session/current/prune — no body required.
+    // POST /api/session/current/prune — no body required (dispatch
+    // drains any body sent anyway).
     use tokio::io::AsyncWriteExt;
-    let _ = read_post_body(header_text, &mut stream).await;
     let (status, body) = handle_history_prune(file_watcher.as_ref()).await;
     let response = HttpResponse::with_content(status, "application/json", body)
         .header("Cache-Control", "no-cache")
@@ -2299,13 +2296,12 @@ pub(crate) async fn handle_current_prune(
 
 pub(crate) async fn handle_current_agent_output(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     query_ctx: Option<WebQueryCtx>,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
 ) {
     use tokio::io::AsyncWriteExt;
     let log_dir = current_session_log_dir(session_log.as_ref(), query_ctx.as_ref());
-    let body_text = read_post_body(header_text, &mut stream).await;
     let response = match log_dir {
         Some(dir) => current_agent_output_post_response(&body_text, &dir),
         None => upload_error_response("404 Not Found", "no active session log"),
@@ -2382,7 +2378,7 @@ pub(crate) async fn handle_session_delete(mut stream: DemuxStream, request_line:
 
 pub(crate) async fn handle_session_agent_output(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     request_line: &str,
 ) {
     use tokio::io::AsyncWriteExt;
@@ -2396,7 +2392,6 @@ pub(crate) async fn handle_session_agent_output(
     let session_id = rest_parts.first().copied().unwrap_or("");
     let is_agent_output_route = rest_parts.get(1).copied() == Some("agent-output");
     let source = query_param(request_line, "source").unwrap_or_else(|| "intendant".to_string());
-    let body_text = read_post_body(header_text, &mut stream).await;
     let response = if is_agent_output_route {
         session_agent_output_post_response(&body_text, session_id, &source)
     } else {
@@ -2891,8 +2886,7 @@ pub(crate) async fn handle_sessions_search(mut stream: DemuxStream, request_line
     finalize_http_stream(&mut stream).await;
 }
 
-pub(crate) async fn handle_worktrees_inspect(mut stream: DemuxStream, header_text: &str) {
-    let body_text = read_request_body(&mut stream, header_text).await;
+pub(crate) async fn handle_worktrees_inspect(mut stream: DemuxStream, body_text: String) {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let (status, body) = match tokio::task::spawn_blocking(move || {
         inspect_worktree_inventory_response(&home, &body_text)
@@ -2917,10 +2911,9 @@ pub(crate) async fn handle_worktrees_inspect(mut stream: DemuxStream, header_tex
 
 pub(crate) async fn handle_worktrees_remove(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     worktree_inventory_cache: Arc<Mutex<Option<String>>>,
 ) {
-    let body_text = read_request_body(&mut stream, header_text).await;
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let cache = worktree_inventory_cache.clone();
     let (status, body) = match tokio::task::spawn_blocking(move || {

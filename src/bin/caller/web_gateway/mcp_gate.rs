@@ -366,6 +366,7 @@ pub(crate) async fn handle_mcp_http_request(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_mcp_post(
     mut stream: DemuxStream,
+    body_text: String,
     header_text: &str,
     request_line: &str,
     peer_connection_identity: Option<PeerConnectionIdentity>,
@@ -382,7 +383,7 @@ pub(crate) async fn handle_mcp_post(
     //   - Notifications (no `id`): 202 Accepted + empty body
     //   - GET for SSE stream:    405 Method Not Allowed (we don't support SSE push)
     //   - DELETE for session:    405 Method Not Allowed (stateless)
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     if let Some(ref mcp) = mcp_server {
         let mcp_cors = mcp_cors_header_segment(header_text, is_tls);
         // Bind the request to an access principal before
@@ -426,32 +427,10 @@ pub(crate) async fn handle_mcp_post(
                 return;
             }
         };
-        let content_length: usize = header_text
-            .lines()
-            .find(|l| l.to_lowercase().starts_with("content-length:"))
-            .and_then(|l| l.split(':').nth(1))
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0);
-        let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-        let body_owned;
-        let body_text = if peeked_body.len() >= content_length {
-            crate::types::truncate_str(peeked_body, content_length)
-        } else {
-            let remaining = content_length.saturating_sub(peeked_body.len());
-            let mut full = peeked_body.to_string();
-            if remaining > 0 {
-                let mut rest = vec![0u8; remaining];
-                if stream.read_exact(&mut rest).await.is_ok() {
-                    full.push_str(&String::from_utf8_lossy(&rest));
-                }
-            }
-            body_owned = full;
-            &body_owned
-        };
         let (mcp_session_id, codex_managed_context, tool_profile) =
             mcp_context_from_request_line(request_line);
         let outcome = handle_mcp_http_request(
-            body_text,
+            &body_text,
             mcp,
             mcp_session_id.as_deref(),
             codex_managed_context,

@@ -8098,12 +8098,57 @@ pub fn spawn_web_gateway(
                         // Handler bodies moved here verbatim from their chain arms;
                         // never add an API route to the chain, declare it in the
                         // table instead.
-                        use crate::gateway_routes::RouteHandlerId;
+                        use crate::gateway_routes::{BodyPolicy, RouteHandlerId};
+                        // Dispatch owns request-body consumption: the body is
+                        // read (and capped) here per the route's declared
+                        // BodyPolicy, so a handler can no longer forget its
+                        // cap — the old readers' unbounded Content-Length
+                        // allocation is retired from the API surface. None
+                        // and Streaming routes get an empty string; uploads
+                        // and the doorbell keep driving the stream
+                        // themselves.
+                        let route_body = match route.body {
+                            BodyPolicy::None | BodyPolicy::Streaming => String::new(),
+                            BodyPolicy::Default | BodyPolicy::Capped(_) => {
+                                let cap = match route.body {
+                                    BodyPolicy::Capped(cap) => cap,
+                                    _ => crate::gateway_routes::DEFAULT_BODY_CAP_BYTES,
+                                };
+                                match read_request_body_capped(&mut stream, &header_text, cap)
+                                    .await
+                                {
+                                    Ok(body) => body,
+                                    Err((status, body)) => {
+                                        use tokio::io::AsyncWriteExt;
+                                        let base = HttpResponse::json(
+                                            status_reason(status),
+                                            body,
+                                        );
+                                        let response =
+                                            match crate::gateway_routes::preflight_posture(
+                                                req_path,
+                                            ) {
+                                                Some(
+                                                    crate::gateway_routes::CorsPosture::Public,
+                                                ) => base.public_cors(),
+                                                Some(
+                                                    crate::gateway_routes::CorsPosture::FleetAllowlist,
+                                                ) => base.fleet_cors(fleet_cors_origin.as_deref()),
+                                                _ => base,
+                                            };
+                                        let _ =
+                                            stream.write_all(&response.into_bytes()).await;
+                                        finalize_http_stream(&mut stream).await;
+                                        return;
+                                    }
+                                }
+                            }
+                        };
                         match route.handler {
                             RouteHandlerId::FsWrite => {
                                 return handle_fs_write(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     http_access_context,
                                     peer_connection_identity,
                                     bus,
@@ -8120,12 +8165,12 @@ pub fn spawn_web_gateway(
                                 .await;
                             }
                             RouteHandlerId::WorktreesInspect => {
-                                return handle_worktrees_inspect(stream, &header_text).await;
+                                return handle_worktrees_inspect(stream, route_body).await;
                             }
                             RouteHandlerId::WorktreesRemove => {
                                 return handle_worktrees_remove(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     worktree_inventory_cache,
                                 )
                                 .await;
@@ -8160,7 +8205,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::FsMkdir => {
                                 return handle_fs_mkdir(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     http_access_context,
                                     peer_connection_identity,
                                     bus,
@@ -8170,7 +8215,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::FsRename => {
                                 return handle_fs_rename(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     http_access_context,
                                     peer_connection_identity,
                                     bus,
@@ -8180,7 +8225,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::FsDelete => {
                                 return handle_fs_delete(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     http_access_context,
                                     peer_connection_identity,
                                     bus,
@@ -8193,7 +8238,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::CurrentRollback => {
                                 return handle_current_rollback(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     bus,
                                     query_ctx,
                                     file_watcher,
@@ -8201,26 +8246,16 @@ pub fn spawn_web_gateway(
                                 .await;
                             }
                             RouteHandlerId::CurrentRedo => {
-                                return handle_current_redo(
-                                    stream,
-                                    &header_text,
-                                    query_ctx,
-                                    file_watcher,
-                                )
+                                return handle_current_redo(stream, query_ctx, file_watcher)
                                 .await;
                             }
                             RouteHandlerId::CurrentPrune => {
-                                return handle_current_prune(
-                                    stream,
-                                    &header_text,
-                                    file_watcher,
-                                )
-                                .await;
+                                return handle_current_prune(stream, file_watcher).await;
                             }
                             RouteHandlerId::CurrentAgentOutput => {
                                 return handle_current_agent_output(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     query_ctx,
                                     session_log,
                                 )
@@ -8264,7 +8299,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::SessionAgentOutput => {
                                 return handle_session_agent_output(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     request_line,
                                 )
                                 .await;
@@ -8299,7 +8334,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::SettingsPost => {
                                 return handle_settings_post(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     bus,
                                     project_root,
                                 )
@@ -8314,7 +8349,7 @@ pub fn spawn_web_gateway(
                                 .await;
                             }
                             RouteHandlerId::ApiKeysPost => {
-                                return handle_api_keys_post(stream, &header_text).await;
+                                return handle_api_keys_post(stream, route_body).await;
                             }
                             RouteHandlerId::ApiKeyStatus => {
                                 return handle_api_key_status(stream).await;
@@ -8325,7 +8360,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::DiagnosticsVisualFreshness => {
                                 return handle_diagnostics_visual_freshness(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     request_line,
                                 )
                                 .await;
@@ -8348,7 +8383,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::AccessOrgGrantPresent => {
                                 return handle_access_org_grant_present(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     req_method,
                                     agent_card_value_for_targets,
                                 )
@@ -8360,7 +8395,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::AccessOrgApplyRenew => {
                                 return handle_access_org_apply_renew(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     req_method,
                                     req_path,
                                 )
@@ -8369,7 +8404,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::AccessIamGrants => {
                                 return handle_access_iam_grants(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     req_method,
                                     req_path,
                                     http_access_context,
@@ -8380,7 +8415,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::AccessOrgManage => {
                                 return handle_access_org_manage(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     req_method,
                                     req_path,
                                     http_access_context,
@@ -8391,7 +8426,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::AccessEnrollmentDecide => {
                                 return handle_access_enrollment_decide(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     req_method,
                                     http_access_context,
                                     fleet_cors_origin,
@@ -8429,7 +8464,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::PeersSubRouter => {
                                 return handle_peers_sub_router(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     request_line,
                                     req_method,
                                     bus,
@@ -8441,7 +8476,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::CoordinatorRoute => {
                                 return handle_coordinator_route(
                                     stream,
-                                    &header_text,
+                                    route_body,
                                     req_method,
                                     peer_registry,
                                 )
@@ -8450,6 +8485,7 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::McpPost => {
                                 return handle_mcp_post(
                                     stream,
+                                    route_body,
                                     &header_text,
                                     request_line,
                                     peer_connection_identity,
@@ -8509,7 +8545,22 @@ pub fn spawn_web_gateway(
                             .await;
                     } else if req_method == "POST" && req_path == "/connect/dashboard/offer" {
                         use tokio::io::AsyncWriteExt;
-                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let body_text = match read_request_body_capped(
+                            &mut stream,
+                            &header_text,
+                            CONNECT_SIGNALING_BODY_CAP_BYTES,
+                        )
+                        .await
+                        {
+                            Ok(body) => body,
+                            Err((status, body)) => {
+                                let response =
+                                    HttpResponse::json(status_reason(status), body).public_cors();
+                                let _ = stream.write_all(&response.into_bytes()).await;
+                                finalize_http_stream(&mut stream).await;
+                                return;
+                            }
+                        };
                         let response = with_public_cors(
                             connect_dashboard_offer_response(
                                 &dashboard_control,
@@ -8521,14 +8572,44 @@ pub fn spawn_web_gateway(
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/connect/dashboard/ice" {
                         use tokio::io::AsyncWriteExt;
-                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let body_text = match read_request_body_capped(
+                            &mut stream,
+                            &header_text,
+                            CONNECT_SIGNALING_BODY_CAP_BYTES,
+                        )
+                        .await
+                        {
+                            Ok(body) => body,
+                            Err((status, body)) => {
+                                let response =
+                                    HttpResponse::json(status_reason(status), body).public_cors();
+                                let _ = stream.write_all(&response.into_bytes()).await;
+                                finalize_http_stream(&mut stream).await;
+                                return;
+                            }
+                        };
                         let response = with_public_cors(
                             connect_dashboard_ice_response(&dashboard_control, &body_text).await,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/connect/dashboard/close" {
                         use tokio::io::AsyncWriteExt;
-                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let body_text = match read_request_body_capped(
+                            &mut stream,
+                            &header_text,
+                            CONNECT_SIGNALING_BODY_CAP_BYTES,
+                        )
+                        .await
+                        {
+                            Ok(body) => body,
+                            Err((status, body)) => {
+                                let response =
+                                    HttpResponse::json(status_reason(status), body).public_cors();
+                                let _ = stream.write_all(&response.into_bytes()).await;
+                                finalize_http_stream(&mut stream).await;
+                                return;
+                            }
+                        };
                         let response = with_public_cors(
                             connect_dashboard_close_response(&dashboard_control, &body_text).await,
                         );
@@ -8966,36 +9047,13 @@ async fn handle_project_root(mut stream: DemuxStream, project_root: Option<PathB
 
 async fn handle_settings_post(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     bus: EventBus,
     project_root: Option<PathBuf>,
 ) {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
-    // Read POST body — may be partially or fully outside the peek buffer
-    let content_length: usize = header_text
-        .lines()
-        .find(|l| l.to_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.split(':').nth(1))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-    let body_owned;
-    let body_text = if peeked_body.len() >= content_length {
-        crate::types::truncate_str(peeked_body, content_length)
-    } else {
-        let remaining = content_length.saturating_sub(peeked_body.len());
-        let mut full = peeked_body.to_string();
-        if remaining > 0 {
-            let mut rest = vec![0u8; remaining];
-            if stream.read_exact(&mut rest).await.is_ok() {
-                full.push_str(&String::from_utf8_lossy(&rest));
-            }
-        }
-        body_owned = full;
-        &body_owned
-    };
+    use tokio::io::AsyncWriteExt;
     let (status, result) =
-        settings_post_result(body_text, project_root.as_deref(), &bus);
+        settings_post_result(&body_text, project_root.as_deref(), &bus);
     let response = json_response(status, result);
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
@@ -9018,31 +9076,9 @@ async fn handle_settings_get(
     finalize_http_stream(&mut stream).await;
 }
 
-async fn handle_api_keys_post(mut stream: DemuxStream, header_text: &str) {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
-    let content_length: usize = header_text
-        .lines()
-        .find(|l| l.to_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.split(':').nth(1))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-    let body_owned;
-    let body_text = if peeked_body.len() >= content_length {
-        crate::types::truncate_str(peeked_body, content_length)
-    } else {
-        let remaining = content_length.saturating_sub(peeked_body.len());
-        let mut full = peeked_body.to_string();
-        if remaining > 0 {
-            let mut rest = vec![0u8; remaining];
-            if stream.read_exact(&mut rest).await.is_ok() {
-                full.push_str(&String::from_utf8_lossy(&rest));
-            }
-        }
-        body_owned = full;
-        &body_owned
-    };
-    let result = handle_set_api_keys(body_text);
+async fn handle_api_keys_post(mut stream: DemuxStream, body_text: String) {
+    use tokio::io::AsyncWriteExt;
+    let result = handle_set_api_keys(&body_text);
     let response = HttpResponse::with_content("200 OK", "application/json", result)
         .header("Access-Control-Allow-Origin", "*")
         .header("Connection", "close")
@@ -9075,7 +9111,7 @@ async fn handle_external_agents(mut stream: DemuxStream, project_root: Option<Pa
 
 async fn handle_diagnostics_visual_freshness(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     request_line: &str,
 ) {
     // **Phase 0 visual-freshness transcript sink** (task #83).
@@ -9089,7 +9125,7 @@ async fn handle_diagnostics_visual_freshness(
     // + `_` only) and reject anything that collapses
     // empty so a missing param can't accidentally
     // produce a bare-`.ndjson` write.
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let session_id_raw: String = request_line
         .split('?')
         .nth(1)
@@ -9107,32 +9143,10 @@ async fn handle_diagnostics_visual_freshness(
                 .unwrap_or_default()
         })
         .unwrap_or_default();
-    let content_length: usize = header_text
-        .lines()
-        .find(|l| l.to_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.split(':').nth(1))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-    let body_owned;
-    let body_bytes: &[u8] = if peeked_body.len() >= content_length {
-        &peeked_body.as_bytes()[..content_length]
-    } else {
-        let remaining = content_length.saturating_sub(peeked_body.len());
-        let mut full: Vec<u8> = peeked_body.as_bytes().to_vec();
-        if remaining > 0 {
-            let mut rest = vec![0u8; remaining];
-            if stream.read_exact(&mut rest).await.is_ok() {
-                full.extend_from_slice(&rest);
-            }
-        }
-        body_owned = full;
-        &body_owned
-    };
     let (status, body) =
         match crate::diagnostics::append_visual_freshness_record(
             &session_id_raw,
-            body_bytes,
+            body_text.as_bytes(),
         ) {
             Ok(written) => (
                 "200 OK",

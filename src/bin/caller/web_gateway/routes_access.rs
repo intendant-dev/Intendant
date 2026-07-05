@@ -172,7 +172,7 @@ pub(crate) async fn handle_dashboard_targets(
 
 pub(crate) async fn handle_access_org_grant_present(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     req_method: &str,
     agent_card_value_for_targets: serde_json::Value,
 ) {
@@ -183,20 +183,15 @@ pub(crate) async fn handle_access_org_grant_present(
             serde_json::json!({"error": "method not allowed"}).to_string(),
         )
     } else {
-        match read_request_body_capped(&mut stream, header_text, 16 * 1024).await {
-            Ok(body_text) => {
-                let (status, body) = match serde_json::from_str::<serde_json::Value>(&body_text)
-                    .map_err(|e| format!("invalid JSON: {e}"))
-                    .and_then(|params| {
-                        access_org_present_response_value(params, &agent_card_value_for_targets)
-                    }) {
-                    Ok(value) => (200, value.to_string()),
-                    Err(error) => (400, serde_json::json!({"error": error}).to_string()),
-                };
-                with_public_cors(json_response(status_reason(status), body))
-            }
-            Err((status, body)) => json_response(status_reason(status), body),
-        }
+        let (status, body) = match serde_json::from_str::<serde_json::Value>(&body_text)
+            .map_err(|e| format!("invalid JSON: {e}"))
+            .and_then(|params| {
+                access_org_present_response_value(params, &agent_card_value_for_targets)
+            }) {
+            Ok(value) => (200, value.to_string()),
+            Err(error) => (400, serde_json::json!({"error": error}).to_string()),
+        };
+        with_public_cors(json_response(status_reason(status), body))
     };
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
@@ -219,7 +214,7 @@ pub(crate) async fn handle_access_org_revocations(mut stream: DemuxStream, req_p
 
 pub(crate) async fn handle_access_org_apply_renew(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     req_method: &str,
     req_path: &str,
 ) {
@@ -230,30 +225,22 @@ pub(crate) async fn handle_access_org_apply_renew(
             serde_json::json!({"error": "method not allowed"}).to_string(),
         )
     } else {
-        let cap = if req_path == "/api/access/orgs/revocations/apply" {
-            crate::access::org::MAX_ORG_ORL_BYTES
+        // The per-path caps (ORL vs grant-doc) live on the two table rows;
+        // dispatch already read under the right one.
+        let handler = if req_path == "/api/access/orgs/revocations/apply" {
+            access_org_orl_apply_response_value
+                as fn(serde_json::Value) -> Result<serde_json::Value, String>
         } else {
-            crate::access::org::MAX_ORG_GRANT_DOC_BYTES
+            access_org_renew_response_value
         };
-        match read_request_body_capped(&mut stream, header_text, cap).await {
-            Ok(body_text) => {
-                let handler = if req_path == "/api/access/orgs/revocations/apply" {
-                    access_org_orl_apply_response_value
-                        as fn(serde_json::Value) -> Result<serde_json::Value, String>
-                } else {
-                    access_org_renew_response_value
-                };
-                let (status, body) = match serde_json::from_str::<serde_json::Value>(&body_text)
-                    .map_err(|e| format!("invalid JSON: {e}"))
-                    .and_then(handler)
-                {
-                    Ok(value) => (200, value.to_string()),
-                    Err(error) => (400, serde_json::json!({"error": error}).to_string()),
-                };
-                with_public_cors(json_response(status_reason(status), body))
-            }
-            Err((status, body)) => json_response(status_reason(status), body),
-        }
+        let (status, body) = match serde_json::from_str::<serde_json::Value>(&body_text)
+            .map_err(|e| format!("invalid JSON: {e}"))
+            .and_then(handler)
+        {
+            Ok(value) => (200, value.to_string()),
+            Err(error) => (400, serde_json::json!({"error": error}).to_string()),
+        };
+        with_public_cors(json_response(status_reason(status), body))
     };
     let _ = stream.write_all(response.as_bytes()).await;
     finalize_http_stream(&mut stream).await;
@@ -261,7 +248,7 @@ pub(crate) async fn handle_access_org_apply_renew(
 
 pub(crate) async fn handle_access_iam_grants(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     req_method: &str,
     req_path: &str,
     http_access_context: HttpAccessContext,
@@ -290,7 +277,6 @@ pub(crate) async fn handle_access_iam_grants(
             );
             let _ = stream.write_all(response.as_bytes()).await;
         } else {
-            let body_text = read_request_body(&mut stream, header_text).await;
             let (status, body) = if req_path == "/api/access/iam/grants/update" {
                 access_iam_update_grant_response_body(&body_text, &http_access_context.principal)
             } else {
@@ -311,7 +297,7 @@ pub(crate) async fn handle_access_iam_grants(
 
 pub(crate) async fn handle_access_org_manage(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     req_method: &str,
     req_path: &str,
     http_access_context: HttpAccessContext,
@@ -340,7 +326,6 @@ pub(crate) async fn handle_access_org_manage(
             );
             let _ = stream.write_all(response.as_bytes()).await;
         } else {
-            let body_text = read_request_body(&mut stream, header_text).await;
             let handler = match req_path {
                 "/api/access/orgs/trust" => {
                     access_org_trust_response_value
@@ -376,7 +361,7 @@ pub(crate) async fn handle_access_org_manage(
 
 pub(crate) async fn handle_access_enrollment_decide(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     req_method: &str,
     http_access_context: HttpAccessContext,
     fleet_cors_origin: Option<String>,
@@ -404,7 +389,6 @@ pub(crate) async fn handle_access_enrollment_decide(
             );
             let _ = stream.write_all(response.as_bytes()).await;
         } else {
-            let body_text = read_request_body(&mut stream, header_text).await;
             let (status, body) =
                 access_enrollment_decide_response_body(&body_text, &http_access_context.principal);
             let response = with_fleet_cors(

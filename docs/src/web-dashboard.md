@@ -1843,7 +1843,7 @@ its operation per method/path from `federation_http_operation`.
 | GET | `/api/fs/list` | FilesystemRead | own origin | none | List a directory (scope-checked) |
 | GET | `/api/fs/read` | FilesystemRead | own origin | none | Read file bytes (scope-checked; supports byte ranges) |
 | POST | `/api/fs/mkdir` | FilesystemWrite | own origin | bounded | Create a directory (scope-checked) |
-| POST | `/api/fs/write` | FilesystemWrite | own origin | capped | Write file bytes (scope-checked; sha256-guarded overwrite) |
+| POST | `/api/fs/write` | FilesystemWrite | own origin | ≤ 150 MiB | Write file bytes (scope-checked; sha256-guarded overwrite) |
 | POST | `/api/fs/rename` | FilesystemWrite | own origin | bounded | Move/rename a file or directory (scope-checked) |
 | POST | `/api/fs/delete` | FilesystemWrite | own origin | bounded | Delete a file or directory (scope-checked) |
 | GET | `/api/session/current/changes[/…]` | SessionManage | own origin | none | List the session's changed files, or the unified diff for one file (subpath) |
@@ -1881,13 +1881,13 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/api-keys` | Settings | own origin | bounded | Store provider API keys in the project .env |
 | GET | `/api/api-key-status` | Settings | own origin | none | Which provider keys are configured (presence only) |
 | GET | `/api/external-agents` | SessionInspect | own origin | none | Detected external coding agents (codex, claude) |
-| POST | `/api/diagnostics/visual-freshness` | DisplayInput | own origin | bounded | Visual-freshness diagnostics transcript sink (NDJSON body) |
+| POST | `/api/diagnostics/visual-freshness` | DisplayInput | own origin | ≤ 16 MiB | Visual-freshness diagnostics transcript sink (NDJSON body) |
 | GET | `/api/displays` | DisplayView | own origin | none | Enumerate active displays |
-| any | `/api/peer-pairing/requests[/…]` | public | public | capped | Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath) |
-| POST | `/api/access/org-grants` | public | public | capped | Present a signed org grant document (verified against locally trusted org keys) |
+| any | `/api/peer-pairing/requests[/…]` | public | public | streaming | Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath) |
+| POST | `/api/access/org-grants` | public | public | ≤ 16 KiB | Present a signed org grant document (verified against locally trusted org keys) |
 | GET | `/api/access/orgs/{org_handle}/revocations` | public | public | none | Org revocation list (ORL) for a trusted org |
-| POST | `/api/access/orgs/revocations/apply` | public | public | capped | Apply a signed org revocation list |
-| POST | `/api/access/org-grants/renew` | public | public | capped | Renew an org grant document (signed payload) |
+| POST | `/api/access/orgs/revocations/apply` | public | public | ≤ 64 KiB | Apply a signed org revocation list |
+| POST | `/api/access/org-grants/renew` | public | public | ≤ 16 KiB | Renew an org grant document (signed payload) |
 | POST | `/api/access/iam/user-client-grants` | AccessManage | fleet allowlist | bounded | Upsert a user-client grant |
 | POST | `/api/access/iam/grants/update` | AccessManage | fleet allowlist | bounded | Update an IAM grant |
 | POST | `/api/access/orgs/trust` | AccessManage | fleet allowlist | bounded | Trust an org root key on this daemon |
@@ -1904,7 +1904,7 @@ its operation per method/path from `federation_http_operation`.
 | GET | `/api/dashboard/targets` | AccessInspect | own origin | none | Dashboard target list (this daemon + connected peers) |
 | any | `/api/peers[/…]` | federation (per method/path) | own origin | bounded | Peer registry (list/add/remove), pairing (invite/join/requests/identities), eligibility, and per-peer quick controls + signaling relays |
 | POST | `/api/coordinator/route` | federation (per method/path) | own origin | bounded | Capability-based task routing through the Coordinator |
-| POST | `/mcp` | MCP token | own origin | bounded | MCP Streamable HTTP endpoint (JSON-RPC requests + notifications) |
+| POST | `/mcp` | MCP token | own origin | ≤ 16 MiB | MCP Streamable HTTP endpoint (JSON-RPC requests + notifications) |
 | GET | `/mcp` | MCP token | own origin | none | MCP SSE stream (405: stateless server) |
 | DELETE | `/mcp` | MCP token | own origin | none | MCP session delete (405: stateless server) |
 <!-- gateway-route-table:end -->

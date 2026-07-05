@@ -150,16 +150,34 @@ pub(crate) enum CorsPosture {
 /// into dispatch so handlers can't forget caps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyPolicy {
-    /// No body is read.
+    /// No body is consumed for this route.
     None,
-    /// Read with the shared bounded reader (`read_request_body` /
-    /// `read_post_body`).
+    /// Dispatch reads the body before the handler runs, capped at
+    /// [`DEFAULT_BODY_CAP_BYTES`]; over-cap requests get a 413 with the
+    /// route's CORS posture.
     Default,
-    /// Read with a route-specific cap (e.g. the fs-write envelope cap).
-    Capped,
-    /// The handler drives the stream itself (uploads, NDJSON streams).
+    /// Dispatch reads the body with this route-specific cap.
+    Capped(usize),
+    /// The handler owns the stream: uploads spool to a tempfile, and the
+    /// doorbell's cap comes from runtime config
+    /// (`peer_access_requests`), which the table cannot carry.
     Streaming,
 }
+
+/// Body cap for [`BodyPolicy::Default`] routes — JSON command bodies
+/// (settings, session ops, access administration, peer quick controls).
+/// Before dispatch-side consumption these reads were UNBOUNDED: any
+/// authenticated caller could allocate arbitrary memory with one huge
+/// Content-Length. Generous headroom over every legitimate payload.
+pub(crate) const DEFAULT_BODY_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+/// Body cap for `POST /mcp` — JSON-RPC tool calls can legitimately carry
+/// file-sized arguments (fs tools, upload-adjacent flows).
+pub(crate) const MCP_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
+
+/// Body cap for the visual-freshness diagnostics sink (NDJSON transcript
+/// batches).
+pub(crate) const DIAGNOSTICS_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
 
 /// Links a table row to its dispatch arm in `web_gateway.rs`. The match
 /// there is exhaustive, so a declared route without an arm — or an arm
@@ -380,7 +398,11 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteMethod::Post,
         PathPattern::Exact("/api/fs/write"),
         PeerOperation::FilesystemWrite,
-        BodyPolicy::Capped,
+        // The JSON envelope adds base64/escaping overhead on top of the
+        // content cap apply_dashboard_fs_write enforces; allow half again.
+        BodyPolicy::Capped(
+            crate::web_gateway::UPLOAD_MAX_BYTES + crate::web_gateway::UPLOAD_MAX_BYTES / 2,
+        ),
         RouteHandlerId::FsWrite,
         "Write file bytes (scope-checked; sha256-guarded overwrite)",
     ),
@@ -733,7 +755,7 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteMethod::Post,
         PathPattern::Exact("/api/diagnostics/visual-freshness"),
         PeerOperation::DisplayInput,
-        BodyPolicy::Default,
+        BodyPolicy::Capped(DIAGNOSTICS_BODY_CAP_BYTES),
         RouteHandlerId::DiagnosticsVisualFreshness,
         "Visual-freshness diagnostics transcript sink (NDJSON body)",
     ),
@@ -756,14 +778,14 @@ pub(crate) static ROUTES: &[Route] = &[
     public_route(
         RouteMethod::Any,
         PathPattern::Under(crate::peer::access_request::PUBLIC_REQUEST_PATH),
-        BodyPolicy::Capped,
+        BodyPolicy::Streaming,
         RouteHandlerId::Doorbell,
         "Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath)",
     ),
     public_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants"),
-        BodyPolicy::Capped,
+        BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES),
         RouteHandlerId::AccessOrgGrantPresent,
         "Present a signed org grant document (verified against locally trusted org keys)",
     ),
@@ -783,14 +805,14 @@ pub(crate) static ROUTES: &[Route] = &[
     public_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/orgs/revocations/apply"),
-        BodyPolicy::Capped,
+        BodyPolicy::Capped(crate::access::org::MAX_ORG_ORL_BYTES),
         RouteHandlerId::AccessOrgApplyRenew,
         "Apply a signed org revocation list",
     ),
     public_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/renew"),
-        BodyPolicy::Capped,
+        BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES),
         RouteHandlerId::AccessOrgApplyRenew,
         "Renew an org grant document (signed payload)",
     ),
@@ -936,7 +958,7 @@ pub(crate) static ROUTES: &[Route] = &[
         pattern: PathPattern::Exact("/mcp"),
         authz: RouteAuthz::McpToken,
         cors: CorsPosture::OwnOrigin,
-        body: BodyPolicy::Default,
+        body: BodyPolicy::Capped(MCP_BODY_CAP_BYTES),
         handler: RouteHandlerId::McpPost,
         doc: "MCP Streamable HTTP endpoint (JSON-RPC requests + notifications)",
     },
@@ -1160,10 +1182,16 @@ pub(crate) fn render_endpoint_docs() -> String {
             CorsPosture::Public => "public",
         };
         let body = match route.body {
-            BodyPolicy::None => "none",
-            BodyPolicy::Default => "bounded",
-            BodyPolicy::Capped => "capped",
-            BodyPolicy::Streaming => "streaming",
+            BodyPolicy::None => "none".to_string(),
+            BodyPolicy::Default => "bounded".to_string(),
+            BodyPolicy::Capped(cap) => {
+                if cap % (1024 * 1024) == 0 {
+                    format!("\u{2264} {} MiB", cap / (1024 * 1024))
+                } else {
+                    format!("\u{2264} {} KiB", cap.div_ceil(1024))
+                }
+            }
+            BodyPolicy::Streaming => "streaming".to_string(),
         };
         out.push_str(&format!(
             "| {} | `{}` | {} | {} | {} | {} |\n",
@@ -1451,14 +1479,55 @@ mod tests {
         // their handlers route methods per leaf internally and answer
         // garbage with JSON 404s a per-shape row split would forfeit.
         assert!(match_route("DELETE", "/api/peers").is_some());
-        assert!(match_route(
-            "DELETE",
-            crate::peer::access_request::PUBLIC_REQUEST_PATH
-        )
-        .is_some());
+        assert!(match_route("DELETE", crate::peer::access_request::PUBLIC_REQUEST_PATH).is_some());
         // Undeclared paths still fall through to the legacy chain / SPA
         // shell rather than the 405 arm.
         assert_eq!(allowed_methods_for_path("/api/no-such-endpoint"), None);
+    }
+
+    #[test]
+    fn body_policies_pin_their_caps() {
+        let policy = |method: &str, path: &str| match_route(method, path).unwrap().0.body;
+        // Route-specific caps.
+        assert_eq!(
+            policy("POST", "/api/fs/write"),
+            BodyPolicy::Capped(
+                crate::web_gateway::UPLOAD_MAX_BYTES + crate::web_gateway::UPLOAD_MAX_BYTES / 2
+            )
+        );
+        assert_eq!(
+            policy("POST", "/mcp"),
+            BodyPolicy::Capped(MCP_BODY_CAP_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/diagnostics/visual-freshness"),
+            BodyPolicy::Capped(DIAGNOSTICS_BODY_CAP_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/access/org-grants"),
+            BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/access/orgs/revocations/apply"),
+            BodyPolicy::Capped(crate::access::org::MAX_ORG_ORL_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/access/org-grants/renew"),
+            BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES)
+        );
+        // Handler-owned streams: uploads spool to a tempfile; the doorbell's
+        // cap is runtime config the table cannot carry.
+        assert_eq!(
+            policy("POST", "/api/session/current/uploads"),
+            BodyPolicy::Streaming
+        );
+        assert_eq!(
+            policy("POST", crate::peer::access_request::PUBLIC_REQUEST_PATH),
+            BodyPolicy::Streaming
+        );
+        // Everything else that takes a body rides the shared default cap.
+        assert_eq!(policy("POST", "/api/settings"), BodyPolicy::Default);
+        assert_eq!(policy("POST", "/api/peers"), BodyPolicy::Default);
     }
 
     #[test]
