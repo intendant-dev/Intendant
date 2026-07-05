@@ -154,9 +154,11 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   (`ROUTES`): dispatch, the pre-dispatch IAM classification, the OPTIONS
   preflight, and the docs endpoint table in `docs/src/web-dashboard.md` all
   derive from the declaration (the HTTP instance of "derive, don't mirror").
-  Never add an HTTP route by editing `web_gateway.rs`'s dispatch chain — add a
-  table row plus a `RouteHandlerId` match arm; unit tests enforce the table
-  invariants and pin the docs chapter.
+  Never add an HTTP route by editing `web_gateway/mod.rs`'s dispatch chain —
+  add a table row plus a `RouteHandlerId` match arm; the row also declares the
+  request-body policy (dispatch reads and caps the body before the handler
+  runs). Unit tests enforce the table invariants, pin the docs chapter, and
+  pin every route-specific body cap.
 - `static/app.html` is **generated** from the `static/app/` fragments (order =
   `static/app/manifest.txt`; assembled by `build.rs` via
   `crates/app-html-assembler`; CI enforces the match). Edit the fragments,

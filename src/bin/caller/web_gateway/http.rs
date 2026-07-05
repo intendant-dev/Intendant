@@ -284,35 +284,6 @@ mod host_header_tests {
     }
 }
 
-/// Read the full POST body (honoring Content-Length). Returns the peeked
-/// prefix if the headers already carried the entire payload; otherwise reads
-/// the remainder from the stream.
-pub(crate) async fn read_post_body<S: AsyncRead + Unpin>(
-    header_text: &str,
-    stream: &mut S,
-) -> String {
-    use tokio::io::AsyncReadExt;
-    let content_length: usize = header_text
-        .lines()
-        .find(|l| l.to_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.split(':').nth(1))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-    if peeked_body.len() >= content_length {
-        return crate::types::truncate_str(peeked_body, content_length).to_string();
-    }
-    let mut full = peeked_body.to_string();
-    let remaining = content_length.saturating_sub(peeked_body.len());
-    if remaining > 0 {
-        let mut rest = vec![0u8; remaining];
-        if stream.read_exact(&mut rest).await.is_ok() {
-            full.push_str(&String::from_utf8_lossy(&rest));
-        }
-    }
-    full
-}
-
 /// Stream the body of an HTTP request into a fresh tempfile, honouring
 /// `Content-Length` and bailing out early if the body exceeds `max_bytes`.
 ///
@@ -321,7 +292,7 @@ pub(crate) async fn read_post_body<S: AsyncRead + Unpin>(
 /// [`crate::upload_store::commit_upload`], which atomically renames it
 /// into place.
 ///
-/// This is the binary counterpart to `read_post_body` — same peek-then-
+/// This is the binary counterpart to `read_request_body_capped` — same peek-then-
 /// stream pattern, but sinks to disk instead of a UTF-8 `String`.
 pub(crate) async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
     header_text: &str,
@@ -726,44 +697,10 @@ pub(crate) fn with_fleet_cors(response: String, allowed_origin: Option<&str>) ->
     format!("{}{rest}", lines.join("\r\n"))
 }
 
-/// Read the body of an HTTP request from `stream`, given the already-
-/// peeked `header_text` (which may include a partial body in its
-/// trailing portion after the `\r\n\r\n` delimiter). Returns the body
-/// as an owned `String`.
-///
-/// Reads exactly `Content-Length` bytes total — the prefix already
-/// in `header_text` plus any remainder still in the socket. Returns
-/// an empty string when no `Content-Length` header is present.
-///
-/// Factored out of the original inline body-reading block in the
-/// `/api/peers` handler so the per-peer outbound op handlers below
-/// can share it without duplicating the peek-then-stream pattern.
-pub(crate) async fn read_request_body<S: AsyncRead + Unpin>(
-    stream: &mut S,
-    header_text: &str,
-) -> String {
-    use tokio::io::AsyncReadExt;
-    let content_length: usize = header_text
-        .lines()
-        .find(|l| l.to_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.split(':').nth(1))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    if content_length == 0 {
-        return String::new();
-    }
-    let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
-    if peeked_body.len() >= content_length {
-        return crate::types::truncate_str(peeked_body, content_length).to_string();
-    }
-    let remaining = content_length.saturating_sub(peeked_body.len());
-    let mut full = peeked_body.to_string();
-    let mut rest = vec![0u8; remaining];
-    if stream.read_exact(&mut rest).await.is_ok() {
-        full.push_str(&String::from_utf8_lossy(&rest));
-    }
-    full
-}
+/// Body cap for the public /connect/dashboard signaling arms (SDP offers
+/// and ICE batches stay far below this; the lane is reachable before any
+/// authentication, so it must never buffer unbounded input).
+pub(crate) const CONNECT_SIGNALING_BODY_CAP_BYTES: usize = 256 * 1024;
 
 pub(crate) async fn read_request_body_capped<S: AsyncRead + Unpin>(
     stream: &mut S,

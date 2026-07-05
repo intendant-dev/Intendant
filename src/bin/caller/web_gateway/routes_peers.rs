@@ -55,7 +55,7 @@ pub(crate) async fn handle_doorbell(
 
 pub(crate) async fn handle_peers_sub_router(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     request_line: &str,
     req_method: &str,
     bus: EventBus,
@@ -102,13 +102,10 @@ pub(crate) async fn handle_peers_sub_router(
     let segments: Vec<&str> = subpath.split('/').filter(|s| !s.is_empty()).collect();
 
     let (status, body) = if segments == ["pairing", "invite"] && req_method == "POST" {
-        let body_text = read_request_body(&mut stream, header_text).await;
         peers_pairing_invite(&body_text)
     } else if segments == ["pairing", "request-access"] && req_method == "POST" {
-        let body_text = read_request_body(&mut stream, header_text).await;
         peers_pairing_request_access(&body_text).await
     } else if segments == ["pairing", "request-access", "poll"] && req_method == "POST" {
-        let body_text = read_request_body(&mut stream, header_text).await;
         peers_pairing_request_access_poll(
             peer_registry.as_ref(),
             project_root.as_deref(),
@@ -120,14 +117,12 @@ pub(crate) async fn handle_peers_sub_router(
     } else if segments == ["pairing", "identities"] && req_method == "GET" {
         peers_pairing_identities_list()
     } else if segments == ["pairing", "identities", "revoke"] && req_method == "POST" {
-        let body_text = read_request_body(&mut stream, header_text).await;
         peers_pairing_identity_revoke(&body_text)
     } else if segments.len() == 4
         && segments[0] == "pairing"
         && segments[1] == "requests"
         && req_method == "POST"
     {
-        let body_text = read_request_body(&mut stream, header_text).await;
         peers_pairing_request_decision(segments[2], segments[3], &body_text)
     } else {
         match peer_registry.as_ref() {
@@ -144,7 +139,6 @@ pub(crate) async fn handle_peers_sub_router(
             Some(registry)
                 if segments.is_empty() && (req_method == "POST" || req_method == "DELETE") =>
             {
-                let body_text = read_request_body(&mut stream, header_text).await;
                 if req_method == "POST" {
                     peers_add(registry, project_root.as_deref(), &body_text).await
                 } else {
@@ -163,13 +157,11 @@ pub(crate) async fn handle_peers_sub_router(
                 peers_eligible(registry, query_str)
             }
             Some(registry) if segments == ["pairing", "join"] && req_method == "POST" => {
-                let body_text = read_request_body(&mut stream, header_text).await;
                 peers_pairing_join(registry, project_root.as_deref(), &body_text).await
             }
             Some(registry) if segments.len() == 2 && req_method == "POST" => {
                 let id = url_path_decode(segments[0]);
                 let op = segments[1];
-                let body_text = read_request_body(&mut stream, header_text).await;
                 match op {
                     "message" => peers_send_message(registry, &id, &body_text).await,
                     "task" => peers_delegate_task(registry, &id, &body_text).await,
@@ -225,7 +217,7 @@ pub(crate) async fn handle_peers_sub_router(
 
 pub(crate) async fn handle_coordinator_route(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     req_method: &str,
     peer_registry: Option<crate::peer::PeerRegistry>,
 ) {
@@ -252,10 +244,7 @@ pub(crate) async fn handle_coordinator_route(
             })
             .to_string(),
         ),
-        Some(registry) => {
-            let body_text = read_request_body(&mut stream, header_text).await;
-            coordinator_route(registry, &body_text).await
-        }
+        Some(registry) => coordinator_route(registry, &body_text).await,
     };
     let reason = match status {
         200 => "OK",

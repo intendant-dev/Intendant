@@ -1947,33 +1947,16 @@ pub(crate) fn upload_error_response(status: &str, message: &str) -> String {
 
 pub(crate) async fn handle_fs_write(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     http_access_context: HttpAccessContext,
     peer_connection_identity: Option<PeerConnectionIdentity>,
     bus: EventBus,
 ) {
     use tokio::io::AsyncWriteExt;
-    // read_post_body has no cap of its own; bound the
-    // body before reading it. The JSON envelope adds
-    // base64/escaping overhead on top of the content
-    // cap that apply_dashboard_fs_write enforces, so
-    // allow half again as much envelope.
-    let content_length: usize = header_text
-        .lines()
-        .find(|l| l.to_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.split(':').nth(1))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    let response = if content_length > UPLOAD_MAX_BYTES + UPLOAD_MAX_BYTES / 2 {
-        json_error(
-            "413 Payload Too Large",
-            format!(
-                "body too large: {content_length} bytes (cap is {})",
-                UPLOAD_MAX_BYTES + UPLOAD_MAX_BYTES / 2
-            ),
-        )
-    } else {
-        let body_text = read_post_body(header_text, &mut stream).await;
+    // Dispatch already read the body under the row's envelope cap
+    // (UPLOAD_MAX_BYTES plus half again — base64/escaping overhead on top
+    // of the content cap apply_dashboard_fs_write enforces).
+    let response = {
         match serde_json::from_str::<FsWriteRequest>(&body_text) {
             Ok(req) => match authorize_http_filesystem_access(
                 &http_access_context,
@@ -2114,13 +2097,12 @@ pub(crate) async fn handle_fs_read(mut stream: DemuxStream, header_text: &str, r
 
 pub(crate) async fn handle_fs_mkdir(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     http_access_context: HttpAccessContext,
     peer_connection_identity: Option<PeerConnectionIdentity>,
     bus: EventBus,
 ) {
     use tokio::io::AsyncWriteExt;
-    let body_text = read_post_body(header_text, &mut stream).await;
     let response = match serde_json::from_str::<FsMkdirRequest>(&body_text) {
         Ok(req) => match authorize_http_filesystem_access(
             &http_access_context,
@@ -2144,13 +2126,12 @@ pub(crate) async fn handle_fs_mkdir(
 
 pub(crate) async fn handle_fs_rename(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     http_access_context: HttpAccessContext,
     peer_connection_identity: Option<PeerConnectionIdentity>,
     bus: EventBus,
 ) {
     use tokio::io::AsyncWriteExt;
-    let body_text = read_post_body(header_text, &mut stream).await;
     let response = match serde_json::from_str::<FsRenameRequest>(&body_text) {
         // Removing the source entry and creating the
         // destination are both writes — each leg passes
@@ -2200,13 +2181,12 @@ pub(crate) async fn handle_fs_rename(
 
 pub(crate) async fn handle_fs_delete(
     mut stream: DemuxStream,
-    header_text: &str,
+    body_text: String,
     http_access_context: HttpAccessContext,
     peer_connection_identity: Option<PeerConnectionIdentity>,
     bus: EventBus,
 ) {
     use tokio::io::AsyncWriteExt;
-    let body_text = read_post_body(header_text, &mut stream).await;
     let response = match serde_json::from_str::<FsDeleteRequest>(&body_text) {
         Ok(req) => match authorize_http_filesystem_access(
             &http_access_context,
@@ -2241,6 +2221,8 @@ pub(crate) async fn handle_fs_delete(
     finalize_http_stream(&mut stream).await;
 }
 
+// Parameter count rides until a request-context bundle collapses the
+// shared per-connection arguments (open cleanup; not load-bearing).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_current_uploads_post(
     mut stream: DemuxStream,

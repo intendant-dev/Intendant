@@ -69,7 +69,9 @@ backend argument is generic, not Codex-only).
 
 Working end-to-end from inside the canvas: approvals (approve/deny on the
 focused agent), the composer (prompt or steer the target, launch new
-sessions with a backend picker), session lifecycle (focus, resume, attach,
+sessions with a backend picker and — for the internal agent — execution
+pills: *auto* / *orch* / *direct*, the same three-state control as the
+dashboard's New Session pane), session lifecycle (focus, resume, attach,
 stop, halt, fork, transcript, copy), the controls panel (autonomy, backend
 selection, mic/cam/display, browser workspaces, recordings, Codex runtime
 options), managed-context operations (seed/rewind/backout/records), context

@@ -2470,7 +2470,7 @@ impl StationInner {
 
     /// The composer strip: canvas-drawn chrome for the DOM input overlay.
     /// Send mode: target chip + input slot + send. Launch mode: input slot
-    /// + agent choice pills + direct toggle + launch.
+    /// + agent choice pills + execution pills + launch.
     fn draw_composer_strip(&mut self, w: f32, h: f32) {
         let (x, y, sw, sh) = self.composer_rect(w, h);
         let controls = &self.snapshot.controls;
@@ -2555,8 +2555,26 @@ impl StationInner {
         }
 
         if launch {
-            // Agent choice pills + direct-mode toggle.
+            // Agent choice pills + execution shape pills. An empty
+            // launch_mode means execution does not apply (external agent
+            // selected); the agent pills then reclaim the full row.
             self.text("agent", x + 16.0, y + 70.0, 8.0, C_TEAL_CSS, "bold");
+            let execution = controls.launch_mode.as_str();
+            let exec_pills = [
+                ("auto", "auto", C_TEAL_CSS),
+                ("orch", "orchestrate", C_LAVENDER_CSS),
+                ("direct", "direct", C_PEACH_CSS),
+            ];
+            let exec_w = exec_pills
+                .iter()
+                .map(|(label, _, _)| label.chars().count() as f32 * 5.8 + 16.0 + 4.0)
+                .sum::<f32>()
+                - 4.0;
+            let agent_limit = if execution.is_empty() {
+                x + sw - 16.0
+            } else {
+                x + sw - exec_w - 24.0
+            };
             let mut cx = x + 58.0;
             let selected_agent = controls.launch_agent.as_str();
             for (label, id) in [
@@ -2566,7 +2584,7 @@ impl StationInner {
                 ("claude", "claude-code"),
             ] {
                 let cw = label.chars().count() as f32 * 5.8 + 16.0;
-                if cx + cw > x + sw - 86.0 {
+                if cx + cw > agent_limit {
                     break;
                 }
                 let active = selected_agent == id;
@@ -2590,25 +2608,32 @@ impl StationInner {
                 ));
                 cx += cw + 6.0;
             }
-            let direct = controls.launch_mode == "direct";
-            self.pill_at(
-                x + sw - 80.0,
-                y + 58.0,
-                64.0,
-                21.0,
-                "direct",
-                if direct { C_PEACH_CSS } else { C_OVERLAY1_CSS },
-                direct,
-            );
-            self.hit_zones.push(HitZone::new(
-                x + sw - 80.0,
-                y + 58.0,
-                64.0,
-                21.0,
-                HitAction::ControlsAction {
-                    action: "launch-direct:toggle".into(),
-                },
-            ));
+            if !execution.is_empty() {
+                let mut ex = x + sw - exec_w - 16.0;
+                for (label, value, accent) in exec_pills {
+                    let cw = label.chars().count() as f32 * 5.8 + 16.0;
+                    let active = execution == value;
+                    self.pill_at(
+                        ex,
+                        y + 58.0,
+                        cw,
+                        21.0,
+                        label,
+                        if active { accent } else { C_OVERLAY1_CSS },
+                        active,
+                    );
+                    self.hit_zones.push(HitZone::new(
+                        ex,
+                        y + 58.0,
+                        cw,
+                        21.0,
+                        HitAction::ControlsAction {
+                            action: format!("launch-execution:{value}"),
+                        },
+                    ));
+                    ex += cw + 4.0;
+                }
+            }
         } else {
             // Target chip: click opens the sessions panel to retarget.
             let chip_w = 70.0;
