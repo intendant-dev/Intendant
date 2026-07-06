@@ -539,7 +539,7 @@ pub fn spawn_web_gateway(
         ice_config.clone(),
         Arc::clone(&tcp_peer_registry),
     ));
-    let _connect_rendezvous_handle = crate::connect_rendezvous::spawn_connect_rendezvous_client(
+    crate::connect_rendezvous::spawn_connect_rendezvous_client(
         config.connect.clone(),
         dashboard_control.clone(),
     );
