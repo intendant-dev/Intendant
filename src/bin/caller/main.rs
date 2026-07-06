@@ -66,6 +66,8 @@ mod skills;
 mod sub_agent;
 mod task_dispatch;
 mod terminal;
+#[cfg(test)]
+mod test_support;
 mod tool_batch;
 mod tools;
 mod transcription;

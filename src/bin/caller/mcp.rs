@@ -11424,7 +11424,9 @@ mod tests {
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
 
-    static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // Crate-wide (not module-local): tests in other modules mutate the same
+    // process environment, so a per-module lock would still race them.
+    use crate::test_support::TEST_ENV_LOCK;
 
     #[test]
     fn format_cu_action_brief_truncates_multibyte_text_on_char_boundary() {
@@ -11636,6 +11638,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
@@ -11696,6 +11699,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
@@ -12733,6 +12737,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let state = test_state();
             {

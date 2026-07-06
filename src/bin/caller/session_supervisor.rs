@@ -6398,6 +6398,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dashboard_delegate_tracks_child_in_parent_registry_and_wakes_parent() {
         let bus = EventBus::new();
+        // Subscribe before the spawn: the relationship assertion below reads
+        // the bus, and broadcast subscribers only see events sent after they
+        // subscribe.
+        let mut bus_rx = bus.subscribe();
         let project_dir = tempfile::tempdir().unwrap();
         let supervisor =
             test_supervisor_with_mock_provider(project_dir.path().to_path_buf(), bus.clone());
@@ -6446,14 +6450,31 @@ mod tests {
                 child.rx.take().expect("completion receiver present"),
             )
         };
-        {
-            let state = supervisor.state.lock().await;
-            let rel = state
-                .related_sessions
-                .get(&child_id)
-                .expect("relationship recorded");
-            assert_eq!(rel.relationship, "subagent");
-            assert_eq!(rel.parent_session_id, "parent");
+        // Assert the relationship via its bus event, not by peeking
+        // supervisor state: the state entry is transient — the mock child
+        // completes near-instantly and its retirement purges
+        // `related_sessions`, so a state read here races the child and
+        // flakes under CI load. The event is the durable signal frontends
+        // consume, emitted synchronously during the spawn.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let event = tokio::time::timeout_at(deadline, bus_rx.recv())
+                .await
+                .expect("SessionRelationship event should arrive")
+                .expect("bus stays open");
+            if let AppEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ephemeral,
+            } = event
+            {
+                assert_eq!(parent_session_id, "parent");
+                assert_eq!(child_session_id, child_id);
+                assert_eq!(relationship, "subagent");
+                assert!(!ephemeral);
+                break;
+            }
         }
 
         // The parent was woken with a notification naming the child.
