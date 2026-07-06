@@ -142,8 +142,8 @@ pub(crate) async fn serve_http_request(
             let methods = table_methods
                 .as_deref()
                 .unwrap_or("GET, POST, DELETE, OPTIONS");
-            let allowed = extract_origin_header(&header_text)
-                .filter(|origin| is_own_or_app_origin(origin, is_tls, &header_text));
+            let allowed = extract_origin_header(header_text)
+                .filter(|origin| is_own_or_app_origin(origin, is_tls, header_text));
             match allowed {
                 Some(origin) => HttpResponse::new("204 No Content")
                     .header("Access-Control-Allow-Origin", origin)
@@ -164,11 +164,11 @@ pub(crate) async fn serve_http_request(
         } else if fleet_scoped {
             let methods = table_methods.as_deref().unwrap_or("GET, POST, OPTIONS");
             let cert_dir = crate::access::backend::select_backend().cert_dir();
-            let allowed = extract_origin_header(&header_text).filter(|origin| {
+            let allowed = extract_origin_header(header_text).filter(|origin| {
                 fleet_access_origin_allowed(
                     origin,
                     is_tls,
-                    &header_text,
+                    header_text,
                     peer_registry.as_ref(),
                     &cert_dir,
                 )
@@ -212,7 +212,7 @@ pub(crate) async fn serve_http_request(
 
     if tls_client_cert_required
         && !tls_client_cert_present
-        && !is_loopback_cleartext_mcp_request(peer_addr, is_tls, &header_text)
+        && !is_loopback_cleartext_mcp_request(peer_addr, is_tls, header_text)
         && !is_public_peer_access_request_path(request_line)
         && !is_public_org_grant_path(request_line)
         && !is_public_connect_bootstrap_path(request_line)
@@ -300,7 +300,7 @@ pub(crate) async fn serve_http_request(
             }
         }
         if let Err((status, body)) =
-            verify_bearer_token(&header_text, inbound_bearer_token.as_deref())
+            verify_bearer_token(header_text, inbound_bearer_token.as_deref())
         {
             use tokio::io::AsyncWriteExt;
             let reason = match status {
@@ -346,20 +346,20 @@ pub(crate) async fn serve_http_request(
     //     anchor page can read the responses;
     //   - anything else on any /api/ path: 403, except the
     //     public doorbell, which is designed to be knocked on.
-    let request_origin = extract_origin_header(&header_text);
+    let request_origin = extract_origin_header(header_text);
     let mut fleet_cors_origin: Option<String> = None;
     if let Some(origin) = request_origin.as_deref().filter(|_| {
         req_path.starts_with("/api/")
             && !is_public_peer_access_request_path(request_line)
             && !is_public_org_grant_path(request_line)
     }) {
-        let own = is_own_or_app_origin(origin, is_tls, &header_text);
+        let own = is_own_or_app_origin(origin, is_tls, header_text);
         let fleet_allowed = !own
             && is_fleet_cors_access_path(req_path)
             && fleet_access_origin_allowed(
                 origin,
                 is_tls,
-                &header_text,
+                header_text,
                 peer_registry.as_ref(),
                 &cert_dir,
             );
@@ -407,7 +407,7 @@ pub(crate) async fn serve_http_request(
                     BodyPolicy::Capped(cap) => cap,
                     _ => crate::gateway_routes::DEFAULT_BODY_CAP_BYTES,
                 };
-                match read_request_body_capped(&mut stream, &header_text, cap).await {
+                match read_request_body_capped(&mut stream, header_text, cap).await {
                     Ok(body) => body,
                     Err((status, body)) => {
                         use tokio::io::AsyncWriteExt;
@@ -468,7 +468,7 @@ pub(crate) async fn serve_http_request(
                 return handle_fs_list(stream, request_line).await;
             }
             RouteHandlerId::FsRead => {
-                return handle_fs_read(stream, &header_text, request_line).await;
+                return handle_fs_read(stream, header_text, request_line).await;
             }
             RouteHandlerId::FsMkdir => {
                 return handle_fs_mkdir(
@@ -520,7 +520,7 @@ pub(crate) async fn serve_http_request(
             RouteHandlerId::CurrentUploadsPost => {
                 return handle_current_uploads_post(
                     stream,
-                    &header_text,
+                    header_text,
                     request_line,
                     discard,
                     bus,
@@ -601,7 +601,7 @@ pub(crate) async fn serve_http_request(
             RouteHandlerId::Doorbell => {
                 return handle_doorbell(
                     stream,
-                    &header_text,
+                    header_text,
                     request_line,
                     req_method,
                     peer_access_request_config,
@@ -702,7 +702,7 @@ pub(crate) async fn serve_http_request(
                 return handle_mcp_post(
                     stream,
                     route_body,
-                    &header_text,
+                    header_text,
                     request_line,
                     peer_connection_identity,
                     mcp_server,
@@ -714,7 +714,7 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::McpStream => {
-                return handle_mcp_stream(stream, &header_text, is_tls).await;
+                return handle_mcp_stream(stream, header_text, is_tls).await;
             }
         }
     } else if let Some(allow) = crate::gateway_routes::allowed_methods_for_path(req_path) {
@@ -760,7 +760,7 @@ pub(crate) async fn serve_http_request(
         use tokio::io::AsyncWriteExt;
         let body_text = match read_request_body_capped(
             &mut stream,
-            &header_text,
+            header_text,
             CONNECT_SIGNALING_BODY_CAP_BYTES,
         )
         .await
@@ -786,7 +786,7 @@ pub(crate) async fn serve_http_request(
         use tokio::io::AsyncWriteExt;
         let body_text = match read_request_body_capped(
             &mut stream,
-            &header_text,
+            header_text,
             CONNECT_SIGNALING_BODY_CAP_BYTES,
         )
         .await
@@ -806,7 +806,7 @@ pub(crate) async fn serve_http_request(
         use tokio::io::AsyncWriteExt;
         let body_text = match read_request_body_capped(
             &mut stream,
-            &header_text,
+            header_text,
             CONNECT_SIGNALING_BODY_CAP_BYTES,
         )
         .await
@@ -834,7 +834,7 @@ pub(crate) async fn serve_http_request(
     ) {
         let response = build_static_asset_response(
             req_method,
-            &header_text,
+            header_text,
             req_query,
             asset_version(),
             asset.view(),
@@ -855,7 +855,7 @@ pub(crate) async fn serve_http_request(
     ) {
         let response = build_static_asset_response(
             req_method,
-            &header_text,
+            header_text,
             req_query,
             asset_version(),
             asset.view(),
@@ -1124,7 +1124,7 @@ pub(crate) async fn serve_http_request(
     ) {
         let response = build_static_asset_response(
             req_method,
-            &header_text,
+            header_text,
             req_query,
             asset_version(),
             asset.view(),
@@ -1164,7 +1164,7 @@ pub(crate) async fn serve_http_request(
         // Under INTENDANT_APP_HTML_PATH the disk copy is
         // re-read (and re-tagged) on every request instead.
         let response = if let Some(path) = app_html_override.as_deref() {
-            app_html_override_response(req_method, &header_text, req_query, path)
+            app_html_override_response(req_method, header_text, req_query, path)
         } else {
             let (etag, gzip) = app_html_cache.get_or_init(|| {
                 (
@@ -1174,7 +1174,7 @@ pub(crate) async fn serve_http_request(
             });
             build_static_asset_response(
                 req_method,
-                &header_text,
+                header_text,
                 req_query,
                 asset_version(),
                 StaticAssetView {
