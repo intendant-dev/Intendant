@@ -187,17 +187,14 @@ fn parse_frontmatter(yaml: &str) -> Result<SkillConfig, String> {
 /// Scans the Agent Skills standard path (`.agents/skills/`) first, then
 /// Intendant-specific paths for backward compatibility.
 pub fn discover_skills(project_root: Option<&Path>) -> Vec<Skill> {
-    discover_skills_with_personal_home(project_root, dirs::home_dir().as_deref())
+    discover_skills_in(project_root, dirs::home_dir().as_deref())
 }
 
-/// [`discover_skills`] with the personal-skills home injectable. Tests pass
-/// `None` (or a temp home) so assertions don't depend on whatever skills the
-/// developer — or the CI runner's user — actually has installed under
-/// `~/.agents/skills` / `~/.intendant/skills`.
-pub fn discover_skills_with_personal_home(
-    project_root: Option<&Path>,
-    personal_home: Option<&Path>,
-) -> Vec<Skill> {
+/// Home-injectable core of [`discover_skills`]. Tests pin `home` (usually
+/// to `None` or a temp dir) so personal skills on the running machine leak
+/// into no assertion — the self-hosted CI runners share a real `$HOME`
+/// that legitimately contains `~/.agents/skills/`.
+fn discover_skills_in(project_root: Option<&Path>, home: Option<&Path>) -> Vec<Skill> {
     let mut skills = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
 
@@ -230,7 +227,7 @@ pub fn discover_skills_with_personal_home(
     }
 
     // 2. Personal skills (standard path first, then legacy)
-    if let Some(home) = personal_home {
+    if let Some(home) = home {
         // Standard: ~/.agents/skills/
         load_skills_from_dir(
             &home.join(".agents").join("skills"),
@@ -474,7 +471,7 @@ Instructions here.
     #[test]
     fn discover_skills_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let skills = discover_skills_with_personal_home(Some(tmp.path()), None);
+        let skills = discover_skills_in(Some(tmp.path()), None);
         assert!(skills.is_empty());
     }
 
@@ -489,7 +486,7 @@ Instructions here.
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
 
-        let skills = discover_skills_with_personal_home(Some(tmp.path()), None);
+        let skills = discover_skills_in(Some(tmp.path()), None);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].config.name, "lint");
         assert_eq!(skills[0].source, SkillSource::Project);
@@ -502,7 +499,7 @@ Instructions here.
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
 
-        let skills = discover_skills_with_personal_home(Some(tmp.path()), None);
+        let skills = discover_skills_in(Some(tmp.path()), None);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].config.name, "lint");
         assert_eq!(skills[0].source, SkillSource::Project);
@@ -517,7 +514,7 @@ Instructions here.
 
         // The documented `<project_root>/skills/` path loads (this repo's
         // own skills/ directory ships through it).
-        let skills = discover_skills_with_personal_home(Some(tmp.path()), None);
+        let skills = discover_skills_in(Some(tmp.path()), None);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].config.name, "lint");
         assert_eq!(skills[0].source, SkillSource::Project);
@@ -526,7 +523,7 @@ Instructions here.
         let standard_dir = tmp.path().join(".agents").join("skills").join("lint");
         std::fs::create_dir_all(&standard_dir).unwrap();
         std::fs::write(standard_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
-        let skills = discover_skills_with_personal_home(Some(tmp.path()), None);
+        let skills = discover_skills_in(Some(tmp.path()), None);
         assert_eq!(skills.len(), 1);
         assert!(skills[0].source_path.to_string_lossy().contains(".agents"));
     }
@@ -545,7 +542,7 @@ Instructions here.
         std::fs::create_dir_all(&legacy_dir).unwrap();
         std::fs::write(legacy_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
 
-        let skills = discover_skills_with_personal_home(Some(tmp.path()), None);
+        let skills = discover_skills_in(Some(tmp.path()), None);
         // Standard path wins — only 1 skill loaded, from .agents/skills/
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].config.name, "lint");
@@ -560,7 +557,7 @@ Instructions here.
         std::fs::create_dir_all(&personal).unwrap();
         std::fs::write(personal.join("SKILL.md"), MINIMAL_SKILL).unwrap();
 
-        let skills = discover_skills_with_personal_home(Some(project.path()), Some(home.path()));
+        let skills = discover_skills_in(Some(project.path()), Some(home.path()));
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].source, SkillSource::Personal);
 
@@ -568,7 +565,7 @@ Instructions here.
         let proj_dir = project.path().join(".agents").join("skills").join("lint");
         std::fs::create_dir_all(&proj_dir).unwrap();
         std::fs::write(proj_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
-        let skills = discover_skills_with_personal_home(Some(project.path()), Some(home.path()));
+        let skills = discover_skills_in(Some(project.path()), Some(home.path()));
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].source, SkillSource::Project);
     }

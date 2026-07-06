@@ -1,49 +1,16 @@
-//! MCP action and snapshot helpers.
+//! Serializable state snapshots shared by the frontends.
 //!
 //! The cross-frontend vocabulary is [`ControlMsg`](crate::event::ControlMsg) and
-//! [`AppEvent`](crate::event::AppEvent). The TUI, web dashboard, MCP server, and
-//! control socket all meet on that EventBus surface.
-//!
-//! `UserAction` and `StateResult` are MCP-oriented helpers used for
-//! approval/input tools and resource serialization. They do not provide a
-//! compile-time exhaustiveness contract across all frontends.
+//! [`AppEvent`](crate::event::AppEvent). The web dashboard, MCP server, and
+//! control socket all meet on that EventBus surface; the snapshot types here
+//! (status, usage, logs, pending approval/input, and the `StateResult`
+//! envelope) are how that state serializes onto those surfaces.
 
-use crate::autonomy::AutonomyLevel;
-use crate::types::{LogLevel, Verbosity};
+use crate::types::LogLevel;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// MCP approval/input actions
-// ---------------------------------------------------------------------------
-
-/// Approval/input actions exposed by the MCP surface.
-///
-/// Adding a variant here requires updating MCP action mapping and handling.
-#[derive(Debug, Clone, PartialEq)]
-pub enum UserAction {
-    /// Approve a pending command (`approve` tool).
-    Approve { id: u64 },
-    /// Deny a pending command (`deny` tool).
-    Deny { id: u64 },
-    /// Skip a pending command (`skip` tool).
-    Skip { id: u64 },
-    /// Approve all future commands (`approve_all` tool).
-    ApproveAll { id: u64 },
-    /// Respond to an askHuman question (`respond` tool).
-    RespondHuman { text: String },
-    /// Change the autonomy level (`set_autonomy` tool).
-    SetAutonomy { level: AutonomyLevel },
-    /// Set verbosity (`set_verbosity` tool).
-    SetVerbosity { level: Verbosity },
-    /// Submit a follow-up message after a round completes.
-    #[allow(dead_code)]
-    SubmitFollowUp { text: String },
-    /// Shut down the agent (`quit` tool).
-    Quit,
-}
-
-// ---------------------------------------------------------------------------
-// MCP snapshots
+// Snapshots
 // ---------------------------------------------------------------------------
 
 /// A snapshot of the current status bar.
@@ -138,26 +105,6 @@ pub struct HumanQuestionSnapshot {
     pub question: String,
 }
 
-/// Snapshot queries used by MCP-style resource handling.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StateQuery {
-    /// Current status bar information.
-    Status,
-    /// Token usage for all models.
-    Usage,
-    /// Log entries, optionally filtered.
-    Logs {
-        since_id: Option<u64>,
-        level_filter: Option<String>,
-        limit: Option<usize>,
-    },
-    /// The current pending approval (if any).
-    PendingApproval,
-    /// The current pending human question (if any).
-    PendingInput,
-}
-
 /// Result of a state query.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -175,73 +122,9 @@ pub enum StateResult {
     },
 }
 
-/// Outcome of processing a [`UserAction`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActionOutcome {
-    /// Action was accepted and applied.
-    Ok,
-    /// Action was not applicable (e.g. no pending approval when approving).
-    NoOp { reason: String },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn user_action_variants_are_distinct() {
-        let a = UserAction::Approve { id: 1 };
-        let b = UserAction::Deny { id: 1 };
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn user_action_approve_eq() {
-        let a = UserAction::Approve { id: 42 };
-        let b = UserAction::Approve { id: 42 };
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn user_action_set_autonomy() {
-        let a = UserAction::SetAutonomy {
-            level: AutonomyLevel::High,
-        };
-        let b = UserAction::SetAutonomy {
-            level: AutonomyLevel::Low,
-        };
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn user_action_respond_human() {
-        let a = UserAction::RespondHuman {
-            text: "PostgreSQL".to_string(),
-        };
-        assert_eq!(
-            a,
-            UserAction::RespondHuman {
-                text: "PostgreSQL".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn state_query_variants_are_distinct() {
-        let a = StateQuery::Status;
-        let b = StateQuery::PendingApproval;
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn state_query_logs_with_filter() {
-        let q = StateQuery::Logs {
-            since_id: Some(5),
-            level_filter: Some("error".to_string()),
-            limit: Some(100),
-        };
-        assert_ne!(q, StateQuery::Status);
-    }
 
     #[test]
     fn status_snapshot_serializes() {
@@ -374,59 +257,6 @@ mod tests {
     }
 
     #[test]
-    fn action_outcome_ok() {
-        assert_eq!(ActionOutcome::Ok, ActionOutcome::Ok);
-    }
-
-    #[test]
-    fn action_outcome_noop() {
-        let outcome = ActionOutcome::NoOp {
-            reason: "no pending approval".to_string(),
-        };
-        assert_ne!(outcome, ActionOutcome::Ok);
-    }
-
-    #[test]
-    fn all_user_actions_constructible() {
-        // Ensures every variant can be constructed — catches accidental removal.
-        let actions: Vec<UserAction> = vec![
-            UserAction::Approve { id: 1 },
-            UserAction::Deny { id: 1 },
-            UserAction::Skip { id: 1 },
-            UserAction::ApproveAll { id: 1 },
-            UserAction::RespondHuman {
-                text: "test".to_string(),
-            },
-            UserAction::SetAutonomy {
-                level: AutonomyLevel::Medium,
-            },
-            UserAction::SetVerbosity {
-                level: Verbosity::Normal,
-            },
-            UserAction::SubmitFollowUp {
-                text: "continue".to_string(),
-            },
-            UserAction::Quit,
-        ];
-        assert_eq!(actions.len(), 9);
-    }
-
-    #[test]
-    fn all_state_queries_constructible() {
-        let queries: Vec<StateQuery> = vec![
-            StateQuery::Status,
-            StateQuery::Logs {
-                since_id: None,
-                level_filter: None,
-                limit: None,
-            },
-            StateQuery::PendingApproval,
-            StateQuery::PendingInput,
-        ];
-        assert_eq!(queries.len(), 4);
-    }
-
-    #[test]
     fn log_level_round_trips_through_snapshot() {
         // Verify that LogLevel variants can be stringified for snapshots.
         let levels = vec![
@@ -459,18 +289,3 @@ pub fn log_level_to_str(level: &LogLevel) -> &'static str {
     }
 }
 
-/// Parse a log level filter string back to a LogLevel.
-#[allow(dead_code)]
-pub fn parse_log_level(s: &str) -> Option<LogLevel> {
-    match s.to_lowercase().as_str() {
-        "info" => Some(LogLevel::Info),
-        "model" => Some(LogLevel::Model),
-        "agent" => Some(LogLevel::Agent),
-        "error" => Some(LogLevel::Error),
-        "warn" => Some(LogLevel::Warn),
-        "subagent" => Some(LogLevel::SubAgent),
-        "detail" => Some(LogLevel::Detail),
-        "debug" => Some(LogLevel::Debug),
-        _ => None,
-    }
-}

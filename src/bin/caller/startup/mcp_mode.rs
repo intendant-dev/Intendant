@@ -1,6 +1,6 @@
 //! The MCP execution shape: run_mcp_mode is main()'s `if flags.mcp`
-//! arm — Model Context Protocol on stdio, architecturally a peer of
-//! the TUI (same EventBus, same UserAction contract).
+//! arm — Model Context Protocol on stdio, architecturally a frontend
+//! peer of the dashboard (same EventBus, same ControlMsg vocabulary).
 
 // Same entangled class as the drain (external_events.rs): keeps the
 // crate-root view it was written against. Narrowing to named imports
@@ -32,7 +32,7 @@ pub(crate) async fn run_mcp_mode(
 ) -> Result<(), CallerError> {
     // MCP mode — speaks Model Context Protocol on stdio.
     // Architecturally a frontend peer of the dashboard: same EventBus,
-    // translating through the UserAction contract.
+    // same ControlMsg vocabulary.
     let bus = EventBus::new();
     let event_rx = bus.subscribe();
     let human_question_path = event::shared_question_path(log_dir.join("human_question"));

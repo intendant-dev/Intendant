@@ -27,10 +27,10 @@ one in Intendant gives you:
   it and the daemon can run several alongside native agents
   (see [control plane & daemon](./control-plane-and-daemon.md)).
 
-Crucially, external-agent control does **not** flow through the `UserAction` enum
-that unifies the native frontends. It rides `ControlMsg` (inbound) and `AppEvent`
-(outbound) on the EventBus (`event.rs`), because the verbs are backend-shaped
-(steer a turn, fork a thread, roll back) rather than the native action set.
+External-agent control rides the same vocabulary as everything else:
+`ControlMsg` (inbound) and `AppEvent` (outbound) on the EventBus (`event.rs`).
+The verbs are backend-shaped (steer a turn, fork a thread, roll back) rather
+than the native action set.
 
 ## The `ExternalAgent` Trait
 
@@ -352,7 +352,7 @@ features it lacks.
 #### Model-driven fission (managed Codex)
 
 Managed Codex sessions can fork themselves. Alongside the rewind tools, the
-managed-context gate exposes a fission surface (`fission_tool()` in `mcp.rs`)
+managed-context gate exposes a fission surface (`fission_tool()` in `mcp/tool_gate.rs`)
 that lets the model split separable work into parallel **full-context sibling
 branches** and join the results back deliberately. The spawn/import mechanics
 live in `main.rs` (`apply_fission_spawn_action` / `apply_fission_import_action`),

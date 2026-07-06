@@ -1,23 +1,20 @@
 # MCP Server
 
 The `--mcp` flag runs Intendant as a [Model Context Protocol](https://modelcontextprotocol.io/)
-server over stdio JSON-RPC (`src/bin/caller/mcp.rs`). It lets an external agent
+server over stdio JSON-RPC (`src/bin/caller/mcp/`). It lets an external agent
 (Claude Code, Codex, etc.) observe and control Intendant: every action a human
 can take in the dashboard is exposed as an MCP tool, plus display/CU/frame
 tools, live audio, and a controller-orchestration surface.
 
 Architecturally the MCP server is a **frontend peer of the dashboard**: it
-subscribes to the same `EventBus` and translates its tools through the
-`UserAction` enum (`frontend.rs`), processed by the shared `process_action`
-handler.
-
-> **Parity scope:** `UserAction` is MCP-only vocabulary today (the retired
-> terminal TUI was its other consumer). The web dashboard and the Unix control
-> socket dispatch [`ControlMsg`](./integrations.md) values that the centralized
-> `control_plane.rs` applies (see [Autonomy & Approvals](./autonomy.md) for why
-> frontends are display-only). So there are two dispatch contracts today:
-> `UserAction` (MCP) and `ControlMsg` (web/control-socket) — a unification
-> candidate. `--mcp` is its own run mode and is **not** implied by `--web`.
+subscribes to the same `EventBus`, and user intents are
+[`ControlMsg`](./integrations.md) values everywhere — the web dashboard and the
+Unix control socket dispatch them to the centralized `control_plane.rs` (see
+[Autonomy & Approvals](./autonomy.md) for why frontends are display-only), and
+the MCP server's approval/input tools apply the same state helpers as its own
+`ControlMsg` arms (`resolve_pending_approval` & co. in `mcp/mod.rs`; the former
+MCP-only `UserAction` enum is retired). `--mcp` is its own run mode and is
+**not** implied by `--web`.
 
 ## Running
 
@@ -72,7 +69,7 @@ Every `POST /mcp` request binds to a principal in the same local IAM system
 that gates the dashboard and federation surfaces
 ([Trust Architecture](./trust-architecture.md)), and **every `tools/call` is
 evaluated at call time** against that principal's permissions via a per-tool
-operation map (`mcp_tool_operation` in `mcp.rs`; e.g. `execute_cu_actions`
+operation map (`mcp_tool_operation` in `mcp/tool_gate.rs`; e.g. `execute_cu_actions`
 and `grant_user_display` require `display.input`, `start_task` requires
 `task.run`, unclassified tools require `runtime.control`). `tools/list` is
 filtered to what the principal may actually call. Binding order:
@@ -172,7 +169,7 @@ Full MCP tool groups:
 | `get_pending_approval` | The current pending approval request (or null). | — |
 | `get_pending_input`    | The current pending `askHuman` question (or null). | — |
 
-### Interactive actions (→ `UserAction`)
+### Interactive actions
 
 | Tool            | Description | Params |
 |-----------------|-------------|--------|
