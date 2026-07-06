@@ -2724,3 +2724,33 @@
   color: var(--green);
 }
 
+
+/* ── Access → Intendant Connect card ── */
+.acc-chip.route-danger::before { background: var(--red); }
+.acc-chip.route-danger { border-color: rgba(243, 139, 168, 0.5); color: var(--red); font-weight: 700; }
+.acc-connect-warn {
+  margin: 8px 0 2px;
+  padding: 8px 10px;
+  border: 1px solid rgba(243, 139, 168, 0.4);
+  border-radius: 8px;
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.acc-connect-phrase {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 6px;
+}
+.acc-connect-word {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 15px;
+  letter-spacing: 0.02em;
+  padding: 5px 10px;
+  border: 1px solid var(--surface2);
+  border-radius: 8px;
+  background: var(--surface0);
+  color: var(--text);
+  user-select: all;
+}

@@ -625,28 +625,7 @@ pub(crate) async fn handle_access_connect_unclaim(
             );
             let _ = stream.write_all(response.as_bytes()).await;
         } else {
-            let result = async {
-                let root = project_root
-                    .as_deref()
-                    .ok_or_else(|| "no project root for this daemon".to_string())?;
-                let project = crate::project::Project::from_root(root.to_path_buf())
-                    .map_err(|e| format!("load project config: {e}"))?;
-                let mut config = project.config.connect.clone().effective_with_env();
-                if config.rendezvous_url.is_none() {
-                    // Enabled-by-dashboard-then-restarted edge: fall back
-                    // to whatever rendezvous the running client used.
-                    config.rendezvous_url =
-                        crate::connect_rendezvous::status_snapshot().rendezvous_url;
-                }
-                let changed = crate::connect_rendezvous::request_unclaim(&config).await?;
-                Ok::<serde_json::Value, String>(serde_json::json!({
-                    "schema_version": 1,
-                    "released": true,
-                    "changed": changed,
-                }))
-            }
-            .await;
-            let (status, body) = match result {
+            let (status, body) = match access_connect_unclaim_response_value(project_root).await {
                 Ok(value) => (200, value.to_string()),
                 Err(error) => (400, serde_json::json!({"error": error}).to_string()),
             };
@@ -658,6 +637,29 @@ pub(crate) async fn handle_access_connect_unclaim(
         }
     }
     finalize_http_stream(&mut stream).await;
+}
+
+/// Shared by the HTTP route and the dashboard-control method: resolve the
+/// effective Connect config for this daemon and post the daemon-signed
+/// release to the rendezvous.
+pub(crate) async fn access_connect_unclaim_response_value(
+    project_root: Option<std::path::PathBuf>,
+) -> Result<serde_json::Value, String> {
+    let root = project_root.ok_or_else(|| "no project root for this daemon".to_string())?;
+    let project = crate::project::Project::from_root(root)
+        .map_err(|e| format!("load project config: {e}"))?;
+    let mut config = project.config.connect.clone().effective_with_env();
+    if config.rendezvous_url.is_none() {
+        // Enabled-by-dashboard-then-restarted edge: fall back to whatever
+        // rendezvous the running client used.
+        config.rendezvous_url = crate::connect_rendezvous::status_snapshot().rendezvous_url;
+    }
+    let changed = crate::connect_rendezvous::request_unclaim(&config).await?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "released": true,
+        "changed": changed,
+    }))
 }
 
 pub(crate) async fn handle_access_overview(
