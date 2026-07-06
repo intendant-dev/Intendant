@@ -2203,8 +2203,16 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let state = test_state();
+            // Point the persisted-wrapper resolver at an empty tempdir: with
+            // the default logs home it reads the real ~/.intendant/logs, and
+            // on a box with live session history (a dev box, the
+            // peer-testing Dell) the hardcoded session id can resolve to an
+            // actual persisted wrapper — the tool then dispatches a resume
+            // instead of taking the rejection path under test.
+            let logs_root = tempfile::tempdir().unwrap();
             {
                 let mut s = state.write().await;
+                s.session_logs_home_override = Some(logs_root.path().to_path_buf());
                 apply_observed_event_to_mcp_state(
                     &mut s,
                     &AppEvent::StatusUpdate {

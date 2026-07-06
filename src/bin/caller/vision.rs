@@ -464,13 +464,30 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn is_display_accessible_no_display_set() {
-        // Temporarily unset DISPLAY to test the "no display" path.
+        // Serialize with every other env-mutating test: this test unsets
+        // DISPLAY, and is_display_accessible() itself re-sets it as a side
+        // effect when it detects a live X socket.
+        let _guard = crate::test_support::TEST_ENV_LOCK.blocking_lock();
         let prev = std::env::var("DISPLAY").ok();
         std::env::remove_var("DISPLAY");
-        assert!(!is_display_accessible());
-        // Restore
-        if let Some(d) = prev {
-            std::env::set_var("DISPLAY", d);
+        // With DISPLAY unset the function deliberately probes /tmp/.X11-unix
+        // and may legitimately find (and authorize against) a real X server —
+        // on such a box "inaccessible" is simply not the true state. Only
+        // assert the no-display outcome where no socket exists (CI runners,
+        // headless boxes) — the same environment-conditional pattern as
+        // find_free_display_prefers_99 above.
+        #[cfg(not(target_os = "windows"))]
+        let have_socket = detect_x11_display().is_some();
+        #[cfg(target_os = "windows")]
+        let have_socket = false;
+        if !have_socket {
+            assert!(!is_display_accessible());
+        }
+        // Restore DISPLAY exactly; the probe may have set it as a side
+        // effect, and leaking it would perturb every later display test.
+        match prev {
+            Some(d) => std::env::set_var("DISPLAY", d),
+            None => std::env::remove_var("DISPLAY"),
         }
     }
 }

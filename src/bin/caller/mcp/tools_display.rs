@@ -944,6 +944,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
@@ -1004,6 +1005,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
@@ -1113,6 +1115,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let state = test_state();
             {
