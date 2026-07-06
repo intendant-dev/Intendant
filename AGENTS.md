@@ -272,6 +272,17 @@ queueing: the queue gate is the deterministic subset, not the full battery, and 
 red queue entry wastes everyone's cycle time. Never bypass the ruleset; if the
 queue itself is wedged, that is an operator (org-owner) decision.
 
+After arming auto-merge, confirm the PR actually **enters the queue** once its
+checks go green (GraphQL `pullRequest.mergeQueueEntry`; `autoMergeRequest`
+going null while queued is normal). Known stall: a job that dies mid-run
+(runner lost communication) and auto-recovers in place can leave its
+per-commit **check run** stuck at `failure` while the workflow run shows
+success — auto-merge reads the check run and waits forever. Detect it by
+comparing `gh pr checks` against `gh run view`; remedy with
+`gh run rerun --job <id>` to mint a fresh check run. Treat any
+"green run, armed auto-merge, still not queued after ~5 minutes" as this
+class of stall, not as normal latency.
+
 **Post-landing: fast-forward the shared mirror.** The queue owns origin/main;
 nothing updates the repo root's local `main` anymore. After your PR merges, run
 `git -C <repo-root> pull --ff-only` (and `git merge --ff-only origin/main` in
