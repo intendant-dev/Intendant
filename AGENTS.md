@@ -296,14 +296,18 @@ required checks pass, so a paths-skipped required check blocks queue entry
 (and on the group side wedges the entry at "Expected"). Only the push-to-main
 triggers keep paths filters — they exist for cache warming, not gating.
 
-All three legs run on the **self-hosted fleet** (`dell-206` =
-`intendant-linux`, `macbook-vm` = `intendant-macos`, `samsung-win` =
-`intendant-windows`) with persistent incremental `target/` dirs — warm gate
-runs are minutes, not half-hours. Self-hosted jobs carry a same-repo guard
-(fork-PR code never executes on our hardware), the Dell and Windows runners
-run as dedicated non-admin `ci` users, and the check *names* stay pinned to
-the `test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os`
-is the name key, `runner` is the placement):
+Trusted refs (pushes, merge-queue refs, same-repo PRs) run on the
+**self-hosted fleet** (`dell-206` = `intendant-linux`, `macbook-vm` =
+`intendant-macos`, `samsung-win` = `intendant-windows`) with persistent
+incremental `target/` dirs — warm gate runs are minutes, not half-hours.
+**Fork PRs route to GitHub-hosted runners instead** (dynamic `runs-on`;
+`matrix.os` doubles as the hosted label): external code never executes on
+our hardware, yet its required checks really run. Fork-PR workflows also
+need maintainer approval before anything runs (all outside collaborators,
+not just first-timers). The Dell and Windows runners run as dedicated
+non-admin `ci` users, and the check *names* stay pinned to the
+`test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os` is
+the name key, `runner` is the fleet placement):
 - **`windows.yml`** — cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Headless-safe: needs no display or API keys. **Required check.**
 - **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real release binaries on Linux + macOS. **Required check.**
 - **`app-html.yml`** — the `static/app/` fragments ↔ generated `static/app.html` regen gate. **Required check.**

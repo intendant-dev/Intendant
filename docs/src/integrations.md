@@ -185,14 +185,19 @@ adds a PR to the queue once the PR's own required checks pass, so a
 wedges the entry at "Expected"). Their push-to-main triggers keep paths
 filters — those runs warm the main-branch caches, they don't gate.
 
-All three legs run on a **self-hosted fleet** (`dell-206` /
-`intendant-linux`, `macbook-vm` / `intendant-macos`, `samsung-win` /
-`intendant-windows`) whose persistent incremental `target/` dirs make warm
-gate runs a few minutes. Self-hosted hardening: jobs carry a same-repo guard
-so fork-PR code never executes on the fleet (fork PRs are handled manually
-behind the Actions fork-approval gate — only maintainers can enqueue anyway),
-the Dell and Windows runners run as dedicated non-admin `ci` users (sudo-less
-on Linux; a plain `Users`-group service account on Windows), runners are
+Trusted refs (pushes, merge-queue refs, same-repo PRs) run on a
+**self-hosted fleet** (`dell-206` / `intendant-linux`, `macbook-vm` /
+`intendant-macos`, `samsung-win` / `intendant-windows`) whose persistent
+incremental `target/` dirs make warm gate runs a few minutes. **Fork PRs
+route to GitHub-hosted runners** via a dynamic `runs-on` (the matrix `os`
+key doubles as the hosted label): external code never executes on the
+fleet, while its required checks still genuinely run — a skipped required
+check would read as satisfied, so routing beats skipping. Fork-PR
+workflows additionally require maintainer approval before running at all
+(the Actions fork-approval policy covers **all** outside collaborators,
+not just first-timers), and only maintainers can enqueue. The Dell and
+Windows runners run as dedicated non-admin `ci` users (sudo-less on
+Linux; a plain `Users`-group service account on Windows), runners are
 registered per-repo, and the default `GITHUB_TOKEN` is read-only.
 
 | Workflow | Trigger | What it does |

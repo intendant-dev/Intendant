@@ -63,12 +63,15 @@ concurrency:
 jobs:
   test:
     name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.runner }}
-    # Self-hosted hardening: never run pull_request code from a fork on our
-    # own hardware — only same-repo branches (every agent landing) and the
-    # merge queue's own refs. Fork PRs are the rare external-contribution
-    # case and get handled manually behind the Actions fork-approval gate.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Trust-based routing: our own refs (pushes, merge-queue refs, same-repo
+    # PRs — every agent landing) run on the self-hosted fleet for speed;
+    # fork PRs run on GitHub-hosted runners so external code never executes
+    # on our hardware, while still getting real required-check results
+    # (a skipped check would read as satisfied — routing closes that hole).
+    # `matrix.os` doubles as the hosted runner label. Fork-PR workflows
+    # additionally sit behind the repo's all-outside-collaborators approval
+    # gate, so nothing runs anywhere without a maintainer's click.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
     # Full test builds are much heavier than the old `cargo check`; a cold
     # Windows runner can take a while, but a hung run shouldn't burn hours.
     timeout-minutes: 90
@@ -79,26 +82,23 @@ jobs:
       matrix:
         # `os` is the check-name key ("test (ubuntu-latest)" is pinned as a
         # required context in the main ruleset — renaming it means a
-        # coordinated ruleset edit); `runner` is where the job actually
-        # runs. All three legs live on the self-hosted fleet (dell-206,
-        # macbook-vm, samsung-win): persistent target/ dirs make warm runs
-        # minutes instead of half-hours. `hosted` gates the
-        # runner-provisioning steps — the self-hosted boxes are
-        # pre-provisioned (deps, toolchains) and keep their build state, so
-        # cache actions and dep installs are hosted-only.
+        # coordinated ruleset edit) AND the hosted-runner label fork PRs
+        # route to; `runner` is the self-hosted fleet placement for trusted
+        # refs (dell-206, macbook-vm, samsung-win — persistent target/ dirs
+        # make warm runs minutes instead of half-hours). Provisioning steps
+        # (dep installs, cache actions) gate on `runner.environment ==
+        # 'github-hosted'`: the fleet boxes are pre-provisioned and keep
+        # their build state.
         include:
           - os: windows-latest
             runner: [self-hosted, intendant-windows]
             target: x86_64-pc-windows-msvc
-            hosted: false
           - os: macos-latest
             runner: [self-hosted, intendant-macos]
             target: aarch64-apple-darwin
-            hosted: false
           - os: ubuntu-latest
             runner: [self-hosted, intendant-linux]
             target: x86_64-unknown-linux-gnu
-            hosted: false
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -114,7 +114,7 @@ jobs:
       # NASM preinstalled on the machine PATH, and its runner user neither
       # has nor needs choco.
       - name: Install NASM (Windows, for ring)
-        if: matrix.hosted && runner.os == 'Windows'
+        if: runner.environment == 'github-hosted' && runner.os == 'Windows'
         run: |
           if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
             choco install nasm --no-progress -y
@@ -131,7 +131,7 @@ jobs:
       # libpng.) Hosted-only: the self-hosted boxes are pre-provisioned and
       # the runner user deliberately has no sudo.
       - name: Install Linux build deps
-        if: matrix.hosted && runner.os == 'Linux'
+        if: runner.environment == 'github-hosted' && runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -148,7 +148,7 @@ jobs:
       # already present on the runner image. Hosted-only: the self-hosted Mac
       # is a provisioned dev box.
       - name: Install macOS build deps
-        if: matrix.hosted && runner.os == 'macOS'
+        if: runner.environment == 'github-hosted' && runner.os == 'macOS'
         run: brew install pkg-config libvpx
 
       # Restore the cargo cache on every run, but only *save* it on pushes to
@@ -160,7 +160,7 @@ jobs:
       # runs — that persistence IS the cache, and shipping it to GitHub's
       # cache store would only add minutes.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        if: matrix.hosted
+        if: runner.environment == 'github-hosted'
         with:
           key: ${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
