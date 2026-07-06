@@ -25,6 +25,7 @@ const FAILURE_SCREENSHOT_SETTLE_MS = 300;
 const DEFAULT_LOG_LINES = 8;
 const LOG_BUFFER_LIMIT = 80;
 const LOG_TEXT_LIMIT = 260;
+const PROBE_JSON_LIMIT = 4096;
 const RESULT_REASON_LIMIT = 520;
 const RESULT_LOG_LIMIT = 320;
 const DIAGNOSTIC_TEXT_LIMIT = 260;
@@ -144,6 +145,15 @@ Options:
   --sandbox                  Omit default --no-sandbox
   --log-lines N              Bounded browser/page log lines on failure (default: ${DEFAULT_LOG_LINES})
   --diagnostics              On failure, include compact generic DOM/page state
+  --probe-json EXPR          Evaluate EXPR in the page after checks pass — and on failure,
+                             before exit — and print one "probe <label> = <JSON>" readback
+                             line per flag to stdout (JSON.stringify'd inside the page;
+                             thrown errors print as {"error":...}; ~${Math.round(PROBE_JSON_LIMIT / 1024)}KB cap per probe).
+                             Optional label=EXPR form; repeatable. Pairs with the SPA's
+                             window.qa probe namespace, e.g.
+                             --probe-json "fuel=window.qa.sessionsFuel()".
+                             With --json the readbacks ride in the result as "probes"
+                             instead of separate lines
   --screenshot PATH          Capture a PNG screenshot after validation/probes
   --station-interaction-probe
                              Click/activate rendered Station hotspots and report latency
@@ -190,6 +200,7 @@ function parseArgs(argv, env = process.env) {
     path: '/',
     selectors: [],
     functions: [],
+    probeJson: [],
     stationProbes: [],
     stationMinFps: DEFAULT_STATION_MIN_FPS,
     stationMaxFrameGapMs: DEFAULT_STATION_MAX_FRAME_GAP_MS,
@@ -277,6 +288,10 @@ function parseArgs(argv, env = process.env) {
       opts.functions.push(readValue());
     } else if (arg.startsWith('--wait-for-function=')) {
       opts.functions.push(arg.slice('--wait-for-function='.length));
+    } else if (arg === '--probe-json') {
+      opts.probeJson.push(parseProbeJsonArgument(readValue()));
+    } else if (arg.startsWith('--probe-json=')) {
+      opts.probeJson.push(parseProbeJsonArgument(arg.slice('--probe-json='.length)));
     } else if (arg === '--station-min-fps') {
       opts.stationMinFps = parsePositiveInt(readValue(), '--station-min-fps');
     } else if (arg.startsWith('--station-min-fps=')) {
@@ -436,6 +451,20 @@ function parseStationProbeArgument(raw) {
     throw new Error('--station-probe requires at least one probe name');
   }
   return names;
+}
+
+function parseProbeJsonArgument(raw) {
+  const value = String(raw || '').trim();
+  if (!value) {
+    throw new Error('--probe-json requires a JS expression');
+  }
+  // Optional label=EXPR form: a bare identifier label followed by '='.
+  // '==' and '=>' keep the whole argument as a plain expression.
+  const labeled = value.match(/^([A-Za-z_$][\w$-]*)=(?![=>])\s*(\S[\s\S]*)$/);
+  if (labeled) {
+    return { label: labeled[1], expression: labeled[2] };
+  }
+  return { label: value, expression: value };
 }
 
 function normalizeStationActivateTarget(raw) {
@@ -639,6 +668,9 @@ async function main() {
     if (opts.keepArtifacts || opts.keepBrowser) {
       artifacts.browserUserDataDir = harness.userDataDir;
     }
+    const probes = opts.probeJson.length
+      ? await harness.collectProbeJson(opts.probeJson)
+      : undefined;
     const result = {
       status: 'pass',
       url: opts.url,
@@ -648,6 +680,7 @@ async function main() {
       artifacts,
       selectors: opts.selectors.length,
       functions: opts.functions.length,
+      probes,
       stationProbes: opts.stationProbes.length,
       stationProbeReports: validation.stationProbeReports,
       stationInteraction: validation.stationInteraction,
@@ -680,11 +713,23 @@ async function main() {
           error: diagError.message || String(diagError),
         }))
       : undefined;
+    // Probe readback runs on failure too — the state at failure is the point.
+    let probes;
+    if (opts.probeJson.length) {
+      probes = harness
+        ? await harness.collectProbeJson(opts.probeJson).catch(() => undefined)
+        : undefined;
+      probes = probes || opts.probeJson.map((probe) => ({
+        label: probe.label,
+        error: 'browser harness unavailable',
+      }));
+    }
     const result = {
       status: 'fail',
       url: opts.url,
       ms: Date.now() - started,
       reason: error.message || String(error),
+      probes,
       failureKind: validationFailureKind(error.message || String(error)),
       browser: harness && harness.browserExecutable,
       websocket: harness && harness.websocketKind,
@@ -712,6 +757,7 @@ function staticScriptsOnly(opts) {
       && !opts.holdDashboard
       && opts.selectors.length === 0
       && opts.functions.length === 0
+      && opts.probeJson.length === 0
       && opts.stationProbes.length === 0
       && !opts.stationInteractionProbe
       && opts.stationActivateTargets.length === 0
@@ -866,11 +912,19 @@ function printResult(opts, result) {
     if (displayResult.staticScripts) {
       console.log(formatStaticScriptPass(displayResult.staticScripts));
     }
+    for (const line of formatProbeJsonLines(displayResult.probes)) {
+      console.log(line);
+    }
     return;
   }
   console.error(
     `FAIL dashboard-validation url=${quote(displayResult.url)} kind=${quote(displayResult.failureKind || 'unknown')} reason=${quote(displayResult.reason)} ms=${displayResult.ms}`,
   );
+  // Probe readback stays on stdout even on failure: it is data for the
+  // caller, not diagnostics noise, and failure state is what probes are for.
+  for (const line of formatProbeJsonLines(displayResult.probes)) {
+    console.log(line);
+  }
   if (displayResult.stationPerfEval) {
     console.error(formatStationPerfEvalLine(displayResult.stationPerfEval));
   }
@@ -912,6 +966,19 @@ function printDashboardHoldResult(opts, result) {
     `PASS dashboard-hold url=${quote(result.url)} readyUrl=${quote(result.readyUrl)} pid=${result.pid || 'unknown'} ms=${result.ms}`,
   );
   console.log('Hold this command open while running CU/browser E2E; interrupt it to stop the temporary dashboard.');
+}
+
+function formatProbeJsonLines(probes) {
+  if (!Array.isArray(probes) || !probes.length) {
+    return [];
+  }
+  return probes.map((probe) => {
+    const payload = probe.error !== undefined
+      ? JSON.stringify({ error: String(probe.error) })
+      : String(probe.json);
+    const suffix = probe.truncated ? ` [truncated, ${probe.truncated} chars total]` : '';
+    return `probe ${probe.label} = ${payload}${suffix}`;
+  });
 }
 
 function formatArtifactLines(artifacts) {
@@ -2065,6 +2132,34 @@ class BrowserHarness {
         return `wait-for-function did not become truthy${suffix}`;
       },
     );
+  }
+
+  // --probe-json readback: best-effort and per-probe fault-isolated, because
+  // it also runs on the failure path where the page may be wedged or gone.
+  async collectProbeJson(probes, timeoutMs = DEFAULT_CDP_COMMAND_TIMEOUT_MS) {
+    const results = [];
+    for (const probe of probes) {
+      let outcome;
+      try {
+        outcome = await this.evaluate(probeJsonExpression(probe.expression), timeoutMs);
+      } catch (error) {
+        outcome = { ok: false, error: error.message || String(error) };
+      }
+      const entry = { label: probe.label };
+      if (outcome && outcome.ok) {
+        entry.json = String(outcome.json);
+        if (outcome.truncated) {
+          entry.truncated = Number(outcome.truncated);
+        }
+      } else {
+        entry.error = truncate(
+          String((outcome && outcome.error) || 'probe evaluation returned no result'),
+          PROBE_JSON_LIMIT,
+        );
+      }
+      results.push(entry);
+    }
+    return results;
   }
 
   async runStationProbe(probe, opts) {
@@ -3358,6 +3453,22 @@ function waitFunctionExpression(source) {
     const candidate = (${trimmed});
     return typeof candidate === 'function' ? candidate() : candidate;
   })())`;
+}
+
+// --probe-json: serialize inside the page so the readback needs no bespoke
+// sink; report thrown errors instead of failing, and cap the transfer.
+function probeJsonExpression(source) {
+  const trimmed = String(source).trim();
+  return `Promise.resolve()
+    .then(() => (${trimmed}))
+    .then((value) => {
+      const json = JSON.stringify(value);
+      const text = json === undefined ? String(value) : json;
+      return text.length > ${PROBE_JSON_LIMIT}
+        ? { ok: true, json: text.slice(0, ${PROBE_JSON_LIMIT}), truncated: text.length }
+        : { ok: true, json: text };
+    })
+    .catch((error) => ({ ok: false, error: String((error && error.message) || error) }))`;
 }
 
 function stationProbeExpression(probe, options = {}) {
@@ -5665,6 +5776,53 @@ async function runSelfTest() {
   // The page-side workflow op source must stay valid JS.
   assert.strictEqual(typeof stationWorkflowOpSource(), 'string');
   new Function(`return (${stationWorkflowOpSource()});`)();
+
+  // --probe-json readback: parsing, page-side expression, line formatting.
+  const probeParsed = parseArgs(
+    [
+      '--port',
+      '1234',
+      '--probe-json',
+      'window.qa.sessionsHydration()',
+      '--probe-json=fuel=window.qa.sessionsFuel()',
+    ],
+    {},
+  );
+  assert.deepStrictEqual(probeParsed.probeJson, [
+    { label: 'window.qa.sessionsHydration()', expression: 'window.qa.sessionsHydration()' },
+    { label: 'fuel', expression: 'window.qa.sessionsFuel()' },
+  ]);
+  // '==' and '=>' after an identifier are expressions, not labels.
+  assert.deepStrictEqual(parseProbeJsonArgument('a==b'), { label: 'a==b', expression: 'a==b' });
+  assert.deepStrictEqual(parseProbeJsonArgument('x=>x'), { label: 'x=>x', expression: 'x=>x' });
+  assert.throws(() => parseProbeJsonArgument('   '), /requires a JS expression/);
+  const probeValue = await new Function(`return (${probeJsonExpression('({ n: 1, s: "two" })')});`)();
+  assert.deepStrictEqual(probeValue, { ok: true, json: '{"n":1,"s":"two"}' });
+  const probeThrown = await new Function(`return (${probeJsonExpression('window.qa.missing()')});`)();
+  assert.strictEqual(probeThrown.ok, false);
+  assert.ok(String(probeThrown.error).includes('window is not defined'));
+  const probeBig = await new Function(`return (${probeJsonExpression(`'y'.repeat(${PROBE_JSON_LIMIT + 100})`)});`)();
+  assert.strictEqual(probeBig.ok, true);
+  assert.strictEqual(probeBig.json.length, PROBE_JSON_LIMIT);
+  assert.strictEqual(probeBig.truncated, PROBE_JSON_LIMIT + 102);
+  assert.deepStrictEqual(
+    formatProbeJsonLines([
+      { label: 'fuel', json: '{"ok":true}' },
+      { label: 'broken', error: 'boom' },
+      { label: 'big', json: '"y"', truncated: 9000 },
+    ]),
+    [
+      'probe fuel = {"ok":true}',
+      'probe broken = {"error":"boom"}',
+      'probe big = "y" [truncated, 9000 chars total]',
+    ],
+  );
+  assert.deepStrictEqual(formatProbeJsonLines(undefined), []);
+  // --probe-json needs a live page: it must not degrade to static-scripts-only.
+  assert.strictEqual(
+    staticScriptsOnly(parseArgs(['--check-static-scripts', '--probe-json', 'window.qa'], {})),
+    false,
+  );
 
   assert.ok(browserArgs('/tmp/profile', parseArgs([], {})).includes('--disable-gpu'));
   const gpuBrowserArgs = browserArgs('/tmp/profile', parsed);
