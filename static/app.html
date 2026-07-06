@@ -7424,6 +7424,76 @@ body.context-focus-active {
   border-left-color: var(--red);
   background: color-mix(in srgb, var(--red) 8%, var(--surface0));
 }
+.sessions-spawn-action {
+  flex: none;
+  margin-left: auto;
+  padding: 3px 10px;
+  border: 1px solid color-mix(in srgb, var(--blue) 45%, var(--surface1));
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--blue) 16%, var(--surface0));
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+}
+.sessions-spawn-action:hover {
+  background: color-mix(in srgb, var(--blue) 28%, var(--surface0));
+}
+.sessions-unfueled-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(250, 179, 135, 0.32);
+  border-left: 3px solid var(--peach);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--peach) 9%, var(--surface0));
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.sessions-unfueled-banner.hidden {
+  display: none;
+}
+.sessions-unfueled-add-keys {
+  flex: none;
+  margin-left: auto;
+  white-space: nowrap;
+}
+.sessions-host-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 2px 0 6px;
+}
+.sessions-host-strip.hidden {
+  display: none;
+}
+.sessions-host-chip {
+  padding: 3px 12px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.sessions-host-chip:hover {
+  border-color: color-mix(in srgb, var(--blue) 45%, var(--surface1));
+  color: var(--text);
+}
+.sessions-host-chip.active {
+  background: color-mix(in srgb, var(--blue) 20%, var(--surface0));
+  border-color: color-mix(in srgb, var(--blue) 55%, var(--surface1));
+  color: var(--text);
+}
+.sessions-host-chip.offline {
+  opacity: 0.55;
+}
+.session-card.sc-peer {
+  cursor: alias;
+}
 .sessions-spawn-spinner {
   width: 12px;
   height: 12px;
@@ -12779,6 +12849,7 @@ body.display-fullscreen-open {
                 <span class="sessions-title">Recent Sessions</span>
                 <button class="ui-btn sessions-refresh" onclick="loadSessions()" title="Reload session list">Refresh</button>
               </div>
+              <div class="sessions-host-strip hidden" id="sessions-host-strip" role="tablist" aria-label="Session host"></div>
               <div class="sessions-toolbar">
                 <label class="sessions-search" for="sessions-search">
                   <span>Quick search</span>
@@ -13054,6 +13125,10 @@ body.display-fullscreen-open {
                       <option value="direct">Direct &mdash; single agent</option>
                     </select>
                   </label>
+                </div>
+                <div id="new-session-unfueled-banner" class="sessions-unfueled-banner hidden">
+                  <span class="sessions-unfueled-text">No model credentials on this daemon &mdash; the internal agent can&rsquo;t start. External agents (Codex, Claude Code) sign in with their own accounts and still work.</span>
+                  <button type="button" class="ui-btn sessions-unfueled-add-keys" onclick="focusSettingsApiKeys()">Add API keys</button>
                 </div>
                 <details class="ui-fold sessions-new-external-fold" id="new-session-external-fold">
                   <summary>External agent options</summary>
@@ -14785,6 +14860,18 @@ const sessionWindows = new Map();
 const recentSessionStatusPhases = new Map();
 const sessionRelationships = new Map();
 const sessionRelationshipHydrationInFlight = new Set();
+// Relationship-hydration termination (2026-07-05 CPU-storm incident):
+// every session ID that has EVER appeared in a served row (any list,
+// stream, or poll path) — hydration treats these as resolved without
+// touching `_cachedSessions`, so termination no longer depends on the
+// Sessions pane having loaded.
+const sessionRowSeenIds = new Set();
+// IDs the daemon answered "no row" for — probed at most once per page
+// load (old logs reference retired `parent`/`parent-session` placeholders,
+// and live Claude Code Task children get non-addressable `task-*` ids).
+// Cleared the moment a row for the ID arrives, so late-created sessions
+// self-heal.
+const sessionRelationshipHydrationUnresolved = new Set();
 let processingLogReplay = false;
 let logReplayAppendBatch = null;
 const sessionMetadataById = new Map();
@@ -18144,6 +18231,9 @@ const sessionsListCache = new Map();
 const sessionsListInflight = new Map();
 const SESSION_HYDRATION_DONE_HIDE_MS = 900;
 let sessionsRecentLimit = SESSION_LIST_RECENT_LIMIT;
+// '' = this daemon; a peer host_id while browsing that peer's sessions
+// from the Sessions tab host strip.
+let sessionsActiveHostId = '';
 
 function applyGatewayConfig(config) {
   const cfg = config && typeof config === 'object' ? config : {};
@@ -18518,7 +18608,7 @@ function stationRefreshSharedCaches() {
     stationSessionsIndexLoading = true;
     stationSessionsIndexError = '';
     fetchSessionsForHost(selfPeerId, { force: false })
-      .then(sessions => applyLoadedSessions(sessions, document.getElementById('sessions-aggregate')))
+      .then(sessions => applyLoadedSessions(sessions, document.getElementById('sessions-aggregate'), selfPeerId))
       .catch(err => {
         stationSessionsIndexError = err && err.message ? err.message : String(err || 'session index failed');
         console.warn('Station sessions refresh failed:', err);
@@ -21139,6 +21229,13 @@ async function stationStartSession() {
   }
   if (!app) {
     failNewSessionSpawnNotice?.('Dashboard is not connected to the server.');
+    return;
+  }
+  const launchAgent = stationEffectiveLaunchAgent();
+  if ((launchAgent === 'internal' || !launchAgent) && daemonInternalUnfueled()) {
+    showControlToast?.('error', NEW_SESSION_UNFUELED_MESSAGE);
+    setNewSessionSpawnNotice('error', NEW_SESSION_UNFUELED_MESSAGE, newSessionAddKeysAction());
+    stationOpenPanel?.('system:controls', 'Internal launch needs credentials');
     return;
   }
   const name = String(stationLaunchDraft.name || '').trim();
@@ -26332,7 +26429,7 @@ function processCommands(cmds) {
         stationScheduleUpdate();
         break;
       case 'session_ended':
-        onSessionEnded(c.session_id, c.reason);
+        onSessionEnded(c.session_id, c.reason, c.error_kind);
         stationScheduleUpdate();
         break;
       case 'external_agent_changed': updateStatusBar({ external_agent: c.agent }); break;
@@ -28508,7 +28605,7 @@ async function ensureManagedContextSessionsLoaded() {
   if (managedContextSessionsLoadInFlight) return managedContextSessionsLoadInFlight;
   managedContextSessionsLoadInFlight = fetchSessionsForHost(selfPeerId, { force: false })
     .then(sessions => {
-      applyLoadedSessions(sessions, document.getElementById('sessions-aggregate'));
+      applyLoadedSessions(sessions, document.getElementById('sessions-aggregate'), selfPeerId);
     })
     .catch(() => {})
     .finally(() => {
@@ -31851,6 +31948,8 @@ function cacheSessionWindowMetadata(sessions) {
       session.intendant_session_id,
     ].map(id => String(id || '').trim()).filter(Boolean)));
     for (const id of ids) {
+      sessionRowSeenIds.add(id);
+      sessionRelationshipHydrationUnresolved.delete(id);
       const { meta: merged, changed } = mergeSessionWindowMetadata(id, meta);
       if (changed && sessionWindows.has(id)) updateSessionWindow(id, merged);
       if (changed) refreshSessionIdentityLabels(id);
@@ -31927,8 +32026,11 @@ function sessionWindowMetadataRequestIds() {
     add(meta.intendantSessionId);
     for (const rel of sessionRelationships.values()) {
       if (rel.parentId === sid || rel.childId === sid) {
-        add(rel.parentId);
-        add(rel.childId);
+        // Negative-cached endpoints (no daemon row exists) stay out of the
+        // periodic metadata poll — they made every 15s refresh a triple
+        // store scan server-side.
+        if (!sessionRelationshipHydrationUnresolved.has(rel.parentId)) add(rel.parentId);
+        if (!sessionRelationshipHydrationUnresolved.has(rel.childId)) add(rel.childId);
       }
     }
     if (win?.source && sid) add(sid);
@@ -35377,42 +35479,78 @@ function sessionRowsReferToSameSession(a, b) {
   return sessionRowIds(b).some(id => ids.has(id));
 }
 
+function sessionRowsEquivalent(a, b) {
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
 function mergeSessionRowsIntoLoadedSessions(rows) {
   if (!Array.isArray(rows) || rows.length === 0 || !sessionsLoaded) return;
+  // Hydrated SELF rows must not merge into (or cache over) a browsed
+  // peer's list.
+  if (typeof sessionsViewingPeer === 'function' && sessionsViewingPeer()) return;
   const next = Array.isArray(_cachedSessions) ? _cachedSessions.slice() : [];
   let changed = false;
   for (const row of rows) {
     if (!row || typeof row !== 'object') continue;
     const index = next.findIndex(existing => sessionRowsReferToSameSession(existing, row));
     if (index >= 0) {
-      next[index] = { ...next[index], ...row };
+      const merged = { ...next[index], ...row };
+      // Identical re-fetches must not count as changes — they used to
+      // force a full unthrottled list rebuild per hydrate response.
+      if (!sessionRowsEquivalent(next[index], merged)) {
+        next[index] = merged;
+        changed = true;
+      }
     } else {
       next.unshift(row);
+      changed = true;
     }
-    changed = true;
   }
   if (!changed) return;
   _cachedSessions = next;
   sessionsListCache.set(sessionListCacheKey(selfPeerId), next);
   updateSessionProjectFilterOptions(next);
   updateNewSessionProjectPrefills(next);
-  renderSessionsAggregate(next, document.getElementById('sessions-aggregate'));
-  renderSessionsViews();
+  // Render through the deferral wrapper (250ms min interval, visibility
+  // gated) — direct renderSessionsViews() here bypassed it and drove the
+  // DOM teardown/rebuild churn in the hydration storm.
+  scheduleSessionsListRender();
 }
 
 function hydrateSessionRelationshipRows(rel) {
   if (!rel || processingLogReplay) return;
   const ids = Array.from(new Set([rel.parentId, rel.childId].filter(Boolean)));
   if (ids.length === 0) return;
-  if (ids.every(id => cachedSessionRowForId(id))) return;
-  const key = ids.slice().sort().join('\u001f');
+  // Per-ID termination, decoupled from the Sessions pane: an ID counts as
+  // resolved once ANY served row mentioned it (sessionRowSeenIds — fed by
+  // every list/stream/poll path), and an ID the daemon has no row for is
+  // probed at most once per page load (negative cache, cleared on row
+  // arrival). Without both, unresolvable endpoints — and, on
+  // #activity-only pages, even fully-real pairs — re-hydrated forever at
+  // network cadence: the 2026-07-05 storm that held the daemon at ~5
+  // cores of TLS + store scans.
+  const resolved = id => sessionRowSeenIds.has(id) || cachedSessionRowForId(id);
+  const pending = ids.filter(
+    id => !resolved(id) && !sessionRelationshipHydrationUnresolved.has(id)
+  );
+  if (pending.length === 0) return;
+  const key = pending.slice().sort().join('\u001f');
   if (sessionRelationshipHydrationInFlight.has(key)) return;
   sessionRelationshipHydrationInFlight.add(key);
-  const url = `/api/sessions?ids=${encodeURIComponent(ids.join(','))}`;
-  dashboardJsonFetch('api_sessions', { ids }, () => authedFetch(url), 'api_sessions_relationships')
+  const url = `/api/sessions?ids=${encodeURIComponent(pending.join(','))}`;
+  dashboardJsonFetch('api_sessions', { ids: pending }, () => authedFetch(url), 'api_sessions_relationships')
     .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
     .then(rows => {
       if (!Array.isArray(rows)) return;
+      for (const id of pending) {
+        if (!rows.some(row => sessionRowMatchesId(row, id))) {
+          sessionRelationshipHydrationUnresolved.add(id);
+        }
+      }
       cacheSessionWindowMetadata(rows);
       mergeSessionRowsIntoLoadedSessions(rows);
     })
@@ -51064,6 +51202,21 @@ function switchSettingsSubtab(name) {
   updateSettingsSaveRow();
 }
 
+// Deep link to the Settings → Account API-keys card — the remediation
+// unfueled notices point at ("Add API keys").
+function focusSettingsApiKeys() {
+  routeTo('settings', 'account');
+  requestAnimationFrame(() => {
+    const heading = document.getElementById('settings-keys-heading');
+    const card = heading?.closest('.ui-card') || heading;
+    if (card?.scrollIntoView) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const firstEmpty = ['settings-key-anthropic', 'settings-key-openai', 'settings-key-gemini']
+      .map(id => document.getElementById(id))
+      .find(el => el && !el.value.trim());
+    firstEmpty?.focus();
+  });
+}
+
 // Apply the remembered sub-tab on initial render, before anything
 // else toggles the default.
 function applyInitialSettingsSubtab() {
@@ -53499,6 +53652,9 @@ class DashboardControlTransport {
         this.lastStatus = status;
         console.info('[dashboard-control] status RPC ok', status.session_id || '');
         dashboardUpdateTransportStatus();
+        // The status frame carries the aggregate `fueled` flag the
+        // New Session preflight banner derives from.
+        if (typeof updateNewSessionFuelBanner === 'function') updateNewSessionFuelBanner();
       }
     }).catch(err => console.warn('[dashboard-control] status RPC failed', err));
     this.request('config').then(config => {
@@ -55146,6 +55302,7 @@ async function ensureDashboardTransferUploadAvailable(options = {}) {
     if (status && typeof status === 'object') {
       dashboardControlTransport.lastStatus = status;
       dashboardUpdateTransportStatus();
+      if (typeof updateNewSessionFuelBanner === 'function') updateNewSessionFuelBanner();
     }
   } catch (err) {
     if (err?.name === 'AbortError') throw err;
@@ -55765,6 +55922,7 @@ function updateDaemonSnapshot(snap) {
   daemons[idx] = snapshotToDaemonEntry(snap);
   upsertDashboardAccessTarget(dashboardAccessTargetFromPeerSnapshot(snap));
   renderDaemonsList();
+  if (typeof renderSessionsHostStrip === 'function') renderSessionsHostStrip();
 }
 
 // Drop a peer from the local daemons list and tear down its WASM
@@ -55822,6 +55980,7 @@ async function refreshPeersFromApi() {
     // per-peer events come through the primary /ws push pipeline.
     daemons = newDaemons;
     renderDaemonsList();
+    if (typeof renderSessionsHostStrip === 'function') renderSessionsHostStrip();
     const overview = await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
     if (overview) {
       return;
@@ -62396,12 +62555,12 @@ function isRestartingSessionReason(reason) {
   return String(reason || '').toLowerCase().includes('restarting session');
 }
 
-function onSessionEnded(sessionId, reason) {
+function onSessionEnded(sessionId, reason, errorKind) {
   const sid = String(sessionId || '').trim();
   stationCurrentTask = '';
   stationCurrentApproval = null;
   stationScheduleUpdate();
-  maybeFailRecentNewSessionSpawn(sid, reason);
+  maybeFailRecentNewSessionSpawn(sid, reason, errorKind);
   const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
   const win = sid ? sessionWindows.get(sid) : null;
   const externalSource = sid ? externalSourceForSessionWindow(sid, win) : '';
@@ -67472,6 +67631,7 @@ function renderNewSessionAgentControls(options = {}) {
       ? 'Managed requires a patched Codex binary with the managed app-server protocol.'
       : '';
   }
+  updateNewSessionFuelBanner();
 }
 
 function setNewSessionStartButtonPending(pending) {
@@ -67480,9 +67640,42 @@ function setNewSessionStartButtonPending(pending) {
   btn.disabled = !!pending;
   btn.classList.toggle('pending', !!pending);
   btn.textContent = pending ? 'Spawning...' : 'Start session';
+  if (!pending) updateNewSessionFuelBanner();
 }
 
-function setNewSessionSpawnNotice(kind, text) {
+// ── Unfueled preflight ──
+// The status frame's aggregate `fueled` flag (presence-level, no settings
+// permission needed) gates internal launches before they spawn a session
+// that can only die with "No API key found". Strict === false: an unknown
+// state (no status frame yet, older daemon) never blocks.
+
+function daemonInternalUnfueled() {
+  return dashboardControlTransport?.lastStatus?.fueled === false;
+}
+
+function newSessionAddKeysAction() {
+  return { label: 'Add API keys', onClick: () => focusSettingsApiKeys() };
+}
+
+const NEW_SESSION_UNFUELED_MESSAGE =
+  'This daemon has no model credentials, so the internal agent can’t start. ' +
+  'External agents (Codex, Claude Code) sign in with their own accounts and still work.';
+
+function updateNewSessionFuelBanner() {
+  const banner = document.getElementById('new-session-unfueled-banner');
+  if (!banner) return;
+  const effective = effectiveNewSessionAgentId();
+  const internalSelected = effective === 'internal' || !effective;
+  const show = internalSelected && daemonInternalUnfueled();
+  banner.classList.toggle('hidden', !show);
+  const btn = document.getElementById('new-session-start-btn');
+  if (btn && !newSessionSpawnPending) {
+    btn.disabled = show;
+    btn.title = show ? 'Internal sessions need an API key or a vault credential lease' : '';
+  }
+}
+
+function setNewSessionSpawnNotice(kind, text, action) {
   const notice = document.getElementById('new-session-spawn-notice');
   const textEl = document.getElementById('new-session-spawn-text');
   if (!notice || !textEl) return;
@@ -67491,6 +67684,20 @@ function setNewSessionSpawnNotice(kind, text) {
   notice.className = `sessions-spawn-notice ${noticeKind}` + (hasText ? '' : ' hidden');
   textEl.textContent = text || '';
   notice.title = text || '';
+  let actionBtn = document.getElementById('new-session-spawn-action');
+  if (action && hasText) {
+    if (!actionBtn) {
+      actionBtn = document.createElement('button');
+      actionBtn.id = 'new-session-spawn-action';
+      actionBtn.type = 'button';
+      actionBtn.className = 'sessions-spawn-action';
+      notice.appendChild(actionBtn);
+    }
+    actionBtn.textContent = action.label;
+    actionBtn.onclick = action.onClick;
+  } else if (actionBtn) {
+    actionBtn.remove();
+  }
   stationScheduleUpdate();
 }
 
@@ -67533,7 +67740,7 @@ function formatNewSessionLaunchFailureReason(reason) {
   return `Session failed: ${text.replace(/^error:\s*/i, '')}`;
 }
 
-function maybeFailRecentNewSessionSpawn(sessionId, reason) {
+function maybeFailRecentNewSessionSpawn(sessionId, reason, errorKind) {
   const sid = String(sessionId || '').trim();
   if (!sid || !newSessionSpawnRecent) return false;
   if (newSessionSpawnRecent.sessionId !== sid) return false;
@@ -67550,7 +67757,9 @@ function maybeFailRecentNewSessionSpawn(sessionId, reason) {
   newSessionSpawnTask = '';
   newSessionSpawnName = '';
   setNewSessionStartButtonPending(false);
-  setNewSessionSpawnNotice('error', message);
+  // Structured failure classes carry an action instead of prose-parsing.
+  const action = errorKind === 'unfueled' ? newSessionAddKeysAction() : null;
+  setNewSessionSpawnNotice('error', message, action);
   showControlToast('error', message);
   return true;
 }
@@ -67654,6 +67863,14 @@ async function startNewSession() {
   }
   if (!app) {
     failNewSessionSpawnNotice('Dashboard is not connected to the server.');
+    return;
+  }
+  const effectiveAgent = effectiveNewSessionAgentId();
+  if ((effectiveAgent === 'internal' || !effectiveAgent) && daemonInternalUnfueled()) {
+    // Belt-and-braces behind the banner: the fueled flag may have flipped
+    // since the last render.
+    updateNewSessionFuelBanner();
+    setNewSessionSpawnNotice('error', NEW_SESSION_UNFUELED_MESSAGE, newSessionAddKeysAction());
     return;
   }
 
@@ -68017,18 +68234,109 @@ function failSessionsHydration(message, received, limit) {
   });
 }
 
-function applyLoadedSessions(sessions, aggEl) {
-  sessionsLoaded = true;
-  _cachedSessions = sessions;
-  stationInvalidateSessionSet();
-  updateSessionProjectFilterOptions(sessions);
-  updateNewSessionProjectPrefills(sessions);
-  cacheSessionWindowMetadata(sessions);
+function applyLoadedSessions(sessions, aggEl, hostId = currentSessionsHostId()) {
+  const isSelf = hostId === selfPeerId;
+  const isActiveView = hostId === currentSessionsHostId();
+  if (isActiveView) {
+    _cachedSessions = sessions;
+    updateSessionProjectFilterOptions(sessions);
+  }
+  if (isSelf) {
+    // Self-coupled side effects stay self-only: Station's session set,
+    // window metadata, and New Session project prefills must not absorb a
+    // browsed peer's rows — and a background SELF load (Station/managed
+    // pane warming the index) must not stomp a peer view the user is
+    // looking at, hence the isActiveView split.
+    sessionsLoaded = true;
+    stationInvalidateSessionSet();
+    updateNewSessionProjectPrefills(sessions);
+    cacheSessionWindowMetadata(sessions);
+  }
+  if (!isActiveView) return;
   if (activeActivitySubtab === 'managed') {
     renderManagedContextSessionSelect();
     renderManagedContextPane();
   }
   scheduleSessionsListRender();
+}
+
+// ── Sessions host strip: browse a connected peer's sessions in place ──
+// Hidden until a peer is connected; power stays discoverable without
+// cluttering the single-daemon experience.
+
+function currentSessionsHostId() {
+  return sessionsActiveHostId || selfPeerId;
+}
+
+function sessionsViewingPeer() {
+  return currentSessionsHostId() !== selfPeerId;
+}
+
+function sessionsHostRowFor(hostId) {
+  return (Array.isArray(daemons) ? daemons : []).find(d => d && d.host_id === hostId) || null;
+}
+
+function setSessionsHost(hostId) {
+  const next = !hostId || hostId === selfPeerId ? '' : String(hostId);
+  if (next === sessionsActiveHostId) return;
+  sessionsActiveHostId = next;
+  sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
+  renderSessionsHostStrip();
+  loadSessions({ force: true });
+}
+
+// Whole-card action while browsing a peer: hand off to the peer's own
+// dashboard (its own auth applies there) rather than faking cross-daemon
+// session control this daemon has no authority for.
+function openPeerSessionExternally(s) {
+  const host = sessionsHostRowFor(currentSessionsHostId());
+  const base = String(host?.browser_tcp_via_url || host?.url || '').replace(/\/+$/, '');
+  if (!base) {
+    showControlToast('error', 'No reachable dashboard URL is known for this peer.');
+    return;
+  }
+  window.open(`${base}/#sessions`, '_blank', 'noopener');
+  const sid = String(s?.session_id || s?.resume_id || '').trim();
+  if (sid) {
+    showControlToast('info', `Opened ${host.label || 'peer'} dashboard — look for session ${sid.slice(0, 8)}…`);
+  }
+}
+
+function renderSessionsHostStrip() {
+  const strip = document.getElementById('sessions-host-strip');
+  if (!strip) return;
+  const peers = (Array.isArray(daemons) ? daemons : [])
+    .filter(d => d && d.host_id && d.host_id !== selfPeerId && d.connected);
+  // Keep a selected-but-now-disconnected peer visible so the active
+  // selection never silently strands.
+  if (sessionsActiveHostId && !peers.some(p => p.host_id === sessionsActiveHostId)) {
+    const known = sessionsHostRowFor(sessionsActiveHostId);
+    if (known) peers.push(known);
+  }
+  strip.classList.toggle('hidden', peers.length === 0);
+  strip.innerHTML = '';
+  if (peers.length === 0) {
+    if (sessionsActiveHostId) setSessionsHost('');
+    return;
+  }
+  const active = currentSessionsHostId();
+  const addChip = (id, label, connected) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'sessions-host-chip'
+      + (active === id ? ' active' : '')
+      + (connected ? '' : ' offline');
+    btn.setAttribute('role', 'tab');
+    btn.setAttribute('aria-selected', active === id ? 'true' : 'false');
+    btn.textContent = label;
+    btn.title = connected
+      ? (id === selfPeerId ? 'Sessions on this daemon' : `Browse sessions on ${label}`)
+      : 'Peer is not connected';
+    btn.onclick = () => setSessionsHost(id);
+    strip.appendChild(btn);
+  };
+  addChip(selfPeerId, 'This daemon', true);
+  for (const p of peers) addChip(p.host_id, p.label || p.host_id, !!p.connected);
 }
 
 // Rendering the sessions list is decoupled from data arrival: streamed
@@ -68058,12 +68366,17 @@ function scheduleSessionsListRender() {
 function loadSessions(options = {}) {
   const listEl = document.getElementById('sessions-list');
   const aggEl = document.getElementById('sessions-aggregate');
-  const requestedLimit = options.limit ?? sessionsRecentLimit;
+  // Complete retrieval by default: the stream's quick phase paints the
+  // first ~600 immediately, then the full corpus replaces it (rendering
+  // stays windowed via Show-more). A bounded Recent list silently hid
+  // ~90% of history and made the aggregate tiles disagree with Stats.
+  const requestedLimit = options.limit ?? 'all';
+  const hostId = options.host || currentSessionsHostId();
   const cacheOptions = { limit: requestedLimit };
-  const cached = sessionsListCache.get(sessionListCacheKey(selfPeerId, cacheOptions));
-  const cacheKey = sessionListCacheKey(selfPeerId, cacheOptions);
+  const cached = sessionsListCache.get(sessionListCacheKey(hostId, cacheOptions));
+  const cacheKey = sessionListCacheKey(hostId, cacheOptions);
   if (cached) {
-    applyLoadedSessions(cached, aggEl);
+    applyLoadedSessions(cached, aggEl, hostId);
   } else if (listEl) {
     // Fresh (uncached) load replaces the list — reset the Show-more window.
     sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
@@ -68092,7 +68405,7 @@ function loadSessions(options = {}) {
       if (token !== _sessionsLoadToken || pendingRows.length === 0) return;
       const next = mergeSessionRows(_cachedSessions, pendingRows);
       pendingRows = [];
-      applyLoadedSessions(next, aggEl);
+      applyLoadedSessions(next, aggEl, hostId);
     }, 50);
   };
   const clearPendingFlush = () => {
@@ -68103,7 +68416,7 @@ function loadSessions(options = {}) {
     pendingRows = [];
   };
 
-  const loadJsonFallback = () => fetchSessionsForHost(selfPeerId, {
+  const loadJsonFallback = () => fetchSessionsForHost(hostId, {
     force: options.force !== false,
     limit: requestedLimit,
   })
@@ -68113,11 +68426,11 @@ function loadSessions(options = {}) {
         sessionsRecentLimit = Math.max(sessionsRecentLimit, sessionListRequestLimit({ limit: requestedLimit }));
       }
       finishSessionsHydration(Array.isArray(sessions) ? sessions.length : 0, requestedLimit);
-      applyLoadedSessions(sessions, aggEl);
+      applyLoadedSessions(sessions, aggEl, hostId);
       return sessions;
     });
 
-  return streamSessionsForHost(selfPeerId, {
+  return streamSessionsForHost(hostId, {
     limit: requestedLimit,
     signal: controller.signal,
   }, {
@@ -68140,7 +68453,7 @@ function loadSessions(options = {}) {
         }
         const rowsToFlush = pendingRows;
         pendingRows = [];
-        applyLoadedSessions(mergeSessionRows(_cachedSessions, rowsToFlush), aggEl);
+        applyLoadedSessions(mergeSessionRows(_cachedSessions, rowsToFlush), aggEl, hostId);
       } else {
         scheduleFlush();
       }
@@ -68164,7 +68477,7 @@ function loadSessions(options = {}) {
         sessionsRecentLimit = Math.max(sessionsRecentLimit, sessionListRequestLimit({ limit: requestedLimit }));
       }
       finishSessionsHydration(Array.isArray(sessions) ? sessions.length : 0, requestedLimit);
-      applyLoadedSessions(sessions, aggEl);
+      applyLoadedSessions(sessions, aggEl, hostId);
     },
   })
     .then(sessions => {
@@ -69735,8 +70048,12 @@ function renderSessionsList(sessions, el, options = {}) {
       card.appendChild(mediaMeta);
     }
 
-    // Actions row
-    if (sessionId || s.can_resume || s.can_delete || ((s.total_bytes > 0 || !isCurrent) && !isExternal)) {
+    // Actions row. While browsing a peer host the cards are read-only —
+    // resume/delete/config act on THIS daemon's stores and would target
+    // the wrong machine; interaction happens on the peer's own dashboard
+    // (whole-card click below).
+    if (!sessionsViewingPeer()
+        && (sessionId || s.can_resume || s.can_delete || ((s.total_bytes > 0 || !isCurrent) && !isExternal))) {
       const actions = document.createElement('div');
       actions.className = 'sc-actions';
 
@@ -69837,7 +70154,13 @@ function renderSessionsList(sessions, el, options = {}) {
       card.appendChild(actions);
     }
 
-    card.addEventListener('click', () => openSessionDetail(s));
+    if (sessionsViewingPeer()) {
+      card.classList.add('sc-peer');
+      card.title = 'Open this session on the peer’s dashboard';
+      card.addEventListener('click', () => openPeerSessionExternally(s));
+    } else {
+      card.addEventListener('click', () => openSessionDetail(s));
+    }
     fragment.appendChild(card);
   }
 
@@ -69854,6 +70177,8 @@ function renderSessionsList(sessions, el, options = {}) {
       ? 'No sessions match the selected projects'
       : hiddenSubagentCount > 0
       ? 'No main sessions found. Subagent sessions are hidden from Recent.'
+      : sessionsViewingPeer()
+      ? 'No sessions visible on this peer — it may not have granted session access.'
       : 'No sessions match the active filters';
     el.appendChild(empty);
   } else {

@@ -953,6 +953,8 @@ function cacheSessionWindowMetadata(sessions) {
       session.intendant_session_id,
     ].map(id => String(id || '').trim()).filter(Boolean)));
     for (const id of ids) {
+      sessionRowSeenIds.add(id);
+      sessionRelationshipHydrationUnresolved.delete(id);
       const { meta: merged, changed } = mergeSessionWindowMetadata(id, meta);
       if (changed && sessionWindows.has(id)) updateSessionWindow(id, merged);
       if (changed) refreshSessionIdentityLabels(id);
@@ -1029,8 +1031,11 @@ function sessionWindowMetadataRequestIds() {
     add(meta.intendantSessionId);
     for (const rel of sessionRelationships.values()) {
       if (rel.parentId === sid || rel.childId === sid) {
-        add(rel.parentId);
-        add(rel.childId);
+        // Negative-cached endpoints (no daemon row exists) stay out of the
+        // periodic metadata poll — they made every 15s refresh a triple
+        // store scan server-side.
+        if (!sessionRelationshipHydrationUnresolved.has(rel.parentId)) add(rel.parentId);
+        if (!sessionRelationshipHydrationUnresolved.has(rel.childId)) add(rel.childId);
       }
     }
     if (win?.source && sid) add(sid);

@@ -253,18 +253,109 @@ function failSessionsHydration(message, received, limit) {
   });
 }
 
-function applyLoadedSessions(sessions, aggEl) {
-  sessionsLoaded = true;
-  _cachedSessions = sessions;
-  stationInvalidateSessionSet();
-  updateSessionProjectFilterOptions(sessions);
-  updateNewSessionProjectPrefills(sessions);
-  cacheSessionWindowMetadata(sessions);
+function applyLoadedSessions(sessions, aggEl, hostId = currentSessionsHostId()) {
+  const isSelf = hostId === selfPeerId;
+  const isActiveView = hostId === currentSessionsHostId();
+  if (isActiveView) {
+    _cachedSessions = sessions;
+    updateSessionProjectFilterOptions(sessions);
+  }
+  if (isSelf) {
+    // Self-coupled side effects stay self-only: Station's session set,
+    // window metadata, and New Session project prefills must not absorb a
+    // browsed peer's rows — and a background SELF load (Station/managed
+    // pane warming the index) must not stomp a peer view the user is
+    // looking at, hence the isActiveView split.
+    sessionsLoaded = true;
+    stationInvalidateSessionSet();
+    updateNewSessionProjectPrefills(sessions);
+    cacheSessionWindowMetadata(sessions);
+  }
+  if (!isActiveView) return;
   if (activeActivitySubtab === 'managed') {
     renderManagedContextSessionSelect();
     renderManagedContextPane();
   }
   scheduleSessionsListRender();
+}
+
+// ── Sessions host strip: browse a connected peer's sessions in place ──
+// Hidden until a peer is connected; power stays discoverable without
+// cluttering the single-daemon experience.
+
+function currentSessionsHostId() {
+  return sessionsActiveHostId || selfPeerId;
+}
+
+function sessionsViewingPeer() {
+  return currentSessionsHostId() !== selfPeerId;
+}
+
+function sessionsHostRowFor(hostId) {
+  return (Array.isArray(daemons) ? daemons : []).find(d => d && d.host_id === hostId) || null;
+}
+
+function setSessionsHost(hostId) {
+  const next = !hostId || hostId === selfPeerId ? '' : String(hostId);
+  if (next === sessionsActiveHostId) return;
+  sessionsActiveHostId = next;
+  sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
+  renderSessionsHostStrip();
+  loadSessions({ force: true });
+}
+
+// Whole-card action while browsing a peer: hand off to the peer's own
+// dashboard (its own auth applies there) rather than faking cross-daemon
+// session control this daemon has no authority for.
+function openPeerSessionExternally(s) {
+  const host = sessionsHostRowFor(currentSessionsHostId());
+  const base = String(host?.browser_tcp_via_url || host?.url || '').replace(/\/+$/, '');
+  if (!base) {
+    showControlToast('error', 'No reachable dashboard URL is known for this peer.');
+    return;
+  }
+  window.open(`${base}/#sessions`, '_blank', 'noopener');
+  const sid = String(s?.session_id || s?.resume_id || '').trim();
+  if (sid) {
+    showControlToast('info', `Opened ${host.label || 'peer'} dashboard — look for session ${sid.slice(0, 8)}…`);
+  }
+}
+
+function renderSessionsHostStrip() {
+  const strip = document.getElementById('sessions-host-strip');
+  if (!strip) return;
+  const peers = (Array.isArray(daemons) ? daemons : [])
+    .filter(d => d && d.host_id && d.host_id !== selfPeerId && d.connected);
+  // Keep a selected-but-now-disconnected peer visible so the active
+  // selection never silently strands.
+  if (sessionsActiveHostId && !peers.some(p => p.host_id === sessionsActiveHostId)) {
+    const known = sessionsHostRowFor(sessionsActiveHostId);
+    if (known) peers.push(known);
+  }
+  strip.classList.toggle('hidden', peers.length === 0);
+  strip.innerHTML = '';
+  if (peers.length === 0) {
+    if (sessionsActiveHostId) setSessionsHost('');
+    return;
+  }
+  const active = currentSessionsHostId();
+  const addChip = (id, label, connected) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'sessions-host-chip'
+      + (active === id ? ' active' : '')
+      + (connected ? '' : ' offline');
+    btn.setAttribute('role', 'tab');
+    btn.setAttribute('aria-selected', active === id ? 'true' : 'false');
+    btn.textContent = label;
+    btn.title = connected
+      ? (id === selfPeerId ? 'Sessions on this daemon' : `Browse sessions on ${label}`)
+      : 'Peer is not connected';
+    btn.onclick = () => setSessionsHost(id);
+    strip.appendChild(btn);
+  };
+  addChip(selfPeerId, 'This daemon', true);
+  for (const p of peers) addChip(p.host_id, p.label || p.host_id, !!p.connected);
 }
 
 // Rendering the sessions list is decoupled from data arrival: streamed
@@ -294,12 +385,17 @@ function scheduleSessionsListRender() {
 function loadSessions(options = {}) {
   const listEl = document.getElementById('sessions-list');
   const aggEl = document.getElementById('sessions-aggregate');
-  const requestedLimit = options.limit ?? sessionsRecentLimit;
+  // Complete retrieval by default: the stream's quick phase paints the
+  // first ~600 immediately, then the full corpus replaces it (rendering
+  // stays windowed via Show-more). A bounded Recent list silently hid
+  // ~90% of history and made the aggregate tiles disagree with Stats.
+  const requestedLimit = options.limit ?? 'all';
+  const hostId = options.host || currentSessionsHostId();
   const cacheOptions = { limit: requestedLimit };
-  const cached = sessionsListCache.get(sessionListCacheKey(selfPeerId, cacheOptions));
-  const cacheKey = sessionListCacheKey(selfPeerId, cacheOptions);
+  const cached = sessionsListCache.get(sessionListCacheKey(hostId, cacheOptions));
+  const cacheKey = sessionListCacheKey(hostId, cacheOptions);
   if (cached) {
-    applyLoadedSessions(cached, aggEl);
+    applyLoadedSessions(cached, aggEl, hostId);
   } else if (listEl) {
     // Fresh (uncached) load replaces the list — reset the Show-more window.
     sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
@@ -328,7 +424,7 @@ function loadSessions(options = {}) {
       if (token !== _sessionsLoadToken || pendingRows.length === 0) return;
       const next = mergeSessionRows(_cachedSessions, pendingRows);
       pendingRows = [];
-      applyLoadedSessions(next, aggEl);
+      applyLoadedSessions(next, aggEl, hostId);
     }, 50);
   };
   const clearPendingFlush = () => {
@@ -339,7 +435,7 @@ function loadSessions(options = {}) {
     pendingRows = [];
   };
 
-  const loadJsonFallback = () => fetchSessionsForHost(selfPeerId, {
+  const loadJsonFallback = () => fetchSessionsForHost(hostId, {
     force: options.force !== false,
     limit: requestedLimit,
   })
@@ -349,11 +445,11 @@ function loadSessions(options = {}) {
         sessionsRecentLimit = Math.max(sessionsRecentLimit, sessionListRequestLimit({ limit: requestedLimit }));
       }
       finishSessionsHydration(Array.isArray(sessions) ? sessions.length : 0, requestedLimit);
-      applyLoadedSessions(sessions, aggEl);
+      applyLoadedSessions(sessions, aggEl, hostId);
       return sessions;
     });
 
-  return streamSessionsForHost(selfPeerId, {
+  return streamSessionsForHost(hostId, {
     limit: requestedLimit,
     signal: controller.signal,
   }, {
@@ -376,7 +472,7 @@ function loadSessions(options = {}) {
         }
         const rowsToFlush = pendingRows;
         pendingRows = [];
-        applyLoadedSessions(mergeSessionRows(_cachedSessions, rowsToFlush), aggEl);
+        applyLoadedSessions(mergeSessionRows(_cachedSessions, rowsToFlush), aggEl, hostId);
       } else {
         scheduleFlush();
       }
@@ -400,7 +496,7 @@ function loadSessions(options = {}) {
         sessionsRecentLimit = Math.max(sessionsRecentLimit, sessionListRequestLimit({ limit: requestedLimit }));
       }
       finishSessionsHydration(Array.isArray(sessions) ? sessions.length : 0, requestedLimit);
-      applyLoadedSessions(sessions, aggEl);
+      applyLoadedSessions(sessions, aggEl, hostId);
     },
   })
     .then(sessions => {

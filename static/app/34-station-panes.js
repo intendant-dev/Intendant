@@ -308,6 +308,13 @@ async function stationStartSession() {
     failNewSessionSpawnNotice?.('Dashboard is not connected to the server.');
     return;
   }
+  const launchAgent = stationEffectiveLaunchAgent();
+  if ((launchAgent === 'internal' || !launchAgent) && daemonInternalUnfueled()) {
+    showControlToast?.('error', NEW_SESSION_UNFUELED_MESSAGE);
+    setNewSessionSpawnNotice('error', NEW_SESSION_UNFUELED_MESSAGE, newSessionAddKeysAction());
+    stationOpenPanel?.('system:controls', 'Internal launch needs credentials');
+    return;
+  }
   const name = String(stationLaunchDraft.name || '').trim();
   const requestedProjectRoot = String(stationLaunchDraft.project || '').trim();
   beginNewSessionSpawnNotice(

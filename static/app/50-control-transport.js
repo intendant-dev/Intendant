@@ -168,6 +168,9 @@ class DashboardControlTransport {
         this.lastStatus = status;
         console.info('[dashboard-control] status RPC ok', status.session_id || '');
         dashboardUpdateTransportStatus();
+        // The status frame carries the aggregate `fueled` flag the
+        // New Session preflight banner derives from.
+        if (typeof updateNewSessionFuelBanner === 'function') updateNewSessionFuelBanner();
       }
     }).catch(err => console.warn('[dashboard-control] status RPC failed', err));
     this.request('config').then(config => {
@@ -1815,6 +1818,7 @@ async function ensureDashboardTransferUploadAvailable(options = {}) {
     if (status && typeof status === 'object') {
       dashboardControlTransport.lastStatus = status;
       dashboardUpdateTransportStatus();
+      if (typeof updateNewSessionFuelBanner === 'function') updateNewSessionFuelBanner();
     }
   } catch (err) {
     if (err?.name === 'AbortError') throw err;
@@ -2434,6 +2438,7 @@ function updateDaemonSnapshot(snap) {
   daemons[idx] = snapshotToDaemonEntry(snap);
   upsertDashboardAccessTarget(dashboardAccessTargetFromPeerSnapshot(snap));
   renderDaemonsList();
+  if (typeof renderSessionsHostStrip === 'function') renderSessionsHostStrip();
 }
 
 // Drop a peer from the local daemons list and tear down its WASM
@@ -2491,6 +2496,7 @@ async function refreshPeersFromApi() {
     // per-peer events come through the primary /ws push pipeline.
     daemons = newDaemons;
     renderDaemonsList();
+    if (typeof renderSessionsHostStrip === 'function') renderSessionsHostStrip();
     const overview = await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
     if (overview) {
       return;

@@ -4009,6 +4009,19 @@ pub(crate) fn file_mtime_secs(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Last-ACTIVITY mtime for an intendant session log dir: the transcript
+/// (`session.jsonl`) when present, else the dir itself. Daemon bookkeeping
+/// (fission-ledger and meta rewrites land via `atomic_write`'s rename into
+/// the dir) bumps the DIR mtime, which made month-old sessions sort — and
+/// read — as "changed today" after every boot sweep. The transcript only
+/// moves on real appends.
+pub(crate) fn session_activity_mtime_secs(dir: &Path) -> u64 {
+    match file_mtime_secs(&dir.join("session.jsonl")) {
+        0 => file_mtime_secs(dir),
+        secs => secs,
+    }
+}
+
 pub(crate) fn metadata_mtime_secs(metadata: &std::fs::Metadata) -> u64 {
     metadata
         .modified()
@@ -7728,7 +7741,7 @@ pub(crate) fn recent_intendant_log_dirs(home: &Path, limit: usize) -> Vec<PathBu
             if !path.is_dir() {
                 return None;
             }
-            let mtime = file_mtime_secs(&path.join("session.jsonl")).max(file_mtime_secs(&path));
+            let mtime = session_activity_mtime_secs(&path);
             Some((mtime, path))
         })
         .collect();
@@ -8217,9 +8230,51 @@ pub(crate) fn limit_session_list_body(body: &str, limit: Option<usize>) -> Strin
     serde_json::to_string(&rows).unwrap_or_else(|_| body.to_string())
 }
 
+/// Whether a serialized session row answers to `id` on any identity field
+/// (mirrors the SPA's `sessionRowMatchesId`).
+pub(crate) fn session_row_answers_to_id(row: &serde_json::Value, id: &str) -> bool {
+    [
+        "session_id",
+        "resume_id",
+        "backend_session_id",
+        "intendant_session_id",
+    ]
+    .iter()
+    .any(|field| row.get(*field).and_then(|v| v.as_str()) == Some(id))
+}
+
+/// The cached full-list body when the cache can serve one under its normal
+/// fresh/stale policy. No inline rebuild — callers fall back to their own
+/// path on a cold cache.
+fn cached_session_list_body_if_serveable() -> Option<String> {
+    let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
+    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    serve_session_list_cache_entry(SESSION_LIST_LIMIT, guard.as_ref())
+}
+
 pub(crate) fn cached_list_sessions_for_ids(ids: &[String]) -> String {
     if ids.is_empty() {
         return "[]".to_string();
+    }
+    // Storm shield (2026-07-05 incident): relationship hydration fires a
+    // request per unknown id pair, and the targeted path below re-scans
+    // all three session stores per call — behind a Connection:-close mTLS
+    // handshake each. When the full-list cache can serve, answer from it;
+    // only requests naming an id the cached list doesn't know fall through
+    // to the fresh targeted scan (a genuinely new session deserves one).
+    if let Some(body) = cached_session_list_body_if_serveable() {
+        if let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
+            let hits: Vec<serde_json::Value> = rows
+                .into_iter()
+                .filter(|row| ids.iter().any(|id| session_row_answers_to_id(row, id)))
+                .collect();
+            let all_found = ids
+                .iter()
+                .all(|id| hits.iter().any(|row| session_row_answers_to_id(row, id)));
+            if all_found {
+                return serde_json::to_string(&hits).unwrap_or_else(|_| "[]".to_string());
+            }
+        }
     }
     cached_list_sessions_for_ids_from_home(&crate::platform::home_dir(), ids)
 }
@@ -9027,6 +9082,11 @@ pub(crate) fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDir
 /// next list pass.
 pub(crate) fn session_file_fingerprints_digest(entries: &[SessionFileFingerprint]) -> String {
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    // Format v2: `updated_at` derives from transcript activity, not dir
+    // mtime. Bumping the layout invalidates every persisted row once, so
+    // cached rows with the old bookkeeping-bumped timestamps rebuild on
+    // the next list pass instead of lingering until their dir changes.
+    ctx.update(&[2u8]);
     for entry in entries {
         ctx.update(entry.rel.as_bytes());
         ctx.update(&[0]);
@@ -9075,7 +9135,7 @@ pub(crate) fn intendant_session_list_row_from_dir(
     let mut canonical_session_id: Option<String> = None;
     let mut capabilities: Option<serde_json::Value> = None;
     let mut session_agent_config = crate::session_config::read_log_dir_config(dir);
-    let mut updated_at_secs = file_mtime_secs(dir);
+    let mut updated_at_secs = session_activity_mtime_secs(dir);
 
     if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
@@ -9564,7 +9624,8 @@ pub(crate) fn intendant_session_skeleton_from_dir(
         created_at = mtime_secs_to_string(file_mtime_secs(dir));
     }
     let created_at = created_at.unwrap_or_default();
-    let updated_at = file_mtime_string(dir).unwrap_or_else(|| created_at.clone());
+    let updated_at = mtime_secs_to_string(session_activity_mtime_secs(dir))
+        .unwrap_or_else(|| created_at.clone());
     serde_json::json!({
         "source": "intendant",
         "source_label": "Intendant",
@@ -9618,7 +9679,7 @@ pub(crate) fn list_intendant_skeleton_sessions_with_limit(
             if !dir.is_dir() {
                 return None;
             }
-            let mtime = file_mtime_secs(&dir);
+            let mtime = session_activity_mtime_secs(&dir);
             Some((dir, mtime))
         })
         .collect::<Vec<_>>();
@@ -9720,7 +9781,7 @@ pub(crate) fn list_sessions_from_home_impl(
             if !dir.is_dir() {
                 return None;
             }
-            let mtime = file_mtime_secs(&dir);
+            let mtime = session_activity_mtime_secs(&dir);
             Some((dir, mtime))
         })
         .collect::<Vec<_>>();
@@ -9883,6 +9944,50 @@ pub(crate) fn stream_sessions_from_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_row_answers_to_id_checks_all_identity_fields() {
+        let row = serde_json::json!({
+            "session_id": "wrapper-1",
+            "resume_id": "resume-1",
+            "backend_session_id": "backend-1",
+            "intendant_session_id": "intendant-1",
+        });
+        for id in ["wrapper-1", "resume-1", "backend-1", "intendant-1"] {
+            assert!(session_row_answers_to_id(&row, id), "{id}");
+        }
+        assert!(!session_row_answers_to_id(&row, "task-ghost"));
+        assert!(!session_row_answers_to_id(&row, ""));
+    }
+
+    #[test]
+    fn session_activity_mtime_prefers_transcript_over_dir_bookkeeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("session.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        // Age the transcript, then simulate daemon bookkeeping (a
+        // fission-ledger rewrite renames into the dir → dir mtime = now).
+        let aged = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&transcript)
+            .unwrap();
+        f.set_modified(aged).unwrap();
+        drop(f);
+        std::fs::write(dir.path().join("fission_ledger.json"), "{}").unwrap();
+
+        assert_eq!(session_activity_mtime_secs(dir.path()), 1_000_000_000);
+        assert!(
+            file_mtime_secs(dir.path()) > 1_000_000_000,
+            "dir mtime should reflect the bookkeeping write"
+        );
+        // Without a transcript, the dir mtime is the only signal left.
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(
+            session_activity_mtime_secs(bare.path()),
+            file_mtime_secs(bare.path())
+        );
+    }
 
     #[test]
     fn recording_playlist_m3u8_formats_segments_for_hls() {

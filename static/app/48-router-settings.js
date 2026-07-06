@@ -1974,6 +1974,21 @@ function switchSettingsSubtab(name) {
   updateSettingsSaveRow();
 }
 
+// Deep link to the Settings → Account API-keys card — the remediation
+// unfueled notices point at ("Add API keys").
+function focusSettingsApiKeys() {
+  routeTo('settings', 'account');
+  requestAnimationFrame(() => {
+    const heading = document.getElementById('settings-keys-heading');
+    const card = heading?.closest('.ui-card') || heading;
+    if (card?.scrollIntoView) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const firstEmpty = ['settings-key-anthropic', 'settings-key-openai', 'settings-key-gemini']
+      .map(id => document.getElementById(id))
+      .find(el => el && !el.value.trim());
+    firstEmpty?.focus();
+  });
+}
+
 // Apply the remembered sub-tab on initial render, before anything
 // else toggles the default.
 function applyInitialSettingsSubtab() {

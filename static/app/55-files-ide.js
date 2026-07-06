@@ -2392,6 +2392,7 @@ function renderNewSessionAgentControls(options = {}) {
       ? 'Managed requires a patched Codex binary with the managed app-server protocol.'
       : '';
   }
+  updateNewSessionFuelBanner();
 }
 
 function setNewSessionStartButtonPending(pending) {
@@ -2400,9 +2401,42 @@ function setNewSessionStartButtonPending(pending) {
   btn.disabled = !!pending;
   btn.classList.toggle('pending', !!pending);
   btn.textContent = pending ? 'Spawning...' : 'Start session';
+  if (!pending) updateNewSessionFuelBanner();
 }
 
-function setNewSessionSpawnNotice(kind, text) {
+// ── Unfueled preflight ──
+// The status frame's aggregate `fueled` flag (presence-level, no settings
+// permission needed) gates internal launches before they spawn a session
+// that can only die with "No API key found". Strict === false: an unknown
+// state (no status frame yet, older daemon) never blocks.
+
+function daemonInternalUnfueled() {
+  return dashboardControlTransport?.lastStatus?.fueled === false;
+}
+
+function newSessionAddKeysAction() {
+  return { label: 'Add API keys', onClick: () => focusSettingsApiKeys() };
+}
+
+const NEW_SESSION_UNFUELED_MESSAGE =
+  'This daemon has no model credentials, so the internal agent can’t start. ' +
+  'External agents (Codex, Claude Code) sign in with their own accounts and still work.';
+
+function updateNewSessionFuelBanner() {
+  const banner = document.getElementById('new-session-unfueled-banner');
+  if (!banner) return;
+  const effective = effectiveNewSessionAgentId();
+  const internalSelected = effective === 'internal' || !effective;
+  const show = internalSelected && daemonInternalUnfueled();
+  banner.classList.toggle('hidden', !show);
+  const btn = document.getElementById('new-session-start-btn');
+  if (btn && !newSessionSpawnPending) {
+    btn.disabled = show;
+    btn.title = show ? 'Internal sessions need an API key or a vault credential lease' : '';
+  }
+}
+
+function setNewSessionSpawnNotice(kind, text, action) {
   const notice = document.getElementById('new-session-spawn-notice');
   const textEl = document.getElementById('new-session-spawn-text');
   if (!notice || !textEl) return;
@@ -2411,6 +2445,20 @@ function setNewSessionSpawnNotice(kind, text) {
   notice.className = `sessions-spawn-notice ${noticeKind}` + (hasText ? '' : ' hidden');
   textEl.textContent = text || '';
   notice.title = text || '';
+  let actionBtn = document.getElementById('new-session-spawn-action');
+  if (action && hasText) {
+    if (!actionBtn) {
+      actionBtn = document.createElement('button');
+      actionBtn.id = 'new-session-spawn-action';
+      actionBtn.type = 'button';
+      actionBtn.className = 'sessions-spawn-action';
+      notice.appendChild(actionBtn);
+    }
+    actionBtn.textContent = action.label;
+    actionBtn.onclick = action.onClick;
+  } else if (actionBtn) {
+    actionBtn.remove();
+  }
   stationScheduleUpdate();
 }
 
@@ -2453,7 +2501,7 @@ function formatNewSessionLaunchFailureReason(reason) {
   return `Session failed: ${text.replace(/^error:\s*/i, '')}`;
 }
 
-function maybeFailRecentNewSessionSpawn(sessionId, reason) {
+function maybeFailRecentNewSessionSpawn(sessionId, reason, errorKind) {
   const sid = String(sessionId || '').trim();
   if (!sid || !newSessionSpawnRecent) return false;
   if (newSessionSpawnRecent.sessionId !== sid) return false;
@@ -2470,7 +2518,9 @@ function maybeFailRecentNewSessionSpawn(sessionId, reason) {
   newSessionSpawnTask = '';
   newSessionSpawnName = '';
   setNewSessionStartButtonPending(false);
-  setNewSessionSpawnNotice('error', message);
+  // Structured failure classes carry an action instead of prose-parsing.
+  const action = errorKind === 'unfueled' ? newSessionAddKeysAction() : null;
+  setNewSessionSpawnNotice('error', message, action);
   showControlToast('error', message);
   return true;
 }
@@ -2574,6 +2624,14 @@ async function startNewSession() {
   }
   if (!app) {
     failNewSessionSpawnNotice('Dashboard is not connected to the server.');
+    return;
+  }
+  const effectiveAgent = effectiveNewSessionAgentId();
+  if ((effectiveAgent === 'internal' || !effectiveAgent) && daemonInternalUnfueled()) {
+    // Belt-and-braces behind the banner: the fueled flag may have flipped
+    // since the last render.
+    updateNewSessionFuelBanner();
+    setNewSessionSpawnNotice('error', NEW_SESSION_UNFUELED_MESSAGE, newSessionAddKeysAction());
     return;
   }
 

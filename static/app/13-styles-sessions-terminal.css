@@ -613,6 +613,76 @@
   border-left-color: var(--red);
   background: color-mix(in srgb, var(--red) 8%, var(--surface0));
 }
+.sessions-spawn-action {
+  flex: none;
+  margin-left: auto;
+  padding: 3px 10px;
+  border: 1px solid color-mix(in srgb, var(--blue) 45%, var(--surface1));
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--blue) 16%, var(--surface0));
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+}
+.sessions-spawn-action:hover {
+  background: color-mix(in srgb, var(--blue) 28%, var(--surface0));
+}
+.sessions-unfueled-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(250, 179, 135, 0.32);
+  border-left: 3px solid var(--peach);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--peach) 9%, var(--surface0));
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.sessions-unfueled-banner.hidden {
+  display: none;
+}
+.sessions-unfueled-add-keys {
+  flex: none;
+  margin-left: auto;
+  white-space: nowrap;
+}
+.sessions-host-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 2px 0 6px;
+}
+.sessions-host-strip.hidden {
+  display: none;
+}
+.sessions-host-chip {
+  padding: 3px 12px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.sessions-host-chip:hover {
+  border-color: color-mix(in srgb, var(--blue) 45%, var(--surface1));
+  color: var(--text);
+}
+.sessions-host-chip.active {
+  background: color-mix(in srgb, var(--blue) 20%, var(--surface0));
+  border-color: color-mix(in srgb, var(--blue) 55%, var(--surface1));
+  color: var(--text);
+}
+.sessions-host-chip.offline {
+  opacity: 0.55;
+}
+.session-card.sc-peer {
+  cursor: alias;
+}
 .sessions-spawn-spinner {
   width: 12px;
   height: 12px;

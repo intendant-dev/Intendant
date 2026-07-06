@@ -110,7 +110,7 @@ function processCommands(cmds) {
         stationScheduleUpdate();
         break;
       case 'session_ended':
-        onSessionEnded(c.session_id, c.reason);
+        onSessionEnded(c.session_id, c.reason, c.error_kind);
         stationScheduleUpdate();
         break;
       case 'external_agent_changed': updateStatusBar({ external_agent: c.agent }); break;

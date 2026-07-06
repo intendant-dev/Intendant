@@ -216,7 +216,7 @@ function stationRefreshSharedCaches() {
     stationSessionsIndexLoading = true;
     stationSessionsIndexError = '';
     fetchSessionsForHost(selfPeerId, { force: false })
-      .then(sessions => applyLoadedSessions(sessions, document.getElementById('sessions-aggregate')))
+      .then(sessions => applyLoadedSessions(sessions, document.getElementById('sessions-aggregate'), selfPeerId))
       .catch(err => {
         stationSessionsIndexError = err && err.message ? err.message : String(err || 'session index failed');
         console.warn('Station sessions refresh failed:', err);

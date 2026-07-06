@@ -1844,42 +1844,78 @@ function sessionRowsReferToSameSession(a, b) {
   return sessionRowIds(b).some(id => ids.has(id));
 }
 
+function sessionRowsEquivalent(a, b) {
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
 function mergeSessionRowsIntoLoadedSessions(rows) {
   if (!Array.isArray(rows) || rows.length === 0 || !sessionsLoaded) return;
+  // Hydrated SELF rows must not merge into (or cache over) a browsed
+  // peer's list.
+  if (typeof sessionsViewingPeer === 'function' && sessionsViewingPeer()) return;
   const next = Array.isArray(_cachedSessions) ? _cachedSessions.slice() : [];
   let changed = false;
   for (const row of rows) {
     if (!row || typeof row !== 'object') continue;
     const index = next.findIndex(existing => sessionRowsReferToSameSession(existing, row));
     if (index >= 0) {
-      next[index] = { ...next[index], ...row };
+      const merged = { ...next[index], ...row };
+      // Identical re-fetches must not count as changes — they used to
+      // force a full unthrottled list rebuild per hydrate response.
+      if (!sessionRowsEquivalent(next[index], merged)) {
+        next[index] = merged;
+        changed = true;
+      }
     } else {
       next.unshift(row);
+      changed = true;
     }
-    changed = true;
   }
   if (!changed) return;
   _cachedSessions = next;
   sessionsListCache.set(sessionListCacheKey(selfPeerId), next);
   updateSessionProjectFilterOptions(next);
   updateNewSessionProjectPrefills(next);
-  renderSessionsAggregate(next, document.getElementById('sessions-aggregate'));
-  renderSessionsViews();
+  // Render through the deferral wrapper (250ms min interval, visibility
+  // gated) — direct renderSessionsViews() here bypassed it and drove the
+  // DOM teardown/rebuild churn in the hydration storm.
+  scheduleSessionsListRender();
 }
 
 function hydrateSessionRelationshipRows(rel) {
   if (!rel || processingLogReplay) return;
   const ids = Array.from(new Set([rel.parentId, rel.childId].filter(Boolean)));
   if (ids.length === 0) return;
-  if (ids.every(id => cachedSessionRowForId(id))) return;
-  const key = ids.slice().sort().join('\u001f');
+  // Per-ID termination, decoupled from the Sessions pane: an ID counts as
+  // resolved once ANY served row mentioned it (sessionRowSeenIds — fed by
+  // every list/stream/poll path), and an ID the daemon has no row for is
+  // probed at most once per page load (negative cache, cleared on row
+  // arrival). Without both, unresolvable endpoints — and, on
+  // #activity-only pages, even fully-real pairs — re-hydrated forever at
+  // network cadence: the 2026-07-05 storm that held the daemon at ~5
+  // cores of TLS + store scans.
+  const resolved = id => sessionRowSeenIds.has(id) || cachedSessionRowForId(id);
+  const pending = ids.filter(
+    id => !resolved(id) && !sessionRelationshipHydrationUnresolved.has(id)
+  );
+  if (pending.length === 0) return;
+  const key = pending.slice().sort().join('\u001f');
   if (sessionRelationshipHydrationInFlight.has(key)) return;
   sessionRelationshipHydrationInFlight.add(key);
-  const url = `/api/sessions?ids=${encodeURIComponent(ids.join(','))}`;
-  dashboardJsonFetch('api_sessions', { ids }, () => authedFetch(url), 'api_sessions_relationships')
+  const url = `/api/sessions?ids=${encodeURIComponent(pending.join(','))}`;
+  dashboardJsonFetch('api_sessions', { ids: pending }, () => authedFetch(url), 'api_sessions_relationships')
     .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
     .then(rows => {
       if (!Array.isArray(rows)) return;
+      for (const id of pending) {
+        if (!rows.some(row => sessionRowMatchesId(row, id))) {
+          sessionRelationshipHydrationUnresolved.add(id);
+        }
+      }
       cacheSessionWindowMetadata(rows);
       mergeSessionRowsIntoLoadedSessions(rows);
     })
