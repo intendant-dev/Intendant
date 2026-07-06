@@ -55,26 +55,29 @@ concurrency:
 jobs:
   smokes:
     name: smokes (${{ matrix.os }})
-    runs-on: ${{ matrix.runner }}
-    # Self-hosted hardening — same rule as windows.yml: fork PR code never
-    # runs on our own hardware.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Trust-based routing — same rule as windows.yml: trusted refs run on
+    # the self-hosted fleet, fork PRs route to GitHub-hosted runners
+    # (`matrix.os` doubles as the hosted label) so external code never
+    # executes on our hardware while its required checks still really run.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        # `os` is the pinned check-name key; `runner` is the self-hosted
-        # fleet placement; `hosted` gates provisioning steps. See
-        # windows.yml for the full rationale.
+        # `os` is the pinned check-name key and the fork-PR hosted label;
+        # `runner` is the self-hosted fleet placement. The smokes pin to the
+        # dedicated intendant-smokes-* labels (one runner instance per box
+        # carries them): the drivers bind fixed ports, so two smokes jobs
+        # must never run concurrently on one machine, while the test jobs
+        # are free to land on any instance. Provisioning steps gate on
+        # runner.environment. See windows.yml for the full rationale.
         include:
           - os: ubuntu-latest
-            runner: [self-hosted, intendant-linux]
+            runner: [self-hosted, intendant-smokes-linux]
             target: x86_64-unknown-linux-gnu
-            hosted: false
           - os: macos-latest
-            runner: [self-hosted, intendant-macos]
+            runner: [self-hosted, intendant-smokes-macos]
             target: aarch64-apple-darwin
-            hosted: false
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -82,12 +85,39 @@ jobs:
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
+      # Doc-only diffs don't need a release build + smoke rigs. Same in-job
+      # relevance detection as windows.yml (a paths: filter on a required
+      # workflow blocks queue entry; an in-job skip still reports green).
+      # Pure git — the fleet boxes have no gh CLI; this matrix is
+      # unix-only so one bash step suffices.
+      - name: Detect CI-relevant changes
+        id: relevance
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.merge_group.base_sha }}"
+          fi
+          git fetch --quiet --depth=1 origin "$base"
+          relevant=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              docs/*|*.md|LICENSE|.gitignore) ;;
+              *) relevant=true; break ;;
+            esac
+          done < <(git diff --name-only "$base" HEAD)
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "CI-relevant change detected: $relevant"
+
       # Same native build deps as windows.yml's test job — the release
       # build compiles the identical dependency set. Hosted-only: the
       # self-hosted boxes are pre-provisioned, and the runner user has
       # no sudo.
       - name: Install Linux build deps
-        if: matrix.hosted && runner.os == 'Linux'
+        if: runner.environment == 'github-hosted' && runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -95,7 +125,7 @@ jobs:
             libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
 
       - name: Install macOS build deps
-        if: matrix.hosted && runner.os == 'macOS'
+        if: runner.environment == 'github-hosted' && runner.os == 'macOS'
         run: brew install pkg-config libvpx
 
       # peer-rig.py drives stop_session over a raw WebSocket. A venv
@@ -111,7 +141,7 @@ jobs:
 
       # Hosted-only: self-hosted runners keep a persistent target/.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        if: matrix.hosted
+        if: runner.environment == 'github-hosted'
         with:
           key: smokes-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -119,13 +149,17 @@ jobs:
       # The smokes run the real release binaries — the same artifacts a
       # dev box's landing lap exercises. `--locked` mirrors windows.yml.
       - name: cargo build --release
+        if: steps.relevance.outputs.relevant != 'false'
         run: cargo build --release -p intendant --bins --locked
 
       - name: session-vitals smoke
+        if: steps.relevance.outputs.relevant != 'false'
         run: node tests/skills/session-vitals-smoke/driver.cjs "$GITHUB_WORKSPACE/target/release/intendant"
 
       - name: native-goal smoke
+        if: steps.relevance.outputs.relevant != 'false'
         run: node tests/skills/native-goal-smoke/driver.cjs "$GITHUB_WORKSPACE/target/release/intendant"
 
       - name: peer-sessions smoke
+        if: steps.relevance.outputs.relevant != 'false'
         run: python3 tests/skills/peer-sessions-smoke/peer-rig.py
