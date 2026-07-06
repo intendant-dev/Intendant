@@ -352,7 +352,7 @@ features it lacks.
 #### Model-driven fission (managed Codex)
 
 Managed Codex sessions can fork themselves. Alongside the rewind tools, the
-managed-context gate exposes a fission surface (`fission_tool()` in `mcp.rs`)
+managed-context gate exposes a fission surface (`fission_tool()` in `mcp/tool_gate.rs`)
 that lets the model split separable work into parallel **full-context sibling
 branches** and join the results back deliberately. The spawn/import mechanics
 live in `main.rs` (`apply_fission_spawn_action` / `apply_fission_import_action`),
