@@ -63,6 +63,8 @@ mod agent_card;
 pub(crate) use agent_card::*;
 mod ws_session;
 pub(crate) use ws_session::*;
+mod http_dispatch;
+pub(crate) use http_dispatch::*;
 
 
 /// Monotonically increasing counter for assigning unique peer IDs to WebSocket
