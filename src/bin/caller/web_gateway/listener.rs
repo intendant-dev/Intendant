@@ -1336,15 +1336,15 @@ pub fn spawn_web_gateway(
                         Err(_) => return,
                     };
 
-                    let (mut ws_tx, mut ws_rx) = ws_stream.split();
-                    let mut outbound_rx = broadcast_tx.subscribe();
+                    let (ws_tx, mut ws_rx) = ws_stream.split();
+                    let outbound_rx = broadcast_tx.subscribe();
 
                     // Per-connection identity for active/passive tracking
                     let connection_id = uuid::Uuid::new_v4().to_string();
 
                     // Direct response channel: tool_response and state_snapshot
                     // messages for this specific connection (not broadcast).
-                    let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<String>();
+                    let (direct_tx, direct_rx) = mpsc::unbounded_channel::<String>();
 
                     // Send bootstrap state snapshot on connect (with connection_id).
                     // Include config (provider/model) since AgentStateSnapshot
@@ -3813,124 +3813,23 @@ pub fn spawn_web_gateway(
                         }
                     });
 
-                    // Phase 5a.1 outbound personalization plumbing.  The
-                    // authority change channel carries the holder's
-                    // server-internal connection_id; this connection's
-                    // outbound task converts each incoming change into a
-                    // personalized `display_input_authority_state` wire
-                    // message.  Connection IDs never leave the daemon —
-                    // only the resolved `you|other|unclaimed` state does.
-                    let mut authority_change_rx = authority_change_tx.subscribe();
-                    let connection_id_outbound = connection_id.clone();
-                    let display_input_authority_outbound = display_input_authority.clone();
-                    let session_registry_outbound = session_registry.clone();
+                    // Phase 5a.1 outbound personalization plumbing: the authority
+                    // change channel carries the holder's server-internal
+                    // connection_id; ws_outbound_task converts each incoming change
+                    // into a personalized `display_input_authority_state` wire
+                    // message.
+                    let authority_change_rx = authority_change_tx.subscribe();
 
                     // Outbound: broadcast + direct responses → WebSocket
-                    let outbound = tokio::spawn(async move {
-                        loop {
-                            tokio::select! {
-                                msg = outbound_rx.recv() => {
-                                    match msg {
-                                        Ok(line) => {
-                                            if ws_tx
-                                                .send(Message::Text(line.into()))
-                                                .await
-                                                .is_err()
-                                            {
-                                                break;
-                                            }
-                                        }
-                                        Err(broadcast::error::RecvError::Closed) => break,
-                                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                    }
-                                }
-                                msg = direct_rx.recv() => {
-                                    match msg {
-                                        Some(line) => {
-                                            if ws_tx
-                                                .send(Message::Text(line.into()))
-                                                .await
-                                                .is_err()
-                                            {
-                                                break;
-                                            }
-                                        }
-                                        None => break,
-                                    }
-                                }
-                                msg = authority_change_rx.recv() => {
-                                    match msg {
-                                        Ok(change) => {
-                                            // Personalize: never ship the holder's identity.
-                                            let state = match &change.holder {
-                                                Some(h) if h.matches_local_ws(&connection_id_outbound) => "you",
-                                                Some(_) => "other",
-                                                None => "unclaimed",
-                                            };
-                                            let frame = serde_json::json!({
-                                                "t": "display_input_authority_state",
-                                                "display_id": change.display_id,
-                                                "state": state,
-                                            }).to_string();
-                                            if ws_tx
-                                                .send(Message::Text(frame.into()))
-                                                .await
-                                                .is_err()
-                                            {
-                                                break;
-                                            }
-                                        }
-                                        Err(broadcast::error::RecvError::Closed) => break,
-                                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                                            // Phase 5a.1: a lagged subscriber missed at least one
-                                            // authority transition.  Send a fresh personalized
-                                            // snapshot for every currently-active display so the
-                                            // browser's chip cannot be left stuck on stale state.
-                                            // Snapshot is computed under the std lock (held briefly,
-                                            // released before any send) plus the session registry's
-                                            // tokio lock for the active-display list — order
-                                            // matters: take the std lock LAST and drop it before
-                                            // awaiting the send to avoid awaiting under a sync guard.
-                                                            let display_ids: Vec<u32> = match session_registry_outbound.as_ref() {
-                                                Some(sr) => sr.read().await.display_ids(),
-                                                None => Vec::new(),
-                                            };
-                                            let snapshots: Vec<(u32, &'static str)> = {
-                                                let auth = display_input_authority_outbound
-                                                    .read()
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                                display_ids.into_iter().map(|did| {
-                                                    let state = match auth.get(&did) {
-                                                        Some(entry) if entry.matches_local_ws(&connection_id_outbound) => "you",
-                                                        Some(_) => "other",
-                                                        None => "unclaimed",
-                                                    };
-                                                    (did, state)
-                                                }).collect()
-                                            };
-                                            let mut send_failed = false;
-                                            for (did, state) in snapshots {
-                                                let frame = serde_json::json!({
-                                                    "t": "display_input_authority_state",
-                                                    "display_id": did,
-                                                    "state": state,
-                                                }).to_string();
-                                                if ws_tx
-                                                    .send(Message::Text(frame.into()))
-                                                    .await
-                                                    .is_err()
-                                                {
-                                                    send_failed = true;
-                                                    break;
-                                                }
-                                            }
-                                            if send_failed { break; }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    });
+                    let outbound = tokio::spawn(ws_outbound_task(
+                        outbound_rx,
+                        direct_rx,
+                        ws_tx,
+                        authority_change_rx,
+                        connection_id.clone(),
+                        display_input_authority.clone(),
+                        session_registry.clone(),
+                    ));
 
                     let _ = tokio::join!(inbound, outbound);
                 } else {

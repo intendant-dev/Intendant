@@ -61,6 +61,8 @@ mod access_gates;
 pub(crate) use access_gates::*;
 mod agent_card;
 pub(crate) use agent_card::*;
+mod ws_session;
+pub(crate) use ws_session::*;
 
 
 /// Monotonically increasing counter for assigning unique peer IDs to WebSocket
