@@ -272,6 +272,25 @@ queueing: the queue gate is the deterministic subset, not the full battery, and 
 red queue entry wastes everyone's cycle time. Never bypass the ruleset; if the
 queue itself is wedged, that is an operator (org-owner) decision.
 
+**Land small, land immediately.** This main takes hundreds of commits a month
+from concurrent agents; every hour a green change sits unqueued is another
+chance main moves under it (a real one-PR landing ate three conflict
+reconciles this way, and two sessions once wrote the same fix in parallel
+because neither had landed it). So: an independent fix ships as its own PR
+the moment it's green — never held back to ride a batch. Two habits make the
+collisions cheap:
+
+- **Open a draft PR when you start, not when you finish** (`gh pr create
+  --draft --fill`, then `gh pr ready` once green). Drafts are the fleet's
+  files-in-flight signal — before touching hot files, check what's already
+  in motion: `gh pr list --state open --json number,title,headRefName,isDraft,files`.
+- **Auto-merge silently disarms** whenever the PR stops being mergeable (main
+  conflict) or a check fails — after every conflict-resolution push or flake
+  rerun, re-run `gh pr merge <n> --merge --auto` and confirm
+  `autoMergeRequest` is set again. While the PR sits IN the queue,
+  `autoMergeRequest` nulling and `mergeStateStatus: UNKNOWN` are normal;
+  only `state` (`MERGED`/`CLOSED`) is terminal.
+
 **Post-landing: fast-forward the shared mirror.** The queue owns origin/main;
 nothing updates the repo root's local `main` anymore. After your PR merges, run
 `git -C <repo-root> pull --ff-only` (and `git merge --ff-only origin/main` in
