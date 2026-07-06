@@ -31938,6 +31938,7 @@ function applySessionRelationshipsFromSession(session) {
 
 function cacheSessionWindowMetadata(sessions) {
   if (!Array.isArray(sessions)) return;
+  const changedIds = new Set();
   for (const session of sessions) {
     if (!session || typeof session !== 'object') continue;
     const meta = sessionWindowMetaFromSession(session);
@@ -31952,7 +31953,7 @@ function cacheSessionWindowMetadata(sessions) {
       sessionRelationshipHydrationUnresolved.delete(id);
       const { meta: merged, changed } = mergeSessionWindowMetadata(id, meta);
       if (changed && sessionWindows.has(id)) updateSessionWindow(id, merged);
-      if (changed) refreshSessionIdentityLabels(id);
+      if (changed) changedIds.add(id);
     }
     if (session.backend_session_id && session.session_id) {
       applySessionIdentity({
@@ -31982,7 +31983,28 @@ function cacheSessionWindowMetadata(sessions) {
   for (const session of sessions) {
     applySessionRelationshipsFromSession(session);
   }
+  refreshSessionIdentityLabelsBulk(changedIds);
   persistSessionWindowState();
+}
+
+// One DOM pass for a whole metadata batch. The per-id
+// refreshSessionIdentityLabels (a document-wide querySelectorAll each)
+// scanned the document once per changed id — a full-corpus list apply
+// (~4.7k rows × ids) froze the tab for tens of seconds.
+function refreshSessionIdentityLabelsBulk(changedIds) {
+  if (!changedIds || changedIds.size === 0) return;
+  const target = resolvePromptTargetSessionId();
+  if (changedIds.has(target)) updateTaskTargetChip();
+  document.querySelectorAll('.log-entry[data-session-id]').forEach(entry => {
+    const sid = entry.dataset.sessionId;
+    if (!changedIds.has(sid)) return;
+    for (const child of entry.children) {
+      if (child.classList?.contains('log-session')) {
+        renderSessionIdentity(child, sid, { showName: false });
+        applyPromptTargetLogSessionBadgeState(entry, target);
+      }
+    }
+  });
 }
 
 function scheduleExternalSessionWindowTranscriptSyncFromMetadata(session) {
@@ -35559,6 +35581,14 @@ function hydrateSessionRelationshipRows(rel) {
       sessionRelationshipHydrationInFlight.delete(key);
     });
 }
+
+// QA hook (stationProbe convention): the hydration-termination state the
+// validate-dashboard harness asserts on — module scope hides it otherwise.
+window.sessionsHydrationProbe = () => ({
+  seen: sessionRowSeenIds.size,
+  unresolved: sessionRelationshipHydrationUnresolved.size,
+  inFlight: sessionRelationshipHydrationInFlight.size,
+});
 
 function applySessionRelationship(evt = {}) {
   const parentId = String(evt.parent_session_id || evt.parentSessionId || '').trim();
@@ -51204,6 +51234,9 @@ function switchSettingsSubtab(name) {
 
 // Deep link to the Settings → Account API-keys card — the remediation
 // unfueled notices point at ("Add API keys").
+// Bridged onto window below: the dashboard runs as a module script, so
+// inline onclick handlers (the unfueled banner's Add-keys button) and the
+// validate-dashboard harness need an explicit global.
 function focusSettingsApiKeys() {
   routeTo('settings', 'account');
   requestAnimationFrame(() => {
@@ -51216,6 +51249,7 @@ function focusSettingsApiKeys() {
     firstEmpty?.focus();
   });
 }
+window.focusSettingsApiKeys = focusSettingsApiKeys;
 
 // Apply the remembered sub-tab on initial render, before anything
 // else toggles the default.
@@ -67649,8 +67683,34 @@ function setNewSessionStartButtonPending(pending) {
 // that can only die with "No API key found". Strict === false: an unknown
 // state (no status frame yet, older daemon) never blocks.
 
+// Layered like refreshUnfueledEmptyState: the status frame's aggregate
+// wins when present; otherwise a one-shot HTTP key-status probe fills in
+// (the control transport may not be connected yet — or ever, for some
+// bindings). Unknown never blocks.
+let daemonUnfueledCached = null;
+let daemonFuelProbeInFlight = false;
+
 function daemonInternalUnfueled() {
-  return dashboardControlTransport?.lastStatus?.fueled === false;
+  const status = dashboardControlTransport?.lastStatus;
+  if (status && typeof status.fueled === 'boolean') return status.fueled === false;
+  return daemonUnfueledCached === true;
+}
+
+function refreshFuelStateForBanner() {
+  const status = dashboardControlTransport?.lastStatus;
+  if (status && typeof status.fueled === 'boolean') return;
+  if (daemonUnfueledCached !== null || daemonFuelProbeInFlight) return;
+  if (typeof fetchApiKeyStatus !== 'function') return;
+  daemonFuelProbeInFlight = true;
+  fetchApiKeyStatus()
+    .then(d => {
+      if (d && !d.error) daemonUnfueledCached = !(d.openai || d.anthropic || d.gemini);
+    })
+    .catch(() => {})
+    .finally(() => {
+      daemonFuelProbeInFlight = false;
+      updateNewSessionFuelBanner();
+    });
 }
 
 function newSessionAddKeysAction() {
@@ -67661,9 +67721,22 @@ const NEW_SESSION_UNFUELED_MESSAGE =
   'This daemon has no model credentials, so the internal agent can’t start. ' +
   'External agents (Codex, Claude Code) sign in with their own accounts and still work.';
 
+// QA hook (stationProbe convention): the preflight inputs the
+// validate-dashboard harness asserts on — module scope hides them.
+window.sessionsFuelProbe = () => ({
+  fueled: dashboardControlTransport?.lastStatus?.fueled ?? null,
+  haveStatus: !!dashboardControlTransport?.lastStatus,
+  unfueledCached: daemonUnfueledCached,
+  effectiveAgent: effectiveNewSessionAgentId(),
+  configuredAgent: newSessionConfiguredAgent || '',
+  bannerHidden: !!document.getElementById('new-session-unfueled-banner')?.classList.contains('hidden'),
+  startDisabled: !!document.getElementById('new-session-start-btn')?.disabled,
+});
+
 function updateNewSessionFuelBanner() {
   const banner = document.getElementById('new-session-unfueled-banner');
   if (!banner) return;
+  refreshFuelStateForBanner();
   const effective = effectiveNewSessionAgentId();
   const internalSelected = effective === 'internal' || !effective;
   const show = internalSelected && daemonInternalUnfueled();
@@ -68234,9 +68307,17 @@ function failSessionsHydration(message, received, limit) {
   });
 }
 
+// '' and the (possibly not-yet-assigned) selfPeerId both mean "this
+// daemon": selfPeerId arrives async, so a load started before identity
+// resolved must still count as self/active once it lands.
+function normalizeSessionsHostId(hostId) {
+  return !hostId || hostId === selfPeerId ? '' : String(hostId);
+}
+
 function applyLoadedSessions(sessions, aggEl, hostId = currentSessionsHostId()) {
-  const isSelf = hostId === selfPeerId;
-  const isActiveView = hostId === currentSessionsHostId();
+  const host = normalizeSessionsHostId(hostId);
+  const isSelf = host === '';
+  const isActiveView = host === normalizeSessionsHostId(currentSessionsHostId());
   if (isActiveView) {
     _cachedSessions = sessions;
     updateSessionProjectFilterOptions(sessions);

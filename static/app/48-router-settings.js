@@ -1976,6 +1976,9 @@ function switchSettingsSubtab(name) {
 
 // Deep link to the Settings → Account API-keys card — the remediation
 // unfueled notices point at ("Add API keys").
+// Bridged onto window below: the dashboard runs as a module script, so
+// inline onclick handlers (the unfueled banner's Add-keys button) and the
+// validate-dashboard harness need an explicit global.
 function focusSettingsApiKeys() {
   routeTo('settings', 'account');
   requestAnimationFrame(() => {
@@ -1988,6 +1991,7 @@ function focusSettingsApiKeys() {
     firstEmpty?.focus();
   });
 }
+window.focusSettingsApiKeys = focusSettingsApiKeys;
 
 // Apply the remembered sub-tab on initial render, before anything
 // else toggles the default.

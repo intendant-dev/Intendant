@@ -253,9 +253,17 @@ function failSessionsHydration(message, received, limit) {
   });
 }
 
+// '' and the (possibly not-yet-assigned) selfPeerId both mean "this
+// daemon": selfPeerId arrives async, so a load started before identity
+// resolved must still count as self/active once it lands.
+function normalizeSessionsHostId(hostId) {
+  return !hostId || hostId === selfPeerId ? '' : String(hostId);
+}
+
 function applyLoadedSessions(sessions, aggEl, hostId = currentSessionsHostId()) {
-  const isSelf = hostId === selfPeerId;
-  const isActiveView = hostId === currentSessionsHostId();
+  const host = normalizeSessionsHostId(hostId);
+  const isSelf = host === '';
+  const isActiveView = host === normalizeSessionsHostId(currentSessionsHostId());
   if (isActiveView) {
     _cachedSessions = sessions;
     updateSessionProjectFilterOptions(sessions);

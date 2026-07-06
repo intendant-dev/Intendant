@@ -1925,6 +1925,14 @@ function hydrateSessionRelationshipRows(rel) {
     });
 }
 
+// QA hook (stationProbe convention): the hydration-termination state the
+// validate-dashboard harness asserts on — module scope hides it otherwise.
+window.sessionsHydrationProbe = () => ({
+  seen: sessionRowSeenIds.size,
+  unresolved: sessionRelationshipHydrationUnresolved.size,
+  inFlight: sessionRelationshipHydrationInFlight.size,
+});
+
 function applySessionRelationship(evt = {}) {
   const parentId = String(evt.parent_session_id || evt.parentSessionId || '').trim();
   const childId = String(evt.child_session_id || evt.childSessionId || '').trim();

@@ -943,6 +943,7 @@ function applySessionRelationshipsFromSession(session) {
 
 function cacheSessionWindowMetadata(sessions) {
   if (!Array.isArray(sessions)) return;
+  const changedIds = new Set();
   for (const session of sessions) {
     if (!session || typeof session !== 'object') continue;
     const meta = sessionWindowMetaFromSession(session);
@@ -957,7 +958,7 @@ function cacheSessionWindowMetadata(sessions) {
       sessionRelationshipHydrationUnresolved.delete(id);
       const { meta: merged, changed } = mergeSessionWindowMetadata(id, meta);
       if (changed && sessionWindows.has(id)) updateSessionWindow(id, merged);
-      if (changed) refreshSessionIdentityLabels(id);
+      if (changed) changedIds.add(id);
     }
     if (session.backend_session_id && session.session_id) {
       applySessionIdentity({
@@ -987,7 +988,28 @@ function cacheSessionWindowMetadata(sessions) {
   for (const session of sessions) {
     applySessionRelationshipsFromSession(session);
   }
+  refreshSessionIdentityLabelsBulk(changedIds);
   persistSessionWindowState();
+}
+
+// One DOM pass for a whole metadata batch. The per-id
+// refreshSessionIdentityLabels (a document-wide querySelectorAll each)
+// scanned the document once per changed id — a full-corpus list apply
+// (~4.7k rows × ids) froze the tab for tens of seconds.
+function refreshSessionIdentityLabelsBulk(changedIds) {
+  if (!changedIds || changedIds.size === 0) return;
+  const target = resolvePromptTargetSessionId();
+  if (changedIds.has(target)) updateTaskTargetChip();
+  document.querySelectorAll('.log-entry[data-session-id]').forEach(entry => {
+    const sid = entry.dataset.sessionId;
+    if (!changedIds.has(sid)) return;
+    for (const child of entry.children) {
+      if (child.classList?.contains('log-session')) {
+        renderSessionIdentity(child, sid, { showName: false });
+        applyPromptTargetLogSessionBadgeState(entry, target);
+      }
+    }
+  });
 }
 
 function scheduleExternalSessionWindowTranscriptSyncFromMetadata(session) {

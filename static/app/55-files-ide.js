@@ -2410,8 +2410,34 @@ function setNewSessionStartButtonPending(pending) {
 // that can only die with "No API key found". Strict === false: an unknown
 // state (no status frame yet, older daemon) never blocks.
 
+// Layered like refreshUnfueledEmptyState: the status frame's aggregate
+// wins when present; otherwise a one-shot HTTP key-status probe fills in
+// (the control transport may not be connected yet — or ever, for some
+// bindings). Unknown never blocks.
+let daemonUnfueledCached = null;
+let daemonFuelProbeInFlight = false;
+
 function daemonInternalUnfueled() {
-  return dashboardControlTransport?.lastStatus?.fueled === false;
+  const status = dashboardControlTransport?.lastStatus;
+  if (status && typeof status.fueled === 'boolean') return status.fueled === false;
+  return daemonUnfueledCached === true;
+}
+
+function refreshFuelStateForBanner() {
+  const status = dashboardControlTransport?.lastStatus;
+  if (status && typeof status.fueled === 'boolean') return;
+  if (daemonUnfueledCached !== null || daemonFuelProbeInFlight) return;
+  if (typeof fetchApiKeyStatus !== 'function') return;
+  daemonFuelProbeInFlight = true;
+  fetchApiKeyStatus()
+    .then(d => {
+      if (d && !d.error) daemonUnfueledCached = !(d.openai || d.anthropic || d.gemini);
+    })
+    .catch(() => {})
+    .finally(() => {
+      daemonFuelProbeInFlight = false;
+      updateNewSessionFuelBanner();
+    });
 }
 
 function newSessionAddKeysAction() {
@@ -2422,9 +2448,22 @@ const NEW_SESSION_UNFUELED_MESSAGE =
   'This daemon has no model credentials, so the internal agent can’t start. ' +
   'External agents (Codex, Claude Code) sign in with their own accounts and still work.';
 
+// QA hook (stationProbe convention): the preflight inputs the
+// validate-dashboard harness asserts on — module scope hides them.
+window.sessionsFuelProbe = () => ({
+  fueled: dashboardControlTransport?.lastStatus?.fueled ?? null,
+  haveStatus: !!dashboardControlTransport?.lastStatus,
+  unfueledCached: daemonUnfueledCached,
+  effectiveAgent: effectiveNewSessionAgentId(),
+  configuredAgent: newSessionConfiguredAgent || '',
+  bannerHidden: !!document.getElementById('new-session-unfueled-banner')?.classList.contains('hidden'),
+  startDisabled: !!document.getElementById('new-session-start-btn')?.disabled,
+});
+
 function updateNewSessionFuelBanner() {
   const banner = document.getElementById('new-session-unfueled-banner');
   if (!banner) return;
+  refreshFuelStateForBanner();
   const effective = effectiveNewSessionAgentId();
   const internalSelected = effective === 'internal' || !effective;
   const show = internalSelected && daemonInternalUnfueled();
