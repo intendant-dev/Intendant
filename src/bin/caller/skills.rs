@@ -550,6 +550,29 @@ Instructions here.
     }
 
     #[test]
+    fn discover_skills_personal_home_and_project_precedence() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        // A personal skill in the injected home's standard path loads.
+        let personal = home.path().join(".agents").join("skills").join("my-skill");
+        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::write(personal.join("SKILL.md"), MINIMAL_SKILL).unwrap();
+        let skills = discover_skills_in(Some(project.path()), Some(home.path()));
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].config.name, "lint");
+        assert_eq!(skills[0].source, SkillSource::Personal);
+
+        // A project skill with the same name shadows the personal one.
+        let project_skill = project.path().join(".agents").join("skills").join("lint");
+        std::fs::create_dir_all(&project_skill).unwrap();
+        std::fs::write(project_skill.join("SKILL.md"), MINIMAL_SKILL).unwrap();
+        let skills = discover_skills_in(Some(project.path()), Some(home.path()));
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].source, SkillSource::Project);
+    }
+
+    #[test]
     fn format_catalog_empty() {
         assert_eq!(format_skill_catalog(&[]), "");
     }

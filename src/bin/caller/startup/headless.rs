@@ -482,6 +482,7 @@ pub(crate) async fn run_headless_mode(
                     flags_direct: flags.direct,
                     shared_session: headless_shared_session.clone(),
                     provider_factory: None,
+                    logs_home_override: None,
                 },
             )
             .spawn_resume_listener(),

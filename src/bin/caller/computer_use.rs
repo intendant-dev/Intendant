@@ -2856,7 +2856,10 @@ mod tests {
 
     #[test]
     fn no_session_message_wayland_user_session_mentions_portal() {
-        // Clear env first so the test is deterministic.
+        // Serialize with every other test that touches this process-global
+        // env var (sync test outside a runtime → blocking_lock), then clear
+        // it so the test is deterministic.
+        let _guard = crate::test_support::TEST_ENV_LOCK.blocking_lock();
         std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         let msg = no_session_message(DisplayBackend::Wayland, &DisplayTarget::UserSession);
         assert!(

@@ -35,6 +35,14 @@ pub struct SessionSupervisorConfig {
     /// production; tests use it to run the loop against a mock provider.
     pub provider_factory:
         Option<Arc<dyn Fn() -> Box<dyn provider::ChatProvider> + Send + Sync>>,
+    /// Injection point for the persisted-session home: resume/attach
+    /// resolution (wrapper logs, the wrapper index, persisted launch
+    /// configs) reads from here. None in production (the real home); tests
+    /// pin it so a machine's live `~/.intendant` session history cannot
+    /// change what they observe — a hardcoded wrapper id in a test can
+    /// otherwise resolve against a real session log and flip the flow
+    /// from follow-up routing to a fresh resume dispatch.
+    pub logs_home_override: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -381,6 +389,16 @@ impl SessionSupervisor {
             config: Arc::new(config),
             state: Arc::new(AsyncMutex::new(SupervisorState::default())),
         }
+    }
+
+    /// Home used for persisted-session resolution (wrapper logs, wrapper
+    /// index, launch configs). The real home in production; tests inject
+    /// `logs_home_override` for hermetic resolution.
+    fn logs_home(&self) -> PathBuf {
+        self.config
+            .logs_home_override
+            .clone()
+            .unwrap_or_else(crate::platform::home_dir)
     }
 
     pub fn spawn(self) -> JoinHandle<()> {
@@ -1406,7 +1424,8 @@ impl SessionSupervisor {
         let is_external = external_backend.is_some();
         let requested_resume_token = resume_id.unwrap_or_else(|| session_id.clone());
         let resume_token = if is_external {
-            effective_external_resume_token(
+            effective_external_resume_token_in_home(
+                &self.logs_home(),
                 &source_norm,
                 &session_id,
                 &requested_resume_token,
@@ -1425,7 +1444,7 @@ impl SessionSupervisor {
                 overrides.as_wire_fields(backend.as_short_str()),
             );
             if let Some(persisted) = crate::session_config::load_for_resume(
-                &crate::platform::home_dir(),
+                &self.logs_home(),
                 backend.as_short_str(),
                 &session_id,
                 Some(&resume_token),
@@ -1508,7 +1527,8 @@ impl SessionSupervisor {
                     }
                 }
                 let (ready_tx, ready_rx) = oneshot::channel();
-                let log_dir = external_resume_log_dir(&session_id, force_new);
+                let log_dir =
+                    external_resume_log_dir_in_home(&self.logs_home(), &session_id, force_new);
                 let session_log = match session_log::SessionLog::open(log_dir.clone()) {
                     Ok(log) => Arc::new(Mutex::new(log)),
                     Err(e) => {
@@ -1619,7 +1639,7 @@ impl SessionSupervisor {
                 }
             }
         } else {
-            external_resume_log_dir(&session_id, force_new)
+            external_resume_log_dir_in_home(&self.logs_home(), &session_id, force_new)
         };
         let session_log = match session_log::SessionLog::open(log_dir.clone()) {
             Ok(log) => Arc::new(Mutex::new(log)),
@@ -3037,7 +3057,7 @@ impl SessionSupervisor {
         &self,
         requested_id: &str,
     ) -> (String, Option<EditRouteTarget>, Option<RelatedSession>) {
-        let home = crate::platform::home_dir();
+        let home = self.logs_home();
         self.lookup_edit_route_target_in_home(requested_id, &home)
             .await
     }
@@ -3679,7 +3699,7 @@ impl SessionSupervisor {
         let mut config = crate::session_config::from_wire_fields(
             overrides.as_wire_fields(backend.as_short_str()),
         );
-        let home = crate::platform::home_dir();
+        let home = self.logs_home();
         if let Some(existing) = crate::session_config::load_for_resume(
             &home,
             backend.as_short_str(),
@@ -4082,7 +4102,8 @@ impl SessionSupervisor {
     }
 
     async fn resolve_persisted_external_managed_id(&self, session_id: &str) -> Option<String> {
-        let (source, backend_session_id) = persisted_external_identity_for_session(session_id)?;
+        let (source, backend_session_id) =
+            persisted_external_identity_for_session_in_home(&self.logs_home(), session_id)?;
         let state = self.state.lock().await;
         let resolved_id = state.resolve_session_id(&backend_session_id)?;
         state
@@ -5078,10 +5099,6 @@ fn emit_follow_up_status(
     });
 }
 
-fn external_resume_log_dir(session_id: &str, force_new: bool) -> PathBuf {
-    external_resume_log_dir_in_home(&crate::platform::home_dir(), session_id, force_new)
-}
-
 fn external_resume_log_dir_in_home(home: &Path, session_id: &str, force_new: bool) -> PathBuf {
     if !force_new {
         if let Some(dir) = session_log::SessionLog::find_session_by_id_in_home(home, session_id) {
@@ -5089,27 +5106,6 @@ fn external_resume_log_dir_in_home(home: &Path, session_id: &str, force_new: boo
         }
     }
     session_log::SessionLog::resolve_path(None)
-}
-
-fn persisted_external_identity_for_session(session_id: &str) -> Option<(String, String)> {
-    let home = crate::platform::home_dir();
-    persisted_external_identity_for_session_in_home(&home, session_id)
-}
-
-pub(crate) fn effective_external_resume_token(
-    source: &str,
-    session_id: &str,
-    requested_resume_token: &str,
-    force_new: bool,
-) -> String {
-    let home = crate::platform::home_dir();
-    effective_external_resume_token_in_home(
-        &home,
-        source,
-        session_id,
-        requested_resume_token,
-        force_new,
-    )
 }
 
 pub(crate) fn effective_external_resume_token_in_home(
@@ -5439,6 +5435,15 @@ mod tests {
             flags_direct: false,
             shared_session: None,
             provider_factory: None,
+            // Hermetic by default: supervisor tests must never resolve
+            // persisted sessions against the machine's real ~/.intendant —
+            // a box with live session history (a dev box, the peer-testing
+            // Dell) can otherwise match a test's hardcoded wrapper id. The
+            // dir is never created unless a test writes through it.
+            logs_home_override: Some(
+                std::env::temp_dir()
+                    .join(format!("intendant-test-logs-home-{}", std::process::id())),
+            ),
         })
     }
 
@@ -6398,6 +6403,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dashboard_delegate_tracks_child_in_parent_registry_and_wakes_parent() {
         let bus = EventBus::new();
+        // Subscribe before the spawn: the relationship assertion below reads
+        // the bus, and broadcast subscribers only see events sent after they
+        // subscribe.
+        let mut bus_rx = bus.subscribe();
         let project_dir = tempfile::tempdir().unwrap();
         let supervisor =
             test_supervisor_with_mock_provider(project_dir.path().to_path_buf(), bus.clone());
@@ -6446,14 +6455,31 @@ mod tests {
                 child.rx.take().expect("completion receiver present"),
             )
         };
-        {
-            let state = supervisor.state.lock().await;
-            let rel = state
-                .related_sessions
-                .get(&child_id)
-                .expect("relationship recorded");
-            assert_eq!(rel.relationship, "subagent");
-            assert_eq!(rel.parent_session_id, "parent");
+        // Assert the relationship via its bus event, not by peeking
+        // supervisor state: the state entry is transient — the mock child
+        // completes near-instantly and its retirement purges
+        // `related_sessions`, so a state read here races the child and
+        // flakes under CI load. The event is the durable signal frontends
+        // consume, emitted synchronously during the spawn.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let event = tokio::time::timeout_at(deadline, bus_rx.recv())
+                .await
+                .expect("SessionRelationship event should arrive")
+                .expect("bus stays open");
+            if let AppEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ephemeral,
+            } = event
+            {
+                assert_eq!(parent_session_id, "parent");
+                assert_eq!(child_session_id, child_id);
+                assert_eq!(relationship, "subagent");
+                assert!(!ephemeral);
+                break;
+            }
         }
 
         // The parent was woken with a notification naming the child.
@@ -6660,8 +6686,12 @@ mod tests {
             )
             .await;
 
-        let msg = rx
-            .try_recv()
+        // recv with a deadline, not try_recv: the routed follow-up's send is
+        // not guaranteed to be synchronous with resume_session's return, and
+        // a non-blocking read races it under CI load.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("resume task should be routed within the deadline")
             .expect("resume task should route to the live backend session");
         assert_eq!(msg.text, "continue after restart");
         assert_eq!(msg.target_session_id.as_deref(), Some(live_backend_id));

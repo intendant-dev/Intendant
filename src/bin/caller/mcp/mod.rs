@@ -2025,7 +2025,9 @@ mod tests {
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
 
-    pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // Crate-wide (not module-local): tests in other modules mutate the same
+    // process environment, so a per-module lock would still race them.
+    pub(crate) use crate::test_support::TEST_ENV_LOCK;
 
     #[test]
     fn format_cu_action_brief_truncates_multibyte_text_on_char_boundary() {

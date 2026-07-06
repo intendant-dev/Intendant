@@ -9687,7 +9687,9 @@ mod tests {
     use crate::types::OutboundEvent;
     use tokio::io::AsyncWriteExt;
 
-    static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // Crate-wide (not module-local): tests in other modules mutate the same
+    // process environment, so a per-module lock would still race them.
+    use crate::test_support::TEST_ENV_LOCK;
 
 
     struct EnvVarGuard {
