@@ -52,10 +52,10 @@ mod tool_gate;
 pub(crate) use tool_gate::*;
 mod tool_params;
 pub(crate) use tool_params::*;
-mod tools_managed;
-pub(crate) use tools_managed::*;
+// tools_managed / tools_display contribute impl-block methods only —
+// nothing importable, so no re-export.
 mod tools_display;
-pub(crate) use tools_display::*;
+mod tools_managed;
 
 const CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT: f64 = 85.0;
 const DENSITY_MAINTENANCE_ANCHOR_LIST_LIMIT: usize = 1;
@@ -655,7 +655,7 @@ pub(crate) fn normalize_shared_view_region_xywh(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UserSessionDisplayActivationRequest {
+pub(crate) enum UserSessionDisplayActivationRequest {
     NotApplicable,
     AlreadyActive,
     NeedsGrant,
