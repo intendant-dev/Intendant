@@ -235,7 +235,7 @@ through the tee is always safe.
 
 A browser that connects late does not miss history. The web gateway reads
 `session.jsonl` and converts it to a stream of outbound events for the WASM
-client (`replay_jsonl_to_outbound_entries` in `web_gateway/session_catalog.rs`):
+client (`replay_jsonl_to_outbound_entries` in `web_gateway/session_catalog/replay.rs`):
 
 - The first replayed entry is a `replay_start` marker carrying the
   provider/model/autonomy values scanned from the log (`scan_replay_status`), so
