@@ -320,7 +320,7 @@ non-admin `ci` users, and the check *names* stay pinned to the
 `test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os` is
 the name key, `runner` is the fleet placement):
 - **`windows.yml`** — cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). On `pull_request` the Windows leg runs `cargo check` only (fast pre-queue signal); the full Windows suite runs in the merge group — the actual gate — and on pushes to main. Headless-safe: needs no display or API keys. **Required check.**
-- **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real release binaries on Linux + macOS. **Required check.**
+- **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real binaries on Linux only (debug profile; the drivers are platform-agnostic protocol probes, so a second platform mostly duplicated coverage while doubling flake surface). **Required check.**
 - **`app-html.yml`** — the `static/app/` fragments ↔ generated `static/app.html` regen gate. **Required check.**
 - **`agents-md-sync.yml`** — CLAUDE.md ↔ AGENTS.md byte-parity. **Required check.**
 - **`audit.yml`** — `cargo audit` on push/PR plus a weekly cron (Mondays 08:00 UTC). Advisory only — new upstream advisories must not block unrelated landings.
