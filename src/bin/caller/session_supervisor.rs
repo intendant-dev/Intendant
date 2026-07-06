@@ -6681,8 +6681,12 @@ mod tests {
             )
             .await;
 
-        let msg = rx
-            .try_recv()
+        // recv with a deadline, not try_recv: the routed follow-up's send is
+        // not guaranteed to be synchronous with resume_session's return, and
+        // a non-blocking read races it under CI load.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("resume task should be routed within the deadline")
             .expect("resume task should route to the live backend session");
         assert_eq!(msg.text, "continue after restart");
         assert_eq!(msg.target_session_id.as_deref(), Some(live_backend_id));
