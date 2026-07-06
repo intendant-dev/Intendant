@@ -72,6 +72,13 @@ jobs:
     # additionally sit behind the repo's all-outside-collaborators approval
     # gate, so nothing runs anywhere without a maintainer's click.
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
+    env:
+      # CI needs pass/fail and panic messages, not debugger-grade binaries.
+      # Debug info is the dominant MSVC link cost across these large test
+      # binaries, so the Windows leg builds without it; Linux/macOS keep
+      # the default — their links are cheap and rich backtraces stay
+      # useful when a failure does need reading in place.
+      CARGO_PROFILE_DEV_DEBUG: ${{ matrix.cargo_debug }}
     # Full test builds are much heavier than the old `cargo check`; a cold
     # Windows runner can take a while, but a hung run shouldn't burn hours.
     timeout-minutes: 90
@@ -93,12 +100,15 @@ jobs:
           - os: windows-latest
             runner: [self-hosted, intendant-windows]
             target: x86_64-pc-windows-msvc
+            cargo_debug: "0"
           - os: macos-latest
             runner: [self-hosted, intendant-macos]
             target: aarch64-apple-darwin
+            cargo_debug: "2"
           - os: ubuntu-latest
             runner: [self-hosted, intendant-linux]
             target: x86_64-unknown-linux-gnu
+            cargo_debug: "2"
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -165,6 +175,17 @@ jobs:
           key: ${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Fast pre-queue signal vs the real merge gate: on pull_request the
+      # WINDOWS leg runs a compile check only — cross-platform compile
+      # breakage is the dominant Windows-only regression class, the full
+      # 12-minute suite would otherwise run twice per landing (PR + group)
+      # on near-identical trees, and the merge queue re-runs everything on
+      # merge_group before anything lands. Linux/macOS stay full on PRs:
+      # they're fast and keep pre-queue runtime signal.
+      - name: cargo check (Windows pull_request fast path)
+        if: github.event_name == 'pull_request' && runner.os == 'Windows'
+        run: cargo check -p intendant --bins -p intendant-core -p intendant-display --locked --target ${{ matrix.target }}
+
       # Build and run the unit tests of the whole `intendant` package — both
       # binaries (the `intendant` controller and the `intendant-runtime`
       # executor) and their shared modules — for this target. `--bins` is the
@@ -175,6 +196,7 @@ jobs:
       # `--locked` makes lockfile drift a hard failure: CI must test exactly
       # the dependency set main pins, never a silent re-resolution of it.
       - name: cargo test
+        if: github.event_name != 'pull_request' || runner.os != 'Windows'
         run: cargo test -p intendant --bins -p intendant-core -p intendant-display --locked --target ${{ matrix.target }}
 
       # Headless end-to-end: the real `intendant` + `intendant-runtime`
@@ -183,4 +205,5 @@ jobs:
       # unit suite can't reach (process spawn, sandbox, tool round-trips,
       # session logging).
       - name: cargo test e2e (mock provider, headless)
+        if: github.event_name != 'pull_request' || runner.os != 'Windows'
         run: cargo test -p intendant --test e2e --locked --target ${{ matrix.target }}
