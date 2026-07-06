@@ -2693,6 +2693,9 @@ const sessionsListCache = new Map();
 const sessionsListInflight = new Map();
 const SESSION_HYDRATION_DONE_HIDE_MS = 900;
 let sessionsRecentLimit = SESSION_LIST_RECENT_LIMIT;
+// '' = this daemon; a peer host_id while browsing that peer's sessions
+// from the Sessions tab host strip.
+let sessionsActiveHostId = '';
 
 function applyGatewayConfig(config) {
   const cfg = config && typeof config === 'object' ? config : {};

@@ -139,6 +139,10 @@ pub enum UiCommand {
     SessionEnded {
         session_id: String,
         reason: String,
+        /// Structured failure class ("unfueled" → the dashboard offers an
+        /// Add-API-keys action). Absent for normal ends.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_kind: Option<String>,
     },
     DebugScreenReady {
         display_id: u64,
@@ -2363,6 +2367,7 @@ impl AppState {
             "session_ended" => {
                 let session_id = msg["session_id"].as_str().unwrap_or("").to_string();
                 let reason = msg["reason"].as_str().unwrap_or("").to_string();
+                let error_kind = msg["error_kind"].as_str().map(|s| s.to_string());
                 if current_session_event {
                     self.phase = "idle".to_string();
                     cmds.push(UiCommand::SetPhase {
@@ -2378,7 +2383,11 @@ impl AppState {
                     None,
                     "system",
                 ));
-                cmds.push(UiCommand::SessionEnded { session_id, reason });
+                cmds.push(UiCommand::SessionEnded {
+                    session_id,
+                    reason,
+                    error_kind,
+                });
             }
 
             "debug_screen_ready" => {

@@ -81,12 +81,12 @@ function isRestartingSessionReason(reason) {
   return String(reason || '').toLowerCase().includes('restarting session');
 }
 
-function onSessionEnded(sessionId, reason) {
+function onSessionEnded(sessionId, reason, errorKind) {
   const sid = String(sessionId || '').trim();
   stationCurrentTask = '';
   stationCurrentApproval = null;
   stationScheduleUpdate();
-  maybeFailRecentNewSessionSpawn(sid, reason);
+  maybeFailRecentNewSessionSpawn(sid, reason, errorKind);
   const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
   const win = sid ? sessionWindows.get(sid) : null;
   const externalSource = sid ? externalSourceForSessionWindow(sid, win) : '';

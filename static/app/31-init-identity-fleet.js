@@ -430,6 +430,18 @@ const sessionWindows = new Map();
 const recentSessionStatusPhases = new Map();
 const sessionRelationships = new Map();
 const sessionRelationshipHydrationInFlight = new Set();
+// Relationship-hydration termination (2026-07-05 CPU-storm incident):
+// every session ID that has EVER appeared in a served row (any list,
+// stream, or poll path) — hydration treats these as resolved without
+// touching `_cachedSessions`, so termination no longer depends on the
+// Sessions pane having loaded.
+const sessionRowSeenIds = new Set();
+// IDs the daemon answered "no row" for — probed at most once per page
+// load (old logs reference retired `parent`/`parent-session` placeholders,
+// and live Claude Code Task children get non-addressable `task-*` ids).
+// Cleared the moment a row for the ID arrives, so late-created sessions
+// self-heal.
+const sessionRelationshipHydrationUnresolved = new Set();
 let processingLogReplay = false;
 let logReplayAppendBatch = null;
 const sessionMetadataById = new Map();

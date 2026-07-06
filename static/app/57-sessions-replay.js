@@ -354,8 +354,12 @@ function renderSessionsList(sessions, el, options = {}) {
       card.appendChild(mediaMeta);
     }
 
-    // Actions row
-    if (sessionId || s.can_resume || s.can_delete || ((s.total_bytes > 0 || !isCurrent) && !isExternal)) {
+    // Actions row. While browsing a peer host the cards are read-only —
+    // resume/delete/config act on THIS daemon's stores and would target
+    // the wrong machine; interaction happens on the peer's own dashboard
+    // (whole-card click below).
+    if (!sessionsViewingPeer()
+        && (sessionId || s.can_resume || s.can_delete || ((s.total_bytes > 0 || !isCurrent) && !isExternal))) {
       const actions = document.createElement('div');
       actions.className = 'sc-actions';
 
@@ -456,7 +460,13 @@ function renderSessionsList(sessions, el, options = {}) {
       card.appendChild(actions);
     }
 
-    card.addEventListener('click', () => openSessionDetail(s));
+    if (sessionsViewingPeer()) {
+      card.classList.add('sc-peer');
+      card.title = 'Open this session on the peer’s dashboard';
+      card.addEventListener('click', () => openPeerSessionExternally(s));
+    } else {
+      card.addEventListener('click', () => openSessionDetail(s));
+    }
     fragment.appendChild(card);
   }
 
@@ -473,6 +483,8 @@ function renderSessionsList(sessions, el, options = {}) {
       ? 'No sessions match the selected projects'
       : hiddenSubagentCount > 0
       ? 'No main sessions found. Subagent sessions are hidden from Recent.'
+      : sessionsViewingPeer()
+      ? 'No sessions visible on this peer — it may not have granted session access.'
       : 'No sessions match the active filters';
     el.appendChild(empty);
   } else {

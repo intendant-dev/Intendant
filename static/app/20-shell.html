@@ -1095,6 +1095,7 @@
                 <span class="sessions-title">Recent Sessions</span>
                 <button class="ui-btn sessions-refresh" onclick="loadSessions()" title="Reload session list">Refresh</button>
               </div>
+              <div class="sessions-host-strip hidden" id="sessions-host-strip" role="tablist" aria-label="Session host"></div>
               <div class="sessions-toolbar">
                 <label class="sessions-search" for="sessions-search">
                   <span>Quick search</span>
@@ -1370,6 +1371,10 @@
                       <option value="direct">Direct &mdash; single agent</option>
                     </select>
                   </label>
+                </div>
+                <div id="new-session-unfueled-banner" class="sessions-unfueled-banner hidden">
+                  <span class="sessions-unfueled-text">No model credentials on this daemon &mdash; the internal agent can&rsquo;t start. External agents (Codex, Claude Code) sign in with their own accounts and still work.</span>
+                  <button type="button" class="ui-btn sessions-unfueled-add-keys" onclick="focusSettingsApiKeys()">Add API keys</button>
                 </div>
                 <details class="ui-fold sessions-new-external-fold" id="new-session-external-fold">
                   <summary>External agent options</summary>

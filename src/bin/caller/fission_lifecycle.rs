@@ -287,7 +287,9 @@ fn handle_lifecycle_event(event: &AppEvent, state: &mut LifecycleWatcherState) {
         AppEvent::Interrupted { session_id, .. } => {
             record_terminal_status(state, session_id.as_deref(), "cancelled", None);
         }
-        AppEvent::SessionEnded { session_id, reason } => {
+        AppEvent::SessionEnded {
+            session_id, reason, ..
+        } => {
             record_session_ended(state, session_id, reason);
         }
         AppEvent::FileChanged { path, .. } => {
@@ -689,6 +691,7 @@ mod tests {
             &AppEvent::SessionEnded {
                 session_id: "lw-child-fail".to_string(),
                 reason: "error: backend exploded".to_string(),
+                error_kind: None,
             },
             &mut state,
         );
@@ -707,6 +710,7 @@ mod tests {
             &AppEvent::SessionEnded {
                 session_id: "lw-child-end".to_string(),
                 reason: "session stopped".to_string(),
+                error_kind: None,
             },
             &mut state,
         );
@@ -733,6 +737,7 @@ mod tests {
             &AppEvent::SessionEnded {
                 session_id: "lw-child-keep".to_string(),
                 reason: "error: late teardown".to_string(),
+                error_kind: None,
             },
             &mut state,
         );

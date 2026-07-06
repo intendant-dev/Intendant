@@ -1205,7 +1205,7 @@ pub(crate) fn recent_intendant_log_dirs(home: &Path, limit: usize) -> Vec<PathBu
             if !path.is_dir() {
                 return None;
             }
-            let mtime = file_mtime_secs(&path.join("session.jsonl")).max(file_mtime_secs(&path));
+            let mtime = session_activity_mtime_secs(&path);
             Some((mtime, path))
         })
         .collect();

@@ -28,6 +28,19 @@ pub(crate) fn file_mtime_secs(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Last-ACTIVITY mtime for an intendant session log dir: the transcript
+/// (`session.jsonl`) when present, else the dir itself. Daemon bookkeeping
+/// (fission-ledger and meta rewrites land via `atomic_write`'s rename into
+/// the dir) bumps the DIR mtime, which made month-old sessions sort — and
+/// read — as "changed today" after every boot sweep. The transcript only
+/// moves on real appends.
+pub(crate) fn session_activity_mtime_secs(dir: &Path) -> u64 {
+    match file_mtime_secs(&dir.join("session.jsonl")) {
+        0 => file_mtime_secs(dir),
+        secs => secs,
+    }
+}
+
 pub(crate) fn metadata_mtime_secs(metadata: &std::fs::Metadata) -> u64 {
     metadata
         .modified()

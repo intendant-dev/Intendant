@@ -9,6 +9,12 @@ pub enum CallerError {
     Json(serde_json::Error),
     Http(reqwest::Error),
     Config(String),
+    /// No usable model credential anywhere: no active lease, no browser
+    /// relay, no key in the process environment or any searched `.env`.
+    /// Displays with the same "Config error:" prefix automation already
+    /// matches on; the distinct variant lets surfaces attach a
+    /// "fuel this daemon" action instead of parsing prose.
+    Unfueled(String),
     Toml(String),
     Display(String),
     WebRtc(String),
@@ -25,10 +31,23 @@ impl fmt::Display for CallerError {
             CallerError::Json(e) => write!(f, "JSON error: {}", e),
             CallerError::Http(e) => write!(f, "HTTP error: {}", e),
             CallerError::Config(msg) => write!(f, "Config error: {}", msg),
+            CallerError::Unfueled(msg) => write!(f, "Config error: {}", msg),
             CallerError::Toml(msg) => write!(f, "TOML error: {}", msg),
             CallerError::Display(msg) => write!(f, "Display error: {}", msg),
             CallerError::WebRtc(msg) => write!(f, "WebRTC error: {}", msg),
             CallerError::ExternalAgent(msg) => write!(f, "External agent error: {}", msg),
+        }
+    }
+}
+
+impl CallerError {
+    /// Structured class for session-end events (`error_kind` on
+    /// SessionEnded): lets UIs attach an action without parsing Display
+    /// prose. None for errors with no dedicated surface affordance.
+    pub fn session_end_kind(&self) -> Option<&'static str> {
+        match self {
+            CallerError::Unfueled(_) => Some("unfueled"),
+            _ => None,
         }
     }
 }
@@ -79,6 +98,14 @@ mod tests {
     fn config_error_display() {
         let err = CallerError::Config("missing key".to_string());
         assert_eq!(format!("{}", err), "Config error: missing key");
+    }
+
+    #[test]
+    fn unfueled_error_displays_as_config_error() {
+        // Automation greps stderr for the "Config error: No API key found"
+        // shape; the typed variant must not change the rendered string.
+        let err = CallerError::Unfueled("No API key found. …".to_string());
+        assert_eq!(format!("{}", err), "Config error: No API key found. …");
     }
 
     #[test]

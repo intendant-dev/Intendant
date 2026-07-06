@@ -193,6 +193,88 @@ fn provider_auth_for(env_name: &str, egress_kind: &'static str) -> Option<Provid
         })
 }
 
+/// The provider API-key environment variables — the single authoritative
+/// list. The Settings save endpoint (`POST /api/api-keys`), the key-status
+/// endpoint, the `fueled` aggregate, and the per-session project `.env`
+/// overlay all derive from it.
+pub const PROVIDER_KEY_ENV_VARS: &[&str] =
+    &["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"];
+
+/// Where the startup `.env` search actually looked, recorded once by
+/// `main()`. Under a daemon, the CLI-era "your project root" reads as the
+/// project a session was created with — which is NOT searched at startup —
+/// so credential errors name these concrete paths instead.
+#[derive(Debug, Clone, Default)]
+pub struct EnvSearchReport {
+    /// The `.env` the cwd walk-up found and loaded, if any.
+    pub cwd_env: Option<std::path::PathBuf>,
+    /// The daemon project root's `.env` and whether it loaded.
+    pub project_env: Option<(std::path::PathBuf, bool)>,
+    /// `~/.config/intendant/.env` and whether it loaded.
+    pub global_env: Option<(std::path::PathBuf, bool)>,
+}
+
+static ENV_SEARCH: std::sync::OnceLock<EnvSearchReport> = std::sync::OnceLock::new();
+
+/// Record the startup `.env` search (first call wins; later calls no-op).
+pub fn record_env_search(report: EnvSearchReport) {
+    let _ = ENV_SEARCH.set(report);
+}
+
+/// Provider API keys read from a session project's `.env` — the LAST
+/// resolution layer: credential leases, the daemon's environment, and a
+/// registered browser egress relay all win over it. Only the names in
+/// [`PROVIDER_KEY_ENV_VARS`] are honored. A project directory is
+/// agent-writable, so nothing with endpoint-shaped power (base URLs,
+/// `PROVIDER`/model selection) may load from there — a planted key bills
+/// the planter, a planted endpoint would exfiltrate conversations. Parsed
+/// per session and never written into the process environment, so
+/// concurrent sessions with different projects cannot contaminate each
+/// other.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectEnvKeys {
+    env_path: Option<std::path::PathBuf>,
+    file_present: bool,
+    keys: std::collections::HashMap<String, String>,
+}
+
+impl ProjectEnvKeys {
+    /// The empty overlay: resolution is exactly the classic
+    /// lease → environment → relay chain.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Parse `<project_root>/.env`, keeping only provider API keys.
+    pub fn load(project_root: &std::path::Path) -> Self {
+        let env_path = project_root.join(".env");
+        let mut keys = std::collections::HashMap::new();
+        let mut file_present = false;
+        if let Ok(iter) = dotenvy::from_path_iter(&env_path) {
+            file_present = true;
+            for (name, value) in iter.flatten() {
+                if PROVIDER_KEY_ENV_VARS.contains(&name.as_str()) && !value.trim().is_empty() {
+                    keys.insert(name, value);
+                }
+            }
+        }
+        Self {
+            env_path: Some(env_path),
+            file_present,
+            keys,
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<String> {
+        self.keys.get(name).cloned()
+    }
+
+    #[cfg(test)]
+    fn has_any(&self) -> bool {
+        !self.keys.is_empty()
+    }
+}
+
 /// A provider HTTP response from either path. Only the surface the
 /// provider parsers actually consume: status, text, JSON, chunk stream.
 enum ProviderHttpResponse {
@@ -3162,12 +3244,35 @@ pub(crate) fn mask_api_keys(s: &str) -> String {
 }
 
 pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
-    let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
+    select_provider_with_project_keys(&ProjectEnvKeys::none())
+}
+
+/// [`select_provider`] with the session project's `.env` joining key
+/// resolution as the last layer (see [`ProjectEnvKeys`] for what is and
+/// isn't honored from it). This is what makes "I picked this project in
+/// the dashboard and its `.env` has keys" actually work for native
+/// sessions on an otherwise unfueled daemon.
+pub fn select_provider_for_project(
+    project_root: Option<&std::path::Path>,
+) -> Result<Box<dyn ChatProvider>, CallerError> {
+    let keys = project_root
+        .map(ProjectEnvKeys::load)
+        .unwrap_or_default();
+    select_provider_with_project_keys(&keys)
+}
+
+fn select_provider_with_project_keys(
+    project_keys: &ProjectEnvKeys,
+) -> Result<Box<dyn ChatProvider>, CallerError> {
+    let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY")
+        .or_else(|| project_keys.get("OPENAI_API_KEY"));
     let anthropic_key = provider_auth_for(
         "ANTHROPIC_API_KEY",
         crate::credential_egress::KIND_ANTHROPIC,
-    );
-    let gemini_key = provider_auth_for("GEMINI_API_KEY", crate::credential_egress::KIND_GEMINI);
+    )
+    .or_else(|| project_keys.get("ANTHROPIC_API_KEY").map(ProviderAuth::Key));
+    let gemini_key = provider_auth_for("GEMINI_API_KEY", crate::credential_egress::KIND_GEMINI)
+        .or_else(|| project_keys.get("GEMINI_API_KEY").map(ProviderAuth::Key));
 
     let preferred = env::var("PROVIDER").ok();
 
@@ -3230,19 +3335,63 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
             "Unknown PROVIDER value: '{}'. Expected 'openai', 'anthropic', or 'gemini'.",
             other
         ))),
-        (None, None, _) => Err(CallerError::Config(unfueled_error_text())),
+        (None, None, _) => Err(CallerError::Unfueled(unfueled_error_text(project_keys))),
     }
 }
 
-/// The daemon is unfueled: no leased credential and no local key. When a
-/// lease recently expired, say so — "reconnect a fueling session" is the
-/// fix, not editing .env.
-fn unfueled_error_text() -> String {
-    let base = "No API key found. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY in your environment, \
-         a .env file in your project root, or ~/.config/intendant/.env for global use.";
+/// The daemon is unfueled: no leased credential, no browser relay, no
+/// local key. Name the places that were actually consulted — under a
+/// daemon, "your project root" would read as the project a session was
+/// created with, which is only consulted for the whitelisted keys in
+/// [`ProjectEnvKeys`] — and point at the remediations that work without a
+/// restart. When a lease recently expired, say so — "reconnect a fueling
+/// session" is the fix, not editing .env. The opening sentence is stable:
+/// automation greps stderr for it.
+fn unfueled_error_text(project_keys: &ProjectEnvKeys) -> String {
+    let mut text = String::from(
+        "No API key found. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY.",
+    );
+    let mut checked: Vec<String> =
+        vec!["credential leases and browser relays (none active)".to_string()];
+    if let Some(report) = ENV_SEARCH.get() {
+        match &report.cwd_env {
+            Some(path) => checked.push(format!("{} (loaded at startup)", path.display())),
+            None => checked.push("no .env found from the startup directory upward".to_string()),
+        }
+        for entry in [&report.project_env, &report.global_env] {
+            if let Some((path, loaded)) = entry {
+                // Skip duplicates: the walk-up and the project root often
+                // resolve to the same file.
+                if report.cwd_env.as_deref() == Some(path.as_path()) {
+                    continue;
+                }
+                checked.push(format!(
+                    "{} ({})",
+                    path.display(),
+                    if *loaded { "loaded at startup" } else { "missing" }
+                ));
+            }
+        }
+    }
+    if let Some(path) = &project_keys.env_path {
+        checked.push(format!(
+            "session project {} ({})",
+            path.display(),
+            if project_keys.file_present {
+                "no provider keys"
+            } else {
+                "missing"
+            }
+        ));
+    }
+    text.push_str(&format!(" Checked: {}.", checked.join("; ")));
+    text.push_str(
+        " Fix: Dashboard \u{2192} Settings \u{2192} API Keys (applies immediately, no restart), \
+         add the key to ~/.config/intendant/.env, or grant a credential lease from your vault.",
+    );
     match crate::credential_leases::expired_lease_note() {
-        Some(note) => format!("Unfueled: {note}. {base}"),
-        None => base.to_string(),
+        Some(note) => format!("Unfueled: {note}. {text}"),
+        None => text,
     }
 }
 
@@ -3709,6 +3858,61 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_env_keys_whitelists_provider_keys_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "OPENAI_API_KEY=sk-project\n\
+             PROVIDER=gemini\n\
+             OPENAI_BASE_URL=https://evil.example\n\
+             MODEL_NAME=gpt-hijack\n\
+             ANTHROPIC_API_KEY=\n",
+        )
+        .unwrap();
+        let keys = ProjectEnvKeys::load(dir.path());
+        assert_eq!(keys.get("OPENAI_API_KEY").as_deref(), Some("sk-project"));
+        // Endpoint-shaped or selection-shaped vars must never load from an
+        // agent-writable project dir.
+        assert!(keys.get("PROVIDER").is_none());
+        assert!(keys.get("OPENAI_BASE_URL").is_none());
+        assert!(keys.get("MODEL_NAME").is_none());
+        // Empty values don't count as configured.
+        assert!(keys.get("ANTHROPIC_API_KEY").is_none());
+        assert!(keys.file_present);
+    }
+
+    #[test]
+    fn project_env_keys_missing_file_is_empty_but_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ProjectEnvKeys::load(dir.path());
+        assert!(!keys.file_present);
+        assert!(!keys.has_any());
+        // The path is still recorded so the unfueled error can say
+        // "checked <project>/.env (missing)".
+        assert!(keys.env_path.as_ref().unwrap().ends_with(".env"));
+    }
+
+    #[test]
+    fn unfueled_error_text_names_session_project_env_and_remediations() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ProjectEnvKeys::load(dir.path());
+        let text = unfueled_error_text(&keys);
+        // Stable opener: automation greps stderr for it.
+        assert!(text.contains("No API key found."), "{text}");
+        assert!(text.contains("session project"), "{text}");
+        assert!(text.contains("missing"), "{text}");
+        assert!(text.contains("Settings"), "{text}");
+        assert!(text.contains("~/.config/intendant/.env"), "{text}");
+    }
+
+    #[test]
+    fn unfueled_error_text_without_project_omits_project_line() {
+        let text = unfueled_error_text(&ProjectEnvKeys::none());
+        assert!(text.contains("No API key found."), "{text}");
+        assert!(!text.contains("session project"), "{text}");
+    }
 
     #[test]
     fn openai_provider_name() {

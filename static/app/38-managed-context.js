@@ -25,7 +25,7 @@ async function ensureManagedContextSessionsLoaded() {
   if (managedContextSessionsLoadInFlight) return managedContextSessionsLoadInFlight;
   managedContextSessionsLoadInFlight = fetchSessionsForHost(selfPeerId, { force: false })
     .then(sessions => {
-      applyLoadedSessions(sessions, document.getElementById('sessions-aggregate'));
+      applyLoadedSessions(sessions, document.getElementById('sessions-aggregate'), selfPeerId);
     })
     .catch(() => {})
     .finally(() => {

@@ -329,12 +329,20 @@ directory is safe to delete; it rebuilds on the next scan.
 - **Recent** — recent sessions as calm three-line cards (title + status
   chip + source badge; task snippet; compact meta) — the long tail (ids,
   absolute dates, token breakdown, disk) lives in the meta tooltip and the
-  detail overlay. A stat-tile strip aggregates the filtered set. Lists
-  render 300 cards and grow with an explicit **Show more** control; the
-  first load shows skeleton rows while the list streams. Child sub-agent
-  sessions are hidden by default; enable **Show subagents** to include
-  them. Fork and side sessions stay visible with lineage chips that point
-  back to their parent session.
+  detail overlay. A stat-tile strip aggregates the filtered set. The list
+  retrieves the **complete** history: the stream's quick phase paints the
+  newest ~600 immediately, then the full corpus replaces it, so the tiles
+  agree with the Stats tab. Lists render 300 cards and grow with an
+  explicit **Show more** control; the first load shows skeleton rows while
+  the list streams. "Changed" timestamps and the newest-first order follow
+  **transcript activity** (`session.jsonl` mtime), not daemon bookkeeping
+  writes into the log dir. Child sub-agent sessions are hidden by default;
+  enable **Show subagents** to include them. Fork and side sessions stay
+  visible with lineage chips that point back to their parent session.
+  When a peer daemon is connected, a **host strip** appears above the
+  toolbar: pick a peer chip to browse that daemon's sessions in place
+  (read-only cards; clicking one hands off to the peer's own dashboard,
+  where the peer's own auth applies).
 - **Deep Search** — search across session history.
 - **Worktrees** — the git worktrees in use by sub-agents (same card +
   Show-more treatment).
@@ -343,7 +351,11 @@ directory is safe to delete; it rebuilds on the next scan.
   task-size heuristic decides), *Orchestrate* (delegates to supervised
   sub-agents), or *Direct* (single agent); an explicit choice beats the
   global *Direct* header toggle, and the control disables when an
-  external backend is selected.
+  external backend is selected. Internal launches also preflight the
+  daemon's **fueled** state: with no API key or vault lease, an inline
+  banner explains why the internal agent can't start (external agents
+  sign in with their own accounts and still work) and deep-links to
+  Settings → API Keys — which applies immediately, no restart.
   External Codex sessions can choose both the binary path and the
   `managed_context` mode (`vanilla` or `managed`) for that session; the
   external-agent options sit in a fold that opens when an external

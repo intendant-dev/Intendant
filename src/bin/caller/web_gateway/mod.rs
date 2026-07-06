@@ -2216,12 +2216,26 @@ mod tests {
             .unwrap();
         let mut tls = connector.connect(server_name, tcp).await.unwrap();
         tls.write_all(request.as_bytes()).await.unwrap();
+        // Read to EOF under one generous deadline. The old 2s timeout with
+        // its result discarded turned this into a load lottery: ~2.8 MB of
+        // dashboard over local TLS can exceed 2s on a busy CI box, and the
+        // caller then trips the body-truncation assertion (the dell flake
+        // tax). Both callers expect complete responses terminated by the
+        // server closing the connection, so read_to_end is the right shape
+        // — the deadline only bounds a hung server.
         let mut response = Vec::new();
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
+        if tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
             tls.read_to_end(&mut response),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            eprintln!(
+                "https_request: read timed out after 30s with {} bytes buffered",
+                response.len()
+            );
+        }
         String::from_utf8_lossy(&response).into_owned()
     }
 

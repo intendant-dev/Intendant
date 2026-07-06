@@ -858,6 +858,7 @@ mod tests {
                 serde_json::to_string(&crate::types::OutboundEvent::SessionEnded {
                     session_id: "s-fold".into(),
                     reason: "done".into(),
+                    error_kind: None,
                 })
                 .unwrap(),
             )

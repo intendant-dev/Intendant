@@ -341,6 +341,7 @@ mod tests {
         let _ = rail.on_event(&AppEvent::SessionEnded {
             session_id: "s1".into(),
             reason: "done".into(),
+            error_kind: None,
         });
         assert!(rail.sessions.is_empty());
     }

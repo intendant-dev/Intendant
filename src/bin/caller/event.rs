@@ -339,6 +339,10 @@ pub enum AppEvent {
     SessionEnded {
         session_id: String,
         reason: String,
+        /// Structured failure class the UI can act on without parsing
+        /// prose (e.g. "unfueled" → an Add-API-keys action). None for
+        /// normal ends and unclassified errors.
+        error_kind: Option<String>,
     },
     DebugScreenReady {
         display_id: u32,
@@ -2026,9 +2030,14 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             source: source.clone(),
         }),
-        AppEvent::SessionEnded { session_id, reason } => Some(OutboundEvent::SessionEnded {
+        AppEvent::SessionEnded {
+            session_id,
+            reason,
+            error_kind,
+        } => Some(OutboundEvent::SessionEnded {
             session_id: session_id.clone(),
             reason: reason.clone(),
+            error_kind: error_kind.clone(),
         }),
         AppEvent::DebugScreenReady { display_id } => Some(OutboundEvent::DebugScreenReady {
             display_id: *display_id,
@@ -2773,7 +2782,9 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         AppEvent::SessionAttached { session_id, source } => {
             log.session_attached(session_id, source);
         }
-        AppEvent::SessionEnded { session_id, reason } => {
+        AppEvent::SessionEnded {
+            session_id, reason, ..
+        } => {
             log.session_ended(session_id, reason);
         }
         AppEvent::SafetyCapReached => {

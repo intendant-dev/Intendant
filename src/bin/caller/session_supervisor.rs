@@ -2204,7 +2204,12 @@ impl SessionSupervisor {
                     .provider_factory
                     .as_ref()
                     .map(|factory| Ok(factory()))
-                    .unwrap_or_else(provider::select_provider)
+                    .unwrap_or_else(|| {
+                        // The session project's .env joins key resolution as
+                        // the last layer (whitelisted key names only — see
+                        // provider::ProjectEnvKeys).
+                        provider::select_provider_for_project(Some(&project.root))
+                    })
                 {
                     Ok(provider) => provider,
                     Err(e) => {
@@ -3204,6 +3209,7 @@ impl SessionSupervisor {
         self.config.bus.send(AppEvent::SessionEnded {
             session_id: canonical.clone(),
             reason: reason.to_string(),
+            error_kind: None,
         });
         Some(StoppedManagedSession {
             session_id: canonical,
@@ -4245,6 +4251,11 @@ impl SessionSupervisor {
                 format!("error: {}", e)
             }
         };
+        let error_kind = result
+            .as_ref()
+            .err()
+            .and_then(|e| e.session_end_kind())
+            .map(str::to_string);
 
         let (ended_session_id, orphaned_children) = {
             let mut state = self.state.lock().await;
@@ -4287,6 +4298,7 @@ impl SessionSupervisor {
             self.config.bus.send(AppEvent::SessionEnded {
                 session_id: ended_session_id.clone(),
                 reason,
+                error_kind,
             });
         }
 
@@ -5839,6 +5851,7 @@ mod tests {
             .observe_lifecycle_event(&AppEvent::SessionEnded {
                 session_id: "wrapper".to_string(),
                 reason: "Process stdout closed".to_string(),
+                error_kind: None,
             })
             .await;
 
@@ -6114,8 +6127,9 @@ mod tests {
                 {
                     saw_stop_request = true;
                 }
-                AppEvent::SessionEnded { session_id, reason }
-                    if session_id == "parent-thread" && reason == "stopped by user" =>
+                AppEvent::SessionEnded {
+                    session_id, reason, ..
+                } if session_id == "parent-thread" && reason == "stopped by user" =>
                 {
                     saw_session_ended = true;
                 }

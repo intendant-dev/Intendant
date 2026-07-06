@@ -818,6 +818,7 @@ pub fn spawn_event_listener(
                     AppEvent::SessionEnded {
                         ref session_id,
                         ref reason,
+                        ..
                     } => {
                         s.note_session_ended(session_id);
                         s.push_log(
@@ -3530,6 +3531,7 @@ mod tests {
                     &AppEvent::SessionEnded {
                         session_id: "codex-thread".to_string(),
                         reason: "Process stdout closed".to_string(),
+                        error_kind: None,
                     },
                 );
             }
