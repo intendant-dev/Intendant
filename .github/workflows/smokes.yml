@@ -88,21 +88,19 @@ jobs:
       # Doc-only diffs don't need a release build + smoke rigs. Same in-job
       # relevance detection as windows.yml (a paths: filter on a required
       # workflow blocks queue entry; an in-job skip still reports green).
+      # Pure git — the fleet boxes have no gh CLI; this matrix is
+      # unix-only so one bash step suffices.
       - name: Detect CI-relevant changes
         id: relevance
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="${{ github.event.pull_request.base.sha }}"
-            head="${{ github.event.pull_request.head.sha }}"
           else
             base="${{ github.event.merge_group.base_sha }}"
-            head="${{ github.event.merge_group.head_sha }}"
           fi
-          files=$(gh api "repos/${{ github.repository }}/compare/$base...$head" --paginate --jq '.files[].filename')
+          git fetch --quiet --depth=1 origin "$base"
           relevant=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
@@ -110,7 +108,7 @@ jobs:
               docs/*|*.md|LICENSE|.gitignore) ;;
               *) relevant=true; break ;;
             esac
-          done <<< "$files"
+          done < <(git diff --name-only "$base" HEAD)
           echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
           echo "CI-relevant change detected: $relevant"
 

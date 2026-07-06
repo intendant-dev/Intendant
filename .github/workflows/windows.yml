@@ -123,23 +123,22 @@ jobs:
       # `paths:` filter on a required workflow would block queue entry
       # instead (verified live on this repo's first docs-only PR). The
       # safe-list is deliberately tiny and inverted: anything not clearly
-      # documentation counts as CI-relevant. The compare API works for both
-      # pull_request and merge_group without deepening the checkout.
-      - name: Detect CI-relevant changes
-        id: relevance
-        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+      # documentation counts as CI-relevant. Pure git against the checkout
+      # (fetch the base at depth 1, two-dot diff): the fleet boxes have no
+      # gh CLI and the Windows box resolves no `bash`, so the step exists
+      # per shell and later steps AND the two outputs together (a skipped
+      # step's output is empty, which passes the != 'false' tests).
+      - name: Detect CI-relevant changes (unix)
+        id: relevance_unix
+        if: runner.os != 'Windows' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="${{ github.event.pull_request.base.sha }}"
-            head="${{ github.event.pull_request.head.sha }}"
           else
             base="${{ github.event.merge_group.base_sha }}"
-            head="${{ github.event.merge_group.head_sha }}"
           fi
-          files=$(gh api "repos/${{ github.repository }}/compare/$base...$head" --paginate --jq '.files[].filename')
+          git fetch --quiet --depth=1 origin "$base"
           relevant=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
@@ -147,9 +146,30 @@ jobs:
               docs/*|*.md|LICENSE|.gitignore) ;;
               *) relevant=true; break ;;
             esac
-          done <<< "$files"
+          done < <(git diff --name-only "$base" HEAD)
           echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
           echo "CI-relevant change detected: $relevant"
+
+      - name: Detect CI-relevant changes (windows)
+        id: relevance_win
+        if: runner.os == 'Windows' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+        shell: pwsh
+        run: |
+          $base = if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+            '${{ github.event.pull_request.base.sha }}'
+          } else {
+            '${{ github.event.merge_group.base_sha }}'
+          }
+          git fetch --quiet --depth=1 origin $base
+          $files = git diff --name-only $base HEAD
+          $relevant = 'false'
+          foreach ($f in $files) {
+            if (-not $f) { continue }
+            if ($f -like 'docs/*' -or $f -like '*.md' -or $f -eq 'LICENSE' -or $f -eq '.gitignore') { continue }
+            $relevant = 'true'; break
+          }
+          "relevant=$relevant" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Output "CI-relevant change detected: $relevant"
 
       # `ring` (our TLS provider — aws-lc-rs is deliberately disabled) builds
       # its x86_64 perlasm assembly with NASM on the MSVC target. Hosted-only,
@@ -216,7 +236,7 @@ jobs:
       # merge_group before anything lands. Linux/macOS stay full on PRs:
       # they're fast and keep pre-queue runtime signal.
       - name: cargo check (Windows pull_request fast path)
-        if: github.event_name == 'pull_request' && runner.os == 'Windows' && steps.relevance.outputs.relevant != 'false'
+        if: github.event_name == 'pull_request' && runner.os == 'Windows' && steps.relevance_win.outputs.relevant != 'false'
         run: cargo check -p intendant --bins -p intendant-core -p intendant-display --locked --target ${{ matrix.target }}
 
       # Build and run the unit tests of the whole `intendant` package — both
@@ -229,7 +249,7 @@ jobs:
       # `--locked` makes lockfile drift a hard failure: CI must test exactly
       # the dependency set main pins, never a silent re-resolution of it.
       - name: cargo test
-        if: (github.event_name != 'pull_request' || runner.os != 'Windows') && steps.relevance.outputs.relevant != 'false'
+        if: (github.event_name != 'pull_request' || runner.os != 'Windows') && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: cargo test -p intendant --bins -p intendant-core -p intendant-display --locked --target ${{ matrix.target }}
 
       # Headless end-to-end: the real `intendant` + `intendant-runtime`
@@ -238,5 +258,5 @@ jobs:
       # unit suite can't reach (process spawn, sandbox, tool round-trips,
       # session logging).
       - name: cargo test e2e (mock provider, headless)
-        if: (github.event_name != 'pull_request' || runner.os != 'Windows') && steps.relevance.outputs.relevant != 'false'
+        if: (github.event_name != 'pull_request' || runner.os != 'Windows') && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: cargo test -p intendant --test e2e --locked --target ${{ matrix.target }}
