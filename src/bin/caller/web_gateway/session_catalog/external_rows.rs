@@ -808,7 +808,6 @@ pub(crate) fn session_relationships_from_log_dir(session_dir: &Path) -> Vec<serd
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
     fn recording_playlist_m3u8_formats_segments_for_hls() {

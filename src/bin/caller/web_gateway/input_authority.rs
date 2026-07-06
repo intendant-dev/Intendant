@@ -1105,7 +1105,6 @@ pub(crate) fn compute_bootstrap_authority_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
     use crate::web_gateway::tests::{seed_holder};
 
     // ---------------------------------------------------------------

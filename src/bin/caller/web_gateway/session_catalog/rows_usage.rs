@@ -807,7 +807,6 @@ pub(crate) fn codex_daily_usage_with_baseline(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
     fn external_session_json_falls_back_to_created_at_for_updated_at() {

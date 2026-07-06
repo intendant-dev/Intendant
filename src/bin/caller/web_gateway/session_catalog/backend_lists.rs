@@ -943,7 +943,6 @@ pub(crate) fn external_session_detail_from_home_with_page(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
     fn list_codex_sessions_uses_first_real_user_message() {

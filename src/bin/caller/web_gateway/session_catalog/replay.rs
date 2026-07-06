@@ -1354,7 +1354,6 @@ pub(crate) fn external_session_newer_than_wrapper(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
     fn test_scan_replay_status_extracts_provider_model_autonomy() {

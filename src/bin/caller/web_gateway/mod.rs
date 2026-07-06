@@ -368,13 +368,6 @@ async fn handle_diagnostics_visual_freshness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::OutboundEvent;
-    use tokio::io::AsyncWriteExt;
-
-    // Crate-wide (not module-local): tests in other modules mutate the same
-    // process environment, so a per-module lock would still race them.
-    use crate::test_support::TEST_ENV_LOCK;
-
 
     pub(crate) struct EnvVarGuard {
         key: &'static str,

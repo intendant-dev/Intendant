@@ -811,7 +811,6 @@ pub(crate) fn file_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use crate::web_gateway::session_catalog::rows_usage::tests::total_usage;
 
     fn persisted_test_key(extra: &str) -> SessionListCacheKey {

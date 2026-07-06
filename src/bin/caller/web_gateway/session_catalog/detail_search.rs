@@ -1016,7 +1016,6 @@ pub(crate) fn session_log_match_snippet(text: &str, terms: &[String], max_chars:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
     fn session_log_search_finds_intendant_log_content_not_summary() {

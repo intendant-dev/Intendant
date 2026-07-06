@@ -1377,7 +1377,6 @@ pub(crate) fn session_ended_id_from_wire(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
     fn external_transcript_cache_invalidates_when_source_file_changes() {
