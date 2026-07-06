@@ -4583,6 +4583,39 @@ pub fn spawn_web_gateway(
                             RouteHandlerId::AccessIamState => {
                                 return handle_access_iam_state(stream, fleet_cors_origin).await;
                             }
+                            RouteHandlerId::AccessConnectStatus => {
+                                return handle_access_connect_status(stream, fleet_cors_origin)
+                                    .await;
+                            }
+                            RouteHandlerId::AccessConnectClaimCode => {
+                                return handle_access_connect_claim_code(
+                                    stream,
+                                    http_access_context,
+                                    fleet_cors_origin,
+                                )
+                                .await;
+                            }
+                            RouteHandlerId::AccessConnectConfig => {
+                                return handle_access_connect_config(
+                                    stream,
+                                    route_body,
+                                    req_method,
+                                    http_access_context,
+                                    project_root.clone(),
+                                    fleet_cors_origin,
+                                )
+                                .await;
+                            }
+                            RouteHandlerId::AccessConnectUnclaim => {
+                                return handle_access_connect_unclaim(
+                                    stream,
+                                    req_method,
+                                    http_access_context,
+                                    project_root.clone(),
+                                    fleet_cors_origin,
+                                )
+                                .await;
+                            }
                             RouteHandlerId::AccessOverview => {
                                 return handle_access_overview(
                                     stream,

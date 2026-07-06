@@ -423,6 +423,243 @@ pub(crate) async fn handle_access_iam_state(
     finalize_http_stream(&mut stream).await;
 }
 
+/// Connect status for the Access card — inspect-grade. Everything EXCEPT
+/// the claim phrase/URL: those are manage-gated on their own route
+/// (`/api/access/connect/claim-code`), so this response only says whether
+/// a code exists and when it expires.
+pub(crate) fn access_connect_status_response_value() -> serde_json::Value {
+    let status = crate::connect_rendezvous::status_snapshot();
+    serde_json::json!({
+        "schema_version": 1,
+        "configured": status.configured,
+        "env_forced": status.env_forced,
+        "rendezvous_url": status.rendezvous_url,
+        "daemon_id": status.daemon_id,
+        "running": status.running,
+        "registered": status.registered,
+        "last_register_unix_ms": status.last_register_unix_ms,
+        "last_error": status.last_error,
+        "claimed": status.claimed,
+        "claimed_by_user_id": status.claimed_by_user_id,
+        "claimed_by_handle": status.claimed_by_handle,
+        "claim_binding": status.claim_binding,
+        "signed_claim": status.signed_claim,
+        "claim_code_available": status.claim_code.is_some(),
+        "claim_code_expires_unix_ms": status.claim_code_expires_unix_ms,
+        "default_rendezvous_url": crate::project::DEFAULT_CONNECT_RENDEZVOUS_URL,
+    })
+}
+
+pub(crate) async fn handle_access_connect_status(
+    mut stream: DemuxStream,
+    fleet_cors_origin: Option<String>,
+) {
+    use tokio::io::AsyncWriteExt;
+    let body = access_connect_status_response_value().to_string();
+    let response = with_fleet_cors(json_response("200 OK", body), fleet_cors_origin.as_deref());
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+pub(crate) fn access_connect_claim_code_response_value() -> serde_json::Value {
+    let status = crate::connect_rendezvous::status_snapshot();
+    serde_json::json!({
+        "schema_version": 1,
+        "claimed": status.claimed,
+        "claim_code": status.claim_code,
+        "claim_url": status.claim_url,
+        "claim_code_expires_unix_ms": status.claim_code_expires_unix_ms,
+    })
+}
+
+pub(crate) async fn handle_access_connect_claim_code(
+    mut stream: DemuxStream,
+    http_access_context: HttpAccessContext,
+    fleet_cors_origin: Option<String>,
+) {
+    use tokio::io::AsyncWriteExt;
+    // Belt and suspenders on the one secret-bearing response: the
+    // pre-dispatch gate already enforced AccessManage from the route
+    // row; re-verify so a dispatch refactor can't quietly downgrade the
+    // claim phrase to inspect-grade.
+    let decision =
+        http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+    if !decision.allowed {
+        let response = json_response(
+            "403 Forbidden",
+            serde_json::json!({
+                "error": "principal does not allow this operation",
+                "principal": http_access_context.principal.as_value(),
+                "permission": decision.permission,
+                "reason": decision.reason,
+            })
+            .to_string(),
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    } else {
+        let body = access_connect_claim_code_response_value().to_string();
+        let response =
+            with_fleet_cors(json_response("200 OK", body), fleet_cors_origin.as_deref());
+        let _ = stream.write_all(response.as_bytes()).await;
+    }
+    finalize_http_stream(&mut stream).await;
+}
+
+/// Enable/disable the Connect client: persist `[connect]` to
+/// intendant.toml, then apply the effective config to the running client
+/// (start/stop live). The environment override always wins over the
+/// file, so the response reports both what was written and what is
+/// actually in effect.
+pub(crate) fn access_connect_config_response_value(
+    params: serde_json::Value,
+    project_root: Option<&std::path::Path>,
+) -> Result<serde_json::Value, String> {
+    let enabled = params
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| "enabled must be true or false".to_string())?;
+    let rendezvous_url = params
+        .get("rendezvous_url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let root = project_root.ok_or_else(|| "no project root for this daemon".to_string())?;
+    let mut project = crate::project::Project::from_root(root.to_path_buf())
+        .map_err(|e| format!("load project config: {e}"))?;
+    project.config.connect.enabled = enabled;
+    if let Some(url) = rendezvous_url {
+        project.config.connect.rendezvous_url = Some(url);
+    }
+    project
+        .save_config()
+        .map_err(|e| format!("write intendant.toml: {e}"))?;
+    let effective = project.config.connect.clone().effective_with_env();
+    let running = crate::connect_rendezvous::apply_config(effective.clone())?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "written_enabled": enabled,
+        "enabled": effective.enabled,
+        "env_forced": crate::project::ConnectConfig::env_forced(),
+        "rendezvous_url": effective.rendezvous_url,
+        "running": running,
+    }))
+}
+
+pub(crate) async fn handle_access_connect_config(
+    mut stream: DemuxStream,
+    body_text: String,
+    req_method: &str,
+    http_access_context: HttpAccessContext,
+    project_root: Option<std::path::PathBuf>,
+    fleet_cors_origin: Option<String>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if req_method != "POST" {
+        let response = json_response(
+            "405 Method Not Allowed",
+            serde_json::json!({"error": "method not allowed"}).to_string(),
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    } else {
+        let decision =
+            http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+        if !decision.allowed {
+            let response = json_response(
+                "403 Forbidden",
+                serde_json::json!({
+                    "error": "principal does not allow this operation",
+                    "principal": http_access_context.principal.as_value(),
+                    "permission": decision.permission,
+                    "reason": decision.reason,
+                })
+                .to_string(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        } else {
+            let (status, body) = match serde_json::from_str::<serde_json::Value>(&body_text)
+                .map_err(|e| format!("invalid request body: {e}"))
+                .and_then(|params| {
+                    access_connect_config_response_value(params, project_root.as_deref())
+                }) {
+                Ok(value) => (200, value.to_string()),
+                Err(error) => (400, serde_json::json!({"error": error}).to_string()),
+            };
+            let response = with_fleet_cors(
+                json_response(status_reason(status), body),
+                fleet_cors_origin.as_deref(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    }
+    finalize_http_stream(&mut stream).await;
+}
+
+pub(crate) async fn handle_access_connect_unclaim(
+    mut stream: DemuxStream,
+    req_method: &str,
+    http_access_context: HttpAccessContext,
+    project_root: Option<std::path::PathBuf>,
+    fleet_cors_origin: Option<String>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if req_method != "POST" {
+        let response = json_response(
+            "405 Method Not Allowed",
+            serde_json::json!({"error": "method not allowed"}).to_string(),
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    } else {
+        let decision =
+            http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+        if !decision.allowed {
+            let response = json_response(
+                "403 Forbidden",
+                serde_json::json!({
+                    "error": "principal does not allow this operation",
+                    "principal": http_access_context.principal.as_value(),
+                    "permission": decision.permission,
+                    "reason": decision.reason,
+                })
+                .to_string(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        } else {
+            let result = async {
+                let root = project_root
+                    .as_deref()
+                    .ok_or_else(|| "no project root for this daemon".to_string())?;
+                let project = crate::project::Project::from_root(root.to_path_buf())
+                    .map_err(|e| format!("load project config: {e}"))?;
+                let mut config = project.config.connect.clone().effective_with_env();
+                if config.rendezvous_url.is_none() {
+                    // Enabled-by-dashboard-then-restarted edge: fall back
+                    // to whatever rendezvous the running client used.
+                    config.rendezvous_url =
+                        crate::connect_rendezvous::status_snapshot().rendezvous_url;
+                }
+                let changed = crate::connect_rendezvous::request_unclaim(&config).await?;
+                Ok::<serde_json::Value, String>(serde_json::json!({
+                    "schema_version": 1,
+                    "released": true,
+                    "changed": changed,
+                }))
+            }
+            .await;
+            let (status, body) = match result {
+                Ok(value) => (200, value.to_string()),
+                Err(error) => (400, serde_json::json!({"error": error}).to_string()),
+            };
+            let response = with_fleet_cors(
+                json_response(status_reason(status), body),
+                fleet_cors_origin.as_deref(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    }
+    finalize_http_stream(&mut stream).await;
+}
+
 pub(crate) async fn handle_access_overview(
     mut stream: DemuxStream,
     http_access_context: HttpAccessContext,
@@ -966,6 +1203,10 @@ pub(crate) fn is_fleet_cors_access_path(req_path: &str) -> bool {
             | "/api/access/iam/grants/update"
             | "/api/access/orgs/trust"
             | "/api/access/orgs/revoke"
+            | "/api/access/connect/status"
+            | "/api/access/connect/claim-code"
+            | "/api/access/connect/config"
+            | "/api/access/connect/unclaim"
     )
 }
 

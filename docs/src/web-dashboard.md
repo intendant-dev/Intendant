@@ -1920,6 +1920,10 @@ its operation per method/path from `federation_http_operation`.
 | GET | `/api/access/enrollment-requests` | AccessInspect | fleet allowlist | none | Pending enrollment requests |
 | GET | `/api/access/iam/state` | AccessInspect | fleet allowlist | none | Local IAM state (roles, grants, bindings) |
 | GET | `/api/access/overview` | AccessInspect | fleet allowlist | none | Access overview for the calling principal |
+| GET | `/api/access/connect/status` | AccessInspect | fleet allowlist | none | Connect rendezvous status (claim state, binding provenance; no claim phrase) |
+| GET | `/api/access/connect/claim-code` | AccessManage | fleet allowlist | none | Reveal the current twelve-word claim phrase (unclaimed daemons only) |
+| POST | `/api/access/connect/config` | AccessManage | fleet allowlist | bounded | Enable/disable the Connect client (persists to intendant.toml, applies live) |
+| POST | `/api/access/connect/unclaim` | AccessManage | fleet allowlist | bounded | Release this daemon's claim binding at the rendezvous (daemon-signed) |
 | GET | `/api/dashboard/targets` | AccessInspect | own origin | none | Dashboard target list (this daemon + connected peers) |
 | any | `/api/peers[/…]` | federation (per method/path) | own origin | bounded | Peer registry (list/add/remove), pairing (invite/join/requests/identities), eligibility, and per-peer quick controls + signaling relays |
 | POST | `/api/coordinator/route` | federation (per method/path) | own origin | bounded | Capability-based task routing through the Coordinator |

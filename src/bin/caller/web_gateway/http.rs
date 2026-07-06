@@ -931,6 +931,10 @@ mod tests {
             "/api/access/enrollment-requests/decide",
             "/api/access/iam/user-client-grants",
             "/api/access/iam/grants/update",
+            "/api/access/connect/status",
+            "/api/access/connect/claim-code",
+            "/api/access/connect/config",
+            "/api/access/connect/unclaim",
         ] {
             assert!(is_fleet_cors_access_path(path), "{path}");
         }
