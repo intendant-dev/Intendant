@@ -65,15 +65,18 @@ jobs:
       fail-fast: false
       matrix:
         # `os` is the pinned check-name key and the fork-PR hosted label;
-        # `runner` is the self-hosted fleet placement. Provisioning steps
-        # gate on runner.environment. See windows.yml for the full
-        # rationale.
+        # `runner` is the self-hosted fleet placement. The smokes pin to the
+        # dedicated intendant-smokes-* labels (one runner instance per box
+        # carries them): the drivers bind fixed ports, so two smokes jobs
+        # must never run concurrently on one machine, while the test jobs
+        # are free to land on any instance. Provisioning steps gate on
+        # runner.environment. See windows.yml for the full rationale.
         include:
           - os: ubuntu-latest
-            runner: [self-hosted, intendant-linux]
+            runner: [self-hosted, intendant-smokes-linux]
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
-            runner: [self-hosted, intendant-macos]
+            runner: [self-hosted, intendant-smokes-macos]
             target: aarch64-apple-darwin
 
     steps:
@@ -81,6 +84,35 @@ jobs:
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
+
+      # Doc-only diffs don't need a release build + smoke rigs. Same in-job
+      # relevance detection as windows.yml (a paths: filter on a required
+      # workflow blocks queue entry; an in-job skip still reports green).
+      - name: Detect CI-relevant changes
+        id: relevance
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.merge_group.base_sha }}"
+            head="${{ github.event.merge_group.head_sha }}"
+          fi
+          files=$(gh api "repos/${{ github.repository }}/compare/$base...$head" --paginate --jq '.files[].filename')
+          relevant=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              docs/*|*.md|LICENSE|.gitignore) ;;
+              *) relevant=true; break ;;
+            esac
+          done <<< "$files"
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "CI-relevant change detected: $relevant"
 
       # Same native build deps as windows.yml's test job — the release
       # build compiles the identical dependency set. Hosted-only: the
@@ -119,13 +151,17 @@ jobs:
       # The smokes run the real release binaries — the same artifacts a
       # dev box's landing lap exercises. `--locked` mirrors windows.yml.
       - name: cargo build --release
+        if: steps.relevance.outputs.relevant != 'false'
         run: cargo build --release -p intendant --bins --locked
 
       - name: session-vitals smoke
+        if: steps.relevance.outputs.relevant != 'false'
         run: node tests/skills/session-vitals-smoke/driver.cjs "$GITHUB_WORKSPACE/target/release/intendant"
 
       - name: native-goal smoke
+        if: steps.relevance.outputs.relevant != 'false'
         run: node tests/skills/native-goal-smoke/driver.cjs "$GITHUB_WORKSPACE/target/release/intendant"
 
       - name: peer-sessions smoke
+        if: steps.relevance.outputs.relevant != 'false'
         run: python3 tests/skills/peer-sessions-smoke/peer-rig.py

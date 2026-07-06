@@ -118,6 +118,39 @@ jobs:
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
+      # Doc-only diffs don't need a 13-minute build. Detect relevance INSIDE
+      # the job so the required check still runs and reports green — a
+      # `paths:` filter on a required workflow would block queue entry
+      # instead (verified live on this repo's first docs-only PR). The
+      # safe-list is deliberately tiny and inverted: anything not clearly
+      # documentation counts as CI-relevant. The compare API works for both
+      # pull_request and merge_group without deepening the checkout.
+      - name: Detect CI-relevant changes
+        id: relevance
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.merge_group.base_sha }}"
+            head="${{ github.event.merge_group.head_sha }}"
+          fi
+          files=$(gh api "repos/${{ github.repository }}/compare/$base...$head" --paginate --jq '.files[].filename')
+          relevant=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              docs/*|*.md|LICENSE|.gitignore) ;;
+              *) relevant=true; break ;;
+            esac
+          done <<< "$files"
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "CI-relevant change detected: $relevant"
+
       # `ring` (our TLS provider — aws-lc-rs is deliberately disabled) builds
       # its x86_64 perlasm assembly with NASM on the MSVC target. Hosted-only,
       # like the other provisioning steps: the self-hosted Windows box has
@@ -183,7 +216,7 @@ jobs:
       # merge_group before anything lands. Linux/macOS stay full on PRs:
       # they're fast and keep pre-queue runtime signal.
       - name: cargo check (Windows pull_request fast path)
-        if: github.event_name == 'pull_request' && runner.os == 'Windows'
+        if: github.event_name == 'pull_request' && runner.os == 'Windows' && steps.relevance.outputs.relevant != 'false'
         run: cargo check -p intendant --bins -p intendant-core -p intendant-display --locked --target ${{ matrix.target }}
 
       # Build and run the unit tests of the whole `intendant` package — both
@@ -196,7 +229,7 @@ jobs:
       # `--locked` makes lockfile drift a hard failure: CI must test exactly
       # the dependency set main pins, never a silent re-resolution of it.
       - name: cargo test
-        if: github.event_name != 'pull_request' || runner.os != 'Windows'
+        if: (github.event_name != 'pull_request' || runner.os != 'Windows') && steps.relevance.outputs.relevant != 'false'
         run: cargo test -p intendant --bins -p intendant-core -p intendant-display --locked --target ${{ matrix.target }}
 
       # Headless end-to-end: the real `intendant` + `intendant-runtime`
@@ -205,5 +238,5 @@ jobs:
       # unit suite can't reach (process spawn, sandbox, tool round-trips,
       # session logging).
       - name: cargo test e2e (mock provider, headless)
-        if: github.event_name != 'pull_request' || runner.os != 'Windows'
+        if: (github.event_name != 'pull_request' || runner.os != 'Windows') && steps.relevance.outputs.relevant != 'false'
         run: cargo test -p intendant --test e2e --locked --target ${{ matrix.target }}
