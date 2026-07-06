@@ -48,6 +48,7 @@ pub(crate) async fn run_daemon_loop(config: DaemonConfig) {
         flags_direct: config.flags_direct,
         shared_session: config.shared_session,
         provider_factory: None,
+        logs_home_override: None,
     })
     .run()
     .await;
@@ -183,6 +184,7 @@ pub(crate) async fn run_daemon(
             flags_direct: flags.direct,
             shared_session: Some(shared_session),
             provider_factory: None,
+            logs_home_override: None,
         })
         .spawn();
     // --continue/--resume under the daemon: the supervisor (subscribed
