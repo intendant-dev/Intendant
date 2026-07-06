@@ -190,11 +190,10 @@ pub fn discover_skills(project_root: Option<&Path>) -> Vec<Skill> {
     discover_skills_in(project_root, dirs::home_dir().as_deref())
 }
 
-/// Testable core of [`discover_skills`]: the personal-skill home is
-/// injected rather than read from the environment, so tests never scan the
-/// real `~/.agents/skills`. A dev or CI home with legitimate personal
-/// skills (the macOS runner shares its home with a dev user) must not
-/// change what project-scoped tests observe.
+/// Home-injectable core of [`discover_skills`]. Tests pin `home` (usually
+/// to `None` or a temp dir) so personal skills on the running machine leak
+/// into no assertion — the self-hosted CI runners share a real `$HOME`
+/// that legitimately contains `~/.agents/skills/`.
 fn discover_skills_in(project_root: Option<&Path>, home: Option<&Path>) -> Vec<Skill> {
     let mut skills = Vec::new();
     let mut seen_names = std::collections::HashSet::new();

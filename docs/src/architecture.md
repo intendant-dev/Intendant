@@ -177,7 +177,7 @@ In brief:
   launches, and tasks arrive over WebSocket/control-socket.
 - **Not yet built:** there is no recurring/scheduled-task facility. The only
   scheduling primitive is the one-shot `ScheduleControllerRestart`
-  (`event.rs` / `mcp.rs`).
+  (`event.rs` / `mcp/`).
 
 ## How It Works (Direct Mode loop)
 

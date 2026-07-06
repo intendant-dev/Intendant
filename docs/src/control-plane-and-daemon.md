@@ -283,7 +283,7 @@ Be precise about this: **Intendant has no recurring / scheduled-task facility.**
 There is no cron, no "run every N minutes", no calendar of future tasks.
 
 The *only* scheduling primitive is the one-shot `ScheduleControllerRestart`
-(`event.rs` / `mcp.rs`): it schedules a single controller restart after an
+(`event.rs` / `mcp/`): it schedules a single controller restart after an
 optional delay, carrying a north-star goal and handoff summary across the
 restart boundary. It is a continuity mechanism for long-running work, not a task
 scheduler. Treat any documentation or assumption that implies recurring jobs as
