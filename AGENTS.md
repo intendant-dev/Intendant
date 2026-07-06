@@ -58,7 +58,9 @@ Read the relevant chapter before changing a subsystem:
 cargo build --release     # → target/release/{intendant-runtime, intendant}
 cargo build               # debug
 cargo check               # type-check only
-cargo test --bins         # unit tests (fast, no API keys)
+cargo test --bins         # unit tests (no API keys; what CI runs)
+cargo nextest run --bins  # same tests, much faster: one process per test
+                          # (needs cargo-nextest; config in .config/nextest.toml)
 cargo clippy              # lint
 ```
 
