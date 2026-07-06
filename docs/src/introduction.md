@@ -26,7 +26,7 @@ Intendant is built around a few core ideas:
 
 **A single-writer control plane.** Shared mutable state (autonomy level, the active agent backend, runtime config) has exactly one writer: the control plane. Frontends are *display-only* — they render state and emit intents, but never mutate state directly. See [Control Plane & Daemon](./control-plane-and-daemon.md).
 
-**Shared frontend vocabulary.** Frontends exchange state and intents through `AppEvent` and `ControlMsg`: the web dashboard, MCP server, and control socket render events and submit control messages to the single-writer control plane. The MCP surface also maps approval/input tools to `UserAction`. See [Architecture](./architecture.md) and [Autonomy & Approvals](./autonomy.md).
+**Shared frontend vocabulary.** Frontends exchange state and intents through `AppEvent` and `ControlMsg`: the web dashboard, MCP server, and control socket render events and submit control messages to the single-writer control plane. See [Architecture](./architecture.md) and [Autonomy & Approvals](./autonomy.md).
 
 **Presence as a separate AI.** Rather than a chat wrapper, the presence layer is an independent (usually fast) model with its own conversation, tools, and state awareness. It mediates between the user and the working agent, turning intent into tasks and narrating progress back. See [Presence Layer](./presence.md).
 

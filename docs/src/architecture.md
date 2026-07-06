@@ -239,9 +239,10 @@ delegate it. Verified against `main.rs`:
 `ControlMsg` and `AppEvent` are the shared vocabulary across frontends. The
 web dashboard, MCP server, and control socket render `AppEvent` state and send
 `ControlMsg` intents through the EventBus; the control plane and session
-supervisor are the state writers. The MCP surface additionally maps its
-approval/input tools to `UserAction` and serializes some resource snapshots via
-`StateResult` — `UserAction` is MCP-only vocabulary today.
+supervisor are the state writers. The MCP surface serializes some resource
+snapshots via `StateResult` (`frontend.rs`); its approval/input tools apply
+the same state helpers as the matching `ControlMsg` arms (the former
+`UserAction` middle-man enum is retired).
 
 There is no single compile-time exhaustiveness guarantee across all frontends.
 Rust exhaustive matching protects each local handler, and cross-frontend parity

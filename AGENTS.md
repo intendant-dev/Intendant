@@ -92,7 +92,7 @@ src/
 │   ├── main.rs                 # entry: CLI flags/help, panic hook, startup prologue + mode dispatch
 │   ├── agent_loop.rs, run_modes.rs, external_mode.rs, external_supervision.rs, display_glue.rs   # carved from main.rs: the native loop + orchestration handlers; native/external mode runners; external supervision helpers; frame/CU/user-display glue
 │   ├── startup/                # web bind/TLS + peer boot; the three mode branches (daemon, mcp_mode, headless)
-│   ├── control_plane.rs, event.rs, frontend.rs   # single-writer state; EventBus; UserAction/ControlMsg
+│   ├── control_plane.rs, event.rs, frontend.rs   # single-writer state; EventBus + ControlMsg; state snapshots
 │   ├── session_supervisor.rs, task_dispatch.rs, file_watcher.rs   # daemon: sessions, dispatch, rewind snapshots
 │   ├── provider.rs, conversation.rs, tools.rs, prompts.rs, skills.rs, autonomy.rs, approval.rs
 │   ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, agent_runner.rs   # native multi-agent
