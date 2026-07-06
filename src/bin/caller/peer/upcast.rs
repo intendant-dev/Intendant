@@ -796,7 +796,9 @@ impl AppEventUpcaster {
                 format!("session attached: {} ({})", session_id, source),
             )],
 
-            AppEvent::SessionEnded { session_id, reason } => {
+            AppEvent::SessionEnded {
+                session_id, reason, ..
+            } => {
                 self.sessions.ended(session_id);
                 vec![PeerEvent::SessionEnded {
                     session_id: session_id.clone(),
@@ -1669,7 +1671,9 @@ impl WireEventUpcaster {
             OutboundEvent::ApprovalResolved { id, .. } => {
                 session_updated_events(self.sessions.approval_resolved(*id))
             }
-            OutboundEvent::SessionEnded { session_id, reason } => {
+            OutboundEvent::SessionEnded {
+                session_id, reason, ..
+            } => {
                 self.sessions.ended(session_id);
                 vec![PeerEvent::SessionEnded {
                     session_id: session_id.clone(),
@@ -2129,7 +2133,9 @@ impl WireEventUpcaster {
                 format!("session attached: {} ({})", session_id, source),
             )],
 
-            OutboundEvent::SessionEnded { session_id, reason } => {
+            OutboundEvent::SessionEnded {
+                session_id, reason, ..
+            } => {
                 self.sessions.ended(session_id);
                 vec![PeerEvent::SessionEnded {
                     session_id: session_id.clone(),
@@ -3127,6 +3133,7 @@ mod tests {
         let end = u.upcast(&AppEvent::SessionEnded {
             session_id: "sess-1".into(),
             reason: "done".into(),
+            error_kind: None,
         });
         match &end[0] {
             PeerEvent::SessionEnded { session_id, reason } => {
@@ -3743,6 +3750,7 @@ mod tests {
         assert_parity(AppEvent::SessionEnded {
             session_id: "sess-99".into(),
             reason: "done".into(),
+            error_kind: None,
         });
     }
 
@@ -4204,6 +4212,7 @@ mod tests {
         let out = u.upcast(&OutboundEvent::SessionEnded {
             session_id: "s1".into(),
             reason: "done".into(),
+            error_kind: None,
         });
         assert_eq!(out.len(), 1, "ended retires the entry — no trailing update");
         assert!(matches!(out[0], PeerEvent::SessionEnded { .. }));

@@ -1835,6 +1835,7 @@ pub(crate) async fn handle_external_thread_action(
             config.bus.send(AppEvent::SessionEnded {
                 session_id: child_thread_id.clone(),
                 reason: "side conversation closed".to_string(),
+                error_kind: None,
             });
             return ExternalThreadActionEffect::SideTurnClosed { child_thread_id };
         }
@@ -2450,6 +2451,7 @@ pub(crate) fn emit_external_subagent_terminal(
         config.bus.send(AppEvent::SessionEnded {
             session_id: thread_id.to_string(),
             reason,
+            error_kind: None,
         });
     }
 }

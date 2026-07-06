@@ -3058,12 +3058,23 @@ async fn main() -> Result<(), CallerError> {
     }
 
     // Load .env: cwd (+ parents) first, then project root, then ~/.config/intendant/
-    dotenvy::dotenv().ok();
+    // — recorded so credential errors can name the concrete paths searched
+    // (under a daemon, "project root" is the launch dir, not the project a
+    // session was created with; see provider::EnvSearchReport).
+    let cwd_env = dotenvy::dotenv().ok();
     let mut project = Project::detect()?;
-    dotenvy::from_path(project.root.join(".env")).ok();
-    if let Some(config_dir) = dirs::config_dir() {
-        dotenvy::from_path(config_dir.join("intendant").join(".env")).ok();
-    }
+    let project_env_path = project.root.join(".env");
+    let project_env_loaded = dotenvy::from_path(&project_env_path).is_ok();
+    let global_env = dirs::config_dir().map(|config_dir| {
+        let path = config_dir.join("intendant").join(".env");
+        let loaded = dotenvy::from_path(&path).is_ok();
+        (path, loaded)
+    });
+    provider::record_env_search(provider::EnvSearchReport {
+        cwd_env,
+        project_env: Some((project_env_path, project_env_loaded)),
+        global_env,
+    });
 
     // Override env vars from CLI flags before provider selection
     let flags = parse_cli_flags()?;

@@ -3162,16 +3162,18 @@ fn dispatch_codex_settings_control_msgs(bus: &EventBus, payload: &SettingsPayloa
 
 /// Return JSON with boolean flags indicating which API keys are usable —
 /// an active credential lease counts the same as a configured .env key.
+/// Field names derive from [`crate::provider::PROVIDER_KEY_ENV_VARS`]
+/// (`OPENAI_API_KEY` → `openai`), the single authoritative key list.
 fn get_api_key_status_json() -> String {
-    let openai = crate::credential_leases::provider_api_key("OPENAI_API_KEY").is_some();
-    let anthropic = crate::credential_leases::provider_api_key("ANTHROPIC_API_KEY").is_some();
-    let gemini = crate::credential_leases::provider_api_key("GEMINI_API_KEY").is_some();
-    serde_json::json!({
-        "openai": openai,
-        "anthropic": anthropic,
-        "gemini": gemini,
-    })
-    .to_string()
+    let mut map = serde_json::Map::new();
+    for name in crate::provider::PROVIDER_KEY_ENV_VARS {
+        let short = name.trim_end_matches("_API_KEY").to_ascii_lowercase();
+        map.insert(
+            short,
+            serde_json::Value::Bool(crate::credential_leases::provider_api_key(name).is_some()),
+        );
+    }
+    serde_json::Value::Object(map).to_string()
 }
 
 pub(crate) fn api_key_status_response_body() -> String {
@@ -3181,7 +3183,7 @@ pub(crate) fn api_key_status_response_body() -> String {
 /// Whether any provider credential is usable at all — the aggregate of
 /// [`get_api_key_status_json`], safe to expose at presence level.
 pub(crate) fn any_provider_credential_usable() -> bool {
-    ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+    crate::provider::PROVIDER_KEY_ENV_VARS
         .iter()
         .any(|name| crate::credential_leases::provider_api_key(name).is_some())
 }
@@ -3235,10 +3237,9 @@ pub(crate) fn handle_set_api_keys(body: &str) -> String {
         }
     };
 
-    // Only allow known key names.
-    const ALLOWED: &[&str] = &["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"];
+    // Only allow known key names (the authoritative provider key list).
     for key in payload.keys.keys() {
-        if !ALLOWED.contains(&key.as_str()) {
+        if !crate::provider::PROVIDER_KEY_ENV_VARS.contains(&key.as_str()) {
             return serde_json::json!({"error": format!("Unknown key: {}", key)}).to_string();
         }
     }

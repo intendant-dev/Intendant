@@ -3377,7 +3377,13 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(AppEvent::SessionEnded { session_id, reason })
+            Some(AppEvent::SessionEnded {
+                session_id,
+                reason,
+                // Not persisted in the session log; replay surfaces carry
+                // the reason prose only.
+                error_kind: None,
+            })
         }
 
         // ── Approval ──

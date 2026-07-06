@@ -662,6 +662,11 @@ pub(crate) async fn run_headless_mode(
     bus.send(AppEvent::SessionEnded {
         session_id,
         reason: reason.clone(),
+        error_kind: result
+            .as_ref()
+            .err()
+            .and_then(|e| e.session_end_kind())
+            .map(str::to_string),
     });
 
     if use_web {
