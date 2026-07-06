@@ -1,15 +1,12 @@
 //! MCP (Model Context Protocol) server for Intendant.
 //!
 //! This module implements an MCP server that exposes Intendant's full state and
-//! controls via the standard protocol. It is architecturally a **peer** of the
-//! TUI — both consume the same [`EventBus`] events and translate user/agent
-//! actions through the shared [`UserAction`](crate::frontend::UserAction) enum.
-//!
-//! ## Parity Contract
-//!
-//! The [`IntendantServer`] uses the same [`UserAction`] enum and [`StateQuery`]
-//! types as the TUI. Adding a new `UserAction` variant forces both this module
-//! and the TUI key handler to handle it (Rust exhaustive match, no wildcards).
+//! controls via the standard protocol. It is architecturally a frontend peer of
+//! the web dashboard and the control socket: all of them consume the same
+//! [`EventBus`] events, and control intents arrive as
+//! [`ControlMsg`](crate::event::ControlMsg). The approval/input tools and the
+//! matching `ControlMsg` arms feed the same state helpers
+//! ([`resolve_pending_approval`] & co.), so both entry points stay in lockstep.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -37,8 +34,7 @@ use crate::autonomy::{AutonomyLevel, SharedAutonomy};
 use crate::control;
 use crate::event::{AppEvent, ApprovalRegistry, ApprovalResponse, ControlMsg, EventBus};
 use crate::frontend::{
-    self, ActionOutcome, ApprovalSnapshot, HumanQuestionSnapshot, LogEntrySnapshot, StateResult,
-    StatusSnapshot, UserAction,
+    self, ApprovalSnapshot, HumanQuestionSnapshot, LogEntrySnapshot, StateResult, StatusSnapshot,
 };
 use crate::types::OutboundEvent;
 use crate::types::{truncate_str, LogLevel, Phase, Verbosity};
@@ -3986,7 +3982,7 @@ async fn handle_control_command_mcp(
         }
         ControlMsg::Approve { id, .. } => {
             let mut s = state.write().await;
-            let outcome = process_action_sync(&mut s, UserAction::Approve { id });
+            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Approve);
             if matches!(outcome, ActionOutcome::Ok) {
                 bus.send(AppEvent::ApprovalResolved {
                     session_id: None,
@@ -4005,7 +4001,7 @@ async fn handle_control_command_mcp(
         }
         ControlMsg::Deny { id, .. } => {
             let mut s = state.write().await;
-            let outcome = process_action_sync(&mut s, UserAction::Deny { id });
+            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Deny);
             if matches!(outcome, ActionOutcome::Ok) {
                 bus.send(AppEvent::ApprovalResolved {
                     session_id: None,
@@ -4050,7 +4046,7 @@ async fn handle_control_command_mcp(
         }
         ControlMsg::Input { text } => {
             let mut s = state.write().await;
-            let outcome = process_action_sync(&mut s, UserAction::RespondHuman { text });
+            let outcome = respond_to_human_question(&mut s, &text);
             emit_control_result(
                 control_tx,
                 "input",
@@ -4062,7 +4058,7 @@ async fn handle_control_command_mcp(
         }
         ControlMsg::Skip { id, .. } => {
             let mut s = state.write().await;
-            let outcome = process_action_sync(&mut s, UserAction::Skip { id });
+            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Skip);
             if matches!(outcome, ActionOutcome::Ok) {
                 bus.send(AppEvent::ApprovalResolved {
                     session_id: None,
@@ -4081,7 +4077,7 @@ async fn handle_control_command_mcp(
         }
         ControlMsg::ApproveAll { id, .. } => {
             let mut s = state.write().await;
-            let outcome = process_action_sync(&mut s, UserAction::ApproveAll { id });
+            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::ApproveAll);
             if matches!(outcome, ActionOutcome::Ok) {
                 bus.send(AppEvent::ApprovalResolved {
                     session_id: None,
@@ -5134,9 +5130,8 @@ async fn handle_control_command_mcp(
             None
         }
         ControlMsg::Quit => {
-            let action = UserAction::Quit;
             let mut s = state.write().await;
-            let outcome = process_action_sync(&mut s, action);
+            let outcome = request_quit(&mut s);
             emit_control_result(
                 control_tx,
                 "quit",
@@ -7972,12 +7967,16 @@ impl IntendantServer {
     }
 }
 
-/// Process a [`UserAction`] against the shared state. This is the **single**
-/// handler that both TUI and MCP feed into.
-///
-/// Note: for actions that need async access (like writing autonomy), the caller
-/// must handle the async parts. This function handles the state-mutation and
-/// oneshot-sending synchronously.
+/// Outcome of an MCP-surface state action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActionOutcome {
+    /// Action was accepted and applied.
+    Ok,
+    /// Action was not applicable (e.g. no pending approval when approving).
+    NoOp { reason: String },
+}
+
+/// Send `response` to the registry waiter registered under `id`.
 fn resolve_approval(registry: &ApprovalRegistry, id: u64, response: ApprovalResponse) {
     if let Ok(mut reg) = registry.lock() {
         if let Some(responder) = reg.remove(&id) {
@@ -7986,112 +7985,65 @@ fn resolve_approval(registry: &ApprovalRegistry, id: u64, response: ApprovalResp
     }
 }
 
-fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOutcome {
-    // Exhaustive match — no wildcard. Compile-time parity enforcement.
-    match action {
-        UserAction::Approve { id: _ } => {
-            if let Some(pending) = state.pending_approval.take() {
-                resolve_approval(
-                    &state.approval_registry,
-                    pending.id,
-                    ApprovalResponse::Approve,
-                );
-                state.set_phase(Phase::RunningAgent);
-                state.push_log(LogLevel::Info, "Approved by MCP agent".to_string());
-                ActionOutcome::Ok
-            } else {
-                ActionOutcome::NoOp {
-                    reason: "No pending approval".to_string(),
-                }
-            }
-        }
-        UserAction::Deny { id: _ } => {
-            if let Some(pending) = state.pending_approval.take() {
-                resolve_approval(&state.approval_registry, pending.id, ApprovalResponse::Deny);
-                state.set_phase(Phase::Done);
-                state.push_log(LogLevel::Info, "Denied by MCP agent".to_string());
-                ActionOutcome::Ok
-            } else {
-                ActionOutcome::NoOp {
-                    reason: "No pending approval".to_string(),
-                }
-            }
-        }
-        UserAction::Skip { id: _ } => {
-            if let Some(pending) = state.pending_approval.take() {
-                resolve_approval(&state.approval_registry, pending.id, ApprovalResponse::Skip);
-                state.set_phase(Phase::RunningAgent);
-                state.push_log(LogLevel::Info, "Skipped by MCP agent".to_string());
-                ActionOutcome::Ok
-            } else {
-                ActionOutcome::NoOp {
-                    reason: "No pending approval".to_string(),
-                }
-            }
-        }
-        UserAction::ApproveAll { id: _ } => {
-            if let Some(pending) = state.pending_approval.take() {
-                resolve_approval(
-                    &state.approval_registry,
-                    pending.id,
-                    ApprovalResponse::ApproveAll,
-                );
-                state.set_phase(Phase::RunningAgent);
-                state.push_log(
-                    LogLevel::Info,
-                    "Approved all (autonomy → Full) by MCP agent".to_string(),
-                );
-                ActionOutcome::Ok
-            } else {
-                ActionOutcome::NoOp {
-                    reason: "No pending approval".to_string(),
-                }
-            }
-        }
-        UserAction::RespondHuman { text } => {
-            if state.human_question.is_some() {
-                // Write response to session-scoped file (same mechanism as TUI)
-                let response_path = state.log_dir.join("human_response");
-                if std::fs::write(&response_path, &text).is_ok() {
-                    state.human_question = None;
-                    state.set_phase(Phase::RunningAgent);
-                    state.push_log(LogLevel::Info, format!("Human response (MCP): {}", text));
-                    ActionOutcome::Ok
-                } else {
-                    ActionOutcome::NoOp {
-                        reason: "Failed to write response file".to_string(),
-                    }
-                }
-            } else {
-                ActionOutcome::NoOp {
-                    reason: "No pending human question".to_string(),
-                }
-            }
-        }
-        UserAction::SetAutonomy { level: _ } => {
-            // Autonomy is set asynchronously by the caller after this returns.
-            ActionOutcome::Ok
-        }
-        UserAction::SetVerbosity { level } => {
-            state.verbosity = level;
-            state.push_log(
-                LogLevel::Info,
-                format!("Verbosity set to {} by MCP agent", verbosity_to_str(level)),
-            );
-            ActionOutcome::Ok
-        }
-        UserAction::SubmitFollowUp { .. } => {
-            // Follow-up is handled asynchronously via the channel, not here.
-            ActionOutcome::NoOp {
-                reason: "SubmitFollowUp must be sent via follow-up channel".to_string(),
-            }
-        }
-        UserAction::Quit => {
-            state.should_quit = true;
-            state.push_log(LogLevel::Info, "Quit requested by MCP agent".to_string());
-            ActionOutcome::Ok
+/// Resolve the pending approval prompt with `response` — the single handler
+/// behind the approve/deny/skip/approve_all tools and their `ControlMsg`
+/// twins. Phase transition and log line derive from the response kind.
+fn resolve_pending_approval(state: &mut McpAppState, response: ApprovalResponse) -> ActionOutcome {
+    let Some(pending) = state.pending_approval.take() else {
+        return ActionOutcome::NoOp {
+            reason: "No pending approval".to_string(),
+        };
+    };
+    let (phase, log) = match &response {
+        ApprovalResponse::Approve => (Phase::RunningAgent, "Approved by MCP agent"),
+        ApprovalResponse::Skip => (Phase::RunningAgent, "Skipped by MCP agent"),
+        ApprovalResponse::Deny => (Phase::Done, "Denied by MCP agent"),
+        ApprovalResponse::ApproveAll => (
+            Phase::RunningAgent,
+            "Approved all (autonomy → Full) by MCP agent",
+        ),
+        ApprovalResponse::Answer { .. } => (Phase::RunningAgent, "Question answered by MCP agent"),
+    };
+    resolve_approval(&state.approval_registry, pending.id, response);
+    state.set_phase(phase);
+    state.push_log(LogLevel::Info, log.to_string());
+    ActionOutcome::Ok
+}
+
+/// Deliver an askHuman reply by writing the session-scoped response file the
+/// agent loop polls.
+fn respond_to_human_question(state: &mut McpAppState, text: &str) -> ActionOutcome {
+    if state.human_question.is_none() {
+        return ActionOutcome::NoOp {
+            reason: "No pending human question".to_string(),
+        };
+    }
+    let response_path = state.log_dir.join("human_response");
+    if std::fs::write(&response_path, text).is_ok() {
+        state.human_question = None;
+        state.set_phase(Phase::RunningAgent);
+        state.push_log(LogLevel::Info, format!("Human response (MCP): {}", text));
+        ActionOutcome::Ok
+    } else {
+        ActionOutcome::NoOp {
+            reason: "Failed to write response file".to_string(),
         }
     }
+}
+
+fn apply_verbosity(state: &mut McpAppState, level: Verbosity) -> ActionOutcome {
+    state.verbosity = level;
+    state.push_log(
+        LogLevel::Info,
+        format!("Verbosity set to {} by MCP agent", verbosity_to_str(level)),
+    );
+    ActionOutcome::Ok
+}
+
+fn request_quit(state: &mut McpAppState) -> ActionOutcome {
+    state.should_quit = true;
+    state.push_log(LogLevel::Info, "Quit requested by MCP agent".to_string());
+    ActionOutcome::Ok
 }
 
 // ---------------------------------------------------------------------------
@@ -8565,13 +8517,10 @@ impl IntendantServer {
         }
     }
 
-    #[tool(
-        description = "Approve a pending command execution. Equivalent to pressing 'y' in the TUI."
-    )]
+    #[tool(description = "Approve a pending command execution.")]
     async fn approve(&self, Parameters(params): Parameters<ApproveParams>) -> String {
-        let action = UserAction::Approve { id: params.id };
         let mut s = self.state.write().await;
-        let outcome = process_action_sync(&mut s, action);
+        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Approve);
         if outcome == ActionOutcome::Ok {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
@@ -8582,13 +8531,10 @@ impl IntendantServer {
         format_outcome(outcome)
     }
 
-    #[tool(
-        description = "Deny a pending command execution. Stops the agent loop. Equivalent to pressing 'n' in the TUI."
-    )]
+    #[tool(description = "Deny a pending command execution. Stops the agent loop.")]
     async fn deny(&self, Parameters(params): Parameters<DenyParams>) -> String {
-        let action = UserAction::Deny { id: params.id };
         let mut s = self.state.write().await;
-        let outcome = process_action_sync(&mut s, action);
+        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Deny);
         if outcome == ActionOutcome::Ok {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
@@ -8600,12 +8546,11 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Skip a pending command execution. The agent continues with the next command. Equivalent to pressing 's' in the TUI."
+        description = "Skip a pending command execution. The agent continues with the next command."
     )]
     async fn skip(&self, Parameters(params): Parameters<SkipParams>) -> String {
-        let action = UserAction::Skip { id: params.id };
         let mut s = self.state.write().await;
-        let outcome = process_action_sync(&mut s, action);
+        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Skip);
         if outcome == ActionOutcome::Ok {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
@@ -8616,13 +8561,10 @@ impl IntendantServer {
         format_outcome(outcome)
     }
 
-    #[tool(
-        description = "Approve this and all future commands (sets autonomy to Full). Equivalent to pressing 'a' in the TUI."
-    )]
+    #[tool(description = "Approve this and all future commands (sets autonomy to Full).")]
     async fn approve_all(&self, Parameters(params): Parameters<ApproveAllParams>) -> String {
-        let action = UserAction::ApproveAll { id: params.id };
         let mut s = self.state.write().await;
-        let outcome = process_action_sync(&mut s, action);
+        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::ApproveAll);
         if outcome == ActionOutcome::Ok {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
@@ -8637,19 +8579,14 @@ impl IntendantServer {
         format_outcome(outcome)
     }
 
-    #[tool(
-        description = "Respond to an askHuman question. Equivalent to typing a response and pressing Enter in the TUI."
-    )]
+    #[tool(description = "Respond to an askHuman question.")]
     async fn respond(&self, Parameters(params): Parameters<RespondParams>) -> String {
-        let action = UserAction::RespondHuman { text: params.text };
         let mut s = self.state.write().await;
-        let outcome = process_action_sync(&mut s, action);
+        let outcome = respond_to_human_question(&mut s, &params.text);
         format_outcome(outcome)
     }
 
-    #[tool(
-        description = "Set the autonomy level. Controls how much approval is required. Equivalent to +/- keys in the TUI."
-    )]
+    #[tool(description = "Set the autonomy level. Controls how much approval is required.")]
     async fn set_autonomy(&self, Parameters(params): Parameters<SetAutonomyParams>) -> String {
         let level = AutonomyLevel::from_str_loose(&params.level);
         let s = self.state.read().await;
@@ -8660,7 +8597,6 @@ impl IntendantServer {
             a.level = level;
         }
         let mut s = self.state.write().await;
-        let _ = process_action_sync(&mut s, UserAction::SetAutonomy { level });
         s.push_log(
             LogLevel::Info,
             format!("Autonomy set to {} by MCP agent", level),
@@ -8668,15 +8604,12 @@ impl IntendantServer {
         format!("Autonomy set to {}", level)
     }
 
-    #[tool(
-        description = "Set log verbosity level. Controls which log entries are shown. Equivalent to pressing 'v' in the TUI."
-    )]
+    #[tool(description = "Set log verbosity level. Controls which log entries are shown.")]
     async fn set_verbosity(&self, Parameters(params): Parameters<SetVerbosityParams>) -> String {
         match parse_verbosity(&params.level) {
             Some(level) => {
-                let action = UserAction::SetVerbosity { level };
                 let mut s = self.state.write().await;
-                let outcome = process_action_sync(&mut s, action);
+                let outcome = apply_verbosity(&mut s, level);
                 format_outcome(outcome)
             }
             None => format!(
@@ -8686,13 +8619,10 @@ impl IntendantServer {
         }
     }
 
-    #[tool(
-        description = "Shut down the Intendant agent. Equivalent to pressing 'q' or Ctrl-C in the TUI."
-    )]
+    #[tool(description = "Shut down the Intendant agent.")]
     async fn quit(&self) -> String {
-        let action = UserAction::Quit;
         let mut s = self.state.write().await;
-        let outcome = process_action_sync(&mut s, action);
+        let outcome = request_quit(&mut s);
         format_outcome(outcome)
     }
 
@@ -17740,7 +17670,7 @@ mod tests {
     }
 
     #[test]
-    fn process_action_approve_with_pending() {
+    fn resolve_pending_approval_approve() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -17756,7 +17686,7 @@ mod tests {
                 category: "destructive".to_string(),
             });
 
-            let outcome = process_action_sync(&mut s, UserAction::Approve { id: 1 });
+            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Approve);
             assert_eq!(outcome, ActionOutcome::Ok);
             assert!(s.pending_approval.is_none());
             assert_eq!(s.phase, Phase::RunningAgent);
@@ -17768,7 +17698,7 @@ mod tests {
     }
 
     #[test]
-    fn process_action_approve_without_pending() {
+    fn resolve_pending_approval_without_pending() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -17776,7 +17706,7 @@ mod tests {
         rt.block_on(async {
             let state = test_state();
             let mut s = state.write().await;
-            let outcome = process_action_sync(&mut s, UserAction::Approve { id: 1 });
+            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Approve);
             match outcome {
                 ActionOutcome::NoOp { reason } => {
                     assert!(reason.contains("No pending approval"));
@@ -17787,7 +17717,7 @@ mod tests {
     }
 
     #[test]
-    fn process_action_deny() {
+    fn resolve_pending_approval_deny() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -17803,7 +17733,7 @@ mod tests {
                 category: "network".to_string(),
             });
 
-            let outcome = process_action_sync(&mut s, UserAction::Deny { id: 2 });
+            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Deny);
             assert_eq!(outcome, ActionOutcome::Ok);
             assert_eq!(s.phase, Phase::Done);
 
@@ -17813,7 +17743,7 @@ mod tests {
     }
 
     #[test]
-    fn process_action_skip() {
+    fn resolve_pending_approval_skip() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -17829,7 +17759,7 @@ mod tests {
                 category: "exec".to_string(),
             });
 
-            let outcome = process_action_sync(&mut s, UserAction::Skip { id: 3 });
+            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Skip);
             assert_eq!(outcome, ActionOutcome::Ok);
             assert_eq!(s.phase, Phase::RunningAgent);
 
@@ -17839,7 +17769,7 @@ mod tests {
     }
 
     #[test]
-    fn process_action_approve_all() {
+    fn resolve_pending_approval_approve_all() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -17855,7 +17785,7 @@ mod tests {
                 category: "exec".to_string(),
             });
 
-            let outcome = process_action_sync(&mut s, UserAction::ApproveAll { id: 4 });
+            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::ApproveAll);
             assert_eq!(outcome, ActionOutcome::Ok);
 
             let response = rx.await.unwrap();
@@ -17864,7 +17794,7 @@ mod tests {
     }
 
     #[test]
-    fn process_action_set_verbosity() {
+    fn apply_verbosity_sets_level() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -17872,19 +17802,14 @@ mod tests {
         rt.block_on(async {
             let state = test_state();
             let mut s = state.write().await;
-            let outcome = process_action_sync(
-                &mut s,
-                UserAction::SetVerbosity {
-                    level: Verbosity::Debug,
-                },
-            );
+            let outcome = apply_verbosity(&mut s, Verbosity::Debug);
             assert_eq!(outcome, ActionOutcome::Ok);
             assert_eq!(s.verbosity, Verbosity::Debug);
         });
     }
 
     #[test]
-    fn process_action_quit() {
+    fn request_quit_sets_flag() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -17892,14 +17817,14 @@ mod tests {
         rt.block_on(async {
             let state = test_state();
             let mut s = state.write().await;
-            let outcome = process_action_sync(&mut s, UserAction::Quit);
+            let outcome = request_quit(&mut s);
             assert_eq!(outcome, ActionOutcome::Ok);
             assert!(s.should_quit);
         });
     }
 
     #[test]
-    fn process_action_respond_human_without_question() {
+    fn respond_to_human_question_without_question() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -17907,12 +17832,7 @@ mod tests {
         rt.block_on(async {
             let state = test_state();
             let mut s = state.write().await;
-            let outcome = process_action_sync(
-                &mut s,
-                UserAction::RespondHuman {
-                    text: "hello".to_string(),
-                },
-            );
+            let outcome = respond_to_human_question(&mut s, "hello");
             match outcome {
                 ActionOutcome::NoOp { reason } => {
                     assert!(reason.contains("No pending human question"));
@@ -19294,6 +19214,14 @@ mod tests {
     }
 
     #[test]
+    fn action_outcome_noop_differs_from_ok() {
+        let outcome = ActionOutcome::NoOp {
+            reason: "no pending approval".to_string(),
+        };
+        assert_ne!(outcome, ActionOutcome::Ok);
+    }
+
+    #[test]
     fn server_info_has_correct_name() {
         let state = test_state();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -19306,41 +19234,6 @@ mod tests {
             let info = server.get_info();
             assert_eq!(info.server_info.name, "intendant");
             assert!(info.instructions.is_some());
-        });
-    }
-
-    #[test]
-    fn all_user_actions_handled_by_process_action() {
-        // This test ensures process_action_sync handles every UserAction variant.
-        // If a new variant is added, the exhaustive match in process_action_sync
-        // will cause a compile error, AND this test will need updating.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let state = test_state();
-            let actions: Vec<UserAction> = vec![
-                UserAction::Approve { id: 1 },
-                UserAction::Deny { id: 1 },
-                UserAction::Skip { id: 1 },
-                UserAction::ApproveAll { id: 1 },
-                UserAction::RespondHuman {
-                    text: "test".to_string(),
-                },
-                UserAction::SetAutonomy {
-                    level: AutonomyLevel::High,
-                },
-                UserAction::SetVerbosity {
-                    level: Verbosity::Normal,
-                },
-                UserAction::Quit,
-            ];
-            for action in actions {
-                let mut s = state.write().await;
-                // Should not panic for any variant
-                let _ = process_action_sync(&mut s, action);
-            }
         });
     }
 
