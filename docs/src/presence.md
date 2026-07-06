@@ -149,7 +149,7 @@ channel, so nothing is lost — the server is simply quiet. Earlier docs called
 this "mutual exclusion / never both simultaneously"; the accurate description is
 a ref-counted pause.
 
-The wire handshake (handled in `web_gateway/mod.rs`):
+The wire handshake (handled in `web_gateway/listener.rs`):
 
 ```
 1. Browser connects voice  → {"t":"presence_connect"}
