@@ -104,7 +104,7 @@ src/
 │   ├── display/                # WebRTC: encode/{pool,vp8,h264_*}, tile/, capture/, webrtc, {x11,wayland,macos,windows}
 │   ├── computer_use.rs, ax.rs, vision.rs, recording.rs, frames.rs
 │   ├── presence.rs, live_audio.rs, audio_routing.rs, transcription.rs, quarantine.rs, schema_validator.rs
-│   ├── web_gateway/                # HTTP/WS gateway: listener (accept/TLS/WS dispatch), http, routes_{sessions,files,peers,access}, session_catalog/, settings, access_gates, input_authority, dashboard_presence, connect_bootstrap, peer_requests, agent_card, mcp_gate, static_assets
+│   ├── web_gateway/                # HTTP/WS gateway: listener (accept/TLS), ws_session (WS tasks), http_dispatch (route dispatch), http, routes_{sessions,files,peers,access}, session_catalog/, settings, access_gates, input_authority, dashboard_presence, connect_bootstrap, peer_requests, agent_card, mcp_gate, static_assets
 │   ├── dashboard_control.rs, terminal.rs, browser_workspace.rs   # dashboard tunnel; PTY registry; agent browser
 │   ├── mcp/, mcp_client.rs, control.rs
 │   ├── transfer_store.rs, upload_store.rs, peer_file_transfer.rs   # transfer jobs; upload/attachment stores
@@ -155,7 +155,7 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   (`ROUTES`): dispatch, the pre-dispatch IAM classification, the OPTIONS
   preflight, and the docs endpoint table in `docs/src/web-dashboard.md` all
   derive from the declaration (the HTTP instance of "derive, don't mirror").
-  Never add an HTTP route by editing `web_gateway/listener.rs`'s dispatch chain —
+  Never add an HTTP route by editing `web_gateway/http_dispatch.rs`'s dispatch chain —
   add a table row plus a `RouteHandlerId` match arm; the row also declares the
   request-body policy (dispatch reads and caps the body before the handler
   runs). Unit tests enforce the table invariants, pin the docs chapter, and
