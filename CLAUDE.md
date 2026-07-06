@@ -278,7 +278,10 @@ nothing updates the repo root's local `main` anymore. After your PR merges, run
 your own worktree). External harnesses' worktree spawns and any session launched
 from the repo root branch from local main's HEAD — a stale mirror silently bases
 them on pre-landing code. (Intendant's own sub-agent and fission worktrees
-branch from the parent's `HEAD`, not local main, and are immune.) Before basing
+branch from the parent checkout's `HEAD` — `worktree::create` base `"HEAD"` —
+so they follow the parent: safe when the parent runs in its own worktree, but a
+session whose project root is the repo root spawns children off the mirror's
+HEAD like any other root-based path.) Before basing
 new work on `main` — a fresh worktree, a root-checkout session — fetch and
 compare first: landings from other machines can stale the mirror between your
 own. If the fast-forward fails (dirty root checkout, ref lock), report it and
