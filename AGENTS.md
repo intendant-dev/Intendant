@@ -272,6 +272,18 @@ queueing: the queue gate is the deterministic subset, not the full battery, and 
 red queue entry wastes everyone's cycle time. Never bypass the ruleset; if the
 queue itself is wedged, that is an operator (org-owner) decision.
 
+**Post-landing: fast-forward the shared mirror.** The queue owns origin/main;
+nothing updates the repo root's local `main` anymore. After your PR merges, run
+`git -C <repo-root> pull --ff-only` (and `git merge --ff-only origin/main` in
+your own worktree). External harnesses' worktree spawns and any session launched
+from the repo root branch from local main's HEAD — a stale mirror silently bases
+them on pre-landing code. (Intendant's own sub-agent and fission worktrees
+branch from the parent's `HEAD`, not local main, and are immune.) Before basing
+new work on `main` — a fresh worktree, a root-checkout session — fetch and
+compare first: landings from other machines can stale the mirror between your
+own. If the fast-forward fails (dirty root checkout, ref lock), report it and
+move on; never force it and never resolve the root checkout's state yourself.
+
 ## CI/CD
 
 GitHub Actions on push / PR to `main`, and — for the required checks — on every
