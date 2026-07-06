@@ -80,18 +80,17 @@ jobs:
         # `os` is the check-name key ("test (ubuntu-latest)" is pinned as a
         # required context in the main ruleset — renaming it means a
         # coordinated ruleset edit); `runner` is where the job actually
-        # runs. The Linux and macOS legs live on the self-hosted fleet
-        # (dell-206, macbook-vm): persistent target/ dirs make warm runs
-        # minutes instead of half-hours. Windows stays hosted until the
-        # third box is up. `hosted` gates the runner-provisioning steps —
-        # the self-hosted boxes are pre-provisioned (deps, toolchains) and
-        # keep their build state, so cache actions and dep installs are
-        # hosted-only.
+        # runs. All three legs live on the self-hosted fleet (dell-206,
+        # macbook-vm, samsung-win): persistent target/ dirs make warm runs
+        # minutes instead of half-hours. `hosted` gates the
+        # runner-provisioning steps — the self-hosted boxes are
+        # pre-provisioned (deps, toolchains) and keep their build state, so
+        # cache actions and dep installs are hosted-only.
         include:
           - os: windows-latest
-            runner: windows-latest
+            runner: [self-hosted, intendant-windows]
             target: x86_64-pc-windows-msvc
-            hosted: true
+            hosted: false
           - os: macos-latest
             runner: [self-hosted, intendant-macos]
             target: aarch64-apple-darwin
@@ -110,12 +109,12 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       # `ring` (our TLS provider — aws-lc-rs is deliberately disabled) builds
-      # its x86_64 perlasm assembly with NASM on the MSVC target. The GitHub
-      # windows-latest image ships NASM, but install it explicitly so the
-      # workflow doesn't silently break if that ever changes; choco is a no-op
-      # when it's already present.
+      # its x86_64 perlasm assembly with NASM on the MSVC target. Hosted-only,
+      # like the other provisioning steps: the self-hosted Windows box has
+      # NASM preinstalled on the machine PATH, and its runner user neither
+      # has nor needs choco.
       - name: Install NASM (Windows, for ring)
-        if: runner.os == 'Windows'
+        if: matrix.hosted && runner.os == 'Windows'
         run: |
           if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
             choco install nasm --no-progress -y
