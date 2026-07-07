@@ -24,7 +24,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
-use crate::peer::transport::pinning::{format_fingerprint, parse_fingerprint};
+use crate::access::pinning::{format_fingerprint, parse_fingerprint};
 use crate::web_tls::{build_acceptor, TlsCertSource};
 
 use super::{certs::CertState, AccessError, AccessResult};

@@ -17,7 +17,7 @@
 
 pub mod intendant;
 pub mod multi;
-pub mod pinning;
+pub use crate::access::pinning;
 pub(crate) mod tls_client;
 
 pub use intendant::IntendantWsTransport;
