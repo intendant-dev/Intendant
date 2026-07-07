@@ -496,6 +496,22 @@ impl IntendantServer {
                 let params = parse_params::<PeerDelegateTaskParams>(args)?;
                 Ok(text_tool_result(self.peer_delegate_task(params).await))
             }
+            "peer_list_displays" => {
+                let params = parse_params::<PeerListDisplaysParams>(args)?;
+                Ok(text_tool_result(self.peer_list_displays(params).await))
+            }
+            "peer_take_screenshot" => {
+                let params = parse_params::<PeerTakeScreenshotParams>(args)?;
+                self.peer_take_screenshot(params)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            "peer_execute_cu_actions" => {
+                let params = parse_params::<PeerExecuteCuActionsParams>(args)?;
+                self.peer_execute_cu_actions(params)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
             _ => Err(format!("Unknown tool: {}", name)),
         }
     }

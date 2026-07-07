@@ -574,6 +574,42 @@ pub struct PeerDelegateTaskParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PeerListDisplaysParams {
+    /// Peer daemon id, as returned by list_peers.
+    pub peer_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PeerTakeScreenshotParams {
+    /// Peer daemon id, as returned by list_peers.
+    pub peer_id: String,
+    /// Peer-side display selector (e.g. "display_99", "user_session"),
+    /// from peer_list_displays or list_peers' displays field. The peer
+    /// auto-detects when omitted.
+    #[serde(default)]
+    pub display_target: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PeerExecuteCuActionsParams {
+    /// Peer daemon id, as returned by list_peers.
+    pub peer_id: String,
+    /// Computer-use actions in the peer's CuAction vocabulary, passed
+    /// through verbatim: tagged objects like
+    /// {"type":"click","x":100,"y":200}, {"type":"type","text":"hi"},
+    /// {"type":"key","key":"Return"}, {"type":"screenshot"},
+    /// {"type":"wait","ms":500}.
+    pub actions: Vec<serde_json::Value>,
+    /// Peer-side display selector; the peer auto-detects when omitted.
+    #[serde(default)]
+    pub display_target: Option<String>,
+    /// "pixel" (default) or "normalized_1000" when coordinates are on
+    /// a 0-1000 grid.
+    #[serde(default)]
+    pub coordinate_space: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScheduleControllerRestartParams {
     /// Identifier for the controlling agent/client (e.g. "codex", "claude_code").
     pub controller_id: String,

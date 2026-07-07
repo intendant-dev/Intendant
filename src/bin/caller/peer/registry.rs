@@ -453,12 +453,22 @@ impl PeerRegistry {
         let peer_id = card.id.clone();
         let log_sink = self.inner.log_sink.clone();
 
+        // Retained on the handle for gateway HTTP side-channels (e.g.
+        // POST /mcp): the same bundle the transports below are built
+        // from, so both paths present one identity to the peer.
+        let transport_credentials = crate::peer::transport::intendant::TransportCredentials {
+            bearer_token: bearer_token.clone(),
+            pinned_fingerprints: pinned_fingerprints.clone(),
+            client_identity: client_identity.clone(),
+        };
+
         let handle = spawn_peer(
             peer_id.clone(),
             card,
             via_urls,
             browser_tcp_via_url,
             label_override,
+            transport_credentials,
             log_sink,
             move |events_tx| {
                 // Build one concrete transport per supported spec (each

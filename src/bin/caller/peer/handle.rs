@@ -29,6 +29,7 @@ use crate::peer::event::{
 };
 use crate::peer::id::PeerId;
 use crate::peer::traits::{PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures};
+use crate::peer::transport::intendant::TransportCredentials;
 use crate::peer::PeerError;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -134,6 +135,15 @@ struct PeerHandleInner {
     /// [`PeerSnapshot::browser_tcp_via_url`] so the dashboard can
     /// pick it over `ws_url` when sending federated WebRTC offers.
     browser_tcp_via_url: Option<String>,
+    /// The auth material the registry assembled for this peer's
+    /// transport (operator config + card auth + installed access
+    /// identity), retained verbatim so side-channel HTTP calls to the
+    /// same gateway — e.g. POST /mcp for direct tool invocation —
+    /// present exactly the identity and pins the federation transport
+    /// itself uses. The card snapshot is NOT a substitute: its
+    /// `auth.transport` reverts to the peer's self-advertised value on
+    /// reconnect, and a peer-issued client cert never appears there.
+    credentials: TransportCredentials,
 }
 
 impl PeerHandle {
@@ -222,6 +232,14 @@ impl PeerHandle {
     #[allow(dead_code)]
     pub fn browser_tcp_via_url(&self) -> Option<&str> {
         self.inner.browser_tcp_via_url.as_deref()
+    }
+
+    /// The transport-grade auth material for this peer (bearer,
+    /// pinned server fingerprints, mTLS client identity). Use this —
+    /// never the card snapshot — when making authenticated HTTP calls
+    /// to the peer's gateway outside the WebSocket transport.
+    pub fn transport_credentials(&self) -> &TransportCredentials {
+        &self.inner.credentials
     }
 
     /// Subscribe to the peer's event stream. Fan-out is lossy for
@@ -542,9 +560,11 @@ pub struct PeerSnapshot {
 /// transport that pushes [`PeerEvent`]s to that sender. Typical use:
 ///
 /// ```ignore
-/// let handle = spawn_peer(peer_id, initial_card, log_sink, |events_tx| {
-///     Box::new(IntendantWsTransport::new(url, events_tx))
-/// });
+/// let handle = spawn_peer(
+///     peer_id, initial_card, via_urls, browser_tcp_via_url,
+///     label_override, credentials, log_sink,
+///     |events_tx| Box::new(IntendantWsTransport::new(url, events_tx)),
+/// );
 /// ```
 ///
 /// `initial_card` is the "last known card" — typically whatever was
@@ -574,12 +594,18 @@ pub struct PeerSnapshot {
 /// `label_override` is operator-supplied display text for this peer. The actor
 /// reapplies it to every refreshed Agent Card so reconnects cannot revert the
 /// row to the peer's self-advertised label.
+///
+/// `credentials` is the same auth bundle the caller feeds into
+/// `build_transport` — retained on the handle (see
+/// [`PeerHandle::transport_credentials`]) so gateway HTTP calls made
+/// outside the transport reuse the identical identity and pins.
 pub fn spawn_peer<F>(
     id: PeerId,
     initial_card: AgentCard,
     via_urls: Vec<String>,
     browser_tcp_via_url: Option<String>,
     label_override: Option<String>,
+    credentials: TransportCredentials,
     log_sink: mpsc::Sender<TaggedPeerEvent>,
     build_transport: F,
 ) -> PeerHandle
@@ -631,6 +657,7 @@ where
             commands: commands_tx,
             events: events_out_tx,
             browser_tcp_via_url,
+            credentials,
         }),
     }
 }
@@ -706,6 +733,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            TransportCredentials::default(),
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
         );
@@ -815,6 +843,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            TransportCredentials::default(),
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
         );
@@ -953,6 +982,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            TransportCredentials::default(),
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
         );
@@ -1063,6 +1093,7 @@ mod tests {
             Vec::new(),
             Some(browser_url.clone()),
             None,
+            TransportCredentials::default(),
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
         );
@@ -1121,6 +1152,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            TransportCredentials::default(),
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
         );

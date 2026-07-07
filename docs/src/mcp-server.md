@@ -231,20 +231,27 @@ active holder.
 
 ### Peer federation
 
-The stage-0 agent-facing surface for [peer federation](./peer-federation.md):
-inspect the peer roster and delegate work to sibling daemons. `list_peers` is
-gated as `peer.inspect` (same classification as `GET /api/peers`);
-`peer_send_message` and `peer_delegate_task` are gated as `peer.use` — acting
-through a peer delegates this daemon's peer identity, and the receiving peer
-authorizes the request against its own grants for this daemon. A delegated
-task runs on the peer's machine under the peer's own autonomy/approval policy;
-no display/computer-use invocation on peers rides this surface yet.
+The agent-facing surface for [peer federation](./peer-federation.md):
+inspect the peer roster, delegate work to sibling daemons, and do direct
+computer use on peer displays. `list_peers` is gated as `peer.inspect` (same
+classification as `GET /api/peers`); every other tool here is gated as
+`peer.use` — acting through a peer delegates this daemon's peer identity, and
+the receiving peer authorizes the request against its own grants for this
+daemon. A delegated task runs on the peer's machine under the peer's own
+autonomy/approval policy. The direct-CU trio is one stateless `tools/call`
+POST to the *peer's* `/mcp` over the transport's mTLS identity; the peer's
+gate then requires display view for `peer_list_displays` /
+`peer_take_screenshot` (profile `read-only-display` or better) and display
+input for `peer_execute_cu_actions` (`peer-operator` / `peer-root`).
 
 | Tool                 | Description | Params |
 |----------------------|-------------|--------|
-| `list_peers`         | Peer snapshot list — id, label, connection state, capabilities, sessions (same payload as `GET /api/peers`). | — |
+| `list_peers`         | Peer snapshot list — id, label, connection state, capabilities, sessions, displays (same payload as `GET /api/peers`). | — |
 | `peer_send_message`  | Send a message to a peer's agent. | `peer_id`, `message`, `session?` |
 | `peer_delegate_task` | Delegate a task executed by the peer's own agent; returns `task_id`. | `peer_id`, `instructions`, `context?` |
+| `peer_list_displays` | List a peer's displays (ids, names, resolutions) over its `/mcp`. | `peer_id` |
+| `peer_take_screenshot` | Screenshot a peer display; returns an MCP image content block. | `peer_id`, `display_target?` |
+| `peer_execute_cu_actions` | Run CU actions on a peer display; returns per-action status + annotated post-action screenshot. | `peer_id`, `actions`, `display_target?`, `coordinate_space?` |
 
 ### Controller Orchestration
 

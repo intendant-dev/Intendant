@@ -98,6 +98,7 @@ pub mod event;
 pub mod handle;
 pub mod id;
 pub mod log_writer;
+pub mod mcp_http;
 pub mod ops;
 pub mod pairing;
 pub mod registry;
