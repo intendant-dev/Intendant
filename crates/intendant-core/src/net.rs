@@ -1,6 +1,16 @@
-//! Local network-interface enumeration: small OS probes with no
-//! dependency on any daemon subsystem (unix walks `getifaddrs(3)` via
-//! libc; Windows goes through the `if-addrs` crate).
+//! Shared network vocabulary: local interface probes (unix walks
+//! `getifaddrs(3)` via libc; Windows goes through the `if-addrs`
+//! crate), the daemon's canonical gateway port, and the TCP-listener
+//! accept-failure policy + rebind helper shared by the web gateway,
+//! the control socket, and the enrollment cert server. No dependency
+//! on any daemon subsystem.
+
+use tokio::net::TcpListener;
+
+/// Default TCP port for the daemon's web gateway (dashboard + API).
+/// Canonical here so access/ and peer/ can name it without reaching
+/// upward into the gateway module.
+pub const DEFAULT_GATEWAY_PORT: u16 = 8765;
 
 /// Enumerate the local machine's routable IP addresses (one entry per
 /// interface address that's globally usable). Used by:
@@ -20,13 +30,6 @@
 ///
 /// Implementation walks `getifaddrs(3)` directly via libc — same crate
 /// the codebase already depends on for other unix interop.
-use tokio::net::TcpListener;
-
-/// Default TCP port for the daemon's web gateway (dashboard + API).
-/// Canonical here so access/ and peer/ can name it without reaching
-/// upward into the gateway module.
-pub const DEFAULT_GATEWAY_PORT: u16 = 8765;
-
 pub fn routable_local_addrs(include_loopback: bool) -> Vec<std::net::IpAddr> {
     use std::net::{IpAddr, Ipv4Addr};
 
