@@ -7,6 +7,7 @@ mod gpu;
 mod hud;
 mod input;
 mod model;
+mod panes;
 mod scene;
 mod util;
 
@@ -241,6 +242,11 @@ impl StationWeb {
             "displays": inner.display_sources.len(),
             "selectedId": inner.selected_id,
             "layout": inner.layout.label(),
+            // World-space panes drawn in the last built frame (6 vertices
+            // per pane); the rig asserts this flips 0 → 1 with
+            // ?station_panes=on + a selected node.
+            "panes": inner.frame.pane_vertices.len() / 6,
+            "panesEnabled": inner.panes_enabled,
             "mood": inner.mood.label(),
             "motion": inner.motion,
             "composer": {
@@ -411,6 +417,9 @@ struct StationInner {
     last_input_ms: f64,
     selected_id: Option<String>,
     focus_id: Option<String>,
+    /// World-space panes (Phase C), opt-in via `?station_panes=on` while
+    /// the program is in flight. Read once at construction.
+    panes_enabled: bool,
     pointer_down: Option<PointerDrag>,
     active_pointers: HashMap<i32, Vec2>,
     pinch_zoom: Option<PinchZoom>,
@@ -531,6 +540,7 @@ impl StationInner {
             last_input_ms: now_ms(),
             selected_id: None,
             focus_id: None,
+            panes_enabled: util::station_enable_panes(),
             pointer_down: None,
             active_pointers: HashMap::new(),
             pinch_zoom: None,

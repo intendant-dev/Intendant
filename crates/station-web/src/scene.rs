@@ -22,6 +22,9 @@ impl StationInner {
         let mut frame = std::mem::take(&mut self.frame);
         frame.clear();
         let camera = self.camera();
+        // The camera moves into the projector closure below; panes need
+        // its basis to billboard, so copy it out first.
+        let (cam_right, cam_up) = (camera.right, camera.up);
         let aspect = self.width as f32 / self.height.max(1) as f32;
         let fov_deg = self.fov_deg;
         let density = self.density;
@@ -122,6 +125,31 @@ impl StationInner {
             }
             true
         });
+
+        // Phase C slice 2, behind ?station_panes=on: one untextured card
+        // beside the selected node — the throwaway that proves the pane
+        // pipeline (billboarding, per-pixel depth against the wireframe)
+        // before real panels migrate into the scene.
+        if self.panes_enabled {
+            if let Some(pos) = self
+                .selected_id
+                .as_ref()
+                .and_then(|id| self.layout_cache.get(id))
+                .copied()
+            {
+                let anchor = pos + cam_right * 0.66 + cam_up * 0.52;
+                crate::panes::add_world_pane(
+                    &mut frame,
+                    &mut project,
+                    cam_right,
+                    cam_up,
+                    anchor,
+                    0.55,
+                    0.34,
+                    Color::rgb(16, 18, 32).with_alpha(0.86),
+                );
+            }
+        }
 
         self.frame = frame;
     }

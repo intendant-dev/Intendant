@@ -17,10 +17,15 @@ pub(crate) struct GpuState {
     pub(crate) config: wgpu::SurfaceConfiguration,
     pub(crate) line_pipeline: wgpu::RenderPipeline,
     pub(crate) tri_pipeline: wgpu::RenderPipeline,
+    /// World-space panes (Phase C): same shader and vertex layout, but a
+    /// real depth compare — the wireframe's written depth occludes panes
+    /// and panes occlude it.
+    pub(crate) pane_pipeline: wgpu::RenderPipeline,
     /// Persistent vertex buffers, uploaded via `Queue::write_buffer` and
     /// grown geometrically on demand; never recreated per frame.
     pub(crate) line_buffer: GpuVertexBuffer,
     pub(crate) tri_buffer: GpuVertexBuffer,
+    pub(crate) pane_buffer: GpuVertexBuffer,
     /// Depth attachment, always sized to `config`. Must be recreated
     /// wherever the surface is resized or every later frame renders
     /// against a stale-sized attachment.
@@ -147,7 +152,7 @@ impl GpuState {
             bind_group_layouts: &[],
             immediate_size: 0,
         });
-        let make_pipeline = |topology| {
+        let make_pipeline = |topology, depth_compare: wgpu::CompareFunction| {
             let vertex_layout = GpuVertex::layout();
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("Station Render Pipeline"),
@@ -177,15 +182,14 @@ impl GpuState {
                     unclipped_depth: false,
                     conservative: false,
                 },
-                // Slice 1 of the world-space-pane program: the attachment
-                // exists and every vertex carries a real clip depth, but
-                // the compare stays Always so the wireframe's painter's-
-                // order alpha blending is untouched. Pane pipelines flip
-                // to a real compare against these written values.
+                // The wireframe pipelines keep compare Always (their
+                // painter's-order alpha blending predates depth and must
+                // stay untouched) while still WRITING depth; the pane
+                // pipeline runs a real compare against those values.
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
                     depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    depth_compare: Some(depth_compare),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
@@ -194,8 +198,18 @@ impl GpuState {
                 cache: None,
             })
         };
-        let line_pipeline = make_pipeline(wgpu::PrimitiveTopology::LineList);
-        let tri_pipeline = make_pipeline(wgpu::PrimitiveTopology::TriangleList);
+        let line_pipeline = make_pipeline(
+            wgpu::PrimitiveTopology::LineList,
+            wgpu::CompareFunction::Always,
+        );
+        let tri_pipeline = make_pipeline(
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::CompareFunction::Always,
+        );
+        let pane_pipeline = make_pipeline(
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::CompareFunction::LessEqual,
+        );
         if let Some(error) = error_scope.pop().await {
             return Err(JsValue::from_str(&format!(
                 "WebGPU pipeline validation failed: {error}"
@@ -203,6 +217,7 @@ impl GpuState {
         }
         let line_buffer = GpuVertexBuffer::new(&device, "Station Lines");
         let tri_buffer = GpuVertexBuffer::new(&device, "Station Triangles");
+        let pane_buffer = GpuVertexBuffer::new(&device, "Station Panes");
         let depth_view = Self::create_depth_view(&device, width, height);
 
         Ok(Self {
@@ -212,8 +227,10 @@ impl GpuState {
             config,
             line_pipeline,
             tri_pipeline,
+            pane_pipeline,
             line_buffer,
             tri_buffer,
+            pane_buffer,
             depth_view,
         })
     }
@@ -281,6 +298,8 @@ impl GpuState {
             .upload(&self.device, &self.queue, &frame.line_vertices);
         self.tri_buffer
             .upload(&self.device, &self.queue, &frame.tri_vertices);
+        self.pane_buffer
+            .upload(&self.device, &self.queue, &frame.pane_vertices);
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -325,6 +344,15 @@ impl GpuState {
                 pass.set_pipeline(&self.tri_pipeline);
                 pass.set_vertex_buffer(0, self.tri_buffer.buffer.slice(..bytes));
                 pass.draw(0..frame.tri_vertices.len() as u32, 0..1);
+            }
+            // Panes draw last: the wireframe has written its depth by
+            // now, so the pane pipeline's LessEqual compare sorts panes
+            // against the whole scene per-pixel.
+            if !frame.pane_vertices.is_empty() {
+                let bytes = std::mem::size_of_val(frame.pane_vertices.as_slice()) as u64;
+                pass.set_pipeline(&self.pane_pipeline);
+                pass.set_vertex_buffer(0, self.pane_buffer.buffer.slice(..bytes));
+                pass.draw(0..frame.pane_vertices.len() as u32, 0..1);
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -405,6 +433,9 @@ impl GpuVertex {
 pub(crate) struct GpuFrame {
     pub(crate) line_vertices: Vec<GpuVertex>,
     pub(crate) tri_vertices: Vec<GpuVertex>,
+    /// World-space pane geometry (panes.rs) — drawn through the
+    /// depth-tested pane pipeline, after the wireframe.
+    pub(crate) pane_vertices: Vec<GpuVertex>,
     pub(crate) projected_nodes: Vec<ProjectedNode>,
 }
 
@@ -413,6 +444,7 @@ impl GpuFrame {
     pub(crate) fn clear(&mut self) {
         self.line_vertices.clear();
         self.tri_vertices.clear();
+        self.pane_vertices.clear();
         self.projected_nodes.clear();
     }
 
