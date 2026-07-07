@@ -275,12 +275,31 @@ queueing: the queue gate is the deterministic subset, not the full battery, and 
 red queue entry wastes everyone's cycle time. Never bypass the ruleset; if the
 queue itself is wedged, that is an operator (org-owner) decision.
 
+**Land small, land immediately.** This main takes hundreds of commits a month
+from concurrent agents; every hour a green change sits unqueued is another
+chance main moves under it (a real one-PR landing ate three conflict
+reconciles this way, and two sessions once wrote the same fix in parallel
+because neither had landed it). So: an independent fix ships as its own PR
+the moment it's green — never held back to ride a batch. Two habits make the
+collisions cheap:
+
+- **Open a draft PR when you start, not when you finish** (`gh pr create
+  --draft --fill`, then `gh pr ready` once green). Drafts are the fleet's
+  files-in-flight signal — before touching hot files, check what's already
+  in motion: `gh pr list --state open --json number,title,headRefName,isDraft,files`.
+- **Auto-merge silently disarms** whenever the PR stops being mergeable (main
+  conflict) or a check fails — after every conflict-resolution push or flake
+  rerun, re-run `gh pr merge <n> --merge --auto` and confirm
+  `autoMergeRequest` is set again. While the PR sits IN the queue,
+  `autoMergeRequest` nulling and `mergeStateStatus: UNKNOWN` are normal;
+  only `state` (`MERGED`/`CLOSED`) is terminal. A queued branch is frozen —
+  pushes are rejected until the entry merges or is dequeued.
+
 After arming auto-merge, confirm the PR actually **enters the queue** once its
-checks go green (GraphQL `pullRequest.mergeQueueEntry`; `autoMergeRequest`
-going null while queued is normal). Known stall: a job that dies mid-run
-(runner lost communication) and auto-recovers in place can leave its
-per-commit **check run** stuck at `failure` while the workflow run shows
-success — auto-merge reads the check run and waits forever. Detect it by
+checks go green (GraphQL `pullRequest.mergeQueueEntry`). Known stall: a job
+that dies mid-run (runner lost communication) and auto-recovers in place can
+leave its per-commit **check run** stuck at `failure` while the workflow run
+shows success — auto-merge reads the check run and waits forever. Detect it by
 comparing `gh pr checks` against `gh run view`; remedy with
 `gh run rerun --job <id>` to mint a fresh check run. Treat any
 "green run, armed auto-merge, still not queued after ~5 minutes" as this
@@ -322,7 +341,7 @@ not just first-timers). The Dell and Windows runners run as dedicated
 non-admin `ci` users, and the check *names* stay pinned to the
 `test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os` is
 the name key, `runner` is the fleet placement):
-- **`windows.yml`** — cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). On `pull_request` the Windows leg runs `cargo check` only (fast pre-queue signal); the full Windows suite runs in the merge group — the actual gate — and on pushes to main. Headless-safe: needs no display or API keys. **Required check.**
+- **`windows.yml`** — cross-platform `cargo test` (the `intendant` bins + the `intendant-core`/`intendant-display`/`intendant-platform` lib crates) + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Outside the merge group the Windows **and macOS** legs run `cargo check` only (fast pre-queue signal on PRs, cheap warm on main pushes); the full non-Linux suites run in the merge group — the actual gate. Linux runs the full suite on every trigger. Headless-safe: needs no display or API keys. **Required check.**
 - **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real binaries on Linux only (debug profile; the drivers are platform-agnostic protocol probes, so a second platform mostly duplicated coverage while doubling flake surface). **Required check.**
 - **`app-html.yml`** — the `static/app/` fragments ↔ generated `static/app.html` regen gate. **Required check.**
 - **`agents-md-sync.yml`** — CLAUDE.md ↔ AGENTS.md byte-parity. **Required check.**

@@ -99,6 +99,7 @@ pub(crate) async fn run_with_presence(
     frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     context_injection: event::ContextInjectionQueue,
     session_registry: display::SharedSessionRegistry,
+    peer_registry: Option<peer::PeerRegistry>,
     agent_backend_override: Option<external_agent::AgentBackend>,
     shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     shared_codex_config: control_plane::SharedCodexConfig,
@@ -2834,6 +2835,7 @@ pub(crate) async fn run_with_presence(
                 &approval_registry,
                 &context_injection, // shared with presence
                 Some(&session_registry),
+                peer_registry.as_ref(),
                 false, // not headless
                 None,  // presence mode has no session supervisor
             )
@@ -2932,6 +2934,7 @@ pub(crate) async fn run_direct_mode(
     approval_registry: event::ApprovalRegistry,
     context_injection: event::ContextInjectionQueue,
     session_registry: Option<display::SharedSessionRegistry>,
+    peer_registry: Option<peer::PeerRegistry>,
     headless: bool,
     attachments: UserAttachments,
     native: NativeSessionConfig,
@@ -3090,6 +3093,7 @@ pub(crate) async fn run_direct_mode(
         &approval_registry,
         &context_injection,
         session_registry.as_ref(),
+        peer_registry.as_ref(),
         headless,
         native.orchestration.as_ref(),
     )

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
@@ -583,6 +583,97 @@ fn cc_plan_entries(input: &serde_json::Value) -> Vec<(String, String, String)> {
         .collect()
 }
 
+/// Insertion-ordered task-list state for one scope (the main thread or one
+/// sub-agent child), folded from the incremental `TaskCreate`/`TaskUpdate`
+/// tools — TodoWrite's successors send deltas, not full snapshots, so
+/// rendering a plan takes running state. Keys are the CLI-assigned task ids;
+/// a create whose result never yielded an id keeps its provisional
+/// `pending:<tool_use_id>` key (quiet degradation — later updates by real id
+/// then materialize a separate entry).
+#[derive(Default)]
+struct CcTaskListFold {
+    order: Vec<String>,
+    /// key → (subject, normalized status)
+    tasks: HashMap<String, (String, String)>,
+}
+
+impl CcTaskListFold {
+    /// Insert or update one task. `None` fields keep the existing values; a
+    /// fresh entry fills them with a placeholder subject / "pending" (an
+    /// update for a task whose creation predates this supervisor still
+    /// deserves a row).
+    fn upsert(&mut self, key: &str, subject: Option<String>, status: Option<String>) {
+        if let Some(slot) = self.tasks.get_mut(key) {
+            if let Some(subject) = subject {
+                slot.0 = subject;
+            }
+            if let Some(status) = status {
+                slot.1 = status;
+            }
+        } else {
+            self.tasks.insert(
+                key.to_string(),
+                (
+                    subject.unwrap_or_else(|| format!("Task #{key}")),
+                    status.unwrap_or_else(|| "pending".to_string()),
+                ),
+            );
+            self.order.push(key.to_string());
+        }
+    }
+
+    /// Adopt the CLI-assigned id for a provisionally-keyed create, keeping
+    /// its position.
+    fn rekey(&mut self, old: &str, new: String) {
+        let Some(value) = self.tasks.remove(old) else {
+            return;
+        };
+        if self.tasks.contains_key(&new) {
+            // Impossible in stream order (the model only learns the id from
+            // this very result) — but on a collision the existing entry is
+            // newer truth; just retire the provisional row.
+            self.order.retain(|k| k != old);
+            return;
+        }
+        if let Some(slot) = self.order.iter_mut().find(|k| **k == old) {
+            *slot = new.clone();
+        }
+        self.tasks.insert(new, value);
+    }
+
+    fn remove(&mut self, key: &str) {
+        if self.tasks.remove(key).is_some() {
+            self.order.retain(|k| k != key);
+        }
+    }
+
+    /// The full list in `PlanUpdate` shape: `(content, priority, status)`.
+    fn entries(&self) -> Vec<(String, String, String)> {
+        self.order
+            .iter()
+            .filter_map(|key| {
+                let (subject, status) = self.tasks.get(key)?;
+                Some((subject.clone(), String::new(), status.clone()))
+            })
+            .collect()
+    }
+}
+
+/// The assigned id from a `TaskCreate` result ("Created task #12: …") — the
+/// first `#`-prefixed digit run in the text.
+fn cc_created_task_id(text: &str) -> Option<String> {
+    for (idx, _) in text.match_indices('#') {
+        let digits: String = text[idx + 1..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !digits.is_empty() {
+            return Some(digits);
+        }
+    }
+    None
+}
+
 /// Terminal summaries ride log lines; keep them one line and short.
 fn task_summary_snippet(text: &str) -> Option<String> {
     let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -634,12 +725,25 @@ struct CcReader {
     /// `task_id` (the key `system:task_*` events use) → spawning
     /// tool_use id.
     task_ids: HashMap<String, String>,
-    /// tool_use ids of `TodoWrite` calls already rendered as `PlanUpdate`,
-    /// so their bookkeeping tool_result ("Todos have been modified
+    /// tool_use ids of plan-shaped calls (`TodoWrite`, `TaskUpdate`) already
+    /// rendered as `PlanUpdate`, mapped to the tool name for failure logs, so
+    /// their bookkeeping tool_result ("Todos have been modified
     /// successfully…") is dropped instead of rendered. Entries are removed
     /// when the result arrives; ids orphaned by an interrupted turn are
     /// inert (tool_use ids never recur) and merely idle here.
-    plan_tools: HashSet<String>,
+    plan_tools: HashMap<String, &'static str>,
+    /// Per-scope folded task lists (None = the main thread) for the
+    /// incremental `TaskCreate`/`TaskUpdate` tools. Print-mode Claude Code
+    /// exposes these instead of `TodoWrite` (which it answers as "not
+    /// enabled in this context"), so this fold is how supervised sessions
+    /// surface plans at all.
+    task_list_folds: HashMap<Option<String>, CcTaskListFold>,
+    /// `TaskCreate` tool_use ids whose result — the only place the CLI
+    /// reveals the assigned task id — hasn't arrived yet, mapped to the
+    /// owning scope. An id orphaned by an interrupted turn leaves its
+    /// provisional row parked as pending, mirroring the CLI's own
+    /// uncertainty about whether the create took.
+    pending_task_creates: HashMap<String, Option<String>>,
     /// Latest rate-limit window per `rateLimitType` (`five_hour`,
     /// `seven_day`) from `rate_limit_event` — attached to outgoing usage
     /// snapshots for the vitals limit gauges. BTreeMap for stable order.
@@ -672,7 +776,9 @@ impl CcReader {
             open_tools: HashMap::new(),
             task_children: HashMap::new(),
             task_ids: HashMap::new(),
-            plan_tools: HashSet::new(),
+            plan_tools: HashMap::new(),
+            task_list_folds: HashMap::new(),
+            pending_task_creates: HashMap::new(),
             limit_windows: std::collections::BTreeMap::new(),
             model: "claude".to_string(),
             context_window: DEFAULT_CONTEXT_WINDOW,
@@ -1153,8 +1259,65 @@ impl CcReader {
                             // tool call; the acknowledgment tool_result is
                             // dropped in tool_result_events. Malformed
                             // inputs fall through to the plain-tool path.
-                            self.plan_tools.insert(tool_id);
+                            self.plan_tools.insert(tool_id, "TodoWrite");
                             out.events.push(AgentEvent::PlanUpdate { entries });
+                            continue;
+                        }
+                    }
+                    if tool_name == "TaskCreate" && !tool_id.is_empty() {
+                        let subject = input
+                            .get("subject")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        if let Some(subject) = subject {
+                            // Fold the create into this scope's task list
+                            // and render the full snapshot. The assigned id
+                            // only arrives in the tool_result, so the entry
+                            // holds a provisional key until then
+                            // (tool_result_events adopts the real id).
+                            let scope = child_scope.map(str::to_string);
+                            let fold = self.task_list_folds.entry(scope.clone()).or_default();
+                            fold.upsert(
+                                &format!("pending:{tool_id}"),
+                                Some(subject.to_string()),
+                                Some("pending".to_string()),
+                            );
+                            out.events.push(AgentEvent::PlanUpdate {
+                                entries: fold.entries(),
+                            });
+                            self.pending_task_creates.insert(tool_id, scope);
+                            continue;
+                        }
+                    }
+                    if tool_name == "TaskUpdate" && !tool_id.is_empty() {
+                        let task_id = input
+                            .get("taskId")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        if let Some(task_id) = task_id {
+                            let scope = child_scope.map(str::to_string);
+                            let fold = self.task_list_folds.entry(scope).or_default();
+                            let status = input
+                                .get("status")
+                                .and_then(|v| v.as_str())
+                                .map(normalize_plan_status);
+                            if status.as_deref() == Some("deleted") {
+                                fold.remove(task_id);
+                            } else {
+                                let subject = input
+                                    .get("subject")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string);
+                                fold.upsert(task_id, subject, status);
+                            }
+                            self.plan_tools.insert(tool_id, "TaskUpdate");
+                            out.events.push(AgentEvent::PlanUpdate {
+                                entries: fold.entries(),
+                            });
                             continue;
                         }
                     }
@@ -1264,12 +1427,31 @@ impl CcReader {
             return;
         }
 
-        if self.plan_tools.remove(&tool_id) {
-            // TodoWrite's acknowledgment is bookkeeping — the PlanUpdate
+        if let Some(scope) = self.pending_task_creates.remove(&tool_id) {
+            // TaskCreate's result is bookkeeping like TodoWrite's, but it
+            // carries the one fact the input lacked: the assigned task id.
+            // Adopt it so later TaskUpdates land on this entry.
+            let fold = self.task_list_folds.entry(scope).or_default();
+            let provisional = format!("pending:{tool_id}");
+            if is_error {
+                fold.remove(&provisional);
+                out.events.push(AgentEvent::PlanUpdate {
+                    entries: fold.entries(),
+                });
+                let message: String = content_text.chars().take(200).collect();
+                out.log("warn", format!("TaskCreate failed: {}", message.trim()));
+            } else if let Some(id) = cc_created_task_id(&content_text) {
+                fold.rekey(&provisional, id);
+            }
+            return;
+        }
+
+        if let Some(plan_tool) = self.plan_tools.remove(&tool_id) {
+            // The plan tool's acknowledgment is bookkeeping — the PlanUpdate
             // already rendered. Failures still surface.
             if is_error {
                 let message: String = content_text.chars().take(200).collect();
-                out.log("warn", format!("TodoWrite failed: {}", message.trim()));
+                out.log("warn", format!("{plan_tool} failed: {}", message.trim()));
             }
             return;
         }
@@ -3277,7 +3459,7 @@ mod tests {
         // Not an open tool (nothing to force-close at turn end), but marked
         // so its acknowledgment result is dropped.
         assert!(reader.open_tools.is_empty());
-        assert!(reader.plan_tools.contains("td1"));
+        assert!(reader.plan_tools.contains_key("td1"));
     }
 
     #[test]
@@ -3292,7 +3474,7 @@ mod tests {
             "acknowledgment must be dropped, got {:?}",
             out.events
         );
-        assert!(!reader.plan_tools.contains("td1"));
+        assert!(!reader.plan_tools.contains_key("td1"));
     }
 
     #[test]
@@ -3352,6 +3534,190 @@ mod tests {
                             if entries.len() == 1 && entries[0].0 == "Child step"
                     )
         )));
+    }
+
+    // ---------------------------------------------------------------
+    // TaskCreate / TaskUpdate → PlanUpdate (incremental fold)
+    // ---------------------------------------------------------------
+
+    const TASK_CREATE_USE: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tc1","name":"TaskCreate","input":{"subject":"Fix the login bug","description":"Trace the redirect loop and fix it"}}]},"session_id":"s1"}"#;
+    // Result text as emitted live by Claude Code 2.1.201 (haiku probe,
+    // 2026-07-07): the assigned id only surfaces here.
+    const TASK_CREATE_RESULT: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tc1","content":"Task #7 created successfully: Fix the login bug","is_error":false}]},"session_id":"s1"}"#;
+
+    #[test]
+    fn task_create_renders_as_plan_update() {
+        let mut reader = test_reader();
+        let out = reader.process_line(TASK_CREATE_USE);
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolStarted { .. })),
+            "TaskCreate must not double-render as a plain tool"
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PlanUpdate { entries }
+                if entries.len() == 1
+                    && entries[0] == ("Fix the login bug".into(), String::new(), "pending".into())
+        )));
+        assert!(reader.open_tools.is_empty());
+        assert!(reader.pending_task_creates.contains_key("tc1"));
+    }
+
+    #[test]
+    fn task_create_result_assigns_id_and_is_suppressed() {
+        let mut reader = test_reader();
+        reader.process_line(TASK_CREATE_USE);
+        let out = reader.process_line(TASK_CREATE_RESULT);
+        assert!(
+            out.events.is_empty(),
+            "the id-bearing ack must be dropped, got {:?}",
+            out.events
+        );
+        assert!(!reader.pending_task_creates.contains_key("tc1"));
+        // A follow-up update by the assigned id lands on the same entry.
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu1","name":"TaskUpdate","input":{"taskId":"7","status":"in_progress"}}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PlanUpdate { entries }
+                if entries.len() == 1
+                    && entries[0]
+                        == ("Fix the login bug".into(), String::new(), "inprogress".into())
+        )));
+    }
+
+    #[test]
+    fn task_update_upserts_unknown_ids_and_suppresses_its_ack() {
+        let mut reader = test_reader();
+        // An update for a task created before this supervisor attached
+        // still materializes a row (placeholder subject).
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu2","name":"TaskUpdate","input":{"taskId":"3","status":"completed"}}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PlanUpdate { entries }
+                if entries.len() == 1
+                    && entries[0] == ("Task #3".into(), String::new(), "completed".into())
+        )));
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu2","content":"Updated task #3","is_error":false}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.is_empty(), "ack must drop, got {:?}", out.events);
+        // A failed update still surfaces, named after its tool.
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu3","name":"TaskUpdate","input":{"taskId":"3","subject":"Renamed"}}]},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu3","content":"no such task","is_error":true}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message }
+                if level == "warn"
+                    && message.contains("TaskUpdate")
+                    && message.contains("no such task")
+        )));
+    }
+
+    #[test]
+    fn task_update_deleted_removes_the_entry() {
+        let mut reader = test_reader();
+        reader.process_line(TASK_CREATE_USE);
+        reader.process_line(TASK_CREATE_RESULT);
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu4","name":"TaskUpdate","input":{"taskId":"7","status":"deleted"}}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PlanUpdate { entries } if entries.is_empty()
+        )));
+    }
+
+    #[test]
+    fn failed_task_create_retracts_the_entry() {
+        let mut reader = test_reader();
+        reader.process_line(TASK_CREATE_USE);
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tc1","content":"task registry unavailable","is_error":true}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PlanUpdate { entries } if entries.is_empty()
+        )));
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message }
+                if level == "warn"
+                    && message.contains("TaskCreate")
+                    && message.contains("task registry unavailable")
+        )));
+    }
+
+    #[test]
+    fn task_tools_fold_per_scope() {
+        let mut reader = test_reader();
+        reader.process_line(TASK_CREATE_USE);
+        reader.process_line(TASK_CREATE_RESULT);
+        spawn_task(&mut reader);
+        // The child's create folds into its own list — one entry, scoped —
+        // not into the main thread's.
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tc9","name":"TaskCreate","input":{"subject":"Child task","description":"child work"}}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::PlanUpdate { entries }
+                            if entries.len() == 1 && entries[0].0 == "Child task"
+                    )
+        )));
+        // The main thread's next snapshot still holds only its own task.
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu9","name":"TaskUpdate","input":{"taskId":"7","status":"in_progress"}}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PlanUpdate { entries }
+                if entries.len() == 1 && entries[0].0 == "Fix the login bug"
+        )));
+    }
+
+    #[test]
+    fn task_create_without_subject_falls_back_to_plain_tool() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tc2","name":"TaskCreate","input":{"description":"orphan"}}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolStarted { item_id, tool_name, .. }
+                if item_id == "tc2" && tool_name == "TaskCreate"
+        )));
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::PlanUpdate { .. })),
+            "a subject-less create is not a plan"
+        );
+        assert!(reader.pending_task_creates.is_empty());
+    }
+
+    #[test]
+    fn created_task_id_parses_liberally() {
+        assert_eq!(
+            cc_created_task_id("Created task #12: Do the thing"),
+            Some("12".to_string())
+        );
+        assert_eq!(cc_created_task_id("Task #3 created"), Some("3".to_string()));
+        assert_eq!(cc_created_task_id("no id here"), None);
+        assert_eq!(cc_created_task_id("trailing hash # only"), None);
     }
 
     #[test]

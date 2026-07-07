@@ -87,11 +87,17 @@ fn b64u_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)
 }
 
-fn default_identity_path() -> PathBuf {
+/// The daemon-identity state directory — also home to small identity-
+/// adjacent records (the signed Connect claim acknowledgment) so they
+/// live and die with the key they relate to.
+pub fn default_identity_dir() -> PathBuf {
     dirs::data_dir()
         .map(|d| d.join("intendant").join(IDENTITY_DIR))
         .unwrap_or_else(|| std::env::temp_dir().join("intendant").join(IDENTITY_DIR))
-        .join(ED25519_PKCS8_FILE)
+}
+
+fn default_identity_path() -> PathBuf {
+    default_identity_dir().join(ED25519_PKCS8_FILE)
 }
 
 #[cfg(unix)]

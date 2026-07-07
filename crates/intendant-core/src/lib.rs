@@ -9,3 +9,5 @@ pub mod autonomy;
 pub mod error;
 pub mod frames;
 pub mod net;
+pub mod usage;
+pub mod vitals;

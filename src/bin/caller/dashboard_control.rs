@@ -128,6 +128,13 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     method("api_access_iam_state", PeerOperation::AccessInspect),
     method("api_access_enrollment_requests", PeerOperation::AccessInspect),
     method("api_dashboard_targets", PeerOperation::AccessInspect),
+    // Connect rendezvous administration. Status is inspect-grade and
+    // never carries the claim phrase; the phrase reveal, config toggle,
+    // and unclaim are manage-gated (mirrors the HTTP route rows).
+    method("api_access_connect_status", PeerOperation::AccessInspect),
+    method("api_access_connect_claim_code", PeerOperation::AccessManage),
+    method("api_access_connect_config", PeerOperation::AccessManage),
+    method("api_access_connect_unclaim", PeerOperation::AccessManage),
     // Credential custody (vault leases + client egress): granting, renewing,
     // revoking, and even reading lease status all sit behind the dedicated
     // gate — a scoped guest session can neither fuel nor drain a daemon, nor
@@ -358,6 +365,9 @@ fn control_method_runtime_ready(runtime: &ControlRuntime, method: &str) -> bool 
         | "api_peer_dashboard_control_signal"
         | "api_coordinator_route" => runtime.peer_registry.is_some(),
         "api_settings_save" => runtime.project_root.is_some(),
+        "api_access_connect_config" | "api_access_connect_unclaim" => {
+            runtime.project_root.is_some()
+        }
         "api_mcp_tool_call" => runtime.mcp_server.is_some(),
         method if method.starts_with("api_transfer_") => runtime.project_root.is_some(),
         method if method.starts_with("api_display_input_authority_") => {
@@ -2796,6 +2806,38 @@ fn control_frame_response(
                         })),
                     }
                 }
+                "api_access_connect_status" => Some(serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": true,
+                    "result": crate::web_gateway::access_connect_status_response_value(),
+                })),
+                "api_access_connect_claim_code" => Some(serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": true,
+                    "result": crate::web_gateway::access_connect_claim_code_response_value(),
+                })),
+                "api_access_connect_config" => {
+                    let params = params.unwrap_or_else(|| serde_json::json!({}));
+                    match crate::web_gateway::access_connect_config_response_value(
+                        params,
+                        runtime.project_root.as_deref(),
+                    ) {
+                        Ok(result) => Some(serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": true,
+                            "result": result,
+                        })),
+                        Err(error) => Some(serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": false,
+                            "error": error,
+                        })),
+                    }
+                }
                 "api_access_org_trust"
                 | "api_access_org_revoke"
                 | "api_access_org_issue"
@@ -3030,6 +3072,7 @@ fn control_frame_response(
                 | "api_peer_pairing_identities"
                 | "api_peer_pairing_identity_revoke"
                 | "api_credential_egress_probe"
+                | "api_access_connect_unclaim"
                 | "api_coordinator_route" => {
                     spawn_control_request(
                         id,
@@ -4628,6 +4671,26 @@ async fn control_request_response(
     match method.as_str() {
         "api_credential_egress_probe" => {
             api_credential_egress_probe_response(id, params.as_ref()).await
+        }
+        "api_access_connect_unclaim" => {
+            match crate::web_gateway::access_connect_unclaim_response_value(
+                runtime.project_root.clone(),
+            )
+            .await
+            {
+                Ok(result) => serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": true,
+                    "result": result,
+                }),
+                Err(error) => serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": false,
+                    "error": error,
+                }),
+            }
         }
         "api_sessions" => api_sessions_response(id, params.as_ref()).await,
         "api_session_detail" => api_session_detail_response(id, params.as_ref()).await,

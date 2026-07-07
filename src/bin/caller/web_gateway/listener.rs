@@ -540,7 +540,7 @@ pub fn spawn_web_gateway(
         ice_config.clone(),
         Arc::clone(&tcp_peer_registry),
     ));
-    let _connect_rendezvous_handle = crate::connect_rendezvous::spawn_connect_rendezvous_client(
+    crate::connect_rendezvous::spawn_connect_rendezvous_client(
         config.connect.clone(),
         dashboard_control.clone(),
     );
@@ -3406,6 +3406,31 @@ mod tests {
         handle.abort();
     }
 
+    /// Rebind with a bounded retry on `AddrInUse` only. The drop→rebind
+    /// window in these tests can lose the ephemeral port to a concurrent
+    /// `bind(:0)` in a parallel test — the kernel recycles just-freed ports
+    /// eagerly, and a loaded CI box makes the theft real (a merge-group
+    /// ejection on 2026-07-07 was exactly this). The helper under test sets
+    /// SO_REUSEADDR, so the only systematic `AddrInUse` source is a socket
+    /// that is genuinely still bound — which keeps failing past the
+    /// deadline and still fails the test.
+    async fn rebind_with_patience(
+        addr: std::net::SocketAddr,
+    ) -> std::io::Result<TcpListener> {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            match rebind_dead_tcp_listener(addr) {
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::AddrInUse
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// The gateway must be able to re-establish its listener on the exact
     /// address a dead one occupied (accept() EINVAL/EBADF recovery path),
     /// and the fresh listener must actually accept connections.
@@ -3415,7 +3440,9 @@ mod tests {
         let addr = original.local_addr().unwrap();
         drop(original);
 
-        let rebound = rebind_dead_tcp_listener(addr).expect("rebind on the freed address");
+        let rebound = rebind_with_patience(addr)
+            .await
+            .expect("rebind on the freed address");
         assert_eq!(rebound.local_addr().unwrap(), addr);
 
         let (client, (server, _peer)) = tokio::join!(
@@ -3443,6 +3470,6 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
 
         drop(holder);
-        assert!(rebind_dead_tcp_listener(addr).is_ok());
+        assert!(rebind_with_patience(addr).await.is_ok());
     }
 }

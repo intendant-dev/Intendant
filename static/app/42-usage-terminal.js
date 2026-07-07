@@ -707,6 +707,79 @@ async function accessDecideEnrollment(fingerprint, approve, roleId) {
   renderAccessAdminSummaries();
 }
 
+/* Intendant Connect status for THIS daemon (hosted rendezvous
+   reachability + claim binding). Pull-based like the overview. The
+   twelve-word claim phrase is NEVER in this payload — it has its own
+   manage-gated fetch (`accessConnectFetchClaimCode`), pulled only on an
+   explicit reveal click. */
+let accessConnectStatus = null;
+
+async function refreshAccessConnectStatus(options = {}) {
+  try {
+    const resp = await dashboardJsonFetch('api_access_connect_status', {}, () => authedFetch('/api/access/connect/status', {
+      cache: 'no-store',
+      signal: options.signal,
+    }), 'api_access_connect_status', { signal: options.signal });
+    if (!resp.ok) throw new Error(`/api/access/connect/status returned ${resp.status}`);
+    const payload = await resp.json();
+    const changed = JSON.stringify(payload) !== JSON.stringify(accessConnectStatus);
+    accessConnectStatus = payload;
+    if (changed) renderAccessAdminSummaries();
+    return payload;
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    if (!options.silent) console.warn('[access-connect] status refresh failed', err);
+    return null;
+  }
+}
+
+async function accessConnectFetchClaimCode() {
+  const resp = await dashboardJsonFetch('api_access_connect_claim_code', {}, () => authedFetch('/api/access/connect/claim-code', {
+    cache: 'no-store',
+  }), 'api_access_connect_claim_code', { fallbackAfterRpcFailure: false });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+  return data;
+}
+
+async function accessConnectSetEnabled(enabled, rendezvousUrl) {
+  const payload = { enabled };
+  if (rendezvousUrl) payload.rendezvous_url = rendezvousUrl;
+  try {
+    const resp = await dashboardJsonFetch('api_access_connect_config', payload, () => authedFetch('/api/access/connect/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }), 'api_access_connect_config', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    showControlToast?.('success', enabled
+      ? 'Connect enabled — this daemon is registering with the rendezvous'
+      : 'Connect disabled');
+  } catch (err) {
+    showControlToast?.('error', err?.message || 'Connect config change failed');
+  }
+  await refreshAccessConnectStatus({ silent: true }).catch(() => null);
+  renderAccessAdminSummaries();
+}
+
+async function accessConnectUnclaim() {
+  try {
+    const resp = await dashboardJsonFetch('api_access_connect_unclaim', {}, () => authedFetch('/api/access/connect/unclaim', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }), 'api_access_connect_unclaim', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    showControlToast?.('success', 'Claim released — a fresh claim phrase will mint shortly');
+  } catch (err) {
+    showControlToast?.('error', err?.message || 'Unclaim failed');
+  }
+  await refreshAccessConnectStatus({ silent: true }).catch(() => null);
+  renderAccessAdminSummaries();
+}
+
 function upsertDashboardAccessTarget(target) {
   const normalized = normalizeDashboardAccessTarget(target);
   if (!normalized) return;

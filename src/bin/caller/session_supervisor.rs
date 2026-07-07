@@ -32,6 +32,10 @@ pub struct SessionSupervisorConfig {
     /// Live display sessions, when the daemon runs a display pipeline. CU
     /// screenshots prefer their in-memory frames over subprocess capture.
     pub session_registry: Option<display::SharedSessionRegistry>,
+    /// Federated peer registry, when the daemon runs the web gateway.
+    /// Backs the native `peer` tool in supervised sessions; None makes
+    /// the tool answer with a federation-inactive note.
+    pub peer_registry: Option<peer::PeerRegistry>,
     pub web_port: Option<u16>,
     pub flags_direct: bool,
     pub shared_session: Option<web_gateway::SharedActiveSession>,
@@ -2315,6 +2319,7 @@ impl SessionSupervisor {
                     approval_registry,
                     context_injection,
                     supervisor.config.session_registry.clone(),
+                    supervisor.config.peer_registry.clone(),
                     true,
                     attachments,
                     native,
@@ -5508,6 +5513,7 @@ mod tests {
             project_root: Some(project_root),
             autonomy: crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
             session_registry: None,
+            peer_registry: None,
             shared_external_agent: Arc::new(tokio::sync::RwLock::new(None)),
             shared_codex_config: Arc::new(tokio::sync::RwLock::new(
                 control_plane::CodexRuntimeConfig {

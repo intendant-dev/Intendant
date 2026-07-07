@@ -590,6 +590,11 @@ pub struct ConnectConfig {
     pub retry_delay_ms: u64,
 }
 
+/// Rendezvous applied when `[connect] enabled = true` names no
+/// `rendezvous_url` — the default hosted instance. The dashboard's
+/// Connect toggle writes exactly that minimal shape.
+pub const DEFAULT_CONNECT_RENDEZVOUS_URL: &str = "https://connect.intendant.dev";
+
 impl ConnectConfig {
     pub fn effective_with_env(mut self) -> Self {
         if let Ok(url) = std::env::var("INTENDANT_CONNECT_RENDEZVOUS_URL") {
@@ -611,7 +616,26 @@ impl ConnectConfig {
                 self.auth_token = Some(token);
             }
         }
+        if self.enabled
+            && self
+                .rendezvous_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .is_none()
+        {
+            self.rendezvous_url = Some(DEFAULT_CONNECT_RENDEZVOUS_URL.to_string());
+        }
         self
+    }
+
+    /// Whether enablement is forced by `INTENDANT_CONNECT_RENDEZVOUS_URL`
+    /// — the dashboard toggle can write `intendant.toml` but cannot win
+    /// against the environment, so it surfaces this instead of pretending.
+    pub fn env_forced() -> bool {
+        std::env::var("INTENDANT_CONNECT_RENDEZVOUS_URL")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
     }
 }
 

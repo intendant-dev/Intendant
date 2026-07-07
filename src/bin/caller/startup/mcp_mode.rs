@@ -149,6 +149,10 @@ pub(crate) async fn run_mcp_mode(
     mcp_app_state.task_description = task.clone().unwrap_or_default();
     mcp_app_state.frame_registry = Some(frame_registry.clone());
     mcp_app_state.session_registry = Some(session_registry.clone());
+    let mcp_peer_registry = _web_handle
+        .as_ref()
+        .map(|gateway| gateway.peer_registry.clone());
+    mcp_app_state.peer_registry = mcp_peer_registry.clone();
     mcp_app_state.screenshot_dir = Some(log_dir.join("screenshots"));
     let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(mcp_app_state));
 
@@ -161,6 +165,7 @@ pub(crate) async fn run_mcp_mode(
     let log_dir_for_launcher = log_dir.clone();
     let mcp_state_for_launcher = mcp_state.clone();
     let session_registry_for_launcher = session_registry.clone();
+    let peer_registry_for_launcher = mcp_peer_registry.clone();
     #[allow(clippy::async_yields_async)]
     let launcher: mcp::TaskLauncher = Box::new(move |task_str: String, bus: EventBus| {
         let project_root = project_root.clone();
@@ -169,6 +174,7 @@ pub(crate) async fn run_mcp_mode(
         let _parent_log_dir = log_dir_for_launcher.clone();
         let mcp_state = mcp_state_for_launcher.clone();
         let session_registry = session_registry_for_launcher.clone();
+        let peer_registry = peer_registry_for_launcher.clone();
         Box::pin(async move {
             // Each MCP task gets a fresh session directory so conversations
             // don't bleed between tasks (reasoning items, tool calls, etc.).
@@ -292,6 +298,7 @@ pub(crate) async fn run_mcp_mode(
                         approval_registry,
                         event::ContextInjectionQueue::default(),
                         Some(session_registry),
+                        peer_registry,
                         false, // not headless — MCP has interactive approval
                         UserAttachments::default(),
                         NativeSessionConfig::direct(),

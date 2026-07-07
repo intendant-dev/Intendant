@@ -21,6 +21,7 @@ pub(crate) struct DaemonConfig {
     pub(crate) shared_claude_config: control_plane::SharedClaudeConfig,
     pub(crate) frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     pub(crate) session_registry: Option<display::SharedSessionRegistry>,
+    pub(crate) peer_registry: Option<peer::PeerRegistry>,
     pub(crate) web_port: Option<u16>,
     pub(crate) flags_direct: bool,
     /// Optional shared session state for headless mode (cleared between tasks).
@@ -46,6 +47,7 @@ pub(crate) async fn run_daemon_loop(config: DaemonConfig) {
         shared_claude_config: config.shared_claude_config,
         frame_registry: config.frame_registry,
         session_registry: config.session_registry,
+        peer_registry: config.peer_registry,
         web_port: config.web_port,
         flags_direct: config.flags_direct,
         shared_session: config.shared_session,
@@ -189,6 +191,7 @@ pub(crate) async fn run_daemon(
             shared_claude_config,
             frame_registry,
             session_registry: Some(session_registry.clone()),
+            peer_registry: Some(gateway.peer_registry.clone()),
             web_port: web_port_for_agent,
             flags_direct: flags.direct,
             shared_session: Some(shared_session),

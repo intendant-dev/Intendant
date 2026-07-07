@@ -229,6 +229,23 @@ active holder.
 |--------------------|-------------|--------|
 | `spawn_live_audio` | Spawn an untrusted [live-audio](./computer-use-and-audio.md#live-audio) voice session. | `id`, `provider`, `playbook`, `response_schema`, … |
 
+### Peer federation
+
+The stage-0 agent-facing surface for [peer federation](./peer-federation.md):
+inspect the peer roster and delegate work to sibling daemons. `list_peers` is
+gated as `peer.inspect` (same classification as `GET /api/peers`);
+`peer_send_message` and `peer_delegate_task` are gated as `peer.use` — acting
+through a peer delegates this daemon's peer identity, and the receiving peer
+authorizes the request against its own grants for this daemon. A delegated
+task runs on the peer's machine under the peer's own autonomy/approval policy;
+no display/computer-use invocation on peers rides this surface yet.
+
+| Tool                 | Description | Params |
+|----------------------|-------------|--------|
+| `list_peers`         | Peer snapshot list — id, label, connection state, capabilities, sessions (same payload as `GET /api/peers`). | — |
+| `peer_send_message`  | Send a message to a peer's agent. | `peer_id`, `message`, `session?` |
+| `peer_delegate_task` | Delegate a task executed by the peer's own agent; returns `task_id`. | `peer_id`, `instructions`, `context?` |
+
 ### Controller Orchestration
 
 | Tool                            | Description | Params |

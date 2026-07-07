@@ -550,6 +550,30 @@ pub struct CaptureSharedViewFrameParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PeerSendMessageParams {
+    /// Peer daemon id, as returned by list_peers.
+    pub peer_id: String,
+    /// Message text delivered to the peer's agent.
+    pub message: String,
+    /// Optional peer-side session id to scope the message to. Omit to
+    /// address the peer's current/default session.
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PeerDelegateTaskParams {
+    /// Peer daemon id, as returned by list_peers.
+    pub peer_id: String,
+    /// Free-form natural-language instructions for the peer's agent.
+    pub instructions: String,
+    /// Optional structured context passed through to the peer (file
+    /// paths, prior state, anything not expressible in the instructions).
+    #[serde(default)]
+    pub context: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScheduleControllerRestartParams {
     /// Identifier for the controlling agent/client (e.g. "codex", "claude_code").
     pub controller_id: String,

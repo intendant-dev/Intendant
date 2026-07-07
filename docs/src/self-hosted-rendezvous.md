@@ -55,11 +55,44 @@ auth_token = "<the --daemon-token value>"
 ```
 
 or via `INTENDANT_CONNECT_RENDEZVOUS_URL`, `INTENDANT_CONNECT_DAEMON_ID`,
-and `INTENDANT_CONNECT_TOKEN`. On startup the daemon registers and prints
-a claim URL; opening it signs the account in (passkey) and binds the
-daemon to it. Claiming grants **no authority** — sessions still resolve
-against the daemon's local IAM (see the role ceilings and org lanes in
-the trust chapter).
+and `INTENDANT_CONNECT_TOKEN`. `enabled = true` with no `rendezvous_url`
+defaults to the hosted instance. The dashboard's **Access → Intendant
+Connect** card drives all of this without touching the file: it toggles
+`enabled`, shows registration/claim state, and reveals the claim phrase
+to manage-grade sessions.
+
+## Claiming, co-signed bindings, and release
+
+An unclaimed daemon's register response carries a 12-word BIP39 claim
+phrase (10-minute TTL, hash-at-rest, reminted on expiry) plus a claim
+URL; the daemon shows them in its startup log and in the Access card.
+Entering the phrase while signed in (passkey) starts a claim: the
+service challenges the daemon, and the daemon signs a proof.
+
+Claim proofs come in two shapes. `intendant-connect-claim-v1` is
+account-blind (legacy). `intendant-connect-claim-v2` — signed whenever
+the challenge names the claiming account — binds the account's user id
+and handle into the payload the **daemon** signs, so the account↔daemon
+binding is co-signed by the daemon's own identity key instead of resting
+on the service's assertion. The daemon persists that acknowledgment
+beside its identity key, and every later register response returns the
+service-asserted owner (`claimed_by_user_id`/`claimed_by_handle`); the
+daemon cross-checks the two and surfaces the result in the Access card
+as **co-signed**, **service-asserted**, or **mismatch** (a re-bind the
+daemon never acknowledged). The transparency log records which proof
+protocol sealed each claim.
+
+Claiming grants **no authority** — sessions still resolve against the
+daemon's local IAM (see the role ceilings and org lanes in the trust
+chapter).
+
+Bindings are releasable from both sides, and both paths append
+`daemon_unclaimed` transparency-log entries: the account owner revokes
+from the service UI, and the **daemon** posts a timestamp-fresh release
+signed with its identity key to `POST /api/daemon/unclaim` — the
+recovery verb for a squatted or mis-claimed box (whose claiming account
+would never revoke), also exposed as the Access card's "Release claim".
+A fresh claim phrase mints on the next register poll.
 
 ## Revocation bulletin board
 

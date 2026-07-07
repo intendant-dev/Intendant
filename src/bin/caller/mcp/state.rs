@@ -74,6 +74,10 @@ pub struct McpAppState {
     pub frame_registry: Option<Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
     /// Display session registry for CU action dispatch.
     pub session_registry: Option<crate::display::SharedSessionRegistry>,
+    /// Federated peer registry for the peer tools (`list_peers`,
+    /// `peer_send_message`, `peer_delegate_task`). `None` when this
+    /// process runs without federation (standalone `--mcp`, tests).
+    pub peer_registry: Option<crate::peer::PeerRegistry>,
     /// User-session display IDs with an activation/portal request already in
     /// flight, keyed by when MCP/ctl last requested activation. This keeps
     /// screenshot loops from queueing duplicate Wayland portal sessions while
@@ -199,6 +203,7 @@ impl McpAppState {
             presence_usage_pct: 0.0,
             frame_registry: None,
             session_registry: None,
+            peer_registry: None,
             user_display_activation_pending: std::collections::HashMap::new(),
             display_capture_ready: HashSet::new(),
             screenshot_dir: None,

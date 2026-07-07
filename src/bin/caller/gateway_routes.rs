@@ -251,6 +251,10 @@ pub(crate) enum RouteHandlerId {
     AccessEnrollmentRequests,
     AccessIamState,
     AccessOverview,
+    AccessConnectStatus,
+    AccessConnectClaimCode,
+    AccessConnectConfig,
+    AccessConnectUnclaim,
     DashboardTargets,
     /// The whole /api/peers registry + pairing sub-router, moved
     /// verbatim (its internal shapes stay as they were; leaf-shape
@@ -921,6 +925,42 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::AccessOverview,
         "Access overview for the calling principal",
+    ),
+    // ── Connect rendezvous administration. Status is inspect-grade but
+    //    never carries the claim phrase; the phrase reveal is its own
+    //    manage-gated route so the one secret-bearing response has the
+    //    strictest gate.
+    fleet_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/access/connect/status"),
+        PeerOperation::AccessInspect,
+        BodyPolicy::None,
+        RouteHandlerId::AccessConnectStatus,
+        "Connect rendezvous status (claim state, binding provenance; no claim phrase)",
+    ),
+    fleet_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/access/connect/claim-code"),
+        PeerOperation::AccessManage,
+        BodyPolicy::None,
+        RouteHandlerId::AccessConnectClaimCode,
+        "Reveal the current twelve-word claim phrase (unclaimed daemons only)",
+    ),
+    fleet_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/access/connect/config"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessConnectConfig,
+        "Enable/disable the Connect client (persists to intendant.toml, applies live)",
+    ),
+    fleet_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/access/connect/unclaim"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessConnectUnclaim,
+        "Release this daemon's claim binding at the rendezvous (daemon-signed)",
     ),
     op_route(
         RouteMethod::Get,
