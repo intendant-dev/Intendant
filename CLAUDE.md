@@ -104,7 +104,7 @@ src/
 │   ├── display/                # WebRTC: encode/{pool,vp8,h264_*}, tile/, capture/, webrtc, {x11,wayland,macos,windows}
 │   ├── computer_use.rs, ax.rs, vision.rs, recording.rs, frames.rs
 │   ├── presence.rs, live_audio.rs, audio_routing.rs, transcription.rs, quarantine.rs, schema_validator.rs
-│   ├── web_gateway/                # HTTP/WS gateway: listener (accept/TLS/WS dispatch), http, routes_{sessions,files,peers,access}, session_catalog/, settings, access_gates, input_authority, dashboard_presence, connect_bootstrap, peer_requests, agent_card, mcp_gate, static_assets
+│   ├── web_gateway/                # HTTP/WS gateway: listener (accept/TLS), ws_session (WS tasks), http_dispatch (route dispatch), http, routes_{sessions,files,peers,access}, session_catalog/, settings, access_gates, input_authority, dashboard_presence, connect_bootstrap, peer_requests, agent_card, mcp_gate, static_assets
 │   ├── dashboard_control.rs, terminal.rs, browser_workspace.rs   # dashboard tunnel; PTY registry; agent browser
 │   ├── mcp/, mcp_client.rs, control.rs
 │   ├── transfer_store.rs, upload_store.rs, peer_file_transfer.rs   # transfer jobs; upload/attachment stores
@@ -155,7 +155,7 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   (`ROUTES`): dispatch, the pre-dispatch IAM classification, the OPTIONS
   preflight, and the docs endpoint table in `docs/src/web-dashboard.md` all
   derive from the declaration (the HTTP instance of "derive, don't mirror").
-  Never add an HTTP route by editing `web_gateway/listener.rs`'s dispatch chain —
+  Never add an HTTP route by editing `web_gateway/http_dispatch.rs`'s dispatch chain —
   add a table row plus a `RouteHandlerId` match arm; the row also declares the
   request-body policy (dispatch reads and caps the body before the handler
   runs). Unit tests enforce the table invariants, pin the docs chapter, and
@@ -272,6 +272,17 @@ queueing: the queue gate is the deterministic subset, not the full battery, and 
 red queue entry wastes everyone's cycle time. Never bypass the ruleset; if the
 queue itself is wedged, that is an operator (org-owner) decision.
 
+After arming auto-merge, confirm the PR actually **enters the queue** once its
+checks go green (GraphQL `pullRequest.mergeQueueEntry`; `autoMergeRequest`
+going null while queued is normal). Known stall: a job that dies mid-run
+(runner lost communication) and auto-recovers in place can leave its
+per-commit **check run** stuck at `failure` while the workflow run shows
+success — auto-merge reads the check run and waits forever. Detect it by
+comparing `gh pr checks` against `gh run view`; remedy with
+`gh run rerun --job <id>` to mint a fresh check run. Treat any
+"green run, armed auto-merge, still not queued after ~5 minutes" as this
+class of stall, not as normal latency.
+
 **Post-landing: fast-forward the shared mirror.** The queue owns origin/main;
 nothing updates the repo root's local `main` anymore. After your PR merges, run
 `git -C <repo-root> pull --ff-only` (and `git merge --ff-only origin/main` in
@@ -296,15 +307,19 @@ required checks pass, so a paths-skipped required check blocks queue entry
 (and on the group side wedges the entry at "Expected"). Only the push-to-main
 triggers keep paths filters — they exist for cache warming, not gating.
 
-All three legs run on the **self-hosted fleet** (`dell-206` =
-`intendant-linux`, `macbook-vm` = `intendant-macos`, `samsung-win` =
-`intendant-windows`) with persistent incremental `target/` dirs — warm gate
-runs are minutes, not half-hours. Self-hosted jobs carry a same-repo guard
-(fork-PR code never executes on our hardware), the Dell and Windows runners
-run as dedicated non-admin `ci` users, and the check *names* stay pinned to
-the `test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os`
-is the name key, `runner` is the placement):
-- **`windows.yml`** — cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Headless-safe: needs no display or API keys. **Required check.**
+Trusted refs (pushes, merge-queue refs, same-repo PRs) run on the
+**self-hosted fleet** (`dell-206` = `intendant-linux`, `macbook-vm` =
+`intendant-macos`, `samsung-win` = `intendant-windows`) with persistent
+incremental `target/` dirs — warm gate runs are minutes, not half-hours.
+**Fork PRs route to GitHub-hosted runners instead** (dynamic `runs-on`;
+`matrix.os` doubles as the hosted label): external code never executes on
+our hardware, yet its required checks really run. Fork-PR workflows also
+need maintainer approval before anything runs (all outside collaborators,
+not just first-timers). The Dell and Windows runners run as dedicated
+non-admin `ci` users, and the check *names* stay pinned to the
+`test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os` is
+the name key, `runner` is the fleet placement):
+- **`windows.yml`** — cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). On `pull_request` the Windows leg runs `cargo check` only (fast pre-queue signal); the full Windows suite runs in the merge group — the actual gate — and on pushes to main. Headless-safe: needs no display or API keys. **Required check.**
 - **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real release binaries on Linux + macOS. **Required check.**
 - **`app-html.yml`** — the `static/app/` fragments ↔ generated `static/app.html` regen gate. **Required check.**
 - **`agents-md-sync.yml`** — CLAUDE.md ↔ AGENTS.md byte-parity. **Required check.**
