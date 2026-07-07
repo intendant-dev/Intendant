@@ -1253,7 +1253,6 @@ pub(crate) async fn api_sessions_search_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
     use crate::dashboard_control::tests::{runtime};
 
     #[tokio::test]

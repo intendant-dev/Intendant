@@ -864,7 +864,6 @@ pub(crate) fn dashboard_control_error_response(id: String, message: impl Into<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
 
     #[test]
     fn oversized_response_frames_are_chunked_and_reassemble() {

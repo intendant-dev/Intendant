@@ -2093,7 +2093,6 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
     use crate::dashboard_control::tests::{runtime, scoped_user_client_grant};
 
     #[test]
