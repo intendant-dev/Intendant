@@ -1556,6 +1556,33 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Quick-search match inside the row's conversation preview. */
+.session-card .sc-preview-hit {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin: 3px 0 5px;
+  padding: 4px 7px;
+  border-left: 2px solid var(--mauve);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--mauve) 8%, transparent);
+  font-size: 12px;
+  color: var(--subtext0);
+}
+.session-card .sc-preview-hit-role {
+  flex: 0 0 auto;
+  color: var(--mauve);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.session-card .sc-preview-hit-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .session-card .sc-meta {
   display: flex;
   gap: 11px;

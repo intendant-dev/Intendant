@@ -1786,6 +1786,11 @@ function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
     return cached.text;
   }
   const totalBytes = session.total_bytes || 0;
+  // Server-side conversation preview (first user/assistant messages) —
+  // quick search reaches into conversation text without a Deep Search.
+  const previewText = Array.isArray(session.preview)
+    ? session.preview.map(p => (p && p.text) || '').filter(Boolean).join(' ')
+    : '';
   const fields = [
     session.session_id,
     shortId,
@@ -1821,6 +1826,7 @@ function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
     totalBytes > 0 ? `${_fmtBytes(totalBytes)} size` : '',
     session.total_tokens != null ? `${session.total_tokens} tokens` : '',
     session.estimated_cost != null ? `$${Number(session.estimated_cost).toFixed(4)}` : '',
+    previewText,
   ];
   const text = fields
     .filter(v => v !== null && v !== undefined && v !== '')

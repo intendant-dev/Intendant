@@ -158,9 +158,26 @@ function sessionCardDerived(m, ctx) {
   }
   const lineageChildren = sessionLineageChildrenForSession(ctx.lineageIndex, s, configMeta)
     .filter(child => !ctx.hideSubagents || sessionRelationshipKindForRow(child) !== 'subagent');
+  // Quick-search hit inside the conversation preview: surface the message
+  // matching the most query terms as a snippet line on the card (any-term
+  // picking made a stray "to" beat the entry holding the actual phrase).
+  let previewHit = null;
+  if (ctx.query && Array.isArray(s.preview)) {
+    const terms = ctx.query.split(/\s+/).filter(Boolean);
+    let bestScore = 0;
+    for (const p of s.preview) {
+      const text = String((p && p.text) || '').toLowerCase();
+      if (!text) continue;
+      const score = terms.reduce((n, term) => n + (text.includes(term) ? 1 : 0), 0);
+      if (score > bestScore) {
+        bestScore = score;
+        previewHit = p;
+      }
+    }
+  }
   return {
     configMeta, configSource, relationshipKind, backendSource, hasExternalBackend,
-    nickname, parentId, parent, parentLabel, lineageChildren,
+    nickname, parentId, parent, parentLabel, lineageChildren, previewHit,
   };
 }
 
@@ -172,11 +189,14 @@ function sessionCardSig(m, derived, ctx) {
   const hitSig = m.logHit
     ? `${m.logHit.matches || 0}\u001e${(((m.logHit.snippets || [])[0]) || {}).content || ''}`
     : '';
+  const previewHitSig = derived.previewHit
+    ? `${derived.previewHit.role || ''}\u001e${derived.previewHit.text || ''}`
+    : '';
   return JSON.stringify(m.s) + '\u001f' + JSON.stringify([
     m.displayStatus, m.isCurrent, m.source, ctx.viewingPeer,
     derived.relationshipKind, derived.configSource, derived.backendSource,
     derived.hasExternalBackend, derived.nickname, derived.parentId,
-    derived.parentLabel, childSig, hitSig,
+    derived.parentLabel, childSig, hitSig, previewHitSig,
   ]);
 }
 
@@ -300,6 +320,7 @@ function renderSessionsList(sessions, el, options = {}) {
     hideSubagents: !!options.hideSubagents,
     viewingPeer: sessionsViewingPeer(),
     currentSessionId,
+    query: options.query || '',
     lineageIndex: buildSessionLineageIndex(sessions),
   };
 
@@ -559,6 +580,24 @@ function buildSessionCard(m, derived, ctx) {
     hitText.title = firstSnippet.content || '';
     hitEl.appendChild(hitText);
     card.appendChild(hitEl);
+  }
+
+  // Quick-search hit inside the conversation preview: one quiet snippet
+  // line showing where the match lives. Deep Search keeps the log-hit row
+  // above for full-history matches.
+  if (derived.previewHit) {
+    const prevEl = document.createElement('div');
+    prevEl.className = 'sc-preview-hit';
+    const roleEl = document.createElement('span');
+    roleEl.className = 'sc-preview-hit-role';
+    roleEl.textContent = derived.previewHit.role === 'assistant' ? 'assistant' : 'user';
+    prevEl.appendChild(roleEl);
+    const textEl = document.createElement('span');
+    textEl.className = 'sc-preview-hit-text';
+    textEl.textContent = derived.previewHit.text || '';
+    textEl.title = derived.previewHit.text || '';
+    prevEl.appendChild(textEl);
+    card.appendChild(prevEl);
   }
 
   // Meta row — the full session id (click to copy) plus compact
