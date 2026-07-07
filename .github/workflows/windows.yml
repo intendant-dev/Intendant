@@ -111,6 +111,41 @@ jobs:
             cargo_debug: "2"
 
     steps:
+      # Fleet preflight: a self-hosted box with a nearly-full disk produces
+      # resource-kill "could not compile" failures with zero rustc
+      # diagnostics that read as toolchain corruption (a 2026-07-06 ENOSPC
+      # mid-compile burned three gate cycles before anyone suspected disk).
+      # Fail fast with the real reason instead. Load is reported but only
+      # warned on — it is spiky and self-correcting, disk is not. Hosted
+      # runners are ephemeral and provisioned per-run; they skip this.
+      - name: Fleet preflight (unix)
+        if: runner.environment != 'github-hosted' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          avail_kb=$(df -Pk . | awk 'NR==2 {print $4}')
+          avail_gb=$((avail_kb / 1024 / 1024))
+          echo "disk available: ${avail_gb}G"
+          if [ "$avail_gb" -lt 20 ]; then
+            echo "::error::fleet preflight: only ${avail_gb}G free on this runner — below the 20G floor. Reclaim disk (merged worktrees' target/ dirs are the usual culprits) and rerun."
+            exit 1
+          fi
+          cores=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          load=$(awk '{print $1}' /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg | awk '{print $2}')
+          echo "load average: $load (cores: $cores)"
+          awk -v l="$load" -v c="$cores" 'BEGIN { if (l > 3*c) print "::warning::fleet preflight: load " l " is over 3x the " c " cores — timing-sensitive tests may flake; consider draining the box" }'
+
+      - name: Fleet preflight (windows)
+        if: runner.environment != 'github-hosted' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $drive = (Get-Location).Path.Substring(0, 1)
+          $freeGB = [math]::Floor((Get-PSDrive $drive).Free / 1GB)
+          Write-Host "disk available: ${freeGB}G on ${drive}:"
+          if ($freeGB -lt 20) {
+            Write-Host "::error::fleet preflight: only ${freeGB}G free on ${drive}: — below the 20G floor. Reclaim disk (merged worktrees' target/ dirs are the usual culprits) and rerun."
+            exit 1
+          }
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # rustup ships preinstalled on the GitHub-hosted runners; just pin the
