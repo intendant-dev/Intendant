@@ -66,6 +66,9 @@ impl TestRig {
             .env_remove("PRESENCE_MODEL")
             .env_remove("CU_PROVIDER")
             .env_remove("CU_MODEL")
+            // A host shell exporting the Connect rendezvous URL would make
+            // the daemon-lane tests dial out; the suite is no-network.
+            .env_remove("INTENDANT_CONNECT_RENDEZVOUS_URL")
             .env("PROVIDER", "mock");
         cmd
     }
@@ -225,6 +228,240 @@ async fn direct_mode_writes_files_through_the_runtime() {
     let written = std::fs::read_to_string(&target)
         .unwrap_or_else(|e| panic!("artifact not written ({e}):\n{}", text_of(&output)));
     assert_eq!(written, "written by the mock e2e\n");
+}
+
+/// Append a child pipe's lines into a shared buffer as they arrive.
+fn drain_pipe_into(
+    pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    buf: std::sync::Arc<std::sync::Mutex<String>>,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::io::AsyncBufReadExt;
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(pipe).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(mut guard) = buf.lock() {
+                guard.push_str(&line);
+                guard.push('\n');
+            }
+        }
+    })
+}
+
+/// Poll a shared output buffer until `needle` appears (returning the full
+/// buffer) or the timeout elapses (panicking with the buffer for context).
+async fn wait_for_output(
+    buf: &std::sync::Arc<std::sync::Mutex<String>>,
+    needle: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let snapshot = buf.lock().map(|guard| guard.clone()).unwrap_or_default();
+        if snapshot.contains(needle) {
+            return snapshot;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for {needle:?} in daemon output:\n{snapshot}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Read WebSocket text frames until one satisfies `pred`, with a timeout.
+async fn wait_for_ws_event<S>(
+    ws: &mut S,
+    timeout: Duration,
+    mut pred: impl FnMut(&serde_json::Value) -> bool,
+) -> serde_json::Value
+where
+    S: futures_util::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    use futures_util::StreamExt;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_else(|| panic!("timed out waiting for a matching /ws event"));
+        let msg = tokio::time::timeout(remaining, ws.next())
+            .await
+            .expect("timed out waiting for a /ws event")
+            .expect("/ws stream ended unexpectedly")
+            .expect("/ws read failed");
+        if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                if pred(&json) {
+                    return json;
+                }
+            }
+        }
+    }
+}
+
+/// The daemon lane, projectless: booted from an empty (markerless) temp
+/// cwd it must come up serving — no cwd baseline scan, `project_root:
+/// null` on the gateway — run a CreateSession that carries an explicit
+/// `project_root` to completion, and fail one without it with the
+/// structured `no_project` error kind instead of adopting cwd.
+#[tokio::test]
+async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    let script = rig.write_script(&serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Working in the explicit project.",
+                  "tool_calls": [{ "name": "exec_command",
+                                   "arguments": { "nonce": 1, "command": "echo PROJECTLESS_E2E_ROUNDTRIP" } }] },
+                { "expect_transcript_contains": "PROJECTLESS_E2E_ROUNDTRIP",
+                  "content": "All work finished.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "projectless mock run complete" } }] }
+            ]
+        }]
+    }));
+    // The session's project: a real directory, distinct from the daemon's
+    // (empty, markerless) launch cwd, passed explicitly per session.
+    let session_project = tempfile::tempdir().expect("session project dir");
+
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script).args([
+        "--no-tls",
+        "--autonomy",
+        "full",
+        "--web",
+        "18921", // base only: the daemon scans forward if taken; the real
+                 // port is parsed from the "Dashboard:" startup line.
+    ]);
+    let mut child = cmd.spawn().expect("spawn intendant daemon");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let _stderr_drain = drain_pipe_into(child.stderr.take().expect("stderr"), stderr_buf.clone());
+    let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
+
+    // (a) It comes up projectless and serves.
+    let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
+    assert!(
+        stderr_so_far.contains("Projectless daemon:"),
+        "missing the projectless startup line:\n{stderr_so_far}"
+    );
+    assert!(
+        stderr_so_far.contains("rewind snapshots off: the daemon has no project"),
+        "the projectless daemon still tried to watch a project root:\n{stderr_so_far}"
+    );
+    let port: u16 = stderr_so_far
+        .lines()
+        .find_map(|line| {
+            let url = line.strip_prefix("Dashboard: http://")?;
+            url.rsplit(':').next()?.trim().parse().ok()
+        })
+        .expect("parse the dashboard port from the startup line");
+
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+    let project_root_body: serde_json::Value = loop {
+        match http.get(format!("{base}/api/project-root")).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                break resp.json().await.expect("project-root JSON")
+            }
+            _ if tokio::time::Instant::now() >= deadline => {
+                panic!("gateway never served /api/project-root");
+            }
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    };
+    assert!(
+        project_root_body.get("project_root").is_some_and(|v| v.is_null()),
+        "projectless daemon must report project_root: null, got {project_root_body}"
+    );
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // (c) CreateSession WITHOUT a project root: the structured failure,
+    // not a dead session and not a cwd-rooted one.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "create_session",
+            "task": "must not start without a project",
+            "direct": true,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send projectless create_session");
+    let ended = wait_for_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_ended")
+    })
+    .await;
+    assert_eq!(
+        ended.get("error_kind").and_then(|v| v.as_str()),
+        Some("no_project"),
+        "expected the structured no_project failure, got {ended}"
+    );
+    assert!(
+        ended
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .is_some_and(|reason| reason.contains("no project selected")),
+        "no_project reason should tell the user to pick a project, got {ended}"
+    );
+
+    // (b) CreateSession WITH an explicit project root runs the scripted
+    // task through the real stack to completion.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "create_session",
+            "task": "run the scripted command in the explicit project",
+            "project_root": session_project.path().to_string_lossy(),
+            "direct": true,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send rooted create_session");
+    let started = wait_for_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_started")
+            && json
+                .get("task")
+                .and_then(|v| v.as_str())
+                .is_some_and(|task| task.contains("explicit project"))
+    })
+    .await;
+    let started_id = started
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("session_started carries a session id")
+        .to_string();
+    let ended = wait_for_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_ended")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(started_id.as_str())
+    })
+    .await;
+    assert!(
+        ended.get("error_kind").is_none_or(|v| v.is_null()),
+        "explicit-project session must end cleanly, got {ended}"
+    );
+    let logs = rig.session_logs();
+    assert!(
+        logs.contains("projectless mock run complete"),
+        "session log missing the done signal:\n{logs}"
+    );
+    assert!(
+        logs.contains("PROJECTLESS_E2E_ROUNDTRIP") || rig.turn_artifacts().contains("PROJECTLESS_E2E_ROUNDTRIP"),
+        "missing the runtime round-trip evidence"
+    );
+
+    child.kill().await.expect("stop the daemon");
 }
 
 #[tokio::test]
