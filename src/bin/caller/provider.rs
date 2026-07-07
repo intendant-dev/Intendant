@@ -70,35 +70,9 @@ fn parse_sse_line(line: &str) -> Option<(&str, &str)> {
 /// Streaming timeout for SSE connections (10 minutes).
 const STREAM_TIMEOUT: Duration = Duration::from_secs(600);
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TokenUsage {
-    /// Full prompt-side context of the request, including cache reads and
-    /// cache writes. Every provider parser normalizes to this convention —
-    /// `cached_tokens` and `cache_creation_tokens` are subsets.
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub total_tokens: u64,
-    /// Tokens served from cache (subset of prompt_tokens, cheaper pricing).
-    #[serde(default)]
-    pub cached_tokens: u64,
-    /// Tokens written to cache this request (subset of prompt_tokens;
-    /// Anthropic bills these at a premium — providers without a write
-    /// concept leave 0).
-    #[serde(default)]
-    pub cache_creation_tokens: u64,
-    /// Prompt-cache TTL implied by this response's cache writes (Anthropic
-    /// 300s default, 3600s with the extended-TTL beta). `None` when the
-    /// response makes no flavor statement — consumers keep the last known
-    /// value or fall back to a provider default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_ttl_seconds: Option<u32>,
-    /// Provider rate-limit windows read from this response's headers
-    /// (Anthropic `anthropic-ratelimit-*`; empty for providers or
-    /// transports that expose none — the credential-egress relay strips
-    /// headers).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rate_limit_windows: Vec<crate::types::SessionLimitWindow>,
-}
+// TokenUsage is hoisted to intendant-core (its consumers span the event
+// vocabulary and session layers); re-exported at the old mount point.
+pub use intendant_core::usage::TokenUsage;
 
 /// Parse Anthropic's per-minute rate-limit headers into vitals windows.
 /// `-reset` is RFC 3339; a missing or unparsable header degrades to a

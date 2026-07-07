@@ -264,10 +264,17 @@ tokio = { version = "1.0", features = ["test-util"] }
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 security-framework = "3"
 
-# The access layer generates RSA daemon certs (RustCrypto `rsa`); keygen is
-# pure-Rust bignum math that runs ~25s per key unoptimized, and every
-# cert-touching test pays it. Optimizing just the arithmetic crates keeps
-# dev builds debuggable while making keygen near-release speed.
+# Optimize external dependencies even in dev builds. The pure-Rust crypto
+# stack (RustCrypto rsa/num-bigint-dig keygen, the p12 3DES/SHA-1 bundle
+# path) runs 10-50x slower unoptimized and every cert-touching test pays
+# it — RSA keygen alone was ~25s/key, and macOS peer-identity tests still
+# took 60s+ with only the rsa crates optimized. `"*"` matches
+# non-workspace crates only: our own code stays opt-level 0 and fully
+# debuggable, and deps rarely rebuild so the one-time cost is amortized
+# immediately.
+[profile.dev.package."*"]
+opt-level = 2
+# The bignum arithmetic under RSA keygen wants full optimization.
 [profile.dev.package.rsa]
 opt-level = 3
 [profile.dev.package.num-bigint-dig]
