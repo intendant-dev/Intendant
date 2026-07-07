@@ -191,6 +191,22 @@ fn find_free_display() -> u32 {
     0
 }
 
+/// The conventional agent virtual display (`:99`) when an X server is
+/// listening for it, judged by its socket in `/tmp/.X11-unix`. Callers
+/// use this to resolve the *default* computer-use display target on
+/// hosts with no registered capture session; explicit targets never
+/// consult it. Always `None` off Linux — virtual displays are Xvfb.
+pub fn conventional_virtual_display() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let socket = format!("/tmp/.X11-unix/X{}", PREFERRED_DISPLAY);
+        if std::path::Path::new(&socket).exists() {
+            return Some(PREFERRED_DISPLAY);
+        }
+    }
+    None
+}
+
 // ── Xvfb guard ──────────────────────────────────────────────────────────────
 
 /// Guard that kills the Xvfb process when dropped.

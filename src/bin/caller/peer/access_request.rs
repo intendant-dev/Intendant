@@ -618,7 +618,12 @@ fn request_id_for(request: &AccessRequestCreate, server_cert_fingerprint: &str) 
     hasher.update(b"\0");
     hasher.update(server_cert_fingerprint.as_bytes());
     let digest = hasher.finalize();
-    URL_SAFE_NO_PAD.encode(&digest[..18])
+    // The 'r' prefix keeps the id from ever starting with base64url's
+    // '-', which argv parsers (this CLI's `peer complete <id>` included)
+    // read as a flag. Ids are opaque: minted here once, carried on the
+    // wire and in store paths, never decoded — old unprefixed ids stay
+    // valid, and the CLI additionally tolerates their leading dash.
+    format!("r{}", URL_SAFE_NO_PAD.encode(&digest[..18]))
 }
 
 fn verification_code_for(
@@ -945,6 +950,37 @@ mod tests {
         };
 
         assert_eq!(effective_body_limit_bytes(&config), 1);
+    }
+
+    #[test]
+    fn minted_request_ids_are_flag_safe() {
+        let certs = tempfile::TempDir::new().unwrap();
+        setup_certs(certs.path());
+        let key = access::certs::generate_client_key_material().unwrap();
+        let request = AccessRequestCreate {
+            version: 1,
+            requester_label: "primary".into(),
+            public_key_pem: key.public_key_pem,
+            nonce: "0123456789abcdef".into(),
+            requested_profile: None,
+            requester_card_url: None,
+        };
+        let created = create_pending_request(
+            certs.path(),
+            request,
+            "https://target/.well-known/agent-card.json".into(),
+            Some("127.0.0.1".into()),
+            &PeerAccessRequestConfig::default(),
+        )
+        .unwrap();
+        // The id rides argv in `peer complete <id>`: a leading '-' reads
+        // as a flag. The 'r' prefix pins the invariant structurally.
+        assert!(
+            created.request_id.starts_with('r'),
+            "id not flag-safe: {}",
+            created.request_id
+        );
+        assert!(validate_request_id(&created.request_id).is_ok());
     }
 
     #[test]
