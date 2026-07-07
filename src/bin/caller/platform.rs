@@ -1126,6 +1126,90 @@ pub fn home_dir() -> std::path::PathBuf {
     }
 }
 
+/// The Intendant state root — where the daemon keeps session logs, the
+/// session-index cache, recordings, quarantine, leased credentials, access
+/// certs, and every other piece of machine-local daemon state.
+/// `~/.intendant` by default.
+///
+/// `$INTENDANT_HOME` overrides the root for the whole process (scratch
+/// daemons, hermetic harnesses, packaged installs): an absolute value is
+/// used verbatim as the state root — no `.intendant` component is appended —
+/// and a relative value resolves against the current directory at first use.
+///
+/// The resolution is computed **once at first use** and cached for the
+/// process lifetime (a state root that moved mid-process would split daemon
+/// state across two trees), so mutating `INTENDANT_HOME` after startup has
+/// no effect. Tests must thread explicit paths instead of mutating the
+/// environment (which races the parallel test runner anyway).
+///
+/// In unit-test builds (`cfg(test)`) the unset-`INTENDANT_HOME` default
+/// swaps from the live `~/.intendant` to a per-process scratch root under
+/// the OS temp dir: unit tests exercising call-time defaults must never
+/// read or write the developer's real daemon state (fixture session rows
+/// used to pollute the live dashboard, and tests observed the live
+/// daemon's concurrent writes — a flake class). Tests that assert on
+/// specific state files keep threading explicit `home`/path parameters;
+/// the scratch root only redirects paths nothing injected. It keeps a
+/// trailing `.intendant` component so shape-sensitive code
+/// (`external_wrapper_index::home_from_log_dir`) parses it like a real
+/// home's state root. This mirrors the `credential_audit::trail_path`
+/// precedent, now subsumed by this seam.
+pub fn intendant_home() -> std::path::PathBuf {
+    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        intendant_home_override(std::env::var_os("INTENDANT_HOME")).unwrap_or_else(|| {
+            #[cfg(test)]
+            {
+                std::env::temp_dir()
+                    .join(format!("intendant-test-home-{}", std::process::id()))
+                    .join(".intendant")
+            }
+            #[cfg(not(test))]
+            {
+                home_dir().join(".intendant")
+            }
+        })
+    })
+    .clone()
+}
+
+/// Interpret an `INTENDANT_HOME` value: absolute paths pass through,
+/// relative ones resolve against the current directory, unset/empty means
+/// "no override". Split from [`intendant_home`] so tests can pin every
+/// branch without racing the parallel runner over process-global env.
+fn intendant_home_override(raw: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    let raw = raw?;
+    if raw.is_empty() {
+        return None;
+    }
+    let path = std::path::PathBuf::from(raw);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        Some(
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(path),
+        )
+    }
+}
+
+/// The state root for an explicit `home`: `<home>/.intendant`, except that
+/// the process's own home routes through [`intendant_home`] so the
+/// `$INTENDANT_HOME` override (and the unit-test scratch default) is
+/// honored. This is the seam for the `home: &Path`-parameterized helpers
+/// (session catalog, wrapper index, session names/config): an explicit
+/// alternate home — a test tempdir, a browsed peer home — stays scoped to
+/// that home, and only the daemon's own home picks up the process override.
+/// Same convention as `backend_lists::codex_dir` with `CODEX_HOME`.
+pub fn intendant_home_in(home: &std::path::Path) -> std::path::PathBuf {
+    if home == home_dir() {
+        intendant_home()
+    } else {
+        home.join(".intendant")
+    }
+}
+
 /// Resolve a configured command string to an on-disk executable without
 /// running anything: values containing a path separator are checked
 /// directly, bare names are searched on `PATH`. A leading `~/` expands to
@@ -1263,6 +1347,57 @@ mod tests {
     #[test]
     fn home_dir_is_nonempty() {
         assert!(!home_dir().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn intendant_home_override_absolute_passes_through() {
+        let abs = if cfg!(windows) {
+            std::path::PathBuf::from("C:\\scratch\\state")
+        } else {
+            std::path::PathBuf::from("/scratch/state")
+        };
+        assert_eq!(
+            intendant_home_override(Some(abs.clone().into_os_string())),
+            Some(abs)
+        );
+    }
+
+    #[test]
+    fn intendant_home_override_relative_resolves_against_cwd() {
+        let resolved = intendant_home_override(Some("scratch-state".into())).unwrap();
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with("scratch-state"));
+    }
+
+    #[test]
+    fn intendant_home_override_unset_and_empty_mean_no_override() {
+        assert_eq!(intendant_home_override(None), None);
+        assert_eq!(intendant_home_override(Some("".into())), None);
+    }
+
+    /// In unit-test builds the unset default is the per-process scratch
+    /// root, never the live `~/.intendant` — the property the whole seam
+    /// exists to guarantee. (The `INTENDANT_HOME` env branch itself is
+    /// pinned via `intendant_home_override` above; the prod default is
+    /// covered behaviorally by the e2e suite's fake-home daemons.)
+    #[test]
+    fn intendant_home_in_tests_is_process_scratch_not_live_home() {
+        let root = intendant_home();
+        assert!(root.starts_with(std::env::temp_dir()));
+        assert!(!root.starts_with(home_dir().join(".intendant")));
+        // `.intendant`-shaped tail, so shape-walking resolvers
+        // (external_wrapper_index::home_from_log_dir) treat it like a
+        // real home's state root.
+        assert!(root.ends_with(".intendant"));
+        // Cached: two reads agree.
+        assert_eq!(root, intendant_home());
+    }
+
+    #[test]
+    fn intendant_home_in_scopes_explicit_homes_but_overrides_process_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(intendant_home_in(tmp.path()), tmp.path().join(".intendant"));
+        assert_eq!(intendant_home_in(&home_dir()), intendant_home());
     }
 
     /// Drop an executable named `name` (plus the `.exe` suffix Windows

@@ -46,6 +46,12 @@ for the headless `tests/e2e/` suite and demos) and requires
 | Anthropic | `claude-sonnet-4-5-20250929` |
 | Gemini | `gemini-2.5-pro` |
 
+### Daemon state root
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, access certs, the service pidfile, and the rest of the machine-local daemon state. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations that are deliberately *not* under the state root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), and the platform-data-dir daemon identity key. |
+
 ### Model and behavior tuning
 
 | Variable | Default | Description |
