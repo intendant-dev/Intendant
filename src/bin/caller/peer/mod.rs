@@ -89,14 +89,14 @@
 //! `transport::openclaw`, `transport::mcp_client`, `registry`,
 //! `coordinator`) once the abstractions here are settled.
 
-pub mod access_policy;
+pub use crate::access::access_policy;
 pub mod access_request;
 mod actor;
 pub mod card;
 pub mod coordinator;
 pub mod event;
 pub mod handle;
-pub mod id;
+pub use intendant_core::peer_id as id;
 pub mod log_writer;
 pub mod mcp_http;
 pub mod ops;
@@ -121,7 +121,7 @@ pub use handle::{
     spawn_peer, ConnectionState, PeerHandle, PeerSnapshot, BROADCAST_CAPACITY, COMMANDS_CAPACITY,
     EVENTS_CAPACITY,
 };
-pub use id::{PeerId, PeerKind};
+pub use id::PeerId;
 pub use log_writer::{spawn_peer_log_writer, LOG_CHANNEL_CAPACITY};
 pub use registry::{PeerRegistry, RegistryEvent, REGISTRY_BROADCAST_CAPACITY};
 pub use traits::{check_feature, PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures};

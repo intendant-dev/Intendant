@@ -2503,6 +2503,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "socket2 0.6.2",
  "tempfile",
  "tokio",
  "toml",

@@ -7,11 +7,19 @@
 //! signed by the access CA as equivalent.
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::CallerError;
 use crate::event::ControlMsg;
+
+pub(crate) fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
+}
 
 pub const DEFAULT_PROFILE: &str = "peer-operator";
 const POLICY_DIR: &str = "peer-access-identities";
@@ -570,7 +578,7 @@ pub fn write_approved_identity(
         card_url: card_url.map(str::to_string),
         request_id: request_id.map(str::to_string),
         filesystem: FilesystemAccessPolicy::default(),
-        created_at_unix: crate::peer::pairing::unix_timestamp(),
+        created_at_unix: unix_timestamp(),
         revoked_at_unix: None,
         expires_at_unix: None,
         source: None,
@@ -650,7 +658,7 @@ pub fn revoke_identity(
         }
     };
     record.status = PeerIdentityStatus::Revoked;
-    record.revoked_at_unix = Some(crate::peer::pairing::unix_timestamp());
+    record.revoked_at_unix = Some(unix_timestamp());
     write_identity_record(cert_dir, &record)?;
     Ok(record)
 }

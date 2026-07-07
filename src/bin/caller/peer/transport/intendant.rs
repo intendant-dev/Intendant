@@ -854,7 +854,7 @@ mod tests {
         let card = transport.connect().await.expect("connect succeeds");
         assert_eq!(
             card.id.kind(),
-            Some(crate::peer::PeerKind::Intendant),
+            Some(crate::peer::id::PeerKind::Intendant),
             "test peer should identify as Intendant"
         );
         assert!(transport.is_connected());

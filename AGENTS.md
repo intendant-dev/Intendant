@@ -100,9 +100,9 @@ src/
 │   ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, agent_runner.rs   # native multi-agent
 │   ├── context_rewind.rs, fission_ledger.rs, fission_lifecycle.rs, lineage_ledger.rs   # managed context: rewinds, fission, lineage
 │   ├── external_agent/         # supervise Codex / Claude Code (+ external_wrapper_index.rs)
-│   ├── access/                 # trust architecture: client keys, IAM, org roots/issuers/ORL, enrollment, platform keystores
+│   ├── access/                 # trust architecture: client keys, IAM, org roots/issuers/ORL, enrollment, peer identity policy + cert pinning, platform keystores
 │   ├── credential_leases.rs, credential_egress.rs, daemon_identity.rs, connect_rendezvous.rs   # credential custody; Connect client
-│   ├── peer/, web_tls.rs       # peer federation (transport, pairing, access profiles); native HTTPS/WSS
+│   ├── peer/, web_tls.rs       # peer federation (transport, pairing; identity policy lives in access/); native HTTPS/WSS
 │   ├── display/                # WebRTC: encode/{pool,vp8,h264_*}, tile/, capture/, webrtc, {x11,wayland,macos,windows}
 │   ├── computer_use.rs, ax.rs, recording.rs, frames.rs
 │   ├── presence.rs, live_audio.rs, audio_routing.rs, transcription.rs, quarantine.rs, schema_validator.rs
@@ -115,7 +115,7 @@ src/
 └── bin/connect/                # intendant-connect: hosted rendezvous (accounts, daemon claims, fleet sync, vault blobs, push, transparency log)
 crates/{presence-core, presence-web, station-web}   # WASM: shared presence types/tools/dispatch, browser presence client, Station renderer
 crates/intendant-platform   # OS integration leaf: platform probes/spawn (platform.rs), DisplayTarget, virtual-display mgmt (vision.rs)
-crates/intendant-core       # shared-vocabulary leaf: error, autonomy, frames, net probes, usage (TokenUsage), vitals, conversation, knowledge, skills
+crates/intendant-core       # shared-vocabulary leaf: error, autonomy, frames, net (probes, listener rebind, gateway port), peer_id, usage (TokenUsage), vitals, conversation, knowledge, skills
 crates/intendant-display    # the WebRTC display pipeline (encoder pool, tiles, capture backends, per-OS input)
 crates/app-html-assembler   # assembles static/app.html from static/app/ (build.rs + the CI regen gate)
 static/         # dashboard SPA: app/ fragments (source) → generated app.html; compiled wasm-web/ + wasm-station/

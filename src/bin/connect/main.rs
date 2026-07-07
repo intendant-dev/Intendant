@@ -2727,6 +2727,22 @@ fn client_rate_key(headers: &HeaderMap, scope: &str) -> String {
     format!("{scope}:{peer}")
 }
 
+/// The caller's public IP as this service observed it (first
+/// X-Forwarded-For hop behind the TLS proxy, else X-Real-IP), validated
+/// as a literal address. Echoed to registering daemons so a box behind
+/// 1:1 NAT (every cloud VM) learns the address the world reaches it by —
+/// the daemon advertises it as an ICE-TCP candidate on Connect offers.
+/// Advisory reachability metadata, not authority: a lying proxy could
+/// only make the daemon advertise an unreachable candidate.
+fn client_observed_ip(headers: &HeaderMap) -> Option<String> {
+    header_string(headers, "x-forwarded-for")
+        .and_then(|v| v.split(',').next().map(str::trim).map(str::to_string))
+        .filter(|v| !v.is_empty())
+        .or_else(|| header_string(headers, "x-real-ip"))
+        .and_then(|v| v.parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_string())
+}
+
 async fn check_rate_limit(
     state: &AppState,
     headers: &HeaderMap,
@@ -4064,6 +4080,7 @@ async fn daemon_register(
     Json(body): Json<DaemonRegisterRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_daemon_auth(&state, &headers)?;
+    let observed_ip = client_observed_ip(&headers);
     check_rate_limit(&state, &headers, "daemon_register", 120, 60_000).await?;
     if body.protocol != PROTOCOL {
         return Err(ApiError::bad_request("unsupported protocol"));
@@ -4215,6 +4232,7 @@ async fn daemon_register(
         "claim_code_expires_unix_ms": claim_code_expires_unix_ms,
         "claim_url": claim_url,
         "daemon_public_key": daemon_public_key,
+        "observed_ip": observed_ip,
     })))
 }
 

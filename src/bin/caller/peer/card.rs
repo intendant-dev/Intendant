@@ -4,7 +4,7 @@
 //! fetched from non-Intendant peers via the same path (A2A-style discovery).
 //! The card is the single source of truth for: who this peer is, what it
 //! can do, how to reach it, and how to authenticate against it. Replaces
-//! the host_label/version/git_sha fields of [`crate::web_gateway::WebGatewayConfig`],
+//! the host_label/version/git_sha fields of the gateway's `WebGatewayConfig`,
 //! which now carries only voice runtime config.
 //!
 //! ## Forward-compat fallback variants
