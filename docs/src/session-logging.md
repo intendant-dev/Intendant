@@ -10,7 +10,11 @@ It serves three audiences: a human debugging after the fact, the dashboard
 replaying a session into the browser, and the resume path rehydrating a
 conversation to continue work.
 
-The implementation lives in `session_log.rs` (`SessionLog`, ~5k lines). Sessions
+The implementation lives in the `session_log/` module: `mod.rs` (the
+`SessionLog` core — open/meta/discovery, emit, CU events, summaries, turn
+files, voice/presence logging), `bus_events.rs` (the event-bus-driven typed
+writer methods), `replay.rs` (the JSONL → `AppEvent` inverse), and
+`history.rs` (conversation read-back and recent-entry tails). Sessions
 are fully isolated — there is no global state file; each session is one
 self-contained directory.
 
@@ -96,7 +100,7 @@ struct LogEvent {
 ```
 
 The event vocabulary is broad and grows with the system. Grouped by area
-(verified against `session_log.rs`):
+(verified against the `session_log/` module):
 
 | Area | Events |
 |------|--------|
@@ -255,7 +259,7 @@ producers (session supervisor, file watcher) behind the stream.
 
 ## Test Coverage
 
-Session logging is exercised by inline `#[cfg(test)]` tests in `session_log.rs`
+Session logging is exercised by inline `#[cfg(test)]` tests in `session_log/`
 and `session_names.rs`: turn-file creation and pretty-printing, separate
 stdout/stderr files, skipping empty stderr, `json_extracted` function extraction,
 reasoning-file writes, span-based chunk reads that avoid re-reading whole turn

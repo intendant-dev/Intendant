@@ -26,7 +26,7 @@
 //!
 //! File open failure and write errors are silently logged via
 //! `eprintln!` to stderr and the task exits. Matches
-//! `session_log.rs`'s posture: a logging failure must not cascade
+//! the `session_log` module's posture: a logging failure must not cascade
 //! into the rest of the daemon, and there's no good recovery
 //! beyond surfacing the error so an operator can fix the disk.
 //! The drop of `rx` unblocks any peer actor waiting on a
@@ -211,7 +211,7 @@ mod tests {
 
     /// Parent directories that don't exist are created
     /// automatically, so callers don't need to mkdir -p before
-    /// spawning the writer. Matches how session_log.rs handles
+    /// spawning the writer. Matches how the session_log module handles
     /// fresh session directories.
     #[tokio::test]
     async fn creates_parent_directory_if_missing() {
