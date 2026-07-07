@@ -1,0 +1,168 @@
+/* ── ui-v2 design tokens (design-overhaul program) ─────────────────────
+   Everything here is scoped under `html.ui-v2` and is completely inert
+   for the v1 UI: the flag is set pre-paint in 00-head.html (?ui=v2 or
+   localStorage intendant.ui2). Two layers live in this file:
+
+   1. The v2 token vocabulary (dark theme, Iris accent — light theme and
+      alternate accents are a later program phase). Values are the design
+      handoff's, verbatim; tokens the prototype used but never declared
+      (--iris-deep, --on-accent, --hover-wash, the -rgb triplets) are
+      declared here so no component ever hardcodes them.
+   2. The v1-bridge remaps: the Catppuccin names the existing fragments
+      consume, re-pointed at v2 tokens so not-yet-migrated panes render
+      acceptably under the v2 chrome during the migration. Deleted at
+      program end together with the v1 chrome.
+
+   Naming note: --text and --green exist in BOTH vocabularies by design —
+   under the flag the v2 definition wins everywhere, which IS the bridge
+   for those two names. */
+
+html.ui-v2 {
+  /* — surfaces — */
+  --bg: #0B0C10;
+  --bg-1: #0E1015;
+  --surface: #14171F;
+  --surface-2: #1A1E28;
+  --surface-3: #232834;
+  --code-bg: #0B0D12;
+  --line: rgba(230, 236, 247, .08);
+  --line-2: rgba(230, 236, 247, .14);
+  --glass: rgba(14, 16, 21, .7);
+
+  /* — ink — */
+  --text: #EAECF2;
+  --text-2: #A7AEBE;
+  --text-3: #6C7482;
+
+  /* — brand + semantics — */
+  --iris: #7E8CFA;
+  --iris-2: #A6AEFF;
+  --iris-deep: #6f7cf0;      /* gradient partner: linear-gradient(180deg, var(--iris), var(--iris-deep)) */
+  --violet: #9B7CF2;
+  --on-accent: #0b0c10;      /* text on iris-filled controls */
+  --green: #58C08C;
+  --amber: #E4A85B;
+  --rose: #EC6A85;
+  --sky: #5DA9E6;
+  --neutral-dot: #6c7086;
+
+  /* — alpha math (rgba(var(--x-rgb), a) for tints; tint formula:
+       fill 8–16%, border ~26%, text full) — */
+  --iris-rgb: 126, 140, 250;
+  --violet-rgb: 155, 124, 242;
+  --green-rgb: 88, 192, 140;
+  --amber-rgb: 228, 168, 91;
+  --rose-rgb: 236, 106, 133;
+  --sky-rgb: 93, 169, 230;
+  --text-rgb: 234, 236, 242;
+
+  /* — interaction washes — */
+  --hover-wash: rgba(230, 236, 247, .04);
+
+  /* — type — */
+  --sans: 'Hanken Grotesk', system-ui, -apple-system, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* — radii ladder — */
+  --r-inset: 8px;
+  --r-ctl: 9px;
+  --r-card: 13px;
+  --r-panel: 17px;
+  --r-pill: 999px;
+
+  /* — elevation — */
+  --shadow-card: 0 12px 40px rgba(0, 0, 0, .34);
+  --shadow-overlay: 0 30px 80px rgba(0, 0, 0, .6);
+  --shadow-primary: 0 6px 16px rgba(var(--iris-rgb), .32);
+
+  /* — motion — */
+  --t-fast: .13s;
+  --t-med: .15s;
+  --t-slow: .2s;
+
+  /* ── v1 bridge: Catppuccin vocabulary → v2 values ─────────────────── */
+  --base: var(--bg);
+  --mantle: var(--bg-1);
+  --crust: var(--code-bg);
+  --surface0: var(--surface-2);
+  --surface1: var(--surface-3);
+  --surface2: var(--surface-3);
+  --overlay0: var(--text-3);
+  --overlay1: var(--text-3);
+  --subtext0: var(--text-2);
+  --subtext1: var(--text-2);
+  --blue: var(--iris);
+  --teal: var(--sky);
+  --yellow: var(--amber);
+  --peach: var(--amber);
+  --red: var(--rose);
+  --mauve: var(--violet);
+  --lavender: var(--iris-2);
+  --sapphire: var(--sky);
+  --log-detail: var(--text-2);
+  --concurrent-view-bg: rgba(14, 16, 21, .68);
+  --concurrent-view-hover-bg: rgba(14, 16, 21, .78);
+  --session-window-bg: rgba(14, 16, 21, .72);
+  --session-window-header-bg: rgba(11, 13, 18, .64);
+  --session-window-hover-bg: rgba(14, 16, 21, .80);
+  --session-window-chip-bg: rgba(26, 30, 40, .64);
+  --glass-bg: rgba(14, 16, 21, .58);
+  --glass-bg-deep: linear-gradient(180deg, rgba(20, 23, 31, .72), rgba(11, 13, 18, .62));
+  --glass-hairline: var(--line);
+  --glass-hairline-bright: var(--line-2);
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, .04);
+  /* --glass-blur unchanged: the blur-over-canvas discipline from v1 carries
+     over verbatim — blur only on flow chrome that never overlaps Station. */
+  --viz-empty: #1A1E28;
+  --viz-ramp-1: #2E3350;
+  --viz-ramp-2: #454C86;
+  --viz-ramp-3: #6470D0;
+  --viz-ramp-4: var(--iris);
+  --viz-ramp-5: var(--iris-2);
+}
+
+/* ── base surface treatments (v2 only) ──────────────────────────────── */
+html.ui-v2 body {
+  background:
+    radial-gradient(1100px 560px at 78% -12%, rgba(var(--iris-rgb), .07), transparent 60%),
+    var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+html.ui-v2 ::selection { background: rgba(var(--iris-rgb), .28); }
+
+html.ui-v2 ::-webkit-scrollbar { width: 10px; height: 10px; }
+html.ui-v2 ::-webkit-scrollbar-thumb {
+  background: rgba(120, 128, 146, .35);
+  border: 3px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+}
+html.ui-v2 ::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 128, 146, .55);
+  background-clip: padding-box;
+}
+
+/* Focus system: the prototype specifies none (outline:none everywhere) —
+   production gets a visible ring. :focus-visible keeps pointer users
+   clean while keyboard users always see where they are. */
+html.ui-v2 :focus-visible {
+  outline: 2px solid var(--iris);
+  outline-offset: 2px;
+}
+html.ui-v2 :focus:not(:focus-visible) { outline: none; }
+
+/* Reduced motion: kill decorative animation, keep state changes instant.
+   Scoped to ui-v2 so v1 stays byte-identical in behavior until the flip. */
+@media (prefers-reduced-motion: reduce) {
+  html.ui-v2 *, html.ui-v2 *::before, html.ui-v2 *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+}

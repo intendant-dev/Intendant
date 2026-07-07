@@ -8,3 +8,23 @@
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#11111b">
+<script>
+  // ui-v2 flag (design-overhaul program): decide before first paint so
+  // neither UI generation flashes. `?ui=v2` / `?ui=v1` overrides and
+  // persists; otherwise localStorage wins; default stays v1 until the
+  // program flips it. The class lives on <html> — all v2 styles are
+  // scoped under `html.ui-v2` and are inert without it.
+  (function () {
+    var on = false;
+    try {
+      var q = new URLSearchParams(location.search).get('ui');
+      if (q === 'v2' || q === 'v1') {
+        on = q === 'v2';
+        localStorage.setItem('intendant.ui2', on ? '1' : '0');
+      } else {
+        on = localStorage.getItem('intendant.ui2') === '1';
+      }
+    } catch (e) { /* storage unavailable: stay v1 */ }
+    if (on) document.documentElement.classList.add('ui-v2');
+  })();
+</script>

@@ -14,6 +14,7 @@
 12-styles-tasks-log.css
 13-styles-sessions-terminal.css
 14-styles-displays-voice.css
+16-styles-v2-tokens.css
 19-style-close.html
 
 20-shell.html
@@ -22,6 +23,7 @@
 23-voice-dialogs.html
 
 30-module-open.html
+31-ui2-foundation.js
 31-init-identity-fleet.js
 32-vault-custody.js
 33-station-core.js
