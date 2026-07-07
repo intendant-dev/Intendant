@@ -6,10 +6,7 @@ use uuid::Uuid;
 
 /// Base directory for all quarantine data.
 fn quarantine_base() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".intendant")
-        .join("quarantine")
+    crate::platform::intendant_home().join("quarantine")
 }
 
 /// Directory for a specific live audio session's quarantined payloads.

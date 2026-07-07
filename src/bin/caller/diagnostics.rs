@@ -15,7 +15,7 @@
 //! one helper trio + boundary tests.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Sanitize a session id from query-string input down to a filesystem-
 /// safe slug. Accepts ASCII alphanumerics, `-`, and `_`; everything else
@@ -48,13 +48,22 @@ pub fn sanitize_session_id(raw: &str) -> Option<String> {
 /// reject the request before reaching the disk).
 ///
 /// Path shape: `<intendant_state_dir>/diagnostics/visual-freshness/<session_id>.ndjson`.
-/// `intendant_state_dir` resolves to `$HOME/.intendant` (or `/tmp/.intendant`
-/// when `HOME` is unset, matching the convention the session-log writer
-/// already uses).
+/// `intendant_state_dir` is `platform::intendant_home()` — `~/.intendant`
+/// unless `$INTENDANT_HOME` overrides it, matching the session-log writer.
 pub fn visual_freshness_path(session_id: &str) -> Option<PathBuf> {
+    visual_freshness_path_in(&intendant_state_dir(), session_id)
+}
+
+/// Explicit-state-dir variant of [`visual_freshness_path`] — the seam
+/// convention: tests (and any caller with a non-process home) pass the
+/// state dir instead of relying on ambient resolution. `cfg(test)`
+/// does not cross crates, so the platform crate's unit-test scratch
+/// default does NOT protect this binary's tests; explicit injection is
+/// what keeps them out of the live `~/.intendant`.
+pub fn visual_freshness_path_in(state_dir: &Path, session_id: &str) -> Option<PathBuf> {
     let slug = sanitize_session_id(session_id)?;
     Some(
-        intendant_state_dir()
+        state_dir
             .join("diagnostics")
             .join("visual-freshness")
             .join(format!("{slug}.ndjson")),
@@ -74,7 +83,17 @@ pub fn visual_freshness_path(session_id: &str) -> Option<PathBuf> {
 /// into single ~5s POSTs of much less than 4 KB so concurrent
 /// interleaving is not a practical concern at the smoke-run scale.
 pub fn append_visual_freshness_record(session_id: &str, body: &[u8]) -> std::io::Result<usize> {
-    let path = visual_freshness_path(session_id).ok_or_else(|| {
+    append_visual_freshness_record_in(&intendant_state_dir(), session_id, body)
+}
+
+/// Explicit-state-dir variant of [`append_visual_freshness_record`]; see
+/// [`visual_freshness_path_in`] for why tests must use this.
+pub fn append_visual_freshness_record_in(
+    state_dir: &Path,
+    session_id: &str,
+    body: &[u8],
+) -> std::io::Result<usize> {
+    let path = visual_freshness_path_in(state_dir, session_id).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "session_id sanitizes to empty",
@@ -91,13 +110,14 @@ pub fn append_visual_freshness_record(session_id: &str, body: &[u8]) -> std::io:
     Ok(body.len())
 }
 
-/// Resolve the Intendant state directory (`~/.intendant`) via the shared
-/// cross-platform `platform::home_dir()` helper (honoring `$HOME` on Unix,
-/// `%USERPROFILE%` on Windows). Pulled into its own helper so test code can
-/// override the home env and verify path construction without touching
-/// production calls.
+/// Resolve the Intendant state directory via the shared
+/// `platform::intendant_home()` seam (`~/.intendant` by default,
+/// `$INTENDANT_HOME` when set). NOTE: the platform crate's unit-test
+/// scratch default does NOT apply to this binary's tests — `cfg(test)`
+/// does not cross crates — so tests must use the `_in` variants with an
+/// explicit tempdir instead of this ambient resolution.
 fn intendant_state_dir() -> PathBuf {
-    crate::platform::home_dir().join(".intendant")
+    crate::platform::intendant_home()
 }
 
 #[cfg(test)]
@@ -168,37 +188,31 @@ mod tests {
 
     #[test]
     fn append_creates_parent_dirs_and_writes_body() {
-        // Sandbox the home dir to a tempdir so the test doesn't write into
-        // the user's real .intendant directory — HOME on Unix, USERPROFILE
-        // on Windows (the variable `platform::home_dir()` honors there).
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        let prev_home = std::env::var(home_var).ok();
-        std::env::set_var(home_var, tmp.path());
-
+        // Explicit tempdir state dir — the ambient default is NOT hermetic
+        // in this binary's tests (`cfg(test)` does not cross crates, so the
+        // platform crate's unit-test scratch never fires here; the previous
+        // ambient version of this test appended into the live
+        // `~/.intendant` and failed on every machine whose file survived a
+        // prior run).
+        let state = tempfile::tempdir().expect("state dir");
         let session_id = "phase0-test-12345";
         let body = b"{\"t\":\"transition\",\"v\":1}\n{\"t\":\"transition\",\"v\":2}\n";
-        let written = append_visual_freshness_record(session_id, body).expect("append");
+        let written =
+            append_visual_freshness_record_in(state.path(), session_id, body).expect("append");
         assert_eq!(written, body.len());
 
         // File contents should match exactly (one batch).
-        let path = visual_freshness_path(session_id).unwrap();
+        let path = visual_freshness_path_in(state.path(), session_id).unwrap();
         let read = std::fs::read(&path).expect("read transcript");
         assert_eq!(read, body);
 
         // A second append should concatenate, not truncate.
         let body2 = b"{\"t\":\"summary\",\"transitions\":2}\n";
-        append_visual_freshness_record(session_id, body2).expect("append 2");
+        append_visual_freshness_record_in(state.path(), session_id, body2).expect("append 2");
         let read2 = std::fs::read(&path).expect("read transcript 2");
         assert_eq!(read2.len(), body.len() + body2.len());
         assert!(read2.starts_with(body));
         assert!(read2.ends_with(body2));
-
-        // Restore the home variable.
-        match prev_home {
-            Some(v) => std::env::set_var(home_var, v),
-            None => std::env::remove_var(home_var),
-        }
     }
 
     #[test]

@@ -5308,7 +5308,7 @@ fn session_log_dir_for_id_in_home(home: &Path, session_id: &str) -> Option<PathB
     if crate::session_names::session_id_looks_like_path(session_id) {
         return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
     }
-    let logs_dir = home.join(".intendant").join("logs");
+    let logs_dir = crate::platform::intendant_home_in(home).join("logs");
     let direct = logs_dir.join(session_id);
     if direct.is_dir() && direct.join("session_meta.json").exists() {
         return Some(direct);

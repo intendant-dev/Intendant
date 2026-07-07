@@ -742,7 +742,7 @@ pub(crate) fn targeted_intendant_session_rows_from_home(
     rows: &mut Vec<serde_json::Value>,
     seen: &mut HashSet<String>,
 ) {
-    let logs_dir = home.join(".intendant").join("logs");
+    let logs_dir = crate::platform::intendant_home_in(home).join("logs");
     let mut seen_dirs = HashSet::new();
     for requested_id in requested_ids {
         if !session_lookup_id_is_safe(requested_id) {
@@ -2051,7 +2051,7 @@ pub(crate) fn list_intendant_skeleton_sessions_with_limit(
     home_path: &Path,
     limit: usize,
 ) -> Vec<serde_json::Value> {
-    let logs_dir = home_path.join(".intendant").join("logs");
+    let logs_dir = crate::platform::intendant_home_in(home_path).join("logs");
     let Ok(entries) = std::fs::read_dir(&logs_dir) else {
         return Vec::new();
     };
@@ -2123,7 +2123,7 @@ pub(crate) fn list_sessions_from_home_impl(
     row_cap: Option<usize>,
 ) -> String {
     preload_session_index();
-    let logs_dir = home_path.join(".intendant").join("logs");
+    let logs_dir = crate::platform::intendant_home_in(home_path).join("logs");
     let mut external_sessions = Vec::new();
     external_sessions.extend(list_codex_sessions_with_limit(
         home_path,
