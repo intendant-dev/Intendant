@@ -200,6 +200,15 @@ async fn spawn_daemon(
     port: u16,
 ) -> DaemonRig {
     let rig = TestRig::new();
+    // These rigs model a *rooted* daemon: an idle --web daemon launched
+    // from a markerless cwd runs projectless and then requires an explicit
+    // per-session project root — but a peer-delegated task
+    // (PeerOp::DelegateTask → ControlMsg::StartTask) carries none, so the
+    // daemon's default project must exist for it to run. An empty
+    // intendant.toml is the minimal project marker (parses to config
+    // defaults; pinned by project.rs's empty-config unit test).
+    std::fs::write(rig.project.path().join("intendant.toml"), "")
+        .expect("mark the daemon rig's project root");
     let script_path = rig.write_script(script);
     let log = std::fs::File::create(rig.home.path().join("daemon.log")).expect("daemon log");
     let mut cmd = rig.command();
