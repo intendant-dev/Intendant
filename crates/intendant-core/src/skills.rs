@@ -237,7 +237,7 @@ fn discover_skills_in(project_root: Option<&Path>, home: Option<&Path>) -> Vec<S
         );
         // Legacy: ~/.intendant/skills/
         load_skills_from_dir(
-            &home.join(".intendant").join("skills"),
+            &crate::platform::intendant_home_in(home).join("skills"),
             SkillSource::Personal,
             &mut skills,
             &mut seen_names,

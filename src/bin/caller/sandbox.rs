@@ -107,10 +107,9 @@ impl SandboxConfig {
         };
         let mut write_paths = vec![scratch, log_dir.to_path_buf()];
 
-        // Allow writes to ~/.intendant
-        if let Some(home) = dirs::home_dir() {
-            write_paths.push(home.join(".intendant"));
-        }
+        // Allow writes to the daemon state root (~/.intendant by default,
+        // $INTENDANT_HOME when overridden).
+        write_paths.push(crate::platform::intendant_home());
 
         Self {
             read_paths: vec![PathBuf::from("/")],

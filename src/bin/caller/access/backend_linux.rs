@@ -1,6 +1,7 @@
 //! Linux implementation of `AccessBackend`.
 //!
-//! Uses `$HOME/.intendant/access-certs` so the user who launches the native
+//! Uses `<state root>/access-certs` (`~/.intendant/access-certs` by
+//! default) so the user who launches the native
 //! dashboard can also read the TLS private key.
 
 use std::path::PathBuf;
@@ -13,9 +14,7 @@ pub struct LinuxBackend;
 
 impl AccessBackend for LinuxBackend {
     fn cert_dir(&self) -> PathBuf {
-        dirs::home_dir()
-            .map(|h| h.join(".intendant").join("access-certs"))
-            .unwrap_or_else(|| PathBuf::from("/tmp/intendant-access-certs"))
+        crate::platform::intendant_home().join("access-certs")
     }
 
     fn detect_primary_ip(&self) -> AccessResult<String> {

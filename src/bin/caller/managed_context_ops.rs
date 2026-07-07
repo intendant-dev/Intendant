@@ -908,13 +908,17 @@ pub(crate) fn managed_context_edit_record_dirs(
         .map(str::trim)
         .filter(|id| !id.is_empty())
     {
-        push_dir(home.join(".intendant").join("logs").join(id));
+        push_dir(
+            crate::platform::intendant_home_in(&home)
+                .join("logs")
+                .join(id),
+        );
         for record in external_wrapper_index::wrappers_for(&home, "codex", id) {
             push_dir(PathBuf::from(record.log_path));
         }
     }
 
-    let logs_dir = home.join(".intendant").join("logs");
+    let logs_dir = crate::platform::intendant_home_in(&home).join("logs");
     if let Ok(entries) = std::fs::read_dir(logs_dir) {
         for entry in entries.flatten() {
             let path = entry.path();

@@ -825,7 +825,7 @@ pub fn apply_overlays_to_sessions(home: &Path, sessions: &mut [Value]) {
 }
 
 fn overlay_path(home: &Path) -> PathBuf {
-    home.join(".intendant").join(OVERLAY_FILE)
+    crate::platform::intendant_home_in(home).join(OVERLAY_FILE)
 }
 
 fn read_overlay_map(home: &Path) -> HashMap<String, HashMap<String, SessionAgentConfig>> {
@@ -890,7 +890,7 @@ fn find_wrapper_config_for_external_session(
     session_id: &str,
     resume_id: Option<&str>,
 ) -> Option<SessionAgentConfig> {
-    let logs_dir = home.join(".intendant").join("logs");
+    let logs_dir = crate::platform::intendant_home_in(home).join("logs");
     let ids: Vec<String> = [Some(session_id), resume_id]
         .into_iter()
         .flatten()

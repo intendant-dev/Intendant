@@ -110,10 +110,19 @@ impl Default for ExternalWrapperIndex {
 }
 
 pub fn index_path(home: &Path) -> PathBuf {
-    home.join(".intendant").join(INDEX_FILE)
+    crate::platform::intendant_home_in(home).join(INDEX_FILE)
 }
 
 pub fn home_from_log_dir(log_dir: &Path) -> Option<PathBuf> {
+    // Process state root first: under `$INTENDANT_HOME` (or the unit-test
+    // scratch root) the logs tree need not carry the `<home>/.intendant`
+    // shape, but a log dir inside it still belongs to the process home —
+    // callers feed the returned home back through `intendant_home_in`-based
+    // paths (index_path, wrappers_for), which resolve to the same root.
+    // With the default root this matches what the shape walk returns.
+    if log_dir.parent() == Some(crate::platform::intendant_home().join("logs").as_path()) {
+        return Some(crate::platform::home_dir());
+    }
     let logs_dir = log_dir.parent()?;
     if logs_dir.file_name().and_then(|name| name.to_str()) != Some("logs") {
         return None;

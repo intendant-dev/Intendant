@@ -1524,9 +1524,9 @@ pub fn spawn_http_observation_listener(
 mod tests {
     use super::*;
     use crate::autonomy::{self, AutonomyState};
+    use crate::mcp::tests::test_state;
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
-    use crate::mcp::tests::{TEST_ENV_LOCK, test_state};
 
     #[test]
     fn managed_watch_context_pressure_satisfied_after_rewind_across_alias_and_compact_cu_growth() {
@@ -1764,13 +1764,9 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            let prior_home = std::env::var_os("HOME");
-            let prior_userprofile = std::env::var_os("USERPROFILE");
+            // Threaded session_logs_home_override replaces the old process
+            // HOME mutation (racy under the parallel runner).
             let home = tempdir().unwrap();
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("USERPROFILE", home.path());
-
             let wrapper_session_id = "540b8411-4fd1-4210-9374-c9d58430f6e6";
             let backend_session_id = "019ea0a9-92fc-7471-85d8-0a281fc54250";
             let project_root = home.path().join("project");
@@ -1805,6 +1801,7 @@ mod tests {
             let state = test_state();
             {
                 let mut s = state.write().await;
+                s.session_logs_home_override = Some(home.path().to_path_buf());
                 apply_observed_event_to_mcp_state(
                     &mut s,
                     &AppEvent::StatusUpdate {
@@ -1873,15 +1870,6 @@ mod tests {
                 }
                 other => panic!("expected ResumeSession control event, got {other:?}"),
             }
-
-            match prior_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match prior_userprofile {
-                Some(value) => std::env::set_var("USERPROFILE", value),
-                None => std::env::remove_var("USERPROFILE"),
-            }
         });
     }
 
@@ -1892,13 +1880,9 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            let prior_home = std::env::var_os("HOME");
-            let prior_userprofile = std::env::var_os("USERPROFILE");
+            // Threaded session_logs_home_override replaces the old process
+            // HOME mutation (racy under the parallel runner).
             let home = tempdir().unwrap();
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("USERPROFILE", home.path());
-
             let wrapper_session_id = "62e6f9d9-06e9-420b-9245-9d0221e47c78";
             let backend_session_id = "019e9f97-active-backend";
             let project_root = home.path().join("project");
@@ -1917,6 +1901,7 @@ mod tests {
             let state = test_state();
             {
                 let mut s = state.write().await;
+                s.session_logs_home_override = Some(home.path().to_path_buf());
                 apply_observed_event_to_mcp_state(
                     &mut s,
                     &AppEvent::StatusUpdate {
@@ -1956,15 +1941,6 @@ mod tests {
                     assert_eq!(task, "continue active managed station work");
                 }
                 other => panic!("expected active StartTask control event, got {other:?}"),
-            }
-
-            match prior_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match prior_userprofile {
-                Some(value) => std::env::set_var("USERPROFILE", value),
-                None => std::env::remove_var("USERPROFILE"),
             }
         });
     }
@@ -2204,12 +2180,13 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let state = test_state();
-            // Point the persisted-wrapper resolver at an empty tempdir: with
-            // the default logs home it reads the real ~/.intendant/logs, and
-            // on a box with live session history (a dev box, the
-            // peer-testing Dell) the hardcoded session id can resolve to an
-            // actual persisted wrapper — the tool then dispatches a resume
-            // instead of taking the rejection path under test.
+            // Point the persisted-wrapper resolver at an empty tempdir: the
+            // default logs home is the process state root (a shared scratch
+            // in unit-test builds, the real ~/.intendant in prod), where this
+            // hardcoded session id could resolve to a persisted wrapper some
+            // other test (or a dev box's live history) left behind — the tool
+            // would then dispatch a resume instead of taking the rejection
+            // path under test.
             let logs_root = tempfile::tempdir().unwrap();
             {
                 let mut s = state.write().await;

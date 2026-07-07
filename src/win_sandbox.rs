@@ -590,8 +590,15 @@ pub fn sweep_stale_journals(dir: &Path) {
 }
 
 /// The directory scoped-shell ACE journals live in (per-user, created on
-/// demand): `%USERPROFILE%\.intendant\win-sandbox-journals`.
+/// demand): `%USERPROFILE%\.intendant\win-sandbox-journals`, or
+/// `%INTENDANT_HOME%\win-sandbox-journals` when the daemon state root is
+/// overridden (the caller binary carries the variable in the environment).
 pub fn journal_dir() -> PathBuf {
+    if let Ok(root) = std::env::var("INTENDANT_HOME") {
+        if !root.trim().is_empty() {
+            return PathBuf::from(root).join("win-sandbox-journals");
+        }
+    }
     dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join(".intendant")
