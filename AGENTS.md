@@ -115,7 +115,7 @@ src/
 │   ├── dashboard_control.rs, terminal.rs, browser_workspace.rs   # dashboard tunnel; PTY registry; agent browser
 │   ├── mcp/, mcp_client.rs, control.rs
 │   ├── transfer_store.rs, upload_store.rs, peer_file_transfer.rs   # transfer jobs; upload/attachment stores
-│   ├── session_log.rs, session_names.rs, project.rs, app_state_pricing.rs
+│   ├── session_log/, session_names.rs, project.rs, app_state_pricing.rs
 │   ├── sandbox.rs, daemon_log_tee.rs, diagnostics.rs, …
 └── bin/connect/                # intendant-connect: hosted rendezvous (accounts, daemon claims, fleet sync, vault blobs, push, transparency log)
 crates/{presence-core, presence-web, station-web}   # WASM: shared presence types/tools/dispatch, browser presence client, Station renderer
