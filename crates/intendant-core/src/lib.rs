@@ -12,5 +12,6 @@ pub mod frames;
 pub mod knowledge;
 pub mod net;
 pub mod skills;
+pub mod state_paths;
 pub mod usage;
 pub mod vitals;
