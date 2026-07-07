@@ -611,11 +611,24 @@ async function main() {
       // Handle display capture lost — disconnect but keep slot for possible re-grant
       if (d.event === 'display_capture_lost') {
         const id = Number(d.display_id || 0);
+        const reason = d.reason || 'capture ended';
         const slot = displaySlots.get(id);
         if (slot) {
           slot.disconnect();
-          slot.statusEl.textContent = 'Display lost: ' + (d.reason || 'capture ended');
+          slot.statusEl.textContent = 'Display lost: ' + reason;
           slot.statusEl.className = 'display-status error';
+        } else {
+          // Capture died before any slot existed — a grant that failed
+          // immediately, e.g. "Your display" on a headless box with no
+          // display server. Without this branch the failure is invisible:
+          // the toggle stays on and no tile ever appears (the daemon-side
+          // reason lands only in its journal).
+          if (Number(grantedDisplayId) === id && typeof setUserDisplayState === 'function') {
+            setUserDisplayState(false);
+          }
+          if (typeof showControlToast === 'function') {
+            showControlToast('error', 'Display unavailable: ' + reason);
+          }
         }
         // Hide the approval banner — capture lost supersedes any pending grant.
         const banner = document.getElementById('display-approval-banner');
