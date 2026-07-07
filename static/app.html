@@ -1158,8 +1158,8 @@ body.access-page #tab-access {
   font-weight: 800;
 }
 .acc-btn.primary:hover, .ui-btn.primary:hover { background: var(--sapphire); border-color: var(--sapphire); }
-.acc-btn.danger, .ui-btn.danger { border-color: rgba(243, 139, 168, 0.7); color: var(--red); background: transparent; }
-.acc-btn.danger:hover, .ui-btn.danger:hover { border-color: var(--red); background: rgba(243, 139, 168, 0.08); }
+.acc-btn.danger, .ui-btn.danger { border-color: color-mix(in srgb, var(--red) 70%, transparent); color: var(--red); background: transparent; }
+.acc-btn.danger:hover, .ui-btn.danger:hover { border-color: var(--red); background: color-mix(in srgb, var(--red) 8%, transparent); }
 .acc-btn:disabled, .ui-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* Route chips — transport is how you got there, never authority. */
@@ -1170,7 +1170,7 @@ body.access-page #tab-access {
   padding: 2px 8px 2px 6px;
   border-radius: 999px;
   border: 1px solid var(--glass-hairline-bright);
-  background: rgba(49, 50, 68, 0.35);
+  background: color-mix(in srgb, var(--surface0) 35%, transparent);
   font-size: 10.5px;
   font-weight: 700;
   letter-spacing: 0.02em;
@@ -1186,15 +1186,15 @@ body.access-page #tab-access {
   flex: 0 0 auto;
 }
 .acc-chip.route-mtls::before { background: var(--lavender); }
-.acc-chip.route-mtls { border-color: rgba(180, 190, 254, 0.35); color: var(--lavender); }
+.acc-chip.route-mtls { border-color: color-mix(in srgb, var(--lavender) 35%, transparent); color: var(--lavender); }
 .acc-chip.route-connect::before { background: var(--sapphire); }
-.acc-chip.route-connect { border-color: rgba(116, 199, 236, 0.35); color: var(--sapphire); }
+.acc-chip.route-connect { border-color: color-mix(in srgb, var(--sapphire) 35%, transparent); color: var(--sapphire); }
 .acc-chip.route-peer::before { background: var(--mauve); }
-.acc-chip.route-peer { border-color: rgba(203, 166, 247, 0.35); color: var(--mauve); }
+.acc-chip.route-peer { border-color: color-mix(in srgb, var(--mauve) 35%, transparent); color: var(--mauve); }
 .acc-chip.route-local::before { background: var(--overlay1); }
 .acc-chip.route-local { color: var(--subtext0); }
 .acc-chip.route-webrtc::before { background: var(--teal); }
-.acc-chip.route-webrtc { border-color: rgba(148, 226, 213, 0.35); color: var(--teal); }
+.acc-chip.route-webrtc { border-color: color-mix(in srgb, var(--teal) 35%, transparent); color: var(--teal); }
 .acc-chip.route-remembered::before { background: transparent; border: 1px dashed var(--overlay0); width: 5px; height: 5px; }
 .acc-chip.route-remembered { border-style: dashed; color: var(--overlay1); }
 
@@ -1205,21 +1205,21 @@ body.access-page #tab-access {
   padding: 2px 8px;
   border-radius: 4px;
   border: 1px solid var(--surface1);
-  background: rgba(49, 50, 68, 0.4);
+  background: color-mix(in srgb, var(--surface0) 40%, transparent);
   font-size: 10.5px;
   font-weight: 800;
   letter-spacing: 0.03em;
   color: var(--subtext1);
   white-space: nowrap;
 }
-.acc-badge.role-root { border-color: rgba(250, 179, 135, 0.65); color: var(--peach); background: rgba(250, 179, 135, 0.10); }
-.acc-badge.role-operator { border-color: rgba(249, 226, 175, 0.5); color: var(--yellow); background: rgba(249, 226, 175, 0.08); }
-.acc-badge.role-terminal { border-color: rgba(249, 226, 175, 0.4); color: var(--yellow); }
-.acc-badge.role-files { border-color: rgba(166, 227, 161, 0.45); color: var(--green); }
-.acc-badge.role-sessions { border-color: rgba(148, 226, 213, 0.45); color: var(--teal); }
-.acc-badge.role-observer { border-color: rgba(137, 180, 250, 0.45); color: var(--blue); }
+.acc-badge.role-root { border-color: color-mix(in srgb, var(--peach) 65%, transparent); color: var(--peach); background: color-mix(in srgb, var(--peach) 10%, transparent); }
+.acc-badge.role-operator { border-color: color-mix(in srgb, var(--yellow) 50%, transparent); color: var(--yellow); background: color-mix(in srgb, var(--yellow) 8%, transparent); }
+.acc-badge.role-terminal { border-color: color-mix(in srgb, var(--yellow) 40%, transparent); color: var(--yellow); }
+.acc-badge.role-files { border-color: color-mix(in srgb, var(--green) 45%, transparent); color: var(--green); }
+.acc-badge.role-sessions { border-color: color-mix(in srgb, var(--teal) 45%, transparent); color: var(--teal); }
+.acc-badge.role-observer { border-color: color-mix(in srgb, var(--blue) 45%, transparent); color: var(--blue); }
 .acc-badge.role-scoped { color: var(--subtext0); }
-.acc-badge.role-peer { border-color: rgba(203, 166, 247, 0.5); color: var(--mauve); background: rgba(203, 166, 247, 0.08); }
+.acc-badge.role-peer { border-color: color-mix(in srgb, var(--mauve) 50%, transparent); color: var(--mauve); background: color-mix(in srgb, var(--mauve) 8%, transparent); }
 .acc-badge.role-planned { border-style: dashed; color: var(--overlay1); }
 
 /* Attention banners — actionable, never decorative. */
@@ -1238,8 +1238,8 @@ body.access-page #tab-access {
   font-size: 12px;
   line-height: 1.5;
 }
-.acc-attention-item.err { border-color: rgba(243, 139, 168, 0.5); }
-.acc-attention-item.warn { border-color: rgba(249, 226, 175, 0.45); }
+.acc-attention-item.err { border-color: color-mix(in srgb, var(--red) 50%, transparent); }
+.acc-attention-item.warn { border-color: color-mix(in srgb, var(--yellow) 45%, transparent); }
 .acc-attention-item .acc-attention-icon {
   width: 22px; height: 22px;
   display: grid; place-items: center;
@@ -1247,9 +1247,9 @@ body.access-page #tab-access {
   font-weight: 900;
   flex: 0 0 auto;
 }
-.acc-attention-item.err .acc-attention-icon { color: var(--red); background: rgba(243, 139, 168, 0.12); }
-.acc-attention-item.warn .acc-attention-icon { color: var(--yellow); background: rgba(249, 226, 175, 0.12); }
-.acc-attention-item.info .acc-attention-icon { color: var(--sapphire); background: rgba(116, 199, 236, 0.12); }
+.acc-attention-item.err .acc-attention-icon { color: var(--red); background: color-mix(in srgb, var(--red) 12%, transparent); }
+.acc-attention-item.warn .acc-attention-icon { color: var(--yellow); background: color-mix(in srgb, var(--yellow) 12%, transparent); }
+.acc-attention-item.info .acc-attention-icon { color: var(--sapphire); background: color-mix(in srgb, var(--sapphire) 12%, transparent); }
 .acc-attention-msg { flex: 1 1 320px; color: var(--text); }
 .acc-attention-msg .acc-attention-detail { display: block; margin-top: 2px; color: var(--subtext0); font-size: 11.5px; }
 .acc-attention-steps { margin: 6px 0 0; padding-left: 18px; color: var(--subtext0); font-size: 11.5px; line-height: 1.6; }
@@ -1281,7 +1281,7 @@ body.access-page #tab-access {
   display: grid; place-items: center;
   border-radius: 9px;
   border: 1px solid var(--glass-hairline-bright);
-  background: rgba(49, 50, 68, 0.5);
+  background: color-mix(in srgb, var(--surface0) 50%, transparent);
   color: var(--lavender);
   font-size: 15px;
   font-weight: 900;
@@ -1322,7 +1322,7 @@ body.access-page #tab-access {
   flex: 1 1 80px;
   border: 1px solid var(--glass-hairline);
   border-radius: 7px;
-  background: rgba(17, 17, 27, 0.35);
+  background: color-mix(in srgb, var(--crust) 35%, transparent);
   padding: 8px 10px;
   cursor: pointer;
   transition: border-color 0.15s ease;
@@ -1348,10 +1348,10 @@ body.access-page #tab-access {
   gap: 7px;
   transition: border-color 0.15s ease, background 0.15s ease;
 }
-.acc-fleet-card:hover { border-color: var(--blue); background: rgba(24, 24, 37, 0.85); }
+.acc-fleet-card:hover { border-color: var(--blue); background: color-mix(in srgb, var(--mantle) 85%, transparent); }
 .acc-fleet-card-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .acc-fleet-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--overlay0); flex: 0 0 auto; }
-.acc-fleet-card.ok .acc-fleet-dot { background: var(--green); box-shadow: 0 0 6px rgba(166, 227, 161, 0.6); }
+.acc-fleet-card.ok .acc-fleet-dot { background: var(--green); box-shadow: 0 0 6px color-mix(in srgb, var(--green) 60%, transparent); }
 .acc-fleet-card.checking .acc-fleet-dot { background: var(--yellow); }
 .acc-fleet-card.err .acc-fleet-dot { background: var(--red); }
 .acc-fleet-card.ghost { border-style: dashed; opacity: 0.75; }
@@ -1370,7 +1370,7 @@ body.access-page #tab-access {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--teal);
-  border: 1px solid rgba(148, 226, 213, 0.4);
+  border: 1px solid color-mix(in srgb, var(--teal) 40%, transparent);
   border-radius: 4px;
   padding: 1px 5px;
   flex: 0 0 auto;
@@ -1404,7 +1404,7 @@ body.access-page #tab-access {
 .acc-explainer-step, .ui-explainer-step {
   border: 1px solid var(--glass-hairline);
   border-radius: 9px;
-  background: rgba(24, 24, 37, 0.4);
+  background: color-mix(in srgb, var(--mantle) 40%, transparent);
   padding: 12px 14px;
 }
 .acc-explainer-arrow, .ui-explainer-arrow {
@@ -1434,7 +1434,7 @@ body.access-page #tab-access {
   margin: 14px 0 0;
   border: 1px solid var(--glass-hairline);
   border-radius: 9px;
-  background: rgba(24, 24, 37, 0.35);
+  background: color-mix(in srgb, var(--mantle) 35%, transparent);
 }
 .acc-fold > summary, .ui-fold > summary {
   list-style: none;
@@ -1491,7 +1491,7 @@ body.access-page #tab-access {
   position: relative;
   border: 1px solid var(--surface1);
   border-radius: 8px;
-  background: rgba(49, 50, 68, 0.25);
+  background: color-mix(in srgb, var(--surface0) 25%, transparent);
   padding: 10px 12px;
   cursor: pointer;
   display: grid;
@@ -1500,7 +1500,7 @@ body.access-page #tab-access {
 }
 .acc-choice-card:hover { border-color: var(--overlay1); }
 .acc-choice-card input { position: absolute; opacity: 0; pointer-events: none; }
-.acc-choice-card.selected { border-color: var(--blue); background: rgba(137, 180, 250, 0.08); }
+.acc-choice-card.selected { border-color: var(--blue); background: color-mix(in srgb, var(--blue) 8%, transparent); }
 .acc-choice-card .t { font-size: 12px; font-weight: 800; color: var(--text); display: flex; align-items: center; gap: 6px; }
 .acc-choice-card .d { font-size: 10.5px; color: var(--subtext0); line-height: 1.45; }
 .acc-detected {
@@ -1510,8 +1510,8 @@ body.access-page #tab-access {
   margin-top: 8px;
   padding: 4px 9px;
   border-radius: 999px;
-  border: 1px solid rgba(166, 227, 161, 0.35);
-  background: rgba(166, 227, 161, 0.07);
+  border: 1px solid color-mix(in srgb, var(--green) 35%, transparent);
+  background: color-mix(in srgb, var(--green) 7%, transparent);
   color: var(--green);
   font-size: 10.5px;
   font-weight: 700;
@@ -1523,7 +1523,7 @@ body.access-page #tab-access {
   padding: 5px 9px;
   border: 1px solid var(--surface1);
   border-radius: 5px;
-  background: rgba(17, 17, 27, 0.55);
+  background: color-mix(in srgb, var(--crust) 55%, transparent);
   color: var(--text);
   font-family: inherit;
   font-size: 12px;
@@ -1534,7 +1534,7 @@ body.access-page #tab-access {
   position: relative;
   border: 1px solid var(--surface1);
   border-radius: 8px;
-  background: rgba(49, 50, 68, 0.25);
+  background: color-mix(in srgb, var(--surface0) 25%, transparent);
   padding: 10px 12px;
   cursor: pointer;
   display: grid;
@@ -1544,8 +1544,8 @@ body.access-page #tab-access {
 }
 .acc-role-card input { position: absolute; opacity: 0; pointer-events: none; }
 .acc-role-card:hover { border-color: var(--overlay1); }
-.acc-role-card.selected { border-color: var(--blue); background: rgba(137, 180, 250, 0.07); }
-.acc-role-card.selected.warn { border-color: var(--peach); background: rgba(250, 179, 135, 0.07); }
+.acc-role-card.selected { border-color: var(--blue); background: color-mix(in srgb, var(--blue) 7%, transparent); }
+.acc-role-card.selected.warn { border-color: var(--peach); background: color-mix(in srgb, var(--peach) 7%, transparent); }
 .acc-role-card-top { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 .acc-role-card .t { font-size: 12px; font-weight: 800; color: var(--text); }
 .acc-role-card .d { font-size: 10.5px; color: var(--subtext0); line-height: 1.45; }
@@ -1576,7 +1576,7 @@ body.access-page #tab-access {
   display: grid; place-items: center;
   border-radius: 7px;
   border: 1px solid var(--glass-hairline-bright);
-  background: rgba(49, 50, 68, 0.5);
+  background: color-mix(in srgb, var(--surface0) 50%, transparent);
   font-size: 10px;
   font-weight: 900;
   letter-spacing: 0.03em;
@@ -1600,7 +1600,7 @@ body.access-page #tab-access {
   padding: 7px 10px;
   border: 1px solid var(--glass-hairline);
   border-radius: 7px;
-  background: rgba(17, 17, 27, 0.35);
+  background: color-mix(in srgb, var(--crust) 35%, transparent);
   font-size: 11.5px;
 }
 .acc-grant-row .t { color: var(--subtext1); }
@@ -1613,7 +1613,7 @@ body.access-page #tab-access {
 .acc-role-info {
   border: 1px solid var(--glass-hairline);
   border-radius: 8px;
-  background: rgba(24, 24, 37, 0.4);
+  background: color-mix(in srgb, var(--mantle) 40%, transparent);
   padding: 10px 12px;
   display: grid;
   gap: 5px;
@@ -1627,7 +1627,7 @@ body.access-page #tab-access {
 .vault-card {
   border: 1px solid var(--glass-hairline);
   border-radius: 8px;
-  background: rgba(24, 24, 37, 0.4);
+  background: color-mix(in srgb, var(--mantle) 40%, transparent);
   padding: 12px 14px;
   display: grid;
   gap: 10px;
@@ -1651,7 +1651,7 @@ body.access-page #tab-access {
 .vault-words {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 6px;
   padding: 10px; border: 1px dashed color-mix(in srgb, var(--yellow) 45%, transparent);
-  border-radius: 8px; background: rgba(17, 17, 27, 0.5);
+  border-radius: 8px; background: color-mix(in srgb, var(--crust) 50%, transparent);
 }
 .vault-words .w {
   font-family: var(--mono, monospace); font-size: 12px; color: var(--text);
@@ -1662,7 +1662,7 @@ body.access-page #tab-access {
 .vault-entry-row {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   border: 1px solid var(--glass-hairline); border-radius: 6px;
-  padding: 6px 9px; background: rgba(17, 17, 27, 0.35); font-size: 11.5px;
+  padding: 6px 9px; background: color-mix(in srgb, var(--crust) 35%, transparent); font-size: 11.5px;
 }
 .vault-entry-row .lbl { color: var(--text); font-weight: 500; }
 .vault-entry-row .secret { font-family: var(--mono, monospace); font-size: 11px; color: var(--subtext0); overflow-wrap: anywhere; }
@@ -1679,17 +1679,17 @@ body.access-page #tab-access {
   font-size: 10px; font-weight: 700; letter-spacing: .04em;
   background: var(--surface0); color: var(--subtext1);
 }
-.custody-chip.grant { background: rgba(166, 227, 161, 0.14); color: var(--green); }
-.custody-chip.revoke { background: rgba(249, 226, 175, 0.14); color: var(--yellow); }
-.custody-chip.expire { background: rgba(108, 112, 134, 0.22); color: var(--overlay1); }
-.custody-chip.egress { background: rgba(137, 180, 250, 0.14); color: var(--blue); }
-.custody-chip.reset { background: rgba(243, 139, 168, 0.12); color: var(--red); }
+.custody-chip.grant { background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green); }
+.custody-chip.revoke { background: color-mix(in srgb, var(--yellow) 14%, transparent); color: var(--yellow); }
+.custody-chip.expire { background: color-mix(in srgb, var(--overlay0) 22%, transparent); color: var(--overlay1); }
+.custody-chip.egress { background: color-mix(in srgb, var(--blue) 14%, transparent); color: var(--blue); }
+.custody-chip.reset { background: color-mix(in srgb, var(--red) 12%, transparent); color: var(--red); }
 .custody-main { color: var(--text); flex: 0 1 auto; min-width: 0; }
 .custody-meta { color: var(--subtext0); flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere; }
 .vault-form-grid { display: grid; grid-template-columns: minmax(110px, 160px) 1fr; gap: 8px; align-items: center; }
 .vault-form-grid label { font-size: 11px; color: var(--subtext1); }
 .vault-form-grid input, .vault-form-grid select, .vault-phrase-input {
-  background: rgba(17, 17, 27, 0.6); color: var(--text);
+  background: color-mix(in srgb, var(--crust) 60%, transparent); color: var(--text);
   border: 1px solid var(--glass-hairline); border-radius: 6px;
   padding: 6px 8px; font-size: 12px; width: 100%;
 }
@@ -1716,13 +1716,13 @@ body.access-page #tab-access {
    --viz-* tokens in :root; they are validated ramps — don't improvise. */
 
 .ui-chip.ok::before { background: var(--green); }
-.ui-chip.ok { border-color: rgba(166, 227, 161, 0.35); color: var(--green); }
+.ui-chip.ok { border-color: color-mix(in srgb, var(--green) 35%, transparent); color: var(--green); }
 .ui-chip.warn::before { background: var(--yellow); }
-.ui-chip.warn { border-color: rgba(249, 226, 175, 0.35); color: var(--yellow); }
+.ui-chip.warn { border-color: color-mix(in srgb, var(--yellow) 35%, transparent); color: var(--yellow); }
 .ui-chip.err::before { background: var(--red); }
-.ui-chip.err { border-color: rgba(243, 139, 168, 0.4); color: var(--red); }
+.ui-chip.err { border-color: color-mix(in srgb, var(--red) 40%, transparent); color: var(--red); }
 .ui-chip.info::before { background: var(--blue); }
-.ui-chip.info { border-color: rgba(137, 180, 250, 0.35); color: var(--blue); }
+.ui-chip.info { border-color: color-mix(in srgb, var(--blue) 35%, transparent); color: var(--blue); }
 .ui-chip.muted::before { background: var(--overlay0); }
 .ui-chip.muted { color: var(--subtext0); }
 
@@ -1774,7 +1774,7 @@ body.access-page #tab-access {
   gap: 3px;
   border: 1px solid var(--glass-hairline);
   border-radius: 9px;
-  background: rgba(24, 24, 37, 0.4);
+  background: color-mix(in srgb, var(--mantle) 40%, transparent);
   padding: 10px 12px;
   min-width: 0;
 }
@@ -1799,7 +1799,7 @@ body.access-page #tab-access {
 .ui-meter {
   height: 6px;
   border-radius: 999px;
-  background: rgba(137, 180, 250, 0.16);
+  background: color-mix(in srgb, var(--blue) 16%, transparent);
   overflow: hidden;
 }
 .ui-meter > i {
@@ -1809,15 +1809,15 @@ body.access-page #tab-access {
   background: var(--blue);
   transition: width 0.25s ease;
 }
-.ui-meter.warn { background: rgba(249, 226, 175, 0.16); }
+.ui-meter.warn { background: color-mix(in srgb, var(--yellow) 16%, transparent); }
 .ui-meter.warn > i { background: var(--yellow); }
-.ui-meter.danger { background: rgba(243, 139, 168, 0.16); }
+.ui-meter.danger { background: color-mix(in srgb, var(--red) 16%, transparent); }
 .ui-meter.danger > i { background: var(--red); }
 
 /* Skeleton shimmer for content that is still loading. */
 .ui-skel {
   border-radius: 7px;
-  background: linear-gradient(100deg, rgba(49, 50, 68, 0.55) 40%, rgba(88, 91, 112, 0.35) 50%, rgba(49, 50, 68, 0.55) 60%);
+  background: linear-gradient(100deg, color-mix(in srgb, var(--surface0) 55%, transparent) 40%, color-mix(in srgb, var(--surface2) 35%, transparent) 50%, color-mix(in srgb, var(--surface0) 55%, transparent) 60%);
   background-size: 200% 100%;
   animation: ui-skel-sheen 1.4s ease-in-out infinite;
   min-height: 14px;
@@ -1951,8 +1951,8 @@ body.access-page #tab-access {
   min-height: 44px;
   margin: 2px 0 10px;
   padding: 9px 0;
-  border-top: 1px solid rgba(88, 91, 112, 0.42);
-  border-bottom: 1px solid rgba(88, 91, 112, 0.42);
+  border-top: 1px solid color-mix(in srgb, var(--surface2) 42%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--surface2) 42%, transparent);
 }
 .target-summary.ok { --target-accent: var(--green); }
 .target-summary.warn { --target-accent: var(--yellow); }
@@ -2017,7 +2017,7 @@ body.access-page #tab-access {
   border: 1px solid var(--surface1);
   border-radius: 999px;
   color: var(--overlay0);
-  background: rgba(49, 50, 68, 0.35);
+  background: color-mix(in srgb, var(--surface0) 35%, transparent);
   font-size: 11px;
   line-height: 1;
   white-space: nowrap;
@@ -2030,17 +2030,17 @@ body.access-page #tab-access {
   background: var(--overlay0);
 }
 .target-chip.ok {
-  border-color: rgba(166, 227, 161, 0.35);
+  border-color: color-mix(in srgb, var(--green) 35%, transparent);
   color: var(--green);
 }
 .target-chip.ok::before { background: var(--green); }
 .target-chip.ready {
-  border-color: rgba(137, 180, 250, 0.35);
+  border-color: color-mix(in srgb, var(--blue) 35%, transparent);
   color: var(--blue);
 }
 .target-chip.ready::before { background: var(--blue); }
 .target-chip.warn {
-  border-color: rgba(249, 226, 175, 0.38);
+  border-color: color-mix(in srgb, var(--yellow) 38%, transparent);
   color: var(--yellow);
 }
 .target-chip.warn::before { background: var(--yellow); }
@@ -2195,14 +2195,14 @@ body.access-page #tab-access {
   transition: background-color 0.12s ease, color 0.12s ease;
 }
 .files-ide-tree-row:hover {
-  background: rgba(49, 50, 68, 0.5);
+  background: color-mix(in srgb, var(--surface0) 50%, transparent);
 }
 .files-ide-tree-row:focus-visible {
   outline: 2px solid var(--files-accent);
   outline-offset: -2px;
 }
 .files-ide-tree-row.active {
-  background: rgba(49, 50, 68, 0.65);
+  background: color-mix(in srgb, var(--surface0) 65%, transparent);
   box-shadow: inset 2px 0 0 var(--files-accent);
   color: var(--text);
 }
@@ -2408,14 +2408,14 @@ body.access-page #tab-access {
   padding: 6px 10px 6px 12px;
   border-bottom: 1px solid var(--surface0);
   box-shadow: inset 3px 0 0 var(--yellow);
-  background: rgba(249, 226, 175, 0.07);
+  background: color-mix(in srgb, var(--yellow) 7%, transparent);
   color: var(--yellow);
   font-size: 12px;
   flex-shrink: 0;
 }
 .files-ide-banner.error {
   box-shadow: inset 3px 0 0 var(--red);
-  background: rgba(243, 139, 168, 0.07);
+  background: color-mix(in srgb, var(--red) 7%, transparent);
   color: var(--red);
 }
 .files-ide-banner .ui-btn {
@@ -2623,7 +2623,7 @@ body.access-page #tab-access {
   background: var(--surface1);
 }
 .cm-s-intendant .CodeMirror-activeline-background {
-  background: rgba(49, 50, 68, 0.45);
+  background: color-mix(in srgb, var(--surface0) 45%, transparent);
 }
 .cm-s-intendant .CodeMirror-matchingbracket {
   color: var(--teal) !important;
@@ -2786,10 +2786,10 @@ body.access-page #tab-access {
   border-radius: inherit;
   background: linear-gradient(90deg, var(--mauve), var(--green));
 }
-.files-transfer-row.running { border-color: rgba(137, 180, 250, 0.55); }
-.files-transfer-row.completed { border-color: rgba(166, 227, 161, 0.45); }
-.files-transfer-row.failed { border-color: rgba(243, 139, 168, 0.5); }
-.files-transfer-row.paused { border-color: rgba(249, 226, 175, 0.45); }
+.files-transfer-row.running { border-color: color-mix(in srgb, var(--blue) 55%, transparent); }
+.files-transfer-row.completed { border-color: color-mix(in srgb, var(--green) 45%, transparent); }
+.files-transfer-row.failed { border-color: color-mix(in srgb, var(--red) 50%, transparent); }
+.files-transfer-row.paused { border-color: color-mix(in srgb, var(--yellow) 45%, transparent); }
 .files-transfer-actions,
 .files-staged-actions,
 .files-upload-actions {
@@ -2909,7 +2909,7 @@ body.access-page #tab-access {
   padding: 10px;
   border: 1px solid var(--glass-hairline);
   border-radius: 6px;
-  background: rgba(24, 24, 37, 0.4);
+  background: color-mix(in srgb, var(--mantle) 40%, transparent);
 }
 .debug-workspace-row-main { min-width: 0; }
 .debug-workspace-row-title {
@@ -2960,9 +2960,9 @@ body.access-page #tab-access {
   color: var(--text);
   font-size: 12px;
 }
-.connect-health-badge.ok { border-color: rgba(166, 227, 161, 0.45); }
-.connect-health-badge.warn { border-color: rgba(249, 226, 175, 0.45); }
-.connect-health-badge.err { border-color: rgba(243, 139, 168, 0.5); }
+.connect-health-badge.ok { border-color: color-mix(in srgb, var(--green) 45%, transparent); }
+.connect-health-badge.warn { border-color: color-mix(in srgb, var(--yellow) 45%, transparent); }
+.connect-health-badge.err { border-color: color-mix(in srgb, var(--red) 50%, transparent); }
 .connect-health-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -3037,9 +3037,9 @@ body.access-page #tab-access {
   background: var(--mantle);
   font-size: 12px;
 }
-.connect-self-test-row.pass { border-color: rgba(166, 227, 161, 0.35); }
-.connect-self-test-row.skip { border-color: rgba(249, 226, 175, 0.35); }
-.connect-self-test-row.fail { border-color: rgba(243, 139, 168, 0.45); }
+.connect-self-test-row.pass { border-color: color-mix(in srgb, var(--green) 35%, transparent); }
+.connect-self-test-row.skip { border-color: color-mix(in srgb, var(--yellow) 35%, transparent); }
+.connect-self-test-row.fail { border-color: color-mix(in srgb, var(--red) 45%, transparent); }
 .connect-self-test-state {
   font-family: 'JetBrains Mono', 'Fira Code', monospace;
   font-size: 10px;
@@ -3832,11 +3832,11 @@ body.access-page #tab-access {
 
 /* ── Access → Intendant Connect card ── */
 .acc-chip.route-danger::before { background: var(--red); }
-.acc-chip.route-danger { border-color: rgba(243, 139, 168, 0.5); color: var(--red); font-weight: 700; }
+.acc-chip.route-danger { border-color: color-mix(in srgb, var(--red) 50%, transparent); color: var(--red); font-weight: 700; }
 .acc-connect-warn {
   margin: 8px 0 2px;
   padding: 8px 10px;
-  border: 1px solid rgba(243, 139, 168, 0.4);
+  border: 1px solid color-mix(in srgb, var(--red) 40%, transparent);
   border-radius: 8px;
   color: var(--red);
   font-size: 12px;
