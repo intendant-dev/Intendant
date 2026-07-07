@@ -1712,6 +1712,7 @@ pub(crate) async fn run_with_presence(
                 &log_dir,
                 &bus,
                 &session_registry,
+                autonomy.read().await.user_display_granted,
             )
             .await
             {

@@ -186,7 +186,6 @@ impl IntendantServer {
             state.autonomy.clone()
         };
         autonomy.write().await.user_display_granted = true;
-        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
         if let Some((width, height)) = active_resolution {
             self.bus.send(AppEvent::DisplayReady {
                 display_id,
@@ -212,7 +211,6 @@ impl IntendantServer {
             let mut autonomy = autonomy.write().await;
             autonomy.user_display_granted = false;
         }
-        std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         self.bus.send(AppEvent::UserDisplayRevoked {
             display_id,
             note: params.note.clone(),
@@ -276,8 +274,7 @@ impl IntendantServer {
                 return UserSessionDisplayActivationRequest::AlreadyActive;
             }
         }
-        let granted = std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok()
-            || autonomy.read().await.user_display_granted;
+        let granted = autonomy.read().await.user_display_granted;
         if !granted {
             return UserSessionDisplayActivationRequest::NeedsGrant;
         }
@@ -307,7 +304,6 @@ impl IntendantServer {
             let mut guard = autonomy.write().await;
             guard.user_display_granted = true;
         }
-        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
         self.bus
             .send(AppEvent::UserDisplayGranted { display_id: 0 });
         UserSessionDisplayActivationRequest::Requested
@@ -348,7 +344,6 @@ impl IntendantServer {
             let mut guard = autonomy.write().await;
             guard.user_display_granted = true;
         }
-        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
         self.bus.send(AppEvent::UserDisplayGranted { display_id });
     }
 
@@ -533,7 +528,11 @@ impl IntendantServer {
             .clone()
             .unwrap_or_else(|| state.log_dir.join("screenshots"));
         let session_registry = state.session_registry.clone();
+        let autonomy = state.autonomy.clone();
         drop(state);
+        // Read after the Wayland activation above, which may have flipped
+        // the grant on the guard.
+        let user_display_granted = autonomy.read().await.user_display_granted;
 
         let _ = std::fs::create_dir_all(&screenshot_dir);
         let mut counter = self
@@ -550,6 +549,7 @@ impl IntendantServer {
             &mut counter,
             &session_registry,
             None,
+            user_display_granted,
         )
         .await;
 
@@ -653,7 +653,11 @@ impl IntendantServer {
             .clone()
             .unwrap_or_else(|| state.log_dir.join("screenshots"));
         let session_registry = state.session_registry.clone();
+        let autonomy = state.autonomy.clone();
         drop(state);
+        // Read after the Wayland activation above, which may have flipped
+        // the grant on the guard.
+        let user_display_granted = autonomy.read().await.user_display_granted;
 
         // Denormalize 0-1000 grid coordinates to pixel coordinates.
         // Reference size comes from the live capture session when one exists
@@ -689,6 +693,7 @@ impl IntendantServer {
             &mut counter,
             &session_registry,
             denorm_ref,
+            user_display_granted,
         )
         .await;
 
@@ -935,7 +940,7 @@ mod tests {
     use super::*;
     use crate::autonomy::{self, AutonomyState};
     use tokio::time::{timeout, Duration};
-    use crate::mcp::tests::{TEST_ENV_LOCK, test_session_registry_with_display, test_state};
+    use crate::mcp::tests::{test_session_registry_with_display, test_state};
 
     #[test]
     fn shared_view_tool_activates_target_and_emits_dashboard_event() {
@@ -944,8 +949,6 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
             let server = IntendantServer::new(test_state(), bus.clone());
@@ -994,7 +997,6 @@ mod tests {
                 }
                 other => panic!("expected SharedView event, got {other:?}"),
             }
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         });
     }
 
@@ -1005,8 +1007,6 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
             let state = test_state();
@@ -1047,13 +1047,11 @@ mod tests {
                 }
                 other => panic!("expected SharedView event, got {other:?}"),
             }
-            // Assert the per-test source of truth, not the process-global
-            // env mirror: any unlocked env toucher anywhere in the binary
-            // can race a mirror read (fleet flake 2026-07-06). The mirror
-            // itself is covered by user_display_env_mirror_tracks_grant_and_revoke.
+            // The autonomy guard is the single source of truth for the
+            // grant (the process-env mirror that used to race across tests
+            // is gone — fleet flake 2026-07-06).
             let autonomy = { state.read().await.autonomy.clone() };
             assert!(autonomy.read().await.user_display_granted);
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         });
     }
 
@@ -1118,8 +1116,6 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let state = test_state();
             {
                 let mut state_guard = state.write().await;
@@ -1148,8 +1144,7 @@ mod tests {
                 }
                 other => panic!("expected UserDisplayGranted event, got {other:?}"),
             }
-            // Source-of-truth assert (see the mirror-race note in the
-            // shared_view test above).
+            // Source-of-truth assert: the autonomy guard holds the grant.
             let autonomy = { state.read().await.autonomy.clone() };
             assert!(autonomy.read().await.user_display_granted);
             assert!(
@@ -1185,55 +1180,10 @@ mod tests {
         });
     }
 
-    /// The ONLY test asserting the process-env mirror of
-    /// `user_display_granted` — everything else asserts the autonomy guard
-    /// (per-test state, race-free). One serialized reader keeps mirror
-    /// coverage without exposing every flow test to cross-test env races.
-    #[test]
-    fn user_display_env_mirror_tracks_grant_and_revoke() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
-            let state = test_state();
-            {
-                let mut state_guard = state.write().await;
-                state_guard
-                    .user_display_activation_pending
-                    .insert(3, std::time::Instant::now());
-            }
-            let bus = EventBus::new();
-            let server = IntendantServer::new(state.clone(), bus);
-
-            server
-                .call_tool_by_name_for_session(
-                    "grant_user_display",
-                    serde_json::json!({ "display_id": 3 }),
-                    Some("managed-session"),
-                    Some(true),
-                )
-                .await
-                .expect("grant_user_display should route");
-            assert_eq!(
-                std::env::var("INTENDANT_USER_DISPLAY_GRANTED").as_deref(),
-                Ok("1")
-            );
-
-            server
-                .call_tool_by_name_for_session(
-                    "revoke_user_display",
-                    serde_json::json!({ "display_id": 3, "note": "done" }),
-                    Some("managed-session"),
-                    Some(true),
-                )
-                .await
-                .expect("revoke_user_display should route");
-            assert!(std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err());
-        });
-    }
+    // The process-env mirror of `user_display_granted` is gone: the autonomy
+    // guard is the single source of truth, and the env var exists only on
+    // runtime children, derived at the spawn boundary — see
+    // `agent_runner::user_display_grant_env_derives_from_guard_state_at_spawn`.
 
     #[test]
     fn wayland_user_session_reacquire_requests_once_when_granted() {
@@ -1242,8 +1192,6 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let state = test_state();
             let autonomy = {
                 let mut s = state.write().await;
@@ -1291,7 +1239,6 @@ mod tests {
                 timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
                 "pending reacquire must not queue duplicate grant events"
             );
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         });
     }
 
@@ -1302,8 +1249,6 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let state = test_state();
             let autonomy = {
                 let mut s = state.write().await;
@@ -1336,7 +1281,6 @@ mod tests {
                 timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
                 "active session must not queue a duplicate portal grant event"
             );
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         });
     }
 
@@ -1347,8 +1291,6 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let state = test_state();
             let autonomy = {
                 let mut s = state.write().await;
@@ -1392,7 +1334,6 @@ mod tests {
                 }
                 other => panic!("expected refreshed UserDisplayGranted event, got {other:?}"),
             }
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         });
     }
 
@@ -1403,8 +1344,6 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let state = test_state();
             {
                 let mut s = state.write().await;
@@ -1455,7 +1394,6 @@ mod tests {
                     .contains_key(&0),
                 "active grant should clear stale pending state"
             );
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         });
     }
 
@@ -1466,8 +1404,6 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let state = test_state();
             {
                 let mut s = state.write().await;

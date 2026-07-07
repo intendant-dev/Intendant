@@ -1269,7 +1269,6 @@ async fn apply_user_approval(
     }
     if cat == autonomy::ActionCategory::DisplayControl && !state.user_display_granted {
         state.user_display_granted = true;
-        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
         bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
     }
 }

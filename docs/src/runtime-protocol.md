@@ -179,6 +179,9 @@ one. `replace_lines` errors if `end_line < line_number`.
 - **Display gating**: `DISPLAY` is set to the chosen display. Access to the user's
   session display (`:0` or below) is refused unless
   `INTENDANT_USER_DISPLAY_GRANTED` is set; otherwise a virtual display is used.
+  The controller derives that variable onto the runtime child's environment at
+  spawn time from the autonomy guard's `user_display_granted` (the grant's
+  single source of truth) — it is never set on the controller's own process.
 - **Exit codes**: real exit code on completion; `-3` on timeout (process killed),
   `-2` on `wait_for_port` timeout, `-1` on spawn/wait failure.
 
