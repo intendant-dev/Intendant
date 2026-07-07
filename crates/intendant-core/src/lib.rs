@@ -6,8 +6,12 @@
 //! peer/frontend/upload types that live above this crate.)
 
 pub mod autonomy;
+pub mod conversation;
 pub mod error;
 pub mod frames;
+pub mod knowledge;
 pub mod net;
+pub mod skills;
+pub mod state_paths;
 pub mod usage;
 pub mod vitals;

@@ -1,4 +1,4 @@
-use crate::provider::TokenUsage;
+use crate::usage::TokenUsage;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 
@@ -282,6 +282,7 @@ impl Conversation {
     ///   and adjacency survive;
     /// - a tool result whose assistant call was dropped — the orphan is
     ///   removed.
+    ///
     /// `resolve_dangling_tool_calls` only patches the trailing batch (the
     /// interrupt case); mutation can strand pairs anywhere in history.
     pub fn repair_tool_call_pairing(&mut self) -> usize {
@@ -367,6 +368,11 @@ impl Conversation {
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.messages.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
     }
 
     pub fn set_usage(&mut self, usage: TokenUsage) {
@@ -634,7 +640,7 @@ impl Conversation {
         let mut writer = std::io::BufWriter::new(file);
         for msg in &self.messages {
             let json = serde_json::to_string(msg)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(std::io::Error::other)?;
             writeln!(writer, "{}", json)?;
         }
         writer.flush()?;
@@ -1456,7 +1462,7 @@ mod tests {
             conv.add_assistant(format!("reply-{}", i));
         }
         // Set usage at 65% — above 0.60 threshold but below 0.90
-        conv.set_usage(crate::provider::TokenUsage {
+        conv.set_usage(crate::usage::TokenUsage {
             prompt_tokens: 65_000,
             completion_tokens: 0,
             total_tokens: 65_000,
@@ -1477,7 +1483,7 @@ mod tests {
             conv.add_user(format!("u{}", i));
             conv.add_assistant(format!("a{}", i));
         }
-        conv.set_usage(crate::provider::TokenUsage {
+        conv.set_usage(crate::usage::TokenUsage {
             prompt_tokens: 50_000,
             completion_tokens: 0,
             total_tokens: 50_000,
