@@ -50,8 +50,8 @@ use crate::app_state_pricing::{estimate_live_usage_cost, estimate_session_cost, 
 use crate::event::AppEvent;
 use crate::peer::{
     ActivityId, ActivityKind, ActivityOutcome, ApprovalDecision, ApprovalRequest, Capability,
-    LogLevel, MessageContent, MessageId, MessageRole, ModelUsage, PeerEvent, PeerStatus,
-    SessionInfo, UsageSnapshot,
+    LogLevel, MessageContent, MessageId, MessageRole, ModelUsage, PeerDisplayInfo, PeerEvent,
+    PeerStatus, SessionInfo, UsageSnapshot,
 };
 use crate::types::OutboundEvent;
 
@@ -328,6 +328,62 @@ pub(crate) fn session_updated_events(changed: Option<SessionInfo>) -> Vec<PeerEv
         .collect()
 }
 
+/// Cap on distinct displays tracked per upcaster. `display_capture_lost`
+/// / `user_display_revoked` prune the normal flow; the cap only bounds a
+/// peer that keeps announcing new display ids without ever losing them.
+/// Unlike sessions there is no timestamp to age by, so at the cap new
+/// ids are refused (existing ids keep updating) — a paired peer with 64
+/// concurrent live displays is not a real topology.
+pub(crate) const MAX_TRACKED_PEER_DISPLAYS: usize = 64;
+
+/// Folds a peer's display-availability wire events (`display_ready`,
+/// `display_resize`, `display_capture_lost`, `user_display_revoked`)
+/// into change-only [`PeerEvent::DisplayReady`] / [`PeerEvent::DisplayLost`]
+/// emissions. Change-only matters because the peer's gateway replays
+/// `display_ready` for every active display on each transport
+/// (re)connect — repeats are the common case, and consumers should see
+/// one idempotent stream. Shared by both upcasters, same drift defense
+/// as [`PeerSessionFold`].
+#[derive(Default)]
+pub(crate) struct PeerDisplayFold {
+    displays: std::collections::BTreeMap<u32, PeerDisplayInfo>,
+}
+
+impl PeerDisplayFold {
+    /// Upsert from a `display_ready` / `display_resize`; emits only
+    /// when the display is new or its geometry actually changed.
+    fn ready(&mut self, display_id: u32, width: u32, height: u32) -> Vec<PeerEvent> {
+        let info = PeerDisplayInfo {
+            display_id,
+            width,
+            height,
+        };
+        if !self.displays.contains_key(&display_id)
+            && self.displays.len() >= MAX_TRACKED_PEER_DISPLAYS
+        {
+            return vec![];
+        }
+        let changed = self.displays.get(&display_id) != Some(&info);
+        self.displays.insert(display_id, info.clone());
+        if changed {
+            vec![PeerEvent::DisplayReady { display: info }]
+        } else {
+            vec![]
+        }
+    }
+
+    /// Retire a display; emits only if it was actually tracked (a
+    /// `capture_lost` for a display this connection never saw
+    /// announces nothing).
+    fn lost(&mut self, display_id: u32, reason: Option<String>) -> Vec<PeerEvent> {
+        if self.displays.remove(&display_id).is_some() {
+            vec![PeerEvent::DisplayLost { display_id, reason }]
+        } else {
+            vec![]
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AppEventUpcaster — in-process AppEvent → PeerEvent
 // ---------------------------------------------------------------------------
@@ -362,6 +418,8 @@ pub struct AppEventUpcaster {
     current_agent_turn: Option<usize>,
     /// Per-session enrichment fold (see [`PeerSessionFold`]).
     sessions: PeerSessionFold,
+    /// Display-availability fold (see [`PeerDisplayFold`]).
+    displays: PeerDisplayFold,
 }
 
 impl Default for AppEventUpcaster {
@@ -379,6 +437,7 @@ impl AppEventUpcaster {
             current_turn: None,
             current_agent_turn: None,
             sessions: PeerSessionFold::default(),
+            displays: PeerDisplayFold::default(),
         }
     }
 
@@ -908,24 +967,21 @@ impl AppEventUpcaster {
                 display_id,
                 width,
                 height,
-            } => vec![PeerEvent::CapabilityEngaged {
-                capability: Capability::Display,
-                detail: serde_json::json!({
-                    "display_id": display_id,
-                    "width": width,
-                    "height": height,
-                }),
-            }],
+            } => self.displays.ready(*display_id, *width, *height),
 
             AppEvent::DisplayResize {
                 display_id,
                 width,
                 height,
-            } => vec![log_event(
-                LogLevel::Info,
-                "display",
-                format!("display {display_id} resized to {width}x{height}"),
-            )],
+            } => {
+                let mut events = vec![log_event(
+                    LogLevel::Info,
+                    "display",
+                    format!("display {display_id} resized to {width}x{height}"),
+                )];
+                events.extend(self.displays.ready(*display_id, *width, *height));
+                events
+            }
 
             AppEvent::DisplayTaken { display_id } => vec![PeerEvent::CapabilityEngaged {
                 capability: Capability::Display,
@@ -940,13 +996,9 @@ impl AppEventUpcaster {
                 reason: note.clone(),
             }],
 
-            AppEvent::DisplayCaptureLost {
-                display_id: _,
-                reason,
-            } => vec![PeerEvent::CapabilityReleased {
-                capability: Capability::Display,
-                reason: Some(format!("capture_lost: {reason}")),
-            }],
+            AppEvent::DisplayCaptureLost { display_id, reason } => self
+                .displays
+                .lost(*display_id, Some(format!("capture_lost: {reason}"))),
 
             AppEvent::DisplayApprovalPending {
                 display_id: _,
@@ -965,11 +1017,16 @@ impl AppEventUpcaster {
 
             AppEvent::UserDisplayRevoked { display_id, note } => {
                 let note_str = note.as_deref().unwrap_or("");
-                vec![log_event(
+                let mut events = vec![log_event(
                     LogLevel::Info,
                     "display",
                     format!("user revoked display {display_id}: {note_str}"),
-                )]
+                )];
+                events.extend(self.displays.lost(
+                    *display_id,
+                    Some(note.clone().unwrap_or_else(|| "user display revoked".to_string())),
+                ));
+                events
             }
 
             AppEvent::DebugScreenReady { display_id } => vec![PeerEvent::CapabilityEngaged {
@@ -1559,6 +1616,8 @@ pub struct WireEventUpcaster {
     current_agent_turn: Option<usize>,
     /// Per-session enrichment fold (see [`PeerSessionFold`]).
     sessions: PeerSessionFold,
+    /// Display-availability fold (see [`PeerDisplayFold`]).
+    displays: PeerDisplayFold,
 }
 
 impl Default for WireEventUpcaster {
@@ -1575,6 +1634,7 @@ impl WireEventUpcaster {
             current_turn: None,
             current_agent_turn: None,
             sessions: PeerSessionFold::default(),
+            displays: PeerDisplayFold::default(),
         }
     }
 
@@ -2245,24 +2305,21 @@ impl WireEventUpcaster {
                 display_id,
                 width,
                 height,
-            } => vec![PeerEvent::CapabilityEngaged {
-                capability: Capability::Display,
-                detail: serde_json::json!({
-                    "display_id": display_id,
-                    "width": width,
-                    "height": height,
-                }),
-            }],
+            } => self.displays.ready(*display_id, *width, *height),
 
             OutboundEvent::DisplayResize {
                 display_id,
                 width,
                 height,
-            } => vec![log_event(
-                LogLevel::Info,
-                "display",
-                format!("display {display_id} resized to {width}x{height}"),
-            )],
+            } => {
+                let mut events = vec![log_event(
+                    LogLevel::Info,
+                    "display",
+                    format!("display {display_id} resized to {width}x{height}"),
+                )];
+                events.extend(self.displays.ready(*display_id, *width, *height));
+                events
+            }
 
             OutboundEvent::DisplayTaken { display_id } => vec![PeerEvent::CapabilityEngaged {
                 capability: Capability::Display,
@@ -2279,13 +2336,9 @@ impl WireEventUpcaster {
                 }]
             }
 
-            OutboundEvent::DisplayCaptureLost {
-                display_id: _,
-                reason,
-            } => vec![PeerEvent::CapabilityReleased {
-                capability: Capability::Display,
-                reason: Some(format!("capture_lost: {reason}")),
-            }],
+            OutboundEvent::DisplayCaptureLost { display_id, reason } => self
+                .displays
+                .lost(*display_id, Some(format!("capture_lost: {reason}"))),
 
             OutboundEvent::DisplayApprovalPending {
                 display_id: _,
@@ -2307,11 +2360,16 @@ impl WireEventUpcaster {
 
             OutboundEvent::UserDisplayRevoked { display_id, note } => {
                 let note_str = note.as_deref().unwrap_or("");
-                vec![log_event(
+                let mut events = vec![log_event(
                     LogLevel::Info,
                     "display",
                     format!("user revoked display {display_id}: {note_str}"),
-                )]
+                )];
+                events.extend(self.displays.lost(
+                    *display_id,
+                    Some(note.clone().unwrap_or_else(|| "user display revoked".to_string())),
+                ));
+                events
             }
 
             OutboundEvent::DebugScreenReady { display_id } => {
@@ -2969,20 +3027,23 @@ mod tests {
     #[test]
     fn display_capability_lifecycle() {
         let mut u = AppEventUpcaster::new();
-        let engaged = u.upcast(&AppEvent::DisplayReady {
+        // Availability is first-class now: display_ready folds into a
+        // typed DisplayReady instead of a detail-blob CapabilityEngaged.
+        let ready = u.upcast(&AppEvent::DisplayReady {
             display_id: 1,
             width: 1920,
             height: 1080,
         });
-        assert_eq!(engaged.len(), 1);
-        match &engaged[0] {
-            PeerEvent::CapabilityEngaged { capability, detail } => {
-                assert_eq!(*capability, Capability::Display);
-                assert_eq!(detail["width"], 1920);
-                assert_eq!(detail["height"], 1080);
+        assert_eq!(ready.len(), 1);
+        match &ready[0] {
+            PeerEvent::DisplayReady { display } => {
+                assert_eq!(display.display_id, 1);
+                assert_eq!((display.width, display.height), (1920, 1080));
             }
-            _ => panic!("expected CapabilityEngaged"),
+            other => panic!("expected DisplayReady, got {other:?}"),
         }
+        // Control release stays a capability transition — the display
+        // still exists, someone just let go of it.
         let released = u.upcast(&AppEvent::DisplayReleased {
             display_id: 1,
             note: Some("user revoked".into()),
@@ -2994,6 +3055,16 @@ mod tests {
             }
             _ => panic!("expected CapabilityReleased"),
         }
+        // Losing capture retires availability.
+        let lost = u.upcast(&AppEvent::DisplayCaptureLost {
+            display_id: 1,
+            reason: "backend_crashed".into(),
+        });
+        assert_eq!(lost.len(), 1);
+        assert!(matches!(
+            &lost[0],
+            PeerEvent::DisplayLost { display_id: 1, .. }
+        ));
     }
 
     /// Recording lifecycle engages/releases the Recording capability.
@@ -3777,6 +3848,119 @@ mod tests {
             display_id: 1,
             reason: "backend_crashed".into(),
         });
+    }
+
+    // ---- Display-availability fold ----
+
+    fn wire_display_ready(display_id: u32, width: u32, height: u32) -> OutboundEvent {
+        OutboundEvent::DisplayReady {
+            display_id,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn wire_display_fold_emits_change_only() {
+        let mut up = WireEventUpcaster::new();
+
+        // First announce emits.
+        let first = up.upcast(&wire_display_ready(99, 1920, 1080));
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            &first[0],
+            PeerEvent::DisplayReady { display }
+                if *display == PeerDisplayInfo { display_id: 99, width: 1920, height: 1080 }
+        ));
+
+        // The gateway replays display_ready on every transport connect —
+        // an identical repeat must be silent.
+        assert!(up.upcast(&wire_display_ready(99, 1920, 1080)).is_empty());
+
+        // A geometry change re-announces (display_resize path).
+        let resized = up.upcast(&OutboundEvent::DisplayResize {
+            display_id: 99,
+            width: 1280,
+            height: 720,
+        });
+        assert!(resized.iter().any(|event| matches!(
+            event,
+            PeerEvent::DisplayReady {
+                display: PeerDisplayInfo {
+                    display_id: 99,
+                    width: 1280,
+                    height: 720,
+                }
+            }
+        )));
+    }
+
+    #[test]
+    fn wire_display_fold_retires_on_capture_lost_and_revoke() {
+        let mut up = WireEventUpcaster::new();
+        up.upcast(&wire_display_ready(99, 1920, 1080));
+        up.upcast(&wire_display_ready(0, 2560, 1440));
+
+        let lost = up.upcast(&OutboundEvent::DisplayCaptureLost {
+            display_id: 99,
+            reason: "backend_crashed".into(),
+        });
+        assert_eq!(lost.len(), 1);
+        assert!(matches!(
+            &lost[0],
+            PeerEvent::DisplayLost { display_id: 99, reason: Some(reason) }
+                if reason == "capture_lost: backend_crashed"
+        ));
+
+        // Revoking the user display retires it too (alongside the
+        // unconditional log line).
+        let revoked = up.upcast(&OutboundEvent::UserDisplayRevoked {
+            display_id: 0,
+            note: None,
+        });
+        assert!(revoked
+            .iter()
+            .any(|event| matches!(event, PeerEvent::DisplayLost { display_id: 0, .. })));
+
+        // Losing a display this connection never saw announces nothing.
+        let unknown = up.upcast(&OutboundEvent::DisplayCaptureLost {
+            display_id: 7,
+            reason: "never seen".into(),
+        });
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn wire_display_fold_refuses_new_ids_at_cap() {
+        let mut up = WireEventUpcaster::new();
+        for id in 0..(MAX_TRACKED_PEER_DISPLAYS as u32) {
+            assert_eq!(up.upcast(&wire_display_ready(id, 100, 100)).len(), 1);
+        }
+        // New id at cap: refused, silent.
+        assert!(up
+            .upcast(&wire_display_ready(
+                MAX_TRACKED_PEER_DISPLAYS as u32,
+                100,
+                100
+            ))
+            .is_empty());
+        // Existing ids keep updating.
+        assert_eq!(up.upcast(&wire_display_ready(0, 200, 200)).len(), 1);
+    }
+
+    #[test]
+    fn replay_lane_does_not_fold_displays() {
+        // Historical display_ready in a served log_replay must not seed
+        // *current* availability — the replay lane folds session state
+        // only; live displays arrive as real wire events via the
+        // gateway's on-connect replay.
+        let mut up = WireEventUpcaster::new();
+        assert!(up
+            .upcast_replayed(&wire_display_ready(99, 1920, 1080))
+            .is_empty());
+        // And the live fold stayed clean: the same display arriving
+        // live afterwards still announces.
+        assert_eq!(up.upcast(&wire_display_ready(99, 1920, 1080)).len(), 1);
     }
 
     #[test]

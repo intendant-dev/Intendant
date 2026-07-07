@@ -351,10 +351,6 @@ pub(crate) fn truncate_sessions_preserving_sources_to(
     *sessions = out;
 }
 
-pub(crate) fn truncate_sessions_preserving_sources(sessions: &mut Vec<serde_json::Value>) {
-    truncate_sessions_preserving_sources_to(sessions, SESSION_LIST_LIMIT)
-}
-
 pub(crate) fn codex_usage_bucket<'a>(
     value: &'a serde_json::Value,
     names: &[&str],

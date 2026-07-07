@@ -250,6 +250,21 @@ pub enum UiCommand {
         host_id: String,
         session_id: String,
     },
+    /// A display became available (or changed geometry) on a federated
+    /// peer. Change-only stream folded daemon-side from the peer's
+    /// `display_ready` / `display_resize` wire events; JS upserts it
+    /// into the peer row's `displays` list by `display_id` (mirror of
+    /// `PeerSessionUpdated`) and refreshes the Station peer chips.
+    PeerDisplayReady {
+        host_id: String,
+        display_id: u32,
+        width: u32,
+        height: u32,
+    },
+    /// A federated peer's display stopped being available (capture
+    /// lost, or the peer's user revoked their grant); JS drops it from
+    /// the peer row's `displays` list.
+    PeerDisplayRemoved { host_id: String, display_id: u32 },
     /// One leg of a federation-driven WebRTC signaling exchange
     /// arriving from a peer. JS feeds the `signal` payload to the
     /// matching per-peer `RTCPeerConnection` keyed by
@@ -3350,6 +3365,50 @@ pub fn render_peer_event(host_id: &str, payload: &serde_json::Value) -> Vec<UiCo
             }]
         }
 
+        // Display availability: log line + model update, so the peer's
+        // displays are discoverable (chips / runway / pickers), not just
+        // narrated. The daemon-side fold is change-only, so every
+        // arrival is a real transition.
+        "display_ready" => {
+            let display = &payload["display"];
+            let display_id = display["display_id"].as_u64().unwrap_or(0) as u32;
+            let width = display["width"].as_u64().unwrap_or(0) as u32;
+            let height = display["height"].as_u64().unwrap_or(0) as u32;
+            vec![
+                UiCommand::PeerLog {
+                    host_id: host.clone(),
+                    ts: now,
+                    level: "info".to_string(),
+                    source: "display".to_string(),
+                    content: format!("display :{display_id} ready ({width}x{height})"),
+                },
+                UiCommand::PeerDisplayReady {
+                    host_id: host,
+                    display_id,
+                    width,
+                    height,
+                },
+            ]
+        }
+
+        "display_lost" => {
+            let display_id = payload["display_id"].as_u64().unwrap_or(0) as u32;
+            let reason = payload["reason"].as_str().unwrap_or("gone");
+            vec![
+                UiCommand::PeerLog {
+                    host_id: host.clone(),
+                    ts: now,
+                    level: "info".to_string(),
+                    source: "display".to_string(),
+                    content: format!("display :{display_id} lost ({reason})"),
+                },
+                UiCommand::PeerDisplayRemoved {
+                    host_id: host,
+                    display_id,
+                },
+            ]
+        }
+
         "session_started" => {
             let session = &payload["session"];
             let label = session["label"].as_str().unwrap_or("");
@@ -5554,6 +5613,72 @@ mod tests {
     /// `peer_event_forwarded` carrying a `log` PeerEvent renders as a
     /// host-tagged PeerLog with level/source/content pulled straight
     /// from the inner payload.
+    #[test]
+    fn peer_event_forwarded_display_lifecycle_upserts_and_retires() {
+        let mut s = AppState::new();
+
+        // display_ready → host-tagged log line (with id + geometry) +
+        // PeerDisplayReady model update.
+        let ready = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "display_ready",
+                "display": { "display_id": 99, "width": 1920, "height": 1080 },
+            },
+        });
+        let cmds = s.handle_message(&ready);
+        let upsert = cmds.iter().find_map(|c| match c {
+            UiCommand::PeerDisplayReady {
+                host_id,
+                display_id,
+                width,
+                height,
+            } => Some((host_id, *display_id, *width, *height)),
+            _ => None,
+        });
+        let (host_id, display_id, width, height) =
+            upsert.expect("PeerDisplayReady emitted");
+        assert_eq!(host_id, "intendant:alpha");
+        assert_eq!((display_id, width, height), (99, 1920, 1080));
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                UiCommand::PeerLog { content, .. }
+                    if content.contains(":99") && content.contains("1920x1080")
+            )),
+            "display_ready logs the id and geometry"
+        );
+
+        // display_lost → log line + PeerDisplayRemoved.
+        let lost = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "display_lost",
+                "display_id": 99,
+                "reason": "capture_lost: backend_crashed",
+            },
+        });
+        let cmds = s.handle_message(&lost);
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                UiCommand::PeerDisplayRemoved { host_id, display_id: 99 }
+                    if host_id == "intendant:alpha"
+            )),
+            "display_lost removes the display from the model"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                UiCommand::PeerLog { content, .. }
+                    if content.contains(":99") && content.contains("backend_crashed")
+            )),
+            "display_lost logs the id and reason"
+        );
+    }
+
     #[test]
     fn peer_event_forwarded_session_lifecycle_upserts_and_retires() {
         let mut s = AppState::new();

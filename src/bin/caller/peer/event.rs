@@ -136,6 +136,24 @@ pub enum PeerEvent {
         reason: Option<String>,
     },
 
+    // ---- Display availability ----
+    /// A display became available on the peer, or an already-known
+    /// display changed geometry. Folded change-only from the peer's
+    /// `display_ready` / `display_resize` wire events; the peer's
+    /// gateway also replays `display_ready` for every active display
+    /// when a transport (re)connects, so a late-joining primary
+    /// converges without snapshot special-casing.
+    DisplayReady { display: PeerDisplayInfo },
+
+    /// A peer display stopped being available: its capture pipeline
+    /// died (`display_capture_lost`) or the peer's user revoked their
+    /// display grant (`user_display_revoked`).
+    DisplayLost {
+        display_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     // ---- Resource accounting ----
     Usage {
         snapshot: UsageSnapshot,
@@ -548,6 +566,18 @@ pub struct PeerMessage {
     pub session: Option<String>,
     pub role: MessageRole,
     pub content: MessageContent,
+}
+
+/// One available display on a federated peer, folded from its
+/// `display_ready` / `display_resize` / `display_capture_lost` /
+/// `user_display_revoked` wire events. The whole struct is the
+/// announce payload — a geometry change re-announces under the same
+/// `display_id`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerDisplayInfo {
+    pub display_id: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
