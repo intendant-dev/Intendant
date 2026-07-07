@@ -3,6 +3,25 @@ let debugScreenActive = false;
 let debugRecording = false;
 const browserWorkspaces = new Map();
 
+// ui-v2 re-skin (design overhaul): the reference Debug page carries a page
+// header the v1 DOM never had. Inject it under the flag only — v1 markup
+// stays untouched; the cards, ids, and handlers below are shared by both.
+if (ui2Enabled()) {
+  const debugPane = document.querySelector('#tab-debug .debug-pane');
+  if (debugPane) {
+    const head = document.createElement('header');
+    head.className = 'ui2-page-head';
+    const title = document.createElement('h2');
+    title.className = 'ui2-page-title';
+    title.textContent = 'Debug';
+    const sub = document.createElement('p');
+    sub.className = 'ui2-page-sub';
+    sub.textContent = 'Diagnostics, the headless observer display, and managed browser workspaces.';
+    head.append(title, sub);
+    debugPane.prepend(head);
+  }
+}
+
 function toggleDebugScreen() {
   if (debugScreenActive) {
     dispatchDashboardActionMsg({ action: 'teardown_debug_screen' });
@@ -41,6 +60,8 @@ function renderBrowserWorkspaces() {
   for (const w of rows) {
     const card = document.createElement('div');
     card.className = 'debug-workspace-row';
+    // ui-v2 status dot is CSS-keyed off this attribute; v1 renders none.
+    if (ui2Enabled()) card.dataset.status = String(w.status || '');
     const meta = document.createElement('div');
     meta.className = 'debug-workspace-row-main';
     const lease = w.lease ? ` leased by ${w.lease.holder_id || 'unknown'}` : ' unleased';
@@ -90,6 +111,15 @@ function handleBrowserWorkspaceMessage(d) {
   renderBrowserWorkspaces();
 }
 
+// The dashboard-fronted session id for owner/holder stamping. The old
+// `currentSessionId` global died in the AppWeb→PresenceWeb merge
+// (9285c7b6); the bare reads below kept the dead name and threw
+// ReferenceError, silently breaking Create and Take/Acquire since March.
+// Same fallback chain the session-window code uses for self-identity.
+function debugPaneSessionId() {
+  return String(currentSessionFullId || daemonSessionFullId || '').trim();
+}
+
 function createBrowserWorkspaceFromDebug() {
   if (!app) return;
   const g = id => document.getElementById(id);
@@ -98,7 +128,7 @@ function createBrowserWorkspaceFromDebug() {
     url: (g('browser-workspace-url')?.value || '').trim() || undefined,
     provider: g('browser-workspace-provider')?.value || 'auto',
     label: (g('browser-workspace-label')?.value || '').trim() || undefined,
-    owner_session_id: currentSessionId || undefined,
+    owner_session_id: debugPaneSessionId() || undefined,
   });
 }
 
@@ -107,7 +137,7 @@ function acquireBrowserWorkspace(workspaceId, force = false) {
   dispatchDashboardActionMsg({
     action: 'acquire_browser_workspace',
     workspace_id: workspaceId,
-    holder_id: currentSessionId || ((typeof connectionId !== 'undefined' && connectionId) ? connectionId : 'dashboard'),
+    holder_id: debugPaneSessionId() || ((typeof connectionId !== 'undefined' && connectionId) ? connectionId : 'dashboard'),
     holder_kind: 'human',
     force: !!force,
   });

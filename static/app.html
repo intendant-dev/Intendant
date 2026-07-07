@@ -12381,6 +12381,286 @@ html.ui-v2 .ui2-palette-empty {
   html.ui-v2 .ui2-nav-item-label, html.ui-v2 .ui2-nav-badge { display: none; }
   html.ui-v2 .ui2-nav-bottom { display: none; }
 }
+/* ── static/app/ui2-debug.css ── */
+/* ── ui-v2 Debug tab: two-card layout (design-overhaul P2) ─────────────
+   Scoped entirely under html.ui-v2 #tab-debug — inert for v1 and for
+   every other surface. This re-skins the existing DOM only: the observer
+   card (status / setup-teardown / record / display-id strip) and the
+   browser-workspaces card (5-provider create form, status line, rows
+   with acquire/close) keep their ids, classes and handlers verbatim.
+   The reference's unhooked preview pane is deliberately not built.
+   The page header (.ui2-page-head) and the rows' data-status attribute
+   are the two ui2Enabled()-gated additions in 56-debug-sessions.js. */
+
+/* ── page scaffold: full-width header row + two equal cards ── */
+html.ui-v2 #tab-debug .debug-pane {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+  gap: 16px;
+  align-content: start;
+  max-width: 980px;
+  padding: 26px 28px 44px;
+}
+html.ui-v2 #tab-debug .ui2-page-head { grid-column: 1 / -1; margin: 0 0 10px; }
+html.ui-v2 #tab-debug .ui2-page-title {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -.02em;
+  color: var(--text);
+}
+html.ui-v2 #tab-debug .ui2-page-sub {
+  margin: 7px 0 0;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+/* ── cards ── */
+html.ui-v2 #tab-debug .ui-card {
+  margin: 0; /* grid gap owns spacing — neutralize v1's stacked-card margin */
+  padding: 16px 18px 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  box-shadow: none;
+}
+html.ui-v2 #tab-debug .ui-section-head {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
+  margin: 0 0 14px;
+}
+html.ui-v2 #tab-debug .ui-section-title {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: normal;
+  color: var(--text);
+}
+html.ui-v2 #tab-debug .ui-section-sub {
+  flex: none;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+/* ── observer-display card ── */
+html.ui-v2 #tab-debug .debug-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 13px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+html.ui-v2 #tab-debug .debug-status::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--neutral-dot);
+}
+html.ui-v2 #tab-debug .debug-status.ok { color: var(--green); }
+html.ui-v2 #tab-debug .debug-status.ok::before {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16);
+}
+html.ui-v2 #tab-debug .debug-actions { gap: 9px; }
+html.ui-v2 #tab-debug .debug-info {
+  margin-top: 14px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--code-bg);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+html.ui-v2 #tab-debug .debug-info p { margin: 2px 0; }
+html.ui-v2 #tab-debug .debug-info code { color: var(--iris-2); }
+
+/* ── buttons: v2 recipes over the shared .ui-btn contract ── */
+html.ui-v2 #tab-debug .ui-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 0;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.2;
+  transition: background var(--t-med), border-color var(--t-med),
+    color var(--t-med), filter var(--t-med);
+}
+html.ui-v2 #tab-debug .ui-btn:hover {
+  background: var(--surface-3);
+  border-color: var(--line-2);
+}
+html.ui-v2 #tab-debug .ui-btn.primary {
+  border-color: transparent;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 800;
+  box-shadow: var(--shadow-primary);
+}
+html.ui-v2 #tab-debug .ui-btn.primary:hover {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  border-color: transparent;
+  filter: brightness(1.08);
+}
+html.ui-v2 #tab-debug .ui-btn.danger,
+html.ui-v2 #tab-debug #debug-record-btn {
+  border-color: rgba(var(--rose-rgb), .4);
+  background: transparent;
+  color: var(--rose);
+  font-weight: 700;
+}
+html.ui-v2 #tab-debug .ui-btn.danger:hover,
+html.ui-v2 #tab-debug #debug-record-btn:hover:not(:disabled) {
+  background: rgba(var(--rose-rgb), .1);
+  border-color: rgba(var(--rose-rgb), .55);
+  color: var(--rose);
+}
+/* Record affordance: the reference's rose dot; currentColor keeps it in
+   step with the disabled-opacity dim. */
+html.ui-v2 #tab-debug #debug-record-btn::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: currentColor;
+}
+
+/* ── browser-workspaces create form ── */
+html.ui-v2 #tab-debug .debug-workspace-form {
+  gap: 12px 10px;
+  margin-bottom: 14px;
+}
+html.ui-v2 #tab-debug .debug-workspace-form label {
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-debug .debug-workspace-form input,
+html.ui-v2 #tab-debug .debug-workspace-form select {
+  padding: 8px 11px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  transition: border-color var(--t-med), box-shadow var(--t-med);
+}
+html.ui-v2 #tab-debug .debug-workspace-form input::placeholder { color: var(--text-3); }
+/* Provider tokens are technical vocabulary → mono (type-system mandate). */
+html.ui-v2 #tab-debug .debug-workspace-form select {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+html.ui-v2 #tab-debug .debug-workspace-form input:focus-visible,
+html.ui-v2 #tab-debug .debug-workspace-form select:focus-visible {
+  outline: none;
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+html.ui-v2 #tab-debug .debug-workspace-form .ui-btn { min-height: 34px; }
+
+/* ── workspace status line + rows ── */
+html.ui-v2 #tab-debug .debug-workspace-status {
+  margin-bottom: 10px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-debug .debug-workspace-status:empty {
+  display: none;
+  margin: 0;
+}
+html.ui-v2 #tab-debug .debug-workspace-list { gap: 9px; }
+html.ui-v2 #tab-debug .debug-workspace-row {
+  gap: 8px 12px;
+  align-items: center;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-2);
+}
+html.ui-v2 #tab-debug .debug-workspace-row-title {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+/* Status dot: keyed off data-status (ui2-gated in JS); inline-block keeps
+   the title's single-line ellipsis intact. Statuses mirror the daemon's
+   BrowserWorkspaceStatus vocabulary (closed rows are filtered out). */
+html.ui-v2 #tab-debug .debug-workspace-row-title::before {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-right: 8px;
+  vertical-align: 1px;
+  background: var(--neutral-dot);
+}
+html.ui-v2 #tab-debug .debug-workspace-row[data-status="ready"] .debug-workspace-row-title::before {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), .14);
+}
+html.ui-v2 #tab-debug .debug-workspace-row[data-status="starting"] .debug-workspace-row-title::before {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .14);
+  animation: ui2-pulse 2s infinite;
+}
+html.ui-v2 #tab-debug .debug-workspace-row[data-status="error"] .debug-workspace-row-title::before {
+  background: var(--rose);
+  box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .14);
+}
+html.ui-v2 #tab-debug .debug-workspace-row-url {
+  margin-top: 3px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-debug .debug-workspace-row-meta {
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-debug .debug-workspace-row-actions { gap: 7px; }
+html.ui-v2 #tab-debug .debug-workspace-row-actions .ui-btn {
+  padding: 5px 11px;
+  font-size: 11.5px;
+  border-radius: 8px;
+}
+
+/* ── empty state (design States recipe) ── */
+html.ui-v2 #tab-debug .ui-empty.compact {
+  padding: 26px 16px;
+  gap: 5px;
+}
+html.ui-v2 #tab-debug .ui-empty-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+html.ui-v2 #tab-debug .ui-empty-hint {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
 </style>
 <!-- ── static/app/20-shell.html ── -->
 </head>
@@ -69860,6 +70140,25 @@ let debugScreenActive = false;
 let debugRecording = false;
 const browserWorkspaces = new Map();
 
+// ui-v2 re-skin (design overhaul): the reference Debug page carries a page
+// header the v1 DOM never had. Inject it under the flag only — v1 markup
+// stays untouched; the cards, ids, and handlers below are shared by both.
+if (ui2Enabled()) {
+  const debugPane = document.querySelector('#tab-debug .debug-pane');
+  if (debugPane) {
+    const head = document.createElement('header');
+    head.className = 'ui2-page-head';
+    const title = document.createElement('h2');
+    title.className = 'ui2-page-title';
+    title.textContent = 'Debug';
+    const sub = document.createElement('p');
+    sub.className = 'ui2-page-sub';
+    sub.textContent = 'Diagnostics, the headless observer display, and managed browser workspaces.';
+    head.append(title, sub);
+    debugPane.prepend(head);
+  }
+}
+
 function toggleDebugScreen() {
   if (debugScreenActive) {
     dispatchDashboardActionMsg({ action: 'teardown_debug_screen' });
@@ -69898,6 +70197,8 @@ function renderBrowserWorkspaces() {
   for (const w of rows) {
     const card = document.createElement('div');
     card.className = 'debug-workspace-row';
+    // ui-v2 status dot is CSS-keyed off this attribute; v1 renders none.
+    if (ui2Enabled()) card.dataset.status = String(w.status || '');
     const meta = document.createElement('div');
     meta.className = 'debug-workspace-row-main';
     const lease = w.lease ? ` leased by ${w.lease.holder_id || 'unknown'}` : ' unleased';
@@ -69947,6 +70248,15 @@ function handleBrowserWorkspaceMessage(d) {
   renderBrowserWorkspaces();
 }
 
+// The dashboard-fronted session id for owner/holder stamping. The old
+// `currentSessionId` global died in the AppWeb→PresenceWeb merge
+// (9285c7b6); the bare reads below kept the dead name and threw
+// ReferenceError, silently breaking Create and Take/Acquire since March.
+// Same fallback chain the session-window code uses for self-identity.
+function debugPaneSessionId() {
+  return String(currentSessionFullId || daemonSessionFullId || '').trim();
+}
+
 function createBrowserWorkspaceFromDebug() {
   if (!app) return;
   const g = id => document.getElementById(id);
@@ -69955,7 +70265,7 @@ function createBrowserWorkspaceFromDebug() {
     url: (g('browser-workspace-url')?.value || '').trim() || undefined,
     provider: g('browser-workspace-provider')?.value || 'auto',
     label: (g('browser-workspace-label')?.value || '').trim() || undefined,
-    owner_session_id: currentSessionId || undefined,
+    owner_session_id: debugPaneSessionId() || undefined,
   });
 }
 
@@ -69964,7 +70274,7 @@ function acquireBrowserWorkspace(workspaceId, force = false) {
   dispatchDashboardActionMsg({
     action: 'acquire_browser_workspace',
     workspace_id: workspaceId,
-    holder_id: currentSessionId || ((typeof connectionId !== 'undefined' && connectionId) ? connectionId : 'dashboard'),
+    holder_id: debugPaneSessionId() || ((typeof connectionId !== 'undefined' && connectionId) ? connectionId : 'dashboard'),
     holder_kind: 'human',
     force: !!force,
   });
