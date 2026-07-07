@@ -112,9 +112,9 @@ pub use card::{
 pub use coordinator::{Coordinator, CoordinatorError, RoutedTask, TaskRequest};
 pub use event::{
     ActivityId, ActivityKind, ActivityOutcome, ApprovalDecision, ApprovalRequest, LogLevel,
-    MessageContent, MessageId, MessagePart, MessageRole, ModelUsage, PeerEvent, PeerMessage,
-    PeerStatus, SessionInfo, TaggedPeerEvent, TaskId, TaskUpdate, UsageSnapshot, WebRtcSessionId,
-    WebRtcSignal,
+    MessageContent, MessageId, MessagePart, MessageRole, ModelUsage, PeerDisplayInfo, PeerEvent,
+    PeerMessage, PeerStatus, SessionInfo, TaggedPeerEvent, TaskId, TaskUpdate, UsageSnapshot,
+    WebRtcSessionId, WebRtcSignal,
 };
 pub use handle::{
     spawn_peer, ConnectionState, PeerHandle, PeerSnapshot, BROADCAST_CAPACITY, COMMANDS_CAPACITY,

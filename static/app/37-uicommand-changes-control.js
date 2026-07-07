@@ -245,6 +245,16 @@ function processCommands(cmds) {
       case 'peer_session_ended':
         removePeerSession(c.host_id, c.session_id);
         break;
+      // Folded per-display advertisements from a peer's event stream —
+      // change-only, idempotent upserts keyed by display_id. Both
+      // helpers re-render the daemons list (which refreshes the Station
+      // header peer chips) themselves.
+      case 'peer_display_ready':
+        upsertPeerDisplay(c.host_id, { display_id: c.display_id, width: c.width, height: c.height });
+        break;
+      case 'peer_display_removed':
+        removePeerDisplay(c.host_id, c.display_id);
+        break;
       case 'peer_webrtc_signal':
         // Per-peer WebRTC signaling: route to the matching
         // RTCPeerConnection (keyed by host_id|display_id|session_id)

@@ -212,6 +212,31 @@ session-action handlers assume local session ids. None of this changes what a
 peer exposes — the sessions rail is derived entirely from the event stream the
 peer already sends under its access profile.
 
+### Per-peer displays — the folded availability rail
+
+Displays ride the same consumer-side pattern. The peer's `/ws` already
+announces display availability (`display_ready`, `display_resize`) and
+retirement (`display_capture_lost`, `user_display_revoked`), and its gateway
+replays `display_ready` for every live display when a connection —
+including a federation transport — (re)attaches. `PeerDisplayFold`
+(`peer/upcast.rs`, embedded in both upcasters) folds that stream change-only
+into `PeerEvent::DisplayReady { display_id, width, height }` /
+`PeerEvent::DisplayLost` — repeats from the on-connect replay are silent, a
+geometry change re-announces. Historical `log_replay` frames deliberately do
+**not** fold displays: replayed availability is not current availability;
+the on-connect replay carries the live truth as real wire events.
+
+The per-peer actor mirrors the fold into a watch-published displays view
+(cleared on disconnect, same ghost-avoidance as sessions), and
+`PeerSnapshot` carries it as `displays`, so `GET /api/peers` — and therefore
+the `list_peers` MCP tool — seeds late joiners and every pushed snapshot
+replaces the row losslessly. On the dashboard each known peer display gets
+its own Station chip (`label · :id`) wired to the existing federated WebRTC
+view path, and the Activity → Log rail narrates transitions with the display
+id and geometry (`display :99 ready (1920x1080)`). An agent that brings up a
+display on a peer is therefore *discoverable* the moment the peer announces
+it — no display id needs to be guessed or typed.
+
 ## Agent-Facing Peer Control (ctl + MCP)
 
 Federation is not a dashboard-only surface. A stage-0 control surface exposes
@@ -235,7 +260,7 @@ the delegation verbs to agents in three shapes with identical semantics:
 
 `list_peers` returns the same peer snapshot list as `GET /api/peers` — id,
 label, connection state, capabilities, and the folded per-peer `sessions`
-rail above. `peer_send_message` (`peer_id`, `message`, optional `session`)
+and `displays` rails above. `peer_send_message` (`peer_id`, `message`, optional `session`)
 sends a message to the peer's agent. `peer_delegate_task` (`peer_id`,
 `instructions`, optional `context`) delegates a task and returns a `task_id`.
 

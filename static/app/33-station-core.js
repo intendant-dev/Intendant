@@ -957,6 +957,34 @@ function stationRenderPeerChips() {
   for (const d of peers) {
     const hostId = String(d.host_id || '');
     const name = compactSessionText(d.label || hostId) || hostId;
+    const displays = Array.isArray(d.displays) ? d.displays : [];
+    if (displays.length) {
+      // One chip per advertised display (the upsert path keeps the
+      // list in ascending display_id order). Peers that don't
+      // advertise displays fall through to the single default-target
+      // chip below, so older daemons look unchanged.
+      for (const disp of displays) {
+        const displayId = Number.parseInt(String(disp.display_id ?? 0), 10) || 0;
+        const size = disp.width && disp.height ? ` (${disp.width}x${disp.height})` : '';
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'station-peer-chip';
+        chip.disabled = !d.connected;
+        chip.title = d.connected
+          ? `Open a live view of display ${displayId}${size} on ${name}`
+          : `${name} is disconnected`;
+        chip.setAttribute('aria-label', d.connected
+          ? `View display ${displayId} on ${name}`
+          : `${name} (disconnected)`);
+        const dot = document.createElement('span');
+        dot.className = d.connected ? 'chip-dot ok' : 'chip-dot';
+        chip.appendChild(dot);
+        chip.appendChild(document.createTextNode(`${name} · :${displayId}`));
+        chip.addEventListener('click', () => stationOpenDisplay(hostId, displayId));
+        frag.appendChild(chip);
+      }
+      continue;
+    }
     const displayId = stationPeerDisplayIdForHost(hostId);
     const chip = document.createElement('button');
     chip.type = 'button';
@@ -1077,10 +1105,23 @@ function stationPeerDisplayId() {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
 }
 
-function stationPeerDisplayIdForHost(hostId, fallback = stationPeerDisplayId()) {
+function stationPeerDisplayIdForHost(hostId, fallback = undefined) {
   const id = String(hostId || '').trim();
   const stored = id ? stationPeerDisplayTargets.get(id) : undefined;
-  const parsed = Number.parseInt(String(stored ?? fallback ?? 0), 10);
+  // No explicit per-host selection and no caller-supplied fallback:
+  // prefer the first display the peer actually advertises (d.displays
+  // is kept in ascending display_id order) over the '0' draft. Peers
+  // that don't advertise displays keep the draft default, so older
+  // daemons behave unchanged. Explicit selections — a stored per-host
+  // target or a caller-passed fallback — still win.
+  if (stored === undefined && fallback === undefined) {
+    const d = id ? daemons.find(x => x.host_id === id) : undefined;
+    if (d && Array.isArray(d.displays) && d.displays.length) {
+      const first = Number.parseInt(String(d.displays[0].display_id ?? 0), 10);
+      if (Number.isFinite(first) && first >= 0) return first;
+    }
+  }
+  const parsed = Number.parseInt(String(stored ?? fallback ?? stationPeerDisplayId()), 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
 }
 
@@ -1690,19 +1731,35 @@ function stationDisplayRunwayPayload(controlsSummary = null) {
     && String(lane.host_id || '') === String(selectedHostId || '')
     && Number(lane.display_id) === Number(selectedDisplayId)
   );
-  if (selectedPeer && peerCanShareDisplay(selectedPeer) && !selectedStreamActive) {
-    lanes.push({
-      type: 'peer_target',
-      id: `target:${selectedPeer.host_id}:${selectedDisplayId}`,
-      title: `${stationPeerDisplayName(selectedPeer) || selectedPeer.host_id} :${selectedDisplayId}`,
-      meta: selectedPeer.connected ? 'ready to open' : 'peer offline',
-      detail: stationPeerCapabilityLabels(selectedPeer).join(', ') || 'selected peer display target',
-      host_id: selectedPeer.host_id,
-      host_label: stationPeerDisplayName(selectedPeer) || selectedPeer.host_id,
-      display_id: selectedDisplayId,
-      lane_label: `target:${selectedPeer.host_id}:${selectedDisplayId}`,
-      selected: true,
-    });
+  if (selectedPeer && peerCanShareDisplay(selectedPeer)) {
+    // One target lane per display the selected peer advertises (minus
+    // those already streaming as remote_stream lanes above). Peers
+    // that don't advertise displays keep the single selected-target
+    // lane, so older daemons look unchanged.
+    const knownDisplays = Array.isArray(selectedPeer.displays) ? selectedPeer.displays : [];
+    const targetIds = knownDisplays.length
+      ? knownDisplays.map(disp => Number.parseInt(String(disp.display_id ?? 0), 10) || 0)
+      : (selectedStreamActive ? [] : [Number(selectedDisplayId) || 0]);
+    for (const displayId of targetIds) {
+      const streamActive = lanes.some(lane =>
+        lane.type === 'remote_stream'
+        && String(lane.host_id || '') === String(selectedPeer.host_id || '')
+        && Number(lane.display_id) === Number(displayId)
+      );
+      if (streamActive) continue;
+      lanes.push({
+        type: 'peer_target',
+        id: `target:${selectedPeer.host_id}:${displayId}`,
+        title: `${stationPeerDisplayName(selectedPeer) || selectedPeer.host_id} :${displayId}`,
+        meta: selectedPeer.connected ? 'ready to open' : 'peer offline',
+        detail: stationPeerCapabilityLabels(selectedPeer).join(', ') || 'selected peer display target',
+        host_id: selectedPeer.host_id,
+        host_label: stationPeerDisplayName(selectedPeer) || selectedPeer.host_id,
+        display_id: displayId,
+        lane_label: `target:${selectedPeer.host_id}:${displayId}`,
+        selected: Number(displayId) === Number(selectedDisplayId),
+      });
+    }
   }
   return {
     // No wall-clock fields here: this payload is embedded in the Station
