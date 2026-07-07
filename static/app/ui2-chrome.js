@@ -219,8 +219,133 @@ function ui2WireMirrors() {
   updateTitle();
 }
 
+// ── ⌘K command palette (P1b) ──────────────────────────────────────────
+// Destinations only for now (the design excludes Debug from the palette;
+// it stays one click away in the rail). Sessions/actions search arrives
+// with the Sessions program phase.
+
+function ui2PaletteEntries() {
+  const entries = [];
+  for (const group of UI2_NAV_GROUPS) {
+    for (const item of group.items) {
+      if (item.tab === 'debug') continue;
+      entries.push(item);
+    }
+  }
+  return entries;
+}
+
+const ui2Palette = { open: false, selected: 0, entries: [] };
+
+function ui2PaletteRender(filter) {
+  const list = document.getElementById('ui2-palette-list');
+  if (!list) return;
+  const q = (filter || '').trim().toLowerCase();
+  const activePane = document.querySelector('.tab-pane.active');
+  const activeTab = activePane ? activePane.id.replace(/^tab-/, '') : '';
+  ui2Palette.entries = ui2PaletteEntries().filter((item) =>
+    !q || item.label.toLowerCase().includes(q) || (item.tab || '').includes(q));
+  ui2Palette.selected = Math.min(ui2Palette.selected, Math.max(0, ui2Palette.entries.length - 1));
+  list.innerHTML = '';
+  if (!ui2Palette.entries.length) {
+    const empty = document.createElement('div');
+    empty.className = 'ui2-palette-empty';
+    empty.textContent = 'No matching screens';
+    list.appendChild(empty);
+    return;
+  }
+  ui2Palette.entries.forEach((item, i) => {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'ui2-palette-row' + (i === ui2Palette.selected ? ' selected' : '');
+    row.setAttribute('role', 'option');
+    const isCurrent = item.tab && item.tab === activeTab;
+    row.innerHTML =
+      `<span class="ui2-nav-icon">${ui2Icon(item.icon, 17)}</span>` +
+      `<span class="ui2-palette-row-label">${item.label}</span>` +
+      `<span class="ui2-palette-row-hint">${isCurrent ? 'current' : 'go'}</span>`;
+    row.addEventListener('click', () => ui2PaletteGo(item));
+    row.addEventListener('mousemove', () => {
+      if (ui2Palette.selected !== i) { ui2Palette.selected = i; ui2PaletteRender(ui2PaletteInput().value); }
+    });
+    list.appendChild(row);
+  });
+}
+
+function ui2PaletteInput() { return document.getElementById('ui2-palette-input'); }
+
+function ui2PaletteGo(item) {
+  ui2PaletteClose();
+  if (item.tab) routeTo(item.tab);
+  else if (item.route) routeTo(item.route[0], item.route[1]);
+}
+
+function ui2PaletteOpen() {
+  const backdrop = document.getElementById('ui2-palette-backdrop');
+  if (!backdrop || ui2Palette.open) return;
+  ui2Palette.open = true;
+  ui2Palette.selected = 0;
+  const activePane = document.querySelector('.tab-pane.active');
+  backdrop.classList.toggle('ui2-no-blur', !!activePane && activePane.id === 'tab-station');
+  backdrop.hidden = false;
+  const input = ui2PaletteInput();
+  if (input) { input.value = ''; input.focus(); }
+  ui2PaletteRender('');
+}
+
+function ui2PaletteClose() {
+  const backdrop = document.getElementById('ui2-palette-backdrop');
+  if (!backdrop || !ui2Palette.open) return;
+  ui2Palette.open = false;
+  backdrop.hidden = true;
+}
+
+function ui2WirePalette() {
+  const backdrop = document.getElementById('ui2-palette-backdrop');
+  const input = ui2PaletteInput();
+  const searchBtn = document.getElementById('ui2-search-btn');
+  if (!backdrop || !input) return;
+  const isMac = /Mac|iP(hone|ad|od)/.test(navigator.platform);
+  const kbd = document.getElementById('ui2-search-kbd');
+  if (kbd) kbd.textContent = isMac ? '⌘K' : 'Ctrl K';
+  const searchIcon = document.getElementById('ui2-search-icon');
+  if (searchIcon) searchIcon.innerHTML = ui2Icon('search', 15);
+  const paletteSearchIcon = document.getElementById('ui2-palette-search-icon');
+  if (paletteSearchIcon) paletteSearchIcon.innerHTML = ui2Icon('search', 16);
+  if (searchBtn) searchBtn.addEventListener('click', ui2PaletteOpen);
+  backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) ui2PaletteClose(); });
+  input.addEventListener('input', () => { ui2Palette.selected = 0; ui2PaletteRender(input.value); });
+  // Capture phase: while the palette is open it owns Esc/arrows/Enter and
+  // nothing leaks into the v1 Escape cascade or composer handlers.
+  document.addEventListener('keydown', (e) => {
+    const combo = (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k';
+    if (combo) {
+      e.preventDefault();
+      e.stopPropagation();
+      ui2Palette.open ? ui2PaletteClose() : ui2PaletteOpen();
+      return;
+    }
+    if (!ui2Palette.open) return;
+    if (e.key === 'Escape') {
+      e.preventDefault(); e.stopPropagation(); ui2PaletteClose();
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault(); e.stopPropagation();
+      const n = ui2Palette.entries.length;
+      if (n) {
+        ui2Palette.selected = (ui2Palette.selected + (e.key === 'ArrowDown' ? 1 : n - 1)) % n;
+        ui2PaletteRender(input.value);
+      }
+    } else if (e.key === 'Enter') {
+      e.preventDefault(); e.stopPropagation();
+      const item = ui2Palette.entries[ui2Palette.selected];
+      if (item) ui2PaletteGo(item);
+    }
+  }, true);
+}
+
 ui2BuildNav();
 if (ui2Enabled()) {
-  document.addEventListener('DOMContentLoaded', ui2WireMirrors, { once: true });
-  if (document.readyState !== 'loading') ui2WireMirrors();
+  const wire = () => { ui2WireMirrors(); ui2WirePalette(); };
+  document.addEventListener('DOMContentLoaded', wire, { once: true });
+  if (document.readyState !== 'loading') wire();
 }

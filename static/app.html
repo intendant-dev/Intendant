@@ -12191,6 +12191,7 @@ html.ui-v2 .ui2-stop {
 }
 html.ui-v2 .ui2-stop:hover { background: rgba(var(--rose-rgb), .1); }
 html.ui-v2 .ui2-stop[disabled] { opacity: .6; cursor: default; }
+html.ui-v2 .ui2-stop[hidden] { display: none; }
 html.ui-v2 .ui2-stop-icon { display: flex; }
 
 html.ui-v2 .ui2-ovs-divider { width: 1px; height: 20px; background: var(--line); flex-shrink: 0; }
@@ -12229,6 +12230,86 @@ html.ui-v2 .ui2-conn[data-state="warn"] .ui2-conn-dot { background: var(--amber)
 html.ui-v2 .ui2-conn[data-state="err"] .ui2-conn-dot { background: var(--rose); box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .14); }
 
 @keyframes ui2-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+
+/* ── search button + command palette ── */
+html.ui-v2 .ui2-search {
+  display: inline-flex; align-items: center; gap: 8px; flex-shrink: 0;
+  padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--r-ctl);
+  background: transparent; color: var(--text-2);
+  font-family: inherit; font-size: 12px; cursor: pointer;
+  transition: background var(--t-med), border-color var(--t-med), color var(--t-med);
+}
+html.ui-v2 .ui2-search:hover { background: var(--surface-2); border-color: var(--line-2); color: var(--text); }
+html.ui-v2 .ui2-search-icon { display: flex; }
+html.ui-v2 .ui2-kbd {
+  font-family: var(--mono); font-size: 10px;
+  padding: 1px 5px; border-radius: 5px;
+  background: var(--surface-3); color: var(--text-2);
+}
+
+html.ui-v2 #ui2-palette-backdrop {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(6, 7, 10, .62);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 14vh;
+  animation: ui2-fade .15s ease;
+}
+/* Blur-over-canvas discipline: while Station is the active pane the
+   backdrop stays translucent-only so the WebGPU scene never recomposites
+   under a live blur. */
+html.ui-v2 #ui2-palette-backdrop.ui2-no-blur {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+html.ui-v2 #ui2-palette-backdrop[hidden] { display: none; }
+
+html.ui-v2 #ui2-palette {
+  width: 600px; max-width: calc(100vw - 48px);
+  max-height: 62vh; overflow: hidden;
+  display: flex; flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-panel);
+  box-shadow: var(--shadow-overlay);
+  animation: ui2-rise .2s ease;
+}
+html.ui-v2 .ui2-palette-search {
+  display: flex; align-items: center; gap: 10px;
+  padding: 13px 15px; border-bottom: 1px solid var(--line);
+}
+html.ui-v2 .ui2-palette-search-icon { display: flex; color: var(--text-3); }
+html.ui-v2 #ui2-palette-input {
+  flex: 1; min-width: 0; border: 0; background: transparent;
+  color: var(--text); font-family: inherit; font-size: 14px;
+}
+html.ui-v2 #ui2-palette-input:focus-visible { outline: none; }
+html.ui-v2 .ui2-palette-eyebrow {
+  font-size: 10.5px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--text-3); padding: 10px 15px 4px;
+}
+html.ui-v2 #ui2-palette-list { overflow-y: auto; padding: 4px 6px 8px; }
+html.ui-v2 .ui2-palette-row {
+  display: flex; align-items: center; gap: 11px; width: 100%;
+  padding: 9px 10px; border: 0; border-radius: var(--r-ctl);
+  background: transparent; color: var(--text-2); cursor: pointer;
+  text-align: left; font-family: inherit; font-size: 13.5px; font-weight: 600;
+}
+html.ui-v2 .ui2-palette-row .ui2-nav-icon { color: inherit; }
+html.ui-v2 .ui2-palette-row-label { flex: 1; min-width: 0; }
+html.ui-v2 .ui2-palette-row-hint {
+  font-family: var(--mono); font-size: 10.5px; color: var(--text-3);
+}
+html.ui-v2 .ui2-palette-row.selected,
+html.ui-v2 .ui2-palette-row:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 .ui2-palette-row.selected { color: var(--iris-2); }
+html.ui-v2 .ui2-palette-empty {
+  padding: 18px 15px 22px; color: var(--text-3); font-size: 13px; text-align: center;
+}
+
+@keyframes ui2-rise { from { opacity: 0; transform: translateY(8px) scale(.99); } to { opacity: 1; transform: none; } }
+@keyframes ui2-fade { from { opacity: 0; } to { opacity: 1; } }
 
 /* ── responsive ── */
 @media (max-width: 1179px) {
@@ -14991,7 +15072,27 @@ html.ui-v2 .ui2-conn[data-state="err"] .ui2-conn-dot { background: var(--rose); 
     <span class="ui2-conn-dot" id="ui2-conn-dot"></span>
     <span class="ui2-conn-label ui2-ovs-compact-hide" id="ui2-conn-label">connecting…</span>
   </button>
+  <button type="button" class="ui2-search" id="ui2-search-btn" title="Command palette">
+    <span class="ui2-search-icon" id="ui2-search-icon"></span>
+    <span class="ui2-ovs-compact-hide">Search</span>
+    <span class="ui2-kbd" id="ui2-search-kbd">⌘K</span>
+  </button>
 </header>
+
+<!-- ⌘K command palette (P1b). Backdrop blur is dropped while the Station
+     pane is active — the blur-over-canvas discipline. -->
+<div id="ui2-palette-backdrop" hidden>
+  <div id="ui2-palette" role="dialog" aria-modal="true" aria-label="Command palette">
+    <div class="ui2-palette-search">
+      <span class="ui2-palette-search-icon" id="ui2-palette-search-icon"></span>
+      <input id="ui2-palette-input" type="text" placeholder="Search screens…"
+             autocomplete="off" spellcheck="false">
+      <span class="ui2-kbd">ESC</span>
+    </div>
+    <div class="ui2-palette-eyebrow">Go to</div>
+    <div id="ui2-palette-list" role="listbox"></div>
+  </div>
+</div>
 <script type="module">
 /* ── static/app/31-ui2-foundation.js ── */
 // ── ui-v2 foundation: flag helpers + inline-SVG icon registry ──────────
@@ -15295,10 +15396,135 @@ function ui2WireMirrors() {
   updateTitle();
 }
 
+// ── ⌘K command palette (P1b) ──────────────────────────────────────────
+// Destinations only for now (the design excludes Debug from the palette;
+// it stays one click away in the rail). Sessions/actions search arrives
+// with the Sessions program phase.
+
+function ui2PaletteEntries() {
+  const entries = [];
+  for (const group of UI2_NAV_GROUPS) {
+    for (const item of group.items) {
+      if (item.tab === 'debug') continue;
+      entries.push(item);
+    }
+  }
+  return entries;
+}
+
+const ui2Palette = { open: false, selected: 0, entries: [] };
+
+function ui2PaletteRender(filter) {
+  const list = document.getElementById('ui2-palette-list');
+  if (!list) return;
+  const q = (filter || '').trim().toLowerCase();
+  const activePane = document.querySelector('.tab-pane.active');
+  const activeTab = activePane ? activePane.id.replace(/^tab-/, '') : '';
+  ui2Palette.entries = ui2PaletteEntries().filter((item) =>
+    !q || item.label.toLowerCase().includes(q) || (item.tab || '').includes(q));
+  ui2Palette.selected = Math.min(ui2Palette.selected, Math.max(0, ui2Palette.entries.length - 1));
+  list.innerHTML = '';
+  if (!ui2Palette.entries.length) {
+    const empty = document.createElement('div');
+    empty.className = 'ui2-palette-empty';
+    empty.textContent = 'No matching screens';
+    list.appendChild(empty);
+    return;
+  }
+  ui2Palette.entries.forEach((item, i) => {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'ui2-palette-row' + (i === ui2Palette.selected ? ' selected' : '');
+    row.setAttribute('role', 'option');
+    const isCurrent = item.tab && item.tab === activeTab;
+    row.innerHTML =
+      `<span class="ui2-nav-icon">${ui2Icon(item.icon, 17)}</span>` +
+      `<span class="ui2-palette-row-label">${item.label}</span>` +
+      `<span class="ui2-palette-row-hint">${isCurrent ? 'current' : 'go'}</span>`;
+    row.addEventListener('click', () => ui2PaletteGo(item));
+    row.addEventListener('mousemove', () => {
+      if (ui2Palette.selected !== i) { ui2Palette.selected = i; ui2PaletteRender(ui2PaletteInput().value); }
+    });
+    list.appendChild(row);
+  });
+}
+
+function ui2PaletteInput() { return document.getElementById('ui2-palette-input'); }
+
+function ui2PaletteGo(item) {
+  ui2PaletteClose();
+  if (item.tab) routeTo(item.tab);
+  else if (item.route) routeTo(item.route[0], item.route[1]);
+}
+
+function ui2PaletteOpen() {
+  const backdrop = document.getElementById('ui2-palette-backdrop');
+  if (!backdrop || ui2Palette.open) return;
+  ui2Palette.open = true;
+  ui2Palette.selected = 0;
+  const activePane = document.querySelector('.tab-pane.active');
+  backdrop.classList.toggle('ui2-no-blur', !!activePane && activePane.id === 'tab-station');
+  backdrop.hidden = false;
+  const input = ui2PaletteInput();
+  if (input) { input.value = ''; input.focus(); }
+  ui2PaletteRender('');
+}
+
+function ui2PaletteClose() {
+  const backdrop = document.getElementById('ui2-palette-backdrop');
+  if (!backdrop || !ui2Palette.open) return;
+  ui2Palette.open = false;
+  backdrop.hidden = true;
+}
+
+function ui2WirePalette() {
+  const backdrop = document.getElementById('ui2-palette-backdrop');
+  const input = ui2PaletteInput();
+  const searchBtn = document.getElementById('ui2-search-btn');
+  if (!backdrop || !input) return;
+  const isMac = /Mac|iP(hone|ad|od)/.test(navigator.platform);
+  const kbd = document.getElementById('ui2-search-kbd');
+  if (kbd) kbd.textContent = isMac ? '⌘K' : 'Ctrl K';
+  const searchIcon = document.getElementById('ui2-search-icon');
+  if (searchIcon) searchIcon.innerHTML = ui2Icon('search', 15);
+  const paletteSearchIcon = document.getElementById('ui2-palette-search-icon');
+  if (paletteSearchIcon) paletteSearchIcon.innerHTML = ui2Icon('search', 16);
+  if (searchBtn) searchBtn.addEventListener('click', ui2PaletteOpen);
+  backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) ui2PaletteClose(); });
+  input.addEventListener('input', () => { ui2Palette.selected = 0; ui2PaletteRender(input.value); });
+  // Capture phase: while the palette is open it owns Esc/arrows/Enter and
+  // nothing leaks into the v1 Escape cascade or composer handlers.
+  document.addEventListener('keydown', (e) => {
+    const combo = (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k';
+    if (combo) {
+      e.preventDefault();
+      e.stopPropagation();
+      ui2Palette.open ? ui2PaletteClose() : ui2PaletteOpen();
+      return;
+    }
+    if (!ui2Palette.open) return;
+    if (e.key === 'Escape') {
+      e.preventDefault(); e.stopPropagation(); ui2PaletteClose();
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault(); e.stopPropagation();
+      const n = ui2Palette.entries.length;
+      if (n) {
+        ui2Palette.selected = (ui2Palette.selected + (e.key === 'ArrowDown' ? 1 : n - 1)) % n;
+        ui2PaletteRender(input.value);
+      }
+    } else if (e.key === 'Enter') {
+      e.preventDefault(); e.stopPropagation();
+      const item = ui2Palette.entries[ui2Palette.selected];
+      if (item) ui2PaletteGo(item);
+    }
+  }, true);
+}
+
 ui2BuildNav();
 if (ui2Enabled()) {
-  document.addEventListener('DOMContentLoaded', ui2WireMirrors, { once: true });
-  if (document.readyState !== 'loading') ui2WireMirrors();
+  const wire = () => { ui2WireMirrors(); ui2WirePalette(); };
+  document.addEventListener('DOMContentLoaded', wire, { once: true });
+  if (document.readyState !== 'loading') wire();
 }
 /* ── static/app/31-init-identity-fleet.js ── */
 'use strict';

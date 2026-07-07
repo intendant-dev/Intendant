@@ -181,6 +181,7 @@ html.ui-v2 .ui2-stop {
 }
 html.ui-v2 .ui2-stop:hover { background: rgba(var(--rose-rgb), .1); }
 html.ui-v2 .ui2-stop[disabled] { opacity: .6; cursor: default; }
+html.ui-v2 .ui2-stop[hidden] { display: none; }
 html.ui-v2 .ui2-stop-icon { display: flex; }
 
 html.ui-v2 .ui2-ovs-divider { width: 1px; height: 20px; background: var(--line); flex-shrink: 0; }
@@ -219,6 +220,86 @@ html.ui-v2 .ui2-conn[data-state="warn"] .ui2-conn-dot { background: var(--amber)
 html.ui-v2 .ui2-conn[data-state="err"] .ui2-conn-dot { background: var(--rose); box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .14); }
 
 @keyframes ui2-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+
+/* ── search button + command palette ── */
+html.ui-v2 .ui2-search {
+  display: inline-flex; align-items: center; gap: 8px; flex-shrink: 0;
+  padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--r-ctl);
+  background: transparent; color: var(--text-2);
+  font-family: inherit; font-size: 12px; cursor: pointer;
+  transition: background var(--t-med), border-color var(--t-med), color var(--t-med);
+}
+html.ui-v2 .ui2-search:hover { background: var(--surface-2); border-color: var(--line-2); color: var(--text); }
+html.ui-v2 .ui2-search-icon { display: flex; }
+html.ui-v2 .ui2-kbd {
+  font-family: var(--mono); font-size: 10px;
+  padding: 1px 5px; border-radius: 5px;
+  background: var(--surface-3); color: var(--text-2);
+}
+
+html.ui-v2 #ui2-palette-backdrop {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(6, 7, 10, .62);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 14vh;
+  animation: ui2-fade .15s ease;
+}
+/* Blur-over-canvas discipline: while Station is the active pane the
+   backdrop stays translucent-only so the WebGPU scene never recomposites
+   under a live blur. */
+html.ui-v2 #ui2-palette-backdrop.ui2-no-blur {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+html.ui-v2 #ui2-palette-backdrop[hidden] { display: none; }
+
+html.ui-v2 #ui2-palette {
+  width: 600px; max-width: calc(100vw - 48px);
+  max-height: 62vh; overflow: hidden;
+  display: flex; flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-panel);
+  box-shadow: var(--shadow-overlay);
+  animation: ui2-rise .2s ease;
+}
+html.ui-v2 .ui2-palette-search {
+  display: flex; align-items: center; gap: 10px;
+  padding: 13px 15px; border-bottom: 1px solid var(--line);
+}
+html.ui-v2 .ui2-palette-search-icon { display: flex; color: var(--text-3); }
+html.ui-v2 #ui2-palette-input {
+  flex: 1; min-width: 0; border: 0; background: transparent;
+  color: var(--text); font-family: inherit; font-size: 14px;
+}
+html.ui-v2 #ui2-palette-input:focus-visible { outline: none; }
+html.ui-v2 .ui2-palette-eyebrow {
+  font-size: 10.5px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--text-3); padding: 10px 15px 4px;
+}
+html.ui-v2 #ui2-palette-list { overflow-y: auto; padding: 4px 6px 8px; }
+html.ui-v2 .ui2-palette-row {
+  display: flex; align-items: center; gap: 11px; width: 100%;
+  padding: 9px 10px; border: 0; border-radius: var(--r-ctl);
+  background: transparent; color: var(--text-2); cursor: pointer;
+  text-align: left; font-family: inherit; font-size: 13.5px; font-weight: 600;
+}
+html.ui-v2 .ui2-palette-row .ui2-nav-icon { color: inherit; }
+html.ui-v2 .ui2-palette-row-label { flex: 1; min-width: 0; }
+html.ui-v2 .ui2-palette-row-hint {
+  font-family: var(--mono); font-size: 10.5px; color: var(--text-3);
+}
+html.ui-v2 .ui2-palette-row.selected,
+html.ui-v2 .ui2-palette-row:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 .ui2-palette-row.selected { color: var(--iris-2); }
+html.ui-v2 .ui2-palette-empty {
+  padding: 18px 15px 22px; color: var(--text-3); font-size: 13px; text-align: center;
+}
+
+@keyframes ui2-rise { from { opacity: 0; transform: translateY(8px) scale(.99); } to { opacity: 1; transform: none; } }
+@keyframes ui2-fade { from { opacity: 0; } to { opacity: 1; } }
 
 /* ── responsive ── */
 @media (max-width: 1179px) {

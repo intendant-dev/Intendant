@@ -71,4 +71,24 @@
     <span class="ui2-conn-dot" id="ui2-conn-dot"></span>
     <span class="ui2-conn-label ui2-ovs-compact-hide" id="ui2-conn-label">connecting…</span>
   </button>
+  <button type="button" class="ui2-search" id="ui2-search-btn" title="Command palette">
+    <span class="ui2-search-icon" id="ui2-search-icon"></span>
+    <span class="ui2-ovs-compact-hide">Search</span>
+    <span class="ui2-kbd" id="ui2-search-kbd">⌘K</span>
+  </button>
 </header>
+
+<!-- ⌘K command palette (P1b). Backdrop blur is dropped while the Station
+     pane is active — the blur-over-canvas discipline. -->
+<div id="ui2-palette-backdrop" hidden>
+  <div id="ui2-palette" role="dialog" aria-modal="true" aria-label="Command palette">
+    <div class="ui2-palette-search">
+      <span class="ui2-palette-search-icon" id="ui2-palette-search-icon"></span>
+      <input id="ui2-palette-input" type="text" placeholder="Search screens…"
+             autocomplete="off" spellcheck="false">
+      <span class="ui2-kbd">ESC</span>
+    </div>
+    <div class="ui2-palette-eyebrow">Go to</div>
+    <div id="ui2-palette-list" role="listbox"></div>
+  </div>
+</div>
