@@ -33,6 +33,11 @@ pub struct PendingClientKeyEnrollment {
     /// Human hint from the offer's account identity, e.g. "@alice". Display
     /// only — never an authorization input.
     pub account_hint: String,
+    /// Whether the account hint was covered by the device key's own v2
+    /// offer signature (attested) or merely asserted by the signaling
+    /// relay. Display provenance for the approval card, nothing more.
+    #[serde(default)]
+    pub account_attested: bool,
     pub first_seen_unix_ms: i64,
     pub last_seen_unix_ms: i64,
     pub attempts: u32,
@@ -55,6 +60,7 @@ pub fn record_refused_client_key(
     origin: &str,
     transport: &str,
     account_hint: &str,
+    account_attested: bool,
     now_unix_ms: i64,
 ) {
     let fingerprint = fingerprint.trim();
@@ -71,6 +77,7 @@ pub fn record_refused_client_key(
         entry.attempts = entry.attempts.saturating_add(1);
         if !account_hint.trim().is_empty() {
             entry.account_hint = account_hint.trim().to_string();
+            entry.account_attested = account_attested;
         }
         if !origin.trim().is_empty() {
             entry.origin = origin.trim().to_string();
@@ -94,6 +101,7 @@ pub fn record_refused_client_key(
         origin: origin.trim().to_string(),
         transport: transport.trim().to_string(),
         account_hint: account_hint.trim().to_string(),
+        account_attested,
         first_seen_unix_ms: now_unix_ms,
         last_seen_unix_ms: now_unix_ms,
         attempts: 1,
@@ -143,6 +151,7 @@ mod tests {
             "https://connect.intendant.dev",
             "connect-dashboard-control",
             "@alice",
+            false,
             now,
         );
         record_refused_client_key(
@@ -151,18 +160,35 @@ mod tests {
             "",
             "connect-dashboard-control",
             "",
+            false,
             now + 10,
         );
         let pending = pending_enrollments(now + 20);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].attempts, 2);
         assert_eq!(pending[0].account_hint, "@alice");
+        assert!(!pending[0].account_attested);
         assert_eq!(pending[0].origin, "https://connect.intendant.dev");
         assert_eq!(pending[0].first_seen_unix_ms, now);
         assert_eq!(pending[0].last_seen_unix_ms, now + 10);
 
-        // TTL prunes stale entries.
-        assert!(pending_enrollments(now + PENDING_TTL_MS + 11).is_empty());
+        // A later attested retry upgrades the hint's provenance (and a
+        // still-later unattested hint downgrades it — latest wins, the
+        // flag always describes the CURRENT hint).
+        record_refused_client_key(
+            "fp-a",
+            "pk-a",
+            "",
+            "connect-dashboard-control",
+            "@alice",
+            true,
+            now + 15,
+        );
+        assert!(pending_enrollments(now + 20)[0].account_attested);
+
+        // TTL prunes stale entries (last activity was the attested retry
+        // at now + 15).
+        assert!(pending_enrollments(now + PENDING_TTL_MS + 16).is_empty());
 
         // Cap evicts the stalest entry, and take() removes on decide.
         clear_for_tests();
@@ -173,6 +199,7 @@ mod tests {
                 "",
                 "connect-dashboard-control",
                 "",
+                false,
                 now + i as i64,
             );
         }

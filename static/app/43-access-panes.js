@@ -295,11 +295,33 @@ function accessPeerGrantCounts(overview = accessOverviewModel()) {
   };
 }
 
+/* This device's own identity-key fingerprint, cached for synchronous
+   renderers. The SAS property of the knock ceremony: the approving human
+   compares the fingerprint the REQUESTING device displays locally against
+   the pending entry on the trusted session — approval by comparison, not
+   by timing coincidence. */
+let accessOwnDeviceFingerprint = '';
+let accessOwnDeviceFingerprintRequested = false;
+function accessEnsureOwnFingerprint() {
+  if (accessOwnDeviceFingerprintRequested) return;
+  accessOwnDeviceFingerprintRequested = true;
+  (async () => {
+    try {
+      const identity = await clientIdentityGet();
+      if (identity?.fingerprint) {
+        accessOwnDeviceFingerprint = String(identity.fingerprint);
+        renderAccessAdminSummaries();
+      }
+    } catch { /* no identity available — the hint below stays generic */ }
+  })();
+}
+
 /* Overview: actionable warnings first — an empty div when all is well. */
 function renderAccessAttention() {
   const mount = document.getElementById('access-attention');
   if (!mount) return;
   mount.innerHTML = '';
+  accessEnsureOwnFingerprint();
   const items = [];
   const status = dashboardTransport?.status
     ? dashboardTransport.status()
@@ -316,6 +338,9 @@ function renderAccessAttention() {
         steps: [
           'Open the daemon directly (its https://host:8765 address) with root access.',
           'Go to Access → People & Devices and grant your Connect account a role.',
+          accessOwnDeviceFingerprint
+            ? `Verify it is really this device: this browser's key fingerprint is ${accessOwnDeviceFingerprint} — approve the pending request only if it matches.`
+            : 'Compare the pending request’s key fingerprint against this device before approving.',
           'Reload this page — Connect is only the route; the daemon decides.',
         ],
         action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
@@ -917,6 +942,11 @@ function renderAccessEnrollmentRequests() {
     headRow.append(glyphEl, nameWrap);
     if (request.origin) {
       headRow.appendChild(accessRouteChip('connect', 'via hosted route', `The offer arrived through ${request.origin}; the key will be recorded with that origin, so the role ceiling applies until it is re-enrolled from an anchor origin.`));
+    }
+    if (request.account_hint) {
+      headRow.appendChild(request.account_attested
+        ? accessRouteChip('webrtc', 'account attested ✓', 'The device key itself signed this account claim (v2 offer) — the name is as trustworthy as the key fingerprint below.')
+        : accessRouteChip('remembered', 'account via route', 'The account name is asserted by the signaling relay, not signed by the device key. Verify the key fingerprint against the requesting device before trusting the name.'));
     }
     card.appendChild(headRow);
 

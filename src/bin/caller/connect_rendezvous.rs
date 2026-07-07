@@ -92,6 +92,14 @@ struct RendezvousEvent {
     client_key_sig: Option<String>,
     #[serde(default)]
     client_key_ts: Option<i64>,
+    /// v2 offer-signature fields (see `access::client_key`): the payload
+    /// version plus the browser's own account claim, relayed verbatim.
+    #[serde(default)]
+    client_key_proto: Option<String>,
+    #[serde(default)]
+    client_key_account_user_id: Option<String>,
+    #[serde(default)]
+    client_key_account_name: Option<String>,
     #[serde(default)]
     org_grant: Option<serde_json::Value>,
     #[serde(default)]
@@ -761,6 +769,9 @@ async fn handle_event(
                 client_key: event.client_key.clone(),
                 client_key_sig: event.client_key_sig.clone(),
                 client_key_ts: event.client_key_ts,
+                client_key_proto: event.client_key_proto.clone(),
+                client_key_account_user_id: event.client_key_account_user_id.clone(),
+                client_key_account_name: event.client_key_account_name.clone(),
             };
             let verified_client_key = match client_key_fields.verify(
                 daemon_id,
@@ -782,6 +793,37 @@ async fn handle_event(
                     return;
                 }
             };
+            // When the device key attests an account (v2 signature) AND the
+            // service stamped one from its session, the two must agree — a
+            // disagreement means the relay and the device are telling
+            // different stories about who is knocking, and nothing
+            // downstream should silently pick one.
+            if let (Some((attested_user, _)), Some(stamped_user)) = (
+                verified_client_key
+                    .as_ref()
+                    .and_then(|key| key.attested_account.as_ref()),
+                event
+                    .user_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+            ) {
+                if attested_user != stamped_user {
+                    let _ = post_error(
+                        client,
+                        base_url,
+                        config,
+                        daemon_id,
+                        &event.id,
+                        &format!(
+                            "client key attests account {attested_user:?} but the rendezvous \
+                             asserts {stamped_user:?} — refusing the mismatched offer"
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
             // Org-grant ride-along (phase 6 step 4): a member's offer may
             // carry its signed org grant document so first contact with a
             // daemon that trusts the org is one round trip. Materialize it
@@ -823,21 +865,34 @@ async fn handle_event(
                     // fingerprint out of this error by hand.
                     if let Some(key) = verified_client_key.as_ref() {
                         let origin = base_origin(base_url);
-                        let account_hint = match (
-                            event
-                                .account_name
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|v| !v.is_empty()),
-                            event
-                                .user_id
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|v| !v.is_empty()),
-                        ) {
-                            (Some(name), _) => format!("@{name}"),
-                            (None, Some(id)) => id.chars().take(12).collect(),
-                            (None, None) => String::new(),
+                        // Prefer the account the device key itself attested
+                        // (v2 signature); the relay-asserted identity is
+                        // only the fallback hint.
+                        let (account_hint, account_attested) = match key.attested_account.as_ref()
+                        {
+                            Some((_, name)) if !name.is_empty() => (format!("@{name}"), true),
+                            Some((user_id, _)) => {
+                                (user_id.chars().take(12).collect::<String>(), true)
+                            }
+                            None => (
+                                match (
+                                    event
+                                        .account_name
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|v| !v.is_empty()),
+                                    event
+                                        .user_id
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|v| !v.is_empty()),
+                                ) {
+                                    (Some(name), _) => format!("@{name}"),
+                                    (None, Some(id)) => id.chars().take(12).collect(),
+                                    (None, None) => String::new(),
+                                },
+                                false,
+                            ),
                         };
                         crate::access::enrollment::record_refused_client_key(
                             &key.fingerprint,
@@ -845,6 +900,7 @@ async fn handle_event(
                             &origin,
                             "connect-dashboard-control",
                             &account_hint,
+                            account_attested,
                             crate::access::client_key::now_unix_ms(),
                         );
                     }
@@ -1538,6 +1594,7 @@ mod tests {
         let key = crate::access::client_key::VerifiedClientKey {
             fingerprint: "fp-abc".to_string(),
             public_key_b64u: "unused".to_string(),
+            attested_account: None,
         };
         // Account metadata matches nothing, but the verified key must bind.
         let grant = connect_dashboard_grant_from_state(
@@ -1579,6 +1636,7 @@ mod tests {
         let key = crate::access::client_key::VerifiedClientKey {
             fingerprint: "fp-unenrolled".to_string(),
             public_key_b64u: "unused".to_string(),
+            attested_account: None,
         };
         let error = connect_dashboard_grant_from_state(state, None, None, Some(&key)).unwrap_err();
         assert!(error.contains("fp-unenrolled"));

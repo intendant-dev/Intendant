@@ -4221,6 +4221,12 @@ struct RendezvousEvent {
     client_key_sig: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_key_ts: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_key_proto: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_key_account_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_key_account_name: Option<String>,
     // Signed org-grant document, also relayed verbatim: the daemon verifies
     // it against the org keys it locally trusts, so this service can
     // neither mint nor amplify one.
@@ -4855,6 +4861,12 @@ struct BrowserOfferRequest {
     #[serde(default)]
     client_key_ts: Option<i64>,
     #[serde(default)]
+    client_key_proto: Option<String>,
+    #[serde(default)]
+    client_key_account_user_id: Option<String>,
+    #[serde(default)]
+    client_key_account_name: Option<String>,
+    #[serde(default)]
     org_grant: Option<serde_json::Value>,
 }
 
@@ -5284,6 +5296,27 @@ async fn browser_offer(
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
             client_key_ts: body.client_key_ts,
+            // v2 offer-signature fields, relayed verbatim like the key
+            // itself: the daemon verifies the signature covers them, so
+            // this service can neither mint nor alter an account claim.
+            client_key_proto: body
+                .client_key_proto
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+            client_key_account_user_id: body
+                .client_key_account_user_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+            client_key_account_name: body
+                .client_key_account_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
             // Opaque passthrough, size-capped so the relay cannot be used
             // to firehose daemons; the daemon re-verifies and rate-limits.
             org_grant: body.org_grant.filter(|doc| {
