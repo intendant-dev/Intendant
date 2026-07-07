@@ -13,6 +13,13 @@ struct Config {
     managed_context: Option<String>,
     raw: bool,
     json: bool,
+    /// `--peer` target as the user typed it. `Some` routes every request to
+    /// that federated peer's `/mcp` with fail-closed peer semantics (see
+    /// `rpc` / `mcp_url`); also the name echoed in peer-mode errors.
+    peer: Option<String>,
+    /// Outbound `Authorization: Bearer` for the resolved peer (its
+    /// `[[peer]] bearer_token`); sent only in peer mode.
+    bearer: Option<String>,
 }
 
 #[derive(Debug)]
@@ -24,7 +31,7 @@ struct CommandArgs {
 
 pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
     let (config, command) = parse_global_args(raw_args)?;
-    let (config, command) = parse_output_flags(config, command);
+    let (mut config, command) = parse_output_flags(config, command);
     if command.is_empty() {
         print_help();
         return Ok(());
@@ -34,7 +41,10 @@ pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
 
-    let client = reqwest::Client::new();
+    let client = match config.peer.clone() {
+        Some(needle) => configure_peer_mode(&mut config, &needle)?,
+        None => reqwest::Client::new(),
+    };
     match command[0].as_str() {
         "status" => {
             ensure_help(&command[1..], help_status)?;
@@ -75,6 +85,8 @@ fn parse_global_args(mut raw: Vec<String>) -> Result<(Config, Vec<String>), Stri
     let mut managed_context = std::env::var("INTENDANT_MANAGED_CONTEXT").ok();
     let mut raw_output = false;
     let mut json_output = false;
+    let mut peer: Option<String> = None;
+    let mut url_flag_given = false;
     let mut command_start = 0;
 
     let mut i = 0;
@@ -82,10 +94,19 @@ fn parse_global_args(mut raw: Vec<String>) -> Result<(Config, Vec<String>), Stri
         match raw[i].as_str() {
             "--url" => {
                 i += 1;
+                url_flag_given = true;
                 base_url = raw
                     .get(i)
                     .cloned()
                     .ok_or_else(|| "--url requires a value".to_string())?;
+            }
+            "--peer" => {
+                i += 1;
+                peer = Some(
+                    raw.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--peer requires a value".to_string())?,
+                );
             }
             "--port" => {
                 i += 1;
@@ -115,7 +136,11 @@ fn parse_global_args(mut raw: Vec<String>) -> Result<(Config, Vec<String>), Stri
             "--raw" => raw_output = true,
             "--json" => json_output = true,
             arg if arg.starts_with("--url=") => {
+                url_flag_given = true;
                 base_url = arg.trim_start_matches("--url=").to_string();
+            }
+            arg if arg.starts_with("--peer=") => {
+                peer = Some(arg.trim_start_matches("--peer=").to_string());
             }
             arg if arg.starts_with("--port=") => {
                 let value = arg.trim_start_matches("--port=");
@@ -142,6 +167,18 @@ fn parse_global_args(mut raw: Vec<String>) -> Result<(Config, Vec<String>), Stri
     }
 
     let command = raw.split_off(command_start);
+    // --peer replaces the whole URL derivation (flag- or env-provided) with
+    // the peer's /mcp endpoint; only the explicit --url flag is a conflict —
+    // INTENDANT_MCP_URL / INTENDANT_PORT are silently overridden.
+    if peer.is_some() && url_flag_given {
+        return Err("--peer and --url are mutually exclusive".to_string());
+    }
+    let peer = match peer.map(|value| value.trim().to_string()) {
+        Some(value) if value.is_empty() => {
+            return Err("--peer requires a non-empty value".to_string());
+        }
+        other => other,
+    };
     let base_url = if base_url.trim().is_empty() {
         format!("http://localhost:{port}/mcp")
     } else {
@@ -155,6 +192,8 @@ fn parse_global_args(mut raw: Vec<String>) -> Result<(Config, Vec<String>), Stri
             managed_context: clean_opt(managed_context),
             raw: raw_output,
             json: json_output,
+            peer,
+            bearer: None,
         },
         command,
     ))
@@ -176,6 +215,150 @@ fn clean_opt(value: Option<String>) -> Option<String> {
     value
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// Resolve `--peer <needle>` against the project's `[[peer]]` configuration
+/// and switch the invocation to peer routing: point `base_url` at the peer's
+/// stateless JSON-RPC `/mcp` endpoint, adopt the peer's outbound bearer, and
+/// build the mTLS-capable HTTP client whose client certificate binds the
+/// principal the peer's IAM profile authorizes.
+fn configure_peer_mode(config: &mut Config, needle: &str) -> Result<reqwest::Client, String> {
+    let project = crate::project::Project::detect()
+        .map_err(|e| format!("--peer could not load the project configuration: {e}"))?;
+    let config_path = project.root.join("intendant.toml");
+    if !config_path.exists() {
+        return Err(format!(
+            "no intendant.toml found at {} (project root detected from the current directory); \
+             --peer needs the project's [[peer]] configuration",
+            config_path.display()
+        ));
+    }
+    if project.config.peers.is_empty() {
+        return Err(format!(
+            "{} has no [[peer]] entries; --peer needs the target peer configured there",
+            config_path.display()
+        ));
+    }
+    let peer = resolve_peer(&project.config.peers, needle)?;
+    config.base_url = peer_mcp_endpoint(&peer.card_url)?;
+    config.bearer = peer.bearer_token.clone();
+
+    let mut pins = Vec::with_capacity(peer.pinned_fingerprints.len());
+    for raw in &peer.pinned_fingerprints {
+        let fp = crate::peer::transport::pinning::parse_fingerprint(raw)
+            .map_err(|e| format!("peer '{needle}': invalid pinned fingerprint {raw:?}: {e}"))?;
+        pins.push(fp);
+    }
+    // Explicit [[peer]] client_cert/client_key wins (same pairing rule the
+    // daemon applies at peer boot); otherwise fall back to the installed
+    // access client identity for TLS peers.
+    let identity = crate::startup::peer_boot::peer_client_identity_from_config(peer)
+        .map_err(|e| format!("peer '{needle}': {e}"))?
+        .or_else(|| {
+            if crate::peer::transport::tls_client::url_uses_tls(&config.base_url) {
+                crate::peer::transport::tls_client::installed_access_client_identity_paths()
+            } else {
+                None
+            }
+        });
+    // 120s: `cu actions` batches can legitimately carry long Wait actions.
+    crate::peer::transport::tls_client::reqwest_client(
+        std::time::Duration::from_secs(120),
+        &pins,
+        identity.as_ref(),
+    )
+    .map_err(|e| format!("peer '{needle}': failed to build TLS client: {e}"))
+}
+
+/// Pick the `[[peer]]` entry `--peer <needle>` refers to. A peer matches when
+/// the needle equals its `label` (case-insensitive), the host of its
+/// `card_url`, or its `card_url` exactly; a needle containing ':' also
+/// matches on the segment after the LAST ':' — peer ids look like
+/// "intendant:nicks-mac", so the suffix is compared against label/host. (The
+/// needle is the side that gets split, never the card_url host, since URLs
+/// carry ':' for ports.)
+fn resolve_peer<'a>(
+    peers: &'a [crate::project::PeerConfig],
+    needle: &str,
+) -> Result<&'a crate::project::PeerConfig, String> {
+    let matches: Vec<&crate::project::PeerConfig> = peers
+        .iter()
+        .filter(|peer| peer_matches(peer, needle))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches[0]),
+        0 => Err(format!(
+            "no configured peer matches '{needle}'; configured peers: {}",
+            peers
+                .iter()
+                .map(describe_peer)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        _ => Err(format!(
+            "--peer '{needle}' is ambiguous; it matches: {}",
+            matches
+                .iter()
+                .map(|peer| describe_peer(peer))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn peer_matches(peer: &crate::project::PeerConfig, needle: &str) -> bool {
+    if needle == peer.card_url || label_or_host_matches(peer, needle) {
+        return true;
+    }
+    match needle.rsplit_once(':') {
+        Some((_, suffix)) => label_or_host_matches(peer, suffix),
+        None => false,
+    }
+}
+
+fn label_or_host_matches(peer: &crate::project::PeerConfig, needle: &str) -> bool {
+    if peer
+        .label
+        .as_deref()
+        .is_some_and(|label| label.eq_ignore_ascii_case(needle))
+    {
+        return true;
+    }
+    card_url_host(peer).is_some_and(|host| host.eq_ignore_ascii_case(needle))
+}
+
+fn card_url_host(peer: &crate::project::PeerConfig) -> Option<String> {
+    reqwest::Url::parse(&peer.card_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+}
+
+/// Render a configured peer for "which peers exist" error listings:
+/// `label (host)` when both are known, else whichever exists, else card_url.
+fn describe_peer(peer: &crate::project::PeerConfig) -> String {
+    let host = card_url_host(peer);
+    match (peer.label.as_deref(), host) {
+        (Some(label), Some(host)) => format!("{label} ({host})"),
+        (Some(label), None) => label.to_string(),
+        (None, Some(host)) => host,
+        (None, None) => peer.card_url.clone(),
+    }
+}
+
+/// Derive the peer gateway's stateless JSON-RPC `/mcp` endpoint from its
+/// Agent Card URL: keep scheme/host/port, drop path and query. The card is
+/// served at `<gateway>/.well-known/agent-card.json`, so the card_url origin
+/// IS the gateway origin that serves `/mcp`. (`via_urls` only override the
+/// `/ws` federation transport, not HTTP RPC.)
+fn peer_mcp_endpoint(card_url: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(card_url)
+        .map_err(|e| format!("invalid peer card_url '{card_url}': {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "peer card_url '{card_url}' must be http(s) to derive the /mcp endpoint"
+        ));
+    }
+    Ok(format!("{}/mcp", url.origin().ascii_serialization()))
 }
 
 fn parse_command_args(
@@ -1273,12 +1456,23 @@ async fn rpc(
         "method": method,
         "params": params,
     });
-    let response = client
-        .post(url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+    let mut request = client.post(url).json(&body);
+    if config.peer.is_some() {
+        // Opt into fail-closed peer semantics on the target gateway: without
+        // a client cert the request is rejected instead of downgraded to an
+        // anonymous principal.
+        request = request.header(
+            crate::peer::transport::intendant::PEER_CLIENT_HEADER,
+            crate::peer::transport::intendant::PEER_CLIENT_HEADER_VALUE,
+        );
+        if let Some(bearer) = &config.bearer {
+            request = request.bearer_auth(bearer);
+        }
+    }
+    let response = request.send().await.map_err(|e| match &config.peer {
+        Some(peer) => format!("request to peer '{peer}' failed: {e}"),
+        None => format!("request failed: {e}"),
+    })?;
     let status = response.status();
     let text = response
         .text()
@@ -1293,7 +1487,9 @@ async fn rpc(
 fn mcp_url(config: &Config) -> Result<reqwest::Url, String> {
     let mut url =
         reqwest::Url::parse(&config.base_url).map_err(|e| format!("invalid MCP URL: {e}"))?;
-    {
+    // Peer mode deliberately appends nothing: session_id / managed_context
+    // scope sessions of the LOCAL daemon and are meaningless cross-daemon.
+    if config.peer.is_none() {
         let mut pairs = url.query_pairs_mut();
         if let Some(session_id) = &config.session_id {
             pairs.append_pair("session_id", session_id);
@@ -1665,6 +1861,7 @@ Usage: intendant ctl [global flags] <command> [args]\n\
 Global flags:\n\
   --url URL                 MCP URL (default http://localhost:8765/mcp)\n\
   --port PORT               Dashboard/MCP port when --url is omitted\n\
+  --peer ID                 Route commands to a federated peer's /mcp over mTLS ([[peer]] label or host); authorized by the profile the peer granted this daemon\n\
   --session ID              Session id to bind to the MCP request\n\
   --managed-context MODE    vanilla or managed\n\
   --json                    Print parsed JSON where possible\n\
@@ -2152,5 +2349,188 @@ mod tests {
 
         save_first_image_or_path(&result, &output).expect("save from image block");
         assert_eq!(std::fs::read(output).expect("read output"), inline_bytes);
+    }
+
+    fn peer_config(card_url: &str, label: Option<&str>) -> crate::project::PeerConfig {
+        crate::project::PeerConfig {
+            card_url: card_url.to_string(),
+            label: label.map(str::to_string),
+            bearer_token: None,
+            via_urls: Vec::new(),
+            client_cert: None,
+            client_key: None,
+            pinned_fingerprints: Vec::new(),
+            browser_tcp_via_url: None,
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            base_url: "http://localhost:8765/mcp".to_string(),
+            session_id: Some("sess-1".to_string()),
+            managed_context: Some("managed".to_string()),
+            raw: false,
+            json: false,
+            peer: None,
+            bearer: None,
+        }
+    }
+
+    #[test]
+    fn resolve_peer_matches_label_case_insensitively() {
+        let peers = vec![
+            peer_config(
+                "https://mac.example:8766/.well-known/agent-card.json",
+                Some("nicks-mac"),
+            ),
+            peer_config("https://dell.example/.well-known/agent-card.json", None),
+        ];
+        let peer = resolve_peer(&peers, "Nicks-Mac").expect("label matches");
+        assert_eq!(peer.label.as_deref(), Some("nicks-mac"));
+    }
+
+    #[test]
+    fn resolve_peer_matches_card_url_host() {
+        let peers = vec![
+            peer_config(
+                "https://mac.example:8766/.well-known/agent-card.json",
+                Some("nicks-mac"),
+            ),
+            peer_config("https://dell.example/.well-known/agent-card.json", None),
+        ];
+        let peer = resolve_peer(&peers, "dell.example").expect("host matches");
+        assert_eq!(
+            peer.card_url,
+            "https://dell.example/.well-known/agent-card.json"
+        );
+    }
+
+    #[test]
+    fn resolve_peer_matches_colon_id_suffix_against_label_and_host() {
+        let peers = vec![
+            peer_config(
+                "https://mac.example:8766/.well-known/agent-card.json",
+                Some("nicks-mac"),
+            ),
+            peer_config("https://dell.example/.well-known/agent-card.json", None),
+        ];
+        let by_label = resolve_peer(&peers, "intendant:nicks-mac").expect("suffix label matches");
+        assert_eq!(by_label.label.as_deref(), Some("nicks-mac"));
+        let by_host = resolve_peer(&peers, "intendant:dell.example").expect("suffix host matches");
+        assert_eq!(
+            by_host.card_url,
+            "https://dell.example/.well-known/agent-card.json"
+        );
+    }
+
+    #[test]
+    fn resolve_peer_matches_exact_card_url() {
+        let card_url = "http://localhost:8766/.well-known/agent-card.json";
+        let peers = vec![peer_config(card_url, None)];
+        let peer = resolve_peer(&peers, card_url).expect("exact card_url matches");
+        assert_eq!(peer.card_url, card_url);
+    }
+
+    #[test]
+    fn resolve_peer_ambiguous_lists_matches() {
+        let peers = vec![
+            peer_config(
+                "https://one.example/.well-known/agent-card.json",
+                Some("twin"),
+            ),
+            peer_config(
+                "https://two.example/.well-known/agent-card.json",
+                Some("twin"),
+            ),
+        ];
+        let err = resolve_peer(&peers, "twin").expect_err("ambiguous is an error");
+        assert!(err.contains("ambiguous"), "says ambiguous: {err}");
+        assert!(err.contains("twin (one.example)"), "lists first: {err}");
+        assert!(err.contains("twin (two.example)"), "lists second: {err}");
+    }
+
+    #[test]
+    fn resolve_peer_no_match_lists_configured_peers() {
+        let peers = vec![
+            peer_config(
+                "https://mac.example:8766/.well-known/agent-card.json",
+                Some("nicks-mac"),
+            ),
+            peer_config("https://dell.example/.well-known/agent-card.json", None),
+        ];
+        let err = resolve_peer(&peers, "nope").expect_err("no match is an error");
+        assert!(err.contains("no configured peer matches 'nope'"), "{err}");
+        assert!(err.contains("nicks-mac (mac.example)"), "{err}");
+        assert!(err.contains("dell.example"), "{err}");
+    }
+
+    #[test]
+    fn peer_mcp_endpoint_keeps_explicit_port_and_drops_path_and_query() {
+        assert_eq!(
+            peer_mcp_endpoint("https://peer.example:8766/.well-known/agent-card.json?v=1")
+                .expect("endpoint derives"),
+            "https://peer.example:8766/mcp"
+        );
+    }
+
+    #[test]
+    fn peer_mcp_endpoint_without_explicit_port() {
+        assert_eq!(
+            peer_mcp_endpoint("http://peer.example/.well-known/agent-card.json")
+                .expect("endpoint derives"),
+            "http://peer.example/mcp"
+        );
+    }
+
+    #[test]
+    fn peer_mcp_endpoint_rejects_non_http_schemes() {
+        assert!(peer_mcp_endpoint("ws://peer.example/ws").is_err());
+        assert!(peer_mcp_endpoint("not a url").is_err());
+    }
+
+    #[test]
+    fn peer_mode_mcp_url_omits_session_params_non_peer_keeps_them() {
+        let mut config = test_config();
+        config.peer = Some("nicks-mac".to_string());
+        let url = mcp_url(&config).expect("peer url parses");
+        assert_eq!(url.query(), None, "peer mode appends no query params");
+
+        let config = test_config();
+        let url = mcp_url(&config).expect("local url parses");
+        let query = url.query().expect("local mode keeps query params");
+        assert!(query.contains("session_id=sess-1"), "{query}");
+        assert!(query.contains("managed_context=managed"), "{query}");
+    }
+
+    #[test]
+    fn parse_global_args_rejects_peer_combined_with_url() {
+        let err = parse_global_args(args(&["--peer", "x", "--url", "http://h/mcp", "status"]))
+            .expect_err("conflict is an error");
+        assert!(err.contains("mutually exclusive"), "{err}");
+        let err = parse_global_args(args(&["--url=http://h/mcp", "--peer=x", "status"]))
+            .expect_err("conflict is an error in = form too");
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn parse_global_args_accepts_both_peer_flag_forms() {
+        let (config, command) =
+            parse_global_args(args(&["--peer", "nicks-mac", "status"])).expect("space form");
+        assert_eq!(config.peer.as_deref(), Some("nicks-mac"));
+        assert!(config.bearer.is_none());
+        assert_eq!(command, args(&["status"]));
+
+        let (config, command) =
+            parse_global_args(args(&["--peer=intendant:nicks-mac", "display", "list"]))
+                .expect("= form");
+        assert_eq!(config.peer.as_deref(), Some("intendant:nicks-mac"));
+        assert_eq!(command, args(&["display", "list"]));
+    }
+
+    #[test]
+    fn parse_global_args_rejects_missing_or_empty_peer_value() {
+        assert!(parse_global_args(args(&["--peer"])).is_err());
+        assert!(parse_global_args(args(&["--peer=", "status"])).is_err());
+        assert!(parse_global_args(args(&["--peer", "  ", "status"])).is_err());
     }
 }
