@@ -4,6 +4,7 @@ members = [
     "crates/app-html-assembler",
     "crates/intendant-core",
     "crates/intendant-display",
+    "crates/intendant-platform",
     "crates/presence-core",
     "crates/presence-web",
     "crates/station-web",
@@ -58,6 +59,7 @@ dirs = "6"
 which = "8"
 intendant-core = { path = "crates/intendant-core" }
 intendant-display = { path = "crates/intendant-display" }
+intendant-platform = { path = "crates/intendant-platform" }
 rmcp = { version = ">=1.4.0, <1.5.0", features = ["server", "transport-io", "client", "transport-child-process"] }
 schemars = "1"
 base64 = "0.22"
@@ -162,23 +164,9 @@ accessibility-sys = "0.2"
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 env-libvpx-sys = { version = "5.1", features = ["generate"] }
 
-# Windows-only system bindings, used by `platform.rs` for the process
-# liveness check (OpenProcess / GetExitCodeProcess) and command-line readout
-# (NtQueryInformationProcess via the Wdk surface, with a
-# QueryFullProcessImageNameW exe-path fallback), and to keep room for the
-# Tier-1 backends (DXGI capture, SendInput, WASAPI, clipboard) without
-# re-touching Cargo.toml. Feature set is the minimum platform.rs needs
-# today plus the threading/process-status surfaces those backends will use.
-# `Wdk_System_Threading` pulls in NtQueryInformationProcess +
-# ProcessCommandLineInformation (the documented-but-NT command-line class).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_Threading",
-    "Win32_System_ProcessStatus",
-    "Wdk_System_Threading",
-] }
+# (windows-sys moved to crates/intendant-platform with platform.rs, its only
+# user in this package.)
 # Windows clipboard backend (display/clipboard.rs). Wraps the Win32 clipboard
 # API (clipboard-win) and provides RGBA image get/set via its default
 # `image-data` feature. That feature pulls in `image` (0.25, png+bmp) and the

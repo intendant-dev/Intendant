@@ -104,16 +104,17 @@ src/
 │   ├── credential_leases.rs, credential_egress.rs, daemon_identity.rs, connect_rendezvous.rs   # credential custody; Connect client
 │   ├── peer/, web_tls.rs       # peer federation (transport, pairing, access profiles); native HTTPS/WSS
 │   ├── display/                # WebRTC: encode/{pool,vp8,h264_*}, tile/, capture/, webrtc, {x11,wayland,macos,windows}
-│   ├── computer_use.rs, ax.rs, vision.rs, recording.rs, frames.rs
+│   ├── computer_use.rs, ax.rs, recording.rs, frames.rs
 │   ├── presence.rs, live_audio.rs, audio_routing.rs, transcription.rs, quarantine.rs, schema_validator.rs
 │   ├── web_gateway/                # HTTP/WS gateway: listener (accept/TLS), ws_session (WS tasks), http_dispatch (route dispatch), http, routes_{sessions,files,peers,access}, session_catalog/, settings, access_gates, input_authority, dashboard_presence, connect_bootstrap, peer_requests, agent_card, mcp_gate, static_assets
 │   ├── dashboard_control.rs, terminal.rs, browser_workspace.rs   # dashboard tunnel; PTY registry; agent browser
 │   ├── mcp/, mcp_client.rs, control.rs
 │   ├── transfer_store.rs, upload_store.rs, peer_file_transfer.rs   # transfer jobs; upload/attachment stores
 │   ├── session_log.rs, session_names.rs, knowledge.rs, project.rs, app_state_pricing.rs
-│   ├── sandbox.rs, platform.rs, daemon_log_tee.rs, diagnostics.rs, …
+│   ├── sandbox.rs, daemon_log_tee.rs, diagnostics.rs, …
 └── bin/connect/                # intendant-connect: hosted rendezvous (accounts, daemon claims, fleet sync, vault blobs, push, transparency log)
 crates/{presence-core, presence-web, station-web}   # WASM: shared presence types/tools/dispatch, browser presence client, Station renderer
+crates/intendant-platform   # OS integration leaf: platform probes/spawn (platform.rs), DisplayTarget, virtual-display mgmt (vision.rs)
 crates/app-html-assembler   # assembles static/app.html from static/app/ (build.rs + the CI regen gate)
 static/         # dashboard SPA: app/ fragments (source) → generated app.html; compiled wasm-web/ + wasm-station/
 macos-app/      # native macOS WKWebView wrapper (built by scripts/bundle-macos.sh)
@@ -170,7 +171,7 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   hand-reconcile the generated file.
 - Pure-safe Rust by default. The Unix (macOS / Linux) code paths keep `unsafe`
   confined to documented islands: small platform probes/signals and display or
-  identity queries in `platform.rs`; macOS Accessibility bindings in `ax.rs`
+  identity queries in `platform.rs` (now `crates/intendant-platform`); macOS Accessibility bindings in `ax.rs`
   (raw `accessibility-sys` FFI wrapped once there — no safe wrapper crate exists
   without dragging in a duplicate `core-graphics`/legacy `objc` stack); and the
   Vortex direct POSIX shared-memory bridge in `live_audio.rs` (`shm_open`,
