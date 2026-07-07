@@ -245,6 +245,11 @@ app-html-assembler = { path = "crates/app-html-assembler" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
+# Line tables keep panic backtraces readable while dropping the bulk of
+# debuginfo the edit->check->test loop never uses; full `debug = 2` is a
+# `cargo build --profile dev-debug`-style opt-in away if a debugger
+# session ever needs it (or temporarily flip this line).
+debug = "line-tables-only"
 
 # The edit→rebuild loop ships from target/release (the multi-agent
 # convention), and the caller is one huge compilation unit — without
@@ -270,3 +275,12 @@ tokio = { version = "1.0", features = ["test-util"] }
 # rustls-native-certs), so pinning it here adds no new crate to the lock.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 security-framework = "3"
+
+# The access layer generates RSA daemon certs (RustCrypto `rsa`); keygen is
+# pure-Rust bignum math that runs ~25s per key unoptimized, and every
+# cert-touching test pays it. Optimizing just the arithmetic crates keeps
+# dev builds debuggable while making keygen near-release speed.
+[profile.dev.package.rsa]
+opt-level = 3
+[profile.dev.package.num-bigint-dig]
+opt-level = 3

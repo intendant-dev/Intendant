@@ -58,7 +58,9 @@ Read the relevant chapter before changing a subsystem:
 cargo build --release     # → target/release/{intendant-runtime, intendant}
 cargo build               # debug
 cargo check               # type-check only
-cargo test --bins         # unit tests (fast, no API keys)
+cargo test --bins         # unit tests (no API keys; what CI runs)
+cargo nextest run --bins  # same tests, much faster: one process per test
+                          # (needs cargo-nextest; config in .config/nextest.toml)
 cargo clippy              # lint
 ```
 
@@ -289,7 +291,18 @@ collisions cheap:
   rerun, re-run `gh pr merge <n> --merge --auto` and confirm
   `autoMergeRequest` is set again. While the PR sits IN the queue,
   `autoMergeRequest` nulling and `mergeStateStatus: UNKNOWN` are normal;
-  only `state` (`MERGED`/`CLOSED`) is terminal.
+  only `state` (`MERGED`/`CLOSED`) is terminal. A queued branch is frozen —
+  pushes are rejected until the entry merges or is dequeued.
+
+After arming auto-merge, confirm the PR actually **enters the queue** once its
+checks go green (GraphQL `pullRequest.mergeQueueEntry`). Known stall: a job
+that dies mid-run (runner lost communication) and auto-recovers in place can
+leave its per-commit **check run** stuck at `failure` while the workflow run
+shows success — auto-merge reads the check run and waits forever. Detect it by
+comparing `gh pr checks` against `gh run view`; remedy with
+`gh run rerun --job <id>` to mint a fresh check run. Treat any
+"green run, armed auto-merge, still not queued after ~5 minutes" as this
+class of stall, not as normal latency.
 
 **Post-landing: fast-forward the shared mirror.** The queue owns origin/main;
 nothing updates the repo root's local `main` anymore. After your PR merges, run
@@ -315,16 +328,20 @@ required checks pass, so a paths-skipped required check blocks queue entry
 (and on the group side wedges the entry at "Expected"). Only the push-to-main
 triggers keep paths filters — they exist for cache warming, not gating.
 
-All three legs run on the **self-hosted fleet** (`dell-206` =
-`intendant-linux`, `macbook-vm` = `intendant-macos`, `samsung-win` =
-`intendant-windows`) with persistent incremental `target/` dirs — warm gate
-runs are minutes, not half-hours. Self-hosted jobs carry a same-repo guard
-(fork-PR code never executes on our hardware), the Dell and Windows runners
-run as dedicated non-admin `ci` users, and the check *names* stay pinned to
-the `test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os`
-is the name key, `runner` is the placement):
-- **`windows.yml`** — cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Headless-safe: needs no display or API keys. **Required check.**
-- **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real release binaries on Linux + macOS. **Required check.**
+Trusted refs (pushes, merge-queue refs, same-repo PRs) run on the
+**self-hosted fleet** (`dell-206` = `intendant-linux`, `macbook-vm` =
+`intendant-macos`, `samsung-win` = `intendant-windows`) with persistent
+incremental `target/` dirs — warm gate runs are minutes, not half-hours.
+**Fork PRs route to GitHub-hosted runners instead** (dynamic `runs-on`;
+`matrix.os` doubles as the hosted label): external code never executes on
+our hardware, yet its required checks really run. Fork-PR workflows also
+need maintainer approval before anything runs (all outside collaborators,
+not just first-timers). The Dell and Windows runners run as dedicated
+non-admin `ci` users, and the check *names* stay pinned to the
+`test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os` is
+the name key, `runner` is the fleet placement):
+- **`windows.yml`** — cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). On `pull_request` the Windows leg runs `cargo check` only (fast pre-queue signal); the full Windows suite runs in the merge group — the actual gate — and on pushes to main. Headless-safe: needs no display or API keys. **Required check.**
+- **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real binaries on Linux only (debug profile; the drivers are platform-agnostic protocol probes, so a second platform mostly duplicated coverage while doubling flake surface). **Required check.**
 - **`app-html.yml`** — the `static/app/` fragments ↔ generated `static/app.html` regen gate. **Required check.**
 - **`agents-md-sync.yml`** — CLAUDE.md ↔ AGENTS.md byte-parity. **Required check.**
 - **`audit.yml`** — `cargo audit` on push/PR plus a weekly cron (Mondays 08:00 UTC). Advisory only — new upstream advisories must not block unrelated landings.

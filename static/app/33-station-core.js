@@ -432,6 +432,13 @@ window.stationProbe = Object.assign(window.stationProbe || {}, {
   },
 });
 
+// QA readback (window.qa convention): Station predates the namespace and
+// keeps its legacy window.stationProbe name (the validator's --station-*
+// probes and smoke skills depend on it); window.qa.station points at it.
+window.qa = Object.assign(window.qa || {}, {
+  station: () => window.stationProbe,
+});
+
 function stationLogEventId(c, fallbackIndex = '') {
   const hostId = String(c?.host_id || c?.hostId || selfPeerId || 'local');
   const sessionId = String(c?.session_id || c?.sessionId || '');

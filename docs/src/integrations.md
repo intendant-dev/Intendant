@@ -185,20 +185,25 @@ adds a PR to the queue once the PR's own required checks pass, so a
 wedges the entry at "Expected"). Their push-to-main triggers keep paths
 filters — those runs warm the main-branch caches, they don't gate.
 
-All three legs run on a **self-hosted fleet** (`dell-206` /
-`intendant-linux`, `macbook-vm` / `intendant-macos`, `samsung-win` /
-`intendant-windows`) whose persistent incremental `target/` dirs make warm
-gate runs a few minutes. Self-hosted hardening: jobs carry a same-repo guard
-so fork-PR code never executes on the fleet (fork PRs are handled manually
-behind the Actions fork-approval gate — only maintainers can enqueue anyway),
-the Dell and Windows runners run as dedicated non-admin `ci` users (sudo-less
-on Linux; a plain `Users`-group service account on Windows), runners are
+Trusted refs (pushes, merge-queue refs, same-repo PRs) run on a
+**self-hosted fleet** (`dell-206` / `intendant-linux`, `macbook-vm` /
+`intendant-macos`, `samsung-win` / `intendant-windows`) whose persistent
+incremental `target/` dirs make warm gate runs a few minutes. **Fork PRs
+route to GitHub-hosted runners** via a dynamic `runs-on` (the matrix `os`
+key doubles as the hosted label): external code never executes on the
+fleet, while its required checks still genuinely run — a skipped required
+check would read as satisfied, so routing beats skipping. Fork-PR
+workflows additionally require maintainer approval before running at all
+(the Actions fork-approval policy covers **all** outside collaborators,
+not just first-timers), and only maintainers can enqueue. The Dell and
+Windows runners run as dedicated non-admin `ci` users (sudo-less on
+Linux; a plain `Users`-group service account on Windows), runners are
 registered per-repo, and the default `GITHUB_TOKEN` is read-only.
 
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
-| `windows.yml` | every PR + merge group; push to `main` (Rust/Cargo paths, cache warming) | **Required.** Cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` plus the headless mock-provider e2e on Windows (`x86_64-pc-windows-msvc`), macOS (`aarch64-apple-darwin`), and Linux (`x86_64-unknown-linux-gnu`) to catch platform-specific build breaks and Unix-only test assumptions |
-| `smokes.yml` | every PR + merge group; push to `main` (Rust/Cargo/smoke paths, cache warming) | **Required.** The keyless smokes (`session-vitals`, `native-goal`, `peer-sessions`) driving real release binaries with the scripted mock provider on Linux + macOS |
+| `windows.yml` | every PR + merge group; push to `main` (Rust/Cargo paths, cache warming) | **Required.** Cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` plus the headless mock-provider e2e on Windows (`x86_64-pc-windows-msvc`), macOS (`aarch64-apple-darwin`), and Linux (`x86_64-unknown-linux-gnu`) to catch platform-specific build breaks and Unix-only test assumptions. On `pull_request` the Windows leg runs `cargo check` only; its full suite runs in the merge group (the actual gate) and on main pushes. The Windows leg builds with `CARGO_PROFILE_DEV_DEBUG=0` — CI wants pass/fail, not PDBs |
+| `smokes.yml` | every PR + merge group; push to `main` (Rust/Cargo/smoke paths, cache warming) | **Required.** The keyless smokes (`session-vitals`, `native-goal`, `peer-sessions`) driving real binaries with the scripted mock provider on Linux (debug profile — the drivers are platform-agnostic protocol probes; a second platform duplicated coverage and doubled flake surface, and release added only build time) |
 | `app-html.yml` | every PR + merge group; push to `main` (fragment/assembler paths) | **Required.** Reruns the assembler and fails when the committed `static/app.html` doesn't match the fragments |
 | `agents-md-sync.yml` | every PR + merge group; push touching `CLAUDE.md`/`AGENTS.md`; manual dispatch | **Required.** Fails when tracked `AGENTS.md` differs byte-for-byte from `CLAUDE.md` |
 | `audit.yml` | push/PR (Cargo paths) + weekly cron (Mon 08:00 UTC) | Advisory: `cargo audit` against the RustSec advisory DB — new upstream advisories must not block unrelated landings |

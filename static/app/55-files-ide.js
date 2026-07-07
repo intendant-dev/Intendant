@@ -2448,16 +2448,19 @@ const NEW_SESSION_UNFUELED_MESSAGE =
   'This daemon has no model credentials, so the internal agent can’t start. ' +
   'External agents (Codex, Claude Code) sign in with their own accounts and still work.';
 
-// QA hook (stationProbe convention): the preflight inputs the
+// QA readback (window.qa convention): the preflight inputs the
 // validate-dashboard harness asserts on — module scope hides them.
-window.sessionsFuelProbe = () => ({
-  fueled: dashboardControlTransport?.lastStatus?.fueled ?? null,
-  haveStatus: !!dashboardControlTransport?.lastStatus,
-  unfueledCached: daemonUnfueledCached,
-  effectiveAgent: effectiveNewSessionAgentId(),
-  configuredAgent: newSessionConfiguredAgent || '',
-  bannerHidden: !!document.getElementById('new-session-unfueled-banner')?.classList.contains('hidden'),
-  startDisabled: !!document.getElementById('new-session-start-btn')?.disabled,
+// Probe functions stay cheap and side-effect-free.
+window.qa = Object.assign(window.qa || {}, {
+  sessionsFuel: () => ({
+    fueled: dashboardControlTransport?.lastStatus?.fueled ?? null,
+    haveStatus: !!dashboardControlTransport?.lastStatus,
+    unfueledCached: daemonUnfueledCached,
+    effectiveAgent: effectiveNewSessionAgentId(),
+    configuredAgent: newSessionConfiguredAgent || '',
+    bannerHidden: !!document.getElementById('new-session-unfueled-banner')?.classList.contains('hidden'),
+    startDisabled: !!document.getElementById('new-session-start-btn')?.disabled,
+  }),
 });
 
 function updateNewSessionFuelBanner() {
