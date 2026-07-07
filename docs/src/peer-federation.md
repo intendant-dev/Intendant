@@ -451,7 +451,7 @@ typically through TURN: when a TURN server is configured in `[webrtc].ice_server
 the federated path pins the browser to `iceTransportPolicy: 'relay'` and both ends
 can allocate on the configured coturn (without a TURN server the policy is left at
 its default). When no direct path can be formed, a **primary-relay TCP fallback**
-kicks in (`display/webrtc.rs` `TcpRelayRegistry`):
+kicks in (`display/webrtc/tcp_mux.rs` `TcpRelayRegistry`):
 
 1. As the peer's `Answer` flows back through the primary, the primary parses the
    peer's ICE ufrag and resolves the peer's advertised URL to a `SocketAddr`,

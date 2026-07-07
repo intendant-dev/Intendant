@@ -71,7 +71,9 @@ viewer):
 
 ## The Encoder Pool
 
-The redesign's centerpiece (`display/encode/pool.rs`). The pre-pool design used
+The redesign's centerpiece (`display/encode/pool/`: vocabulary types, the
+subscription lease + keyframe coalescer, the orchestrating `EncoderPool`, and
+the encoder worker threads). The pre-pool design used
 **one encoder per session** with the codec locked to the *first* peer's offer:
 every later viewer had to accept that codec or its WebRTC offer failed outright.
 The naive fix — one encoder per peer — is what transcoding gateways do, and it
@@ -157,7 +159,10 @@ seen one, so the decoder never renders garbage.
 
 ## Per-Peer WebRTC Driver (`rtc`-rs, sans-I/O)
 
-Each browser connection is a `WebRtcPeer` (`display/webrtc.rs`) that runs its own
+Each browser connection is a `WebRtcPeer` (`display/webrtc/`: the peer handle in
+`mod.rs`, ICE-TCP registries in `tcp_mux.rs`, candidate gathering in `ice.rs`,
+offer handling + construction in `offer.rs`, the driver task in `driver.rs`, and
+pool glue in `pool_glue.rs`) that runs its own
 tokio **driver task**. The driver holds a sans-I/O
 [`rtc` crate](https://crates.io/crates/rtc) (rtc-rs, pinned to `=0.9.0`)
 `RTCPeerConnection` plus its own UDP/TCP sockets, and pumps everything in a single
