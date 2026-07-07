@@ -24,7 +24,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
-use crate::peer::transport::pinning::{format_fingerprint, parse_fingerprint};
+use crate::access::pinning::{format_fingerprint, parse_fingerprint};
 use crate::web_tls::{build_acceptor, TlsCertSource};
 
 use super::{certs::CertState, AccessError, AccessResult};
@@ -213,7 +213,7 @@ async fn accept_loop(
                 c
             }
             Err(e) => {
-                if crate::web_gateway::should_continue_after_accept_error(&e) {
+                if intendant_core::net::should_continue_after_accept_error(&e) {
                     // Bare `continue` here would hot-spin at 100% CPU under
                     // descriptor pressure; pause before the next accept.
                     eprintln!("[access/cert-server] accept failed: {e} (continuing)");
@@ -224,7 +224,7 @@ async fn accept_loop(
                 // accept loop): retry the same socket briefly before
                 // declaring it dead.
                 fatal_accept_streak += 1;
-                if fatal_accept_streak < crate::web_gateway::FATAL_ACCEPT_REBIND_THRESHOLD {
+                if fatal_accept_streak < intendant_core::net::FATAL_ACCEPT_REBIND_THRESHOLD {
                     eprintln!(
                         "[access/cert-server] accept failed: {e} (retry {fatal_accept_streak} before rebind)"
                     );
@@ -249,7 +249,7 @@ async fn accept_loop(
                 let mut delay = std::time::Duration::from_millis(250);
                 listener = loop {
                     tokio::time::sleep(delay).await;
-                    match crate::web_gateway::rebind_dead_tcp_listener(addr) {
+                    match intendant_core::net::rebind_dead_tcp_listener(addr) {
                         Ok(fresh) => {
                             eprintln!("[access/cert-server] listener rebound on {addr}");
                             break fresh;

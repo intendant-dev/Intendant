@@ -169,7 +169,7 @@ pub struct IamGrant {
     /// included. Enforcement shares `filesystem_access_allowed` with
     /// peer scoping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fs_scope: Option<crate::peer::access_policy::FilesystemAccessPolicy>,
+    pub fs_scope: Option<crate::access::access_policy::FilesystemAccessPolicy>,
 }
 
 impl IamGrant {
@@ -536,7 +536,7 @@ impl AccessPrincipal {
 impl AccessDecision {
     pub fn allowed(
         principal: &AccessPrincipal,
-        op: crate::peer::access_policy::PeerOperation,
+        op: crate::access::access_policy::PeerOperation,
         reason: impl Into<String>,
     ) -> Self {
         Self {
@@ -550,7 +550,7 @@ impl AccessDecision {
 
     pub fn denied(
         principal: &AccessPrincipal,
-        op: crate::peer::access_policy::PeerOperation,
+        op: crate::access::access_policy::PeerOperation,
         reason: impl Into<String>,
     ) -> Self {
         Self {
@@ -827,7 +827,7 @@ pub fn upsert_user_client_grant(
         if read_roots.is_empty() && write_roots.is_empty() {
             None
         } else {
-            Some(crate::peer::access_policy::FilesystemAccessPolicy {
+            Some(crate::access::access_policy::FilesystemAccessPolicy {
                 read_roots,
                 write_roots,
             })
@@ -1802,7 +1802,7 @@ fn permission_summary(id: &str) -> &'static str {
 pub fn fs_scope_for_principal<'a>(
     state: &'a LocalIamState,
     principal: &AccessPrincipal,
-) -> Option<&'a crate::peer::access_policy::FilesystemAccessPolicy> {
+) -> Option<&'a crate::access::access_policy::FilesystemAccessPolicy> {
     let grant_id = principal.grant_id.as_deref()?;
     state
         .grants
@@ -1813,7 +1813,7 @@ pub fn fs_scope_for_principal<'a>(
 
 pub fn evaluate_principal_operation(
     principal: &AccessPrincipal,
-    op: crate::peer::access_policy::PeerOperation,
+    op: crate::access::access_policy::PeerOperation,
 ) -> AccessDecision {
     match principal.kind.as_str() {
         "root_session" => AccessDecision::allowed(
@@ -1829,7 +1829,7 @@ pub fn evaluate_principal_operation(
                     "peer daemon principal has no profile",
                 );
             };
-            if crate::peer::access_policy::profile_allows_operation(profile, op) {
+            if crate::access::access_policy::profile_allows_operation(profile, op) {
                 AccessDecision::allowed(
                     principal,
                     op,
@@ -1860,7 +1860,7 @@ pub fn evaluate_principal_operation(
 pub fn evaluate_principal_operation_with_state(
     state: &LocalIamState,
     principal: &AccessPrincipal,
-    op: crate::peer::access_policy::PeerOperation,
+    op: crate::access::access_policy::PeerOperation,
 ) -> AccessDecision {
     if matches!(principal.kind.as_str(), "root_session" | "peer_daemon") {
         return evaluate_principal_operation(principal, op);
@@ -2032,8 +2032,8 @@ pub fn permissions_excess<'a>(granted: &'a [String], cap: &[String]) -> Option<&
     })
 }
 
-pub fn operation_permission_id(op: crate::peer::access_policy::PeerOperation) -> &'static str {
-    use crate::peer::access_policy::PeerOperation;
+pub fn operation_permission_id(op: crate::access::access_policy::PeerOperation) -> &'static str {
+    use crate::access::access_policy::PeerOperation;
     match op {
         PeerOperation::PresenceRead => "presence.read",
         PeerOperation::StatsRead => "stats.read",
@@ -3073,9 +3073,9 @@ mod tests {
             "admin-peer",
         ] {
             assert!(
-                !crate::peer::access_policy::profile_allows_operation(
+                !crate::access::access_policy::profile_allows_operation(
                     profile,
-                    crate::peer::access_policy::PeerOperation::CredentialsManage,
+                    crate::access::access_policy::PeerOperation::CredentialsManage,
                 ),
                 "peer profile {profile} must not allow credentials.manage"
             );
@@ -3169,7 +3169,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::AccessInspect,
+                crate::access::access_policy::PeerOperation::AccessInspect,
             )
             .allowed
         );
@@ -3177,7 +3177,7 @@ mod tests {
             !evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::AccessManage,
+                crate::access::access_policy::PeerOperation::AccessManage,
             )
             .allowed
         );
@@ -3193,7 +3193,7 @@ mod tests {
 
     #[test]
     fn agent_session_grants_scope_supervised_mcp_sessions() {
-        use crate::peer::access_policy::PeerOperation;
+        use crate::access::access_policy::PeerOperation;
 
         let actor = AccessPrincipal::root_dashboard_session("test", "test");
         let mut state = LocalIamState::default();
@@ -3358,7 +3358,7 @@ mod tests {
 
     #[test]
     fn lapsed_agent_session_grants_bind_and_deny_instead_of_defaulting() {
-        use crate::peer::access_policy::PeerOperation;
+        use crate::access::access_policy::PeerOperation;
 
         let actor = AccessPrincipal::root_dashboard_session("test", "test");
         let mut state = LocalIamState::default();
@@ -3422,7 +3422,7 @@ mod tests {
 
     #[test]
     fn lapsed_local_process_grant_binds_and_denies() {
-        use crate::peer::access_policy::PeerOperation;
+        use crate::access::access_policy::PeerOperation;
 
         let actor = AccessPrincipal::root_dashboard_session("test", "test");
         let mut state = LocalIamState::default();
@@ -3460,7 +3460,7 @@ mod tests {
 
     #[test]
     fn local_process_grant_scopes_loopback_mcp() {
-        use crate::peer::access_policy::PeerOperation;
+        use crate::access::access_policy::PeerOperation;
 
         let actor = AccessPrincipal::root_dashboard_session("test", "test");
         let mut state = LocalIamState::default();
@@ -3496,7 +3496,7 @@ mod tests {
 
     #[test]
     fn mcp_default_principals_are_root_compatible_with_real_identity() {
-        use crate::peer::access_policy::PeerOperation;
+        use crate::access::access_policy::PeerOperation;
 
         let agent = AccessPrincipal::supervised_agent_session_default("kid-1", "http", true);
         assert_eq!(agent.kind, "root_session");
@@ -3545,7 +3545,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::AccessInspect,
+                crate::access::access_policy::PeerOperation::AccessInspect,
             )
             .allowed
         );
@@ -3553,7 +3553,7 @@ mod tests {
             !evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::AccessManage,
+                crate::access::access_policy::PeerOperation::AccessManage,
             )
             .allowed
         );
@@ -3582,7 +3582,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::TerminalWrite,
+                crate::access::access_policy::PeerOperation::TerminalWrite,
             )
             .allowed
         );
@@ -3594,7 +3594,7 @@ mod tests {
         let decision = evaluate_principal_operation_with_state(
             &state,
             &principal,
-            crate::peer::access_policy::PeerOperation::TerminalWrite,
+            crate::access::access_policy::PeerOperation::TerminalWrite,
         );
         assert!(!decision.allowed);
         assert!(decision.reason.contains("expired"), "{}", decision.reason);
@@ -3644,14 +3644,14 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::ShellSpawn,
+                crate::access::access_policy::PeerOperation::ShellSpawn,
             )
             .allowed
         );
         let denied = evaluate_principal_operation_with_state(
             &state,
             &principal,
-            crate::peer::access_policy::PeerOperation::AccessManage,
+            crate::access::access_policy::PeerOperation::AccessManage,
         );
         assert!(!denied.allowed);
         assert!(denied.reason.contains("role ceiling"));
@@ -3662,7 +3662,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::AccessManage,
+                crate::access::access_policy::PeerOperation::AccessManage,
             )
             .allowed
         );
@@ -3705,7 +3705,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &anchor,
-                crate::peer::access_policy::PeerOperation::AccessManage,
+                crate::access::access_policy::PeerOperation::AccessManage,
             )
             .allowed
         );
@@ -3716,7 +3716,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &hosted,
-                crate::peer::access_policy::PeerOperation::ShellSpawn,
+                crate::access::access_policy::PeerOperation::ShellSpawn,
             )
             .allowed
         );
@@ -3724,7 +3724,7 @@ mod tests {
             !evaluate_principal_operation_with_state(
                 &state,
                 &hosted,
-                crate::peer::access_policy::PeerOperation::AccessManage,
+                crate::access::access_policy::PeerOperation::AccessManage,
             )
             .allowed
         );
@@ -3764,7 +3764,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::TerminalWrite,
+                crate::access::access_policy::PeerOperation::TerminalWrite,
             )
             .allowed
         );
@@ -3772,7 +3772,7 @@ mod tests {
             !evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::ShellSpawn,
+                crate::access::access_policy::PeerOperation::ShellSpawn,
             )
             .allowed
         );
@@ -3780,7 +3780,7 @@ mod tests {
             !evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::Settings,
+                crate::access::access_policy::PeerOperation::Settings,
             )
             .allowed
         );
@@ -3816,7 +3816,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::AccessInspect,
+                crate::access::access_policy::PeerOperation::AccessInspect,
             )
             .allowed
         );
@@ -3872,7 +3872,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::SessionInspect,
+                crate::access::access_policy::PeerOperation::SessionInspect,
             )
             .allowed
         );
@@ -3901,7 +3901,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::TerminalView,
+                crate::access::access_policy::PeerOperation::TerminalView,
             )
             .allowed
         );
@@ -3909,7 +3909,7 @@ mod tests {
             evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::TerminalWrite,
+                crate::access::access_policy::PeerOperation::TerminalWrite,
             )
             .allowed
         );
@@ -3919,7 +3919,7 @@ mod tests {
             !evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::ShellSpawn,
+                crate::access::access_policy::PeerOperation::ShellSpawn,
             )
             .allowed
         );
@@ -3927,7 +3927,7 @@ mod tests {
             !evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                crate::access::access_policy::PeerOperation::FilesystemWrite,
             )
             .allowed
         );
@@ -4113,7 +4113,7 @@ mod tests {
     #[test]
     fn root_principal_allows_every_current_operation() {
         let principal = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
-        for op in crate::peer::access_policy::ALL_OPERATIONS {
+        for op in crate::access::access_policy::ALL_OPERATIONS {
             assert!(
                 evaluate_principal_operation(&principal, op).allowed,
                 "{op:?} should be allowed for root principal"
@@ -4129,14 +4129,14 @@ mod tests {
         assert!(
             evaluate_principal_operation(
                 &principal,
-                crate::peer::access_policy::PeerOperation::DisplayView,
+                crate::access::access_policy::PeerOperation::DisplayView,
             )
             .allowed
         );
         assert!(
             !evaluate_principal_operation(
                 &principal,
-                crate::peer::access_policy::PeerOperation::AccessManage,
+                crate::access::access_policy::PeerOperation::AccessManage,
             )
             .allowed
         );

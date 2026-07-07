@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::PathBuf;
 
-const DEFAULT_PORT: u16 = 8765;
+use intendant_core::net::DEFAULT_GATEWAY_PORT as DEFAULT_PORT;
 
 #[derive(Debug, Clone)]
 struct Config {

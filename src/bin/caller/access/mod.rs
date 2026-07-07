@@ -11,6 +11,7 @@
 
 use std::{fmt, net::IpAddr, path::PathBuf};
 
+pub mod access_policy;
 pub mod backend;
 // `certs` is pure-Rust (rcgen + p12-keystore) and compiles on every
 // platform, so it stays ungated — `read_server_cert_fingerprint` backs the
@@ -25,6 +26,7 @@ pub mod client_key;
 pub mod enrollment;
 pub mod iam;
 pub mod org;
+pub mod pinning;
 pub mod state;
 #[cfg(not(target_os = "windows"))]
 pub mod wizard;
@@ -227,7 +229,7 @@ impl Default for AccessArgs {
     fn default() -> Self {
         Self {
             action: AccessAction::Help,
-            https_port: crate::web_gateway::DEFAULT_PORT,
+            https_port: intendant_core::net::DEFAULT_GATEWAY_PORT,
             cert_port: 9999,
             ips: Vec::new(),
             hosts: Vec::new(),
