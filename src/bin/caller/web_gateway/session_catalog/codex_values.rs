@@ -74,6 +74,113 @@ pub(crate) fn message_content_text(content: &serde_json::Value) -> Option<String
     }
 }
 
+/// Prose-only variant of [`message_content_text`] for row previews: string
+/// content passes through, but array content contributes only explicit
+/// `type == "text"` blocks — tool_use/tool_result blocks (whose `content`
+/// can be a plain string) must never leak into a conversation preview.
+pub(crate) fn message_prose_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => {
+            let parts: Vec<&str> = items
+                .iter()
+                .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("text"))
+                .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Compact conversation preview carried on session list rows: the first
+/// couple of user and assistant MESSAGES, prose only — callers feed only
+/// message-text events/records, so tool calls, tool results, and command
+/// output are excluded structurally rather than by content sniffing. It
+/// powers the Sessions-tab quick search without shipping transcripts;
+/// Deep Search keeps full-history duty.
+pub(crate) const SESSION_PREVIEW_ROLE_SLOTS: usize = 2;
+pub(crate) const SESSION_PREVIEW_TEXT_CHARS: usize = 160;
+/// Cap on the total preview TEXT bytes per row (JSON scaffolding rides on
+/// top). Keeps the unlimited list's growth bounded (~+2 MB at 4k rows).
+pub(crate) const SESSION_PREVIEW_MAX_BYTES: usize = 500;
+/// Version token folded into external row cache keys; bump it whenever the
+/// preview shape changes so persisted rows rebuild with the new field.
+/// (Intendant rows version through the fingerprint digest byte instead.)
+pub(crate) const SESSION_ROW_PREVIEW_FORMAT: &str = "p1";
+
+#[derive(Default)]
+pub(crate) struct SessionPreviewBuilder {
+    entries: Vec<(&'static str, String)>, // chronological (role, text)
+    user: usize,
+    assistant: usize,
+}
+
+impl SessionPreviewBuilder {
+    pub(crate) fn push_user(&mut self, text: &str) {
+        Self::push(&mut self.user, "user", text, &mut self.entries);
+    }
+
+    pub(crate) fn push_assistant(&mut self, text: &str) {
+        Self::push(&mut self.assistant, "assistant", text, &mut self.entries);
+    }
+
+    fn push(
+        slot: &mut usize,
+        role: &'static str,
+        text: &str,
+        entries: &mut Vec<(&'static str, String)>,
+    ) {
+        if *slot >= SESSION_PREVIEW_ROLE_SLOTS {
+            return;
+        }
+        let text = compact_text(text, SESSION_PREVIEW_TEXT_CHARS);
+        if text.is_empty() {
+            return;
+        }
+        *slot += 1;
+        entries.push((role, text));
+    }
+
+    /// Serializes to the row's `preview` value, enforcing the byte cap on
+    /// a char boundary; `None` when nothing prose-shaped was collected.
+    pub(crate) fn into_value(self) -> Option<serde_json::Value> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let mut used = 0usize;
+        let mut out = Vec::new();
+        for (role, text) in self.entries {
+            if used >= SESSION_PREVIEW_MAX_BYTES {
+                break;
+            }
+            let budget = SESSION_PREVIEW_MAX_BYTES - used;
+            let mut text = text;
+            if text.len() > budget {
+                let mut cut = budget;
+                while cut > 0 && !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text.truncate(cut);
+            }
+            if text.is_empty() {
+                break;
+            }
+            used += text.len();
+            out.push(serde_json::json!({ "role": role, "text": text }));
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Array(out))
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct ExternalJsonLineKind<'a> {
     #[serde(rename = "type", borrow)]

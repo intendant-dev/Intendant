@@ -1,6 +1,6 @@
 ---
 name: intendant-cli
-description: Use when an agent needs Intendant control beyond the small MCP bootstrap set. Prefer `intendant ctl` over broad MCP tools to keep model context small.
+description: Use to operate a running Intendant daemon from the CLI — sessions, approvals, displays and screenshots, computer-use input, browser workspaces, audio, and federated peers (message or delegate to another machine's agent, or drive its screen directly with --peer). Prefer `intendant ctl` over broad MCP tools to keep model context small.
 ---
 
 # Intendant CLI
@@ -15,6 +15,17 @@ Start with:
 "${INTENDANT:-intendant}" ctl --help
 "${INTENDANT:-intendant}" ctl status --json
 "${INTENDANT:-intendant}" ctl tools list
+```
+
+Quick recipes — the highest-traffic one-liners; everything else is one `--help` away:
+
+```bash
+"${INTENDANT:-intendant}" ctl display screenshot --output shot.png    # see a local display
+"${INTENDANT:-intendant}" ctl cu actions --actions '[{"type":"click","x":100,"y":200}]' --output after.png
+"${INTENDANT:-intendant}" ctl peer list                               # federated peers + their displays
+"${INTENDANT:-intendant}" ctl peer task <peer-id> "instructions"      # the peer's own agent executes
+"${INTENDANT:-intendant}" ctl --peer <id> display screenshot --output peer.png   # drive another machine
+"${INTENDANT:-intendant}" ctl --peer <id> cu actions --actions '[{"type":"click","x":100,"y":200}]'
 ```
 
 Useful groups:

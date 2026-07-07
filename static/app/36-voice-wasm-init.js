@@ -913,7 +913,7 @@ async function main() {
       setConnectEventStatus('ok', 'Dashboard events are live through verified Hosted Connect');
     } catch (err) {
       console.warn('[dashboard-control] Connect dashboard bootstrap failed', err);
-      dashboardSetControlLastError(err?.message || String(err));
+      dashboardSetControlLastError(err?.message || String(err), err?.controlErrorKind || '');
       dashboardUpdateTransportStatus();
       setConnectEventStatus('err', 'Hosted Connect dashboard events failed');
       scheduleDashboardConnectReconnect(err?.message || String(err), { delayMs: 1000 });

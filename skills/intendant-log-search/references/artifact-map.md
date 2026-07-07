@@ -301,7 +301,7 @@ Important rewind fields:
 
 If behavior changes, start with these files instead of rediscovering the whole repo:
 
-- `src/bin/caller/session_log.rs`: `SessionLog`, `LogEvent`, turn sidecars, summaries, replay conversion, file-span readers.
+- `src/bin/caller/session_log/`: `SessionLog`, `LogEvent`, turn sidecars, summaries (`mod.rs`), bus-event writers (`bus_events.rs`), replay conversion + file-span readers (`replay.rs`), history read-back (`history.rs`).
 - `src/bin/caller/event.rs`: `AppEvent` durability allow-list and `write_event_to_session_log()`.
 - `src/agent.rs`: sandboxed runtime log files, screenshot files, `askHuman` temp files, stdout/stderr tailing.
 - `src/bin/caller/main.rs`: controller session creation/resume, daemon log tee install, runtime env, frame/recording/file-watcher setup.

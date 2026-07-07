@@ -1984,6 +1984,15 @@ class BrowserHarness {
     this.cdp.on('event', (message) => this.recordPageEvent(message));
     await this.cdp.send('Page.enable', {}, this.sessionId);
     await this.cdp.send('Runtime.enable', {}, this.sessionId);
+    // KNOWN LIMIT: with the Network domain enabled, Chrome stops delivering
+    // a streaming response body to the page after ~4.5 MB (byte-identical
+    // stall, headless and headed; explicit maxTotal/maxResourceBufferSize
+    // do not lift it). The daemon and the page are fine — real browsers
+    // stream the same response to completion. Scenarios that need a large
+    // payload (e.g. the full sessions list, >5 MB at ~3.5k rows) must pull
+    // it via a non-streaming path instead: window.qa.sessionsActions
+    // .pullAll() on the Sessions tab. Diagnosed 2026-07-07 (task #19),
+    // full evidence trail in the session-catalog program notes.
     await this.cdp.send('Network.enable', {}, this.sessionId).catch(() => {});
     await this.cdp.send('Log.enable', {}, this.sessionId).catch(() => {});
   }

@@ -32,7 +32,7 @@ Two stacked canvases plus a deliberately tiny set of DOM elements:
   origin, one node per connected host orbiting it, agent nodes orbiting
   their host, approval-glow and token-budget rings, event sparks, a
   starfield, and a ground grid.
-- **HUD canvas** — the entire interactive UI, painted per-frame by `hud.rs`:
+- **HUD canvas** — the entire interactive UI, painted per-frame by `hud/` (stage, panels, focus, widgets):
   header band, command deck, the nine orbital "system" targets (activity /
   context / managed / controls / sessions / peers / changes / worktrees /
   view), scrollable per-domain panels, focus-detail panels (agent / host /
@@ -158,6 +158,14 @@ compact/fallback presentation (small viewports, the Canvas-2D fallback,
 accessibility). This is the "full immersive 3D experience" milestone: the
 scene is no longer a backdrop behind the UI — the scene *is* the UI,
 spatially.
+
+*In flight behind `?station_panes=on`*: the depth attachment, a
+billboarded depth-tested pane pipeline (`panes.rs`), and glyph-atlas text
+on those panes (`text_atlas.rs` — the HUD font baked to a mip-chained R8
+coverage texture, sampled by a textured pipeline) are live, proven by one
+card beside the selected node. Raycast picking and the promotion of real
+panels into the scene are next; the flag flips to opt-out when the pane
+presentation graduates.
 
 ### Phase D — XR spatial computing
 

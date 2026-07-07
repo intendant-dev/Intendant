@@ -562,8 +562,37 @@ function sendShellResize(cols, rows, options = {}) {
 }
 
 // ── Standalone Shell (lazy xterm.js) ──
-//
-// Loads the CDN-hosted xterm.js on first use. Sends
+
+// Build the xterm theme object from the ui-v2 design tokens. xterm paints
+// into canvas/inline-styled DOM, so CSS custom properties cannot cascade in —
+// they are resolved here once at init (the ui-v2 flag is fixed pre-paint for
+// the whole page load, and v2 keeps terminal surfaces dark in every app
+// theme). Returns null when the tokens are unavailable so the caller can
+// fall back to the v1 palette.
+function ui2ShellTheme() {
+  const styles = getComputedStyle(document.documentElement);
+  const token = name => styles.getPropertyValue(name).trim();
+  const codeBg = token('--code-bg');
+  if (!codeBg) return null;
+  const irisRgb = token('--iris-rgb') || '126, 140, 250';
+  return {
+    background: codeBg,
+    foreground: token('--text'),
+    cursor: token('--text'),
+    cursorAccent: codeBg,
+    selectionBackground: `rgba(${irisRgb}, 0.28)`,
+    black: token('--surface-3'), red: token('--rose'),
+    green: token('--green'), yellow: token('--amber'),
+    blue: token('--iris'), magenta: token('--violet'),
+    cyan: token('--sky'), white: token('--text-2'),
+    brightBlack: token('--text-3'), brightRed: token('--rose'),
+    brightGreen: token('--green'), brightYellow: token('--amber'),
+    brightBlue: token('--iris-2'), brightMagenta: token('--violet'),
+    brightCyan: token('--sky'), brightWhite: token('--text'),
+  };
+}
+
+// Loads the vendored xterm.js on first use. Sends
 // terminal_open / terminal_input / terminal_resize / terminal_close
 // messages to the server; handleShellOutput/handleShellExited receive
 // the reply events.
@@ -575,19 +604,28 @@ function initShell() {
   document.getElementById('xterm-css').removeAttribute('disabled');
 
   const start = () => {
+    // ui-v2 re-themes the same instance from design tokens (and turns on
+    // the design's blinking block cursor); v1 keeps Catppuccin Mocha
+    // verbatim. Sizing/fit logic is identical in both generations.
+    const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
+    const theme = (ui2 && ui2ShellTheme()) || {
+      background: '#1e1e2e', foreground: '#cdd6f4', cursor: '#f5e0dc', cursorAccent: '#1e1e2e',
+      selectionBackground: '#45475a',
+      black: '#45475a', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
+      blue: '#89b4fa', magenta: '#cba6f7', cyan: '#94e2d5', white: '#bac2de',
+      brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
+      brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#cba6f7',
+      brightCyan: '#94e2d5', brightWhite: '#a6adc8',
+    };
+    const ui2Mono = ui2
+      ? getComputedStyle(document.documentElement).getPropertyValue('--mono').trim()
+      : '';
     shellTerm = new Terminal({
-      theme: {
-        background: '#1e1e2e', foreground: '#cdd6f4', cursor: '#f5e0dc', cursorAccent: '#1e1e2e',
-        selectionBackground: '#45475a',
-        black: '#45475a', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
-        blue: '#89b4fa', magenta: '#cba6f7', cyan: '#94e2d5', white: '#bac2de',
-        brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
-        brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#cba6f7',
-        brightCyan: '#94e2d5', brightWhite: '#a6adc8',
-      },
-      fontFamily: "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
+      theme,
+      fontFamily: ui2Mono || "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
       fontSize: 13, allowProposedApi: true,
       scrollback: 5000,
+      cursorBlink: ui2,
     });
     shellFitAddon = new FitAddon.FitAddon();
     shellTerm.loadAddon(shellFitAddon);
@@ -779,6 +817,13 @@ function wireShellKeybar() {
   // rule forces the bar visible on touch devices regardless of this class.
   const toggle = document.getElementById('keybar-toggle');
   if (toggle) {
+    // ui-v2: the Terminal sub-tab strip is hidden (Shell is its only
+    // sub-tab) and the Keys toggle joins the shell toolbar, matching the
+    // design's toolbar placement. The element keeps its id and listeners;
+    // v1 keeps the strip untouched.
+    if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+      document.querySelector('#tab-terminal .shell-toolbar')?.appendChild(toggle);
+    }
     const isCoarse = window.matchMedia('(pointer: coarse)').matches;
     if (isCoarse) {
       toggle.classList.add('active');

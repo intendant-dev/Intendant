@@ -31,22 +31,15 @@ name: Keyless smokes
 # same reason: the regressions these catch (e.g. the usage-rail miss)
 # fire identically in debug, and --release only added build time.
 
+# Required-check triggers only — unfiltered on purpose: a paths-skipped
+# required check blocks queue entry (PRs) or wedges the group
+# (merge_group). See windows.yml for the full rationale. There is
+# deliberately NO push trigger (dropped 2026-07-07): the merge-group run
+# just built and ran these exact smokes on the identical tree, and the
+# constant PR + group flow keeps the runner's debug tree warm — the
+# push-side rerun burned ~7 minutes of dell capacity per landing for no
+# new signal.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "**/*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**/Cargo.toml"
-      - "tests/skills/session-vitals-smoke/**"
-      - "tests/skills/native-goal-smoke/**"
-      - "tests/skills/peer-sessions-smoke/**"
-      - ".github/workflows/smokes.yml"
-  # Required-check triggers — unfiltered on purpose: a paths-skipped
-  # required check blocks queue entry (PRs) or wedges the group
-  # (merge_group). See windows.yml for the full rationale; the push
-  # trigger keeps its paths for cache warming only.
   pull_request:
     branches: [main]
   merge_group:
@@ -66,6 +59,12 @@ jobs:
     # (`matrix.os` doubles as the hosted label) so external code never
     # executes on our hardware while its required checks still really run.
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
+    env:
+      # Match windows.yml's Linux leg so this job shares the runner's warm
+      # incremental tree with the test job instead of maintaining a second
+      # debuginfo-flavored artifact chain. The smokes probe protocol
+      # behavior, which debuginfo doesn't change.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     timeout-minutes: 90
     strategy:
       fail-fast: false

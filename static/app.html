@@ -7085,6 +7085,29 @@ body.context-focus-active {
   color: var(--overlay0);
   font-size: 12px;
 }
+/* Inline filter box atop the (capped) project menus. */
+.sessions-multi-filter-search {
+  position: sticky;
+  top: 0;
+  padding: 2px 2px 6px;
+  background: var(--mantle);
+}
+.sessions-multi-filter-search.hidden { display: none; }
+.sessions-multi-filter-search input {
+  width: 100%;
+  padding: 5px 7px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--base);
+  color: var(--text);
+  font-size: 12px;
+}
+.sessions-multi-filter-more {
+  padding: 6px 7px;
+  color: var(--overlay0);
+  font-size: 11px;
+  font-style: italic;
+}
 .sessions-toggle {
   display: flex;
   align-items: center;
@@ -7734,6 +7757,12 @@ body.context-focus-active {
   display: flex;
   justify-content: center;
   padding: 10px 0 4px;
+}
+/* Invisible IntersectionObserver target that auto-grows the sessions
+   render window as the user scrolls toward the bottom of the list. */
+.sessions-scroll-sentinel {
+  height: 1px;
+  pointer-events: none;
 }
 /* Long-tail stats inside the session-detail overlay. */
 .sd-meta-strip {
@@ -8421,6 +8450,33 @@ body.context-focus-active {
   letter-spacing: 0.04em;
 }
 .session-card .sc-search-hit-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Quick-search match inside the row's conversation preview. */
+.session-card .sc-preview-hit {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin: 3px 0 5px;
+  padding: 4px 7px;
+  border-left: 2px solid var(--mauve);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--mauve) 8%, transparent);
+  font-size: 12px;
+  color: var(--subtext0);
+}
+.session-card .sc-preview-hit-role {
+  flex: 0 0 auto;
+  color: var(--mauve);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.session-card .sc-preview-hit-text {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -12427,6 +12483,2348 @@ html.ui-v2 .ui2-vp-cam-slot #videoPreviewWrap {
 }
 html.ui-v2 .ui2-vp-cam-slot #videoPreviewEl { width: 100%; height: auto; display: block; }
 html.ui-v2 .ui2-vp-note { font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
+/* ── static/app/ui2-access.css ── */
+/* ── ui-v2 Access surface re-skin (design-overhaul P2) ─────────────────
+   Everything here is scoped under `html.ui-v2` and restyles the EXISTING
+   Access DOM (acc-* / access-* / daemon-pairing-* / connect-health-*
+   builders) to the v2 design language — v1 stays pixel-identical.
+   Recipes come from the design-system reference: tint formula (fill
+   8–16%, border ~26%, text full color), radius ladder, segmented-control
+   grammar (nav=neutral, choice=accent), eyebrow labels, mono mandate.
+
+   Vault + custody (#access-vault-section / #access-custody-section
+   internals) are deliberately untouched — a separate program task owns
+   them; only their pane-level section heads are restyled here. */
+
+/* ── page chrome: in-page header (injected under the flag) + subtabs ── */
+html.ui-v2 .ui2-acc-pagehead {
+  width: 100%;
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 26px 20px 0;
+  flex-shrink: 0;
+}
+html.ui-v2 .ui2-acc-title {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -.02em;
+  color: var(--text);
+}
+html.ui-v2 .ui2-acc-sub {
+  margin-top: 4px;
+  font-size: 14px;
+  color: var(--text-2);
+}
+
+html.ui-v2 #access-subtabs {
+  display: flex;
+  width: max-content;
+  max-width: calc(100% - 40px);
+  margin: 16px 0 2px max(20px, calc((100% - 1120px) / 2 + 20px));
+  padding: 3px;
+  gap: 3px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  border-radius: 11px;
+  flex-shrink: 0;
+}
+html.ui-v2 #access-subtabs .subtab-btn {
+  border: 0;
+  border-radius: 8px;
+  min-height: 0;
+  padding: 7px 13px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 700;
+  transition: background var(--t-fast), color var(--t-fast);
+  white-space: nowrap;
+}
+html.ui-v2 #access-subtabs .subtab-btn:hover { color: var(--text); }
+html.ui-v2 #access-subtabs .subtab-btn.active {
+  background: var(--surface-3);
+  color: var(--text);
+  border: 0;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, .2);
+}
+
+html.ui-v2 .access-pane-body { padding: 20px 20px 56px; }
+
+/* ── section heads → eyebrow labels ── */
+html.ui-v2 #tab-access .acc-section-head {
+  margin: 26px 0 12px;
+  gap: 4px 12px;
+}
+html.ui-v2 #tab-access .acc-section-head:first-child { margin-top: 6px; }
+html.ui-v2 #tab-access .acc-section-title {
+  flex: 1 1 100%;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-access .acc-section-sub {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-3);
+  max-width: 860px;
+}
+html.ui-v2 #tab-access .acc-section-actions { margin-left: auto; }
+
+/* ── buttons (acc-btn maps onto the v2 button recipes) ── */
+html.ui-v2 .acc-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 0;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--t-med), border-color var(--t-med), color var(--t-med), filter var(--t-med);
+}
+html.ui-v2 .acc-btn:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2 .acc-btn.primary {
+  padding: 8px 16px;
+  border: 0;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+}
+html.ui-v2 .acc-btn.primary:hover {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  filter: brightness(1.08);
+}
+html.ui-v2 .acc-btn.danger {
+  border: 1px solid rgba(var(--rose-rgb), .4);
+  background: transparent;
+  color: var(--rose);
+  font-weight: 700;
+}
+html.ui-v2 .acc-btn.danger:hover {
+  border-color: rgba(var(--rose-rgb), .55);
+  background: rgba(var(--rose-rgb), .1);
+}
+html.ui-v2 .acc-btn:disabled { opacity: .45; cursor: not-allowed; }
+/* selects that reuse the button recipe (expiry, enrollment role) */
+html.ui-v2 select.acc-btn { padding: 7px 10px; background: var(--surface-2); border-color: var(--line-2); }
+
+/* ── chips (routes/provenance) + role badges → pill recipes ── */
+html.ui-v2 .acc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+html.ui-v2 .acc-chip::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--neutral-dot);
+  border: 0;
+}
+html.ui-v2 .acc-chip.route-mtls {
+  background: rgba(var(--iris-rgb), .14);
+  border-color: rgba(var(--iris-rgb), .26);
+  color: var(--iris-2);
+}
+html.ui-v2 .acc-chip.route-mtls::before { background: var(--iris); }
+html.ui-v2 .acc-chip.route-connect {
+  background: rgba(var(--sky-rgb), .14);
+  border-color: rgba(var(--sky-rgb), .26);
+  color: var(--sky);
+}
+html.ui-v2 .acc-chip.route-connect::before { background: var(--sky); }
+html.ui-v2 .acc-chip.route-peer {
+  background: rgba(var(--violet-rgb), .14);
+  border-color: rgba(var(--violet-rgb), .26);
+  color: var(--violet);
+}
+html.ui-v2 .acc-chip.route-peer::before { background: var(--violet); }
+html.ui-v2 .acc-chip.route-webrtc {
+  background: rgba(var(--green-rgb), .12);
+  border-color: rgba(var(--green-rgb), .26);
+  color: var(--green);
+}
+html.ui-v2 .acc-chip.route-webrtc::before { background: var(--green); }
+html.ui-v2 .acc-chip.route-local { background: var(--surface-3); border-color: var(--line-2); color: var(--text-2); }
+html.ui-v2 .acc-chip.route-local::before { background: var(--neutral-dot); }
+html.ui-v2 .acc-chip.route-remembered {
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--line-2);
+  color: var(--text-3);
+}
+html.ui-v2 .acc-chip.route-remembered::before { background: transparent; border: 1px dashed var(--text-3); width: 5px; height: 5px; }
+html.ui-v2 .acc-chip.route-danger {
+  background: rgba(var(--rose-rgb), .14);
+  border-color: rgba(var(--rose-rgb), .32);
+  color: var(--rose);
+}
+html.ui-v2 .acc-chip.route-danger::before { background: var(--rose); }
+
+html.ui-v2 .acc-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+html.ui-v2 .acc-badge.role-root {
+  background: rgba(var(--iris-rgb), .14);
+  border-color: rgba(var(--iris-rgb), .26);
+  color: var(--iris-2);
+}
+html.ui-v2 .acc-badge.role-operator {
+  background: rgba(var(--sky-rgb), .14);
+  border-color: rgba(var(--sky-rgb), .26);
+  color: var(--sky);
+}
+html.ui-v2 .acc-badge.role-peer {
+  background: rgba(var(--violet-rgb), .14);
+  border-color: rgba(var(--violet-rgb), .26);
+  color: var(--violet);
+}
+html.ui-v2 .acc-badge.role-terminal,
+html.ui-v2 .acc-badge.role-files,
+html.ui-v2 .acc-badge.role-sessions,
+html.ui-v2 .acc-badge.role-observer,
+html.ui-v2 .acc-badge.role-scoped {
+  background: var(--surface-3);
+  border-color: var(--line-2);
+  color: var(--text-2);
+}
+html.ui-v2 .acc-badge.role-planned { border-style: dashed; background: transparent; color: var(--text-3); }
+
+/* ── attention banners (the design's amber approval-family recipe) ── */
+html.ui-v2 .acc-attention { gap: 10px; }
+html.ui-v2 .acc-attention:not(:empty) { margin-bottom: 18px; }
+html.ui-v2 .acc-attention-item {
+  padding: 13px 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(var(--amber-rgb), .32);
+  background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02));
+  box-shadow: none;
+  font-size: 13px;
+  align-items: center;
+}
+html.ui-v2 .acc-attention-item.err {
+  border-color: rgba(var(--rose-rgb), .32);
+  background: linear-gradient(180deg, rgba(var(--rose-rgb), .09), rgba(var(--rose-rgb), .02));
+}
+html.ui-v2 .acc-attention-item .acc-attention-icon {
+  width: 9px;
+  height: 9px;
+  min-width: 9px;
+  border-radius: 50%;
+  overflow: hidden;
+  font-size: 0;
+  color: transparent;
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .16);
+  animation: ui2-pulse 2s infinite;
+}
+html.ui-v2 .acc-attention-item.err .acc-attention-icon {
+  background: var(--rose);
+  box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .16);
+  color: transparent;
+}
+html.ui-v2 .acc-attention-item.warn .acc-attention-icon {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .16);
+  color: transparent;
+}
+html.ui-v2 .acc-attention-item.info .acc-attention-icon {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .16);
+  color: transparent;
+}
+html.ui-v2 .acc-attention-msg { color: var(--text); font-weight: 600; }
+html.ui-v2 .acc-attention-msg .acc-attention-detail {
+  color: var(--text-2);
+  font-weight: 400;
+  font-size: 12px;
+}
+html.ui-v2 .acc-attention-steps { color: var(--text-2); font-weight: 400; font-size: 12px; }
+html.ui-v2 .acc-attention-steps code { color: var(--iris-2); font-family: var(--mono); }
+html.ui-v2 .acc-attention-item .acc-btn {
+  border: 0;
+  border-radius: 8px;
+  padding: 7px 14px;
+  background: var(--amber);
+  color: var(--on-accent);
+  font-size: 12.5px;
+  font-weight: 800;
+}
+html.ui-v2 .acc-attention-item .acc-btn:hover { background: var(--amber); filter: brightness(1.08); }
+html.ui-v2 .acc-attention-item.err .acc-btn { background: var(--rose); }
+html.ui-v2 .acc-attention-item.err .acc-btn:hover { background: var(--rose); }
+
+/* ── identity hero cards ── */
+html.ui-v2 .acc-hero-grid {
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 14px;
+  margin-bottom: 22px;
+}
+html.ui-v2 #access-identity-hero { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); }
+html.ui-v2 .acc-hero-card {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: none;
+  padding: 18px 20px;
+  gap: 2px 14px;
+}
+html.ui-v2 #access-identity-hero .acc-hero-card:first-child {
+  background: linear-gradient(145deg, var(--surface-2), var(--surface));
+  border-color: var(--line-2);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, .28);
+}
+html.ui-v2 .acc-hero-glyph {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  border: 1px solid var(--line-2);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: .02em;
+}
+html.ui-v2 .acc-hero-glyph.kind-connect { color: var(--sky); }
+html.ui-v2 .acc-hero-glyph.kind-cert { color: var(--iris-2); }
+html.ui-v2 .acc-hero-glyph.kind-human { color: var(--green); }
+html.ui-v2 .acc-hero-glyph.kind-peer { color: var(--violet); }
+html.ui-v2 .acc-hero-glyph.kind-session { color: var(--sky); }
+html.ui-v2 .acc-hero-glyph.daemon { color: var(--sky); }
+html.ui-v2 .acc-hero-kicker {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  color: var(--text-3);
+  align-self: end;
+}
+html.ui-v2 .acc-hero-title {
+  font-size: 19px;
+  font-weight: 800;
+  letter-spacing: -.01em;
+}
+html.ui-v2 .acc-hero-chips { margin-top: 8px; }
+html.ui-v2 .acc-hero-lines { margin-top: 14px; gap: 6px; }
+html.ui-v2 .acc-hero-line { font-size: 13px; gap: 12px; }
+html.ui-v2 .acc-hero-line strong {
+  flex: 0 0 96px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  padding-top: 1px;
+}
+html.ui-v2 .acc-hero-line span { color: var(--text-2); }
+html.ui-v2 .acc-hero-line span.mono { font-family: var(--mono); font-size: 11.5px; color: var(--text-3); }
+html.ui-v2 .acc-hero-actions { margin-top: 14px; }
+
+/* stats become label/value rows (design "This daemon" card) */
+html.ui-v2 .acc-hero-stats {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0;
+  margin-top: 12px;
+}
+html.ui-v2 .acc-hero-stat {
+  display: flex;
+  flex-direction: row-reverse;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 9px 2px;
+  transition: none;
+}
+html.ui-v2 .acc-hero-stat + .acc-hero-stat { border-top: 1px solid var(--line); }
+html.ui-v2 .acc-hero-stat:hover { border-color: var(--line); }
+html.ui-v2 .acc-hero-stat:hover .l { color: var(--iris-2); }
+html.ui-v2 .acc-hero-stat .n { font-size: 20px; font-weight: 800; letter-spacing: -.01em; }
+html.ui-v2 .acc-hero-stat .l {
+  margin-top: 0;
+  font-size: 13px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-2);
+  transition: color var(--t-fast);
+}
+
+/* ── fleet strip ── */
+html.ui-v2 .acc-fleet-strip {
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 10px;
+  margin-bottom: 22px;
+}
+html.ui-v2 .acc-fleet-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 12px 14px;
+  gap: 6px;
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .acc-fleet-card:hover { border-color: var(--line-2); background: var(--surface-2); }
+html.ui-v2 .acc-fleet-dot { background: var(--neutral-dot); }
+html.ui-v2 .acc-fleet-card.ok .acc-fleet-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16);
+}
+html.ui-v2 .acc-fleet-card.checking .acc-fleet-dot { background: var(--amber); box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .14); }
+html.ui-v2 .acc-fleet-card.err .acc-fleet-dot { background: var(--rose); box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .14); }
+html.ui-v2 .acc-fleet-card.ghost { border-style: dashed; opacity: .8; }
+html.ui-v2 .acc-fleet-name { font-size: 13px; font-weight: 700; }
+html.ui-v2 .acc-fleet-self {
+  border: 0;
+  border-radius: 6px;
+  padding: 1px 7px;
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+html.ui-v2 .acc-fleet-meta .acc-chip,
+html.ui-v2 .acc-fleet-meta .acc-badge { padding: 2px 8px; font-size: 10px; }
+html.ui-v2 .acc-fleet-add {
+  border: 1px dashed var(--line-2);
+  border-radius: 12px;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 600;
+  transition: border-color var(--t-fast), color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .acc-fleet-add:hover { border-color: rgba(var(--iris-rgb), .4); color: var(--iris-2); background: rgba(var(--iris-rgb), .05); }
+
+/* ── "How access works" explainer: 3 numbered cards ── */
+html.ui-v2 .ui2-acc-explainer-head {
+  grid-column: 1 / -1;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  margin-bottom: -2px;
+}
+html.ui-v2 #tab-access .acc-explainer {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 10px 0 18px;
+  counter-reset: ui2-acc-step;
+}
+html.ui-v2 #tab-access .acc-explainer-arrow { display: none; }
+html.ui-v2 #tab-access .acc-explainer-step {
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--surface);
+  padding: 16px;
+  counter-increment: ui2-acc-step;
+}
+html.ui-v2 #tab-access .acc-explainer-step::before {
+  content: counter(ui2-acc-step);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: var(--surface-3);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+  margin-bottom: 12px;
+}
+html.ui-v2 #tab-access .acc-explainer-kicker { display: none; }
+html.ui-v2 #tab-access .acc-explainer-title { font-size: 14px; font-weight: 800; margin-bottom: 5px; }
+html.ui-v2 #tab-access .acc-explainer-text { font-size: 12px; line-height: 1.55; color: var(--text-2); }
+
+/* ── folds ── */
+html.ui-v2 #tab-access .acc-fold {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+html.ui-v2 #tab-access .acc-fold > summary {
+  padding: 12px 16px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-2);
+}
+html.ui-v2 #tab-access .acc-fold > summary::before { color: var(--text-3); }
+html.ui-v2 #tab-access .acc-fold > summary:hover { color: var(--text); }
+html.ui-v2 #tab-access .acc-fold-body { padding: 2px 16px 16px; }
+html.ui-v2 #tab-access .acc-fold-hint { font-size: 12px; color: var(--text-3); }
+html.ui-v2 #tab-access .acc-fold-hint code { font-family: var(--mono); color: var(--iris-2); }
+
+/* ── grant flow (inline form wearing the wizard's clothes) ── */
+html.ui-v2 .acc-grant-flow {
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--surface);
+  box-shadow: none;
+  padding: 20px;
+  margin-bottom: 18px;
+}
+html.ui-v2 .acc-grant-flow-title { font-size: 15px; font-weight: 800; }
+html.ui-v2 .acc-grant-flow-sub { font-size: 12px; color: var(--text-3); }
+html.ui-v2 .acc-grant-flow-mode {
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 10.5px;
+  letter-spacing: .05em;
+}
+html.ui-v2 .acc-step-label {
+  margin: 18px 0 10px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .08em;
+  color: var(--text-3);
+}
+html.ui-v2 .acc-step-label::after { background: var(--line); }
+html.ui-v2 .acc-choice-row { gap: 10px; }
+html.ui-v2 .acc-choice-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 13px 14px;
+  gap: 4px;
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .acc-choice-card:hover { border-color: var(--line-2); }
+/* selection tracks the real input state (:has), not only the .selected
+   class — the v1 kind-sync sweep strips the class from the Apply-to
+   checkbox cards (it looks for a kind radio inside every choice card),
+   a shared-code quirk this scoped pass must not touch. */
+html.ui-v2 .acc-choice-card.selected,
+html.ui-v2 .acc-choice-card:has(input:checked) {
+  border-color: var(--iris);
+  background: rgba(var(--iris-rgb), .09);
+}
+html.ui-v2 .acc-choice-card.selected::after,
+html.ui-v2 .acc-choice-card:has(input:checked)::after {
+  content: '✓';
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 17px;
+  height: 17px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--iris);
+  color: var(--on-accent);
+  font-size: 10px;
+  font-weight: 800;
+}
+html.ui-v2 .acc-choice-card .t { font-size: 13.5px; font-weight: 700; padding-right: 20px; }
+html.ui-v2 .acc-choice-card .d { font-size: 11.5px; color: var(--text-2); }
+html.ui-v2 .acc-choice-card:has(input:disabled) { opacity: .55; cursor: not-allowed; }
+html.ui-v2 .acc-detected {
+  border: 1px solid rgba(var(--green-rgb), .26);
+  border-radius: 10px;
+  background: rgba(var(--green-rgb), .08);
+  color: var(--green);
+  padding: 7px 12px;
+  font-size: 11.5px;
+}
+html.ui-v2 .acc-field-grid label {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  color: var(--text-3);
+}
+html.ui-v2 .acc-field-grid input,
+html.ui-v2 .acc-field-grid select {
+  min-height: 36px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+}
+html.ui-v2 .acc-field-grid input::placeholder { color: var(--text-3); }
+html.ui-v2 .acc-field-grid input:focus,
+html.ui-v2 .acc-field-grid select:focus {
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25);
+}
+html.ui-v2 .acc-role-picker { gap: 10px; }
+html.ui-v2 .acc-role-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 13px 14px;
+  gap: 5px;
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .acc-role-card:hover { border-color: var(--line-2); }
+html.ui-v2 .acc-role-card.selected,
+html.ui-v2 .acc-role-card:has(input:checked) {
+  border-color: var(--iris);
+  background: rgba(var(--iris-rgb), .09);
+}
+html.ui-v2 .acc-role-card.selected.warn,
+html.ui-v2 .acc-role-card.warn:has(input:checked) {
+  border-color: rgba(var(--amber-rgb), .6);
+  background: rgba(var(--amber-rgb), .08);
+}
+html.ui-v2 .acc-role-card .t { font-family: var(--mono); font-size: 13px; font-weight: 700; }
+html.ui-v2 .acc-role-card .d { font-size: 11.5px; color: var(--text-2); }
+html.ui-v2 .acc-role-card .p { font-size: 10.5px; font-family: var(--mono); color: var(--text-3); }
+html.ui-v2 .acc-grant-flow-msg { font-size: 12px; color: var(--text-3); }
+html.ui-v2 .acc-grant-fs-scope {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--bg-1);
+  padding: 10px 12px;
+}
+html.ui-v2 .acc-grant-fs-scope summary { font-size: 12.5px; font-weight: 600; color: var(--text-2); }
+html.ui-v2 .acc-grant-fs-roots textarea {
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--code-bg);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 8px 10px;
+}
+html.ui-v2 .acc-status-toggle {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+  padding: 3px;
+  gap: 3px;
+  overflow: visible;
+}
+html.ui-v2 .acc-status-toggle span {
+  border-radius: 7px;
+  padding: 6px 14px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-2);
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 .acc-status-toggle input:checked + span {
+  background: linear-gradient(180deg, rgba(var(--iris-rgb), .24), rgba(var(--iris-rgb), .1));
+  color: var(--iris-2);
+  box-shadow: inset 0 0 0 1px rgba(var(--iris-rgb), .3);
+}
+
+/* ── principal cards + grant rows (People & Devices) ── */
+html.ui-v2 .acc-principal-card {
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--surface);
+  padding: 14px 16px;
+}
+html.ui-v2 #access-enrollment-requests .acc-principal-card {
+  border-color: rgba(var(--amber-rgb), .3);
+}
+html.ui-v2 .acc-principal-glyph {
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  border: 1px solid var(--line-2);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 800;
+}
+html.ui-v2 .acc-principal-glyph.kind-connect { color: var(--sky); }
+html.ui-v2 .acc-principal-glyph.kind-cert { color: var(--iris-2); }
+html.ui-v2 .acc-principal-glyph.kind-human { color: var(--green); }
+html.ui-v2 .acc-principal-glyph.kind-peer { color: var(--violet); }
+html.ui-v2 .acc-principal-glyph.kind-session { color: var(--sky); }
+html.ui-v2 .acc-principal-name { font-size: 14.5px; font-weight: 700; }
+html.ui-v2 .acc-principal-kind { font-size: 11px; color: var(--text-3); }
+/* lifecycle pill hugs the right edge, like the design's principal rows */
+html.ui-v2 .acc-principal-head > .access-model-status { margin-left: auto; }
+html.ui-v2 .acc-principal-authn {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 .acc-grant-row {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--bg-1);
+  padding: 10px 13px;
+  font-size: 12px;
+}
+html.ui-v2 .acc-grant-row .t { color: var(--text-2); }
+html.ui-v2 .acc-grant-row .why { color: var(--text-3); font-size: 11px; }
+html.ui-v2 .acc-grant-row-actions .acc-btn {
+  min-height: 0;
+  padding: 5px 11px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+/* ── connect card extras ── */
+html.ui-v2 .acc-connect-warn {
+  border: 1px solid rgba(var(--rose-rgb), .32);
+  border-radius: 11px;
+  background: rgba(var(--rose-rgb), .07);
+  color: var(--text-2);
+  padding: 10px 13px;
+  font-size: 12px;
+  line-height: 1.55;
+  margin-top: 10px;
+}
+html.ui-v2 .acc-connect-phrase {
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--code-bg);
+  padding: 16px;
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+}
+html.ui-v2 .acc-connect-word {
+  font-family: var(--mono);
+  font-size: 14px;
+  letter-spacing: .02em;
+  line-height: 1.6;
+  color: var(--iris-2);
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+/* ── daemons pane: target rows ── */
+html.ui-v2 .access-target-surface { gap: 10px; }
+html.ui-v2 .access-target-row {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--neutral-dot);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: none;
+  padding: 13px 16px;
+}
+html.ui-v2 .access-target-row.ok { border-left-color: var(--green); }
+html.ui-v2 .access-target-row.warn,
+html.ui-v2 .access-target-row.checking { border-left-color: var(--amber); }
+html.ui-v2 .access-target-row.err { border-left-color: var(--rose); }
+html.ui-v2 .access-target-dot { box-shadow: 0 0 0 3px color-mix(in srgb, var(--access-target-accent) 16%, transparent); }
+html.ui-v2 .access-target-row.ok .access-target-dot { background: var(--green); box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16); }
+html.ui-v2 .access-target-row.warn .access-target-dot,
+html.ui-v2 .access-target-row.checking .access-target-dot { background: var(--amber); box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .16); }
+html.ui-v2 .access-target-row.err .access-target-dot { background: var(--rose); box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .16); }
+html.ui-v2 .access-target-title { font-size: 15px; font-weight: 800; }
+html.ui-v2 .access-target-badge {
+  border: 0;
+  border-radius: 6px;
+  padding: 2px 7px;
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 400;
+}
+html.ui-v2 .access-target-subtitle { font-family: var(--mono); font-size: 11px; color: var(--text-3); }
+html.ui-v2 .access-target-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .07em;
+  color: var(--text-3);
+}
+html.ui-v2 .access-target-value { font-size: 12.5px; }
+html.ui-v2 .access-target-detail { font-size: 11.5px; color: var(--text-3); }
+html.ui-v2 .access-target-chips .target-chip {
+  border: 0;
+  border-radius: 6px;
+  padding: 2px 8px;
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 400;
+}
+html.ui-v2 .access-target-chips .target-chip::before { display: none; }
+html.ui-v2 .access-target-chips .target-chip.off { opacity: .5; }
+html.ui-v2 .access-target-actions button {
+  min-height: 0;
+  padding: 7px 13px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 600;
+  transition: background var(--t-fast), border-color var(--t-fast), filter var(--t-fast);
+}
+html.ui-v2 .access-target-actions button:hover { background: var(--surface-3); border-color: var(--line-2); }
+html.ui-v2 .access-target-actions button.primary {
+  border: 0;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+}
+html.ui-v2 .access-target-actions button.primary:hover { filter: brightness(1.08); background: linear-gradient(180deg, var(--iris), var(--iris-deep)); }
+html.ui-v2 .access-target-actions button.danger {
+  border-color: rgba(var(--rose-rgb), .4);
+  background: transparent;
+  color: var(--rose);
+  font-weight: 700;
+}
+html.ui-v2 .access-target-actions button.danger:hover { background: rgba(var(--rose-rgb), .1); border-color: rgba(var(--rose-rgb), .55); }
+
+/* ── peers pane: pairing panels ── */
+html.ui-v2 .daemon-pairing-grid { gap: 14px; }
+html.ui-v2 #tab-access .daemon-pairing-panel {
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--surface);
+  padding: 18px;
+}
+html.ui-v2 #tab-access .daemon-pairing-title {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--text);
+}
+html.ui-v2 .daemon-pairing-mode-tabs {
+  display: inline-flex;
+  width: max-content;
+  max-width: 100%;
+  padding: 3px;
+  gap: 3px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-2);
+}
+html.ui-v2 .daemon-pairing-mode-tabs button {
+  flex: 0 0 auto;
+  min-height: 0;
+  border: 0;
+  border-radius: 8px;
+  padding: 7px 13px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 700;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 .daemon-pairing-mode-tabs button:hover { color: var(--text); }
+html.ui-v2 .daemon-pairing-mode-tabs button.active {
+  background: var(--surface-3);
+  color: var(--text);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, .2);
+}
+html.ui-v2 .daemon-pairing-row input,
+html.ui-v2 .daemon-pairing-row select,
+html.ui-v2 .daemon-add-row input {
+  min-height: 36px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13px;
+}
+html.ui-v2 .daemon-pairing-row input::placeholder,
+html.ui-v2 .daemon-add-row input::placeholder,
+html.ui-v2 .daemon-pairing-textarea::placeholder { color: var(--text-3); }
+html.ui-v2 .daemon-pairing-row input:focus,
+html.ui-v2 .daemon-pairing-row select:focus,
+html.ui-v2 .daemon-add-row input:focus,
+html.ui-v2 .daemon-pairing-textarea:focus {
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25);
+}
+html.ui-v2 .daemon-pairing-textarea {
+  border: 1px solid var(--line-2);
+  border-radius: 11px;
+  background: var(--code-bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.7;
+  padding: 10px 12px;
+}
+html.ui-v2 .daemon-pairing-row button,
+html.ui-v2 .daemon-pairing-actions button,
+html.ui-v2 .daemon-add-row button {
+  min-height: 36px;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 600;
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .daemon-pairing-row button:hover,
+html.ui-v2 .daemon-pairing-actions button:hover,
+html.ui-v2 .daemon-add-row button:hover { background: var(--surface-2); border-color: var(--line-2); }
+html.ui-v2 .daemon-pairing-status { font-size: 11.5px; color: var(--text-3); }
+html.ui-v2 .daemon-pairing-status.error { color: var(--rose); }
+html.ui-v2 .daemon-pairing-status.ok { color: var(--green); }
+html.ui-v2 .daemons-status { font-size: 11.5px; color: var(--text-3); }
+html.ui-v2 .daemons-status.error { color: var(--rose); }
+html.ui-v2 .daemons-status.ok { color: var(--green); }
+/* invite-secret caution note (amber) vs the pairing verification code
+   (#daemon-request-code), which wears the design's claim-phrase block */
+html.ui-v2 .daemon-pairing-secret {
+  border: 1px solid rgba(var(--amber-rgb), .26);
+  border-radius: 10px;
+  background: rgba(var(--amber-rgb), .08);
+  padding: 8px 12px;
+  font-size: 11.5px;
+  color: var(--amber);
+}
+html.ui-v2 .daemon-pairing-secret:empty { display: none; }
+html.ui-v2 #daemon-request-code {
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--code-bg);
+  padding: 12px 16px;
+  font-family: var(--mono);
+  font-size: 14px;
+  letter-spacing: .06em;
+  line-height: 1.9;
+  color: var(--iris-2);
+}
+html.ui-v2 .daemon-add-persist { font-size: 12.5px; color: var(--text-2); }
+
+/* inbound request + identity cards */
+html.ui-v2 .daemon-access-request-card,
+html.ui-v2 .daemon-identity-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg-1);
+  padding: 12px 14px;
+}
+html.ui-v2 .daemon-access-request-card + .daemon-access-request-card,
+html.ui-v2 .daemon-identity-card + .daemon-identity-card { margin-top: 8px; }
+html.ui-v2 .daemon-access-request-head,
+html.ui-v2 .daemon-identity-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+html.ui-v2 .daemon-access-request-code {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: .06em;
+  color: var(--iris-2);
+  background: var(--code-bg);
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  padding: 3px 10px;
+}
+html.ui-v2 .daemon-access-request-meta { font-size: 11.5px; color: var(--text-3); }
+html.ui-v2 .daemon-identity-status {
+  padding: 2px 9px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: lowercase;
+}
+html.ui-v2 .daemon-identity-status.approved {
+  background: rgba(var(--green-rgb), .12);
+  border: 1px solid rgba(var(--green-rgb), .26);
+  color: var(--green);
+}
+html.ui-v2 .daemon-identity-status.revoked {
+  background: rgba(var(--rose-rgb), .14);
+  border: 1px solid rgba(var(--rose-rgb), .26);
+  color: var(--rose);
+}
+html.ui-v2 .daemon-identity-role { font-size: 12px; color: var(--text-2); }
+html.ui-v2 .daemon-identity-profile { font-size: 11.5px; color: var(--text-3); }
+html.ui-v2 .daemon-identity-fingerprint {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .daemon-access-request-actions button,
+html.ui-v2 .daemon-identity-actions button {
+  min-height: 0;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  transition: background var(--t-fast), border-color var(--t-fast), filter var(--t-fast);
+}
+html.ui-v2 .daemon-access-request-actions button.approve {
+  border: 0;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+}
+html.ui-v2 .daemon-access-request-actions button.approve:hover { filter: brightness(1.08); }
+html.ui-v2 .daemon-access-request-actions button.deny,
+html.ui-v2 .daemon-identity-actions button[data-peer-identity-revoke] {
+  border-color: rgba(var(--rose-rgb), .4);
+  background: transparent;
+  color: var(--rose);
+  font-weight: 700;
+}
+html.ui-v2 .daemon-access-request-actions button.deny:hover,
+html.ui-v2 .daemon-identity-actions button[data-peer-identity-revoke]:hover {
+  background: rgba(var(--rose-rgb), .1);
+}
+html.ui-v2 .daemon-access-request-actions button:disabled,
+html.ui-v2 .daemon-identity-actions button:disabled { opacity: .45; }
+
+/* capability routing fold internals */
+html.ui-v2 .coord-section-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-access .coord-row input,
+html.ui-v2 #tab-access .coord-textarea {
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  padding: 8px 12px;
+}
+html.ui-v2 #tab-access .coord-textarea { font-family: var(--mono); font-size: 12px; background: var(--code-bg); }
+html.ui-v2 #tab-access .coord-row button {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 8px 14px;
+}
+html.ui-v2 #tab-access .coord-row button:hover { background: var(--surface-2); border-color: var(--line-2); }
+html.ui-v2 #tab-access .coord-result { font-family: var(--mono); font-size: 11.5px; color: var(--text-2); }
+
+/* ── diagnostics pane ── */
+html.ui-v2 #tab-access .access-overview-grid {
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+html.ui-v2 #tab-access .access-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 13px 16px;
+}
+html.ui-v2 #tab-access .access-card-title { font-size: 14px; font-weight: 700; }
+html.ui-v2 #tab-access .access-card-kind {
+  padding: 2px 9px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+html.ui-v2 #tab-access .access-card-detail { font-size: 12px; color: var(--text-3); }
+html.ui-v2 #tab-access .access-card-actions button {
+  min-height: 0;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+}
+html.ui-v2 #tab-access .access-card-actions button:hover { background: var(--surface-3); border-color: var(--line-2); }
+html.ui-v2 #tab-access .access-card-actions button.primary {
+  border: 0;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 800;
+}
+html.ui-v2 #tab-access .access-card-actions button.danger { border-color: rgba(var(--rose-rgb), .4); color: var(--rose); background: transparent; }
+
+html.ui-v2 #tab-access .settings-group {
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--surface);
+  padding: 18px;
+}
+html.ui-v2 #tab-access .settings-group legend {
+  padding: 0 8px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 .connect-health-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-weight: 700;
+}
+html.ui-v2 .connect-health-badge::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--neutral-dot);
+}
+html.ui-v2 .connect-health-badge.ok {
+  border-color: rgba(var(--green-rgb), .26);
+  background: rgba(var(--green-rgb), .12);
+  color: var(--green);
+}
+html.ui-v2 .connect-health-badge.ok::before { background: var(--green); }
+html.ui-v2 .connect-health-badge.warn {
+  border-color: rgba(var(--amber-rgb), .26);
+  background: rgba(var(--amber-rgb), .14);
+  color: var(--amber);
+}
+html.ui-v2 .connect-health-badge.warn::before { background: var(--amber); }
+html.ui-v2 .connect-health-badge.err {
+  border-color: rgba(var(--rose-rgb), .26);
+  background: rgba(var(--rose-rgb), .14);
+  color: var(--rose);
+}
+html.ui-v2 .connect-health-badge.err::before { background: var(--rose); }
+html.ui-v2 .connect-health-badge strong { color: inherit; }
+html.ui-v2 .connect-health-item {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--bg-1);
+  padding: 10px 12px;
+}
+html.ui-v2 .connect-health-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 .connect-health-value { font-size: 12.5px; color: var(--text); }
+html.ui-v2 .connect-health-item.ok .connect-health-value { color: var(--green); }
+html.ui-v2 .connect-health-item.warn .connect-health-value { color: var(--amber); }
+html.ui-v2 .connect-health-item.err .connect-health-value { color: var(--rose); }
+html.ui-v2 #connect-self-test-btn {
+  min-height: 0;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+html.ui-v2 #connect-self-test-btn:hover { background: var(--surface-3); border-color: var(--line-2); }
+html.ui-v2 .connect-self-test-results { font-size: 12px; }
+html.ui-v2 .connect-self-test-row { border-color: var(--line); }
+html.ui-v2 .connect-self-test-name { color: var(--text-2); }
+html.ui-v2 .connect-self-test-detail { font-family: var(--mono); font-size: 10.5px; color: var(--text-3); }
+
+/* ── advanced pane: role catalog, matrix, audit cards, model tables ── */
+html.ui-v2 .acc-role-catalog { gap: 10px; }
+html.ui-v2 .acc-role-info {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 13px 14px;
+}
+html.ui-v2 .acc-role-info .d { font-size: 11.5px; color: var(--text-2); }
+html.ui-v2 .acc-role-info .perms { font-family: var(--mono); font-size: 10px; color: var(--text-3); }
+
+html.ui-v2 #tab-access .access-matrix {
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--surface);
+}
+html.ui-v2 #tab-access .access-matrix-table th {
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: .05em;
+}
+html.ui-v2 #tab-access .access-matrix-table td {
+  border-bottom: 1px solid var(--line);
+  color: var(--text-3);
+  font-size: 11px;
+}
+html.ui-v2 #tab-access .access-matrix-policy {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+html.ui-v2 #tab-access .access-matrix-cell {
+  min-width: 44px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 10.5px;
+  font-weight: 800;
+}
+html.ui-v2 #tab-access .access-matrix-cell.yes { background: rgba(var(--green-rgb), .12); color: var(--green); }
+html.ui-v2 #tab-access .access-matrix-cell.no { background: rgba(var(--rose-rgb), .1); color: var(--rose); }
+html.ui-v2 #tab-access .access-matrix-cell.conditional,
+html.ui-v2 #tab-access .access-matrix-cell.planned { background: rgba(var(--amber-rgb), .12); color: var(--amber); }
+
+/* the detail mounts keep v1's single-column outer grid: the renderer
+   nests its own .access-admin-grid.two card grid inside, and the matrix
+   mount's lone table child needs the full row width to scroll in */
+html.ui-v2 #tab-access .access-admin-grid.two { gap: 12px; }
+html.ui-v2 #tab-access .access-detail-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+html.ui-v2 #tab-access .access-detail-head { border-bottom: 1px solid var(--line); padding: 11px 14px; }
+html.ui-v2 #tab-access .access-detail-title { font-size: 13px; font-weight: 800; }
+html.ui-v2 #tab-access .access-detail-body { padding: 12px 14px; }
+html.ui-v2 #tab-access .access-detail-line { font-size: 11.5px; color: var(--text-2); }
+html.ui-v2 #tab-access .access-detail-line strong {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-access .access-detail-actions { padding: 0 14px 14px; }
+
+html.ui-v2 #tab-access .access-model-section {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+html.ui-v2 #tab-access .access-model-section-head { border-bottom: 1px solid var(--line); padding: 11px 14px; }
+html.ui-v2 #tab-access .access-model-section-title { font-size: 13px; font-weight: 800; }
+html.ui-v2 #tab-access .access-model-section-count {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-access .access-model-row { padding: 10px 14px; }
+html.ui-v2 #tab-access .access-model-row + .access-model-row { border-top: 1px solid var(--line); }
+html.ui-v2 #tab-access .access-model-main { font-size: 12.5px; font-weight: 700; }
+html.ui-v2 #tab-access .access-model-meta { font-size: 11.5px; color: var(--text-2); }
+html.ui-v2 #tab-access .access-model-detail { font-family: var(--mono); font-size: 10.5px; color: var(--text-3); }
+
+/* status pills (shared by model rows, principal heads, role catalog) */
+html.ui-v2 #tab-access .access-model-status {
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  text-transform: lowercase;
+  padding: 2px 9px;
+}
+html.ui-v2 #tab-access .access-model-status.active,
+html.ui-v2 #tab-access .access-model-status.connected,
+html.ui-v2 #tab-access .access-model-status.enforced,
+html.ui-v2 #tab-access .access-model-status.current {
+  border-color: rgba(var(--green-rgb), .26);
+  background: rgba(var(--green-rgb), .12);
+  color: var(--green);
+}
+html.ui-v2 #tab-access .access-model-status.offline,
+html.ui-v2 #tab-access .access-model-status.planned,
+html.ui-v2 #tab-access .access-model-status.expired,
+html.ui-v2 #tab-access .access-model-status.draft {
+  border-color: rgba(var(--amber-rgb), .26);
+  background: rgba(var(--amber-rgb), .14);
+  color: var(--amber);
+}
+html.ui-v2 #tab-access .access-model-status.revoked,
+html.ui-v2 #tab-access .access-model-status.disabled,
+html.ui-v2 #tab-access .access-model-status.failed {
+  border-color: rgba(var(--rose-rgb), .26);
+  background: rgba(var(--rose-rgb), .14);
+  color: var(--rose);
+}
+
+/* ── shared bits ── */
+html.ui-v2 #tab-access .access-empty {
+  font-size: 12.5px;
+  color: var(--text-3);
+  padding: 10px 0;
+}
+
+/* ── responsive ── */
+@media (max-width: 940px) {
+  html.ui-v2 #access-identity-hero { grid-template-columns: 1fr; }
+  html.ui-v2 #tab-access .acc-explainer { grid-template-columns: 1fr; }
+}
+/* ── static/app/ui2-terminal-files.css ── */
+/* ── ui-v2: Terminal + Files surfaces (design-overhaul P2) ─────────────
+   Re-skin of the existing Terminal (xterm PTY) and Files (IDE workbench +
+   Transfers) panes onto the v2 token system. Every rule except the two
+   v1 guards at the top is scoped under html.ui-v2; the DOM, element ids,
+   and QA bridges (window.intendantDashboardFilesIde/_debug*, status
+   element ids) are untouched — this file plus small ui2-gated JS in
+   44-shell-frames.js / 55-files-ide.js is the whole change.
+
+   The xterm and CodeMirror content areas keep the design rule that code
+   surfaces stay dark: xterm's palette is a JS theme object built from
+   these tokens at init (ui2ShellTheme in 44-shell-frames.js); CodeMirror
+   is pure CSS via the .cm-s-intendant overrides below. */
+
+/* v1 guards: elements that exist only for the v2 design (the ^C/^D/⏎ key
+   chips and the Ln/Col statusbar span) stay invisible — and layout-inert —
+   under the v1 UI. These are deliberately the only unscoped rules here. */
+.shell-key.ui2-key { display: none; }
+.files-ide-status-lncol { display: none; }
+
+/* ═══ TERMINAL ═══════════════════════════════════════════════════════ */
+
+/* Single sub-tab: the strip is hidden; the Keys toggle is reparented into
+   the shell toolbar by wireShellKeybar() under the flag. */
+html.ui-v2 #tab-terminal .subtabs { display: none; }
+
+html.ui-v2 #term-pane-shell { padding: 0 20px 14px; }
+
+html.ui-v2 #tab-terminal .shell-toolbar {
+  background: transparent;
+  border-bottom: 0;
+  padding: 13px 0 11px;
+  gap: 10px;
+}
+html.ui-v2 #tab-terminal .shell-toolbar label {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* Select skin shared by both surfaces: the design's "Target: atlas ▾"
+   dropdown-button, expressed on the existing native <select>. */
+html.ui-v2 #tab-terminal .shell-toolbar select,
+html.ui-v2 #tab-files select {
+  appearance: none;
+  -webkit-appearance: none;
+  min-height: 32px;
+  padding: 6px 30px 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background-color: var(--surface);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23A7AEBE' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 14px;
+  color: var(--text);
+  font: 700 12.5px var(--sans);
+  transition: background-color var(--t-med), border-color var(--t-med);
+}
+html.ui-v2 #tab-terminal .shell-toolbar select:hover,
+html.ui-v2 #tab-files select:hover {
+  background-color: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2 #tab-files select:focus {
+  border-color: var(--files-accent);
+}
+
+html.ui-v2 .shell-host-status {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+html.ui-v2 .shell-host-status.error { color: var(--rose); }
+html.ui-v2 .shell-host-status.warn { color: var(--amber); }
+html.ui-v2 .shell-host-status.ok { color: var(--green); }
+
+html.ui-v2 .shell-share-btn {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--surface);
+  color: var(--text-2);
+  font: 600 12px var(--sans);
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 .shell-share-btn:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+  color: var(--text);
+}
+html.ui-v2 .shell-share-btn.is-shared {
+  background: rgba(var(--green-rgb), .12);
+  border-color: rgba(var(--green-rgb), .26);
+  color: var(--green);
+}
+
+html.ui-v2 #tab-terminal .shell-toolbar .target-summary {
+  border-left: 1px solid var(--line);
+}
+
+/* The stage: --code-bg mono surface with the design's terminal elevation.
+   The inner padding lives on .xterm so the FitAddon subtracts it when
+   computing cols/rows (parent padding would skew the fit math). */
+html.ui-v2 .terminal-container {
+  border: 1px solid var(--line-2);
+  border-radius: 14px;
+  background: var(--code-bg);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03), 0 20px 50px rgba(0, 0, 0, .4);
+  overflow: hidden;
+}
+html.ui-v2 #shell-container .xterm { padding: 12px 14px; }
+
+/* Key bar: design chips — mono 11.5/600, radius 8, line border on surface. */
+html.ui-v2 .shell-keybar {
+  background: transparent;
+  border-top: 0;
+  padding: 11px 2px 1px;
+  gap: 8px;
+}
+html.ui-v2 .shell-key {
+  min-width: 38px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-2);
+  font: 600 11.5px var(--mono);
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .shell-key:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 .shell-key:active { background: var(--surface-3); color: var(--text); }
+html.ui-v2 .shell-key.sticky.armed {
+  background: linear-gradient(180deg, rgba(var(--iris-rgb), .24), rgba(var(--iris-rgb), .1));
+  border-color: transparent;
+  box-shadow: inset 0 0 0 1px rgba(var(--iris-rgb), .3);
+  color: var(--iris-2);
+}
+html.ui-v2 .shell-key.ui2-key { display: inline-block; }
+
+html.ui-v2 .keybar-toggle {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: transparent;
+  color: var(--text-2);
+  font: 600 12px var(--sans);
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .keybar-toggle:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 .keybar-toggle.active {
+  background: rgba(var(--iris-rgb), .12);
+  border-color: rgba(var(--iris-rgb), .3);
+  color: var(--iris-2);
+}
+
+/* Target-summary (shared component) inside these surfaces: quieter, mono
+   detail line, design-tinted capability chips. */
+html.ui-v2 #tab-terminal .target-summary-detail,
+html.ui-v2 #tab-files .target-summary-detail {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-terminal .target-summary-kind,
+html.ui-v2 #tab-files .target-summary-kind {
+  font-family: var(--mono);
+  color: var(--text-3);
+}
+html.ui-v2 #tab-terminal .target-chip,
+html.ui-v2 #tab-files .target-chip {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0;
+  border-color: var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+html.ui-v2 #tab-terminal .target-chip.ok,
+html.ui-v2 #tab-files .target-chip.ok {
+  background: rgba(var(--green-rgb), .12);
+  border-color: rgba(var(--green-rgb), .26);
+  color: var(--green);
+}
+html.ui-v2 #tab-terminal .target-chip.ready,
+html.ui-v2 #tab-files .target-chip.ready {
+  background: rgba(var(--sky-rgb), .12);
+  border-color: rgba(var(--sky-rgb), .26);
+  color: var(--sky);
+}
+html.ui-v2 #tab-terminal .target-chip.warn,
+html.ui-v2 #tab-files .target-chip.warn {
+  background: rgba(var(--amber-rgb), .14);
+  border-color: rgba(var(--amber-rgb), .26);
+  color: var(--amber);
+}
+
+/* ═══ FILES ══════════════════════════════════════════════════════════ */
+
+/* Host accent under v2: sky = this daemon, violet = peer (the JS sets the
+   inline value on host switch; this is the pre-render default). */
+html.ui-v2 #tab-files { --files-accent: var(--sky); }
+
+/* Editor | Transfers as the design's neutral segmented control. */
+html.ui-v2 #tab-files .subtabs {
+  align-self: flex-start;
+  display: inline-flex;
+  gap: 3px;
+  margin: 12px 20px 0;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-2);
+}
+html.ui-v2 #tab-files .subtab-btn {
+  min-height: 0;
+  padding: 6px 13px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-2);
+  font: 700 12.5px var(--sans);
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #tab-files .subtab-btn:hover { color: var(--text); }
+html.ui-v2 #tab-files .subtab-btn.active {
+  background: var(--surface-3);
+  border-color: transparent;
+  color: var(--text);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, .2);
+}
+
+/* Buttons inside both surfaces: v2 secondary / primary / danger recipes
+   on the existing .ui-btn hooks. */
+html.ui-v2 #tab-terminal .ui-btn,
+html.ui-v2 #tab-files .ui-btn,
+html.ui-v2 #fs-picker-modal .modal-cancel,
+html.ui-v2 #fs-picker-modal .modal-confirm {
+  min-height: 30px;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: 600 12px var(--sans);
+  line-height: 1.2;
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #tab-terminal .ui-btn:hover,
+html.ui-v2 #tab-files .ui-btn:hover,
+html.ui-v2 #fs-picker-modal .modal-cancel:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2 #tab-files .ui-btn.primary,
+html.ui-v2 #fs-picker-modal .modal-confirm {
+  border: 0;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .25);
+}
+html.ui-v2 #tab-files .ui-btn.primary:hover,
+html.ui-v2 #fs-picker-modal .modal-confirm:hover {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  filter: brightness(1.08);
+}
+html.ui-v2 #tab-files .ui-btn.danger {
+  border-color: rgba(var(--rose-rgb), .4);
+  background: transparent;
+  color: var(--rose);
+  font-weight: 700;
+}
+html.ui-v2 #tab-files .ui-btn.danger:hover {
+  border-color: rgba(var(--rose-rgb), .4);
+  background: rgba(var(--rose-rgb), .1);
+}
+html.ui-v2 #tab-files .ui-btn:disabled { opacity: .45; }
+
+/* Text inputs across the Files surfaces: v2 input recipe, mono for paths. */
+html.ui-v2 #tab-files input[type="text"],
+html.ui-v2 #tab-files .files-ide-create-row input {
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  transition: border-color var(--t-fast);
+}
+html.ui-v2 #tab-files input[type="text"]:focus,
+html.ui-v2 #tab-files .files-ide-create-row input:focus {
+  border-color: var(--files-accent);
+}
+html.ui-v2 #tab-files input[type="text"]::placeholder { color: var(--text-3); }
+
+/* — Editor sub-tab — */
+
+html.ui-v2 .files-ide-toolbar {
+  min-height: 0;
+  padding: 11px 20px;
+  background: transparent;
+  border-bottom: 0;
+}
+html.ui-v2 .files-ide-toolbar label {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+html.ui-v2 .files-ide-body {
+  grid-template-columns: minmax(226px, 280px) minmax(0, 1fr);
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+}
+html.ui-v2 .files-ide-tree-pane {
+  background: var(--bg-1);
+  border-right: 1px solid var(--line);
+}
+html.ui-v2 .files-ide-tree-toolbar {
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 #tab-files .files-ide-tree-toolbar input {
+  padding: 5px 8px;
+  font-size: 11.5px;
+}
+html.ui-v2 #tab-files .files-ide-tree-toolbar .ui-btn {
+  min-height: 0;
+  padding: 4px 9px;
+  font-size: 11.5px;
+}
+html.ui-v2 #tab-files .files-ide-tree-toolbar .ui-btn[aria-pressed="true"] {
+  border-color: rgba(var(--iris-rgb), .3);
+  background: rgba(var(--iris-rgb), .12);
+  color: var(--iris-2);
+}
+
+/* Tree rows: design file-tree items — mono 12.5, radius 7, accent-tinted
+   active row with the inset bar. Indent stays the renderer's inline
+   padding-left. */
+html.ui-v2 .files-ide-tree { padding: 5px 0; }
+html.ui-v2 .files-ide-tree-row {
+  width: auto;
+  margin: 1px 6px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  padding-right: 6px;
+  border-radius: 7px;
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+html.ui-v2 .files-ide-tree-row:hover { background: var(--hover-wash); color: var(--text); }
+html.ui-v2 .files-ide-tree-row.active {
+  background: color-mix(in srgb, var(--files-accent) 14%, transparent);
+  box-shadow: inset 2px 0 0 var(--files-accent);
+  color: var(--text);
+}
+html.ui-v2 .files-ide-tree-row .files-ide-tree-caret { color: var(--text-3); }
+html.ui-v2 .files-ide-tree-row.dir .files-ide-tree-caret { color: var(--amber); }
+html.ui-v2 .files-ide-tree-row.dir .files-ide-tree-name { color: var(--text); }
+html.ui-v2 .files-ide-tree-row.hidden-entry .files-ide-tree-caret,
+html.ui-v2 .files-ide-tree-row.hidden-entry .files-ide-tree-name { color: var(--text-3); }
+html.ui-v2 .files-ide-tree-notice {
+  color: var(--text-3);
+  font-size: 11px;
+}
+html.ui-v2 #tab-files .files-ide-create-row input { padding: 3px 7px; }
+html.ui-v2 #tab-files .files-ide-create-row input,
+html.ui-v2 #tab-files .files-ide-create-row input:focus {
+  border-color: var(--files-accent);
+}
+
+html.ui-v2 .files-ide-row-act {
+  border-radius: 6px;
+  color: var(--text-3);
+}
+html.ui-v2 .files-ide-row-act:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+html.ui-v2 .files-ide-row-act.delete:hover { color: var(--rose); }
+html.ui-v2 .files-ide-row-act.delete.armed {
+  background: var(--rose);
+  color: var(--on-accent);
+}
+
+/* Buffer tabs: mono strip on bg-1; active = code-bg + accent top bar;
+   dirty dot iris; two-step Discard? in rose. */
+html.ui-v2 .files-ide-tabs {
+  min-height: 36px;
+  padding: 0;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 .files-ide-tab {
+  padding: 0 10px 0 14px;
+  border-right: 1px solid var(--line);
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 12px;
+  box-shadow: inset 0 2px 0 transparent;
+}
+html.ui-v2 .files-ide-tab:hover { color: var(--text-2); }
+html.ui-v2 .files-ide-tab.active {
+  background: var(--code-bg);
+  color: var(--text);
+  box-shadow: inset 0 2px 0 var(--files-accent);
+}
+html.ui-v2 .files-ide-tab .files-ide-tab-dirty { color: var(--iris); }
+html.ui-v2 .files-ide-tab .files-ide-tab-close {
+  border-radius: 6px;
+  color: var(--text-3);
+}
+html.ui-v2 .files-ide-tab .files-ide-tab-close:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+html.ui-v2 .files-ide-tab .files-ide-tab-close.confirm-discard {
+  color: var(--rose);
+  font-family: var(--sans);
+}
+
+/* Conflict / error banner: the design's amber attention-card language
+   (rose for errors), kept as a strip above the editor. */
+html.ui-v2 .files-ide-banner {
+  padding: 8px 14px;
+  border-bottom: 1px solid rgba(var(--amber-rgb), .32);
+  box-shadow: none;
+  background: linear-gradient(180deg, rgba(var(--amber-rgb), .1), rgba(var(--amber-rgb), .04));
+  color: var(--amber);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+html.ui-v2 .files-ide-banner.error {
+  border-bottom-color: rgba(var(--rose-rgb), .32);
+  box-shadow: none;
+  background: linear-gradient(180deg, rgba(var(--rose-rgb), .1), rgba(var(--rose-rgb), .04));
+  color: var(--rose);
+}
+html.ui-v2 #tab-files .files-ide-banner .ui-btn { min-height: 24px; padding: 3px 9px; font-size: 11.5px; }
+
+/* Find bar: floating v2 panel. */
+html.ui-v2 .files-ide-find {
+  padding: 6px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+html.ui-v2 .files-ide-find input { padding: 4px 8px; }
+html.ui-v2 #tab-files .files-ide-find .ui-btn { min-height: 24px; padding: 3px 8px; font-size: 11.5px; }
+html.ui-v2 .files-ide-find-count {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+html.ui-v2 .files-ide-find-count.none { color: var(--rose); }
+
+html.ui-v2 .files-ide-empty .ui-empty-title {
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 700;
+}
+html.ui-v2 .files-ide-empty .ui-empty-sub {
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* Statusbar: mono line on bg-1. Right padding stays clear of the floating
+   mic/screenshot controls, as in v1. */
+html.ui-v2 .files-ide-statusbar {
+  min-height: 34px;
+  padding: 5px 96px 5px 14px;
+  background: var(--bg-1);
+  border-top: 1px solid var(--line);
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+html.ui-v2 .files-ide-status-host {
+  padding: 2px 9px 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--text-2);
+  font-weight: 600;
+}
+html.ui-v2 .files-ide-host-dot {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--files-accent) 16%, transparent);
+}
+html.ui-v2 .files-ide-status-meta { color: var(--text-3); }
+html.ui-v2 .files-ide-status-lncol { display: inline; color: var(--text-3); white-space: nowrap; }
+html.ui-v2 .files-ide-status-lncol:empty { display: none; }
+html.ui-v2 .files-ide-save-status { color: var(--text-3); }
+html.ui-v2 .files-ide-save-status.error { color: var(--rose); }
+html.ui-v2 .files-ide-save-status.ok { color: var(--green); }
+html.ui-v2 #tab-files .files-ide-statusbar .ui-btn.primary { min-height: 26px; padding: 4px 12px; }
+
+/* Editor: CodeMirror on --code-bg with the design mono scale. */
+html.ui-v2 .files-ide-editor-host .CodeMirror {
+  background: var(--code-bg);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+/* CodeMirror token theme, v2 variant of .cm-s-intendant (design mapping:
+   keywords iris-2, strings green, calls/builtins sky, comments text-3). */
+html.ui-v2 .cm-s-intendant.CodeMirror {
+  background: var(--code-bg);
+  color: var(--text);
+}
+html.ui-v2 .cm-s-intendant .CodeMirror-gutters {
+  background: var(--code-bg);
+  border-right: 0;
+}
+html.ui-v2 .cm-s-intendant .CodeMirror-linenumber {
+  padding: 0 14px 0 10px;
+  color: color-mix(in srgb, var(--text-3) 72%, transparent);
+}
+html.ui-v2 .cm-s-intendant .CodeMirror-cursor { border-left: 2px solid var(--text); }
+html.ui-v2 .cm-s-intendant .CodeMirror-selected { background: rgba(var(--iris-rgb), .22); }
+html.ui-v2 .cm-s-intendant.CodeMirror-focused .CodeMirror-selected { background: rgba(var(--iris-rgb), .25); }
+html.ui-v2 .cm-s-intendant .CodeMirror-activeline-background { background: var(--hover-wash); }
+html.ui-v2 .cm-s-intendant .CodeMirror-matchingbracket {
+  color: var(--sky) !important;
+  border-bottom: 1px solid var(--sky);
+}
+html.ui-v2 .cm-s-intendant .CodeMirror-nonmatchingbracket { color: var(--rose) !important; }
+html.ui-v2 .cm-s-intendant .cm-keyword { color: var(--iris-2); }
+html.ui-v2 .cm-s-intendant .cm-atom { color: var(--violet); }
+html.ui-v2 .cm-s-intendant .cm-number { color: var(--amber); }
+html.ui-v2 .cm-s-intendant .cm-def { color: var(--sky); }
+html.ui-v2 .cm-s-intendant .cm-variable { color: var(--text); }
+html.ui-v2 .cm-s-intendant .cm-variable-2 { color: var(--iris-2); }
+html.ui-v2 .cm-s-intendant .cm-variable-3,
+html.ui-v2 .cm-s-intendant .cm-type { color: var(--violet); }
+html.ui-v2 .cm-s-intendant .cm-property { color: var(--text); }
+html.ui-v2 .cm-s-intendant .cm-operator { color: var(--text-2); }
+html.ui-v2 .cm-s-intendant .cm-comment { color: var(--text-3); }
+html.ui-v2 .cm-s-intendant .cm-string { color: var(--green); }
+html.ui-v2 .cm-s-intendant .cm-string-2 { color: var(--sky); }
+html.ui-v2 .cm-s-intendant .cm-meta { color: var(--sky); }
+html.ui-v2 .cm-s-intendant .cm-qualifier { color: var(--amber); }
+html.ui-v2 .cm-s-intendant .cm-builtin { color: var(--sky); }
+html.ui-v2 .cm-s-intendant .cm-bracket { color: var(--text-2); }
+html.ui-v2 .cm-s-intendant .cm-tag { color: var(--rose); }
+html.ui-v2 .cm-s-intendant .cm-attribute { color: var(--amber); }
+html.ui-v2 .cm-s-intendant .cm-header { color: var(--iris-2); }
+html.ui-v2 .cm-s-intendant .cm-quote { color: var(--green); }
+html.ui-v2 .cm-s-intendant .cm-hr { color: var(--text-3); }
+html.ui-v2 .cm-s-intendant .cm-link { color: var(--sky); }
+html.ui-v2 .cm-s-intendant .cm-error { color: var(--rose); }
+html.ui-v2 .cm-s-intendant .cm-negative { color: var(--rose); }
+html.ui-v2 .cm-s-intendant .cm-positive { color: var(--green); }
+
+/* — Transfers sub-tab (undesigned in the handoff; composed from the v2
+     card/row/meter/tint recipes) — */
+
+html.ui-v2 .files-pane {
+  max-width: 880px;
+  padding: 18px 24px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+html.ui-v2 #tab-files .files-tool {
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  padding: 16px 18px;
+}
+html.ui-v2 #tab-files .ui-section-title {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 800;
+}
+html.ui-v2 #tab-files .ui-section-sub {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+html.ui-v2 .files-download-status {
+  color: var(--text-2);
+  font-size: 12px;
+}
+html.ui-v2 .files-download-status.ok { color: var(--green); }
+html.ui-v2 .files-download-status.warn { color: var(--amber); }
+html.ui-v2 .files-download-status.error { color: var(--rose); }
+html.ui-v2 #files-ide-tree-status { padding: 0 10px 8px; }
+
+html.ui-v2 #tab-files .files-download-meter,
+html.ui-v2 #tab-files .ui-meter {
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+}
+html.ui-v2 .files-download-meter-fill {
+  background: linear-gradient(90deg, var(--sky), var(--iris));
+}
+
+/* Transfer + staged rows: v2 rows with a semantic status edge. */
+html.ui-v2 .files-transfer-row,
+html.ui-v2 .files-staged-row {
+  padding: 11px 14px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-2);
+  border-radius: 11px;
+  background: var(--surface-2);
+}
+html.ui-v2 .files-transfer-row.running { border-color: var(--line); border-left-color: var(--sky); }
+html.ui-v2 .files-transfer-row.queued { border-color: var(--line); border-left-color: var(--text-3); }
+html.ui-v2 .files-transfer-row.completed { border-color: var(--line); border-left-color: var(--green); }
+html.ui-v2 .files-transfer-row.failed { border-color: var(--line); border-left-color: var(--rose); }
+html.ui-v2 .files-transfer-row.cancelled { border-color: var(--line); border-left-color: var(--text-3); }
+html.ui-v2 .files-transfer-row.paused { border-color: var(--line); border-left-color: var(--amber); }
+html.ui-v2 .files-transfer-row.server {
+  background: linear-gradient(180deg, rgba(var(--iris-rgb), .07), rgba(var(--iris-rgb), .03)),
+    var(--surface-2);
+}
+html.ui-v2 .files-transfer-title,
+html.ui-v2 .files-staged-title {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text);
+}
+html.ui-v2 .files-transfer-meta,
+html.ui-v2 .files-staged-meta {
+  color: var(--text-3);
+  font-size: 11px;
+}
+html.ui-v2 .files-transfer-meter {
+  height: 5px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+}
+html.ui-v2 .files-transfer-meter-fill {
+  background: linear-gradient(90deg, var(--sky), var(--iris));
+}
+html.ui-v2 #tab-files .ui-empty-title { color: var(--text); font-size: 13.5px; font-weight: 700; }
+html.ui-v2 #tab-files .ui-empty-hint { color: var(--text-3); font-size: 11.5px; line-height: 1.5; }
+
+/* Uploads. */
+html.ui-v2 .files-upload-config input,
+html.ui-v2 .files-upload-config select { min-height: 32px; }
+html.ui-v2 .files-upload-dropzone {
+  border: 1px dashed var(--line-2);
+  border-radius: 11px;
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: 12px;
+}
+html.ui-v2 .files-upload-dropzone.dragover {
+  border-color: var(--iris);
+  background: rgba(var(--iris-rgb), .08);
+  color: var(--text);
+}
+
+/* — Shared fs-picker modal (Browse flows here + Sessions pickers) — */
+html.ui-v2 .fs-picker-dialog {
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-panel);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  box-shadow: var(--shadow-overlay);
+}
+html.ui-v2 .fs-picker-path-row input {
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+html.ui-v2 .fs-picker-path-row input:focus { border-color: var(--iris); }
+html.ui-v2 .fs-picker-path-row button {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: 600 12px var(--sans);
+}
+html.ui-v2 .fs-picker-path-row button:hover { background: var(--surface-2); border-color: var(--line-2); }
+html.ui-v2 .fs-picker-entry {
+  border-radius: 7px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+html.ui-v2 .fs-picker-entry:hover { background: var(--hover-wash); color: var(--text); }
+html.ui-v2 .fs-picker-entry.selected {
+  background: rgba(var(--iris-rgb), .14);
+  color: var(--text);
+}
+html.ui-v2 .fs-picker-status { font-size: 12px; color: var(--text-2); }
+html.ui-v2 .fs-picker-status.error { color: var(--rose); }
+html.ui-v2 .fs-picker-status.ok { color: var(--green); }
+html.ui-v2 .fs-picker-status.warn { color: var(--amber); }
+html.ui-v2 .fs-picker-close {
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-3);
+}
+html.ui-v2 .fs-picker-close:hover { background: var(--surface-2); color: var(--text); }
+
+/* — Responsive parity: the v1 sheets collapse these grids inside media
+     queries; the higher-specificity v2 overrides must collapse with them. */
+@media (max-width: 900px) {
+  html.ui-v2 .files-ide-body { grid-template-columns: 1fr; }
+  html.ui-v2 .files-ide-tree-pane {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  html.ui-v2 .files-pane { padding: 12px; }
+}
+/* ── static/app/ui2-debug.css ── */
+/* ── ui-v2 Debug tab: two-card layout (design-overhaul P2) ─────────────
+   Scoped entirely under html.ui-v2 #tab-debug — inert for v1 and for
+   every other surface. This re-skins the existing DOM only: the observer
+   card (status / setup-teardown / record / display-id strip) and the
+   browser-workspaces card (5-provider create form, status line, rows
+   with acquire/close) keep their ids, classes and handlers verbatim.
+   The reference's unhooked preview pane is deliberately not built.
+   The page header (.ui2-page-head) and the rows' data-status attribute
+   are the two ui2Enabled()-gated additions in 56-debug-sessions.js. */
+
+/* ── page scaffold: full-width header row + two equal cards ── */
+html.ui-v2 #tab-debug .debug-pane {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+  gap: 16px;
+  align-content: start;
+  max-width: 980px;
+  padding: 26px 28px 44px;
+}
+html.ui-v2 #tab-debug .ui2-page-head { grid-column: 1 / -1; margin: 0 0 10px; }
+html.ui-v2 #tab-debug .ui2-page-title {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -.02em;
+  color: var(--text);
+}
+html.ui-v2 #tab-debug .ui2-page-sub {
+  margin: 7px 0 0;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+/* ── cards ── */
+html.ui-v2 #tab-debug .ui-card {
+  margin: 0; /* grid gap owns spacing — neutralize v1's stacked-card margin */
+  padding: 16px 18px 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  box-shadow: none;
+}
+html.ui-v2 #tab-debug .ui-section-head {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
+  margin: 0 0 14px;
+}
+html.ui-v2 #tab-debug .ui-section-title {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: normal;
+  color: var(--text);
+}
+html.ui-v2 #tab-debug .ui-section-sub {
+  flex: none;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+/* ── observer-display card ── */
+html.ui-v2 #tab-debug .debug-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 13px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+html.ui-v2 #tab-debug .debug-status::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--neutral-dot);
+}
+html.ui-v2 #tab-debug .debug-status.ok { color: var(--green); }
+html.ui-v2 #tab-debug .debug-status.ok::before {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16);
+}
+html.ui-v2 #tab-debug .debug-actions { gap: 9px; }
+html.ui-v2 #tab-debug .debug-info {
+  margin-top: 14px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--code-bg);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+html.ui-v2 #tab-debug .debug-info p { margin: 2px 0; }
+html.ui-v2 #tab-debug .debug-info code { color: var(--iris-2); }
+
+/* ── buttons: v2 recipes over the shared .ui-btn contract ── */
+html.ui-v2 #tab-debug .ui-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 0;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.2;
+  transition: background var(--t-med), border-color var(--t-med),
+    color var(--t-med), filter var(--t-med);
+}
+html.ui-v2 #tab-debug .ui-btn:hover {
+  background: var(--surface-3);
+  border-color: var(--line-2);
+}
+html.ui-v2 #tab-debug .ui-btn.primary {
+  border-color: transparent;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 800;
+  box-shadow: var(--shadow-primary);
+}
+html.ui-v2 #tab-debug .ui-btn.primary:hover {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  border-color: transparent;
+  filter: brightness(1.08);
+}
+html.ui-v2 #tab-debug .ui-btn.danger,
+html.ui-v2 #tab-debug #debug-record-btn {
+  border-color: rgba(var(--rose-rgb), .4);
+  background: transparent;
+  color: var(--rose);
+  font-weight: 700;
+}
+html.ui-v2 #tab-debug .ui-btn.danger:hover,
+html.ui-v2 #tab-debug #debug-record-btn:hover:not(:disabled) {
+  background: rgba(var(--rose-rgb), .1);
+  border-color: rgba(var(--rose-rgb), .55);
+  color: var(--rose);
+}
+/* Record affordance: the reference's rose dot; currentColor keeps it in
+   step with the disabled-opacity dim. */
+html.ui-v2 #tab-debug #debug-record-btn::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: currentColor;
+}
+
+/* ── browser-workspaces create form ── */
+html.ui-v2 #tab-debug .debug-workspace-form {
+  gap: 12px 10px;
+  margin-bottom: 14px;
+}
+html.ui-v2 #tab-debug .debug-workspace-form label {
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-debug .debug-workspace-form input,
+html.ui-v2 #tab-debug .debug-workspace-form select {
+  padding: 8px 11px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  transition: border-color var(--t-med), box-shadow var(--t-med);
+}
+html.ui-v2 #tab-debug .debug-workspace-form input::placeholder { color: var(--text-3); }
+/* Provider tokens are technical vocabulary → mono (type-system mandate). */
+html.ui-v2 #tab-debug .debug-workspace-form select {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+html.ui-v2 #tab-debug .debug-workspace-form input:focus-visible,
+html.ui-v2 #tab-debug .debug-workspace-form select:focus-visible {
+  outline: none;
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+html.ui-v2 #tab-debug .debug-workspace-form .ui-btn { min-height: 34px; }
+
+/* ── workspace status line + rows ── */
+html.ui-v2 #tab-debug .debug-workspace-status {
+  margin-bottom: 10px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-debug .debug-workspace-status:empty {
+  display: none;
+  margin: 0;
+}
+html.ui-v2 #tab-debug .debug-workspace-list { gap: 9px; }
+html.ui-v2 #tab-debug .debug-workspace-row {
+  gap: 8px 12px;
+  align-items: center;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-2);
+}
+html.ui-v2 #tab-debug .debug-workspace-row-title {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+/* Status dot: keyed off data-status (ui2-gated in JS); inline-block keeps
+   the title's single-line ellipsis intact. Statuses mirror the daemon's
+   BrowserWorkspaceStatus vocabulary (closed rows are filtered out). */
+html.ui-v2 #tab-debug .debug-workspace-row-title::before {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-right: 8px;
+  vertical-align: 1px;
+  background: var(--neutral-dot);
+}
+html.ui-v2 #tab-debug .debug-workspace-row[data-status="ready"] .debug-workspace-row-title::before {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), .14);
+}
+html.ui-v2 #tab-debug .debug-workspace-row[data-status="starting"] .debug-workspace-row-title::before {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .14);
+  animation: ui2-pulse 2s infinite;
+}
+html.ui-v2 #tab-debug .debug-workspace-row[data-status="error"] .debug-workspace-row-title::before {
+  background: var(--rose);
+  box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .14);
+}
+html.ui-v2 #tab-debug .debug-workspace-row-url {
+  margin-top: 3px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-debug .debug-workspace-row-meta {
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-debug .debug-workspace-row-actions { gap: 7px; }
+html.ui-v2 #tab-debug .debug-workspace-row-actions .ui-btn {
+  padding: 5px 11px;
+  font-size: 11.5px;
+  border-radius: 8px;
+}
+
+/* ── empty state (design States recipe) ── */
+html.ui-v2 #tab-debug .ui-empty.compact {
+  padding: 26px 16px;
+  gap: 5px;
+}
+html.ui-v2 #tab-debug .ui-empty-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+html.ui-v2 #tab-debug .ui-empty-hint {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
 </style>
 <!-- ── static/app/20-shell.html ── -->
 </head>
@@ -13357,10 +15755,14 @@ html.ui-v2 .ui2-vp-note { font-size: 11.5px; color: var(--text-3); line-height: 
             <button class="shell-key" data-key="tab">Tab</button>
             <button class="shell-key sticky wide" data-sticky="ctrl">Ctrl</button>
             <button class="shell-key sticky wide" data-sticky="alt">Alt</button>
+            <!-- ui2-key chips are part of the ui-v2 design bar; hidden under v1. -->
+            <button class="shell-key ui2-key" data-key="ctrlc" title="Ctrl+C (interrupt)">^C</button>
+            <button class="shell-key ui2-key" data-key="ctrld" title="Ctrl+D (end of input)">^D</button>
             <button class="shell-key" data-key="up" title="Up">&#x2191;</button>
             <button class="shell-key" data-key="down" title="Down">&#x2193;</button>
             <button class="shell-key" data-key="left" title="Left">&#x2190;</button>
             <button class="shell-key" data-key="right" title="Right">&#x2192;</button>
+            <button class="shell-key ui2-key" data-key="enter" title="Enter">&#x23CE;</button>
             <button class="shell-key" data-key="home" title="Home">Home</button>
             <button class="shell-key" data-key="end" title="End">End</button>
             <button class="shell-key" data-key="pgup" title="Page Up">PgUp</button>
@@ -13961,6 +16363,7 @@ html.ui-v2 .ui2-vp-note { font-size: 11.5px; color: var(--text-3); line-height: 
                 <span id="files-ide-status-host" class="files-ide-status-host"><span class="files-ide-host-dot"></span><span id="files-ide-status-host-label"></span></span>
                 <span id="files-ide-status-path" class="files-ide-status-path" title=""></span>
                 <span id="files-ide-status-meta" class="files-ide-status-meta"></span>
+                <span id="files-ide-status-lncol" class="files-ide-status-lncol"></span>
                 <span class="files-ide-statusbar-spacer"></span>
                 <span id="files-ide-save-status" class="files-ide-save-status" aria-live="polite"></span>
                 <button id="files-ide-save-btn" class="ui-btn primary" type="button" onclick="filesIdeSaveActive()" disabled>Save</button>
@@ -15838,12 +18241,17 @@ let apiKeyStatusLoaded = false;
 // sessions/worktrees module state they touch must be declared up here,
 // not next to their renderers (TDZ).
 const SESSION_LIST_RECENT_LIMIT = 600;
-const SESSION_CARD_RENDER_LIMIT = 300;
+// Sessions render in viewport-sized pages: the initial window, the
+// IntersectionObserver auto-append step, and the Show-more fallback step
+// are all one page. Small pages keep the tab's DOM budget flat no matter
+// how large the corpus grows.
+const SESSION_CARD_RENDER_PAGE = 60;
 const WORKTREE_CARD_RENDER_LIMIT = 200;
 // Show-more render windows: how many cards the list renderers paint before
-// offering a "Show N more" button. Reset on filter/search/sort changes and
-// on a fresh (uncached) list load.
-let sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
+// offering a "Show N more" button (sessions also auto-grow via a scroll
+// sentinel). Reset on filter/search/sort changes and on a fresh (uncached)
+// list load.
+let sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
 let worktreesRenderWindow = WORKTREE_CARD_RENDER_LIMIT;
 let _sessionsLoadToken = 0;
 let _sessionsStreamAbort = null;
@@ -15877,6 +18285,11 @@ let _sessionsHydrationState = {
 let _sessionsRenderTimer = null;
 let _sessionsRenderLastTs = 0;
 const SESSIONS_RENDER_MIN_INTERVAL_MS = 250;
+// Sessions list render-pass state (see 57-sessions-replay.js): the
+// #sessions deep link runs loadSessions → resetSessionsListRenderState on
+// this same script-evaluation path.
+const _sessionsListRenderState = new Map(); // list element id → pass state
+let _sessionCardBuildSeq = 0; // stamps built cards; QA asserts node identity by it
 let worktreesRequestSerial = 0;
 let worktreesActivityClearTimeout = null;
 let worktreesLoadPromise = null;
@@ -16353,6 +18766,11 @@ let dashboardServerMessageDispatcher = null;
 const wsDeniedToastShown = new Set();
 let dashboardControlEventsActive = false;
 let dashboardControlLastError = '';
+// Coarse failure class for dashboardControlLastError so panes can give
+// honest guidance: 'refused' (the daemon itself rejected the offer),
+// 'transport' (answer received but ICE/DTLS/DataChannel never became
+// ready), 'signaling' (no answer at all), or '' (unclassified).
+let dashboardControlLastErrorKind = '';
 let dashboardConnectReconnectTimer = null;
 let dashboardConnectReconnectAttempt = 0;
 let dashboardConnectReconnectInFlight = false;
@@ -19521,6 +21939,10 @@ const shellModifiers = { ctrl: false, alt: false };
 const SHELL_KEY_SEQS = {
   esc: '\x1b',
   tab: '\t',
+  // ^C / ^D / ⏎ chips (ui-v2 design bar; buttons are hidden under v1).
+  ctrlc: '\x03',
+  ctrld: '\x04',
+  enter: '\r',
   up: '\x1b[A',
   down: '\x1b[B',
   left: '\x1b[D',
@@ -27528,7 +29950,7 @@ async function main() {
       setConnectEventStatus('ok', 'Dashboard events are live through verified Hosted Connect');
     } catch (err) {
       console.warn('[dashboard-control] Connect dashboard bootstrap failed', err);
-      dashboardSetControlLastError(err?.message || String(err));
+      dashboardSetControlLastError(err?.message || String(err), err?.controlErrorKind || '');
       dashboardUpdateTransportStatus();
       setConnectEventStatus('err', 'Hosted Connect dashboard events failed');
       scheduleDashboardConnectReconnect(err?.message || String(err), { delayMs: 1000 });
@@ -33332,55 +35754,123 @@ function applySessionRelationshipsFromSession(session) {
   }
 }
 
+function _foldSessionWindowMetadataRow(session, changedIds) {
+  const meta = sessionWindowMetaFromSession(session);
+  const ids = Array.from(new Set([
+    session.session_id,
+    session.resume_id,
+    session.backend_session_id,
+    session.intendant_session_id,
+  ].map(id => String(id || '').trim()).filter(Boolean)));
+  for (const id of ids) {
+    sessionRowSeenIds.add(id);
+    sessionRelationshipHydrationUnresolved.delete(id);
+    const { meta: merged, changed } = mergeSessionWindowMetadata(id, meta);
+    if (changed && sessionWindows.has(id)) updateSessionWindow(id, merged);
+    if (changed) changedIds.add(id);
+  }
+  if (session.backend_session_id && session.session_id) {
+    applySessionIdentity({
+      session_id: session.session_id,
+      backend_session_id: session.backend_session_id,
+      source: session.backend_source,
+      backend_source_label: session.backend_source_label,
+    });
+  }
+  if (!sessionMetadataStatusIsTerminal(session)) {
+    const rawSource = String(session.source || '').trim().toLowerCase();
+    const source = rawSource === 'intendant'
+      ? 'intendant'
+      : normalizeAgentId(session.source || session.backend_source || '');
+    const backendSessionId = String(session.backend_session_id || '').trim();
+    const intendantSessionId = String(session.intendant_session_id || '').trim();
+    const sessionId = String(session.session_id || '').trim();
+    if (source && source !== 'intendant' && intendantSessionId) {
+      clearStaleSessionWindowDetached(sessionId, 'session metadata reports an attached wrapper');
+    }
+    if (source === 'intendant' && backendSessionId) {
+      clearStaleSessionWindowDetached(backendSessionId, 'wrapper metadata reports this session is attached');
+    }
+  }
+  scheduleExternalSessionWindowTranscriptSyncFromMetadata(session);
+}
+
+// Full-corpus list applies fold thousands of rows; running that
+// synchronously on every stream flush stalled the main thread. Small
+// batches still fold inline (event-driven single-row refreshes stay
+// immediate); large ones fold in idle-time slices. A batch arriving
+// mid-fold queues behind it — latest wins, so every row is eventually
+// folded with the newest data — and the DOM label refresh plus the
+// persist run once per completed fold, not once per flush.
+const SESSION_WINDOW_META_FOLD_SYNC_MAX = 400;
+const SESSION_WINDOW_META_FOLD_CHUNK = 400;
+let _sessionWindowMetaFold = null; // { rows, index, phase, changedIds, queued }
+
 function cacheSessionWindowMetadata(sessions) {
   if (!Array.isArray(sessions)) return;
-  const changedIds = new Set();
-  for (const session of sessions) {
+  if (sessions.length <= SESSION_WINDOW_META_FOLD_SYNC_MAX && !_sessionWindowMetaFold) {
+    const changedIds = new Set();
+    for (const session of sessions) {
+      if (!session || typeof session !== 'object') continue;
+      _foldSessionWindowMetadataRow(session, changedIds);
+    }
+    for (const session of sessions) {
+      if (!session || typeof session !== 'object') continue;
+      applySessionRelationshipsFromSession(session);
+    }
+    refreshSessionIdentityLabelsBulk(changedIds);
+    persistSessionWindowState();
+    return;
+  }
+  if (_sessionWindowMetaFold) {
+    // Union-merge rather than replace: a small event-driven batch queued
+    // behind an in-flight fold must not drop a queued full-corpus apply
+    // (mergeSessionRows keeps newest-per-row).
+    _sessionWindowMetaFold.queued = _sessionWindowMetaFold.queued
+      ? mergeSessionRows(_sessionWindowMetaFold.queued, sessions)
+      : sessions;
+    return;
+  }
+  _sessionWindowMetaFold = { rows: sessions, index: 0, phase: 'meta', changedIds: new Set(), queued: null };
+  _scheduleSessionWindowMetaFoldSlice();
+}
+
+function _scheduleSessionWindowMetaFoldSlice() {
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(deadline => _runSessionWindowMetaFoldSlice(deadline), { timeout: 300 });
+  } else {
+    setTimeout(() => _runSessionWindowMetaFoldSlice(null), 16);
+  }
+}
+
+function _runSessionWindowMetaFoldSlice(deadline) {
+  const fold = _sessionWindowMetaFold;
+  if (!fold) return;
+  const hasBudget = () => deadline && typeof deadline.timeRemaining === 'function'
+    ? deadline.timeRemaining() > 2
+    : true;
+  let processed = 0;
+  while (processed < SESSION_WINDOW_META_FOLD_CHUNK && hasBudget()) {
+    if (fold.index >= fold.rows.length) {
+      if (fold.phase === 'meta') {
+        fold.phase = 'relationships';
+        fold.index = 0;
+        continue;
+      }
+      _sessionWindowMetaFold = null;
+      refreshSessionIdentityLabelsBulk(fold.changedIds);
+      persistSessionWindowState();
+      if (fold.queued) cacheSessionWindowMetadata(fold.queued);
+      return;
+    }
+    const session = fold.rows[fold.index];
+    fold.index += 1;
     if (!session || typeof session !== 'object') continue;
-    const meta = sessionWindowMetaFromSession(session);
-    const ids = Array.from(new Set([
-      session.session_id,
-      session.resume_id,
-      session.backend_session_id,
-      session.intendant_session_id,
-    ].map(id => String(id || '').trim()).filter(Boolean)));
-    for (const id of ids) {
-      sessionRowSeenIds.add(id);
-      sessionRelationshipHydrationUnresolved.delete(id);
-      const { meta: merged, changed } = mergeSessionWindowMetadata(id, meta);
-      if (changed && sessionWindows.has(id)) updateSessionWindow(id, merged);
-      if (changed) changedIds.add(id);
-    }
-    if (session.backend_session_id && session.session_id) {
-      applySessionIdentity({
-        session_id: session.session_id,
-        backend_session_id: session.backend_session_id,
-        source: session.backend_source,
-        backend_source_label: session.backend_source_label,
-      });
-    }
-    if (!sessionMetadataStatusIsTerminal(session)) {
-      const rawSource = String(session.source || '').trim().toLowerCase();
-      const source = rawSource === 'intendant'
-        ? 'intendant'
-        : normalizeAgentId(session.source || session.backend_source || '');
-      const backendSessionId = String(session.backend_session_id || '').trim();
-      const intendantSessionId = String(session.intendant_session_id || '').trim();
-      const sessionId = String(session.session_id || '').trim();
-      if (source && source !== 'intendant' && intendantSessionId) {
-        clearStaleSessionWindowDetached(sessionId, 'session metadata reports an attached wrapper');
-      }
-      if (source === 'intendant' && backendSessionId) {
-        clearStaleSessionWindowDetached(backendSessionId, 'wrapper metadata reports this session is attached');
-      }
-    }
-    scheduleExternalSessionWindowTranscriptSyncFromMetadata(session);
+    if (fold.phase === 'meta') _foldSessionWindowMetadataRow(session, fold.changedIds);
+    else applySessionRelationshipsFromSession(session);
+    processed += 1;
   }
-  for (const session of sessions) {
-    applySessionRelationshipsFromSession(session);
-  }
-  refreshSessionIdentityLabelsBulk(changedIds);
-  persistSessionWindowState();
+  _scheduleSessionWindowMetaFoldSlice();
 }
 
 // One DOM pass for a whole metadata batch. The per-id
@@ -43621,21 +46111,63 @@ function renderAccessAttention() {
   const lastError = String(status.lastError || dashboardControlLastError || '').trim();
   if (summary.kind === 'err') {
     if (dashboardConnectModeEnabled()) {
-      items.push({
-        kind: 'err',
-        icon: '!',
-        message: 'Hosted Connect reached this daemon, but the daemon refused dashboard control.',
-        detail: lastError,
-        steps: [
-          'Open the daemon directly (its https://host:8765 address) with root access.',
-          'Go to Access → People & Devices and grant your Connect account a role.',
-          accessOwnDeviceFingerprint
-            ? `Verify it is really this device: this browser's key fingerprint is ${accessOwnDeviceFingerprint} — approve the pending request only if it matches.`
-            : 'Compare the pending request’s key fingerprint against this device before approving.',
-          'Reload this page — Connect is only the route; the daemon decides.',
-        ],
-        action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
-      });
+      // Three distinct failures share this err state; the transport records
+      // which one happened ('refused' | 'transport' | 'signaling') so the
+      // guidance matches reality. IAM advice is reserved for a genuine
+      // daemon refusal — sending someone to grant roles over a firewall
+      // problem wastes their debugging on the wrong layer.
+      const failureKind = String(status.lastErrorKind || dashboardControlLastErrorKind || '').trim();
+      if (failureKind === 'refused') {
+        items.push({
+          kind: 'err',
+          icon: '!',
+          message: 'Hosted Connect reached this daemon, but the daemon refused dashboard control.',
+          detail: lastError,
+          steps: [
+            'Open the daemon directly (its https://host:8765 address) with root access.',
+            'Go to Access → People & Devices and grant your Connect account a role.',
+            accessOwnDeviceFingerprint
+              ? `Verify it is really this device: this browser's key fingerprint is ${accessOwnDeviceFingerprint} — approve the pending request only if it matches.`
+              : 'Compare the pending request’s key fingerprint against this device before approving.',
+            'Reload this page — Connect is only the route; the daemon decides.',
+          ],
+          action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
+        });
+      } else if (failureKind === 'transport') {
+        items.push({
+          kind: 'err',
+          icon: '!',
+          message: 'This daemon answered through Hosted Connect, but the connection could not be established.',
+          detail: lastError,
+          steps: [
+            'Check that the daemon’s gateway port (its https://host:8765 listener) accepts inbound connections from the internet — a cloud box needs an inbound firewall rule.',
+            'The daemon advertises the public address the rendezvous observed for it; an extra NAT or proxy layer can make that address unreachable.',
+            'Hard-reload this page to retry with a fresh connection.',
+          ],
+          action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
+        });
+      } else if (failureKind === 'signaling') {
+        items.push({
+          kind: 'err',
+          icon: '!',
+          message: 'This daemon did not answer the Hosted Connect offer.',
+          detail: lastError,
+          steps: [
+            'Check that the daemon is running and has internet access — offers only reach it while it polls the rendezvous.',
+            'Confirm Connect is still enabled on the daemon and that it is claimed by this account.',
+            'Wait a moment and reload this page — a daemon that just started can take a few seconds to begin polling.',
+          ],
+          action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
+        });
+      } else {
+        items.push({
+          kind: 'err',
+          icon: '!',
+          message: 'The Hosted Connect control channel failed.',
+          detail: lastError,
+          action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
+        });
+      }
     } else {
       items.push({
         kind: 'err',
@@ -43866,6 +46398,14 @@ function renderAccessExplainer() {
   const mount = document.getElementById('access-model-explainer');
   if (!mount || mount.dataset.built === 'true') return;
   mount.dataset.built = 'true';
+  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+    // ui-v2 only: the design's "How access works" section eyebrow. The v1
+    // explainer renders headless, so this is additive and flag-gated.
+    const head = document.createElement('div');
+    head.className = 'ui2-acc-explainer-head';
+    head.textContent = 'How access works';
+    mount.appendChild(head);
+  }
   const steps = [{
     kicker: 'Who',
     title: 'People, devices & daemons',
@@ -45251,8 +47791,30 @@ function renderAccessIamStateCard() {
   }));
 }
 
+/* ui-v2 only (design-overhaul P2): the design's in-page header above the
+   Access subtabs. Injected at render time under the flag so the v1 DOM
+   stays byte-identical; idempotent, so ticks cost one getElementById. */
+function ui2AccessEnsurePageChrome() {
+  if (typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
+  if (document.getElementById('ui2-access-pagehead')) return;
+  const subtabs = document.getElementById('access-subtabs');
+  if (!subtabs || !subtabs.parentElement) return;
+  const head = document.createElement('div');
+  head.id = 'ui2-access-pagehead';
+  head.className = 'ui2-acc-pagehead';
+  const title = document.createElement('h1');
+  title.className = 'ui2-acc-title';
+  title.textContent = 'Access';
+  const sub = document.createElement('div');
+  sub.className = 'ui2-acc-sub';
+  sub.textContent = 'Who can reach this daemon and its fleet — and on whose authority. Every daemon decides for itself.';
+  head.append(title, sub);
+  subtabs.parentElement.insertBefore(head, subtabs);
+}
+
 function renderAccessAdminSummaries() {
   if (!document.getElementById('tab-access')) return;
+  ui2AccessEnsurePageChrome();
   // Transport ticks call this 17-renderer fanout constantly; skip the DOM
   // work while the Access pane is hidden and run once on the next entry.
   if (!paneIsVisible('access')) {
@@ -45916,8 +48478,37 @@ function sendShellResize(cols, rows, options = {}) {
 }
 
 // ── Standalone Shell (lazy xterm.js) ──
-//
-// Loads the CDN-hosted xterm.js on first use. Sends
+
+// Build the xterm theme object from the ui-v2 design tokens. xterm paints
+// into canvas/inline-styled DOM, so CSS custom properties cannot cascade in —
+// they are resolved here once at init (the ui-v2 flag is fixed pre-paint for
+// the whole page load, and v2 keeps terminal surfaces dark in every app
+// theme). Returns null when the tokens are unavailable so the caller can
+// fall back to the v1 palette.
+function ui2ShellTheme() {
+  const styles = getComputedStyle(document.documentElement);
+  const token = name => styles.getPropertyValue(name).trim();
+  const codeBg = token('--code-bg');
+  if (!codeBg) return null;
+  const irisRgb = token('--iris-rgb') || '126, 140, 250';
+  return {
+    background: codeBg,
+    foreground: token('--text'),
+    cursor: token('--text'),
+    cursorAccent: codeBg,
+    selectionBackground: `rgba(${irisRgb}, 0.28)`,
+    black: token('--surface-3'), red: token('--rose'),
+    green: token('--green'), yellow: token('--amber'),
+    blue: token('--iris'), magenta: token('--violet'),
+    cyan: token('--sky'), white: token('--text-2'),
+    brightBlack: token('--text-3'), brightRed: token('--rose'),
+    brightGreen: token('--green'), brightYellow: token('--amber'),
+    brightBlue: token('--iris-2'), brightMagenta: token('--violet'),
+    brightCyan: token('--sky'), brightWhite: token('--text'),
+  };
+}
+
+// Loads the vendored xterm.js on first use. Sends
 // terminal_open / terminal_input / terminal_resize / terminal_close
 // messages to the server; handleShellOutput/handleShellExited receive
 // the reply events.
@@ -45929,19 +48520,28 @@ function initShell() {
   document.getElementById('xterm-css').removeAttribute('disabled');
 
   const start = () => {
+    // ui-v2 re-themes the same instance from design tokens (and turns on
+    // the design's blinking block cursor); v1 keeps Catppuccin Mocha
+    // verbatim. Sizing/fit logic is identical in both generations.
+    const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
+    const theme = (ui2 && ui2ShellTheme()) || {
+      background: '#1e1e2e', foreground: '#cdd6f4', cursor: '#f5e0dc', cursorAccent: '#1e1e2e',
+      selectionBackground: '#45475a',
+      black: '#45475a', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
+      blue: '#89b4fa', magenta: '#cba6f7', cyan: '#94e2d5', white: '#bac2de',
+      brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
+      brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#cba6f7',
+      brightCyan: '#94e2d5', brightWhite: '#a6adc8',
+    };
+    const ui2Mono = ui2
+      ? getComputedStyle(document.documentElement).getPropertyValue('--mono').trim()
+      : '';
     shellTerm = new Terminal({
-      theme: {
-        background: '#1e1e2e', foreground: '#cdd6f4', cursor: '#f5e0dc', cursorAccent: '#1e1e2e',
-        selectionBackground: '#45475a',
-        black: '#45475a', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
-        blue: '#89b4fa', magenta: '#cba6f7', cyan: '#94e2d5', white: '#bac2de',
-        brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
-        brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#cba6f7',
-        brightCyan: '#94e2d5', brightWhite: '#a6adc8',
-      },
-      fontFamily: "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
+      theme,
+      fontFamily: ui2Mono || "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
       fontSize: 13, allowProposedApi: true,
       scrollback: 5000,
+      cursorBlink: ui2,
     });
     shellFitAddon = new FitAddon.FitAddon();
     shellTerm.loadAddon(shellFitAddon);
@@ -46133,6 +48733,13 @@ function wireShellKeybar() {
   // rule forces the bar visible on touch devices regardless of this class.
   const toggle = document.getElementById('keybar-toggle');
   if (toggle) {
+    // ui-v2: the Terminal sub-tab strip is hidden (Shell is its only
+    // sub-tab) and the Keys toggle joins the shell toolbar, matching the
+    // design's toolbar placement. The element keeps its id and listeners;
+    // v1 keeps the strip untouched.
+    if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+      document.querySelector('#tab-terminal .shell-toolbar')?.appendChild(toggle);
+    }
     const isCoarse = window.matchMedia('(pointer: coarse)').matches;
     if (isCoarse) {
       toggle.classList.add('active');
@@ -53211,8 +55818,9 @@ function dashboardConnectSignalUrl(path) {
   return `${DASHBOARD_CONNECT_SIGNALING_BASE}${normalized.startsWith('/') ? '' : '/'}${normalized}`;
 }
 
-function dashboardSetControlLastError(message = '') {
+function dashboardSetControlLastError(message = '', kind = '') {
   dashboardControlLastError = String(message || '').trim();
+  dashboardControlLastErrorKind = dashboardControlLastError ? String(kind || '').trim() : '';
 }
 
 function dashboardUpdateTransportStatus() {
@@ -53669,9 +56277,10 @@ class DashboardTransport {
     dashboardUpdateTransportStatus();
     this.controlStartPromise = dashboardControlTransport.connect().then(() => true).catch(err => {
       console.warn('[dashboard-control] connect failed', err);
-      dashboardSetControlLastError(err?.message || String(err));
+      dashboardSetControlLastError(err?.message || String(err), err?.controlErrorKind || '');
       if (dashboardControlTransport) {
         dashboardControlTransport.lastError = dashboardControlLastError;
+        dashboardControlTransport.lastErrorKind = dashboardControlLastErrorKind;
       }
       dashboardUpdateTransportStatus();
       dashboardControlTransport = null;
@@ -53706,6 +56315,7 @@ class DashboardTransport {
       enabled: this.enabled(),
       connected: false,
       lastError: dashboardControlLastError,
+      lastErrorKind: dashboardControlLastErrorKind,
       ...reconnect,
     };
   }
@@ -53954,12 +56564,18 @@ async function waitForDashboardControlReady(timeoutMs = 30000) {
     if (dashboardTransport?.canUseRpc?.()) return true;
     await new Promise(resolve => setTimeout(resolve, 100));
   }
-  throw new Error('dashboard Connect transport did not become ready');
+  // Signaling already succeeded by this point (the offer resolved to a
+  // verified answer) — what never happened is the WebRTC transport itself.
+  const err = new Error('dashboard Connect transport did not become ready');
+  err.controlErrorKind = 'transport';
+  throw err;
 }
 
 async function hydrateDashboardFromControl() {
   if (!dashboardTransport?.canUseRpc?.()) {
-    throw new Error('dashboard Connect transport is not connected');
+    const err = new Error('dashboard Connect transport is not connected');
+    err.controlErrorKind = 'transport';
+    throw err;
   }
   const [status, config, card, accessOverview, targets] = await Promise.all([
     dashboardTransport.request('status', {}, { timeoutMs: 15000 }).catch(() => null),
@@ -54048,7 +56664,7 @@ async function runDashboardConnectReconnect(reason = 'dashboard transport discon
   } catch (err) {
     retryReason = err?.message || String(err);
     console.warn('[dashboard-control] Hosted Connect reconnect failed', err);
-    dashboardSetControlLastError(retryReason);
+    dashboardSetControlLastError(retryReason, err?.controlErrorKind || '');
     setConnectEventStatus('err', 'Hosted Connect dashboard reconnect failed');
   } finally {
     dashboardConnectReconnectInFlight = false;
@@ -55251,6 +57867,7 @@ class DashboardControlTransport {
     this.localOfferSdp = '';
     this.lastStatus = null;
     this.lastError = '';
+    this.lastErrorKind = '';
     this.iceRoute = '';
     this.iceCandidatePair = '';
     this.pendingIce = [];
@@ -55268,6 +57885,7 @@ class DashboardControlTransport {
 
   async connect() {
     this.lastError = '';
+    this.lastErrorKind = '';
     dashboardSetControlLastError('');
     dashboardUpdateTransportStatus();
     const iceServers = buildIceServersFromGatewayConfig(gatewayConfig);
@@ -55282,7 +57900,8 @@ class DashboardControlTransport {
     };
     this.channel.onerror = () => {
       this.lastError = 'DataChannel error';
-      dashboardSetControlLastError(this.lastError);
+      this.lastErrorKind = 'transport';
+      dashboardSetControlLastError(this.lastError, this.lastErrorKind);
       dashboardUpdateTransportStatus();
       this.scheduleReconnect(this.lastError, { delayMs: 1000 });
     };
@@ -55298,6 +57917,11 @@ class DashboardControlTransport {
     this.pc.onconnectionstatechange = () => {
       const state = this.pc?.connectionState || 'closed';
       console.info('[dashboard-control] pc state', state);
+      // A peer connection that reaches `failed` did get signaling through
+      // (there was something to fail); the loss is ICE/DTLS-level. Record
+      // that durably on this transport so status renders long after the
+      // event still classify the failure honestly.
+      if (state === 'failed' && !this.lastErrorKind) this.lastErrorKind = 'transport';
       this.refreshIceRoute().catch(err => console.debug('[dashboard-control] route stats failed', err));
       dashboardUpdateTransportStatus();
       if (state === 'failed' || state === 'closed') {
@@ -55384,7 +58008,8 @@ class DashboardControlTransport {
   handleError(error) {
     console.warn('[dashboard-control] signaling error', error);
     this.lastError = String(error || 'signaling error');
-    dashboardSetControlLastError(this.lastError);
+    this.lastErrorKind = 'signaling';
+    dashboardSetControlLastError(this.lastError, this.lastErrorKind);
     dashboardUpdateTransportStatus();
     this.close();
     this.scheduleReconnect(this.lastError, { delayMs: 1000 });
@@ -55397,6 +58022,7 @@ class DashboardControlTransport {
 
   handleOpen() {
     this.lastError = '';
+    this.lastErrorKind = '';
     dashboardSetControlLastError('');
     this.refreshIceRoute().catch(() => {});
     dashboardUpdateTransportStatus();
@@ -56112,7 +58738,11 @@ class DashboardControlTransport {
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok || body.ok === false) {
-      throw new Error(body.error || `${path} returned ${resp.status}`);
+      const err = new Error(body.error || `${path} returned ${resp.status}`);
+      // The rendezvous encodes who failed in the status: callers use it to
+      // tell a daemon-authored refusal from "no answer ever came back".
+      err.connectHttpStatus = resp.status;
+      throw err;
     }
     return body;
   }
@@ -56167,13 +58797,26 @@ class DashboardControlTransport {
       // materializes it before resolving this very offer (one-round-trip
       // first contact). The daemon re-verifies everything.
       const orgGrant = await orgGrantForOffer(DASHBOARD_CONNECT_DAEMON_ID);
-      const answer = await this.postConnectSignal('/api/browser/offer', {
-        daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
-        sdp,
-        client_nonce: this.clientNonce,
-        ...identity,
-        ...(orgGrant ? { org_grant: orgGrant } : {}),
-      });
+      let answer;
+      try {
+        answer = await this.postConnectSignal('/api/browser/offer', {
+          daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
+          sdp,
+          client_nonce: this.clientNonce,
+          ...identity,
+          ...(orgGrant ? { org_grant: orgGrant } : {}),
+        });
+      } catch (err) {
+        // 502 relays the daemon's own words: it received the offer and
+        // posted an explicit refusal back through the rendezvous (the one
+        // exception is the service-internal "daemon answer channel
+        // closed"). Everything else — 504 offer timeout, 404 unknown
+        // daemon, a fetch failure — means no answer ever arrived.
+        const daemonSpoke = err?.connectHttpStatus === 502 &&
+          !/daemon answer channel closed/i.test(String(err?.message || ''));
+        err.controlErrorKind = daemonSpoke ? 'refused' : 'signaling';
+        throw err;
+      }
       this.signalingMode = 'connect-rendezvous';
       dashboardUpdateTransportStatus();
       return answer;
@@ -56325,6 +58968,7 @@ class DashboardControlTransport {
       iceRoute: this.iceRoute,
       iceCandidatePair: this.iceCandidatePair,
       lastError: this.lastError,
+      lastErrorKind: this.lastErrorKind,
       eventsActive: dashboardControlEventsActive,
       grantKind: this.lastStatus?.grant_kind ?? null,
       grantLabel: this.lastStatus?.grant_label ?? null,
@@ -67104,12 +69748,15 @@ function switchFilesSubtab(name) {
 }
 
 // The machine tint: one accent answers "whose disk is this?" — blue for
-// this daemon, mauve for a peer. Applied to the active editor tab, tree
-// selection, and the statusbar host chip via --files-accent.
+// this daemon, mauve for a peer (ui-v2 maps the same rule onto the design
+// palette: sky = this daemon, violet = peer). Applied to the active editor
+// tab, tree selection, and the statusbar host chip via --files-accent.
 function filesIdeApplyAccent(hostId) {
-  document
-    .getElementById('tab-files')
-    ?.style.setProperty('--files-accent', hostId ? 'var(--mauve)' : 'var(--blue)');
+  const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
+  const accent = hostId
+    ? (ui2 ? 'var(--violet)' : 'var(--mauve)')
+    : (ui2 ? 'var(--sky)' : 'var(--blue)');
+  document.getElementById('tab-files')?.style.setProperty('--files-accent', accent);
 }
 
 function filesIdeSelectedHostId() {
@@ -67946,6 +70593,9 @@ function filesIdeActivate(key) {
         },
       },
     });
+    // Ln/Col statusbar indicator (ui-v2 design add; span is hidden and
+    // stays empty under v1).
+    filesIdeCm.on('cursorActivity', filesIdeUpdateLnCol);
   }
   if (empty) empty.classList.add('hidden');
   if (filesIdeCm) {
@@ -68040,6 +70690,22 @@ function filesIdeSetSaveStatus(kind, text) {
   el.className = 'files-ide-save-status' + (kind ? ` ${kind}` : '');
 }
 
+// Ln/Col cursor indicator, ui-v2 only: the design statusbar reads
+// `host · Language · LF · Ln 8, Col 24`. Under v1 the span is display:none
+// and kept empty so the flex gap contributes nothing.
+function filesIdeUpdateLnCol() {
+  const el = document.getElementById('files-ide-status-lncol');
+  if (!el) return;
+  const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
+  const buffer = filesIdeActiveBuffer();
+  if (!ui2 || !buffer || !filesIdeCm) {
+    if (el.textContent) el.textContent = '';
+    return;
+  }
+  const pos = filesIdeCm.getCursor();
+  el.textContent = `Ln ${pos.line + 1}, Col ${pos.ch + 1}`;
+}
+
 function filesIdeRenderChrome() {
   const buffer = filesIdeActiveBuffer();
   const pathEl = document.getElementById('files-ide-status-path');
@@ -68097,6 +70763,7 @@ function filesIdeRenderChrome() {
       banner.innerHTML = '';
     }
   }
+  filesIdeUpdateLnCol();
 }
 
 function filesIdeSerializeBuffer(buffer) {
@@ -69926,6 +72593,25 @@ let debugScreenActive = false;
 let debugRecording = false;
 const browserWorkspaces = new Map();
 
+// ui-v2 re-skin (design overhaul): the reference Debug page carries a page
+// header the v1 DOM never had. Inject it under the flag only — v1 markup
+// stays untouched; the cards, ids, and handlers below are shared by both.
+if (ui2Enabled()) {
+  const debugPane = document.querySelector('#tab-debug .debug-pane');
+  if (debugPane) {
+    const head = document.createElement('header');
+    head.className = 'ui2-page-head';
+    const title = document.createElement('h2');
+    title.className = 'ui2-page-title';
+    title.textContent = 'Debug';
+    const sub = document.createElement('p');
+    sub.className = 'ui2-page-sub';
+    sub.textContent = 'Diagnostics, the headless observer display, and managed browser workspaces.';
+    head.append(title, sub);
+    debugPane.prepend(head);
+  }
+}
+
 function toggleDebugScreen() {
   if (debugScreenActive) {
     dispatchDashboardActionMsg({ action: 'teardown_debug_screen' });
@@ -69964,6 +72650,8 @@ function renderBrowserWorkspaces() {
   for (const w of rows) {
     const card = document.createElement('div');
     card.className = 'debug-workspace-row';
+    // ui-v2 status dot is CSS-keyed off this attribute; v1 renders none.
+    if (ui2Enabled()) card.dataset.status = String(w.status || '');
     const meta = document.createElement('div');
     meta.className = 'debug-workspace-row-main';
     const lease = w.lease ? ` leased by ${w.lease.holder_id || 'unknown'}` : ' unleased';
@@ -70013,6 +72701,15 @@ function handleBrowserWorkspaceMessage(d) {
   renderBrowserWorkspaces();
 }
 
+// The dashboard-fronted session id for owner/holder stamping. The old
+// `currentSessionId` global died in the AppWeb→PresenceWeb merge
+// (9285c7b6); the bare reads below kept the dead name and threw
+// ReferenceError, silently breaking Create and Take/Acquire since March.
+// Same fallback chain the session-window code uses for self-identity.
+function debugPaneSessionId() {
+  return String(currentSessionFullId || daemonSessionFullId || '').trim();
+}
+
 function createBrowserWorkspaceFromDebug() {
   if (!app) return;
   const g = id => document.getElementById(id);
@@ -70021,7 +72718,7 @@ function createBrowserWorkspaceFromDebug() {
     url: (g('browser-workspace-url')?.value || '').trim() || undefined,
     provider: g('browser-workspace-provider')?.value || 'auto',
     label: (g('browser-workspace-label')?.value || '').trim() || undefined,
-    owner_session_id: currentSessionId || undefined,
+    owner_session_id: debugPaneSessionId() || undefined,
   });
 }
 
@@ -70030,7 +72727,7 @@ function acquireBrowserWorkspace(workspaceId, force = false) {
   dispatchDashboardActionMsg({
     action: 'acquire_browser_workspace',
     workspace_id: workspaceId,
-    holder_id: currentSessionId || ((typeof connectionId !== 'undefined' && connectionId) ? connectionId : 'dashboard'),
+    holder_id: debugPaneSessionId() || ((typeof connectionId !== 'undefined' && connectionId) ? connectionId : 'dashboard'),
     holder_kind: 'human',
     force: !!force,
   });
@@ -70230,7 +72927,7 @@ function setSessionsHost(hostId) {
   const next = !hostId || hostId === selfPeerId ? '' : String(hostId);
   if (next === sessionsActiveHostId) return;
   sessionsActiveHostId = next;
-  sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
+  sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
   renderSessionsHostStrip();
   loadSessions({ force: true });
 }
@@ -70328,8 +73025,10 @@ function loadSessions(options = {}) {
   if (cached) {
     applyLoadedSessions(cached, aggEl, hostId);
   } else if (listEl) {
-    // Fresh (uncached) load replaces the list — reset the Show-more window.
-    sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
+    // Fresh (uncached) load replaces the list — reset the Show-more window
+    // and drop the render-pass state (the skeleton wipe orphans its DOM).
+    sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
+    resetSessionsListRenderState(listEl.id);
     listEl.innerHTML = '<div class="ui-skel sessions-skel-card"></div>'.repeat(6);
   }
 
@@ -70453,6 +73152,7 @@ function loadSessions(options = {}) {
           requestedLimit,
         );
         if (!cached && listEl) {
+          resetSessionsListRenderState(listEl.id);
           listEl.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
         }
       });
@@ -70582,7 +73282,17 @@ function sessionLineageRelationshipLabel(kind) {
   return kind || 'related';
 }
 
+// Single-slot memo: the index costs two sessionConfigMetadata sweeps over
+// the whole corpus, and every render pass (each search keystroke included)
+// wants it. The rowset array is replaced whenever data changes
+// (mergeSessionRows), so array identity is the invalidation key.
+let _sessionLineageIndexFor = null;
+let _sessionLineageIndexMemo = null;
+
 function buildSessionLineageIndex(sessions) {
+  if (sessions && sessions === _sessionLineageIndexFor && _sessionLineageIndexMemo) {
+    return _sessionLineageIndexMemo;
+  }
   const byId = new Map();
   const childrenByParentId = new Map();
   const rows = Array.isArray(sessions) ? sessions : [];
@@ -70601,7 +73311,15 @@ function buildSessionLineageIndex(sessions) {
     if (!childrenByParentId.has(parentId)) childrenByParentId.set(parentId, []);
     childrenByParentId.get(parentId).push(session);
   }
-  return { byId, childrenByParentId };
+  // Deterministic child ordering regardless of the caller's sort: newest
+  // first (the index used to inherit the list's sort order).
+  for (const children of childrenByParentId.values()) {
+    children.sort((a, b) => sessionDateSortValue(b, 'updated_at') - sessionDateSortValue(a, 'updated_at'));
+  }
+  const index = { byId, childrenByParentId };
+  _sessionLineageIndexFor = sessions;
+  _sessionLineageIndexMemo = index;
+  return index;
 }
 
 function sessionLineageParentForSession(index, session, meta = null) {
@@ -70636,7 +73354,9 @@ function sessionLineageOpenSession(sourceSession, targetSession, targetId, ev = 
   }
   const id = compactSessionText(targetId || targetSession?.session_id || targetSession?.resume_id);
   if (!id) return;
-  const target = targetSession || {
+  // Re-resolve at click time: lineage chips can outlive the row snapshot
+  // they were built from (cards are cached across stream refreshes).
+  const target = findCachedSessionByAnyId(id) || targetSession || {
     session_id: id,
     source: sessionLineageSource(sourceSession),
     task: shortSessionId(id),
@@ -70784,7 +73504,7 @@ function _refilterSessions() {
 // Filter/search/sort change: the visible set changes shape, so the
 // Show-more window snaps back to the default page size.
 function _refreshSessionsFilters() {
-  sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
+  sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
   _refilterSessions();
 }
 
@@ -70809,6 +73529,20 @@ function sessionChangedSortValue(session) {
   );
 }
 
+// Throwaway scratch paths (agent test homes, e2e rigs, OS temp) can easily
+// outnumber real projects in the corpus. They collapse into one synthetic
+// menu entry instead of ballooning the picker; selecting it matches every
+// temp-shaped path.
+const SESSION_TEMP_PROJECTS_FILTER_VALUE = '::temp-projects::';
+
+function sessionPathLooksTemporary(path) {
+  if (!path) return false;
+  if (/^\/(private\/)?var\/folders\//.test(path)) return true;
+  return String(path)
+    .split(/[\\/]+/)
+    .some(seg => seg === 'tmp' || seg === 'temp' || seg === 'Temp' || seg === 'TEMP');
+}
+
 function sessionProjectFilterOptions(sessions) {
   const buckets = new Map();
   for (const session of Array.isArray(sessions) ? sessions : []) {
@@ -70824,7 +73558,27 @@ function sessionProjectFilterOptions(sessions) {
     existing.latestChanged = Math.max(existing.latestChanged, sessionChangedSortValue(session));
     buckets.set(path, existing);
   }
-  return Array.from(buckets.values()).sort((a, b) => {
+  const options = [];
+  let temp = null;
+  for (const item of buckets.values()) {
+    if (!sessionPathLooksTemporary(item.path)) {
+      options.push(item);
+      continue;
+    }
+    temp = temp || {
+      path: SESSION_TEMP_PROJECTS_FILTER_VALUE,
+      label: 'Temporary directories',
+      title: 'Sessions whose project directory is a throwaway temp path (/tmp, /var/folders, %TEMP%)',
+      count: 0,
+      paths: 0,
+      latestChanged: 0,
+    };
+    temp.count += item.count;
+    temp.paths += 1;
+    temp.latestChanged = Math.max(temp.latestChanged, item.latestChanged);
+  }
+  if (temp) options.push(temp);
+  return options.sort((a, b) => {
     const byChanged = b.latestChanged - a.latestChanged;
     if (byChanged) return byChanged;
     const byLabel = a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
@@ -70835,10 +73589,49 @@ function sessionProjectFilterOptions(sessions) {
 function sessionProjectMultiFilterOptions(sessions) {
   return sessionProjectFilterOptions(sessions).map(item => ({
     value: item.path,
-    label: `${item.label} (${item.count.toLocaleString()})`,
-    title: item.path,
+    label: item.paths
+      ? `${item.label} (${item.paths.toLocaleString()} paths, ${item.count.toLocaleString()})`
+      : `${item.label} (${item.count.toLocaleString()})`,
+    title: item.title || item.path,
     plural: 'projects',
   }));
+}
+
+// The project menus render a bounded page of the full option set: every
+// selected value (unchecking must always be possible), then the most
+// recently active projects up to the cap, with an inline filter box that
+// narrows against the whole set. An uncapped render once ballooned the
+// hidden DOM with hundreds of scratch-path checkboxes per menu.
+const SESSION_PROJECT_MENU_CAP = 40;
+const _sessionProjectMenuFilterText = new Map(); // menuId → live filter text
+
+function sessionProjectMenuScaffold(menu, kind, cfg) {
+  let optionsWrap = menu.querySelector(':scope > .sessions-multi-filter-options');
+  if (optionsWrap) {
+    return { search: menu.querySelector(':scope > .sessions-multi-filter-search'), optionsWrap };
+  }
+  menu.textContent = '';
+  const search = document.createElement('div');
+  search.className = 'sessions-multi-filter-search';
+  const input = document.createElement('input');
+  input.type = 'search';
+  input.addEventListener('input', () => {
+    _sessionProjectMenuFilterText.set(cfg.menuId, input.value.trim());
+    renderSessionProjectFilterMenu(kind);
+  });
+  input.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Escape' || !input.value) return;
+    input.value = '';
+    _sessionProjectMenuFilterText.set(cfg.menuId, '');
+    renderSessionProjectFilterMenu(kind);
+    ev.stopPropagation();
+  });
+  search.appendChild(input);
+  optionsWrap = document.createElement('div');
+  optionsWrap.className = 'sessions-multi-filter-options';
+  menu.appendChild(search);
+  menu.appendChild(optionsWrap);
+  return { search, optionsWrap };
 }
 
 function renderSessionProjectFilterMenu(kind) {
@@ -70846,16 +73639,43 @@ function renderSessionProjectFilterMenu(kind) {
   const menu = document.getElementById(cfg.menuId);
   if (!menu) return;
   const selected = new Set(parseStoredSessionMultiFilter(kind));
-  menu.innerHTML = '';
+  const { search, optionsWrap } = sessionProjectMenuScaffold(menu, kind, cfg);
+  const filterText = (_sessionProjectMenuFilterText.get(cfg.menuId) || '').toLowerCase();
+  const searchInput = search.querySelector('input');
+  searchInput.placeholder = `Filter ${cfg.options.length.toLocaleString()} projects...`;
+  search.classList.toggle('hidden', cfg.options.length <= SESSION_PROJECT_MENU_CAP && !filterText);
+  optionsWrap.textContent = '';
 
-  if (cfg.options.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'sessions-multi-filter-empty';
-    empty.textContent = 'No project directories';
-    menu.appendChild(empty);
+  const matchesFilter = opt => !filterText
+    || opt.label.toLowerCase().includes(filterText)
+    || String(opt.value).toLowerCase().includes(filterText)
+    || String(opt.title || '').toLowerCase().includes(filterText);
+  const visible = [];
+  for (const opt of cfg.options) {
+    if (selected.has(opt.value)) visible.push(opt);
+  }
+  let overflow = 0;
+  let shown = 0;
+  for (const opt of cfg.options) {
+    if (selected.has(opt.value) || !matchesFilter(opt)) continue;
+    if (shown >= SESSION_PROJECT_MENU_CAP) {
+      overflow += 1;
+      continue;
+    }
+    visible.push(opt);
+    shown += 1;
   }
 
-  for (const opt of cfg.options) {
+  if (visible.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'sessions-multi-filter-empty';
+    empty.textContent = filterText
+      ? `No projects match "${filterText}"`
+      : 'No project directories';
+    optionsWrap.appendChild(empty);
+  }
+
+  for (const opt of visible) {
     const label = document.createElement('label');
     if (opt.title) label.title = opt.title;
     const input = document.createElement('input');
@@ -70867,7 +73687,14 @@ function renderSessionProjectFilterMenu(kind) {
     text.textContent = opt.label;
     label.appendChild(input);
     label.appendChild(text);
-    menu.appendChild(label);
+    optionsWrap.appendChild(label);
+  }
+
+  if (overflow > 0) {
+    const more = document.createElement('div');
+    more.className = 'sessions-multi-filter-more';
+    more.textContent = `+${overflow.toLocaleString()} more — type to narrow`;
+    optionsWrap.appendChild(more);
   }
 
   const validSelected = Array.from(selected).filter(value =>
@@ -70881,10 +73708,29 @@ function renderSessionProjectFilterMenu(kind) {
   setSessionMultiFilterValues(kind, validSelected);
 }
 
+let _sessionProjectOptionsSerialized = null;
+
 function updateSessionProjectFilterOptions(sessions = _cachedSessions) {
   sessionProjectFilterOptionsCache = sessionProjectMultiFilterOptions(sessions);
-  renderSessionProjectFilterMenu('project');
-  renderSessionProjectFilterMenu('deep-project');
+  // Streamed refreshes call this on every flush; skip the DOM work when the
+  // option set didn't change, and never rebuild a menu the user has open —
+  // it re-renders on its next open instead.
+  const serialized = JSON.stringify(sessionProjectFilterOptionsCache.map(o => [o.value, o.label]));
+  const changed = serialized !== _sessionProjectOptionsSerialized;
+  _sessionProjectOptionsSerialized = serialized;
+  for (const kind of ['project', 'deep-project']) {
+    const menu = document.getElementById(sessionMultiFilterConfig(kind).menuId);
+    if (!menu) continue;
+    const rendered = menu.dataset.optionsRendered === '1';
+    if (rendered && !changed) continue;
+    if (rendered && !menu.classList.contains('hidden')) {
+      menu.dataset.staleOptions = '1';
+      continue;
+    }
+    renderSessionProjectFilterMenu(kind);
+    menu.dataset.optionsRendered = '1';
+    delete menu.dataset.staleOptions;
+  }
 }
 
 function sessionMultiFilterConfig(kind) {
@@ -71026,11 +73872,20 @@ function setupSessionMultiFilter(kind, onChange) {
     ev.stopPropagation();
     const willOpen = menu.classList.contains('hidden');
     closeSessionMultiFilterMenus(willOpen ? kind : '');
+    if (willOpen && menu.dataset.staleOptions === '1') {
+      // Option refreshes are deferred while the menu is open (see
+      // updateSessionProjectFilterOptions) — catch up before showing it.
+      renderSessionProjectFilterMenu(kind);
+      delete menu.dataset.staleOptions;
+    }
     menu.classList.toggle('hidden', !willOpen);
     button.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
   });
   menu.addEventListener('click', ev => ev.stopPropagation());
-  menu.addEventListener('change', () => {
+  menu.addEventListener('change', (ev) => {
+    // The project menus embed a text filter input; only checkbox toggles
+    // are selection changes.
+    if (ev.target && ev.target.type !== 'checkbox') return;
     const values = sessionMultiFilterValues(kind);
     localStorage.setItem(cfg.key, JSON.stringify(values));
     updateSessionMultiFilterSummary(kind);
@@ -71229,7 +74084,9 @@ function sessionDeepProjectFilterValue() {
 function sessionMatchesProjectFilter(session, filter) {
   const filters = Array.isArray(filter) ? filter : (filter && filter !== 'all' ? [filter] : []);
   if (filters.length === 0) return true;
-  return filters.includes(sessionProjectDirectory(session));
+  const dir = sessionProjectDirectory(session);
+  if (filters.includes(SESSION_TEMP_PROJECTS_FILTER_VALUE) && sessionPathLooksTemporary(dir)) return true;
+  return filters.includes(dir);
 }
 
 function sessionMatchesSourceFilter(source, filter) {
@@ -71535,8 +74392,25 @@ function updateSessionsSearchStatus() {
   }
 }
 
+// Per-row haystack memo: without it every quick-search keystroke rebuilds
+// a ~30-field string for every row in the corpus. Keyed by row object
+// identity — mergeSessionRows keeps identity for untouched rows and swaps
+// it when a row changes, so entries invalidate themselves; the two inputs
+// that can drift independently of the row (current-session status override)
+// revalidate explicitly. source/shortId derive from the row and need no key.
+const _sessionSearchTextCache = new WeakMap();
+
 function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
+  const cached = _sessionSearchTextCache.get(session);
+  if (cached && cached.status === displayStatus && cached.current === isCurrent) {
+    return cached.text;
+  }
   const totalBytes = session.total_bytes || 0;
+  // Server-side conversation preview (first user/assistant messages) —
+  // quick search reaches into conversation text without a Deep Search.
+  const previewText = Array.isArray(session.preview)
+    ? session.preview.map(p => (p && p.text) || '').filter(Boolean).join(' ')
+    : '';
   const fields = [
     session.session_id,
     shortId,
@@ -71572,11 +74446,14 @@ function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
     totalBytes > 0 ? `${_fmtBytes(totalBytes)} size` : '',
     session.total_tokens != null ? `${session.total_tokens} tokens` : '',
     session.estimated_cost != null ? `$${Number(session.estimated_cost).toFixed(4)}` : '',
+    previewText,
   ];
-  return fields
+  const text = fields
     .filter(v => v !== null && v !== undefined && v !== '')
     .join(' ')
     .toLowerCase();
+  _sessionSearchTextCache.set(session, { status: displayStatus, current: isCurrent, text });
+  return text;
 }
 
 function sessionMatchesSearch(session, query, displayStatus, source, shortId, isCurrent) {
@@ -71642,101 +74519,101 @@ function renderAggregateStatTiles(el, cards) {
 }
 
 /* ── static/app/57-sessions-replay.js ── */
-function renderSessionsList(sessions, el, options = {}) {
-  if (!el) return;
-  el.innerHTML = '';
-  updateSessionsSearchStatus();
+// ── Sessions list rendering: windowed, signature-guarded, node-stable ──
+// The corpus (_cachedSessions) can be thousands of rows; the DOM holds only
+// `sessionsRenderWindow` cards (one SESSION_CARD_RENDER_PAGE initially,
+// auto-grown page-at-a-time by a scroll sentinel, with the Show-more button
+// as the explicit fallback). Each render pass is decided by a cheap
+// signature: an identical pass is skipped outright, a grown window appends
+// only the new cards, and only a changed rowset/filter/sort runs a full
+// pass — and even a full pass reuses the DOM node of every card whose
+// content signature is unchanged, so a stream refresh keeps node identity
+// (and event listeners) for untouched rows instead of wiping the subtree.
+// (Pass state lives in the early client-state block — deep-link TDZ.)
 
-  const deepSearchOnly = !!options.deepSearchOnly;
-  if (deepSearchOnly && !_sessionDeepSearch.active) {
-    const message = _sessionDeepSearch.loading
-      ? 'Deep search is running...'
-      : 'Run a deep search to show log matches';
-    el.innerHTML = `<div class="empty-state">${message}</div>`;
-    return;
+function sessionsListRenderStateFor(elId) {
+  let st = _sessionsListRenderState.get(elId);
+  if (!st) {
+    st = {
+      dataRef: null,
+      optionsKey: '',
+      window: 0,
+      matched: null, // match entries from the last full pass (sorted, filtered)
+      matchedCount: 0,
+      hiddenSubagentCount: 0,
+      renderedCount: 0,
+      cards: new Map(), // row key → { sig, card } — bounded by the render window
+      trailer: [],
+      io: null,
+      growPending: false,
+      lastMode: 'none',
+      lastMs: 0,
+      passSeq: 0, // counts non-skip passes; QA sequencing hook
+    };
+    _sessionsListRenderState.set(elId, st);
   }
+  return st;
+}
 
-  if (sessions.length === 0) {
-    el.innerHTML = '<div class="empty-state">No sessions found</div>';
-    return;
-  }
+// Wipe sites (loading skeletons, empty states, error placeholders) replace
+// the list DOM out from under the pass state — they must drop it so the
+// next render runs a full pass instead of appending into a foreign subtree.
+function resetSessionsListRenderState(elId) {
+  const st = elId ? _sessionsListRenderState.get(elId) : null;
+  if (!st) return;
+  if (st.io) st.io.disconnect();
+  _sessionsListRenderState.delete(elId);
+}
 
-  // Sort sessions based on dropdown
+// Everything besides the rowset that changes what the list shows. A pass
+// with the same data array identity and the same key as the previous one
+// is a no-op (mergeSessionRows returns a new array whenever data changed).
+function sessionsListOptionsKey(options, currentSessionId) {
+  return JSON.stringify([
+    options.mode || '',
+    options.query || '',
+    options.sortValue || 'updated-desc',
+    options.projectFilter || '',
+    options.sourceFilter || [],
+    options.statusFilter || [],
+    !!options.deepSearchOnly,
+    options.deepSearchOnly ? _sessionDeepSearchToken : 0,
+    options.deepSearchOnly ? !!_sessionDeepSearch.active : false,
+    !!options.hideSubagents,
+    currentSessionId,
+    sessionsViewingPeer() ? currentSessionsHostId() : '',
+  ]);
+}
+
+function collectSessionsListMatches(sessions, options, ctx) {
   const sortVal = options.sortValue || 'updated-desc';
-  const sorted = [...sessions];
   const [field, dir] = sortVal.split('-');
   const asc = dir === 'asc';
-  sorted.sort((a, b) => {
-    let va, vb;
+  const sortKey = (s) => {
     switch (field) {
-      case 'created':
-        va = sessionDateSortValue(a, 'created_at');
-        vb = sessionDateSortValue(b, 'created_at');
-        break;
-      case 'updated':
-        va = sessionDateSortValue(a, 'updated_at');
-        vb = sessionDateSortValue(b, 'updated_at');
-        break;
-      case 'cost':
-        va = a.estimated_cost || 0;
-        vb = b.estimated_cost || 0;
-        break;
-      case 'size':
-        va = a.total_bytes || 0;
-        vb = b.total_bytes || 0;
-        break;
-      case 'turns':
-        va = a.turns || 0;
-        vb = b.turns || 0;
-        break;
+      case 'created': return sessionDateSortValue(s, 'created_at');
+      case 'updated': return sessionDateSortValue(s, 'updated_at');
+      case 'cost': return s.estimated_cost || 0;
+      case 'size': return s.total_bytes || 0;
+      case 'turns': return s.turns || 0;
       default: return 0;
     }
-    return asc ? va - vb : vb - va;
-  });
-
-  const currentSessionId = daemonSessionFullId || '';
+  };
+  // Decorate-sort-undecorate: sessionDateSortValue parses timestamps, so
+  // key once per row instead of once per comparison.
+  const decorated = sessions.map(s => [sortKey(s), s]);
+  decorated.sort((a, b) => asc ? a[0] - b[0] : b[0] - a[0]);
 
   const query = options.query || '';
   const projectFilter = options.projectFilter || '';
   const sourceFilter = options.sourceFilter || [];
   const statusFilter = options.statusFilter || [];
-  const hasProjectFilter = Array.isArray(projectFilter) ? projectFilter.length > 0 : !!projectFilter;
-  const deepSearchActive = deepSearchOnly && _sessionDeepSearch.active;
-  const hideSubagents = !!options.hideSubagents;
+  const matched = [];
   let hiddenSubagentCount = 0;
-  let matchedCount = 0;
-  let renderedCount = 0;
-  const fragment = document.createDocumentFragment();
-  const lineageIndex = buildSessionLineageIndex(sorted);
-
-  for (const s of sorted) {
-    const configMeta = sessionConfigMetadata(s);
-    const configSource = sessionConfigSource(configMeta);
-    const relationshipKind = sessionRelationshipKindForRow(s, configMeta);
-    const rawSource = normalizeAgentId(s.source || '') || 'intendant';
-    const backendSource = normalizeAgentId(
-      s.backend_source ||
-      s.backendSource ||
-      s.configured_source ||
-      s.configuredSource ||
-      configMeta.backend_source ||
-      configMeta.backendSource ||
-      configMeta.configured_source ||
-      configMeta.configuredSource ||
-      ''
-    );
-    const hasExternalBackend = !!(
-      backendSource && backendSource !== 'intendant' ||
-      configSource && configSource !== 'intendant' ||
-      s.backend_session_id ||
-      s.backendSessionId ||
-      configMeta.backendSessionId ||
-      configMeta.backend_session_id
-    );
-    const source = rawSource;
+  for (const [, s] of decorated) {
+    const source = normalizeAgentId(s.source || '') || 'intendant';
     const shortId = (s.session_id || '').substring(0, 8);
-    const isExternal = source !== 'intendant';
-    const isCurrent = currentSessionId && s.session_id && s.session_id.startsWith(currentSessionId);
+    const isCurrent = !!(ctx.currentSessionId && s.session_id && s.session_id.startsWith(ctx.currentSessionId));
 
     // Override status for current session — never show as abandoned/idle
     let displayStatus = s.status || 'in_progress';
@@ -71744,382 +74621,249 @@ function renderSessionsList(sessions, el, options = {}) {
       displayStatus = 'in_progress';
     }
 
-    // Apply filters
+    // Cheap filters first; sessionConfigMetadata (object merges per row)
+    // only runs for rows that survive them.
     if (!sessionMatchesProjectFilter(s, projectFilter)) continue;
     if (!sessionMatchesSourceFilter(source, sourceFilter)) continue;
     if (!sessionMatchesStatusFilter(displayStatus, statusFilter)) continue;
-    const summaryMatch = sessionMatchesSearch(s, query, displayStatus, source, shortId, isCurrent);
-    if (!summaryMatch) continue;
-    const logHit = deepSearchOnly ? sessionDeepSearchHit(s, source) : null;
-    if (deepSearchActive && !logHit) continue;
-    if (hideSubagents && relationshipKind === 'subagent') {
+    if (!sessionMatchesSearch(s, query, displayStatus, source, shortId, isCurrent)) continue;
+    const logHit = ctx.deepSearchOnly ? sessionDeepSearchHit(s, source) : null;
+    if (ctx.deepSearchActive && !logHit) continue;
+    if (ctx.hideSubagents && sessionRelationshipKindForRow(s) === 'subagent') {
       hiddenSubagentCount += 1;
       continue;
     }
+    matched.push({ s, source, shortId, isCurrent, displayStatus, logHit });
+  }
+  return { matched, hiddenSubagentCount };
+}
 
-    matchedCount += 1;
-    if (renderedCount >= sessionsRenderWindow) continue;
-    renderedCount += 1;
-
-    const rowIsPartial = s.partial === true;
-    const card = document.createElement('div');
-    card.className = 'session-card';
-    if (isCurrent) card.classList.add('current');
-    if (displayStatus === 'abandoned') card.classList.add('dimmed');
-    if (rowIsPartial) card.classList.add('partial');
-
-    const sessionName = compactSessionText(s.name);
-    const taskText = compactSessionText(s.task);
-    const sessionId = s.session_id || '';
-    const primaryText = sessionName || taskText || 'Untitled session';
-    const titleKindText = sessionName ? 'name' : taskText ? 'initial' : 'untitled';
-
-    // Top row: name/task + status badges
-    const top = document.createElement('div');
-    top.className = 'sc-top';
-
-    const titleBlock = document.createElement('div');
-    titleBlock.className = 'sc-title-block';
-    const titleRow = document.createElement('div');
-    titleRow.className = 'sc-title-row';
-    const titleKind = document.createElement('span');
-    titleKind.className = 'sc-title-kind';
-    titleKind.classList.add(titleKindText);
-    titleKind.textContent = titleKindText;
-    titleKind.title = sessionName
-      ? 'User-assigned session name'
-      : taskText
-        ? 'Initial message fallback'
-        : 'No initial message found';
-    titleRow.appendChild(titleKind);
-    const nameEl = document.createElement('div');
-    nameEl.className = 'sc-name';
-    nameEl.textContent = primaryText;
-    nameEl.title = primaryText;
-    titleRow.appendChild(nameEl);
-    titleBlock.appendChild(titleRow);
-    top.appendChild(titleBlock);
-
-    const statusEl = document.createElement('span');
-    statusEl.className = `ui-chip ${sessionStatusChipTone(displayStatus)} sc-status ${displayStatus}`;
-    statusEl.textContent = displayStatus.replace('_', ' ');
-    top.appendChild(statusEl);
-
-    const sourceEl = document.createElement('span');
-    sourceEl.className = 'ui-badge sc-source' + (isExternal ? '' : ' local');
-    sourceEl.textContent = isExternal
-      ? (
-        s.source_label ||
-        s.sourceLabel ||
-        s.backend_source_label ||
-        s.backendSourceLabel ||
-        prettyAgentName(source) ||
-        source
-      )
-      : (s.source_label || s.sourceLabel || 'Intendant');
-    if (!isExternal && hasExternalBackend && backendSource && backendSource !== 'intendant') {
-      sourceEl.title = `${prettyAgentName(backendSource) || backendSource} backend`;
+// Card inputs computed from OUTSIDE the row object itself (lineage across
+// other rows, live config metadata, deep-search hits, peer browsing).
+// The row's own fields are covered by JSON.stringify(row) in the card
+// signature; this covers the rest, so signature equality ⇒ identical card.
+function sessionCardDerived(m, ctx) {
+  const { s } = m;
+  const configMeta = sessionConfigMetadata(s);
+  const configSource = sessionConfigSource(configMeta);
+  const relationshipKind = sessionRelationshipKindForRow(s, configMeta);
+  const backendSource = normalizeAgentId(
+    s.backend_source ||
+    s.backendSource ||
+    s.configured_source ||
+    s.configuredSource ||
+    configMeta.backend_source ||
+    configMeta.backendSource ||
+    configMeta.configured_source ||
+    configMeta.configuredSource ||
+    ''
+  );
+  const hasExternalBackend = !!(
+    backendSource && backendSource !== 'intendant' ||
+    configSource && configSource !== 'intendant' ||
+    s.backend_session_id ||
+    s.backendSessionId ||
+    configMeta.backendSessionId ||
+    configMeta.backend_session_id
+  );
+  let nickname = '';
+  let parentId = '';
+  let parent = null;
+  let parentLabel = '';
+  if (relationshipKind) {
+    nickname = compactSessionText(configMeta.agentNickname || s.agent_nickname || s.agentNickname);
+    const lineage = sessionLineageParentForSession(ctx.lineageIndex, s, configMeta);
+    parentId = lineage.parentId;
+    parent = lineage.parent;
+    parentLabel = sessionLineageDisplayLabel(parent, parentId);
+  }
+  const lineageChildren = sessionLineageChildrenForSession(ctx.lineageIndex, s, configMeta)
+    .filter(child => !ctx.hideSubagents || sessionRelationshipKindForRow(child) !== 'subagent');
+  // Quick-search hit inside the conversation preview: surface the message
+  // matching the most query terms as a snippet line on the card (any-term
+  // picking made a stray "to" beat the entry holding the actual phrase).
+  let previewHit = null;
+  if (ctx.query && Array.isArray(s.preview)) {
+    const terms = ctx.query.split(/\s+/).filter(Boolean);
+    let bestScore = 0;
+    for (const p of s.preview) {
+      const text = String((p && p.text) || '').toLowerCase();
+      if (!text) continue;
+      const score = terms.reduce((n, term) => n + (text.includes(term) ? 1 : 0), 0);
+      if (score > bestScore) {
+        bestScore = score;
+        previewHit = p;
+      }
     }
-    top.appendChild(sourceEl);
+  }
+  return {
+    configMeta, configSource, relationshipKind, backendSource, hasExternalBackend,
+    nickname, parentId, parent, parentLabel, lineageChildren, previewHit,
+  };
+}
 
-    if (rowIsPartial) {
-      const loadingEl = document.createElement('span');
-      loadingEl.className = 'ui-chip info sc-role sc-loading-chip';
-      loadingEl.textContent = 'loading details';
-      loadingEl.title = 'Tokens, costs, lineage, and disk sizes are still hydrating';
-      top.appendChild(loadingEl);
-    }
+function sessionCardSig(m, derived, ctx) {
+  const childSig = derived.lineageChildren.map(child => {
+    const childId = sessionLineageIds(child)[0] || child.session_id || '';
+    return `${sessionRelationshipKindForRow(child)}\u001e${childId}\u001e${sessionLineageDisplayLabel(child, childId)}`;
+  }).join('\u001d');
+  const hitSig = m.logHit
+    ? `${m.logHit.matches || 0}\u001e${(((m.logHit.snippets || [])[0]) || {}).content || ''}`
+    : '';
+  const previewHitSig = derived.previewHit
+    ? `${derived.previewHit.role || ''}\u001e${derived.previewHit.text || ''}`
+    : '';
+  return JSON.stringify(m.s) + '\u001f' + JSON.stringify([
+    m.displayStatus, m.isCurrent, m.source, ctx.viewingPeer,
+    derived.relationshipKind, derived.configSource, derived.backendSource,
+    derived.hasExternalBackend, derived.nickname, derived.parentId,
+    derived.parentLabel, childSig, hitSig, previewHitSig,
+  ]);
+}
 
-    if (s.role) {
-      const roleEl = document.createElement('span');
-      roleEl.className = 'ui-chip muted sc-role';
-      roleEl.textContent = s.role;
-      top.appendChild(roleEl);
-    }
+// Reused cards keep their DOM nodes, so their relative "Nm ago" label is
+// refreshed in place instead of by rebuild (the absolute timestamp lives
+// in the tooltip and never drifts).
+function refreshSessionCardRelativeLabel(card) {
+  const changedAt = card.dataset.changedAt || '';
+  if (!changedAt) return;
+  const span = card.querySelector('.sc-meta .value[data-rel="changed"]');
+  if (!span) return;
+  const label = sessionRelativeLabel(changedAt) || changedAt;
+  if (span.textContent !== label) span.textContent = label;
+}
 
-    if (relationshipKind) {
-      const nickname = compactSessionText(configMeta.agentNickname || s.agent_nickname || s.agentNickname);
-      const { parentId, parent } = sessionLineageParentForSession(lineageIndex, s, configMeta);
-      const parentLabel = sessionLineageDisplayLabel(parent, parentId);
-      const kindLabel = sessionLineageRelationshipLabel(relationshipKind);
-      const chipText = relationshipKind === 'subagent' && nickname
-        ? `${kindLabel} ${nickname}`
-        : parentId
-          ? `${kindLabel} of ${parentLabel}`
-          : kindLabel;
-      const titleParts = [
-        relationshipKind === 'subagent' && nickname ? `Subagent: ${nickname}` : `Relationship: ${kindLabel}`,
-        parentId ? `Parent: ${parentLabel} (${parentId})` : '',
-      ].filter(Boolean);
-      const relationEl = createSessionLineageListChip(s, parent, parentId, chipText, titleParts.join('\n') || `${kindLabel} session`);
-      top.appendChild(relationEl);
-    }
+function sessionCardFor(m, ctx, st, nextCards) {
+  const key = sessionListRowKey(m.s);
+  const derived = sessionCardDerived(m, ctx);
+  const sig = sessionCardSig(m, derived, ctx);
+  const cached = key ? st.cards.get(key) : null;
+  let card;
+  if (cached && cached.sig === sig) {
+    card = cached.card;
+    refreshSessionCardRelativeLabel(card);
+  } else {
+    card = buildSessionCard(m, derived, ctx);
+    if (key) card.dataset.sessionKey = key;
+    card.dataset.qaBuildSeq = String(++_sessionCardBuildSeq);
+  }
+  if (key) (nextCards || st.cards).set(key, { sig, card });
+  return card;
+}
 
-    const lineageChildren = sessionLineageChildrenForSession(lineageIndex, s, configMeta)
-      .filter(child => !hideSubagents || sessionRelationshipKindForRow(child) !== 'subagent');
-    if (lineageChildren.length > 0) {
-      const childrenEl = document.createElement('span');
-      childrenEl.className = 'ui-chip muted sc-role sc-lineage-chip sc-lineage-children';
-      childrenEl.textContent = lineageChildren.length === 1 ? '1 child' : `${lineageChildren.length} children`;
-      childrenEl.title = lineageChildren
-        .slice(0, 8)
-        .map(child => {
-          const childKind = sessionLineageRelationshipLabel(sessionRelationshipKindForRow(child));
-          const childId = sessionLineageIds(child)[0] || child.session_id || '';
-          return `${childKind}: ${sessionLineageDisplayLabel(child, childId)}${childId ? ` (${childId})` : ''}`;
-        })
-        .join('\n') + (lineageChildren.length > 8 ? `\n+${lineageChildren.length - 8} more` : '');
-      top.appendChild(childrenEl);
-    }
+function growSessionsRenderWindow() {
+  sessionsRenderWindow += SESSION_CARD_RENDER_PAGE;
+  renderSessionsViews();
+}
 
-    if (isCurrent) {
-      const badge = document.createElement('span');
-      badge.className = 'ui-chip info sc-current-badge';
-      badge.textContent = 'current';
-      top.appendChild(badge);
-    }
+function removeSessionsListTrailer(st) {
+  for (const node of st.trailer) node.remove();
+  st.trailer = [];
+}
 
-    card.appendChild(top);
-
-    // Task
-    if (taskText && sessionName) {
-      const taskEl = document.createElement('div');
-      taskEl.className = 'sc-task';
-      taskEl.textContent = taskText;
-      taskEl.title = taskText;
-      card.appendChild(taskEl);
-    }
-
-    if (logHit) {
-      const hitEl = document.createElement('div');
-      hitEl.className = 'sc-search-hit';
-      const hitCount = document.createElement('span');
-      hitCount.className = 'sc-search-hit-count';
-      const matches = Number(logHit.matches || 0);
-      hitCount.textContent = `${matches} log ${matches === 1 ? 'match' : 'matches'}`;
-      hitEl.appendChild(hitCount);
-      const firstSnippet = (logHit.snippets || [])[0] || {};
-      const hitText = document.createElement('span');
-      hitText.className = 'sc-search-hit-text';
-      hitText.textContent = firstSnippet.content || '';
-      hitText.title = firstSnippet.content || '';
-      hitEl.appendChild(hitText);
-      card.appendChild(hitEl);
-    }
-
-    // Meta row — the full session id (click to copy) plus compact
-    // essentials; the long tail (absolute dates, provider, token breakdown,
-    // disk) moves to the row tooltip and stays visible in the
-    // session-detail overlay.
-    const meta = document.createElement('div');
-    meta.className = 'sc-meta';
-    const addMetaField = (label, value, valueClass, valueTitle) => {
-      if (value === null || value === undefined || value === '') return null;
-      const span = document.createElement('span');
-      const l = document.createElement('span');
-      l.className = 'label';
-      l.textContent = label;
-      const v = document.createElement('span');
-      v.className = 'value' + (valueClass ? ` ${valueClass}` : '');
-      v.textContent = value;
-      if (valueTitle) v.title = valueTitle;
-      span.appendChild(l);
-      span.appendChild(v);
-      meta.appendChild(span);
-      return v;
-    };
-
-    const idVal = addMetaField('id', sessionId || shortId, 'sc-id', 'Click to copy the session ID');
-    if (idVal) {
-      idVal.addEventListener('click', (e) => {
-        e.stopPropagation();
-        const fullId = sessionId || shortId;
-        copyTextToClipboard(fullId)
-          .then(() => showControlToast('success', `Copied session ID ${shortSessionId(fullId)}`))
-          .catch(err => showControlToast('error', `Copy session ID failed: ${err?.message || err}`));
+// Scroll sentinel + Show-more fallback below the rendered cards. The
+// IntersectionObserver grows the window a page at a time as the user nears
+// the bottom; the button stays for environments without IO and as the
+// explicit bulk control.
+function appendSessionsListTrailer(el, st) {
+  removeSessionsListTrailer(st);
+  const remaining = st.matchedCount - st.renderedCount;
+  if (remaining <= 0) {
+    if (st.io) st.io.disconnect();
+    return;
+  }
+  const sentinel = document.createElement('div');
+  sentinel.className = 'sessions-scroll-sentinel';
+  sentinel.setAttribute('aria-hidden', 'true');
+  const moreRow = document.createElement('div');
+  moreRow.className = 'sessions-show-more';
+  const moreBtn = document.createElement('button');
+  moreBtn.type = 'button';
+  moreBtn.className = 'ui-btn sessions-show-more-btn';
+  moreBtn.textContent = `Show ${Math.min(SESSION_CARD_RENDER_PAGE, remaining).toLocaleString()} more (${remaining.toLocaleString()} remaining)`;
+  moreBtn.onclick = () => growSessionsRenderWindow();
+  moreRow.appendChild(moreBtn);
+  el.appendChild(sentinel);
+  el.appendChild(moreRow);
+  st.trailer = [sentinel, moreRow];
+  if (!st.io && typeof IntersectionObserver === 'function') {
+    st.io = new IntersectionObserver((entries) => {
+      if (!entries.some(e => e.isIntersecting)) return;
+      if (st.growPending) return;
+      st.growPending = true;
+      requestAnimationFrame(() => {
+        st.growPending = false;
+        if (st.matchedCount > st.renderedCount) growSessionsRenderWindow();
       });
-    }
-    const changedAt = s.updated_at || s.changed_at;
-    if (changedAt) addMetaField('changed', sessionRelativeLabel(changedAt) || changedAt, null, changedAt);
-    const projectPath = sessionProjectDirectory(s);
-    if (projectPath) addMetaField('project', compactPathLabel(projectPath), null, projectPath);
-    if (s.model) addMetaField('model', s.model, 'model-val');
-    if (s.turns > 0) addMetaField('turns', s.turns);
-    if (rowIsPartial) {
-      const loading = document.createElement('span');
-      loading.className = 'sc-loading-meta';
-      const loadingLabel = document.createElement('span');
-      loadingLabel.className = 'label';
-      loadingLabel.textContent = 'details';
-      const loadingVal = document.createElement('span');
-      loadingVal.className = 'value';
-      loadingVal.textContent = 'tokens, cost, lineage, size';
-      loading.appendChild(loadingLabel);
-      loading.appendChild(loadingVal);
-      meta.appendChild(loading);
-    } else {
-      if (s.total_tokens > 0) addMetaField('tokens', s.total_tokens.toLocaleString());
-      if (s.estimated_cost > 0) addMetaField('cost', formatUsd(s.estimated_cost, 2));
-    }
+    }, { rootMargin: '600px 0px' });
+  }
+  if (st.io) {
+    st.io.disconnect();
+    st.io.observe(sentinel);
+  }
+}
 
-    const tipParts = [];
-    if (s.created_at) tipParts.push(`created: ${s.created_at}`);
-    if (changedAt) tipParts.push(`changed: ${changedAt}`);
-    if (s.provider) tipParts.push(`provider: ${s.provider}`);
-    if (!rowIsPartial && s.total_tokens > 0) {
-      tipParts.push(`tokens: ${(s.prompt_tokens || 0).toLocaleString()} in${s.cached_tokens > 0 ? ` (${s.cached_tokens.toLocaleString()} cached)` : ''} / ${(s.completion_tokens || 0).toLocaleString()} out`);
-    }
-    if (!rowIsPartial && s.total_bytes > 0) tipParts.push(`disk: ${_fmtBytes(s.total_bytes)}`);
-    if (projectPath) tipParts.push(`project: ${projectPath}`);
-    if (tipParts.length) meta.title = tipParts.join('\n');
-    card.appendChild(meta);
+function renderSessionsList(sessions, el, options = {}) {
+  if (!el) return;
+  updateSessionsSearchStatus();
+  const elId = el.id || '';
+  const t0 = performance.now();
 
-    // Media stats row (recordings, annotations, clips) + total session size
-    const hasMedia = (s.recordings > 0 || s.annotations > 0 || s.clips > 0);
-    if (!rowIsPartial && hasMedia) {
-      const mediaMeta = document.createElement('div');
-      mediaMeta.className = 'sc-meta sc-media';
-      const addMediaField = (label, value, valueClass) => {
-        const span = document.createElement('span');
-        const l = document.createElement('span');
-        l.className = 'label';
-        l.textContent = label;
-        const v = document.createElement('span');
-        v.className = 'value' + (valueClass ? ` ${valueClass}` : '');
-        v.textContent = value;
-        span.appendChild(l);
-        span.appendChild(v);
-        mediaMeta.appendChild(span);
-      };
-      if (s.recordings > 0) addMediaField('recordings', s.recordings, 'v-blue');
-      if (s.annotations > 0) addMediaField('annotations', s.annotations, 'v-peach');
-      if (s.clips > 0) addMediaField('clips', s.clips, 'v-peach');
-      if (s.total_bytes > 0) addMediaField('size', _fmtBytes(s.total_bytes), 'v-dim');
-      card.appendChild(mediaMeta);
-    }
-
-    // Actions row. While browsing a peer host the cards are read-only —
-    // resume/delete/config act on THIS daemon's stores and would target
-    // the wrong machine; interaction happens on the peer's own dashboard
-    // (whole-card click below).
-    if (!sessionsViewingPeer()
-        && (sessionId || s.can_resume || s.can_delete || ((s.total_bytes > 0 || !isCurrent) && !isExternal))) {
-      const actions = document.createElement('div');
-      actions.className = 'sc-actions';
-
-      if (s.can_resume !== false) {
-        const resumeBtn = document.createElement('button');
-        resumeBtn.className = 'ui-btn sc-resume-btn';
-        resumeBtn.textContent = 'Resume session';
-        resumeBtn.title = 'Resume this session in Activity';
-        resumeBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          resumeSession(s);
-        });
-        actions.appendChild(resumeBtn);
-      }
-
-      if (sessionId) {
-        const renameBtn = document.createElement('button');
-        renameBtn.className = 'ui-btn sc-rename-btn';
-        renameBtn.textContent = 'Rename';
-        renameBtn.title = 'Rename this session';
-        renameBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          requestSessionRename(s);
-        });
-        actions.appendChild(renameBtn);
-      }
-
-      if (sessionId && configSource && configSource !== 'intendant') {
-        const configBtn = document.createElement('button');
-        configBtn.className = 'ui-btn sc-rename-btn';
-        configBtn.textContent = 'Configure';
-        configBtn.title = 'Configure binary and managed context for this session';
-        configBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          openSessionConfigModal(s);
-        });
-        actions.appendChild(configBtn);
-      }
-
-      const canDeleteLocalSessionData = rawSource === 'intendant'
-        ? s.can_delete !== false
-        : !!(s.can_delete_intendant_log && s.intendant_session_id);
-      if (canDeleteLocalSessionData) {
-        const sessionDeleteLabel = rawSource === 'intendant'
-          ? 'Delete session'
-          : 'Delete Intendant log';
-        const sessionDeleteBytes = rawSource === 'intendant'
-          ? s.total_bytes
-          : (s.intendant_total_bytes || 0);
-        const btn = document.createElement('button');
-        btn.className = 'ui-btn danger sc-delete-btn';
-        btn.textContent = 'Delete...';
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          // Close any existing menu
-          document.querySelectorAll('.sc-delete-menu').forEach(m => m.remove());
-          const menu = document.createElement('div');
-          menu.className = 'sc-delete-menu';
-          menu.setAttribute('role', 'menu');
-
-          const addItem = (label, target, bytes, danger) => {
-            const item = document.createElement('button');
-            item.type = 'button';
-            item.className = 'sc-delete-menu-item' + (danger ? ' danger' : '');
-            item.setAttribute('role', 'menuitem');
-            const txt = document.createElement('span');
-            txt.textContent = label;
-            item.appendChild(txt);
-            if (bytes > 0) {
-              const hint = document.createElement('span');
-              hint.className = 'size-hint';
-              hint.textContent = _fmtBytes(bytes);
-              item.appendChild(hint);
-            }
-            item.addEventListener('click', (ev) => {
-              ev.stopPropagation();
-              menu.remove();
-              deleteSessionData(s.session_id, target, label);
-            });
-            menu.appendChild(item);
-          };
-
-          if ((s.recordings || 0) > 0) addItem('Delete recordings', 'recordings', s.recording_bytes || 0);
-          if ((s.frames_bytes || 0) > 0 || (s.annotations || 0) > 0 || (s.clips || 0) > 0) addItem('Delete frames', 'frames', s.frames_bytes || 0);
-          const hasMedia = (s.recordings || 0) > 0 || (s.frames_bytes || 0) > 0;
-          if (hasMedia) addItem('Delete all media', 'media', (s.recording_bytes || 0) + (s.frames_bytes || 0));
-          if ((s.turns_bytes || 0) > 0) addItem('Delete turn data', 'turns', s.turns_bytes);
-          if (!isCurrent) addItem(sessionDeleteLabel, 'session', sessionDeleteBytes, true);
-
-          if (menu.children.length > 0) {
-            actions.appendChild(menu);
-            const close = (ev) => { if (!menu.contains(ev.target)) { menu.remove(); document.removeEventListener('click', close); } };
-            setTimeout(() => document.addEventListener('click', close), 0);
-          }
-        });
-        actions.appendChild(btn);
-      }
-      card.appendChild(actions);
-    }
-
-    if (sessionsViewingPeer()) {
-      card.classList.add('sc-peer');
-      card.title = 'Open this session on the peer’s dashboard';
-      card.addEventListener('click', () => openPeerSessionExternally(s));
-    } else {
-      card.addEventListener('click', () => openSessionDetail(s));
-    }
-    fragment.appendChild(card);
+  const deepSearchOnly = !!options.deepSearchOnly;
+  if (deepSearchOnly && !_sessionDeepSearch.active) {
+    const message = _sessionDeepSearch.loading
+      ? 'Deep search is running...'
+      : 'Run a deep search to show log matches';
+    resetSessionsListRenderState(elId);
+    el.innerHTML = `<div class="empty-state">${message}</div>`;
+    return;
   }
 
+  if (sessions.length === 0) {
+    resetSessionsListRenderState(elId);
+    el.innerHTML = '<div class="empty-state">No sessions found</div>';
+    return;
+  }
+
+  const currentSessionId = daemonSessionFullId || '';
+  const st = sessionsListRenderStateFor(elId);
+  const optionsKey = sessionsListOptionsKey(options, currentSessionId);
+  const windowSize = sessionsRenderWindow;
+  const samePass = st.dataRef === sessions && st.optionsKey === optionsKey && st.matched !== null;
+  if (samePass && st.window === windowSize) {
+    st.lastMode = 'skip'; // identical pass — the DOM is already right
+    return;
+  }
+
+  const ctx = {
+    deepSearchOnly,
+    deepSearchActive: deepSearchOnly && _sessionDeepSearch.active,
+    hideSubagents: !!options.hideSubagents,
+    viewingPeer: sessionsViewingPeer(),
+    currentSessionId,
+    query: options.query || '',
+    lineageIndex: buildSessionLineageIndex(sessions),
+  };
+
+  const appendOnly = samePass && windowSize > st.window && st.renderedCount > 0;
+  let matched = st.matched;
+  let hiddenSubagentCount = st.hiddenSubagentCount;
+  if (!appendOnly) {
+    const collected = collectSessionsListMatches(sessions, options, ctx);
+    matched = collected.matched;
+    hiddenSubagentCount = collected.hiddenSubagentCount;
+  }
+  const matchedCount = matched.length;
+
   if (matchedCount === 0) {
+    const query = options.query || '';
+    const projectFilter = options.projectFilter || '';
+    const hasProjectFilter = Array.isArray(projectFilter) ? projectFilter.length > 0 : !!projectFilter;
     const empty = document.createElement('div');
     empty.className = 'empty-state';
-    empty.textContent = deepSearchActive && sessionDeepSearchHasMissingMetadata()
+    empty.textContent = ctx.deepSearchActive && sessionDeepSearchHasMissingMetadata()
       ? 'Loading session metadata for matching log results...'
-      : deepSearchActive
+      : ctx.deepSearchActive
       ? 'No sessions match the deep search results'
       : query
       ? 'No sessions match your search'
@@ -72127,29 +74871,469 @@ function renderSessionsList(sessions, el, options = {}) {
       ? 'No sessions match the selected projects'
       : hiddenSubagentCount > 0
       ? 'No main sessions found. Subagent sessions are hidden from Recent.'
-      : sessionsViewingPeer()
+      : ctx.viewingPeer
       ? 'No sessions visible on this peer — it may not have granted session access.'
       : 'No sessions match the active filters';
+    resetSessionsListRenderState(elId);
+    el.innerHTML = '';
     el.appendChild(empty);
-  } else {
-    el.appendChild(fragment);
-    if (matchedCount > renderedCount) {
-      const remaining = matchedCount - renderedCount;
-      const moreRow = document.createElement('div');
-      moreRow.className = 'sessions-show-more';
-      const moreBtn = document.createElement('button');
-      moreBtn.type = 'button';
-      moreBtn.className = 'ui-btn sessions-show-more-btn';
-      moreBtn.textContent = `Show ${Math.min(SESSION_CARD_RENDER_LIMIT, remaining).toLocaleString()} more (${remaining.toLocaleString()} remaining)`;
-      moreBtn.onclick = () => {
-        sessionsRenderWindow += SESSION_CARD_RENDER_LIMIT;
-        renderSessionsViews();
-      };
-      moreRow.appendChild(moreBtn);
-      el.appendChild(moreRow);
-    }
+    return;
   }
 
+  const renderedTarget = Math.min(windowSize, matchedCount);
+  const nextCards = appendOnly ? null : new Map();
+  const built = [];
+  for (let i = appendOnly ? st.renderedCount : 0; i < renderedTarget; i++) {
+    built.push(sessionCardFor(matched[i], ctx, st, nextCards));
+  }
+
+  if (appendOnly) {
+    removeSessionsListTrailer(st);
+    for (const card of built) el.appendChild(card);
+  } else {
+    st.cards = nextCards;
+    st.trailer = [];
+    el.replaceChildren(...built);
+  }
+  st.dataRef = sessions;
+  st.optionsKey = optionsKey;
+  st.window = windowSize;
+  st.matched = matched;
+  st.matchedCount = matchedCount;
+  st.hiddenSubagentCount = hiddenSubagentCount;
+  st.renderedCount = renderedTarget;
+  appendSessionsListTrailer(el, st);
+  st.lastMode = appendOnly ? 'append' : 'full';
+  st.lastMs = performance.now() - t0;
+  st.passSeq += 1;
+}
+
+// QA readback (window.qa convention): DOM-budget and node-identity facts
+// the validate-dashboard harness asserts on — module scope hides them.
+// Probe functions stay cheap and side-effect-free.
+window.qa = Object.assign(window.qa || {}, {
+  sessionsDom: (listId = 'sessions-list') => {
+    const el = document.getElementById(listId);
+    const st = _sessionsListRenderState.get(listId) || null;
+    const cards = el ? Array.from(el.querySelectorAll('.session-card')) : [];
+    return {
+      nodes: el ? el.getElementsByTagName('*').length : 0,
+      cards: cards.length,
+      matched: st ? st.matchedCount : null,
+      hiddenSubagents: st ? st.hiddenSubagentCount : null,
+      corpus: Array.isArray(_cachedSessions) ? _cachedSessions.length : null,
+      window: sessionsRenderWindow,
+      page: SESSION_CARD_RENDER_PAGE,
+      lastMode: st ? st.lastMode : 'none',
+      lastMs: st ? st.lastMs : null,
+      passSeq: st ? st.passSeq : 0,
+      loadToken: _sessionsLoadToken,
+      trailer: st ? st.trailer.length : 0,
+      hydration: {
+        active: _sessionsHydrationState.active,
+        done: _sessionsHydrationState.done,
+        phase: _sessionsHydrationState.phase,
+        received: _sessionsHydrationState.received,
+      },
+      cardSeqs: cards.slice(0, 24).map(c => ({
+        key: c.dataset.sessionKey || '',
+        seq: Number(c.dataset.qaBuildSeq || 0),
+      })),
+    };
+  },
+  // QA ACTIONS (not probes — they mutate): the module scope hides the
+  // sessions functions from harness-evaluated JS, so scripted scenarios
+  // need explicit bridges (same reason as the window.* onclick bridges;
+  // precedent: station.activate).
+  sessionsActions: {
+    reload: () => loadSessions({ force: true }),
+    grow: () => growSessionsRenderWindow(),
+    // Pull the complete corpus over the plain-JSON path — deterministic
+    // fallback while the RPC stream leg can wedge before its replace.
+    pullAll: () => fetchSessionsForHost(undefined, { force: true, limit: 'all' })
+      .then(rows => applyLoadedSessions(rows, document.getElementById('sessions-aggregate'))),
+  },
+});
+
+function buildSessionCard(m, derived, ctx) {
+  const { s, source, shortId, isCurrent, displayStatus, logHit } = m;
+  const { configMeta, configSource, relationshipKind, backendSource, hasExternalBackend } = derived;
+  const isExternal = source !== 'intendant';
+
+  const rowIsPartial = s.partial === true;
+  const card = document.createElement('div');
+  card.className = 'session-card';
+  if (isCurrent) card.classList.add('current');
+  if (displayStatus === 'abandoned') card.classList.add('dimmed');
+  if (rowIsPartial) card.classList.add('partial');
+
+  const sessionName = compactSessionText(s.name);
+  const taskText = compactSessionText(s.task);
+  const sessionId = s.session_id || '';
+  const primaryText = sessionName || taskText || 'Untitled session';
+  const titleKindText = sessionName ? 'name' : taskText ? 'initial' : 'untitled';
+
+  // Top row: name/task + status badges
+  const top = document.createElement('div');
+  top.className = 'sc-top';
+
+  const titleBlock = document.createElement('div');
+  titleBlock.className = 'sc-title-block';
+  const titleRow = document.createElement('div');
+  titleRow.className = 'sc-title-row';
+  const titleKind = document.createElement('span');
+  titleKind.className = 'sc-title-kind';
+  titleKind.classList.add(titleKindText);
+  titleKind.textContent = titleKindText;
+  titleKind.title = sessionName
+    ? 'User-assigned session name'
+    : taskText
+      ? 'Initial message fallback'
+      : 'No initial message found';
+  titleRow.appendChild(titleKind);
+  const nameEl = document.createElement('div');
+  nameEl.className = 'sc-name';
+  nameEl.textContent = primaryText;
+  nameEl.title = primaryText;
+  titleRow.appendChild(nameEl);
+  titleBlock.appendChild(titleRow);
+  top.appendChild(titleBlock);
+
+  const statusEl = document.createElement('span');
+  statusEl.className = `ui-chip ${sessionStatusChipTone(displayStatus)} sc-status ${displayStatus}`;
+  statusEl.textContent = displayStatus.replace('_', ' ');
+  top.appendChild(statusEl);
+
+  const sourceEl = document.createElement('span');
+  sourceEl.className = 'ui-badge sc-source' + (isExternal ? '' : ' local');
+  sourceEl.textContent = isExternal
+    ? (
+      s.source_label ||
+      s.sourceLabel ||
+      s.backend_source_label ||
+      s.backendSourceLabel ||
+      prettyAgentName(source) ||
+      source
+    )
+    : (s.source_label || s.sourceLabel || 'Intendant');
+  if (!isExternal && hasExternalBackend && backendSource && backendSource !== 'intendant') {
+    sourceEl.title = `${prettyAgentName(backendSource) || backendSource} backend`;
+  }
+  top.appendChild(sourceEl);
+
+  if (rowIsPartial) {
+    const loadingEl = document.createElement('span');
+    loadingEl.className = 'ui-chip info sc-role sc-loading-chip';
+    loadingEl.textContent = 'loading details';
+    loadingEl.title = 'Tokens, costs, lineage, and disk sizes are still hydrating';
+    top.appendChild(loadingEl);
+  }
+
+  if (s.role) {
+    const roleEl = document.createElement('span');
+    roleEl.className = 'ui-chip muted sc-role';
+    roleEl.textContent = s.role;
+    top.appendChild(roleEl);
+  }
+
+  if (relationshipKind) {
+    const { nickname, parentId, parent, parentLabel } = derived;
+    const kindLabel = sessionLineageRelationshipLabel(relationshipKind);
+    const chipText = relationshipKind === 'subagent' && nickname
+      ? `${kindLabel} ${nickname}`
+      : parentId
+        ? `${kindLabel} of ${parentLabel}`
+        : kindLabel;
+    const titleParts = [
+      relationshipKind === 'subagent' && nickname ? `Subagent: ${nickname}` : `Relationship: ${kindLabel}`,
+      parentId ? `Parent: ${parentLabel} (${parentId})` : '',
+    ].filter(Boolean);
+    const relationEl = createSessionLineageListChip(s, parent, parentId, chipText, titleParts.join('\n') || `${kindLabel} session`);
+    top.appendChild(relationEl);
+  }
+
+  const lineageChildren = derived.lineageChildren;
+  if (lineageChildren.length > 0) {
+    const childrenEl = document.createElement('span');
+    childrenEl.className = 'ui-chip muted sc-role sc-lineage-chip sc-lineage-children';
+    childrenEl.textContent = lineageChildren.length === 1 ? '1 child' : `${lineageChildren.length} children`;
+    childrenEl.title = lineageChildren
+      .slice(0, 8)
+      .map(child => {
+        const childKind = sessionLineageRelationshipLabel(sessionRelationshipKindForRow(child));
+        const childId = sessionLineageIds(child)[0] || child.session_id || '';
+        return `${childKind}: ${sessionLineageDisplayLabel(child, childId)}${childId ? ` (${childId})` : ''}`;
+      })
+      .join('\n') + (lineageChildren.length > 8 ? `\n+${lineageChildren.length - 8} more` : '');
+    top.appendChild(childrenEl);
+  }
+
+  if (isCurrent) {
+    const badge = document.createElement('span');
+    badge.className = 'ui-chip info sc-current-badge';
+    badge.textContent = 'current';
+    top.appendChild(badge);
+  }
+
+  card.appendChild(top);
+
+  // Task
+  if (taskText && sessionName) {
+    const taskEl = document.createElement('div');
+    taskEl.className = 'sc-task';
+    taskEl.textContent = taskText;
+    taskEl.title = taskText;
+    card.appendChild(taskEl);
+  }
+
+  if (logHit) {
+    const hitEl = document.createElement('div');
+    hitEl.className = 'sc-search-hit';
+    const hitCount = document.createElement('span');
+    hitCount.className = 'sc-search-hit-count';
+    const matches = Number(logHit.matches || 0);
+    hitCount.textContent = `${matches} log ${matches === 1 ? 'match' : 'matches'}`;
+    hitEl.appendChild(hitCount);
+    const firstSnippet = (logHit.snippets || [])[0] || {};
+    const hitText = document.createElement('span');
+    hitText.className = 'sc-search-hit-text';
+    hitText.textContent = firstSnippet.content || '';
+    hitText.title = firstSnippet.content || '';
+    hitEl.appendChild(hitText);
+    card.appendChild(hitEl);
+  }
+
+  // Quick-search hit inside the conversation preview: one quiet snippet
+  // line showing where the match lives. Deep Search keeps the log-hit row
+  // above for full-history matches.
+  if (derived.previewHit) {
+    const prevEl = document.createElement('div');
+    prevEl.className = 'sc-preview-hit';
+    const roleEl = document.createElement('span');
+    roleEl.className = 'sc-preview-hit-role';
+    roleEl.textContent = derived.previewHit.role === 'assistant' ? 'assistant' : 'user';
+    prevEl.appendChild(roleEl);
+    const textEl = document.createElement('span');
+    textEl.className = 'sc-preview-hit-text';
+    textEl.textContent = derived.previewHit.text || '';
+    textEl.title = derived.previewHit.text || '';
+    prevEl.appendChild(textEl);
+    card.appendChild(prevEl);
+  }
+
+  // Meta row — the full session id (click to copy) plus compact
+  // essentials; the long tail (absolute dates, provider, token breakdown,
+  // disk) moves to the row tooltip and stays visible in the
+  // session-detail overlay.
+  const meta = document.createElement('div');
+  meta.className = 'sc-meta';
+  const addMetaField = (label, value, valueClass, valueTitle) => {
+    if (value === null || value === undefined || value === '') return null;
+    const span = document.createElement('span');
+    const l = document.createElement('span');
+    l.className = 'label';
+    l.textContent = label;
+    const v = document.createElement('span');
+    v.className = 'value' + (valueClass ? ` ${valueClass}` : '');
+    v.textContent = value;
+    if (valueTitle) v.title = valueTitle;
+    span.appendChild(l);
+    span.appendChild(v);
+    meta.appendChild(span);
+    return v;
+  };
+
+  const idVal = addMetaField('id', sessionId || shortId, 'sc-id', 'Click to copy the session ID');
+  if (idVal) {
+    idVal.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const fullId = sessionId || shortId;
+      copyTextToClipboard(fullId)
+        .then(() => showControlToast('success', `Copied session ID ${shortSessionId(fullId)}`))
+        .catch(err => showControlToast('error', `Copy session ID failed: ${err?.message || err}`));
+    });
+  }
+  const changedAt = s.updated_at || s.changed_at;
+  if (changedAt) {
+    const changedVal = addMetaField('changed', sessionRelativeLabel(changedAt) || changedAt, null, changedAt);
+    if (changedVal) {
+      // refreshSessionCardRelativeLabel re-derives this label in place when
+      // the card is reused across render passes.
+      changedVal.dataset.rel = 'changed';
+      card.dataset.changedAt = changedAt;
+    }
+  }
+  const projectPath = sessionProjectDirectory(s);
+  if (projectPath) addMetaField('project', compactPathLabel(projectPath), null, projectPath);
+  if (s.model) addMetaField('model', s.model, 'model-val');
+  if (s.turns > 0) addMetaField('turns', s.turns);
+  if (rowIsPartial) {
+    const loading = document.createElement('span');
+    loading.className = 'sc-loading-meta';
+    const loadingLabel = document.createElement('span');
+    loadingLabel.className = 'label';
+    loadingLabel.textContent = 'details';
+    const loadingVal = document.createElement('span');
+    loadingVal.className = 'value';
+    loadingVal.textContent = 'tokens, cost, lineage, size';
+    loading.appendChild(loadingLabel);
+    loading.appendChild(loadingVal);
+    meta.appendChild(loading);
+  } else {
+    if (s.total_tokens > 0) addMetaField('tokens', s.total_tokens.toLocaleString());
+    if (s.estimated_cost > 0) addMetaField('cost', formatUsd(s.estimated_cost, 2));
+  }
+
+  const tipParts = [];
+  if (s.created_at) tipParts.push(`created: ${s.created_at}`);
+  if (changedAt) tipParts.push(`changed: ${changedAt}`);
+  if (s.provider) tipParts.push(`provider: ${s.provider}`);
+  if (!rowIsPartial && s.total_tokens > 0) {
+    tipParts.push(`tokens: ${(s.prompt_tokens || 0).toLocaleString()} in${s.cached_tokens > 0 ? ` (${s.cached_tokens.toLocaleString()} cached)` : ''} / ${(s.completion_tokens || 0).toLocaleString()} out`);
+  }
+  if (!rowIsPartial && s.total_bytes > 0) tipParts.push(`disk: ${_fmtBytes(s.total_bytes)}`);
+  if (projectPath) tipParts.push(`project: ${projectPath}`);
+  if (tipParts.length) meta.title = tipParts.join('\n');
+  card.appendChild(meta);
+
+  // Media stats row (recordings, annotations, clips) + total session size
+  const hasMedia = (s.recordings > 0 || s.annotations > 0 || s.clips > 0);
+  if (!rowIsPartial && hasMedia) {
+    const mediaMeta = document.createElement('div');
+    mediaMeta.className = 'sc-meta sc-media';
+    const addMediaField = (label, value, valueClass) => {
+      const span = document.createElement('span');
+      const l = document.createElement('span');
+      l.className = 'label';
+      l.textContent = label;
+      const v = document.createElement('span');
+      v.className = 'value' + (valueClass ? ` ${valueClass}` : '');
+      v.textContent = value;
+      span.appendChild(l);
+      span.appendChild(v);
+      mediaMeta.appendChild(span);
+    };
+    if (s.recordings > 0) addMediaField('recordings', s.recordings, 'v-blue');
+    if (s.annotations > 0) addMediaField('annotations', s.annotations, 'v-peach');
+    if (s.clips > 0) addMediaField('clips', s.clips, 'v-peach');
+    if (s.total_bytes > 0) addMediaField('size', _fmtBytes(s.total_bytes), 'v-dim');
+    card.appendChild(mediaMeta);
+  }
+
+  // Actions row. While browsing a peer host the cards are read-only —
+  // resume/delete/config act on THIS daemon's stores and would target
+  // the wrong machine; interaction happens on the peer's own dashboard
+  // (whole-card click below).
+  if (!ctx.viewingPeer
+      && (sessionId || s.can_resume || s.can_delete || ((s.total_bytes > 0 || !isCurrent) && !isExternal))) {
+    const actions = document.createElement('div');
+    actions.className = 'sc-actions';
+
+    if (s.can_resume !== false) {
+      const resumeBtn = document.createElement('button');
+      resumeBtn.className = 'ui-btn sc-resume-btn';
+      resumeBtn.textContent = 'Resume session';
+      resumeBtn.title = 'Resume this session in Activity';
+      resumeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        resumeSession(s);
+      });
+      actions.appendChild(resumeBtn);
+    }
+
+    if (sessionId) {
+      const renameBtn = document.createElement('button');
+      renameBtn.className = 'ui-btn sc-rename-btn';
+      renameBtn.textContent = 'Rename';
+      renameBtn.title = 'Rename this session';
+      renameBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        requestSessionRename(s);
+      });
+      actions.appendChild(renameBtn);
+    }
+
+    if (sessionId && configSource && configSource !== 'intendant') {
+      const configBtn = document.createElement('button');
+      configBtn.className = 'ui-btn sc-rename-btn';
+      configBtn.textContent = 'Configure';
+      configBtn.title = 'Configure binary and managed context for this session';
+      configBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openSessionConfigModal(s);
+      });
+      actions.appendChild(configBtn);
+    }
+
+    const canDeleteLocalSessionData = source === 'intendant'
+      ? s.can_delete !== false
+      : !!(s.can_delete_intendant_log && s.intendant_session_id);
+    if (canDeleteLocalSessionData) {
+      const sessionDeleteLabel = source === 'intendant'
+        ? 'Delete session'
+        : 'Delete Intendant log';
+      const sessionDeleteBytes = source === 'intendant'
+        ? s.total_bytes
+        : (s.intendant_total_bytes || 0);
+      const btn = document.createElement('button');
+      btn.className = 'ui-btn danger sc-delete-btn';
+      btn.textContent = 'Delete...';
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        // Close any existing menu
+        document.querySelectorAll('.sc-delete-menu').forEach(m => m.remove());
+        const menu = document.createElement('div');
+        menu.className = 'sc-delete-menu';
+        menu.setAttribute('role', 'menu');
+
+        const addItem = (label, target, bytes, danger) => {
+          const item = document.createElement('button');
+          item.type = 'button';
+          item.className = 'sc-delete-menu-item' + (danger ? ' danger' : '');
+          item.setAttribute('role', 'menuitem');
+          const txt = document.createElement('span');
+          txt.textContent = label;
+          item.appendChild(txt);
+          if (bytes > 0) {
+            const hint = document.createElement('span');
+            hint.className = 'size-hint';
+            hint.textContent = _fmtBytes(bytes);
+            item.appendChild(hint);
+          }
+          item.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            menu.remove();
+            deleteSessionData(s.session_id, target, label);
+          });
+          menu.appendChild(item);
+        };
+
+        if ((s.recordings || 0) > 0) addItem('Delete recordings', 'recordings', s.recording_bytes || 0);
+        if ((s.frames_bytes || 0) > 0 || (s.annotations || 0) > 0 || (s.clips || 0) > 0) addItem('Delete frames', 'frames', s.frames_bytes || 0);
+        const hasMedia = (s.recordings || 0) > 0 || (s.frames_bytes || 0) > 0;
+        if (hasMedia) addItem('Delete all media', 'media', (s.recording_bytes || 0) + (s.frames_bytes || 0));
+        if ((s.turns_bytes || 0) > 0) addItem('Delete turn data', 'turns', s.turns_bytes);
+        if (!isCurrent) addItem(sessionDeleteLabel, 'session', sessionDeleteBytes, true);
+
+        if (menu.children.length > 0) {
+          actions.appendChild(menu);
+          const close = (ev) => { if (!menu.contains(ev.target)) { menu.remove(); document.removeEventListener('click', close); } };
+          setTimeout(() => document.addEventListener('click', close), 0);
+        }
+      });
+      actions.appendChild(btn);
+    }
+    card.appendChild(actions);
+  }
+
+  if (ctx.viewingPeer) {
+    card.classList.add('sc-peer');
+    card.title = 'Open this session on the peer’s dashboard';
+    card.addEventListener('click', () => openPeerSessionExternally(s));
+  } else {
+    card.addEventListener('click', () => openSessionDetail(s));
+  }
+  return card;
 }
 
 function _refilterWorktrees() {

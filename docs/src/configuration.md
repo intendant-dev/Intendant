@@ -507,8 +507,8 @@ INTENDANT_CONNECT_TOKEN=shared-dev-token \
   ./target/release/intendant --web 8876
 ```
 
-There are two committed validators. The hosted production-alpha validator starts
-`intendant-connect`, a daemon, and a browser virtual authenticator:
+There are three committed validators. The hosted production-alpha validator
+starts `intendant-connect`, a daemon, and a browser virtual authenticator:
 
 ```bash
 node scripts/validate-connect-hosted-mvp.cjs
@@ -528,6 +528,16 @@ Connect account, then proves the browser-public-origin -> rendezvous ->
 daemon-outbound-signaling -> direct WebRTC DataChannel path while keeping the
 normal dashboard mTLS default in place. The hosted MVP validator covers the real
 account/passkey flow, claim proof, local grant binding, revoke, and audit.
+
+The transport validator drives the fresh-box ceremony end to end — passkey
+signup, daemon-minted first-owner bootstrap phrase, hosted `/app` dashboard —
+and asserts the control DataChannel actually opens, including over the
+ICE-TCP path a NAT'd cloud daemon depends on (see
+[Self-Hosted Rendezvous → End-to-end transport validation](./self-hosted-rendezvous.md#end-to-end-transport-validation)):
+
+```bash
+node scripts/connect-transport-e2e.cjs
+```
 
 ### `[server]` (daemon and federation)
 

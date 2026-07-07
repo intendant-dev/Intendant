@@ -10,7 +10,7 @@ use crate::model::{StationAgent, StationHost, StationSnapshot};
 use crate::util::phase_color;
 use crate::util::{
     css_rgba, goal_status_color, relationship_color, role_color, stable_angle, stable_unit, Color,
-    C_BLUE, C_GREEN, C_PEACH, C_RED, C_SAPPHIRE, C_SURFACE0, C_TEAL, C_YELLOW,
+    C_BLUE, C_GREEN, C_PEACH, C_RED, C_SAPPHIRE, C_SUBTEXT0, C_SURFACE0, C_TEAL, C_TEXT, C_YELLOW,
 };
 use crate::StationInner;
 
@@ -126,10 +126,13 @@ impl StationInner {
             true
         });
 
-        // Phase C slice 2, behind ?station_panes=on: one untextured card
-        // beside the selected node — the throwaway that proves the pane
-        // pipeline (billboarding, per-pixel depth against the wireframe)
-        // before real panels migrate into the scene.
+        // Phase C slices 2–3, behind ?station_panes=on: one card beside
+        // the selected node — the throwaway that proves the pane pipeline
+        // (billboarding, per-pixel depth against the wireframe) and the
+        // glyph-atlas text on it, before real panels migrate into the
+        // scene. Title is the selected id; rows reuse the cached
+        // control-center summaries (fresh: render() recomputes them
+        // before building the frame).
         if self.panes_enabled {
             if let Some(pos) = self
                 .selected_id
@@ -138,16 +141,62 @@ impl StationInner {
                 .copied()
             {
                 let anchor = pos + cam_right * 0.66 + cam_up * 0.52;
-                crate::panes::add_world_pane(
+                let emitted = crate::panes::add_world_pane(
                     &mut frame,
                     &mut project,
                     cam_right,
                     cam_up,
                     anchor,
-                    0.55,
-                    0.34,
+                    PANE_HALF_W,
+                    PANE_HALF_H,
                     Color::rgb(16, 18, 32).with_alpha(0.86),
                 );
+                if emitted {
+                    // Register the card for raycast picking (slice 4,
+                    // input::pick_pane) — click-solid, matching its
+                    // per-pixel occlusion of the scene behind it.
+                    frame.pane_targets.push(crate::panes::PaneTarget {
+                        id: self.selected_id.clone().unwrap_or_default(),
+                        anchor,
+                        right: cam_right,
+                        up: cam_up,
+                        half_w: PANE_HALF_W,
+                        half_h: PANE_HALF_H,
+                    });
+                    if let Some(atlas) = self.text_atlas.as_ref() {
+                        let inner_w = (PANE_HALF_W - PANE_MARGIN) * 2.0;
+                        let top_left = anchor - cam_right * (PANE_HALF_W - PANE_MARGIN)
+                            + cam_up * (PANE_HALF_H - PANE_MARGIN);
+                        let title = self.selected_id.as_deref().unwrap_or_default();
+                        crate::text_atlas::add_text_world(
+                            &mut frame,
+                            atlas,
+                            &mut project,
+                            cam_right,
+                            cam_up,
+                            top_left,
+                            PANE_TITLE_H,
+                            &atlas.fit_to_width(title, PANE_TITLE_H, inner_w),
+                            C_TEXT,
+                        );
+                        let mut cursor = top_left - cam_up * (PANE_TITLE_H * 1.3);
+                        for target in self.system_targets.iter().take(3) {
+                            let row = format!("{}  {}", target.title, target.value);
+                            crate::text_atlas::add_text_world(
+                                &mut frame,
+                                atlas,
+                                &mut project,
+                                cam_right,
+                                cam_up,
+                                cursor,
+                                PANE_ROW_H,
+                                &atlas.fit_to_width(&row, PANE_ROW_H, inner_w),
+                                C_SUBTEXT0,
+                            );
+                            cursor = cursor - cam_up * (PANE_ROW_H * 1.25);
+                        }
+                    }
+                }
             }
         }
 
@@ -687,10 +736,29 @@ impl Camera {
         }
         Some((Vec2::new(ndc_x, ndc_y), z))
     }
+
+    /// Inverse of `project_depth`: the world-space ray from the eye
+    /// through an NDC point. The direction is normalized; every point
+    /// `eye + dir * t` (t > 0) projects back onto `ndc`.
+    pub(crate) fn ray_through(&self, ndc: Vec2, aspect: f32, fov_deg: f32) -> (Vec3, Vec3) {
+        let f = 1.0 / (fov_deg.to_radians() * 0.5).tan();
+        let dir = self.forward + self.right * (ndc.x * aspect / f) + self.up * (ndc.y / f);
+        (self.eye, dir.normalized())
+    }
 }
 
 /// Half-width (in NDC) of the faint thick pass behind glowing lines.
 pub(crate) const GLOW_WIDTH: f32 = 0.007;
+
+/// Proof-card geometry (Phase C slices 2–3), world units: pane
+/// half-extents, inner text margin, and the title/row glyph-cell heights.
+/// Sized so the text draws near the atlas's baked glyph size at typical
+/// camera distances (see `text_atlas` on sampling quality).
+const PANE_HALF_W: f32 = 0.62;
+const PANE_HALF_H: f32 = 0.40;
+const PANE_MARGIN: f32 = 0.07;
+const PANE_TITLE_H: f32 = 0.14;
+const PANE_ROW_H: f32 = 0.105;
 
 /// Depth-cued brightness: geometry nearer than the orbit center draws a
 /// little brighter, farther a little dimmer. `z` is view-space depth and
@@ -731,6 +799,14 @@ pub(crate) fn ndc_to_screen(pos: [f32; 2], width: u32, height: u32) -> Vec2 {
     Vec2::new(
         (pos[0] * 0.5 + 0.5) * width as f32,
         (0.5 - pos[1] * 0.5) * height as f32,
+    )
+}
+
+/// Inverse of `ndc_to_screen`: device pixels back to NDC.
+pub(crate) fn screen_to_ndc(px: f32, py: f32, width: u32, height: u32) -> Vec2 {
+    Vec2::new(
+        px / width.max(1) as f32 * 2.0 - 1.0,
+        1.0 - py / height.max(1) as f32 * 2.0,
     )
 }
 
@@ -916,6 +992,40 @@ mod tests {
             (a.x - b.x).abs() > 1e-6 || (a.y - b.y).abs() > 1e-6 || (a.z - b.z).abs() > 1e-6,
             "orbital and constellation should place hosts differently"
         );
+    }
+
+    #[test]
+    fn ray_through_inverts_projection() {
+        let camera = Camera::look_at(
+            Vec3::new(4.0, 3.0, 10.0),
+            Vec3::new(0.0, 0.25, 0.0),
+            Vec3::Y,
+        );
+        let (aspect, fov) = (16.0 / 9.0, 55.0);
+        for world in [
+            Vec3::ZERO,
+            Vec3::new(1.3, -0.4, 2.0),
+            Vec3::new(-2.0, 1.5, -1.0),
+        ] {
+            let (ndc, _z) = camera.project_depth(world, aspect, fov).unwrap();
+            let (origin, dir) = camera.ray_through(ndc, aspect, fov);
+            // The ray must pass (numerically) through the source point,
+            // in front of the eye.
+            let along = (world - origin).dot(dir);
+            assert!(along > 0.0);
+            let closest = origin + dir * along;
+            let miss = (world - closest).len();
+            assert!(miss < 1e-4, "ray misses its source point by {miss}");
+        }
+    }
+
+    #[test]
+    fn screen_to_ndc_round_trips_with_ndc_to_screen() {
+        for (x, y) in [(0.0, 0.0), (100.0, 50.0), (199.0, 99.0), (37.5, 81.25)] {
+            let ndc = screen_to_ndc(x, y, 200, 100);
+            let back = ndc_to_screen([ndc.x, ndc.y], 200, 100);
+            assert!((back.x - x).abs() < 1e-4 && (back.y - y).abs() < 1e-4);
+        }
     }
 
     #[test]

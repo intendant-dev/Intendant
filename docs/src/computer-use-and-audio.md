@@ -15,7 +15,8 @@ the *model* seeing and acting, not the human-facing video transport.
 The CU abstraction (`src/bin/caller/computer_use.rs`) gives any provider a
 common action set and dispatches it through a platform backend. Provider-
 specific parsing of CU tool calls (OpenAI computer-use, Anthropic
-`computer_20251124`, Gemini) lives in `provider.rs`; the executor here is
+`computer_20251124`, Gemini) lives in the `provider/` per-provider modules
+(`openai.rs`, `anthropic.rs`, `gemini.rs`); the executor here is
 provider-neutral. Anthropic `wait`/`hold_key` durations arrive in **seconds**
 and are converted to milliseconds (clamped to 30 s) at parse time.
 
@@ -111,6 +112,19 @@ CU actions operate on a `DisplayTarget` (`#[serde(tag = "kind")]`):
   login session's `DISPLAY` (falling back to `:0`); on macOS the primary display
   doesn't use `DISPLAY`. Requires an explicit `DisplayControl` grant via the
   autonomy system.
+
+When a pixel-CU call (`take_screenshot`, `execute_cu_actions`) omits
+`display_target`, the default is availability-aware
+(`computer_use::default_display_target`): the lowest-id live virtual capture
+session wins, then the conventional agent Xvfb display (`:99`) when its X
+socket is up (Linux only), then the user session. Explicit targets are never
+second-guessed, and every downstream gate applies to the fallback exactly as
+it would to an explicit `user_session` request. The native agent loop uses the
+same resolution when a session has no CU display configured, except its
+user-session fallback additionally requires the user-display grant — the
+model-driven path never auto-targets the user's desktop ungranted.
+(`read_screen` defaults to the user session unconditionally — element trees
+only exist there.)
 
 User-session access uses a **session-grant** model: approve once (the `d` hotkey
 the dashboard control, MCP `grant_user_display`, or

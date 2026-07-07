@@ -25,6 +25,11 @@ pub(crate) struct CodexSessionListAccumulator {
     pub(crate) saw_user_message_event: bool,
     pub(crate) event_user_turns: Vec<Option<String>>,
     pub(crate) fallback_user_turns: Vec<Option<String>>,
+    // Assistant prose for the row preview (message-typed response items
+    // only — tool payloads have other types). User preview texts derive
+    // from the turn vectors above at finish(), which already handle
+    // injected-text filtering and thread rollbacks.
+    pub(crate) preview_assistant_texts: Vec<String>,
 }
 
 impl CodexSessionListAccumulator {
@@ -129,6 +134,14 @@ impl CodexSessionListAccumulator {
                             self.fallback_user_turns
                                 .push(Some(compact_text(&text, 180)));
                         }
+                        if role == "assistant"
+                            && self.preview_assistant_texts.len() < SESSION_PREVIEW_ROLE_SLOTS
+                        {
+                            let compacted = compact_text(&text, SESSION_PREVIEW_TEXT_CHARS);
+                            if !compacted.is_empty() {
+                                self.preview_assistant_texts.push(compacted);
+                            }
+                        }
                     }
                 }
             }
@@ -188,6 +201,24 @@ impl CodexSessionListAccumulator {
                 daily_usage.entry(day).or_default().add(self.undated_usage);
             }
         }
+        // User texts follow the same preference as `turns`: event-stream
+        // user_message turns when present, response-item fallbacks
+        // otherwise (both already rollback-adjusted and injection-filtered).
+        // Rollout excerpts don't interleave the two role streams by
+        // timestamp, so entries group users-first.
+        let user_turns = if self.saw_user_message_event {
+            &self.event_user_turns
+        } else {
+            &self.fallback_user_turns
+        };
+        let mut preview_builder = SessionPreviewBuilder::default();
+        for text in user_turns.iter().flatten().take(SESSION_PREVIEW_ROLE_SLOTS) {
+            preview_builder.push_user(text);
+        }
+        for text in &self.preview_assistant_texts {
+            preview_builder.push_assistant(text);
+        }
+        let preview = preview_builder.into_value();
         Some(CodexSessionListSummary {
             id,
             created_at: self.created_at,
@@ -204,6 +235,7 @@ impl CodexSessionListAccumulator {
             turns,
             file_updated_at,
             bytes: file_size(path),
+            preview,
         })
     }
 }
@@ -287,7 +319,7 @@ pub(crate) fn codex_session_list_summary_from_excerpt(
 }
 
 pub(crate) fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListSummary> {
-    let key = session_list_cache_key("codex", path, "")?;
+    let key = session_list_cache_key("codex", path, SESSION_ROW_PREVIEW_FORMAT)?;
     if let Some(entry) = cached_codex_session_list_entry(&key) {
         return Some(entry.summary);
     }
@@ -551,6 +583,9 @@ pub(crate) fn list_codex_sessions_with_limit(
                 obj.insert("session_goal".to_string(), serde_json::json!(goal));
             }
         }
+        if let Some(preview) = summary.preview.as_ref() {
+            session["preview"] = preview.clone();
+        }
         rows.insert(id, session);
     }
 
@@ -577,7 +612,7 @@ pub(crate) fn list_codex_sessions_with_limit(
 }
 
 pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_json::Value> {
-    let key = session_list_cache_key("claude-code", path, "")?;
+    let key = session_list_cache_key("claude-code", path, SESSION_ROW_PREVIEW_FORMAT)?;
     if let Some(row) = cached_session_list_row(&key) {
         return Some(row);
     }
@@ -602,6 +637,7 @@ pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_jso
     let mut daily_usage: BTreeMap<String, SessionUsage> = BTreeMap::new();
     let mut seen_usage = HashSet::new();
     let mut turns = 0u64;
+    let mut preview = SessionPreviewBuilder::default();
     for (line_idx, line_result) in reader.lines().enumerate() {
         let Ok(line) = line_result else {
             continue;
@@ -617,7 +653,9 @@ pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_jso
             }
             cwd = Some(value);
         }
-        if obj.get("type").and_then(|v| v.as_str()) == Some("user") {
+        let record_type = obj.get("type").and_then(|v| v.as_str());
+        let record_is_meta = obj.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false);
+        if record_type == Some("user") {
             turns += 1;
             if task.is_none() {
                 if let Some(msg) = obj.get("message") {
@@ -635,6 +673,33 @@ pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_jso
                         task = Some(compact_text(user_text, 180));
                     }
                 }
+            }
+            // Preview wants real prompts only: prose text blocks (a
+            // tool_result record is also type=user), never meta records.
+            if !record_is_meta {
+                if let Some(content) = obj
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(message_prose_text)
+                {
+                    let user_text = content
+                        .split(
+                            crate::external_agent::claude_code::CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER,
+                        )
+                        .next()
+                        .unwrap_or(&content)
+                        .trim_end();
+                    preview.push_user(user_text);
+                }
+            }
+        }
+        if record_type == Some("assistant") && !record_is_meta {
+            if let Some(content) = obj
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(message_prose_text)
+            {
+                preview.push_assistant(&content);
             }
         }
         if let Some(msg) = obj.get("message") {
@@ -683,6 +748,9 @@ pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_jso
     );
     apply_session_usage(&mut session, usage, model.as_deref());
     apply_session_daily_usage(&mut session, &daily_usage, model.as_deref());
+    if let Some(preview) = preview.into_value() {
+        session["preview"] = preview;
+    }
     store_session_list_row(key, &session);
     Some(session)
 }
@@ -739,7 +807,11 @@ pub(crate) fn gemini_session_list_row_from_file(
     {
         return None;
     }
-    let key = session_list_cache_key("gemini", path, roots_fingerprint)?;
+    let key = session_list_cache_key(
+        "gemini",
+        path,
+        format!("{SESSION_ROW_PREVIEW_FORMAT}:{roots_fingerprint}"),
+    )?;
     if let Some(row) = cached_session_list_row(&key) {
         return Some(row);
     }
@@ -758,6 +830,7 @@ pub(crate) fn gemini_session_list_row_from_file(
     let mut model = value_str(&obj, "model");
     let mut usage = SessionUsage::default();
     let mut daily_usage: BTreeMap<String, SessionUsage> = BTreeMap::new();
+    let mut preview = SessionPreviewBuilder::default();
     let session_started_at = value_str(&obj, "startTime");
     if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
         for msg in messages {
@@ -779,15 +852,25 @@ pub(crate) fn gemini_session_list_row_from_file(
                 .unwrap_or("");
             if role == "user" {
                 turns += 1;
-                if task.is_none() {
-                    let text = msg
-                        .get("text")
-                        .or_else(|| msg.get("message"))
-                        .or_else(|| msg.get("content"))
-                        .and_then(message_content_text);
-                    if let Some(text) = text {
+                let text = msg
+                    .get("text")
+                    .or_else(|| msg.get("message"))
+                    .or_else(|| msg.get("content"))
+                    .and_then(message_content_text);
+                if let Some(text) = text {
+                    if task.is_none() {
                         task = Some(compact_text(&text, 180));
                     }
+                    preview.push_user(&text);
+                }
+            } else if role == "assistant" || role == "model" {
+                if let Some(text) = msg
+                    .get("text")
+                    .or_else(|| msg.get("message"))
+                    .or_else(|| msg.get("content"))
+                    .and_then(message_prose_text)
+                {
+                    preview.push_assistant(&text);
                 }
             }
         }
@@ -813,6 +896,9 @@ pub(crate) fn gemini_session_list_row_from_file(
     );
     apply_session_usage(&mut session, usage, model.as_deref());
     apply_session_daily_usage(&mut session, &daily_usage, model.as_deref());
+    if let Some(preview) = preview.into_value() {
+        session["preview"] = preview;
+    }
     store_session_list_row(key, &session);
     Some(session)
 }
@@ -1031,6 +1117,110 @@ mod tests {
         );
         assert_eq!(session.get("name").and_then(|v| v.as_str()), None);
         assert_eq!(session.get("turns").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    #[test]
+    fn codex_row_preview_pairs_user_turns_with_assistant_prose() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("07");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let id = "019e37ae-preview-pairs";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": id, "timestamp": "2026-07-07T10:00:00Z", "cwd": "/repo"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Port the parser"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Starting with the lexer."}]
+                }
+            }),
+            // Tool payloads are not message-typed — never preview material.
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": "{\"command\":[\"cargo\",\"test\"]}"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:04Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Now the emitter"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:05Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Emitter done."}]
+                }
+            }),
+            // Both assistant slots taken — must not appear.
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:06Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Extra reply."}]
+                }
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-07-07T10-00-00-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        let preview = session.get("preview").and_then(|v| v.as_array()).unwrap();
+        let flat: Vec<(&str, &str)> = preview
+            .iter()
+            .map(|e| {
+                (
+                    e.get("role").and_then(|v| v.as_str()).unwrap(),
+                    e.get("text").and_then(|v| v.as_str()).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                ("user", "Port the parser"),
+                ("user", "Now the emitter"),
+                ("assistant", "Starting with the lexer."),
+                ("assistant", "Emitter done."),
+            ]
+        );
     }
 
     #[test]
@@ -2173,6 +2363,86 @@ mod tests {
         assert_eq!(session["turns"].as_u64(), Some(1));
         let cost = session["estimated_cost"].as_f64().unwrap();
         assert!((cost - 0.000714).abs() < 1e-12, "unexpected cost {cost}");
+    }
+
+    #[test]
+    fn claude_row_preview_takes_prose_and_skips_tool_and_meta_records() {
+        let home = tempfile::tempdir().unwrap();
+        let project_dir = home.path().join(".claude").join("projects").join("-tmp-p");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:00Z",
+                "type": "user",
+                "cwd": "/tmp/p",
+                "message": {"content": "Refactor the parser"}
+            }),
+            // Meta records are typed user but are not conversation.
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:01Z",
+                "type": "user",
+                "isMeta": true,
+                "message": {"content": "Caveat: system housekeeping text"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:02Z",
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "Starting with the tokenizer."},
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "cargo test"}}
+                ]}
+            }),
+            // Tool results come back as type=user; content is tool output.
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:03Z",
+                "type": "user",
+                "message": {"content": [
+                    {"type": "tool_result", "content": "test result: ok. 100 passed"}
+                ]}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:04Z",
+                "type": "user",
+                "message": {"content": "Now handle unicode too"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:05Z",
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "Unicode handled."}]}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(project_dir.join("preview-abc.jsonl"), contents).unwrap();
+
+        let sessions = list_claude_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some("preview-abc"))
+            .expect("claude session should be listed");
+        let preview = session.get("preview").and_then(|v| v.as_array()).unwrap();
+        let flat: Vec<(&str, &str)> = preview
+            .iter()
+            .map(|e| {
+                (
+                    e.get("role").and_then(|v| v.as_str()).unwrap(),
+                    e.get("text").and_then(|v| v.as_str()).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                ("user", "Refactor the parser"),
+                ("assistant", "Starting with the tokenizer."),
+                ("user", "Now handle unicode too"),
+                ("assistant", "Unicode handled."),
+            ]
+        );
     }
 
     #[test]

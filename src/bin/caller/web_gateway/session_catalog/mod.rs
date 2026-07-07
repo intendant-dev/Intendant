@@ -218,6 +218,10 @@ pub(crate) struct CodexSessionListSummary {
     turns: u64,
     file_updated_at: Option<String>,
     bytes: u64,
+    /// Conversation preview entries (same shape as the row `preview`
+    /// field); absent on entries persisted before the field existed.
+    #[serde(default)]
+    preview: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1465,11 +1469,11 @@ pub(crate) fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDir
 /// next list pass.
 pub(crate) fn session_file_fingerprints_digest(entries: &[SessionFileFingerprint]) -> String {
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-    // Format v2: `updated_at` derives from transcript activity, not dir
-    // mtime. Bumping the layout invalidates every persisted row once, so
-    // cached rows with the old bookkeeping-bumped timestamps rebuild on
-    // the next list pass instead of lingering until their dir changes.
-    ctx.update(&[2u8]);
+    // Format v3: rows carry the conversation `preview`. Bumping the layout
+    // invalidates every persisted row once, so cached rows without the new
+    // field rebuild on the next list pass instead of lingering until their
+    // dir changes. (v2 moved `updated_at` to transcript activity.)
+    ctx.update(&[3u8]);
     for entry in entries {
         ctx.update(entry.rel.as_bytes());
         ctx.update(&[0]);
@@ -1555,6 +1559,13 @@ pub(crate) fn intendant_session_list_row_from_dir(
         }
     }
 
+    // Conversation preview: the meta task is the first user message; the
+    // event loop below adds steer follow-ups and assistant text.
+    let mut preview = SessionPreviewBuilder::default();
+    if let Some(task_text) = task.as_deref() {
+        preview.push_user(task_text);
+    }
+
     let jsonl_path = dir.join("session.jsonl");
     if let Ok(contents) = std::fs::read_to_string(&jsonl_path) {
         for line in contents.lines() {
@@ -1618,7 +1629,9 @@ pub(crate) fn intendant_session_list_row_from_dir(
                         } else if message.starts_with("Model: ") && model.is_none() {
                             model = Some(message.trim_start_matches("Model: ").to_string());
                         } else if message.starts_with("Task: ") && task.is_none() {
-                            task = Some(message.trim_start_matches("Task: ").to_string());
+                            let task_text = message.trim_start_matches("Task: ");
+                            preview.push_user(task_text);
+                            task = Some(task_text.to_string());
                         } else if message.starts_with("Interrupted: ")
                             || message.starts_with("External agent interrupted: ")
                         {
@@ -1640,7 +1653,21 @@ pub(crate) fn intendant_session_list_row_from_dir(
                         }
                     }
                 }
+                "steer_requested" => {
+                    if let Some(text) = obj
+                        .get("data")
+                        .and_then(|d| d.get("text"))
+                        .and_then(|v| v.as_str())
+                    {
+                        preview.push_user(text);
+                    }
+                }
                 "model_response" => {
+                    // The event's message is the model TEXT preview (first
+                    // 200 chars); tool calls live in other event kinds.
+                    if !message.is_empty() {
+                        preview.push_assistant(message);
+                    }
                     if let Some(tok) = obj.get("data").and_then(|d| d.get("tokens")) {
                         let mut event_usage = SessionUsage::default();
                         if let Some(t) = tok.get("total").and_then(|v| v.as_u64()) {
@@ -1885,6 +1912,9 @@ pub(crate) fn intendant_session_list_row_from_dir(
         "can_resume": true,
         "relationships": relationships,
     });
+    if let Some(preview) = preview.into_value() {
+        wrapper_session["preview"] = preview;
+    }
     if let Some(config) = session_agent_config.as_ref() {
         crate::session_config::apply_config_to_session_json(&mut wrapper_session, config);
     }
@@ -2672,6 +2702,101 @@ mod tests {
         let body = list_sessions_from_home_with_limit(home.path(), Some(2));
         let sessions: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
         assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn intendant_row_preview_collects_prose_and_respects_slots() {
+        let home = tempfile::tempdir().unwrap();
+        let log_dir = home.path().join(".intendant").join("logs").join("preview-1");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "created_at": "2026-07-07T10:00:00Z",
+                "task": "Fix the login bug",
+                "status": "idle"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let events = [
+            serde_json::json!({"ts": "2026-07-07T10:00:00Z", "event": "session_start", "message": "Session started"}),
+            // Non-conversation events must never enter the preview.
+            serde_json::json!({"ts": "2026-07-07T10:00:01Z", "event": "messages_input", "turn": 1, "message": "Messages logged (9000 bytes)"}),
+            serde_json::json!({"ts": "2026-07-07T10:00:02Z", "event": "info", "level": "info", "message": "[runtime] Task dispatched: something"}),
+            serde_json::json!({"ts": "2026-07-07T10:00:03Z", "event": "model_response", "turn": 1, "message": "I will start by reading the auth module."}),
+            serde_json::json!({"ts": "2026-07-07T10:00:04Z", "event": "steer_requested", "message": "Steer requested: Also update the tests", "data": {"id": "s1", "status": "requested", "text": "Also update the tests"}}),
+            serde_json::json!({"ts": "2026-07-07T10:00:05Z", "event": "model_response", "turn": 2, "message": "Tests updated; the fix is in."}),
+            // Third assistant message: both assistant slots are taken.
+            serde_json::json!({"ts": "2026-07-07T10:00:06Z", "event": "model_response", "turn": 3, "message": "Extra reply that must not appear."}),
+        ];
+        let jsonl: String = events.iter().map(|e| format!("{e}\n")).collect();
+        std::fs::write(log_dir.join("session.jsonl"), jsonl).unwrap();
+
+        let row = intendant_session_list_row_from_dir(&log_dir, "preview-1").unwrap();
+        let preview = row.get("preview").and_then(|v| v.as_array()).unwrap();
+        let flat: Vec<(String, String)> = preview
+            .iter()
+            .map(|e| {
+                (
+                    e.get("role").and_then(|v| v.as_str()).unwrap().to_string(),
+                    e.get("text").and_then(|v| v.as_str()).unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                ("user".to_string(), "Fix the login bug".to_string()),
+                (
+                    "assistant".to_string(),
+                    "I will start by reading the auth module.".to_string()
+                ),
+                ("user".to_string(), "Also update the tests".to_string()),
+                (
+                    "assistant".to_string(),
+                    "Tests updated; the fix is in.".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn preview_builder_enforces_byte_cap_on_char_boundary() {
+        let mut builder = SessionPreviewBuilder::default();
+        let long = "é".repeat(200); // 2 bytes per char; compacted to 160 chars
+        builder.push_user(&long);
+        builder.push_assistant(&long);
+        builder.push_user(&long);
+        builder.push_assistant(&long);
+        let value = builder.into_value().unwrap();
+        let entries = value.as_array().unwrap();
+        let total: usize = entries
+            .iter()
+            .map(|e| e.get("text").and_then(|v| v.as_str()).unwrap().len())
+            .sum();
+        assert!(total <= SESSION_PREVIEW_MAX_BYTES, "total {total}");
+        // Every surviving text is valid UTF-8 by construction (as_str) —
+        // the cap must land on a char boundary rather than panic.
+        assert!(entries.len() >= 2);
+    }
+
+    #[test]
+    fn preview_prose_text_excludes_tool_blocks() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "real prose"},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "rm -rf /tmp/x"}},
+            {"type": "tool_result", "content": "raw tool output that must not leak"},
+        ]);
+        assert_eq!(message_prose_text(&content).as_deref(), Some("real prose"));
+        let tool_only = serde_json::json!([
+            {"type": "tool_result", "content": "raw tool output"},
+        ]);
+        assert_eq!(message_prose_text(&tool_only), None);
+        assert_eq!(
+            message_prose_text(&serde_json::json!("plain string prompt")).as_deref(),
+            Some("plain string prompt")
+        );
     }
 
     #[test]

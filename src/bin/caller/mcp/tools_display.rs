@@ -516,12 +516,6 @@ impl IntendantServer {
         #[cfg(target_os = "linux")]
         crate::linux_display_env::ensure_gui_session_env("mcp take_screenshot");
 
-        let target = resolve_display_target(params.display_target.as_deref());
-        let backend = DisplayBackend::detect();
-        let activation_request = self
-            .ensure_wayland_user_session_display_activation(target, backend)
-            .await;
-
         let state = self.state.read().await;
         let screenshot_dir = state
             .screenshot_dir
@@ -530,6 +524,15 @@ impl IntendantServer {
         let session_registry = state.session_registry.clone();
         let autonomy = state.autonomy.clone();
         drop(state);
+
+        let target = match params.display_target.as_deref() {
+            Some(spec) => resolve_display_target(spec),
+            None => crate::computer_use::default_display_target(&session_registry).await,
+        };
+        let backend = DisplayBackend::detect();
+        let activation_request = self
+            .ensure_wayland_user_session_display_activation(target, backend)
+            .await;
         // Read after the Wayland activation above, which may have flipped
         // the grant on the guard.
         let user_display_granted = autonomy.read().await.user_display_granted;
@@ -594,11 +597,12 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<ReadScreenParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Element trees only exist for the real session; default there rather
-        // than to a virtual display like the pixel tools do.
+        // Element trees only exist for the real session; default there
+        // unconditionally rather than availability-probing like the pixel
+        // tools do.
         let target = match params.display_target.as_deref() {
             None => crate::computer_use::DisplayTarget::UserSession,
-            some => resolve_display_target(some),
+            Some(spec) => resolve_display_target(spec),
         };
         match crate::computer_use::read_screen_elements(target).await {
             Ok(snapshot) => {
@@ -641,12 +645,6 @@ impl IntendantServer {
             return Ok(text_tool_error("No actions provided"));
         }
 
-        let target = resolve_display_target(params.display_target.as_deref());
-        let backend = DisplayBackend::detect();
-        let activation_request = self
-            .ensure_wayland_user_session_display_activation(target, backend)
-            .await;
-
         let state = self.state.read().await;
         let screenshot_dir = state
             .screenshot_dir
@@ -655,6 +653,15 @@ impl IntendantServer {
         let session_registry = state.session_registry.clone();
         let autonomy = state.autonomy.clone();
         drop(state);
+
+        let target = match params.display_target.as_deref() {
+            Some(spec) => resolve_display_target(spec),
+            None => crate::computer_use::default_display_target(&session_registry).await,
+        };
+        let backend = DisplayBackend::detect();
+        let activation_request = self
+            .ensure_wayland_user_session_display_activation(target, backend)
+            .await;
         // Read after the Wayland activation above, which may have flipped
         // the grant on the guard.
         let user_display_granted = autonomy.read().await.user_display_granted;
