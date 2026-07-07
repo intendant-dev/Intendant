@@ -400,16 +400,16 @@ pub(crate) fn parse_turn_host_port(authority: &str) -> (String, u16) {
 pub(crate) struct RelayAllocation {
     /// The relayed transport address coturn allocated (the candidate's
     /// transport address — what the remote peer dials).
-    relayed_addr: SocketAddr,
+    pub(crate) relayed_addr: SocketAddr,
     /// The reflexive base the TURN server observed for our relay socket
     /// (Allocate response `XOR-MAPPED-ADDRESS`), used as the candidate's
     /// `raddr`/`rport`.
-    mapped_addr: SocketAddr,
+    pub(crate) mapped_addr: SocketAddr,
     /// Driver → relay: RTC outbound bytes that ICE wants to send *from* the
     /// relayed address. Each item is `(peer_addr, bytes)`; the relay task
     /// ensures a permission exists for `peer_addr` then sends via the TURN
     /// client (Send indication → ChannelData once a channel is bound).
-    relay_out_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    pub(crate) relay_out_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
 }
 
 /// Drive a sans-I/O TURN client to allocate a relay on `server`, then run the

@@ -92,7 +92,7 @@ use tokio_util::sync::CancellationToken;
 mod tcp_mux;
 pub use tcp_mux::*;
 mod ice;
-pub use ice::*;
+pub(crate) use ice::*;
 
 /// Bound on the per-peer encoded-frame channel. Frames in excess are dropped
 /// with backpressure registered in the display metrics.
@@ -2127,7 +2127,7 @@ struct RtpSendState {
 /// Inbound packet from one of the per-interface forwarder tasks or a
 /// TCP connection reader. `proto` tags which transport it arrived on so
 /// the driver can hand it to the RTC core with the correct metadata.
-struct InboundPacket {
+pub(crate) struct InboundPacket {
     proto: TransportProtocol,
     source: SocketAddr,
     destination: SocketAddr,
