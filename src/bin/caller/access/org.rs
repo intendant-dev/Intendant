@@ -1018,7 +1018,7 @@ pub fn org_target_daemon_ids(extra_ids: &[String]) -> Vec<String> {
     push(&mut ids, &host_label);
     push(
         &mut ids,
-        crate::peer::PeerId::new(crate::peer::PeerKind::Intendant, &host_label).as_str(),
+        intendant_core::peer_id::PeerId::new(intendant_core::peer_id::PeerKind::Intendant, &host_label).as_str(),
     );
     ids
 }

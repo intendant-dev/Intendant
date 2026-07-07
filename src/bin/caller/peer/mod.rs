@@ -96,7 +96,7 @@ pub mod card;
 pub mod coordinator;
 pub mod event;
 pub mod handle;
-pub mod id;
+pub use intendant_core::peer_id as id;
 pub mod log_writer;
 pub mod mcp_http;
 pub mod ops;
