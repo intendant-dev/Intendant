@@ -12,9 +12,19 @@ final-status-level = "slow"
 # Per-test timings for slow-test audits (target/nextest/default/junit.xml).
 path = "junit.xml"
 
-# Heavy-crypto tests: subprocess `security` CLI (serialized behind
-# securityd) + real keygen; give them headroom instead of false timeouts
-# on a loaded box.
+# macOS keychain reality: the access backend is the real keychain, so any
+# test that adds a peer or touches an identity shells out to `security`
+# (serialized behind securityd) and pays 30-60s — rustc optimization
+# cannot help a subprocess, and the affected tests span peer::, access::,
+# startup::peer_boot, and the web_gateway peer-API routes. Until the
+# access backend is test-injectable (planned), macOS gets a realistic
+# global ceiling; Linux/Windows keep the tight default above.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "macos")'
+slow-timeout = { period = "30s", terminate-after = 8 }
+
+# Heavy-crypto tests (subprocess `security` import, real keygen) need
+# headroom on loaded Linux boxes too.
 [[profile.default.overrides]]
 filter = 'test(/p12_|_recert|keychain/)'
 slow-timeout = { period = "60s", terminate-after = 4 }
