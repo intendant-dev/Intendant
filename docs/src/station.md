@@ -32,7 +32,7 @@ Two stacked canvases plus a deliberately tiny set of DOM elements:
   origin, one node per connected host orbiting it, agent nodes orbiting
   their host, approval-glow and token-budget rings, event sparks, a
   starfield, and a ground grid.
-- **HUD canvas** — the entire interactive UI, painted per-frame by `hud.rs`:
+- **HUD canvas** — the entire interactive UI, painted per-frame by `hud/` (stage, panels, focus, widgets):
   header band, command deck, the nine orbital "system" targets (activity /
   context / managed / controls / sessions / peers / changes / worktrees /
   view), scrollable per-domain panels, focus-detail panels (agent / host /
