@@ -2445,6 +2445,7 @@ dependencies = [
  "image",
  "intendant-core",
  "intendant-display",
+ "intendant-platform",
  "landlock",
  "libc",
  "notify",
@@ -2486,7 +2487,6 @@ dependencies = [
  "uuid",
  "which 8.0.2",
  "windows 0.59.0",
- "windows-sys 0.59.0",
  "x11rb",
  "x509-parser 0.18.1",
  "zip",
@@ -2536,6 +2536,20 @@ dependencies = [
  "uuid",
  "windows 0.59.0",
  "x11rb",
+]
+
+[[package]]
+name = "intendant-platform"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "intendant-core",
+ "libc",
+ "serde",
+ "tempfile",
+ "tokio",
+ "which 8.0.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

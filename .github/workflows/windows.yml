@@ -237,7 +237,9 @@ jobs:
       # they're fast and keep pre-queue runtime signal.
       - name: cargo check (Windows pull_request fast path)
         if: github.event_name == 'pull_request' && runner.os == 'Windows' && steps.relevance_win.outputs.relevant != 'false'
-        run: cargo check -p intendant --bins -p intendant-core -p intendant-display --locked --target ${{ matrix.target }}
+        run: |
+          cargo check -p intendant --bins --locked --target ${{ matrix.target }}
+          cargo check -p intendant-core -p intendant-display -p intendant-platform --tests --locked --target ${{ matrix.target }}
 
       # Build and run the unit tests of the whole `intendant` package — both
       # binaries (the `intendant` controller and the `intendant-runtime`
@@ -250,7 +252,12 @@ jobs:
       # the dependency set main pins, never a silent re-resolution of it.
       - name: cargo test
         if: (github.event_name != 'pull_request' || runner.os != 'Windows') && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
-        run: cargo test -p intendant --bins -p intendant-core -p intendant-display --locked --target ${{ matrix.target }}
+        run: |
+          cargo test -p intendant --bins --locked --target ${{ matrix.target }}
+          # Lib crates get their own invocation: a global `--bins` filter
+          # silently no-ops packages that have no bin targets, which is
+          # how the core/display lib tests went dark after extraction.
+          cargo test -p intendant-core -p intendant-display -p intendant-platform --locked --target ${{ matrix.target }}
 
       # Headless end-to-end: the real `intendant` + `intendant-runtime`
       # binaries driven by the scripted mock provider (see tests/e2e/main.rs).

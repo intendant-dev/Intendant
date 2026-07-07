@@ -43,7 +43,7 @@ mod mcp;
 mod mcp_client;
 mod peer;
 mod peer_file_transfer;
-mod platform;
+pub(crate) use intendant_platform::platform;
 mod presence;
 mod project;
 mod prompts;
@@ -74,7 +74,7 @@ mod transcription;
 mod transfer_store;
 mod types;
 mod upload_store;
-mod vision;
+pub(crate) use intendant_platform::vision;
 mod web_gateway;
 mod web_tls;
 #[cfg(windows)]
