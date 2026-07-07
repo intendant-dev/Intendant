@@ -792,7 +792,6 @@ pub(crate) fn find_context_rewind_anchor_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
 
     #[test]
     fn context_rewind_thread_id_candidates_prefers_session_then_alias() {
