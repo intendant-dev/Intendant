@@ -941,55 +941,123 @@ function applySessionRelationshipsFromSession(session) {
   }
 }
 
+function _foldSessionWindowMetadataRow(session, changedIds) {
+  const meta = sessionWindowMetaFromSession(session);
+  const ids = Array.from(new Set([
+    session.session_id,
+    session.resume_id,
+    session.backend_session_id,
+    session.intendant_session_id,
+  ].map(id => String(id || '').trim()).filter(Boolean)));
+  for (const id of ids) {
+    sessionRowSeenIds.add(id);
+    sessionRelationshipHydrationUnresolved.delete(id);
+    const { meta: merged, changed } = mergeSessionWindowMetadata(id, meta);
+    if (changed && sessionWindows.has(id)) updateSessionWindow(id, merged);
+    if (changed) changedIds.add(id);
+  }
+  if (session.backend_session_id && session.session_id) {
+    applySessionIdentity({
+      session_id: session.session_id,
+      backend_session_id: session.backend_session_id,
+      source: session.backend_source,
+      backend_source_label: session.backend_source_label,
+    });
+  }
+  if (!sessionMetadataStatusIsTerminal(session)) {
+    const rawSource = String(session.source || '').trim().toLowerCase();
+    const source = rawSource === 'intendant'
+      ? 'intendant'
+      : normalizeAgentId(session.source || session.backend_source || '');
+    const backendSessionId = String(session.backend_session_id || '').trim();
+    const intendantSessionId = String(session.intendant_session_id || '').trim();
+    const sessionId = String(session.session_id || '').trim();
+    if (source && source !== 'intendant' && intendantSessionId) {
+      clearStaleSessionWindowDetached(sessionId, 'session metadata reports an attached wrapper');
+    }
+    if (source === 'intendant' && backendSessionId) {
+      clearStaleSessionWindowDetached(backendSessionId, 'wrapper metadata reports this session is attached');
+    }
+  }
+  scheduleExternalSessionWindowTranscriptSyncFromMetadata(session);
+}
+
+// Full-corpus list applies fold thousands of rows; running that
+// synchronously on every stream flush stalled the main thread. Small
+// batches still fold inline (event-driven single-row refreshes stay
+// immediate); large ones fold in idle-time slices. A batch arriving
+// mid-fold queues behind it — latest wins, so every row is eventually
+// folded with the newest data — and the DOM label refresh plus the
+// persist run once per completed fold, not once per flush.
+const SESSION_WINDOW_META_FOLD_SYNC_MAX = 400;
+const SESSION_WINDOW_META_FOLD_CHUNK = 400;
+let _sessionWindowMetaFold = null; // { rows, index, phase, changedIds, queued }
+
 function cacheSessionWindowMetadata(sessions) {
   if (!Array.isArray(sessions)) return;
-  const changedIds = new Set();
-  for (const session of sessions) {
+  if (sessions.length <= SESSION_WINDOW_META_FOLD_SYNC_MAX && !_sessionWindowMetaFold) {
+    const changedIds = new Set();
+    for (const session of sessions) {
+      if (!session || typeof session !== 'object') continue;
+      _foldSessionWindowMetadataRow(session, changedIds);
+    }
+    for (const session of sessions) {
+      if (!session || typeof session !== 'object') continue;
+      applySessionRelationshipsFromSession(session);
+    }
+    refreshSessionIdentityLabelsBulk(changedIds);
+    persistSessionWindowState();
+    return;
+  }
+  if (_sessionWindowMetaFold) {
+    // Union-merge rather than replace: a small event-driven batch queued
+    // behind an in-flight fold must not drop a queued full-corpus apply
+    // (mergeSessionRows keeps newest-per-row).
+    _sessionWindowMetaFold.queued = _sessionWindowMetaFold.queued
+      ? mergeSessionRows(_sessionWindowMetaFold.queued, sessions)
+      : sessions;
+    return;
+  }
+  _sessionWindowMetaFold = { rows: sessions, index: 0, phase: 'meta', changedIds: new Set(), queued: null };
+  _scheduleSessionWindowMetaFoldSlice();
+}
+
+function _scheduleSessionWindowMetaFoldSlice() {
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(deadline => _runSessionWindowMetaFoldSlice(deadline), { timeout: 300 });
+  } else {
+    setTimeout(() => _runSessionWindowMetaFoldSlice(null), 16);
+  }
+}
+
+function _runSessionWindowMetaFoldSlice(deadline) {
+  const fold = _sessionWindowMetaFold;
+  if (!fold) return;
+  const hasBudget = () => deadline && typeof deadline.timeRemaining === 'function'
+    ? deadline.timeRemaining() > 2
+    : true;
+  let processed = 0;
+  while (processed < SESSION_WINDOW_META_FOLD_CHUNK && hasBudget()) {
+    if (fold.index >= fold.rows.length) {
+      if (fold.phase === 'meta') {
+        fold.phase = 'relationships';
+        fold.index = 0;
+        continue;
+      }
+      _sessionWindowMetaFold = null;
+      refreshSessionIdentityLabelsBulk(fold.changedIds);
+      persistSessionWindowState();
+      if (fold.queued) cacheSessionWindowMetadata(fold.queued);
+      return;
+    }
+    const session = fold.rows[fold.index];
+    fold.index += 1;
     if (!session || typeof session !== 'object') continue;
-    const meta = sessionWindowMetaFromSession(session);
-    const ids = Array.from(new Set([
-      session.session_id,
-      session.resume_id,
-      session.backend_session_id,
-      session.intendant_session_id,
-    ].map(id => String(id || '').trim()).filter(Boolean)));
-    for (const id of ids) {
-      sessionRowSeenIds.add(id);
-      sessionRelationshipHydrationUnresolved.delete(id);
-      const { meta: merged, changed } = mergeSessionWindowMetadata(id, meta);
-      if (changed && sessionWindows.has(id)) updateSessionWindow(id, merged);
-      if (changed) changedIds.add(id);
-    }
-    if (session.backend_session_id && session.session_id) {
-      applySessionIdentity({
-        session_id: session.session_id,
-        backend_session_id: session.backend_session_id,
-        source: session.backend_source,
-        backend_source_label: session.backend_source_label,
-      });
-    }
-    if (!sessionMetadataStatusIsTerminal(session)) {
-      const rawSource = String(session.source || '').trim().toLowerCase();
-      const source = rawSource === 'intendant'
-        ? 'intendant'
-        : normalizeAgentId(session.source || session.backend_source || '');
-      const backendSessionId = String(session.backend_session_id || '').trim();
-      const intendantSessionId = String(session.intendant_session_id || '').trim();
-      const sessionId = String(session.session_id || '').trim();
-      if (source && source !== 'intendant' && intendantSessionId) {
-        clearStaleSessionWindowDetached(sessionId, 'session metadata reports an attached wrapper');
-      }
-      if (source === 'intendant' && backendSessionId) {
-        clearStaleSessionWindowDetached(backendSessionId, 'wrapper metadata reports this session is attached');
-      }
-    }
-    scheduleExternalSessionWindowTranscriptSyncFromMetadata(session);
+    if (fold.phase === 'meta') _foldSessionWindowMetadataRow(session, fold.changedIds);
+    else applySessionRelationshipsFromSession(session);
+    processed += 1;
   }
-  for (const session of sessions) {
-    applySessionRelationshipsFromSession(session);
-  }
-  refreshSessionIdentityLabelsBulk(changedIds);
-  persistSessionWindowState();
+  _scheduleSessionWindowMetaFoldSlice();
 }
 
 // One DOM pass for a whole metadata batch. The per-id
