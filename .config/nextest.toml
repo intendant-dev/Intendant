@@ -38,3 +38,10 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 [[profile.default.overrides]]
 filter = 'test(/peer::(registry::tests::add_peer_|handle::tests::snapshot_carries_folded_|coordinator::tests::)/)'
 slow-timeout = { period = "60s", terminate-after = 4 }
+
+# The mTLS pairing e2e provisions a real access cert store (3× RSA-2048
+# keygen) and boots a TLS daemon before its first assertion — seconds of
+# setup before any poll starts, more under load.
+[[profile.default.overrides]]
+filter = 'test(/ctl_peer_mtls_pairing/)'
+slow-timeout = { period = "120s", terminate-after = 3 }

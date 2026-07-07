@@ -170,6 +170,15 @@ fn tail(contents: &str, max: usize) -> String {
     contents[start..].to_string()
 }
 
+/// One free loopback port, same caveats as [`two_free_loopback_ports`].
+fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("ephemeral port addr")
+        .port()
+}
+
 /// Two distinct free loopback ports, grabbed while both listeners are
 /// alive so the kernel cannot hand out the same port twice. The listeners
 /// are dropped on return and the daemons re-bind moments later; if a port
@@ -213,7 +222,21 @@ async fn spawn_daemon(
     script: &serde_json::Value,
     port: u16,
 ) -> DaemonRig {
-    let rig = TestRig::new();
+    spawn_daemon_on_rig(client, TestRig::new(), script, port, false).await
+}
+
+/// [`spawn_daemon`] against a caller-prepared rig — used when the rig's
+/// state root needs provisioning (e.g. `access setup`) before boot. With
+/// `tls` the daemon is left on its default TLS+mTLS path (it auto-loads
+/// the rig's provisioned access certs), so `client` must tolerate the
+/// self-signed server cert.
+async fn spawn_daemon_on_rig(
+    client: &reqwest::Client,
+    rig: TestRig,
+    script: &serde_json::Value,
+    port: u16,
+    tls: bool,
+) -> DaemonRig {
     // These rigs model a *rooted* daemon: an idle --web daemon launched
     // from a markerless cwd runs projectless and then requires an explicit
     // per-session project root — but a peer-delegated task
@@ -234,23 +257,38 @@ async fn spawn_daemon(
         .stderr(log);
     cmd.arg("--web")
         .arg(port.to_string())
-        .args([
-            "--bind",
-            "127.0.0.1",
-            "--no-tls",
-            "--no-tui",
-            "--autonomy",
-            "full",
-        ])
-        .arg("--advertise-url")
-        .arg(format!("ws://127.0.0.1:{port}/ws"));
+        .args(["--bind", "127.0.0.1", "--no-tui", "--autonomy", "full"]);
+    let (ws_scheme, http_scheme) = if tls {
+        ("wss", "https")
+    } else {
+        cmd.arg("--no-tls");
+        ("ws", "http")
+    };
+    cmd.arg("--advertise-url")
+        .arg(format!("{ws_scheme}://127.0.0.1:{port}/ws"));
     let child = cmd.spawn().expect("spawn intendant daemon");
     let mut daemon = DaemonRig { child, rig, port };
 
-    let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
+    // Readiness. Plain rigs poll the agent card as before. TLS rigs
+    // cannot: the gateway's default-mTLS policy requires a client cert
+    // for everything except peer access and Connect bootstrap, and the
+    // card is not exempt — so a certless probe would spin forever.
+    // The pairing doorbell IS deliberately certless (it exists for
+    // pre-identity bootstrap), so any HTTP response from it proves the
+    // TLS listener is up (the vm pairing script probes the same path).
+    let probe_url = if tls {
+        format!("{http_scheme}://127.0.0.1:{port}/api/peer-pairing/requests/not-found")
+    } else {
+        format!("{http_scheme}://127.0.0.1:{port}/.well-known/agent-card.json")
+    };
     let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
     loop {
-        if http_get_json(client, &card_url).await.is_some() {
+        let ready = if tls {
+            client.get(&probe_url).send().await.is_ok()
+        } else {
+            http_get_json(client, &probe_url).await.is_some()
+        };
+        if ready {
             return daemon;
         }
         if let Ok(Some(status)) = daemon.child.try_wait() {
@@ -261,7 +299,7 @@ async fn spawn_daemon(
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "daemon on port {port} did not serve its agent card within \
+            "daemon on port {port} did not answer {probe_url} within \
              {DAEMON_START_TIMEOUT:?}:\n{}",
             daemon.log_tail()
         );
@@ -994,4 +1032,220 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
     // both daemons are dead before their temp homes are removed.
     let _ = a.child.kill().await;
     let _ = b.child.kill().await;
+}
+
+/// The remainder of a stdout line beginning with `prefix` — the pairing
+/// CLI's contract for machine consumption (`:: request id: …`).
+fn line_suffix(text: &str, prefix: &str) -> String {
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("no line starts with {prefix:?} in:\n{text}"))
+        .trim()
+        .to_string()
+}
+
+/// Run `intendant ctl --peer peer-e2e-b <args…>` from side A's project —
+/// deliberately no `--port` and no daemon on side A: peer routing reads
+/// `[[peer]]` from the project config and dials the peer directly.
+async fn ctl_peer(rig: &TestRig, args: &[&str]) -> std::process::Output {
+    let mut cmd = rig.command();
+    cmd.env_remove("INTENDANT_MCP_URL")
+        .env_remove("INTENDANT_PORT")
+        .env_remove("INTENDANT_SESSION_ID")
+        .env_remove("INTENDANT_MANAGED_CONTEXT");
+    cmd.arg("ctl").args(["--peer", "peer-e2e-b"]).args(args);
+    rig.run(cmd).await
+}
+
+/// The full mTLS peer-principal path over a real pairing ceremony — what
+/// the `--no-tls` federation test above deliberately cannot exercise:
+/// there every /mcp request binds the tokenless-loopback principal, never
+/// a peer identity. Here daemon B serves TLS+mTLS from a provisioned
+/// access store; side A (no daemon and no pre-provisioned store — `peer
+/// request` mints its own keypair) pairs via request → headless approve →
+/// complete under the scoped `read-only-display` profile, then drives B's
+/// /mcp daemon-lessly with `ctl --peer`.
+///
+/// The allowed call proves the issued client cert resolved to the granted
+/// profile: ctl's `x-intendant-peer` marker makes an unresolvable cert a
+/// hard 403, so success cannot be an anonymous fallback. The denied call
+/// proves the same principal is refused display input, and the diagnostic
+/// must name the peer-daemon principal — a transport failure or a
+/// non-peer denial would not.
+///
+/// Not on Windows: the `intendant access` provisioning CLI is
+/// `#[cfg(not(target_os = "windows"))]` and `WindowsBackend::cert_dir()`
+/// ignores the sandboxed state root, so the rig cannot provision there.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
+    let insecure_probe = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(4))
+        .build()
+        .expect("build insecure probe client");
+
+    // Side B: provision an isolated access store under the rig's state
+    // root, then boot the daemon on its default TLS+mTLS path (no
+    // `--no-tls` ⇒ it auto-loads the store's server cert and verifies
+    // client certs against the store's CA).
+    let port_b = free_loopback_port();
+    let rig_b = TestRig::new();
+    std::fs::write(rig_b.project.path().join("intendant.toml"), "")
+        .expect("mark side B's project root");
+    let setup = {
+        let mut cmd = rig_b.command();
+        cmd.args([
+            "access",
+            "setup",
+            "--ip",
+            "127.0.0.1",
+            "--host",
+            "localhost",
+            "--name",
+            "peer-e2e-b",
+            "--port",
+            &port_b.to_string(),
+            "--no-serve-certs",
+            "--force",
+        ]);
+        rig_b.run(cmd).await
+    };
+    assert!(
+        setup.status.success(),
+        "access setup failed:\n{}",
+        text_of(&setup)
+    );
+
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let mut daemon_b = spawn_daemon_on_rig(&insecure_probe, rig_b, &idle_script, port_b, true).await;
+
+    // Side A: a bare project, nothing else.
+    let rig_a = TestRig::new();
+    std::fs::write(rig_a.project.path().join("intendant.toml"), "")
+        .expect("mark side A's project root");
+    let request = {
+        let mut cmd = rig_a.command();
+        cmd.args([
+            "peer",
+            "request",
+            &format!("https://127.0.0.1:{port_b}"),
+            "--label",
+            "peer-e2e-a",
+            "--profile",
+            "read-only-display",
+        ]);
+        rig_a.run(cmd).await
+    };
+    assert!(
+        request.status.success(),
+        "peer request failed:\n{}\ndaemon B log:\n{}",
+        text_of(&request),
+        daemon_b.log_tail()
+    );
+    let request_stdout = String::from_utf8_lossy(&request.stdout).into_owned();
+    let request_id = line_suffix(&request_stdout, ":: request id: ");
+    let approval_code = line_suffix(&request_stdout, ":: approval code: ");
+
+    // Approve headlessly on B: a direct state-file write against B's
+    // cert store (the running daemon rereads the file per status poll).
+    // The profile is stated explicitly again — approval, not the
+    // request, is what grants — and canonically: unknown profile
+    // strings silently degrade to presence-only rather than erroring.
+    let approve = {
+        let mut cmd = daemon_b.rig.command();
+        cmd.args([
+            "peer",
+            "approve",
+            &approval_code,
+            "--profile",
+            "read-only-display",
+        ]);
+        daemon_b.rig.run(cmd).await
+    };
+    assert!(
+        approve.status.success(),
+        "peer approve failed:\n{}",
+        text_of(&approve)
+    );
+
+    // Complete on A. `peer complete` exits 0 even while the request is
+    // still pending, so the install lines — not the exit status — are
+    // the assertion.
+    let complete = {
+        let mut cmd = rig_a.command();
+        cmd.args(["peer", "complete", &request_id, "--label", "peer-e2e-b"]);
+        rig_a.run(cmd).await
+    };
+    let complete_text = text_of(&complete);
+    assert!(
+        complete.status.success(),
+        "peer complete failed:\n{complete_text}"
+    );
+    assert!(
+        complete_text.contains(":: client cert:"),
+        "peer complete did not install an identity (still pending?):\n{complete_text}"
+    );
+    let peer_config = std::fs::read_to_string(rig_a.project.path().join("intendant.toml"))
+        .expect("read side A's intendant.toml");
+    assert!(
+        peer_config.contains("[[peer]]") && peer_config.contains("pinned_fingerprints"),
+        "completion did not persist the [[peer]] entry:\n{peer_config}"
+    );
+
+    // B recorded the inbound identity under the scoped profile — this
+    // guards the assertions below against the alias/degradation traps
+    // in profile handling (an accidental peer-root grant would make the
+    // deny leg vacuous… by passing, not failing, so pin the profile).
+    let identities = {
+        let mut cmd = daemon_b.rig.command();
+        cmd.args(["peer", "identities"]);
+        daemon_b.rig.run(cmd).await
+    };
+    let identities_text = text_of(&identities);
+    assert!(
+        identities_text.contains("Approved")
+            && identities_text.contains("profile=read-only-display"),
+        "approved identity with the scoped profile not recorded on B:\n{identities_text}"
+    );
+
+    // Allowed: display list is display-view, within read-only-display.
+    let allowed = ctl_peer(&rig_a, &["display", "list"]).await;
+    let allowed_text = text_of(&allowed);
+    assert!(
+        allowed.status.success(),
+        "peer-routed display list failed:\n{allowed_text}\ndaemon B log:\n{}",
+        daemon_b.log_tail()
+    );
+    assert!(
+        !allowed_text.contains("Permission denied"),
+        "display view should be within read-only-display:\n{allowed_text}"
+    );
+
+    // Denied: cu actions is display-input, above the profile ceiling.
+    let denied = ctl_peer(
+        &rig_a,
+        &["cu", "actions", "--actions", r#"[{"type":"screenshot"}]"#],
+    )
+    .await;
+    let denied_text = text_of(&denied);
+    assert!(
+        denied_text.contains("Permission denied for tool 'execute_cu_actions'"),
+        "display input should be denied under read-only-display:\n{denied_text}\ndaemon B log:\n{}",
+        daemon_b.log_tail()
+    );
+    assert!(
+        denied_text.contains("principal:peer-daemon:"),
+        "denial should carry the peer-daemon principal:\n{denied_text}"
+    );
+
+    let _ = daemon_b.child.kill().await;
 }
