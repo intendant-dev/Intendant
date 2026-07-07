@@ -111,6 +111,15 @@ function handleBrowserWorkspaceMessage(d) {
   renderBrowserWorkspaces();
 }
 
+// The dashboard-fronted session id for owner/holder stamping. The old
+// `currentSessionId` global died in the AppWeb→PresenceWeb merge
+// (9285c7b6); the bare reads below kept the dead name and threw
+// ReferenceError, silently breaking Create and Take/Acquire since March.
+// Same fallback chain the session-window code uses for self-identity.
+function debugPaneSessionId() {
+  return String(currentSessionFullId || daemonSessionFullId || '').trim();
+}
+
 function createBrowserWorkspaceFromDebug() {
   if (!app) return;
   const g = id => document.getElementById(id);
@@ -119,7 +128,7 @@ function createBrowserWorkspaceFromDebug() {
     url: (g('browser-workspace-url')?.value || '').trim() || undefined,
     provider: g('browser-workspace-provider')?.value || 'auto',
     label: (g('browser-workspace-label')?.value || '').trim() || undefined,
-    owner_session_id: currentSessionId || undefined,
+    owner_session_id: debugPaneSessionId() || undefined,
   });
 }
 
@@ -128,7 +137,7 @@ function acquireBrowserWorkspace(workspaceId, force = false) {
   dispatchDashboardActionMsg({
     action: 'acquire_browser_workspace',
     workspace_id: workspaceId,
-    holder_id: currentSessionId || ((typeof connectionId !== 'undefined' && connectionId) ? connectionId : 'dashboard'),
+    holder_id: debugPaneSessionId() || ((typeof connectionId !== 'undefined' && connectionId) ? connectionId : 'dashboard'),
     holder_kind: 'human',
     force: !!force,
   });
