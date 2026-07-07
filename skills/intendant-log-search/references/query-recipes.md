@@ -313,7 +313,7 @@ jq '{current_head_id, rounds:[.rounds[]? | {id,parent_id,summary,timestamp_unix,
 Find rounds touching a path:
 
 ```bash
-PATH_PART="src/bin/caller/session_log.rs"
+PATH_PART="src/bin/caller/session_log/mod.rs"
 jq -c --arg p "$PATH_PART" '.rounds[]? | select((.files_changed // []) | index($p)) | {id,summary,files_changed}' \
   "$S/file_snapshots/history.json"
 ```
