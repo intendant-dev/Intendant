@@ -599,6 +599,7 @@ pub struct PeerSnapshot {
 /// `build_transport` — retained on the handle (see
 /// [`PeerHandle::transport_credentials`]) so gateway HTTP calls made
 /// outside the transport reuse the identical identity and pins.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_peer<F>(
     id: PeerId,
     initial_card: AgentCard,
