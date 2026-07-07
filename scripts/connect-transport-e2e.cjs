@@ -813,13 +813,18 @@ async function main() {
         new Promise(resolve => setTimeout(resolve, 8000)),
       ]);
     }
-    if (proxy) await new Promise(resolve => proxy.close(resolve)).catch(() => {});
+    // Children first: the daemon holds a long-poll open through the proxy,
+    // so a graceful proxy close would wait on it forever.
     for (const child of children.reverse()) {
       if (child.exitCode === null && !child.killed) child.kill('SIGTERM');
     }
     await new Promise(resolve => setTimeout(resolve, 500));
     for (const child of children) {
       if (child.exitCode === null && !child.killed) child.kill('SIGKILL');
+    }
+    if (proxy) {
+      proxy.close(() => {});
+      if (typeof proxy.closeAllConnections === 'function') proxy.closeAllConnections();
     }
     if (!failed && !options.keep) {
       fs.rmSync(tmp, { recursive: true, force: true });

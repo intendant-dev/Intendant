@@ -155,6 +155,48 @@ block, `header_up -X-Forwarded-For` deletions are applied **after**
 idiom deletes the value it just set. Use the set alone — a set already
 replaces anything the client supplied.
 
+## End-to-end transport validation
+
+`scripts/connect-transport-e2e.cjs` asserts the outcome this whole
+chapter exists for — a browser that registered at the rendezvous,
+claimed a **fresh** daemon with its first-owner bootstrap phrase, and
+opened the hosted dashboard gets an **OPEN dashboard-control
+DataChannel** — entirely locally: no cloud resources, no real accounts.
+It spawns `intendant-connect` (`--open-registration`, `localhost`
+WebAuthn origin), a ~30-line `X-Forwarded-For`-injecting forward proxy
+standing in for the production reverse proxy, and a scratch-`HOME`
+daemon (keyless, `PROVIDER=mock`) whose empty IAM mints the bootstrap
+phrase; headless Chromium then mints the passkey account with a CDP
+virtual authenticator and walks the real `/connect` signup → phrase →
+bootstrap-arm page flow.
+
+Two hosted `/app` dashboard connections are asserted. The baseline pass
+requires channel open + verified daemon binding + an answered status RPC
+(a granted session, not a refusal — the claiming browser key was
+bootstrap-enrolled `role:root`). The TCP-forced pass then makes UDP
+unroutable from inside the page (answer-SDP candidate strip plus
+suppression of the browser's own UDP trickle, so no peer-reflexive UDP
+pair can sneak back) — the topology of a cloud box whose UDP is filtered
+— and requires the *selected* ICE pair to be `tcp` at
+`observed_ip:gateway_port`, the daemon to log `ICE-TCP enabled on …`,
+and a second `[dashboard/control] data channel open`. Each regression
+the first cloud deployment hit fails a distinct printed stage: a proxy
+dropping `X-Forwarded-For` fails the register-echo stage, a daemon not
+advertising ICE-TCP fails the candidate stage, and DTLS/SCTP transmits
+misrouted off the nominated TCP pair reproduce their 30-second DTLS
+stall in the final stage.
+
+```bash
+cargo build --bin intendant --bin intendant-runtime --bin intendant-connect
+node scripts/connect-transport-e2e.cjs      # target/debug; --release for release bins
+```
+
+Operator battery, not CI: it needs a Chromium (Playwright's browser or
+`CHROME_PATH`/`CHROME_BIN`; see `scripts/lib/browser-automation.cjs`)
+and one routable non-loopback IPv4 interface (auto-detected; `--lan-ip`
+overrides). Prints staged progress, exits 0/1, cleans up its scratch
+state (kept on failure for inspection).
+
 The service stores each org's latest root-signed revocation list, blind:
 `POST /api/orgs/revocations/publish` accepts a list whose embedded
 signature verifies and whose `seq` is not lower than the stored one;
