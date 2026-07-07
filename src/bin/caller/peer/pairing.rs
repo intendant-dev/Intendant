@@ -194,60 +194,90 @@ fn parse_args(argv: &[String]) -> Result<PeerArgs, CallerError> {
                 args.action = PeerAction::Help;
                 return Ok(args);
             }
-            other if other.starts_with('-') => {
+            "--" => {
+                // Standard end-of-flags separator: everything after is
+                // positional, however it starts.
+                for rest in iter.by_ref() {
+                    take_positional(&mut args, rest)?;
+                }
+            }
+            other if other.starts_with("--") => {
                 return Err(CallerError::Config(format!("unknown peer flag '{other}'")));
             }
-            other => match args.action {
-                PeerAction::Join if args.invite.is_none() => {
-                    args.invite = Some(other.to_string());
+            other if other.starts_with('-') => {
+                // Request ids are opaque tokens; historically base64url,
+                // where 1 in 64 starts with '-'. When the action still
+                // expects its positional code/id, a single-dash token is
+                // that value, not a flag typo.
+                if expects_code_or_id(&args) {
+                    take_positional(&mut args, other)?;
+                } else {
+                    return Err(CallerError::Config(format!("unknown peer flag '{other}'")));
                 }
-                PeerAction::Request if args.target_url.is_none() => {
-                    args.target_url = Some(other.to_string());
-                }
-                PeerAction::Approve
-                | PeerAction::Deny
-                | PeerAction::Complete
-                | PeerAction::Revoke
-                    if args.code_or_id.is_none() =>
-                {
-                    args.code_or_id = Some(other.to_string());
-                }
-                PeerAction::Invite => {
-                    return Err(CallerError::Config(format!(
-                        "unexpected argument '{other}' for `intendant peer invite`"
-                    )));
-                }
-                PeerAction::Join => {
-                    return Err(CallerError::Config(format!(
-                        "unexpected extra invite argument '{other}'"
-                    )));
-                }
-                PeerAction::Request => {
-                    return Err(CallerError::Config(format!(
-                        "unexpected extra target argument '{other}'"
-                    )));
-                }
-                PeerAction::Approve | PeerAction::Deny | PeerAction::Complete => {
-                    return Err(CallerError::Config(format!(
-                        "unexpected extra request argument '{other}'"
-                    )));
-                }
-                PeerAction::Revoke => {
-                    return Err(CallerError::Config(format!(
-                        "unexpected extra identity argument '{other}'"
-                    )));
-                }
-                PeerAction::Requests | PeerAction::Identities => {
-                    return Err(CallerError::Config(format!(
-                        "unexpected argument '{other}' for this peer subcommand"
-                    )));
-                }
-                PeerAction::Help => {}
-            },
+            }
+            other => take_positional(&mut args, other)?,
         }
     }
 
     Ok(args)
+}
+
+/// Whether the parsed action takes a positional code/id that is still
+/// unfilled.
+fn expects_code_or_id(args: &PeerArgs) -> bool {
+    matches!(
+        args.action,
+        PeerAction::Approve | PeerAction::Deny | PeerAction::Complete | PeerAction::Revoke
+    ) && args.code_or_id.is_none()
+}
+
+/// Assign a positional argument according to the action's grammar.
+fn take_positional(args: &mut PeerArgs, other: &str) -> Result<(), CallerError> {
+    match args.action {
+        PeerAction::Join if args.invite.is_none() => {
+            args.invite = Some(other.to_string());
+        }
+        PeerAction::Request if args.target_url.is_none() => {
+            args.target_url = Some(other.to_string());
+        }
+        PeerAction::Approve | PeerAction::Deny | PeerAction::Complete | PeerAction::Revoke
+            if args.code_or_id.is_none() =>
+        {
+            args.code_or_id = Some(other.to_string());
+        }
+        PeerAction::Invite => {
+            return Err(CallerError::Config(format!(
+                "unexpected argument '{other}' for `intendant peer invite`"
+            )));
+        }
+        PeerAction::Join => {
+            return Err(CallerError::Config(format!(
+                "unexpected extra invite argument '{other}'"
+            )));
+        }
+        PeerAction::Request => {
+            return Err(CallerError::Config(format!(
+                "unexpected extra target argument '{other}'"
+            )));
+        }
+        PeerAction::Approve | PeerAction::Deny | PeerAction::Complete => {
+            return Err(CallerError::Config(format!(
+                "unexpected extra request argument '{other}'"
+            )));
+        }
+        PeerAction::Revoke => {
+            return Err(CallerError::Config(format!(
+                "unexpected extra identity argument '{other}'"
+            )));
+        }
+        PeerAction::Requests | PeerAction::Identities => {
+            return Err(CallerError::Config(format!(
+                "unexpected argument '{other}' for this peer subcommand"
+            )));
+        }
+        PeerAction::Help => {}
+    }
+    Ok(())
 }
 
 fn print_help() {
@@ -828,6 +858,47 @@ mod tests {
         let encoded = encode_invite(&original).unwrap();
         assert!(encoded.starts_with(INVITE_PREFIX));
         assert_eq!(decode_invite(&encoded).unwrap(), original);
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn complete_accepts_dash_leading_request_id() {
+        // Historical request ids are raw base64url: 1 in 64 starts with
+        // '-' and used to die here as "unknown peer flag" (the 2026-07-08
+        // merge-queue ejection).
+        let args = parse_args(&argv(&[
+            "complete",
+            "-vyeJaE3hyqm4J45K5j_sVTX",
+            "--label",
+            "peer-b",
+        ]))
+        .expect("dash-leading id is the positional, not a flag");
+        assert!(matches!(args.action, PeerAction::Complete));
+        assert_eq!(args.code_or_id.as_deref(), Some("-vyeJaE3hyqm4J45K5j_sVTX"));
+        assert_eq!(args.label.as_deref(), Some("peer-b"));
+    }
+
+    #[test]
+    fn double_dash_separator_forces_positionals() {
+        let args = parse_args(&argv(&["revoke", "--", "--looks-like-a-flag"]))
+            .expect("everything after -- is positional");
+        assert!(matches!(args.action, PeerAction::Revoke));
+        assert_eq!(args.code_or_id.as_deref(), Some("--looks-like-a-flag"));
+    }
+
+    #[test]
+    fn unknown_double_dash_flag_still_errors() {
+        let err = parse_args(&argv(&["complete", "--profle", "x"])).unwrap_err();
+        assert!(err.to_string().contains("unknown peer flag '--profle'"));
+    }
+
+    #[test]
+    fn dash_token_after_filled_positional_still_errors() {
+        let err = parse_args(&argv(&["complete", "req-1", "-extra"])).unwrap_err();
+        assert!(err.to_string().contains("unknown peer flag '-extra'"));
     }
 
     #[test]
