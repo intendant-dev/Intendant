@@ -1815,7 +1815,12 @@ pub(crate) async fn run_agent_loop(
                 source: None,
             });
 
-            let output = agent_runner::run_agent(&json_str, log_dir, &project.root).await?;
+            // Read the grant fresh from the autonomy guard at every runtime
+            // spawn so a mid-session grant/revoke reaches the next child.
+            let user_display_granted = autonomy.read().await.user_display_granted;
+            let output =
+                agent_runner::run_agent(&json_str, log_dir, &project.root, user_display_granted)
+                    .await?;
             let output_id = event::next_agent_output_id();
 
             // Log agent output
@@ -1863,6 +1868,7 @@ pub(crate) async fn run_agent_loop(
                     &mut cu_action_counter,
                     &session_log,
                     session_registry,
+                    autonomy.read().await.user_display_granted,
                 )
                 .await;
             }
@@ -1876,6 +1882,7 @@ pub(crate) async fn run_agent_loop(
                 &mut cu_action_counter,
                 &session_log,
                 session_registry,
+                autonomy.read().await.user_display_granted,
             )
             .await;
         } else {
@@ -2259,7 +2266,12 @@ Proceed with explicit assumptions and continue without additional questions."
                 source: None,
             });
 
-            let output = agent_runner::run_agent(&json_str, log_dir, &project.root).await?;
+            // Read the grant fresh from the autonomy guard at every runtime
+            // spawn so a mid-session grant/revoke reaches the next child.
+            let user_display_granted = autonomy.read().await.user_display_granted;
+            let output =
+                agent_runner::run_agent(&json_str, log_dir, &project.root, user_display_granted)
+                    .await?;
             let output_id = event::next_agent_output_id();
 
             // Log agent output

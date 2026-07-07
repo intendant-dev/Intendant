@@ -446,6 +446,11 @@ pub fn normalized_to_pixels(
 /// Returns one result per action. A screenshot is automatically captured after
 /// the last non-Screenshot action (all providers expect a screenshot in the
 /// result).
+///
+/// `user_display_granted` is the autonomy guard's grant state (the single
+/// source of truth for the user-display grant), read by the caller; it is
+/// only used to word the no-session recovery message.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_actions(
     actions: &[CuAction],
     target: DisplayTarget,
@@ -454,6 +459,7 @@ pub async fn execute_actions(
     action_counter: &mut u64,
     session_registry: &Option<crate::display::SharedSessionRegistry>,
     denorm_ref: Option<(u32, u32)>,
+    user_display_granted: bool,
 ) -> Vec<CuActionResult> {
     #[cfg(target_os = "linux")]
     crate::linux_display_env::ensure_gui_session_env("computer use actions");
@@ -483,7 +489,11 @@ pub async fn execute_actions(
             return vec![CuActionResult {
                 success: false,
                 screenshot: None,
-                error: Some(no_session_message(effective_backend, &target)),
+                error: Some(no_session_message(
+                    effective_backend,
+                    &target,
+                    user_display_granted,
+                )),
             }];
         }
         DisplayBackend::X11 | DisplayBackend::MacOS => {} // handled below
@@ -1605,7 +1615,13 @@ fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 /// session-only backends (Wayland, Windows). A bare "no session" message left
 /// callers with no hint about what's wrong or how to recover, which caused
 /// external agents to retry the same call indefinitely.
-fn no_session_message(backend: DisplayBackend, target: &DisplayTarget) -> String {
+/// `user_display_granted` is the autonomy guard's grant state, passed in by
+/// the caller; it only steers the recovery wording.
+fn no_session_message(
+    backend: DisplayBackend,
+    target: &DisplayTarget,
+    user_display_granted: bool,
+) -> String {
     if backend == DisplayBackend::Windows {
         return match target {
             DisplayTarget::UserSession => "No active display capture session on Windows. The \
@@ -1618,7 +1634,7 @@ fn no_session_message(backend: DisplayBackend, target: &DisplayTarget) -> String
             ),
         };
     }
-    let granted = std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok();
+    let granted = user_display_granted;
     let diagnostic = linux_gui_env_diagnostic_suffix();
     match target {
         DisplayTarget::UserSession => {
@@ -2769,7 +2785,11 @@ mod tests {
 
     #[test]
     fn no_session_message_wayland_virtual_target_suggests_xvfb() {
-        let msg = no_session_message(DisplayBackend::Wayland, &DisplayTarget::Virtual { id: 99 });
+        let msg = no_session_message(
+            DisplayBackend::Wayland,
+            &DisplayTarget::Virtual { id: 99 },
+            false,
+        );
         assert!(
             msg.contains(":99"),
             "message should mention display number: {}",
@@ -2780,12 +2800,10 @@ mod tests {
 
     #[test]
     fn no_session_message_wayland_user_session_mentions_portal() {
-        // Serialize with every other test that touches this process-global
-        // env var (sync test outside a runtime → blocking_lock), then clear
-        // it so the test is deterministic.
-        let _guard = crate::test_support::TEST_ENV_LOCK.blocking_lock();
-        std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
-        let msg = no_session_message(DisplayBackend::Wayland, &DisplayTarget::UserSession);
+        // The grant state is an explicit parameter (from the autonomy
+        // guard), so both wordings are testable without touching any
+        // process-global state.
+        let msg = no_session_message(DisplayBackend::Wayland, &DisplayTarget::UserSession, false);
         assert!(
             msg.contains("grant_user_display"),
             "ungranted message: {}",
@@ -2797,25 +2815,27 @@ mod tests {
             msg
         );
 
-        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-        let msg = no_session_message(DisplayBackend::Wayland, &DisplayTarget::UserSession);
+        let msg = no_session_message(DisplayBackend::Wayland, &DisplayTarget::UserSession, true);
         assert!(
             msg.contains("portal"),
             "granted message should mention portal: {}",
             msg
         );
-        std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
     }
 
     #[test]
     fn no_session_message_windows_names_recovery_paths() {
-        let msg = no_session_message(DisplayBackend::Windows, &DisplayTarget::UserSession);
+        let msg = no_session_message(DisplayBackend::Windows, &DisplayTarget::UserSession, false);
         assert!(
             msg.contains("grant_user_display"),
             "windows user-session message: {}",
             msg
         );
-        let msg = no_session_message(DisplayBackend::Windows, &DisplayTarget::Virtual { id: 99 });
+        let msg = no_session_message(
+            DisplayBackend::Windows,
+            &DisplayTarget::Virtual { id: 99 },
+            false,
+        );
         assert!(
             msg.contains("user_session"),
             "windows virtual-target message should redirect to the desktop: {}",

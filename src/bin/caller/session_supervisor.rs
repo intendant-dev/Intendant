@@ -2437,7 +2437,17 @@ impl SessionSupervisor {
                 level: None,
                 turn: None,
             });
-            let cu_target = display_target.as_deref().map(parse_display_target_str);
+            // Grant state from the autonomy guard (the single source of
+            // truth), read when the CU task is dispatched.
+            let user_display_granted = supervisor
+                .config
+                .autonomy
+                .read()
+                .await
+                .user_display_granted;
+            let cu_target = display_target
+                .as_deref()
+                .map(|s| parse_display_target_str(s, user_display_granted));
             let result = run_cu_task(
                 cu_provider.as_ref(),
                 &task,
@@ -2449,6 +2459,7 @@ impl SessionSupervisor {
                 &cu_config,
                 cu_target,
                 session_registry.as_ref(),
+                user_display_granted,
             )
             .await;
 

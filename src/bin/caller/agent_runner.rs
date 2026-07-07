@@ -10,6 +10,23 @@ use tokio::time::{timeout, Duration};
 /// Maximum bytes to read from agent stdout/stderr (64 MB).
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Env var the sandboxed runtime consults to decide whether display 0 (the
+/// user's real session) is a permitted capture/input target (`src/agent.rs`,
+/// `docs/src/runtime-protocol.md`). The controller never sets this on its own
+/// process — the autonomy guard (`AutonomyState::user_display_granted`) is
+/// the single source of truth, and the flag is derived onto the child's
+/// environment here, at the runtime spawn boundary.
+const USER_DISPLAY_GRANTED_ENV: &str = "INTENDANT_USER_DISPLAY_GRANTED";
+
+/// Derive the user-display grant onto a runtime child's environment.
+/// Absence of the var means "not granted" on the runtime side, so `false`
+/// sets nothing.
+fn apply_user_display_grant_env(cmd: &mut Command, user_display_granted: bool) {
+    if user_display_granted {
+        cmd.env(USER_DISPLAY_GRANTED_ENV, "1");
+    }
+}
+
 pub struct AgentOutput {
     pub stdout: String,
     pub stderr: String,
@@ -75,10 +92,16 @@ fn output_with_exit_status(
     Ok(AgentOutput { stdout, stderr })
 }
 
+/// Spawn the sandboxed runtime for one command batch.
+///
+/// `user_display_granted` is the autonomy guard's grant state, read by the
+/// caller at spawn time — the runtime child observes it as
+/// `INTENDANT_USER_DISPLAY_GRANTED` on its environment.
 pub async fn run_agent(
     json_input: &str,
     log_dir: &std::path::Path,
     workdir: &std::path::Path,
+    user_display_granted: bool,
 ) -> Result<AgentOutput, CallerError> {
     // Linux enforces this via Landlock inside the runtime; macOS wraps the
     // runtime in sandbox-exec; Windows re-execs inside the runtime under a
@@ -93,10 +116,17 @@ pub async fn run_agent(
                 write_paths,
                 enabled: true,
             };
-            return run_agent_inner(json_input, log_dir, Some(workdir), Some(&sandbox)).await;
+            return run_agent_inner(
+                json_input,
+                log_dir,
+                Some(workdir),
+                Some(&sandbox),
+                user_display_granted,
+            )
+            .await;
         }
     }
-    run_agent_inner(json_input, log_dir, Some(workdir), None).await
+    run_agent_inner(json_input, log_dir, Some(workdir), None, user_display_granted).await
 }
 
 /// Run the agent with optional Landlock sandbox configuration.
@@ -105,8 +135,9 @@ pub async fn run_agent_sandboxed(
     json_input: &str,
     log_dir: &std::path::Path,
     sandbox: &crate::sandbox::SandboxConfig,
+    user_display_granted: bool,
 ) -> Result<AgentOutput, CallerError> {
-    run_agent_inner(json_input, log_dir, None, Some(sandbox)).await
+    run_agent_inner(json_input, log_dir, None, Some(sandbox), user_display_granted).await
 }
 
 async fn run_agent_inner(
@@ -114,6 +145,7 @@ async fn run_agent_inner(
     log_dir: &std::path::Path,
     workdir: Option<&std::path::Path>,
     sandbox: Option<&crate::sandbox::SandboxConfig>,
+    user_display_granted: bool,
 ) -> Result<AgentOutput, CallerError> {
     let agent_path = std::env::current_exe()
         .ok()
@@ -173,10 +205,11 @@ async fn run_agent_inner(
         }
     }
 
-    // Pass through user display grant if set by the caller
-    if std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok() {
-        cmd.env("INTENDANT_USER_DISPLAY_GRANTED", "1");
-    }
+    // Derive the user-display grant from the autonomy guard (passed in by
+    // the caller) onto the child env. This spawn boundary is the only place
+    // the grant becomes an environment variable — the controller's own
+    // process env is never mutated with it.
+    apply_user_display_grant_env(&mut cmd, user_display_granted);
 
     // Also preserve the original user display for UserSession resolution
     if std::env::var("INTENDANT_USER_DISPLAY").is_ok() {
@@ -289,5 +322,33 @@ mod tests {
             br#"{"type":"result","data":"missing nonce"}"#
         ));
         assert!(!has_parseable_runtime_output(b"panic before json"));
+    }
+
+    /// The spawn boundary is the only place the user-display grant becomes
+    /// an environment variable: granted derives the exact var name the
+    /// runtime reads (`src/agent.rs`), ungranted leaves the child env
+    /// untouched (absence = denied on the runtime side). The controller's
+    /// own process env plays no part.
+    #[test]
+    fn user_display_grant_env_derives_from_guard_state_at_spawn() {
+        let mut cmd = Command::new("true");
+        apply_user_display_grant_env(&mut cmd, true);
+        let env: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(
+            env.contains(&(
+                std::ffi::OsStr::new("INTENDANT_USER_DISPLAY_GRANTED"),
+                Some(std::ffi::OsStr::new("1"))
+            )),
+            "granted state must set the runtime's grant var on the child: {env:?}"
+        );
+
+        let mut cmd = Command::new("true");
+        apply_user_display_grant_env(&mut cmd, false);
+        assert!(
+            cmd.as_std()
+                .get_envs()
+                .all(|(k, _)| k != std::ffi::OsStr::new("INTENDANT_USER_DISPLAY_GRANTED")),
+            "ungranted state must not set the grant var on the child"
+        );
     }
 }

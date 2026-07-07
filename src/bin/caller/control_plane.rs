@@ -663,13 +663,12 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             // churn would have shown the same lag.
             let did = display_id.unwrap_or(0);
             {
+                // The autonomy guard is the single holder of the grant;
+                // runtime children observe it via the env derivation at the
+                // spawn boundary (agent_runner).
                 let mut guard = state.autonomy.write().await;
                 guard.user_display_granted = true;
             }
-            // Keep the env var in sync so subprocesses that inspect it
-            // (agent runners, etc.) observe the same state the autonomy
-            // guard reports. Matches the tui/mcp paths that set it.
-            std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
             state
                 .bus
                 .send(AppEvent::UserDisplayGranted { display_id: did });
@@ -680,7 +679,6 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 let mut guard = state.autonomy.write().await;
                 guard.user_display_granted = false;
             }
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             state.bus.send(AppEvent::UserDisplayRevoked {
                 display_id: did,
                 note: note.clone(),

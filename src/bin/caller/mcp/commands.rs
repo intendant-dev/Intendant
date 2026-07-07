@@ -1208,7 +1208,6 @@ pub(crate) async fn handle_control_command_mcp(
                 s.autonomy.clone()
             };
             autonomy.write().await.user_display_granted = true;
-            std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
             if let Some((width, height)) = active_resolution {
                 bus.send(AppEvent::DisplayReady {
                     display_id: did,
@@ -1244,7 +1243,6 @@ pub(crate) async fn handle_control_command_mcp(
                 let mut a = autonomy.write().await;
                 a.user_display_granted = false;
             }
-            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             bus.send(AppEvent::UserDisplayRevoked {
                 display_id: did,
                 note: note.clone(),

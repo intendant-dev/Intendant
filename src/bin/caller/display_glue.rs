@@ -316,6 +316,8 @@ pub(crate) async fn capture_display_screenshot(
 
 // Try the CU-first path: send task to the fast CU model.
 /// Returns None if CU is not available (no display, no provider).
+/// `user_display_granted` is the autonomy guard's grant state, read by the
+/// caller at dispatch time.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_cu_first(
     project_root: &std::path::Path,
@@ -326,6 +328,7 @@ pub(crate) async fn try_cu_first(
     log_dir: &std::path::Path,
     bus: &event::EventBus,
     session_registry: &display::SharedSessionRegistry,
+    user_display_granted: bool,
 ) -> Option<Result<CuTaskResult, CallerError>> {
     slog(session_log, |l| {
         l.info(&format!(
@@ -339,7 +342,7 @@ pub(crate) async fn try_cu_first(
     let reference_images = if reference_images.is_empty() {
         // No frames from browser streaming — try a fresh screenshot if user display
         // is granted, so CU-first can work without the Stream button being active.
-        if std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok() {
+        if user_display_granted {
             slog(session_log, |l| {
                 l.info("try_cu_first: no registry frames, taking fresh screenshot")
             });
@@ -380,7 +383,7 @@ pub(crate) async fn try_cu_first(
     // from select_cu_provider is sized for virtual displays (e.g. 768x1024).
     // On macOS or when targeting the user's real display, the actual resolution
     // may differ (e.g. 1512x949), causing coordinate mismatches.
-    if std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok() {
+    if user_display_granted {
         let display_id = std::env::var("DISPLAY")
             .ok()
             .and_then(|d| d.trim_start_matches(':').parse::<u32>().ok())
@@ -423,6 +426,7 @@ pub(crate) async fn try_cu_first(
             &proj.config.computer_use,
             None, // auto-resolve display target
             Some(session_registry),
+            user_display_granted,
         )
         .await,
     )
@@ -838,13 +842,13 @@ pub(crate) fn frame_has_visible_rgb(frame: &display::Frame) -> bool {
 /// machinery — which on Windows captures the existing desktop via
 /// `WindowsBackend` (DXGI Desktop Duplication), NOT a virtual Xvfb display.
 ///
-/// The autonomy grant flag and `INTENDANT_USER_DISPLAY_GRANTED` env are set
-/// to match a real grant, so the dashboard's "your display" toggle, CU
-/// display targeting, and agent subprocesses all observe a consistent
-/// "granted" state. Activation degrades gracefully — if the capture backend
-/// can't start (no interactive desktop, etc.) `activate_user_display` logs
-/// and returns without registering, leaving the dashboard at "No displays
-/// active" rather than failing startup.
+/// The autonomy grant flag is set to match a real grant, so the dashboard's
+/// "your display" toggle, CU display targeting, and agent subprocesses
+/// (which receive the grant on their env at the runtime spawn boundary) all
+/// observe a consistent "granted" state. Activation degrades gracefully —
+/// if the capture backend can't start (no interactive desktop, etc.)
+/// `activate_user_display` logs and returns without registering, leaving
+/// the dashboard at "No displays active" rather than failing startup.
 #[cfg(target_os = "windows")]
 pub(crate) async fn auto_activate_windows_user_display(
     bus: &EventBus,
@@ -857,7 +861,6 @@ pub(crate) async fn auto_activate_windows_user_display(
         let mut guard = autonomy.write().await;
         guard.user_display_granted = true;
     }
-    std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
     activate_user_display(bus, session_registry, frame_registry, 0).await;
 }
 
@@ -887,7 +890,12 @@ pub(crate) fn detect_wayland_socket() -> Option<String> {
 /// Parse a display target string from the presence model into a `DisplayTarget`.
 ///
 /// Accepts "user_session" for the user's display, or ":<N>" / "<N>" for virtual.
-pub(crate) fn parse_display_target_str(s: &str) -> computer_use::DisplayTarget {
+/// `user_display_granted` is the autonomy guard's grant state, used only by
+/// the unrecognized-string fallback resolution.
+pub(crate) fn parse_display_target_str(
+    s: &str,
+    user_display_granted: bool,
+) -> computer_use::DisplayTarget {
     match s.trim() {
         "user_session" | "user" | ":0" | "0" => computer_use::DisplayTarget::UserSession,
         other => {
@@ -900,7 +908,7 @@ pub(crate) fn parse_display_target_str(s: &str) -> computer_use::DisplayTarget {
                 }
             } else {
                 // Unrecognized — fall back to auto-resolve
-                resolve_cu_display_target()
+                resolve_cu_display_target(user_display_granted)
             }
         }
     }
@@ -908,16 +916,17 @@ pub(crate) fn parse_display_target_str(s: &str) -> computer_use::DisplayTarget {
 
 /// Resolve the display target for CU actions.
 ///
-/// If user display access is granted (env var set) and the current DISPLAY
-/// is `:0` (or unset, indicating no virtual display was launched), returns
-/// `UserSession`. Otherwise returns `Virtual` with the current display ID.
-/// On macOS, always returns `UserSession` when DISPLAY is unset (no Xvfb).
-pub(crate) fn resolve_cu_display_target() -> computer_use::DisplayTarget {
+/// If user display access is granted (`user_display_granted`, read from the
+/// autonomy guard by the caller) and the current DISPLAY is `:0` (or unset,
+/// indicating no virtual display was launched), returns `UserSession`.
+/// Otherwise returns `Virtual` with the current display ID. On macOS, always
+/// returns `UserSession` when DISPLAY is unset (no Xvfb).
+pub(crate) fn resolve_cu_display_target(user_display_granted: bool) -> computer_use::DisplayTarget {
     let display_id: Option<u32> = std::env::var("DISPLAY")
         .ok()
         .and_then(|d| d.trim_start_matches(':').parse().ok());
 
-    let user_granted = std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok();
+    let user_granted = user_display_granted;
 
     match display_id {
         // DISPLAY is :0 and user granted → target user session
@@ -947,6 +956,8 @@ pub(crate) enum CuTaskResult {
 ///
 /// Creates a lightweight conversation (no project context, skills, or knowledge),
 /// runs the CU model for a few turns until the task is done, and returns.
+/// `user_display_granted` is the autonomy guard's grant state, read by the
+/// caller when the task is dispatched.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_cu_task(
     provider: &dyn provider::ChatProvider,
@@ -959,6 +970,7 @@ pub(crate) async fn run_cu_task(
     cu_config: &project::ComputerUseConfig,
     target_override: Option<computer_use::DisplayTarget>,
     session_registry: Option<&display::SharedSessionRegistry>,
+    user_display_granted: bool,
 ) -> Result<CuTaskResult, CallerError> {
     // Owned form for execute_actions, which wants `&Option<_>`.
     let session_registry = session_registry.cloned();
@@ -966,7 +978,8 @@ pub(crate) async fn run_cu_task(
     let mut cu_counter = 0u64;
     let backend = computer_use::DisplayBackend::from_config(&cu_config.backend);
 
-    let display_target = target_override.unwrap_or_else(resolve_cu_display_target);
+    let display_target =
+        target_override.unwrap_or_else(|| resolve_cu_display_target(user_display_granted));
 
     // CU-first system prompt: handle display tasks or escalate
     let system_prompt =
@@ -1201,6 +1214,7 @@ pub(crate) async fn run_cu_task(
                     &mut cu_counter,
                     &session_registry,
                     None,
+                    user_display_granted,
                 )
                 .await;
 
@@ -1295,18 +1309,16 @@ pub(crate) async fn handle_shared_view_calls(
         // existing display grant instead of flipping it from a tool call.
         // Only display-exposing verbs gate — focus/input/hide operate on
         // whatever view is already shown.
+        let user_display_granted = autonomy.read().await.user_display_granted;
         let effective_user_display = match display_id {
             Some(0) => true,
             Some(_) => false,
             None => matches!(
-                resolve_cu_display_target(),
+                resolve_cu_display_target(user_display_granted),
                 computer_use::DisplayTarget::UserSession
             ),
         };
-        if matches!(action, "show" | "capture")
-            && effective_user_display
-            && !autonomy.read().await.user_display_granted
-        {
+        if matches!(action, "show" | "capture") && effective_user_display && !user_display_granted {
             conversation.add_tool_result(
                 call_id,
                 "shared_view",
@@ -1358,7 +1370,7 @@ pub(crate) async fn handle_shared_view_calls(
                 let target = match display_id {
                     Some(0) => computer_use::DisplayTarget::UserSession,
                     Some(id) => computer_use::DisplayTarget::Virtual { id },
-                    None => resolve_cu_display_target(),
+                    None => resolve_cu_display_target(user_display_granted),
                 };
                 let screenshot_dir = log_dir.join("screenshots");
                 let _ = std::fs::create_dir_all(&screenshot_dir);
@@ -1371,6 +1383,7 @@ pub(crate) async fn handle_shared_view_calls(
                     cu_counter,
                     &registry,
                     None,
+                    user_display_granted,
                 )
                 .await;
                 match results.first().and_then(|r| r.screenshot.as_ref()) {
@@ -1419,6 +1432,9 @@ pub(crate) async fn handle_shared_view_calls(
     }
 }
 
+/// `user_display_granted` is the autonomy guard's grant state, read by the
+/// caller before dispatching the batch.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_cu_calls(
     cu_calls: &[computer_use::CuToolCall],
     conversation: &mut conversation::Conversation,
@@ -1427,11 +1443,12 @@ pub(crate) async fn execute_cu_calls(
     counter: &mut u64,
     session_log: &SharedSessionLog,
     session_registry: Option<&display::SharedSessionRegistry>,
+    user_display_granted: bool,
 ) {
     // Owned form for execute_actions, which wants `&Option<_>`.
     let session_registry = session_registry.cloned();
     let display_target = if cu_display.is_some() {
-        resolve_cu_display_target()
+        resolve_cu_display_target(user_display_granted)
     } else {
         // No CU display configured — default to virtual :99
         computer_use::DisplayTarget::Virtual { id: 99 }
@@ -1501,6 +1518,7 @@ pub(crate) async fn execute_cu_calls(
             counter,
             &session_registry,
             None,
+            user_display_granted,
         )
         .await;
 
