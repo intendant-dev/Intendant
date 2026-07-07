@@ -1,9 +1,9 @@
 name: Keyless smokes
 
 # The live-fire subset of the landing battery that needs NO API keys and NO
-# display: real release binaries driven end to end by the scripted mock
-# provider (PROVIDER=mock). These drivers were written keyless by design so
-# they could one day gate landings — this workflow is that day. Coverage the
+# display: real binaries driven end to end by the scripted mock provider
+# (PROVIDER=mock). These drivers were written keyless by design so they
+# could one day gate landings — this workflow is that day. Coverage the
 # unit suite structurally can't reach:
 #
 #   - session-vitals-smoke: daemon in a dirty git repo; asserts the vitals
@@ -22,8 +22,14 @@ name: Keyless smokes
 # probes) need keys or a display and deliberately stay OUT of the merge gate;
 # they run as post-landing checks on operator hardware.
 #
-# Linux + macOS only: the drivers manage daemons via Unix control sockets and
-# POSIX signals. Windows unit/e2e coverage lives in windows.yml.
+# Linux only: the drivers are platform-agnostic PROTOCOL probes (control
+# socket, /ws, /api) — a second Unix platform mostly duplicates the same
+# code paths while doubling the flake surface, and every flake costs a
+# queue cycle. Platform-specific coverage lives in windows.yml's 3-OS
+# unit+e2e matrix; the drivers need Unix control sockets and POSIX
+# signals, so Linux is the natural single host. Debug profile for the
+# same reason: the regressions these catch (e.g. the usage-rail miss)
+# fire identically in debug, and --release only added build time.
 
 on:
   push:
@@ -75,9 +81,6 @@ jobs:
           - os: ubuntu-latest
             runner: [self-hosted, intendant-smokes-linux]
             target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            runner: [self-hosted, intendant-smokes-macos]
-            target: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -124,10 +127,6 @@ jobs:
             pkg-config libclang-dev libvpx-dev libpipewire-0.3-dev \
             libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
 
-      - name: Install macOS build deps
-        if: runner.environment == 'github-hosted' && runner.os == 'macOS'
-        run: brew install pkg-config libvpx
-
       # peer-rig.py drives stop_session over a raw WebSocket. A venv
       # sidesteps PEP 668 (externally-managed pythons reject bare pip
       # installs); prepending its bin to GITHUB_PATH makes it the
@@ -146,20 +145,24 @@ jobs:
           key: smokes-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # The smokes run the real release binaries — the same artifacts a
-      # dev box's landing lap exercises. `--locked` mirrors windows.yml.
-      - name: cargo build --release
+      # Debug profile: the smokes probe protocol behavior, which the
+      # profile doesn't change, and this shares the warm debug tree with
+      # local `cargo test` builds instead of maintaining a second release
+      # tree per checkout. `--locked` mirrors windows.yml.
+      - name: cargo build
         if: steps.relevance.outputs.relevant != 'false'
-        run: cargo build --release -p intendant --bins --locked
+        run: cargo build -p intendant --bins --locked
 
       - name: session-vitals smoke
         if: steps.relevance.outputs.relevant != 'false'
-        run: node tests/skills/session-vitals-smoke/driver.cjs "$GITHUB_WORKSPACE/target/release/intendant"
+        run: node tests/skills/session-vitals-smoke/driver.cjs "$GITHUB_WORKSPACE/target/debug/intendant"
 
       - name: native-goal smoke
         if: steps.relevance.outputs.relevant != 'false'
-        run: node tests/skills/native-goal-smoke/driver.cjs "$GITHUB_WORKSPACE/target/release/intendant"
+        run: node tests/skills/native-goal-smoke/driver.cjs "$GITHUB_WORKSPACE/target/debug/intendant"
 
       - name: peer-sessions smoke
         if: steps.relevance.outputs.relevant != 'false'
+        env:
+          INTENDANT_BIN: ${{ github.workspace }}/target/debug/intendant
         run: python3 tests/skills/peer-sessions-smoke/peer-rig.py
