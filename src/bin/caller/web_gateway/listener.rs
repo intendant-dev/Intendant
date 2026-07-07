@@ -65,75 +65,9 @@ pub(crate) fn log_tls_failure_rate_limited(state: &TlsFailureLogState, peer: &st
 // rollouts; parents past the per-build budget pick up their baseline on a
 // later list pass.
 
-/// Consecutive "fatal-class" accept failures tolerated on the same socket
-/// before it is dropped and rebound. EINVAL has been observed twice on
-/// macOS (2026-07-04, both times within ~1s of an external-agent spawn)
-/// on a listener that remained LISTEN at the kernel afterwards — treating
-/// the first one as fatal is what actually broke the dashboard. A short
-/// streak (~2s) absorbs the spurious case; a genuinely dead socket fails
-/// every retry and reaches the rebind path.
-pub(crate) const FATAL_ACCEPT_REBIND_THRESHOLD: u32 = 8;
-
-pub(crate) fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
-    match error.kind() {
-        std::io::ErrorKind::Interrupted
-        | std::io::ErrorKind::WouldBlock
-        | std::io::ErrorKind::ConnectionAborted
-        | std::io::ErrorKind::ConnectionReset
-        | std::io::ErrorKind::TimedOut => return true,
-        std::io::ErrorKind::InvalidInput
-        | std::io::ErrorKind::InvalidData
-        | std::io::ErrorKind::NotFound
-        | std::io::ErrorKind::PermissionDenied => return false,
-        _ => {}
-    }
-
-    match error.raw_os_error() {
-        // The listener file descriptor/socket is invalid or no longer a
-        // listening socket (EBADF/EINVAL/ENOTSOCK). Retrying accept() on it
-        // would spin forever — the caller rebinds a fresh listener instead.
-        Some(9 | 22 | 38) => false,
-        // Process/system descriptor pressure and socket buffer pressure are
-        // recoverable after current connections close. Keep the gateway alive
-        // so the dashboard recovers instead of becoming half-alive.
-        Some(23 | 24 | 55) => true,
-        // Unknown accept errors are safer to treat as per-connection failures:
-        // losing one inbound connection is better than dropping the dashboard
-        // listener while existing WebSocket tasks make the UI look alive.
-        _ => true,
-    }
-}
-
-/// Rebind a TCP listener on its original address after the previous
-/// socket became unusable — seen in the wild on macOS as `accept()`
-/// returning EINVAL a minute into an app-spawned daemon's life, which
-/// used to kill the listener task and leave the dashboard half-alive
-/// (established WebSockets kept flowing while every new connection —
-/// session details, files, uploads, Station assets — failed). Mirrors
-/// `bind_dual_stack_or_v4`: dual-stack for the IPv6 wildcard,
-/// `SO_REUSEADDR` so lingering TIME_WAIT sockets don't block the port.
-/// Shared by the dashboard gateway and the enrollment cert server.
-pub(crate) fn rebind_dead_tcp_listener(
-    addr: std::net::SocketAddr,
-) -> std::io::Result<TcpListener> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let domain = if addr.is_ipv6() {
-        Domain::IPV6
-    } else {
-        Domain::IPV4
-    };
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-    if addr.is_ipv6() && addr.ip().is_unspecified() {
-        let _ = socket.set_only_v6(false);
-    }
-    let _ = socket.set_reuse_address(true);
-    socket.bind(&addr.into())?;
-    socket.listen(1024)?;
-    socket.set_nonblocking(true)?;
-    let std_listener: std::net::TcpListener = socket.into();
-    TcpListener::from_std(std_listener)
-}
-
+pub(crate) use intendant_core::net::{
+    rebind_dead_tcp_listener, should_continue_after_accept_error, FATAL_ACCEPT_REBIND_THRESHOLD,
+};
 
 pub fn spawn_web_gateway(
     listener: TcpListener,
@@ -1756,19 +1690,6 @@ mod tests {
             + Unpin,
     {
         next_ws_json_matching(ws_rx, |json| json["t"] == ty).await
-    }
-
-    #[test]
-    fn accept_error_classifier_keeps_listener_alive_for_transient_errors() {
-        assert!(should_continue_after_accept_error(&std::io::Error::from(
-            std::io::ErrorKind::ConnectionAborted
-        )));
-        assert!(should_continue_after_accept_error(
-            &std::io::Error::from_raw_os_error(24)
-        ));
-        assert!(!should_continue_after_accept_error(
-            &std::io::Error::from_raw_os_error(9)
-        ));
     }
 
     #[tokio::test]
@@ -3412,72 +3333,5 @@ mod tests {
         );
 
         handle.abort();
-    }
-
-    /// Rebind with a bounded retry on `AddrInUse` only. The drop→rebind
-    /// window in these tests can lose the ephemeral port to a concurrent
-    /// `bind(:0)` in a parallel test — the kernel recycles just-freed ports
-    /// eagerly, and a loaded CI box makes the theft real (a merge-group
-    /// ejection on 2026-07-07 was exactly this). The helper under test sets
-    /// SO_REUSEADDR, so the only systematic `AddrInUse` source is a socket
-    /// that is genuinely still bound — which keeps failing past the
-    /// deadline and still fails the test.
-    async fn rebind_with_patience(
-        addr: std::net::SocketAddr,
-    ) -> std::io::Result<TcpListener> {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        loop {
-            match rebind_dead_tcp_listener(addr) {
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::AddrInUse
-                        && tokio::time::Instant::now() < deadline =>
-                {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                }
-                other => return other,
-            }
-        }
-    }
-
-    /// The gateway must be able to re-establish its listener on the exact
-    /// address a dead one occupied (accept() EINVAL/EBADF recovery path),
-    /// and the fresh listener must actually accept connections.
-    #[tokio::test]
-    async fn rebind_dead_tcp_listener_restores_reachability() {
-        let original = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = original.local_addr().unwrap();
-        drop(original);
-
-        let rebound = rebind_with_patience(addr)
-            .await
-            .expect("rebind on the freed address");
-        assert_eq!(rebound.local_addr().unwrap(), addr);
-
-        let (client, (server, _peer)) = tokio::join!(
-            tokio::net::TcpStream::connect(addr),
-            async { rebound.accept().await.unwrap() },
-        );
-        client.expect("client connects to rebound listener");
-        drop(server);
-    }
-
-    /// SO_REUSEADDR does not override an actively bound listener on Unix —
-    /// the accept-loop recovery MUST drop the dead socket before rebinding,
-    /// or every attempt self-inflicts EADDRINUSE (seen live: a daemon whose
-    /// accept loop died spun on rebind for over an hour while its own dead
-    /// listener still owned the port). Windows semantics differ, so the
-    /// still-bound assertion is Unix-only.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn rebind_fails_while_dead_listener_is_still_bound() {
-        let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = holder.local_addr().unwrap();
-
-        let err = rebind_dead_tcp_listener(addr)
-            .expect_err("rebinding must fail while the previous listener still holds the address");
-        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
-
-        drop(holder);
-        assert!(rebind_with_patience(addr).await.is_ok());
     }
 }
