@@ -280,6 +280,17 @@ pub(crate) fn station_enable_webgpu() -> bool {
         .is_none_or(|url| !url.contains("station_gpu=canvas") && !url.contains("station_gpu=off"))
 }
 
+/// World-space panes (Phase C) are opt-IN while the program is in
+/// flight: `?station_panes=on` (or `=1`) enables them; absence or any
+/// other value keeps the scene wireframe-only. Flips to opt-out when the
+/// pane presentation graduates.
+pub(crate) fn station_enable_panes() -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|document| document.url().ok())
+        .is_some_and(|url| url.contains("station_panes=on") || url.contains("station_panes=1"))
+}
+
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn now_ms() -> f64 {
     thread_local! {
