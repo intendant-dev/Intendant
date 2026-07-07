@@ -1940,7 +1940,8 @@ fn help_display() {
 fn help_display_screenshot() {
     println!(
         "Usage: intendant ctl display screenshot [--target TARGET] [--output out.png]\n\
-Targets include user_session, display_99, 99, and legacy :99."
+Targets include user_session, display_99, 99, and legacy :99.\n\
+Omit --target to auto-detect: a live agent virtual display when one exists, else the user session."
     );
 }
 
@@ -1995,7 +1996,8 @@ fn help_cu() {
 Run `intendant ctl cu actions --help` for the action JSON shapes.\n\
 `cu elements` reads the frontmost app's UI element tree (roles, labels, values, frames) — \n\
 cheap textual grounding: click the center of a reported frame. macOS user-session only for now.\n\
-Targets: user_session (needs display grant), 99/display_99 (virtual). Omit to auto-detect."
+Targets: user_session (needs display grant), 99/display_99 (virtual).\n\
+Omit to auto-detect: a live agent virtual display when one exists, else the user session."
     );
 }
 

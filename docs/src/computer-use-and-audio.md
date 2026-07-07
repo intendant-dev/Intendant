@@ -112,6 +112,19 @@ CU actions operate on a `DisplayTarget` (`#[serde(tag = "kind")]`):
   doesn't use `DISPLAY`. Requires an explicit `DisplayControl` grant via the
   autonomy system.
 
+When a pixel-CU call (`take_screenshot`, `execute_cu_actions`) omits
+`display_target`, the default is availability-aware
+(`computer_use::default_display_target`): the lowest-id live virtual capture
+session wins, then the conventional agent Xvfb display (`:99`) when its X
+socket is up (Linux only), then the user session. Explicit targets are never
+second-guessed, and every downstream gate applies to the fallback exactly as
+it would to an explicit `user_session` request. The native agent loop uses the
+same resolution when a session has no CU display configured, except its
+user-session fallback additionally requires the user-display grant — the
+model-driven path never auto-targets the user's desktop ungranted.
+(`read_screen` defaults to the user session unconditionally — element trees
+only exist there.)
+
 User-session access uses a **session-grant** model: approve once (the `d` hotkey
 the dashboard control, MCP `grant_user_display`, or
 `intendant ctl display grant-user`), and the grant holds for the rest of the

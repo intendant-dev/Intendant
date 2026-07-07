@@ -1707,6 +1707,47 @@ async fn lookup_display_session(
     registry.read().await.get(display_id)
 }
 
+/// Pick the display target for CU calls that omit `display_target`.
+///
+/// Preference order: the lowest-id live virtual-display capture session,
+/// then the conventional agent Xvfb display when its X socket is up
+/// (Linux only), then the user's session display. The old default was a
+/// blind `Virtual { id: 99 }`, which turned "omit the target" into a
+/// hard error on hosts that never started a virtual display — a machine
+/// whose only session is `:0`, or Windows, where virtual displays don't
+/// exist at all. The user-session fallback grants nothing new: the same
+/// caller could always pass `display_target="user_session"` explicitly,
+/// and every downstream gate (per-tool IAM, the user-display grant on
+/// the session-only backends) applies to the fallback identically.
+pub async fn default_display_target(
+    session_registry: &Option<crate::display::SharedSessionRegistry>,
+) -> DisplayTarget {
+    let session_display_ids = match session_registry.as_ref() {
+        Some(registry) => registry.read().await.display_ids(),
+        None => Vec::new(),
+    };
+    choose_default_display_target(
+        session_display_ids,
+        intendant_platform::vision::conventional_virtual_display(),
+    )
+}
+
+/// Registry/probe-injectable core of [`default_display_target`].
+fn choose_default_display_target(
+    session_display_ids: Vec<u32>,
+    conventional_virtual: Option<u32>,
+) -> DisplayTarget {
+    // Display id 0 is the user-session capture session, not a virtual
+    // display — never let it masquerade as `Virtual { id: 0 }`.
+    if let Some(id) = session_display_ids.into_iter().filter(|id| *id != 0).min() {
+        return DisplayTarget::Virtual { id };
+    }
+    if let Some(id) = conventional_virtual {
+        return DisplayTarget::Virtual { id };
+    }
+    DisplayTarget::UserSession
+}
+
 /// Execute CU actions by routing through a `DisplaySession` (WebRTC pipeline).
 ///
 /// Converts CU pixel coordinates to normalised 0.0..1.0 coordinates expected by
@@ -2959,6 +3000,44 @@ mod tests {
     fn display_target_display_fmt() {
         assert_eq!(format!("{}", DisplayTarget::Virtual { id: 99 }), ":99");
         assert_eq!(format!("{}", DisplayTarget::UserSession), "user_session");
+    }
+
+    #[test]
+    fn default_target_prefers_lowest_live_virtual_session() {
+        assert_eq!(
+            choose_default_display_target(vec![0, 120, 100], None),
+            DisplayTarget::Virtual { id: 100 }
+        );
+        // A live session beats the conventional-socket probe.
+        assert_eq!(
+            choose_default_display_target(vec![101], Some(99)),
+            DisplayTarget::Virtual { id: 101 }
+        );
+    }
+
+    #[test]
+    fn default_target_uses_conventional_socket_without_sessions() {
+        assert_eq!(
+            choose_default_display_target(vec![], Some(99)),
+            DisplayTarget::Virtual { id: 99 }
+        );
+        // The user-session capture session (id 0) is not a virtual display.
+        assert_eq!(
+            choose_default_display_target(vec![0], Some(99)),
+            DisplayTarget::Virtual { id: 99 }
+        );
+    }
+
+    #[test]
+    fn default_target_falls_back_to_user_session() {
+        assert_eq!(
+            choose_default_display_target(vec![], None),
+            DisplayTarget::UserSession
+        );
+        assert_eq!(
+            choose_default_display_target(vec![0], None),
+            DisplayTarget::UserSession
+        );
     }
 
     #[test]

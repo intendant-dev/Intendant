@@ -1492,26 +1492,26 @@ const FISSION_WAIT_MAX_TIMEOUT_S: u64 = 300;
 /// group on the operator's behalf.
 const FISSION_CONTROL_DETACH_REASON: &str = "operator detach via fission_control";
 
-fn resolve_display_target(target: Option<&str>) -> crate::computer_use::DisplayTarget {
+/// Parse an explicit display-target spec. Callers resolve an *omitted*
+/// spec with [`crate::computer_use::default_display_target`], which is
+/// availability-aware, instead of assuming a virtual display exists.
+fn resolve_display_target(target: &str) -> crate::computer_use::DisplayTarget {
     use crate::computer_use::DisplayTarget;
     match target {
-        Some("user_session") | Some("user") | Some("primary") | Some(":0") | Some("0")
-        | Some("display_0") => DisplayTarget::UserSession,
-        Some(s) if s.starts_with(':') => {
+        "user_session" | "user" | "primary" | ":0" | "0" | "display_0" => {
+            DisplayTarget::UserSession
+        }
+        s if s.starts_with(':') => {
             let id: u32 = s[1..].parse().unwrap_or(99);
             DisplayTarget::Virtual { id }
         }
-        Some(s) if s.starts_with("display_") => {
+        s if s.starts_with("display_") => {
             let id: u32 = s["display_".len()..].parse().unwrap_or(99);
             DisplayTarget::Virtual { id }
         }
-        Some(s) => {
+        s => {
             let id: u32 = s.parse().unwrap_or(99);
             DisplayTarget::Virtual { id }
-        }
-        None => {
-            // Default: first virtual display
-            DisplayTarget::Virtual { id: 99 }
         }
     }
 }
