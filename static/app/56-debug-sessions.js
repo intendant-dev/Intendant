@@ -3,6 +3,25 @@ let debugScreenActive = false;
 let debugRecording = false;
 const browserWorkspaces = new Map();
 
+// ui-v2 re-skin (design overhaul): the reference Debug page carries a page
+// header the v1 DOM never had. Inject it under the flag only — v1 markup
+// stays untouched; the cards, ids, and handlers below are shared by both.
+if (ui2Enabled()) {
+  const debugPane = document.querySelector('#tab-debug .debug-pane');
+  if (debugPane) {
+    const head = document.createElement('header');
+    head.className = 'ui2-page-head';
+    const title = document.createElement('h2');
+    title.className = 'ui2-page-title';
+    title.textContent = 'Debug';
+    const sub = document.createElement('p');
+    sub.className = 'ui2-page-sub';
+    sub.textContent = 'Diagnostics, the headless observer display, and managed browser workspaces.';
+    head.append(title, sub);
+    debugPane.prepend(head);
+  }
+}
+
 function toggleDebugScreen() {
   if (debugScreenActive) {
     dispatchDashboardActionMsg({ action: 'teardown_debug_screen' });
@@ -41,6 +60,8 @@ function renderBrowserWorkspaces() {
   for (const w of rows) {
     const card = document.createElement('div');
     card.className = 'debug-workspace-row';
+    // ui-v2 status dot is CSS-keyed off this attribute; v1 renders none.
+    if (ui2Enabled()) card.dataset.status = String(w.status || '');
     const meta = document.createElement('div');
     meta.className = 'debug-workspace-row-main';
     const lease = w.lease ? ` leased by ${w.lease.holder_id || 'unknown'}` : ' unleased';
