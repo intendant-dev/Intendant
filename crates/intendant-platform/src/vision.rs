@@ -1,9 +1,9 @@
-use super::error::CallerError;
+use intendant_core::error::CallerError;
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
 use tokio::process::Child;
 
-use super::computer_use::DisplayTarget;
+use crate::DisplayTarget;
 
 /// Per-provider display resolution for Xvfb (Linux) or native display (macOS).
 pub struct DisplayConfig {
@@ -23,9 +23,9 @@ pub(crate) fn read_lock_pid(lock_path: &str) -> Option<u32> {
 
 /// Check if a lock file is stale (the PID inside is no longer running).
 #[cfg(target_os = "linux")]
-pub(crate) fn is_lock_stale(lock_path: &str) -> bool {
+pub fn is_lock_stale(lock_path: &str) -> bool {
     match read_lock_pid(lock_path) {
-        Some(pid) => !super::platform::process_alive(pid),
+        Some(pid) => !crate::platform::process_alive(pid),
         None => false, // can't read/parse → assume not stale
     }
 }
@@ -33,12 +33,12 @@ pub(crate) fn is_lock_stale(lock_path: &str) -> bool {
 /// Check whether the process owning a lock file is an Xvfb instance for the given display.
 /// Returns true if the process cmdline starts with "Xvfb :<id>".
 #[cfg(target_os = "linux")]
-pub(crate) fn is_our_xvfb(lock_path: &str, display_id: u32) -> bool {
+pub fn is_our_xvfb(lock_path: &str, display_id: u32) -> bool {
     let pid = match read_lock_pid(lock_path) {
         Some(p) => p,
         None => return false,
     };
-    let cmdline_str = match super::platform::process_cmdline(pid) {
+    let cmdline_str = match crate::platform::process_cmdline(pid) {
         Some(s) => s,
         None => return false,
     };
@@ -48,7 +48,7 @@ pub(crate) fn is_our_xvfb(lock_path: &str, display_id: u32) -> bool {
 
 /// Kill the process that owns a lock file (if alive) and clean up.
 #[cfg(target_os = "linux")]
-pub(crate) fn kill_and_reclaim(lock_path: &str, display_id: u32) {
+pub fn kill_and_reclaim(lock_path: &str, display_id: u32) {
     let Some(pid) = read_lock_pid(lock_path) else {
         eprintln!(
             "[vision] refusing to reclaim X lock {} for display {}: no readable pid",
@@ -65,7 +65,7 @@ pub(crate) fn kill_and_reclaim(lock_path: &str, display_id: u32) {
     {
         Ok(status) if status.success() => {
             for _ in 0..10 {
-                if !super::platform::process_alive(pid) {
+                if !crate::platform::process_alive(pid) {
                     remove_stale_lock(display_id);
                     return;
                 }
@@ -93,7 +93,7 @@ pub(crate) fn kill_and_reclaim(lock_path: &str, display_id: u32) {
 
 /// Remove a stale X lock file and its socket.
 #[cfg(target_os = "linux")]
-pub(crate) fn remove_stale_lock(id: u32) {
+pub fn remove_stale_lock(id: u32) {
     let lock = format!("/tmp/.X{}-lock", id);
     let socket = format!("/tmp/.X11-unix/X{}", id);
     let _ = std::fs::remove_file(&lock);
@@ -103,19 +103,19 @@ pub(crate) fn remove_stale_lock(id: u32) {
 // Non-Linux stubs — these are called from debug.rs and XvfbGuard::Drop.
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
-pub(crate) fn is_lock_stale(_lock_path: &str) -> bool {
+pub fn is_lock_stale(_lock_path: &str) -> bool {
     false
 }
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
-pub(crate) fn is_our_xvfb(_lock_path: &str, _display_id: u32) -> bool {
+pub fn is_our_xvfb(_lock_path: &str, _display_id: u32) -> bool {
     false
 }
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
-pub(crate) fn kill_and_reclaim(_lock_path: &str, _display_id: u32) {}
+pub fn kill_and_reclaim(_lock_path: &str, _display_id: u32) {}
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn remove_stale_lock(_id: u32) {}
+pub fn remove_stale_lock(_id: u32) {}
 
 // ── Display config ──────────────────────────────────────────────────────────
 
@@ -156,11 +156,21 @@ const PREFERRED_DISPLAY: u32 = 99;
 /// 4. Lock file with some other live process → skip to next display
 #[cfg(target_os = "linux")]
 fn find_free_display() -> u32 {
+    find_free_display_in(std::path::Path::new("/tmp"))
+}
+
+/// Lock-dir-injectable core of [`find_free_display`]. Tests pin a temp dir
+/// so the scan never probes the real X11 locks — a live :99 on a shared box
+/// (or a CI runner that also hosts a daemon) must never be examined, let
+/// alone reclaimed, by a unit test.
+#[cfg(target_os = "linux")]
+fn find_free_display_in(lock_dir: &std::path::Path) -> u32 {
     for id in PREFERRED_DISPLAY..200 {
-        let lock = format!("/tmp/.X{}-lock", id);
-        if !std::path::Path::new(&lock).exists() {
+        let lock = lock_dir.join(format!(".X{}-lock", id));
+        if !lock.exists() {
             return id;
         }
+        let lock = lock.to_string_lossy();
         // Lock file exists — check if the owning process is dead
         if is_lock_stale(&lock) {
             remove_stale_lock(id);
@@ -351,6 +361,12 @@ pub fn detect_x11_display() -> Option<String> {
 mod tests {
     use super::*;
 
+    // Crate-local env lock, same role as the caller's
+    // `test_support::TEST_ENV_LOCK`: serializes env-mutating tests within
+    // this test binary. A lock cannot serialize across crates' separate
+    // test processes anyway, so crate-local is exactly as strong.
+    static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn display_config_openai() {
         let config = display_config_for_provider("openai");
@@ -382,17 +398,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn find_free_display_avoids_existing() {
-        // Should return a display number >= 99
-        let id = find_free_display();
-        assert!(id >= 99);
-        // The returned display should either have no lock file,
-        // or have a stale lock file that was cleaned up
-        let lock = format!("/tmp/.X{}-lock", id);
-        assert!(
-            !std::path::Path::new(&lock).exists() || is_lock_stale(&lock),
-            "display :{} has a live lock file",
-            id
-        );
+        let tmp = tempfile::tempdir().unwrap();
+        // :99 is occupied by a live, non-Xvfb process (this test itself), so
+        // the scan must leave it alone and settle on :100.
+        std::fs::write(
+            tmp.path().join(".X99-lock"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        assert_eq!(find_free_display_in(tmp.path()), 100);
     }
 
     #[cfg(target_os = "linux")]
@@ -467,7 +481,7 @@ mod tests {
         // Serialize with every other env-mutating test: this test unsets
         // DISPLAY, and is_display_accessible() itself re-sets it as a side
         // effect when it detects a live X socket.
-        let _guard = crate::test_support::TEST_ENV_LOCK.blocking_lock();
+        let _guard = TEST_ENV_LOCK.blocking_lock();
         let prev = std::env::var("DISPLAY").ok();
         std::env::remove_var("DISPLAY");
         // With DISPLAY unset the function deliberately probes /tmp/.X11-unix

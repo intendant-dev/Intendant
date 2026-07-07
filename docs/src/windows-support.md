@@ -241,8 +241,8 @@ and capture microphone audio from it.
 
 ### Process and Network Introspection
 
-`platform.rs` provides the Windows implementations of the cross-platform
-process and network helpers:
+`platform.rs` (in the `intendant-platform` crate) provides the Windows
+implementations of the cross-platform process and network helpers:
 
 - **Process liveness** — `OpenProcess` (query-only) + `GetExitCodeProcess`,
   since Windows has no `kill(pid, 0)` equivalent.

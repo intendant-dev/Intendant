@@ -970,6 +970,51 @@ mod tests {
         }
     }
 
+    /// Total wait budget for PTY output in these tests. A cold shell spawn
+    /// on a loaded CI runner (PowerShell under ConPTY on the Windows box,
+    /// especially) can take tens of seconds before the first byte shows;
+    /// a passing run returns the moment the bytes arrive and never waits
+    /// the budget out, so generous costs nothing when green.
+    const OUTPUT_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Drain `rx` until the accumulated output contains `needle`
+    /// (`None` = return on the first output event, i.e. the shell painted
+    /// something). Matching runs on the accumulated transcript, not per
+    /// chunk, so a token split across PTY read chunks still matches.
+    /// Panics loudly — including everything that WAS received — on
+    /// deadline, shell exit, or channel close.
+    async fn expect_output(
+        rx: &mut mpsc::UnboundedReceiver<TerminalEvent>,
+        needle: Option<&str>,
+        phase: &str,
+    ) -> String {
+        let deadline = tokio::time::Instant::now() + OUTPUT_BUDGET;
+        let mut transcript = String::new();
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(TerminalEvent::Output(bytes))) => {
+                    transcript.push_str(&String::from_utf8_lossy(&bytes));
+                    match needle {
+                        Some(token) if !transcript.contains(token) => {}
+                        _ => return transcript,
+                    }
+                }
+                Ok(Some(TerminalEvent::Exited { status })) => panic!(
+                    "{phase}: shell exited (status {status}) before output \
+                     contained {needle:?}; received: {transcript:?}"
+                ),
+                Ok(None) => panic!(
+                    "{phase}: event channel closed before output contained \
+                     {needle:?}; received: {transcript:?}"
+                ),
+                Err(_) => panic!(
+                    "{phase}: no output containing {needle:?} within \
+                     {OUTPUT_BUDGET:?}; received: {transcript:?}"
+                ),
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn open_attach_write_and_receive_output() {
         let registry = TerminalRegistry::new(std::env::temp_dir());
@@ -983,27 +1028,17 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         session.attach(tx);
 
+        // Don't type until the shell has painted something: zsh's tty
+        // setup flushes pending input, so bytes written during startup can
+        // be silently discarded (see scoped_shell_is_sandboxed_on_macos —
+        // a human typing into the dashboard never races this).
+        expect_output(&mut rx, None, "shell startup").await;
+
         // A terminal client sends CR (the Enter key), not LF — required for
         // ConPTY to submit the line on Windows; harmless on Unix.
         session.write_input(b"echo hello_from_pty\r");
 
-        // Drain events until we see the expected echo, with a bounded wait.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut saw_echo = false;
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
-                Ok(Some(TerminalEvent::Output(bytes))) => {
-                    if String::from_utf8_lossy(&bytes).contains("hello_from_pty") {
-                        saw_echo = true;
-                        break;
-                    }
-                }
-                Ok(Some(TerminalEvent::Exited { .. })) => break,
-                Ok(None) => break,
-                Err(_) => {}
-            }
-        }
-        assert!(saw_echo, "did not see echoed output from PTY");
+        expect_output(&mut rx, Some("hello_from_pty"), "echo output").await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1015,38 +1050,26 @@ mod tests {
             .await
             .unwrap();
 
-        // Drive a command through the first listener, then detach.
+        // Drive a command through the first listener, then detach. Wait
+        // for the shell to paint before typing (startup can flush pending
+        // input — see open_attach_write_and_receive_output), and confirm
+        // the token echoed before detaching: the reader thread pushes to
+        // scrollback before broadcasting, so once a listener saw the
+        // token the scrollback provably contains it.
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         session.attach(tx1);
+        expect_output(&mut rx1, None, "shell startup").await;
         // CR (Enter), not LF — see open_attach_write_and_receive_output.
         session.write_input(b"echo scroll_token_abc\r");
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(100), rx1.recv()).await {
-                Ok(Some(TerminalEvent::Output(bytes))) => {
-                    if String::from_utf8_lossy(&bytes).contains("scroll_token_abc") {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
+        expect_output(&mut rx1, Some("scroll_token_abc"), "first listener").await;
         drop(rx1);
 
         // Reattach with a fresh listener and expect the scrollback replay
-        // to contain the token — no additional commands driven.
+        // to contain the token — no additional commands driven, so the
+        // token can only come from the replay.
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         session.attach(tx2);
-        match tokio::time::timeout(std::time::Duration::from_millis(500), rx2.recv()).await {
-            Ok(Some(TerminalEvent::Output(bytes))) => {
-                assert!(
-                    String::from_utf8_lossy(&bytes).contains("scroll_token_abc"),
-                    "replayed scrollback missing token"
-                );
-            }
-            other => panic!("expected replay event, got {other:?}"),
-        }
+        expect_output(&mut rx2, Some("scroll_token_abc"), "scrollback replay").await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
