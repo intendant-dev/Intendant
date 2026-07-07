@@ -127,8 +127,29 @@ Connect offers advertise an **ICE-TCP candidate at
 reach, over the same port that already serves the dashboard. Browsers
 dial it directly; no STUN or TURN is required for the hosted
 dashboard-control path (the box's firewall must allow the gateway port
-inbound). Reachability metadata only: a lying proxy chain could at worst
-advertise an unreachable candidate.
+inbound). Display sessions opened through a hosted dashboard advertise
+the same tuple. Reachability metadata only: a lying proxy chain could at
+worst advertise an unreachable candidate.
+
+Because the service reads the caller's address from `X-Forwarded-For`
+(falling back to `X-Real-IP`), the reverse proxy in front of a
+self-hosted instance **must set one of those headers** — with a plain
+proxy_pass and no forwarding headers, `observed_ip` stays empty and
+hosted dashboards cannot reach any NAT'd daemon, a failure that only
+shows up later as an ICE timeout. Verify the full chain after deploying:
+
+```bash
+curl -s -X POST https://connect.example.com/api/daemon/register \
+  -H 'content-type: application/json' \
+  -d '{"protocol":"intendant-connect-rendezvous-v1","daemon_id":"probe","daemon_public_key":"probe"}' \
+  | grep observed_ip   # must echo YOUR public IP, not null
+```
+
+Caddy gotcha (this bit the default instance): within a `reverse_proxy`
+block, `header_up -X-Forwarded-For` deletions are applied **after**
+`header_up X-Forwarded-For {remote_host}` sets, so the strip-then-set
+idiom deletes the value it just set. Use the set alone — a set already
+replaces anything the client supplied.
 
 The service stores each org's latest root-signed revocation list, blind:
 `POST /api/orgs/revocations/publish` accepts a list whose embedded
