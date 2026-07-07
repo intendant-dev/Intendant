@@ -245,19 +245,22 @@ unset) prefers **OpenAI** when an OpenAI key is present, then Anthropic, then
 Gemini. See [Configuration](./configuration.md) for the full environment
 reference and per-provider default models.
 
-> **Daemon installs: "project root" means the daemon's launch directory.**
-> The search above runs **once, at process startup**, relative to wherever the
-> daemon was launched — for the installed macOS app that is a synthetic
-> workspace dir (`~/projects/intendant-workspace`), for a service install
-> usually `$HOME`. The project you pick when creating a session in the
-> dashboard does **not** feed this search. What a session's project `.env`
-> *does* contribute: the three provider key variables (and only those — never
-> `PROVIDER`, model, or endpoint settings) join that session's key resolution
-> as the last layer, after credential leases and the daemon's own environment.
-> For a daemon, the reliable places for keys are **Dashboard → Settings → API
-> Keys** (persists to `~/.config/intendant/.env` and applies immediately, no
-> restart), that global file itself (restart required if edited by hand), or
-> vault leases per [Credential Custody](./credential-custody.md).
+> **Daemon installs run projectless.** The search above runs **once, at
+> process startup**, relative to wherever the daemon was launched — for the
+> installed macOS app and service installs that is usually `$HOME`. A launch
+> directory without a project marker (`.git` / `intendant.toml`) is **not**
+> treated as a project: the daemon runs projectless (its `.env` layer for that
+> directory comes only from the ordinary cwd walk-up, and each dashboard
+> session picks its own project directory). The project you pick when creating
+> a session does **not** feed this startup search. What a session's project
+> `.env` *does* contribute: the three provider key variables (and only those —
+> never `PROVIDER`, model, or endpoint settings) join that session's key
+> resolution as the last layer, after credential leases and the daemon's own
+> environment. For a daemon, the reliable places for keys are **Dashboard →
+> Settings → API Keys** (persists to `~/.config/intendant/.env` and applies
+> immediately, no restart), that global file itself (restart required if
+> edited by hand), or vault leases per
+> [Credential Custody](./credential-custody.md).
 
 ## Your first run
 

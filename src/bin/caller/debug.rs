@@ -57,11 +57,10 @@ pub fn find_free_debug_display() -> u32 {
     DEBUG_DISPLAY_MAX // fallback
 }
 
-/// Returns `~/.intendant/recordings/` for daemon-scoped recordings.
+/// Returns `<state root>/recordings/` (`~/.intendant/recordings/` by
+/// default) for daemon-scoped recordings.
 pub fn daemon_recordings_dir() -> PathBuf {
-    crate::platform::home_dir()
-        .join(".intendant")
-        .join("recordings")
+    crate::platform::intendant_home().join("recordings")
 }
 
 /// Set up a debug screen.
@@ -104,10 +103,7 @@ pub async fn setup_debug_screen(web_port: u16) -> Result<DebugScreen, String> {
         .map_err(|e| format!("Failed to launch debug Xvfb: {}", e))?;
 
     // Create/reuse debug Firefox profile
-    let profile_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".intendant")
-        .join("debug-profile");
+    let profile_dir = crate::platform::intendant_home().join("debug-profile");
     if !profile_dir.exists() {
         let _ = std::fs::create_dir_all(&profile_dir);
         // Write user.js with debugger prefs and passive defaults

@@ -28,6 +28,13 @@ use crate::daemon_identity::b64u;
 use base64::Engine as _;
 
 pub const CLIENT_KEY_OFFER_PROTOCOL: &str = "intendant-client-key-offer-v1";
+/// v2 extends the signed payload with the browser's own account claim
+/// (`\n{account_user_id}\n{account_name}`), so the account shown on a
+/// pending enrollment can be **attested by the device key** instead of
+/// taken from whatever the signaling relay asserts. Old browsers keep
+/// signing v1; a v1 offer carrying account fields is rejected outright —
+/// nothing may ride outside the signature.
+pub const CLIENT_KEY_OFFER_PROTOCOL_V2: &str = "intendant-client-key-offer-v2";
 
 /// Accept signatures whose timestamp is at most this far from daemon time in
 /// either direction. Generous enough for clock skew, small enough that a
@@ -45,6 +52,10 @@ pub struct VerifiedClientKey {
     pub fingerprint: String,
     /// base64url of the raw public key point, retained for display/audit.
     pub public_key_b64u: String,
+    /// `(account_user_id, account_name)` covered by a v2 signature — the
+    /// device key itself vouched for this account claim. `None` on v1
+    /// offers (any account hint then rests on the relay's word).
+    pub attested_account: Option<(String, String)>,
 }
 
 /// Stable fingerprint for a raw P-256 public key point.
@@ -63,7 +74,7 @@ pub fn is_client_key_fingerprint(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// The exact byte string a client signs for an offer.
+/// The exact byte string a client signs for a v1 offer.
 pub fn client_key_offer_payload(
     daemon_id: &str,
     client_nonce: &str,
@@ -73,6 +84,23 @@ pub fn client_key_offer_payload(
     let sdp_digest = b64u(ring::digest::digest(&ring::digest::SHA256, sdp.as_bytes()).as_ref());
     format!("{CLIENT_KEY_OFFER_PROTOCOL}\n{daemon_id}\n{client_nonce}\n{sdp_digest}\n{ts_unix_ms}")
         .into_bytes()
+}
+
+/// The exact byte string a client signs for a v2 offer (v1 plus the
+/// browser's own account claim). Mirrored by the dashboard JS signer.
+pub fn client_key_offer_payload_v2(
+    daemon_id: &str,
+    client_nonce: &str,
+    sdp: &str,
+    ts_unix_ms: i64,
+    account_user_id: &str,
+    account_name: &str,
+) -> Vec<u8> {
+    let sdp_digest = b64u(ring::digest::digest(&ring::digest::SHA256, sdp.as_bytes()).as_ref());
+    format!(
+        "{CLIENT_KEY_OFFER_PROTOCOL_V2}\n{daemon_id}\n{client_nonce}\n{sdp_digest}\n{ts_unix_ms}\n{account_user_id}\n{account_name}"
+    )
+    .into_bytes()
 }
 
 /// Verify a signed offer. `daemon_id` must be the daemon's own expectation
@@ -89,6 +117,50 @@ pub fn verify_client_key_offer(
     sdp: &str,
     now_unix_ms: i64,
 ) -> Result<VerifiedClientKey, String> {
+    let payload = client_key_offer_payload(daemon_id, client_nonce, sdp, ts_unix_ms);
+    verify_signed_offer(client_key_b64u, signature_b64u, ts_unix_ms, now_unix_ms, &payload)
+        .map(|(fingerprint, public_key_b64u)| VerifiedClientKey {
+            fingerprint,
+            public_key_b64u,
+            attested_account: None,
+        })
+}
+
+pub fn verify_client_key_offer_v2(
+    client_key_b64u: &str,
+    signature_b64u: &str,
+    ts_unix_ms: i64,
+    daemon_id: &str,
+    client_nonce: &str,
+    sdp: &str,
+    now_unix_ms: i64,
+    account_user_id: &str,
+    account_name: &str,
+) -> Result<VerifiedClientKey, String> {
+    let payload = client_key_offer_payload_v2(
+        daemon_id,
+        client_nonce,
+        sdp,
+        ts_unix_ms,
+        account_user_id,
+        account_name,
+    );
+    verify_signed_offer(client_key_b64u, signature_b64u, ts_unix_ms, now_unix_ms, &payload)
+        .map(|(fingerprint, public_key_b64u)| VerifiedClientKey {
+            fingerprint,
+            public_key_b64u,
+            attested_account: Some((account_user_id.to_string(), account_name.to_string())),
+        })
+}
+
+/// Shared key/signature/timestamp mechanics for every payload version.
+fn verify_signed_offer(
+    client_key_b64u: &str,
+    signature_b64u: &str,
+    ts_unix_ms: i64,
+    now_unix_ms: i64,
+    payload: &[u8],
+) -> Result<(String, String), String> {
     let engine = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let key = engine
         .decode(client_key_b64u.trim())
@@ -112,14 +184,10 @@ pub fn verify_client_key_offer(
             "client key signature timestamp is {skew}ms from daemon time (max {CLIENT_KEY_MAX_SKEW_MS}ms)"
         ));
     }
-    let payload = client_key_offer_payload(daemon_id, client_nonce, sdp, ts_unix_ms);
     ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, &key)
-        .verify(&payload, &signature)
+        .verify(payload, &signature)
         .map_err(|_| "client key signature verification failed".to_string())?;
-    Ok(VerifiedClientKey {
-        fingerprint: client_key_fingerprint(&key),
-        public_key_b64u: b64u(&key),
-    })
+    Ok((client_key_fingerprint(&key), b64u(&key)))
 }
 
 /// Optional client-key fields as they appear in offer payloads, shared by the
@@ -132,6 +200,16 @@ pub struct ClientKeyOfferFields {
     pub client_key_sig: Option<String>,
     #[serde(default)]
     pub client_key_ts: Option<i64>,
+    /// Which offer payload the signature covers. Absent/empty = v1
+    /// (browsers that predate the field always signed v1).
+    #[serde(default)]
+    pub client_key_proto: Option<String>,
+    /// Browser-claimed account identity — only meaningful under a v2
+    /// signature, which covers these exact strings.
+    #[serde(default)]
+    pub client_key_account_user_id: Option<String>,
+    #[serde(default)]
+    pub client_key_account_name: Option<String>,
 }
 
 impl ClientKeyOfferFields {
@@ -151,6 +229,10 @@ impl ClientKeyOfferFields {
     /// - `Err(_)` when a key was offered but does not verify — callers must
     ///   fail closed rather than fall back, so a relay cannot strip or corrupt
     ///   the binding to downgrade a key-authenticated session.
+    ///
+    /// Version dispatch is strict: account fields on a v1 offer are an
+    /// error (they would be riding outside the signature), and an unknown
+    /// protocol is an error rather than a fallback.
     pub fn verify(
         &self,
         daemon_id: &str,
@@ -169,7 +251,51 @@ impl ClientKeyOfferFields {
         let ts = self
             .client_key_ts
             .ok_or_else(|| "client key offer is missing its timestamp".to_string())?;
-        verify_client_key_offer(key, sig, ts, daemon_id, client_nonce, sdp, now_unix_ms).map(Some)
+        let account_user_id = self
+            .client_key_account_user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        let account_name = self
+            .client_key_account_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        let proto = self
+            .client_key_proto
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(CLIENT_KEY_OFFER_PROTOCOL);
+        match proto {
+            CLIENT_KEY_OFFER_PROTOCOL => {
+                if account_user_id.is_some() || account_name.is_some() {
+                    return Err(
+                        "client key account fields require a v2-signed offer".to_string()
+                    );
+                }
+                verify_client_key_offer(key, sig, ts, daemon_id, client_nonce, sdp, now_unix_ms)
+                    .map(Some)
+            }
+            CLIENT_KEY_OFFER_PROTOCOL_V2 => {
+                let account_user_id = account_user_id.ok_or_else(|| {
+                    "v2 client key offer is missing its account user id".to_string()
+                })?;
+                verify_client_key_offer_v2(
+                    key,
+                    sig,
+                    ts,
+                    daemon_id,
+                    client_nonce,
+                    sdp,
+                    now_unix_ms,
+                    account_user_id,
+                    account_name.unwrap_or(""),
+                )
+                .map(Some)
+            }
+            other => Err(format!("unsupported client key offer protocol {other:?}")),
+        }
     }
 }
 
@@ -317,6 +443,7 @@ mod tests {
             client_key: Some("AAAA".to_string()),
             client_key_sig: None,
             client_key_ts: None,
+            ..Default::default()
         };
         assert!(fields.verify("d", "n", "sdp", 0).is_err());
 
@@ -329,6 +456,7 @@ mod tests {
             client_key: Some(key.raw_point_b64u.clone()),
             client_key_sig: Some(sign(&key, "d", "n", "sdp", ts)),
             client_key_ts: Some(ts),
+            ..Default::default()
         };
         let verified = fields.verify("d", "n", "sdp", ts).unwrap().unwrap();
         assert_eq!(
@@ -339,5 +467,70 @@ mod tests {
                     .unwrap()
             )
         );
+        assert_eq!(verified.attested_account, None);
+    }
+
+    fn sign_v2(
+        key: &TestKey,
+        daemon_id: &str,
+        nonce: &str,
+        sdp: &str,
+        ts: i64,
+        user: &str,
+        name: &str,
+    ) -> String {
+        let rng = ring::rand::SystemRandom::new();
+        let payload = client_key_offer_payload_v2(daemon_id, nonce, sdp, ts, user, name);
+        b64u(key.pair.sign(&rng, &payload).unwrap().as_ref())
+    }
+
+    #[test]
+    fn v2_offer_attests_the_account_and_binds_it() {
+        let key = generate_key();
+        let ts = 1_700_000_000_000;
+        let fields = ClientKeyOfferFields {
+            client_key: Some(key.raw_point_b64u.clone()),
+            client_key_sig: Some(sign_v2(
+                &key, "daemon-a", "nonce-1", "v=0 sdp", ts, "user-1", "alice",
+            )),
+            client_key_ts: Some(ts),
+            client_key_proto: Some(CLIENT_KEY_OFFER_PROTOCOL_V2.to_string()),
+            client_key_account_user_id: Some("user-1".to_string()),
+            client_key_account_name: Some("alice".to_string()),
+        };
+        let verified = fields
+            .verify("daemon-a", "nonce-1", "v=0 sdp", ts)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            verified.attested_account,
+            Some(("user-1".to_string(), "alice".to_string()))
+        );
+
+        // A relay swapping the claimed account fails the signature.
+        let swapped = ClientKeyOfferFields {
+            client_key_account_user_id: Some("mallory-user".to_string()),
+            ..fields.clone()
+        };
+        assert!(swapped.verify("daemon-a", "nonce-1", "v=0 sdp", ts).is_err());
+
+        // Account fields glued onto a v1-signed offer are rejected: nothing
+        // may ride outside the signature.
+        let glued = ClientKeyOfferFields {
+            client_key: Some(key.raw_point_b64u.clone()),
+            client_key_sig: Some(sign(&key, "daemon-a", "nonce-1", "v=0 sdp", ts)),
+            client_key_ts: Some(ts),
+            client_key_proto: None,
+            client_key_account_user_id: Some("mallory-user".to_string()),
+            client_key_account_name: None,
+        };
+        assert!(glued.verify("daemon-a", "nonce-1", "v=0 sdp", ts).is_err());
+
+        // Unknown protocol versions fail closed instead of falling back.
+        let unknown = ClientKeyOfferFields {
+            client_key_proto: Some("intendant-client-key-offer-v9".to_string()),
+            ..fields
+        };
+        assert!(unknown.verify("daemon-a", "nonce-1", "v=0 sdp", ts).is_err());
     }
 }

@@ -86,6 +86,7 @@ function onSessionEnded(sessionId, reason, errorKind) {
   stationCurrentTask = '';
   stationCurrentApproval = null;
   stationScheduleUpdate();
+  maybeFailPendingNewSessionSpawnNoProject(errorKind);
   maybeFailRecentNewSessionSpawn(sid, reason, errorKind);
   const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
   const win = sid ? sessionWindows.get(sid) : null;

@@ -21,6 +21,10 @@ pub(crate) struct GpuState {
     /// grown geometrically on demand; never recreated per frame.
     pub(crate) line_buffer: GpuVertexBuffer,
     pub(crate) tri_buffer: GpuVertexBuffer,
+    /// Depth attachment, always sized to `config`. Must be recreated
+    /// wherever the surface is resized or every later frame renders
+    /// against a stale-sized attachment.
+    pub(crate) depth_view: wgpu::TextureView,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -173,7 +177,18 @@ impl GpuState {
                     unclipped_depth: false,
                     conservative: false,
                 },
-                depth_stencil: None,
+                // Slice 1 of the world-space-pane program: the attachment
+                // exists and every vertex carries a real clip depth, but
+                // the compare stays Always so the wireframe's painter's-
+                // order alpha blending is untouched. Pane pipelines flip
+                // to a real compare against these written values.
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
                 cache: None,
@@ -188,6 +203,7 @@ impl GpuState {
         }
         let line_buffer = GpuVertexBuffer::new(&device, "Station Lines");
         let tri_buffer = GpuVertexBuffer::new(&device, "Station Triangles");
+        let depth_view = Self::create_depth_view(&device, width, height);
 
         Ok(Self {
             surface,
@@ -198,7 +214,26 @@ impl GpuState {
             tri_pipeline,
             line_buffer,
             tri_buffer,
+            depth_view,
         })
+    }
+
+    fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Station Depth"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        texture.create_view(&wgpu::TextureViewDescriptor::default())
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
@@ -208,6 +243,7 @@ impl GpuState {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
+        self.depth_view = Self::create_depth_view(&self.device, self.config.width, self.config.height);
     }
 
     pub(crate) fn render(&mut self, frame: &GpuFrame) -> Result<(), JsValue> {
@@ -263,7 +299,17 @@ impl GpuState {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    // Nothing reads the attachment after the pass, so the
+                    // store is discarded; within-pass depth tests (the pane
+                    // pipelines) are unaffected by the store op.
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
@@ -299,6 +345,10 @@ impl GpuState {
     }
 }
 
+/// Depth attachment format, shared by the pipelines and the texture.
+#[cfg(target_arch = "wasm32")]
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
 #[cfg(target_arch = "wasm32")]
 const STATION_WGSL: &str = r#"
 struct VertexOut {
@@ -307,9 +357,13 @@ struct VertexOut {
 };
 
 @vertex
-fn vs_main(@location(0) position: vec2<f32>, @location(1) color: vec4<f32>) -> VertexOut {
+fn vs_main(
+  @location(0) position: vec2<f32>,
+  @location(1) depth: f32,
+  @location(2) color: vec4<f32>,
+) -> VertexOut {
   var out: VertexOut;
-  out.position = vec4<f32>(position, 0.0, 1.0);
+  out.position = vec4<f32>(position, depth, 1.0);
   out.color = color;
   return out;
 }
@@ -324,13 +378,18 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct GpuVertex {
     pub(crate) pos: [f32; 2],
+    /// Clip-space z in [0, 1) — `scene::ndc_depth` of the view depth for
+    /// projected geometry, 0.0 (nearest) for screen-space geometry.
+    /// Out-of-range values clip the vertex, so producers stay inside the
+    /// helper.
+    pub(crate) depth: f32,
     pub(crate) color: [f32; 4],
 }
 
 impl GpuVertex {
     #[cfg(target_arch = "wasm32")]
-    pub(crate) const ATTRS: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
+    pub(crate) const ATTRS: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32x4];
 
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
@@ -357,37 +416,48 @@ impl GpuFrame {
         self.projected_nodes.clear();
     }
 
-    pub(crate) fn add_line_ndc(&mut self, a: Vec2, b: Vec2, color: Color) {
+    pub(crate) fn add_line_ndc(&mut self, a: Vec2, za: f32, b: Vec2, zb: f32, color: Color) {
         self.line_vertices.push(GpuVertex {
             pos: [a.x, a.y],
+            depth: za,
             color: color.into(),
         });
         self.line_vertices.push(GpuVertex {
             pos: [b.x, b.y],
+            depth: zb,
             color: color.into(),
         });
     }
 
     /// Project and append one line segment. The projector returns the NDC
-    /// position plus a depth-cue brightness multiplier; the segment's alpha
-    /// is scaled by the endpoints' mean so nearer edges draw brighter.
+    /// position, a depth-cue brightness multiplier — the segment's alpha
+    /// is scaled by the endpoints' mean so nearer edges draw brighter —
+    /// and the clip depth written to the depth attachment.
     pub(crate) fn add_line_projected(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
         a: Vec3,
         b: Vec3,
         color: Color,
     ) {
-        if let (Some((pa, ca)), Some((pb, cb))) = (project(a), project(b)) {
+        if let (Some((pa, ca, za)), Some((pb, cb, zb))) = (project(a), project(b)) {
             let cue = (ca + cb) * 0.5;
-            self.add_line_ndc(pa, pb, color.with_alpha((color.a * cue).min(1.0)));
+            self.add_line_ndc(pa, za, pb, zb, color.with_alpha((color.a * cue).min(1.0)));
         }
     }
 
     /// Two-pass glow segment: a thick low-alpha quad under a thin bright
     /// line. Same pipelines, just extra vertices — far cheaper than any
     /// post-process blur. `width` is the quad half-width in NDC.
-    pub(crate) fn add_glow_line_ndc(&mut self, a: Vec2, b: Vec2, color: Color, width: f32) {
+    pub(crate) fn add_glow_line_ndc(
+        &mut self,
+        a: Vec2,
+        za: f32,
+        b: Vec2,
+        zb: f32,
+        color: Color,
+        width: f32,
+    ) {
         let dx = b.x - a.x;
         let dy = b.y - a.y;
         let len = (dx * dx + dy * dy).sqrt();
@@ -396,21 +466,25 @@ impl GpuFrame {
             let py = dx / len * width;
             let halo: [f32; 4] = color.with_alpha(color.a * 0.17).into();
             let quad = [
-                [a.x - px, a.y - py],
-                [b.x - px, b.y - py],
-                [b.x + px, b.y + py],
-                [a.x - px, a.y - py],
-                [b.x + px, b.y + py],
-                [a.x + px, a.y + py],
+                ([a.x - px, a.y - py], za),
+                ([b.x - px, b.y - py], zb),
+                ([b.x + px, b.y + py], zb),
+                ([a.x - px, a.y - py], za),
+                ([b.x + px, b.y + py], zb),
+                ([a.x + px, a.y + py], za),
             ];
-            for pos in quad {
-                self.tri_vertices.push(GpuVertex { pos, color: halo });
+            for (pos, depth) in quad {
+                self.tri_vertices.push(GpuVertex {
+                    pos,
+                    depth,
+                    color: halo,
+                });
             }
         }
-        self.add_line_ndc(a, b, color);
+        self.add_line_ndc(a, za, b, zb, color);
     }
 
-    pub(crate) fn add_quad_ndc(&mut self, x: f32, y: f32, size: f32, color: [f32; 4]) {
+    pub(crate) fn add_quad_ndc(&mut self, x: f32, y: f32, size: f32, color: [f32; 4], depth: f32) {
         let s = size;
         let verts = [
             [x - s, y - s],
@@ -421,13 +495,13 @@ impl GpuFrame {
             [x - s, y + s],
         ];
         for pos in verts {
-            self.tri_vertices.push(GpuVertex { pos, color });
+            self.tri_vertices.push(GpuVertex { pos, depth, color });
         }
     }
 
     pub(crate) fn add_ring(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
         center: Vec3,
         radius: f32,
         color: Color,
@@ -440,7 +514,7 @@ impl GpuFrame {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_glow_ring(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
         center: Vec3,
         radius: f32,
         color: Color,
@@ -453,7 +527,7 @@ impl GpuFrame {
     #[allow(clippy::too_many_arguments)]
     fn ring_inner(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
         center: Vec3,
         radius: f32,
         color: Color,
@@ -473,11 +547,15 @@ impl GpuFrame {
             if let Some(prev_p) = prev {
                 match glow_width {
                     Some(width) => {
-                        if let (Some((pa, ca)), Some((pb, cb))) = (project(prev_p), project(p)) {
+                        if let (Some((pa, ca, za)), Some((pb, cb, zb))) =
+                            (project(prev_p), project(p))
+                        {
                             let cue = (ca + cb) * 0.5;
                             self.add_glow_line_ndc(
                                 pa,
+                                za,
                                 pb,
+                                zb,
                                 color.with_alpha((color.a * cue).min(1.0)),
                                 width,
                             );
@@ -492,7 +570,7 @@ impl GpuFrame {
 
     pub(crate) fn add_wire_octa(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
         center: Vec3,
         scale: f32,
         spin: f32,
@@ -525,7 +603,7 @@ impl GpuFrame {
 
     pub(crate) fn add_wire_tetra(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
         center: Vec3,
         scale: f32,
         spin: f32,
@@ -543,7 +621,7 @@ impl GpuFrame {
 
     pub(crate) fn add_wire_icosa(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
         center: Vec3,
         scale: f32,
         spin: f32,
@@ -601,7 +679,7 @@ impl GpuFrame {
 
     pub(crate) fn add_wire_hex(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
         center: Vec3,
         radius: f32,
         height: f32,
@@ -631,7 +709,7 @@ impl GpuFrame {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_edges(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
         center: Vec3,
         scale: f32,
         spin: f32,
@@ -657,19 +735,20 @@ mod tests {
     #[test]
     fn quads_push_two_triangles() {
         let mut frame = GpuFrame::default();
-        frame.add_quad_ndc(0.0, 0.0, 0.1, [1.0, 1.0, 1.0, 1.0]);
+        frame.add_quad_ndc(0.0, 0.0, 0.1, [1.0, 1.0, 1.0, 1.0], 0.25);
         assert_eq!(frame.tri_vertices.len(), 6);
         assert!(frame.line_vertices.is_empty());
+        assert!(frame.tri_vertices.iter().all(|v| v.depth == 0.25));
     }
 
     #[test]
     fn lines_push_vertex_pairs_and_projection_culls() {
         let mut frame = GpuFrame::default();
         let color = Color::rgb(255, 0, 0);
-        frame.add_line_ndc(Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0), color);
+        frame.add_line_ndc(Vec2::new(0.0, 0.0), 0.0, Vec2::new(1.0, 1.0), 0.0, color);
         assert_eq!(frame.line_vertices.len(), 2);
         // A projector that culls everything adds nothing.
-        let mut cull = |_: Vec3| -> Option<(Vec2, f32)> { None };
+        let mut cull = |_: Vec3| -> Option<(Vec2, f32, f32)> { None };
         frame.add_line_projected(&mut cull, Vec3::ZERO, Vec3::Y, color);
         assert_eq!(frame.line_vertices.len(), 2);
     }
@@ -677,19 +756,36 @@ mod tests {
     #[test]
     fn projected_lines_apply_depth_cue_to_alpha() {
         let mut frame = GpuFrame::default();
-        let mut dim = |v: Vec3| Some((Vec2::new(v.x, v.y), 0.5));
+        let mut dim = |v: Vec3| Some((Vec2::new(v.x, v.y), 0.5, 0.5));
         frame.add_line_projected(&mut dim, Vec3::ZERO, Vec3::Y, Color::rgb(255, 0, 0));
         assert!((frame.line_vertices[0].color[3] - 0.5).abs() < 1e-6);
         // A cue above 1.0 brightens but never exceeds full alpha.
-        let mut hot = |v: Vec3| Some((Vec2::new(v.x, v.y), 1.5));
+        let mut hot = |v: Vec3| Some((Vec2::new(v.x, v.y), 1.5, 0.5));
         frame.add_line_projected(&mut hot, Vec3::ZERO, Vec3::Y, Color::rgb(255, 0, 0));
         assert_eq!(frame.line_vertices[2].color[3], 1.0);
     }
 
     #[test]
+    fn projected_depth_reaches_the_vertices() {
+        let mut frame = GpuFrame::default();
+        // Per-endpoint depth: y=0 endpoint near, y=1 endpoint far.
+        let mut slope = |v: Vec3| Some((Vec2::new(v.x, v.y), 1.0, 0.1 + v.y * 0.6));
+        frame.add_line_projected(&mut slope, Vec3::ZERO, Vec3::Y, Color::rgb(255, 0, 0));
+        assert!((frame.line_vertices[0].depth - 0.1).abs() < 1e-6);
+        assert!((frame.line_vertices[1].depth - 0.7).abs() < 1e-6);
+        // The glow halo's quad corners inherit their own endpoint's depth.
+        frame.add_glow_line_ndc(Vec2::new(0.0, 0.0), 0.2, Vec2::new(1.0, 0.0), 0.8, Color::rgb(0, 0, 255), 0.01);
+        let quad = &frame.tri_vertices[..6];
+        assert_eq!(
+            quad.iter().map(|v| v.depth).collect::<Vec<_>>(),
+            vec![0.2, 0.8, 0.8, 0.2, 0.8, 0.2]
+        );
+    }
+
+    #[test]
     fn ring_segments_share_endpoints() {
         let mut frame = GpuFrame::default();
-        let mut identity = |v: Vec3| Some((Vec2::new(v.x, v.y), 1.0));
+        let mut identity = |v: Vec3| Some((Vec2::new(v.x, v.y), 1.0, 0.5));
         frame.add_ring(
             &mut identity,
             Vec3::ZERO,
@@ -705,17 +801,17 @@ mod tests {
     fn glow_lines_add_quad_plus_bright_core() {
         let mut frame = GpuFrame::default();
         let color = Color::rgb(0, 0, 255);
-        frame.add_glow_line_ndc(Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), color, 0.01);
+        frame.add_glow_line_ndc(Vec2::new(0.0, 0.0), 0.0, Vec2::new(1.0, 0.0), 0.0, color, 0.01);
         assert_eq!(frame.tri_vertices.len(), 6, "thick halo quad");
         assert_eq!(frame.line_vertices.len(), 2, "thin bright core");
         assert!(frame.tri_vertices[0].color[3] < frame.line_vertices[0].color[3]);
         // Degenerate (zero-length) glow segments skip the quad, not crash.
-        frame.add_glow_line_ndc(Vec2::new(0.5, 0.5), Vec2::new(0.5, 0.5), color, 0.01);
+        frame.add_glow_line_ndc(Vec2::new(0.5, 0.5), 0.0, Vec2::new(0.5, 0.5), 0.0, color, 0.01);
         assert_eq!(frame.tri_vertices.len(), 6);
         assert_eq!(frame.line_vertices.len(), 4);
 
         let mut glow_ring = GpuFrame::default();
-        let mut identity = |v: Vec3| Some((Vec2::new(v.x, v.y), 1.0));
+        let mut identity = |v: Vec3| Some((Vec2::new(v.x, v.y), 1.0, 0.5));
         glow_ring.add_glow_ring(&mut identity, Vec3::ZERO, 1.0, color, Plane::XY, 0.01);
         assert_eq!(glow_ring.line_vertices.len(), 128);
         assert_eq!(glow_ring.tri_vertices.len(), 64 * 6);
@@ -724,7 +820,7 @@ mod tests {
     #[test]
     fn clear_empties_but_keeps_capacity() {
         let mut frame = GpuFrame::default();
-        frame.add_quad_ndc(0.0, 0.0, 0.1, [1.0; 4]);
+        frame.add_quad_ndc(0.0, 0.0, 0.1, [1.0; 4], 0.0);
         let cap = frame.tri_vertices.capacity();
         frame.clear();
         assert!(frame.tri_vertices.is_empty());

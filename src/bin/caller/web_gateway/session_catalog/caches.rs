@@ -179,8 +179,7 @@ pub(crate) struct PersistedIntendantSessionEntry {
 }
 
 pub(crate) fn session_index_dir() -> PathBuf {
-    crate::platform::home_dir()
-        .join(".intendant")
+    crate::platform::intendant_home()
         .join("cache")
         .join("session_index")
 }

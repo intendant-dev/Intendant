@@ -531,7 +531,10 @@ fn default_scan_roots(
     }
 
     add(home.join("projects"), "common-projects");
-    add(home.join(".intendant").join("worktrees"), "common");
+    add(
+        crate::platform::intendant_home_in(home).join("worktrees"),
+        "common",
+    );
     add(home.join(".codex").join("worktrees"), "common");
     add(home.join(".claude").join("worktrees"), "common");
 

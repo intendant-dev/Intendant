@@ -252,6 +252,14 @@ pub fn spawn_web_gateway(
     // request doesn't pay the initial scan. The persistent per-session
     // index makes this mostly stat calls + one parallel index sweep; the
     // results land in the ordinary response caches.
+    //
+    // Not under test: unit tests spawn hundreds of gateways, and the warm
+    // scan walks the REAL ~/.intendant of whoever runs the tests — on a
+    // dev box with a long session history that is a stat storm per test
+    // (the dominant cost of the whole suite before this gate) and a
+    // hermeticity leak. Tests that exercise session lists inject their
+    // own home via list_sessions_from_home.
+    #[cfg(not(test))]
     tokio::task::spawn_blocking(|| {
         preload_session_index();
         // 600 matches the dashboard's default recent-list request size;

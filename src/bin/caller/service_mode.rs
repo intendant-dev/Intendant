@@ -156,16 +156,13 @@ fn current_exe_display() -> String {
 }
 
 fn default_log_path() -> PathBuf {
-    crate::platform::home_dir()
-        .join(".intendant")
+    crate::platform::intendant_home()
         .join("logs")
         .join("service.log")
 }
 
 fn supervisor_pidfile() -> PathBuf {
-    crate::platform::home_dir()
-        .join(".intendant")
-        .join("service-supervisor.pid")
+    crate::platform::intendant_home().join("service-supervisor.pid")
 }
 
 fn carried_env(get: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
@@ -522,7 +519,7 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
             let user_id = windows_user_id();
             let run_args = supervisor_run_args(&log_str, &envs, &daemon_args);
             let xml = schtasks_xml(&exe, &run_args, &user_id, boot);
-            let xml_path = home.join(".intendant").join("service-task.xml");
+            let xml_path = crate::platform::intendant_home().join("service-task.xml");
             write_private(&xml_path, &xml)?;
             run_ok(
                 "schtasks",

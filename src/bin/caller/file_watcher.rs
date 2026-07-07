@@ -204,9 +204,9 @@ const IGNORED_EXTENSIONS: &[&str] = &[
 /// minutes reading `~/.rustup` before the dashboard and rendezvous
 /// client could spawn.)
 pub fn root_is_snapshot_worthy(root: &Path) -> bool {
-    // A git worktree's `.git` is a file, not a directory — exists()
-    // covers both shapes.
-    root.join(".git").exists() || root.join("intendant.toml").exists()
+    // Same marker notion as "does the daemon have a project at all" —
+    // one definition, owned by project.rs.
+    crate::project::root_has_project_marker(root)
 }
 
 /// Tree-wide budget for the initial baseline scan. A root that blows

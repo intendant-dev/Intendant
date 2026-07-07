@@ -85,6 +85,17 @@ impl SandboxConfig {
     /// - Read: `/` (everything)
     /// - Write: project root, the OS scratch dir, log directory, home `.intendant`
     pub fn default_for_project(project_root: &Path, log_dir: &Path) -> Self {
+        let mut config = Self::projectless(log_dir);
+        config.write_paths.insert(0, project_root.to_path_buf());
+        config
+    }
+
+    /// Default config for a daemon with **no project** (projectless): the
+    /// same base scope as `default_for_project` minus the project root —
+    /// scratch dir, log dir, and `~/.intendant` only. Absence of a project
+    /// must shrink the write scope, never widen it: in particular the
+    /// daemon's launch cwd is *not* writable.
+    pub fn projectless(log_dir: &Path) -> Self {
         // The scratch dir stays the literal `/tmp` on Unix (macOS `TMPDIR`
         // aliases are composed into the Seatbelt profile separately); on
         // Windows the equivalent is the profile-local `%TEMP%`, which has
@@ -94,12 +105,11 @@ impl SandboxConfig {
         } else {
             PathBuf::from("/tmp")
         };
-        let mut write_paths = vec![project_root.to_path_buf(), scratch, log_dir.to_path_buf()];
+        let mut write_paths = vec![scratch, log_dir.to_path_buf()];
 
-        // Allow writes to ~/.intendant
-        if let Some(home) = dirs::home_dir() {
-            write_paths.push(home.join(".intendant"));
-        }
+        // Allow writes to the daemon state root (~/.intendant by default,
+        // $INTENDANT_HOME when overridden).
+        write_paths.push(crate::platform::intendant_home());
 
         Self {
             read_paths: vec![PathBuf::from("/")],
@@ -383,6 +393,23 @@ mod tests {
         assert!(config.write_paths.contains(&scratch));
         assert!(config.write_paths.contains(&PathBuf::from("/tmp/logs")));
         assert!(config.read_paths.contains(&PathBuf::from("/")));
+    }
+
+    #[test]
+    fn projectless_config_is_the_project_config_minus_the_project_root() {
+        let log_dir = Path::new("/tmp/logs");
+        let projectless = SandboxConfig::projectless(log_dir);
+        let mut with_project =
+            SandboxConfig::default_for_project(Path::new("/home/user/project"), log_dir);
+        // Exactly one path apart: the project root. No cwd, no widening.
+        assert!(!projectless
+            .write_paths
+            .contains(&PathBuf::from("/home/user/project")));
+        with_project
+            .write_paths
+            .retain(|p| p != Path::new("/home/user/project"));
+        assert_eq!(projectless.write_paths, with_project.write_paths);
+        assert!(projectless.enabled);
     }
 
     #[test]

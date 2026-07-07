@@ -176,18 +176,11 @@ fn restrict_file(path: &Path) {
 }
 
 fn trail_path() -> PathBuf {
-    // Unit tests exercise grant/revoke/register for their own modules;
-    // their side-effect events must never land in the developer's real
-    // trail file.
-    if cfg!(test) {
-        return std::env::temp_dir().join(format!(
-            "custody-audit-test-global-{}.jsonl",
-            std::process::id()
-        ));
-    }
-    crate::platform::home_dir()
-        .join(".intendant")
-        .join("custody-audit.jsonl")
+    // `platform::intendant_home()` already resolves to a per-process
+    // scratch root in unit-test builds, so side-effect events from other
+    // modules' tests never land in the developer's real trail file (the
+    // seam subsumed this module's older `cfg!(test)` temp-file redirect).
+    crate::platform::intendant_home().join("custody-audit.jsonl")
 }
 
 fn global() -> &'static Mutex<Trail> {

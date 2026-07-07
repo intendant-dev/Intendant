@@ -121,10 +121,20 @@ impl Agent {
             fs::create_dir_all(&path)?;
             return Ok(path);
         }
-        // Fallback: create a fresh temp directory
+        // Fallback: a fresh timestamped directory under the daemon state
+        // root. `INTENDANT_HOME` (carried in the environment by the caller
+        // binary, whose `platform::intendant_home()` is the same seam)
+        // overrides the `~/.intendant` default so a relocated daemon's
+        // runtime logs land in the same tree.
         let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let log_dir = PathBuf::from(format!("{}/.intendant/logs/{}", home, timestamp));
+        let state_root = match std::env::var("INTENDANT_HOME") {
+            Ok(root) if !root.trim().is_empty() => PathBuf::from(root),
+            _ => {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                PathBuf::from(home).join(".intendant")
+            }
+        };
+        let log_dir = state_root.join("logs").join(&timestamp);
         fs::create_dir_all(&log_dir)?;
         Ok(log_dir)
     }

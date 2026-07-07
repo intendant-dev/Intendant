@@ -65,7 +65,7 @@ pub(crate) fn current_agent_output_response_for_ids(ids: Vec<String>, log_dir: &
         return upload_error_response("400 Bad Request", "missing output ids");
     }
 
-    let fallback_logs_dir = Some(crate::platform::home_dir().join(".intendant").join("logs"));
+    let fallback_logs_dir = Some(crate::platform::intendant_home().join("logs"));
     let chunks = agent_output_chunks_with_fallback(log_dir, &ids, fallback_logs_dir.as_deref());
     let found: HashSet<&str> = chunks
         .iter()
@@ -604,7 +604,7 @@ pub(crate) fn changes_request_target_from_home(
     home: &Path,
 ) -> Option<ChangesRequestTarget> {
     let target_id = changes_request_target_id(request_line)?;
-    let logs_dir = home.join(".intendant").join("logs");
+    let logs_dir = crate::platform::intendant_home_in(home).join("logs");
     let entries = std::fs::read_dir(logs_dir).ok()?;
     let mut candidates = Vec::new();
 
@@ -1472,7 +1472,9 @@ pub(crate) fn managed_context_safe_log_dir_id(id: &str) -> Option<String> {
 
 pub(crate) fn managed_context_named_log_dir(home: &Path, session_id: &str) -> Option<PathBuf> {
     let session_id = managed_context_safe_log_dir_id(session_id)?;
-    let path = home.join(".intendant").join("logs").join(session_id);
+    let path = crate::platform::intendant_home_in(home)
+        .join("logs")
+        .join(session_id);
     path.is_dir().then_some(path)
 }
 
@@ -1573,7 +1575,7 @@ pub(crate) fn managed_context_candidate_log_dirs(
                 return dirs;
             }
         }
-        let logs_dir = home.join(".intendant").join("logs");
+        let logs_dir = crate::platform::intendant_home_in(home).join("logs");
         if let Ok(entries) = std::fs::read_dir(&logs_dir) {
             for entry in entries.flatten() {
                 let log_dir = entry.path();

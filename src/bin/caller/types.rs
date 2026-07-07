@@ -269,7 +269,8 @@ pub enum OutboundEvent {
         session_id: String,
         reason: String,
         /// Structured failure class for actionable errors ("unfueled" →
-        /// the dashboard offers Add API Keys). Absent for normal ends.
+        /// the dashboard offers Add API Keys; "no_project" → it points
+        /// at the project picker). Absent for normal ends.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_kind: Option<String>,
     },

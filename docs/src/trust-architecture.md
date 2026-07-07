@@ -112,7 +112,7 @@ fully rolled out:
 | Your anchor daemon | Full compromise | It already runs your agent; nothing new is delegated to it |
 | Another daemon of yours | That machine's authority | Each daemon is its own authority island |
 | Org portal daemon (guest lane) | The guest's org-scoped session | Blast radius = the org's own resources; self-defeating |
-| Rendezvous / signaling | Denial of service; first-introduction name games | Channels bind to daemon keys; claim phrases bind keys out of band; daemons co-sign claim bindings (v2 proofs) and flag asserted owners they never acknowledged |
+| Rendezvous / signaling | Denial of service; first-introduction name games | Channels bind to daemon keys; claim phrases bind keys out of band; daemons co-sign claim bindings (v2 proofs) and flag asserted owners they never acknowledged; first-owner bootstrap phrases are daemon-minted (the service holds only a hash, so it cannot enroll a key of its own) |
 | TURN relay | Denial of service; traffic analysis | Sees only ciphertext |
 | Fleet metadata store | Denial of service | Records are client-signed (and encrypted where private); clients verify |
 | Name directory | Handle confusion at first introduction | Key-first identity; handles are labels; org keys sign membership; append-only transparency log over all name bindings (STH pinned + consistency-verified by browsers; inclusion proofs on claims), optional DNS/GitHub attestation badges, invite-gated registration + reserved handles + dormant-handle reclamation |
