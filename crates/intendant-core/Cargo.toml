@@ -8,6 +8,8 @@ publish = false
 [dependencies]
 presence-core = { path = "../presence-core" }
 serde = { version = "1.0", features = ["derive"] }
+# skills discovery walks the home skills dir.
+dirs = "6"
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["sync"] }
 # CallerError carries reqwest::Error in its Http variant; feature set

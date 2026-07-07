@@ -1,4 +1,4 @@
-use crate::provider::TokenUsage;
+use crate::usage::TokenUsage;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 
@@ -1456,7 +1456,7 @@ mod tests {
             conv.add_assistant(format!("reply-{}", i));
         }
         // Set usage at 65% — above 0.60 threshold but below 0.90
-        conv.set_usage(crate::provider::TokenUsage {
+        conv.set_usage(crate::usage::TokenUsage {
             prompt_tokens: 65_000,
             completion_tokens: 0,
             total_tokens: 65_000,
@@ -1477,7 +1477,7 @@ mod tests {
             conv.add_user(format!("u{}", i));
             conv.add_assistant(format!("a{}", i));
         }
-        conv.set_usage(crate::provider::TokenUsage {
+        conv.set_usage(crate::usage::TokenUsage {
             prompt_tokens: 50_000,
             completion_tokens: 0,
             total_tokens: 50_000,

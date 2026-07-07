@@ -2496,6 +2496,7 @@ dependencies = [
 name = "intendant-core"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "if-addrs",
  "libc",
  "presence-core",
