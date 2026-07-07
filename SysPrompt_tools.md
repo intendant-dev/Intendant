@@ -25,6 +25,10 @@ For non-display tasks (shell commands, file editing, code), continue using `exec
 
 Use the `shared_view` tool to give the user live dashboard visibility into an agent-owned display — your virtual display, a sandbox, or a VM. Open it proactively when the human should visually stay in the loop: demoing a finished result (`show` with a short `reason`), longer GUI/browser sessions the user may want to watch, or auth/judgment handoffs (`input` — the user grants input authority from the dashboard; the tool only asks). Use `focus` when referencing a specific screen region, and `hide` when the moment is over. Sharing the user's own screen (`user_session`) is an explicit opt-in that requires their display grant — default to your own displays.
 
+## Federated Peers
+
+Use the `peer` tool to work with federated peer daemons — sibling Intendants on other machines, not subordinates. `list` shows each peer's id, connection state, capabilities, and visible sessions; `message` sends text to a peer's agent; `task` delegates work that the peer's own agent executes on its machine under its own autonomy and approval policy (you get a task id back, and the peer's progress streams to the dashboard's peers rail — you do not supervise it). The receiving daemon authorizes every action against its own grants for this daemon, so a denied action means the peer's owner has not granted it — report that rather than retrying. If federation is not configured the tool says so; that is not an error to work around.
+
 ## Best Practices
 
 1. **Sequential Execution:** Each tool call blocks until completion and returns results directly.

@@ -52,10 +52,11 @@ mod tool_gate;
 pub(crate) use tool_gate::*;
 mod tool_params;
 pub(crate) use tool_params::*;
-// tools_managed / tools_display contribute impl-block methods only —
-// nothing importable, so no re-export.
+// tools_managed / tools_display / tools_peer contribute impl-block
+// methods only — nothing importable, so no re-export.
 mod tools_display;
 mod tools_managed;
+mod tools_peer;
 
 const CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT: f64 = 85.0;
 const DENSITY_MAINTENANCE_ANCHOR_LIST_LIMIT: usize = 1;
@@ -485,6 +486,15 @@ impl IntendantServer {
             "spawn_live_audio" => {
                 let params = parse_params::<SpawnLiveAudioParams>(args)?;
                 Ok(text_tool_result(self.spawn_live_audio(params).await))
+            }
+            "list_peers" => Ok(text_tool_result(self.list_peers().await)),
+            "peer_send_message" => {
+                let params = parse_params::<PeerSendMessageParams>(args)?;
+                Ok(text_tool_result(self.peer_send_message(params).await))
+            }
+            "peer_delegate_task" => {
+                let params = parse_params::<PeerDelegateTaskParams>(args)?;
+                Ok(text_tool_result(self.peer_delegate_task(params).await))
             }
             _ => Err(format!("Unknown tool: {}", name)),
         }
