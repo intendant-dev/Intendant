@@ -9,7 +9,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{DeviceOrientationEvent, Event, KeyboardEvent, PointerEvent, WheelEvent};
 
-use crate::scene::{ndc_to_screen, LayoutName, Vec2};
+use crate::scene::{ndc_to_screen, screen_to_ndc, LayoutName, Vec2};
 use crate::util::now_ms;
 use crate::StationInner;
 
@@ -159,7 +159,10 @@ impl StationInner {
                         s.mark_input();
                         s.set_cursor("drag");
                     }
-                } else if s.hit_action_at(x, y).is_some() || s.pick_node(x, y).is_some() {
+                } else if s.hit_action_at(x, y).is_some()
+                    || s.pick_pane(x, y).is_some()
+                    || s.pick_node(x, y).is_some()
+                {
                     s.set_cursor("pointer");
                 } else {
                     s.set_cursor("grab");
@@ -201,7 +204,15 @@ impl StationInner {
                     } else if let Some(action) = drag.pending_action {
                         s.dispatch_hit(action)
                     } else if !drag.moved {
-                        s.selected_id = s.pick_node(x, y);
+                        // Panes are click-solid (slice 4): the card
+                        // occludes the scene behind it per-pixel, so a
+                        // click on it keeps its node selected instead of
+                        // falling through to empty-space deselection.
+                        // (A node floating between the camera and a card
+                        // is stolen by the card — acceptable while the
+                        // one card anchors to the selection; revisit with
+                        // a depth compare if panes multiply.)
+                        s.selected_id = s.pick_pane(x, y).or_else(|| s.pick_node(x, y));
                         s.hud_dirty = true;
                         None
                     } else {
@@ -405,6 +416,33 @@ impl StationInner {
                 let p = ndc_to_screen([n.ndc.x, n.ndc.y], self.width, self.height);
                 let d = ((p.x - px).powi(2) + (p.y - py).powi(2)).sqrt();
                 (d <= n.radius * self.dpr as f32 + 10.0).then(|| (d, n.id.clone()))
+            })
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(_, id)| id)
+    }
+
+    /// Raycast pane picking (Phase C slice 4): the inverse of
+    /// `Camera::project_depth` through the pointer's pixel, intersected
+    /// with the frame's world-space pane targets; the nearest hit wins.
+    /// Coordinates are CSS px like `pick_node`'s.
+    pub(crate) fn pick_pane(&self, x: f32, y: f32) -> Option<String> {
+        if self.frame.pane_targets.is_empty() {
+            return None;
+        }
+        let ndc = screen_to_ndc(
+            x * self.dpr as f32,
+            y * self.dpr as f32,
+            self.width,
+            self.height,
+        );
+        let camera = self.camera();
+        let aspect = self.width as f32 / self.height.max(1) as f32;
+        let (origin, dir) = camera.ray_through(ndc, aspect, self.fov_deg);
+        self.frame
+            .pane_targets
+            .iter()
+            .filter_map(|target| {
+                crate::panes::ray_hit(target, origin, dir).map(|t| (t, target.id.clone()))
             })
             .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(_, id)| id)
