@@ -27,12 +27,15 @@ impl StationInner {
         let density = self.density;
         let camera_distance = self.distance;
 
-        // Projector used by every scene element: NDC position plus a
-        // depth-cued brightness multiplier (nearer geometry draws brighter).
+        // Projector used by every scene element: NDC position, a
+        // depth-cued brightness multiplier (nearer geometry draws
+        // brighter), and the clip-space depth written to the depth
+        // attachment (pass-through today; world-space panes test against
+        // it from slice 2 on).
         let mut project = move |p: Vec3| {
             camera
                 .project_depth(p, aspect, fov_deg)
-                .map(|(ndc, z)| (ndc, depth_alpha(z, camera_distance)))
+                .map(|(ndc, z)| (ndc, depth_alpha(z, camera_distance), ndc_depth(z)))
         };
 
         let star_alpha = self.mood.starfield_alpha();
@@ -42,10 +45,10 @@ impl StationInner {
             .enumerate()
             .step_by(self.mood.starfield_stride())
         {
-            if let Some((p, cue)) = project(*star) {
+            if let Some((p, cue, z)) = project(*star) {
                 let s = 0.0045 * density;
                 let alpha = star_alpha * cue.min(1.0) * star_twinkle(anim_ms, idx);
-                frame.add_quad_ndc(p.x, p.y, s, [0.35, 0.36, 0.44, alpha]);
+                frame.add_quad_ndc(p.x, p.y, s, [0.35, 0.36, 0.44, alpha], z);
             }
         }
 
@@ -104,7 +107,7 @@ impl StationInner {
             }
             let lifted =
                 particle.start.lerp(particle.end, t) + Vec3::new(0.0, (t * PI).sin() * 0.6, 0.0);
-            if let Some((p, cue)) = project(lifted) {
+            if let Some((p, cue, z)) = project(lifted) {
                 let size = (0.026 * (1.0 - t) + 0.006) * density;
                 frame.add_quad_ndc(
                     p.x,
@@ -114,6 +117,7 @@ impl StationInner {
                         .color
                         .with_alpha((0.88 * (1.0 - t) * cue).min(1.0))
                         .into(),
+                    z,
                 );
             }
             true
@@ -125,7 +129,7 @@ impl StationInner {
     pub(crate) fn add_grid(
         &self,
         frame: &mut GpuFrame,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
     ) {
         let grid = 9;
         for i in -grid..=grid {
@@ -149,7 +153,7 @@ impl StationInner {
     pub(crate) fn add_operator(
         &self,
         frame: &mut GpuFrame,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
         time_ms: f64,
     ) {
         let pos = self.layout_cache.get("op").copied().unwrap_or(Vec3::ZERO);
@@ -176,7 +180,7 @@ impl StationInner {
         if self.selected_id.as_deref() == Some("op") {
             self.add_selection_halo(frame, project, pos, 1.32);
         }
-        if let Some((p, _)) = project(pos) {
+        if let Some((p, _, _)) = project(pos) {
             frame.projected_nodes.push(ProjectedNode::new(
                 "op",
                 NodeKind::Operator,
@@ -192,7 +196,7 @@ impl StationInner {
     pub(crate) fn add_selection_halo(
         &self,
         frame: &mut GpuFrame,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
         pos: Vec3,
         radius: f32,
     ) {
@@ -211,7 +215,7 @@ impl StationInner {
         frame: &mut GpuFrame,
         host: &StationHost,
         pos: Vec3,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
         time_ms: f64,
     ) {
         let id = format!("host:{}", host.id);
@@ -234,7 +238,7 @@ impl StationInner {
         if self.selected_id.as_deref() == Some(&id) {
             self.add_selection_halo(frame, project, pos, 0.94);
         }
-        if let Some((p, _)) = project(pos) {
+        if let Some((p, _, _)) = project(pos) {
             frame.projected_nodes.push(ProjectedNode::new(
                 &id,
                 NodeKind::Host,
@@ -249,7 +253,7 @@ impl StationInner {
         frame: &mut GpuFrame,
         agent: &StationAgent,
         pos: Vec3,
-        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
         time_ms: f64,
     ) {
         let role = role_color(&agent.role);
@@ -327,7 +331,7 @@ impl StationInner {
                 );
             }
         }
-        if let Some((p, _)) = project(pos) {
+        if let Some((p, _, _)) = project(pos) {
             frame.projected_nodes.push(ProjectedNode::new(
                 &agent.id,
                 NodeKind::Agent,
@@ -667,6 +671,15 @@ pub(crate) fn depth_alpha(z: f32, camera_distance: f32) -> f32 {
     (1.0 + (camera_distance - z) * 0.04).clamp(0.6, 1.18)
 }
 
+/// View-space depth → clip-space z in [0, 1) for the depth attachment.
+/// Asymptotic rather than near/far-planed: monotonic in view depth, can
+/// never leave the clip range (out-of-range z would silently clip the
+/// vertex), and needs no far-plane constant — ordering is all the depth
+/// test needs. Revisit precision only if pane occlusion ever demands it.
+pub(crate) fn ndc_depth(view_z: f32) -> f32 {
+    1.0 - 1.0 / (1.0 + view_z.max(0.0))
+}
+
 /// Gentle per-star twinkle, frozen (1.0) whenever ambient motion is off —
 /// `anim_ms` is already zeroed at motion 0, so a parked scene stays still.
 pub(crate) fn star_twinkle(anim_ms: f64, idx: usize) -> f32 {
@@ -775,6 +788,25 @@ pub(crate) fn layout_positions(
 mod tests {
     use super::*;
     use crate::model::StationAgent;
+
+    #[test]
+    fn ndc_depth_is_monotonic_and_clip_safe() {
+        // Strictly increasing in view depth: farther geometry writes a
+        // larger depth value.
+        let samples = [0.0, 0.12, 1.0, 4.0, 10.0, 100.0, 1e6];
+        for pair in samples.windows(2) {
+            assert!(ndc_depth(pair[0]) < ndc_depth(pair[1]));
+        }
+        // Never leaves [0, 1): an out-of-range z would clip the vertex.
+        for z in samples {
+            let d = ndc_depth(z);
+            assert!((0.0..1.0).contains(&d), "z={z} mapped to {d}");
+        }
+        assert_eq!(ndc_depth(0.0), 0.0);
+        // Degenerate negative depth (behind the camera; the projector
+        // culls these before mapping) still stays in range.
+        assert_eq!(ndc_depth(-3.0), 0.0);
+    }
 
     fn snapshot() -> StationSnapshot {
         StationSnapshot {
