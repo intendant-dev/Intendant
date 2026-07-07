@@ -11,7 +11,6 @@
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -23,7 +22,7 @@ use crate::project::{PeerConfig, Project};
 
 const INVITE_PREFIX: &str = "intendant-peer-v1.";
 pub(crate) const AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
-const DEFAULT_WEB_PORT: u16 = crate::web_gateway::DEFAULT_PORT;
+const DEFAULT_WEB_PORT: u16 = intendant_core::net::DEFAULT_GATEWAY_PORT;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerInvite {
@@ -552,7 +551,7 @@ pub(crate) fn create_invite_from_cert_dir(
         server_cert_fingerprint: Some(server_cert_fingerprint.clone()),
         client_cert_pem: identity.cert_pem,
         client_key_pem: identity.key_pem,
-        issued_at_unix: unix_timestamp(),
+        issued_at_unix: crate::access::access_policy::unix_timestamp(),
     };
     let encoded = encode_invite(&invite)?;
     Ok(InviteOutcome {
@@ -767,13 +766,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
-}
-
-pub(crate) fn unix_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_default()
 }
 
 pub(crate) fn write_secret_file(path: &Path, contents: &str) -> io::Result<()> {

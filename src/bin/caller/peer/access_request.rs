@@ -17,9 +17,8 @@ use crate::access;
 use crate::error::CallerError;
 use crate::project::{PeerAccessRequestConfig, PeerConfig, Project};
 
-use super::pairing::{
-    storage_slug, unix_timestamp, write_secret_file, JoinOutcome, AGENT_CARD_PATH,
-};
+use super::access_policy::unix_timestamp;
+use super::pairing::{storage_slug, write_secret_file, JoinOutcome, AGENT_CARD_PATH};
 
 pub(crate) const PUBLIC_REQUEST_PATH: &str = "/api/peer-pairing/requests";
 const REQUEST_STORE_DIR: &str = "peer-access-requests";

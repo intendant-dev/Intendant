@@ -620,21 +620,17 @@ function initShell() {
     openShellSessionIfPossible();
   };
 
-  // If xterm.js is already loaded, start immediately. Otherwise load it
-  // and its fit addon, then start.
+  // If xterm.js is already loaded, start immediately. Otherwise load the
+  // vendored copies (embedded static assets — no external fetch) and start.
   if (typeof Terminal !== 'undefined' && typeof FitAddon !== 'undefined') {
     start();
     return;
   }
   const script = document.createElement('script');
-  script.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js';
-  script.integrity = 'sha384-J4qzUjBl1FxyLsl/kQPQIOeINsmp17OHYXDOMpMxlKX53ZfYsL+aWHpgArvOuof9';
-  script.crossOrigin = 'anonymous';
+  script.src = '/xterm.min.js';
   script.onload = () => {
     const fitScript = document.createElement('script');
-    fitScript.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js';
-    fitScript.integrity = 'sha384-UwMkGaBqfOcrTjPjXdAPWrGQkhpxTJ21vKtTwLb6wBpBM8HQXKAiUuwVJfgY0Yw6';
-    fitScript.crossOrigin = 'anonymous';
+    fitScript.src = '/xterm-addon-fit.min.js';
     fitScript.onload = start;
     document.head.appendChild(fitScript);
   };

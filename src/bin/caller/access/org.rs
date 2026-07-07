@@ -337,14 +337,14 @@ pub fn issue_org_grant(
     } else {
         // Peer subjects take a peer profile in the `peer:` namespace, not
         // an IAM role; the fingerprint is the mTLS cert digest.
-        let normalized = crate::peer::access_policy::normalize_fingerprint(peer_fingerprint_raw)
+        let normalized = crate::access::access_policy::normalize_fingerprint(peer_fingerprint_raw)
             .map_err(|e| AccessError(e.to_string()))?;
         let Some(profile) = peer_profile_from_role(role_id) else {
             return Err(AccessError(format!(
                 "peer-subject documents use the peer profile vocabulary: expected peer:<profile>, got {role_id}"
             )));
         };
-        crate::peer::access_policy::normalize_profile(profile)
+        crate::access::access_policy::normalize_profile(profile)
             .map_err(|e| AccessError(e.to_string()))?;
         normalized
     };
@@ -415,7 +415,7 @@ pub fn verify_org_grant(doc: &OrgGrantDocument, now_unix_ms: u64) -> Result<(), 
         );
     }
     if has_peer {
-        crate::peer::access_policy::normalize_fingerprint(&doc.subject.peer_fingerprint)
+        crate::access::access_policy::normalize_fingerprint(&doc.subject.peer_fingerprint)
             .map_err(|e| e.to_string())?;
         if peer_profile_from_role(&doc.role_id).is_none() {
             return Err(format!(
@@ -456,7 +456,7 @@ pub fn verify_org_grant(doc: &OrgGrantDocument, now_unix_ms: u64) -> Result<(), 
                     }
                     let granted = peer_profile_from_role(&doc.role_id).unwrap_or("");
                     let cap = scope.strip_prefix("peer:").unwrap_or(scope);
-                    if !crate::peer::access_policy::profile_fits_under(granted, cap) {
+                    if !crate::access::access_policy::profile_fits_under(granted, cap) {
                         return Err(format!(
                             "document profile {} exceeds the issuer's scope {scope}",
                             doc.role_id
@@ -506,7 +506,7 @@ pub struct MaterializedOrgGrant {
 /// `revoked_subjects` entries are matched against.
 fn subject_fingerprint(doc: &OrgGrantDocument) -> String {
     if doc.subject.is_peer() {
-        crate::peer::access_policy::normalize_fingerprint(&doc.subject.peer_fingerprint)
+        crate::access::access_policy::normalize_fingerprint(&doc.subject.peer_fingerprint)
             .unwrap_or_else(|_| doc.subject.peer_fingerprint.trim().to_string())
     } else {
         normalize_client_key_fingerprint(&doc.subject.client_key_fingerprint)
@@ -848,7 +848,7 @@ pub fn install_issuer_cert(
 /// identity store.
 #[derive(Clone, Debug, Serialize)]
 pub struct MaterializedOrgPeerGrant {
-    pub record: crate::peer::access_policy::PeerIdentityRecord,
+    pub record: crate::access::access_policy::PeerIdentityRecord,
     pub org_handle: String,
     #[serde(skip)]
     pub changed: bool,
@@ -866,7 +866,7 @@ pub fn materialize_org_peer_grant(
     daemon_ids: &[String],
     now_unix_ms: u64,
 ) -> AccessResult<MaterializedOrgPeerGrant> {
-    use crate::peer::access_policy as pol;
+    use crate::access::access_policy as pol;
     if !doc.subject.is_peer() {
         return Err(AccessError("not a peer-subject document".to_string()));
     }
@@ -1018,7 +1018,7 @@ pub fn org_target_daemon_ids(extra_ids: &[String]) -> Vec<String> {
     push(&mut ids, &host_label);
     push(
         &mut ids,
-        crate::peer::PeerId::new(crate::peer::PeerKind::Intendant, &host_label).as_str(),
+        intendant_core::peer_id::PeerId::new(intendant_core::peer_id::PeerKind::Intendant, &host_label).as_str(),
     );
     ids
 }
@@ -1359,7 +1359,7 @@ pub fn apply_orl(
     // advancing last_orl_seq past an unrecorded revocation would make the
     // idempotent re-apply a no-op and leave the peer approved forever.
     let mut revoked_peer_identities = 0;
-    let identities = crate::peer::access_policy::list_identities(cert_dir).map_err(|e| {
+    let identities = crate::access::access_policy::list_identities(cert_dir).map_err(|e| {
         AccessError(format!(
             "cannot apply org {handle} revocation list: peer identity store unreadable: {e}"
         ))
@@ -1383,13 +1383,13 @@ pub fn apply_orl(
             && listed
             && matches!(
                 record.status,
-                crate::peer::access_policy::PeerIdentityStatus::Approved
+                crate::access::access_policy::PeerIdentityStatus::Approved
             )
         {
             let fingerprint = record.fingerprint.clone();
-            record.status = crate::peer::access_policy::PeerIdentityStatus::Revoked;
+            record.status = crate::access::access_policy::PeerIdentityStatus::Revoked;
             record.revoked_at_unix = Some(now_unix);
-            match crate::peer::access_policy::write_identity_record(cert_dir, &record) {
+            match crate::access::access_policy::write_identity_record(cert_dir, &record) {
                 Ok(()) => revoked_peer_identities += 1,
                 Err(e) => failed_peer_writes.push(format!("{fingerprint}: {e}")),
             }
@@ -1576,7 +1576,7 @@ pub fn trust_org(
         .map(str::trim)
         .filter(|profile| !profile.is_empty())
         .map(|profile| {
-            crate::peer::access_policy::normalize_profile(
+            crate::access::access_policy::normalize_profile(
                 profile.strip_prefix("peer:").unwrap_or(profile),
             )
             .map_err(|e| AccessError(e.to_string()))
@@ -1653,18 +1653,18 @@ pub fn revoke_org(
         revoked += 1;
     }
     // Peer identities this org materialized go with it.
-    if let Ok(identities) = crate::peer::access_policy::list_identities(cert_dir) {
+    if let Ok(identities) = crate::access::access_policy::list_identities(cert_dir) {
         let now_unix = (now_unix_ms / 1000) as i64;
         for mut record in identities {
             if record.source.as_deref() == Some(&source as &str)
                 && matches!(
                     record.status,
-                    crate::peer::access_policy::PeerIdentityStatus::Approved
+                    crate::access::access_policy::PeerIdentityStatus::Approved
                 )
             {
-                record.status = crate::peer::access_policy::PeerIdentityStatus::Revoked;
+                record.status = crate::access::access_policy::PeerIdentityStatus::Revoked;
                 record.revoked_at_unix = Some(now_unix);
-                if crate::peer::access_policy::write_identity_record(cert_dir, &record).is_ok() {
+                if crate::access::access_policy::write_identity_record(cert_dir, &record).is_ok() {
                     revoked += 1;
                 }
             }
@@ -1781,7 +1781,7 @@ mod tests {
             crate::access::iam::evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::SessionInspect,
+                crate::access::access_policy::PeerOperation::SessionInspect,
             )
             .allowed
         );
@@ -1789,7 +1789,7 @@ mod tests {
             !crate::access::iam::evaluate_principal_operation_with_state(
                 &state,
                 &principal,
-                crate::peer::access_policy::PeerOperation::AccessManage,
+                crate::access::access_policy::PeerOperation::AccessManage,
             )
             .allowed
         );
@@ -2273,7 +2273,7 @@ mod tests {
         .unwrap();
         let applied = apply_orl(&mut state, dir.path(), &orl, test_now()).unwrap();
         assert_eq!(applied.revoked_peer_identities, 1);
-        let record = crate::peer::access_policy::lookup_identity(dir.path(), peer_fp)
+        let record = crate::access::access_policy::lookup_identity(dir.path(), peer_fp)
             .unwrap()
             .unwrap();
         assert!(!record.is_active((test_now() / 1000) as i64));
@@ -2513,12 +2513,12 @@ mod tests {
         .unwrap();
 
         // An approved org-materialized peer identity that the list revokes.
-        let record = crate::peer::access_policy::PeerIdentityRecord {
+        let record = crate::access::access_policy::PeerIdentityRecord {
             version: 1,
             fingerprint: "aabbccdd".to_string(),
             label: "peer".to_string(),
             profile: "session-reader".to_string(),
-            status: crate::peer::access_policy::PeerIdentityStatus::Approved,
+            status: crate::access::access_policy::PeerIdentityStatus::Approved,
             card_url: None,
             request_id: None,
             filesystem: Default::default(),
@@ -2529,7 +2529,7 @@ mod tests {
             org_grant_id: Some("g-1".to_string()),
             issued_via: None,
         };
-        crate::peer::access_policy::write_identity_record(dir.path(), &record).unwrap();
+        crate::access::access_policy::write_identity_record(dir.path(), &record).unwrap();
 
         let orl = orl_revoke(
             &root,

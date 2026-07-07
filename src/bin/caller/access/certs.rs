@@ -325,7 +325,7 @@ fn regenerate_server_cert(cert_dir: &Path, server_names: &ServerNames) -> Access
 
 /// SHA-256 fingerprint of this daemon's local server cert, in
 /// the lowercase-hex format that
-/// [`crate::peer::transport::pinning::parse_fingerprint`] consumes.
+/// [`crate::access::pinning::parse_fingerprint`] consumes.
 ///
 /// Used by `[server.auth] advertised_transport = "pin-self-cert"`
 /// to auto-fill the local Agent Card's
@@ -751,8 +751,8 @@ mod tests {
         );
         // Round-trips through the pinning parser — same byte sequence
         // a connecting peer's verifier consumes.
-        let parsed = crate::peer::transport::pinning::parse_fingerprint(&fp).unwrap();
-        let reformatted = crate::peer::transport::pinning::format_fingerprint(&parsed);
+        let parsed = crate::access::pinning::parse_fingerprint(&fp).unwrap();
+        let reformatted = crate::access::pinning::format_fingerprint(&parsed);
         assert_eq!(fp, reformatted);
     }
 
