@@ -1,0 +1,20 @@
+# Workspace nextest configuration. `cargo nextest run --bins` is the fast
+# local equivalent of `cargo test --bins`: one process per test (no shared
+# process globals), better scheduling, per-test timings.
+
+[profile.default]
+# Surface anything slower than 15s in the run summary; two periods then
+# terminate — no unit test should legitimately run 30s.
+slow-timeout = { period = "15s", terminate-after = 2 }
+final-status-level = "slow"
+
+[profile.default.junit]
+# Per-test timings for slow-test audits (target/nextest/default/junit.xml).
+path = "junit.xml"
+
+# Heavy-crypto tests: subprocess `security` CLI (serialized behind
+# securityd) + real keygen; give them headroom instead of false timeouts
+# on a loaded box.
+[[profile.default.overrides]]
+filter = 'test(/p12_|_recert|keychain/)'
+slow-timeout = { period = "60s", terminate-after = 4 }
