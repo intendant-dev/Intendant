@@ -41,6 +41,33 @@ pub(crate) const CODEMIRROR_BUNDLE_JS: &str =
 pub(crate) const CODEMIRROR_BUNDLE_CSS: &str =
     include_str!("../../../../static/codemirror-bundle.css");
 
+// Vendored xterm.js (MIT). Previously loaded from jsdelivr with SRI
+// pins — the one external fetch in the dashboard; embedding it keeps
+// the terminal working offline/LAN and on hosted Connect. The vendored
+// bytes hash-match the exact SRI digests the CDN loader pinned.
+pub(crate) const XTERM_JS: &str = include_str!("../../../../static/xterm.min.js");
+
+pub(crate) const XTERM_ADDON_FIT_JS: &str =
+    include_str!("../../../../static/xterm-addon-fit.min.js");
+
+pub(crate) const XTERM_CSS: &str = include_str!("../../../../static/xterm.css");
+
+// Self-hosted variable fonts (SIL OFL 1.1; license texts ship in
+// static/fonts/). Referenced by the @font-face rules in
+// static/app/09-styles-fonts.css — the dashboard must stay fully
+// self-contained for offline/LAN and hosted-Connect use.
+pub(crate) const FONT_HANKEN_LATIN: &[u8] =
+    include_bytes!("../../../../static/fonts/hanken-grotesk-latin.woff2");
+
+pub(crate) const FONT_HANKEN_LATIN_EXT: &[u8] =
+    include_bytes!("../../../../static/fonts/hanken-grotesk-latin-ext.woff2");
+
+pub(crate) const FONT_JBMONO_LATIN: &[u8] =
+    include_bytes!("../../../../static/fonts/jetbrains-mono-latin.woff2");
+
+pub(crate) const FONT_JBMONO_LATIN_EXT: &[u8] =
+    include_bytes!("../../../../static/fonts/jetbrains-mono-latin-ext.woff2");
+
 /// Compute a short content hash for cache-busting embedded static assets.
 /// When the WASM, JS, or favicon changes (i.e. a new build), the hash changes,
 /// the URL changes, and browsers fetch the new version.
@@ -165,6 +192,44 @@ pub(crate) fn embedded_static_asset(path: &str) -> Option<&'static EmbeddedStati
             "application/javascript",
             AUDIO_PROCESSOR_JS.as_bytes(),
             true,
+        );
+        insert(
+            "/xterm.min.js",
+            "application/javascript",
+            XTERM_JS.as_bytes(),
+            true,
+        );
+        insert(
+            "/xterm-addon-fit.min.js",
+            "application/javascript",
+            XTERM_ADDON_FIT_JS.as_bytes(),
+            true,
+        );
+        insert("/xterm.css", "text/css", XTERM_CSS.as_bytes(), true);
+        // woff2 is already Brotli-compressed; gzip would only add overhead.
+        insert(
+            "/fonts/hanken-grotesk-latin.woff2",
+            "font/woff2",
+            FONT_HANKEN_LATIN,
+            false,
+        );
+        insert(
+            "/fonts/hanken-grotesk-latin-ext.woff2",
+            "font/woff2",
+            FONT_HANKEN_LATIN_EXT,
+            false,
+        );
+        insert(
+            "/fonts/jetbrains-mono-latin.woff2",
+            "font/woff2",
+            FONT_JBMONO_LATIN,
+            false,
+        );
+        insert(
+            "/fonts/jetbrains-mono-latin-ext.woff2",
+            "font/woff2",
+            FONT_JBMONO_LATIN_EXT,
+            false,
         );
         // PNG is already deflate-compressed; gzip would only add overhead.
         insert("/icon-128.png", "image/png", ICON_128_PNG, false);
@@ -327,7 +392,8 @@ pub(crate) fn rewrite_asset_url_with_version(html: &str, path: &str, version: &s
 /// Asset URLs inside app.html that carry `?v=` cache busters. The
 /// spawn-time rewrite of the embedded copy and the
 /// `INTENDANT_APP_HTML_PATH` per-request override apply the same set.
-const APP_HTML_VERSIONED_ASSETS: [&str; 8] = [
+const APP_HTML_VERSIONED_ASSETS: [&str; 13] = [
+    "/xterm.css",
     "/wasm-web/presence_web.js",
     "/wasm-web/presence_web_bg.wasm",
     "/wasm-station/station_web.js",
@@ -336,6 +402,10 @@ const APP_HTML_VERSIONED_ASSETS: [&str; 8] = [
     "/codemirror-bundle.js",
     "/codemirror-bundle.css",
     "/icon-128.png",
+    "/fonts/hanken-grotesk-latin.woff2",
+    "/fonts/hanken-grotesk-latin-ext.woff2",
+    "/fonts/jetbrains-mono-latin.woff2",
+    "/fonts/jetbrains-mono-latin-ext.woff2",
 ];
 
 /// Rewrite every [`APP_HTML_VERSIONED_ASSETS`] URL in an app.html body to

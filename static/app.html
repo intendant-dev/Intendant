@@ -10,6 +10,44 @@
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#11111b">
 <style>
+/* ── static/app/09-styles-fonts.css ── */
+/* Self-hosted variable fonts (SIL OFL 1.1 — licenses in static/fonts/).
+   Hanken Grotesk = UI face, JetBrains Mono = code/IDs/metrics face for the
+   v2 design system; declared app-wide so both UI generations can resolve
+   them. Served from the embedded /fonts/* assets (static_assets.rs) —
+   the dashboard stays fully self-contained offline. */
+@font-face {
+  font-family: 'Hanken Grotesk';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url(/fonts/hanken-grotesk-latin.woff2) format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Hanken Grotesk';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url(/fonts/hanken-grotesk-latin-ext.woff2) format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url(/fonts/jetbrains-mono-latin.woff2) format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url(/fonts/jetbrains-mono-latin-ext.woff2) format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
 /* ── static/app/10-styles-shell.css ── */
 :root {
   --base: #1e1e2e;
@@ -14448,14 +14486,10 @@ body.display-fullscreen-open {
   </div>
 </div>
 
-<!-- xterm.js (loaded lazily for Terminal tab). Pinned + SRI-verified —
-     bump version and hashes together. Generator: scripts/refresh-xterm-sri.sh
-     (or just re-fetch from jsdelivr and run `openssl dgst -sha384 -binary | openssl base64 -A`). -->
-<link rel="stylesheet"
-      href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css"
-      integrity="sha384-8Xk9wy/gzEDUKrXtrmCFa2bBuK3BpjpDuL/p0SeKQX19Khl/M+lHOgD/CyYf7efP"
-      crossorigin="anonymous"
-      id="xterm-css" disabled>
+<!-- xterm.js stylesheet (enabled lazily for the Terminal tab). Vendored at
+     static/xterm.css and served embedded — refresh via scripts/refresh-xterm-sri.sh
+     when bumping the pinned xterm version. -->
+<link rel="stylesheet" href="/xterm.css" id="xterm-css" disabled>
 
 <script type="module">
 /* ── static/app/31-init-identity-fleet.js ── */
@@ -44706,21 +44740,17 @@ function initShell() {
     openShellSessionIfPossible();
   };
 
-  // If xterm.js is already loaded, start immediately. Otherwise load it
-  // and its fit addon, then start.
+  // If xterm.js is already loaded, start immediately. Otherwise load the
+  // vendored copies (embedded static assets — no external fetch) and start.
   if (typeof Terminal !== 'undefined' && typeof FitAddon !== 'undefined') {
     start();
     return;
   }
   const script = document.createElement('script');
-  script.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js';
-  script.integrity = 'sha384-J4qzUjBl1FxyLsl/kQPQIOeINsmp17OHYXDOMpMxlKX53ZfYsL+aWHpgArvOuof9';
-  script.crossOrigin = 'anonymous';
+  script.src = '/xterm.min.js';
   script.onload = () => {
     const fitScript = document.createElement('script');
-    fitScript.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js';
-    fitScript.integrity = 'sha384-UwMkGaBqfOcrTjPjXdAPWrGQkhpxTJ21vKtTwLb6wBpBM8HQXKAiUuwVJfgY0Yw6';
-    fitScript.crossOrigin = 'anonymous';
+    fitScript.src = '/xterm-addon-fit.min.js';
     fitScript.onload = start;
     document.head.appendChild(fitScript);
   };

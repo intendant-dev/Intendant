@@ -1278,6 +1278,7 @@ fn content_type_for_path(path: &Path) -> &'static str {
         "webmanifest" => "application/manifest+json",
         "svg" => "image/svg+xml",
         "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
         _ => "application/octet-stream",
     }
 }
