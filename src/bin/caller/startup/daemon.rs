@@ -11,7 +11,9 @@ use crate::*;
 /// Configuration for `run_daemon_loop`.
 pub(crate) struct DaemonConfig {
     pub(crate) bus: EventBus,
-    pub(crate) project_root: PathBuf,
+    /// `None` = projectless daemon: no default session project; every
+    /// CreateSession must carry an explicit `project_root` override.
+    pub(crate) project_root: Option<PathBuf>,
     pub(crate) autonomy: SharedAutonomy,
     pub(crate) shared_external_agent:
         Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
@@ -58,6 +60,12 @@ pub(crate) async fn run_daemon_loop(config: DaemonConfig) {
 pub(crate) async fn run_daemon(
     flags: &CliFlags,
     project: &Project,
+    // The daemon's default project root, `None` when the launch directory
+    // has no project marker (projectless — see main's
+    // `daemon_project_root`). `project` still supplies config defaults;
+    // its `root` field is only the launch cwd and must not be treated as
+    // a project here.
+    project_root: Option<PathBuf>,
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
     log_dir: PathBuf,
@@ -105,7 +113,7 @@ pub(crate) async fn run_daemon(
     let _log_sinks = startup::wiring::spawn_log_sinks(&bus, &session_log);
 
     let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) =
-        startup::wiring::start_project_file_watcher(&project.root, &log_dir, &bus);
+        startup::wiring::start_project_file_watcher(project_root.as_deref(), &log_dir, &bus);
 
     let (transcriber, transcriber_err) =
         startup::wiring::build_transcriber(&project.config.transcription);
@@ -115,6 +123,7 @@ pub(crate) async fn run_daemon(
     let gateway = startup::wiring::spawn_mode_web_gateway(
         flags,
         project,
+        project_root.clone(),
         &autonomy,
         &log_dir,
         &session_log,
@@ -149,19 +158,19 @@ pub(crate) async fn run_daemon(
             codex_config: shared_codex_config.clone(),
             claude_config: shared_claude_config.clone(),
             bus: bus.clone(),
-            project_root: Some(project.root.clone()),
+            project_root: project_root.clone(),
         },
     );
 
     // Vitals chips for the daemon's primary session: git state of the
-    // project root (statusline port).
-    let _vitals_producer = if let Some(session_id) = session_log_id(&session_log) {
-        Some(session_vitals::spawn_session_vitals_producer(
+    // project root (statusline port). A projectless daemon has no repo to
+    // report on — no producer.
+    let _vitals_producer = match (session_log_id(&session_log), project_root.clone()) {
+        (Some(session_id), Some(root)) => Some(session_vitals::spawn_session_vitals_producer(
             bus.clone(),
-            vec![(session_id, project.root.clone())],
-        ))
-    } else {
-        None
+            vec![(session_id, root)],
+        )),
+        _ => None,
     };
     // Native usage rail: derive per-session UsageSnapshots from
     // ModelResponse events (dashboard meter + cache/limits vitals).
@@ -173,7 +182,7 @@ pub(crate) async fn run_daemon(
     let supervisor_handle =
         session_supervisor::SessionSupervisor::new(session_supervisor::SessionSupervisorConfig {
             bus,
-            project_root: project.root.clone(),
+            project_root,
             autonomy,
             shared_external_agent,
             shared_codex_config,

@@ -2716,19 +2716,39 @@ fn is_simple_task(task: &str) -> bool {
     task.len() < 100
 }
 
-fn configure_sandbox_env(flags: &CliFlags, project: &Project, log_dir: &std::path::Path) {
+fn configure_sandbox_env(
+    flags: &CliFlags,
+    project: &Project,
+    log_dir: &std::path::Path,
+    // `None` = projectless daemon: the write scope is scratch + logs +
+    // ~/.intendant + explicit absolute grants only — the launch cwd never
+    // becomes writable by accident. Every other path passes the project root.
+    project_write_scope: Option<&std::path::Path>,
+) {
     let enabled = flags.sandbox || project.config.sandbox.enabled;
     if !enabled {
         env::remove_var("INTENDANT_SANDBOX_WRITE_PATHS");
         return;
     }
 
-    let mut sandbox_cfg = sandbox::SandboxConfig::default_for_project(&project.root, log_dir);
+    let mut sandbox_cfg = match project_write_scope {
+        Some(root) => sandbox::SandboxConfig::default_for_project(root, log_dir),
+        None => sandbox::SandboxConfig::projectless(log_dir),
+    };
     for p in &project.config.sandbox.extra_write_paths {
         let extra = if std::path::Path::new(p).is_absolute() {
             PathBuf::from(p)
+        } else if let Some(root) = project_write_scope {
+            root.join(p)
         } else {
-            project.root.join(p)
+            // No project to anchor a relative grant to; resolving against
+            // the launch cwd would silently widen the projectless scope.
+            // (Unreachable in practice — projectless implies no
+            // intendant.toml, so this list is empty — kept fail-closed.)
+            eprintln!(
+                "[sandbox] relative extra write path {p} ignored: the daemon has no project root to resolve it against"
+            );
+            continue;
         };
         sandbox_cfg.write_paths.push(extra);
     }
@@ -3065,8 +3085,16 @@ async fn main() -> Result<(), CallerError> {
     // session was created with; see provider::EnvSearchReport).
     let cwd_env = dotenvy::dotenv().ok();
     let mut project = Project::detect()?;
-    let project_env_path = project.root.join(".env");
-    let project_env_loaded = dotenvy::from_path(&project_env_path).is_ok();
+    // A root without a project marker (.git / intendant.toml) is just the
+    // launch cwd — its .env, if any, was already covered by the cwd walk
+    // above. Don't load (or report) it a second time as a "project root"
+    // layer: under a daemon that label misled credential errors.
+    let project_has_marker = project::root_has_project_marker(&project.root);
+    let project_env = project_has_marker.then(|| {
+        let path = project.root.join(".env");
+        let loaded = dotenvy::from_path(&path).is_ok();
+        (path, loaded)
+    });
     let global_env = dirs::config_dir().map(|config_dir| {
         let path = config_dir.join("intendant").join(".env");
         let loaded = dotenvy::from_path(&path).is_ok();
@@ -3074,7 +3102,7 @@ async fn main() -> Result<(), CallerError> {
     });
     provider::record_env_search(provider::EnvSearchReport {
         cwd_env,
-        project_env: Some((project_env_path, project_env_loaded)),
+        project_env,
         global_env,
     });
 
@@ -3097,17 +3125,39 @@ async fn main() -> Result<(), CallerError> {
             env::set_var("MAX_OUTPUT_TOKENS", max_out.to_string());
         }
     }
+    // Idle web/dashboard startup defaults to the daemon path (the session
+    // supervisor owns all launches). Computed here — from flags only, which
+    // are not mutated below — because the daemon shape decides resume
+    // ownership, the sandbox write scope, and whether a markerless cwd
+    // becomes a project at all.
+    let web_daemon_requested =
+        should_start_idle_web_daemon(!flags.no_web && !flags.mcp && !flags.json_output, &flags);
+    // Projectless: a daemon launched from a directory with no project marker
+    // (.git / intendant.toml — `project::root_has_project_marker`) runs
+    // without a project instead of adopting cwd; an installed app or service
+    // otherwise inherits an accident of launch directory as its sandbox
+    // scope, watcher root, and default session project. CLI (headless/MCP)
+    // invocations keep cwd-as-project — correct for `intendant "task"`
+    // inside a repo.
+    let projectless_daemon = web_daemon_requested && !project_has_marker;
+    let daemon_project_root: Option<PathBuf> =
+        (!projectless_daemon).then(|| project.root.clone());
+    if projectless_daemon {
+        eprintln!(
+            "Projectless daemon: {} has no project marker (.git or intendant.toml) — \
+             running without a default project; sessions choose their own project directory",
+            project.root.display()
+        );
+    }
     // Create or resume session log.
     //
     // Under the default-web daemon, --continue/--resume are owned by the
     // SUPERVISOR: the daemon starts on a fresh base log and resumes the
     // target session through ResumeSession at startup. (These flags used to
     // be silently swallowed — the daemon adopted the old session's log dir
-    // and then idled.) The predicate mirrors use_web/web_daemon_requested
-    // computed below; the flags it reads are not mutated in between.
+    // and then idled.)
     let daemon_owns_resume =
-        should_start_idle_web_daemon(!flags.no_web && !flags.mcp && !flags.json_output, &flags)
-            && (flags.continue_last || flags.resume_id.is_some());
+        web_daemon_requested && (flags.continue_last || flags.resume_id.is_some());
     let mut daemon_startup_resume_dir: Option<PathBuf> = None;
     let log_dir = if let Some(ref session_id) = flags.resume_id {
         // --resume <id>: find a specific session by ID or path
@@ -3204,7 +3254,7 @@ async fn main() -> Result<(), CallerError> {
     let session_registry: display::SharedSessionRegistry =
         Arc::new(tokio::sync::RwLock::new(display::SessionRegistry::new()));
 
-    configure_sandbox_env(&flags, &project, &log_dir);
+    configure_sandbox_env(&flags, &project, &log_dir, daemon_project_root.as_deref());
 
     // --owner bootstrap: pin root authority to the given browser key
     // before any surface comes up. Failing this with the flag present is
@@ -3290,9 +3340,11 @@ async fn main() -> Result<(), CallerError> {
         });
     }
 
-    // Write session metadata (project root, task will be filled in later if available).
+    // Write session metadata (project root, task will be filled in later if
+    // available). A projectless daemon's base session honestly records no
+    // project instead of attributing itself to the launch cwd.
     slog(&session_log, |l| {
-        l.write_meta(Some(&project.root), None);
+        l.write_meta(daemon_project_root.as_deref(), None);
     });
 
     // Web gateway is on by default unless explicitly disabled, or when running
@@ -3410,14 +3462,20 @@ async fn main() -> Result<(), CallerError> {
         Err(e) => return Err(e),
     };
     slog(&session_log, |l| {
-        l.debug(&format!("Project root: {}", project.root.display()));
+        match daemon_project_root.as_deref() {
+            Some(root) => l.debug(&format!("Project root: {}", root.display())),
+            None => l.debug(&format!(
+                "Project root: none (projectless daemon; launched from {})",
+                project.root.display()
+            )),
+        }
         l.debug(&format!("Autonomy: {}", flags.autonomy));
     });
 
-    // Idle web/dashboard startup defaults to the daemon path: the session
+    // web_daemon_requested (computed above, before the session log): idle
+    // web/dashboard startup defaults to the daemon path — the session
     // supervisor owns all launches. A task on the command line runs it as
     // the foreground (headless) session under the same gateway.
-    let web_daemon_requested = should_start_idle_web_daemon(use_web, &flags);
 
     // Task resolution: the daemon starts idle; MCP mode allows starting
     // without a task (it honors an explicit --task-file but must not
@@ -3439,6 +3497,7 @@ async fn main() -> Result<(), CallerError> {
         return startup::daemon::run_daemon(
             &flags,
             &project,
+            daemon_project_root,
             autonomy,
             session_log,
             log_dir,

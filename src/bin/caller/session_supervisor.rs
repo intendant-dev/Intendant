@@ -17,7 +17,13 @@ use super::*;
 #[derive(Clone)]
 pub struct SessionSupervisorConfig {
     pub bus: EventBus,
-    pub project_root: PathBuf,
+    /// The daemon's default project for sessions that don't carry their
+    /// own. `None` = projectless daemon (launch dir had no project
+    /// marker): creating or resuming a session then *requires* an
+    /// explicit project root, and a CreateSession without one fails
+    /// with the structured `no_project` error kind instead of silently
+    /// adopting the launch cwd.
+    pub project_root: Option<PathBuf>,
     pub autonomy: SharedAutonomy,
     pub shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     pub shared_codex_config: control_plane::SharedCodexConfig,
@@ -500,8 +506,10 @@ impl SessionSupervisor {
 
     fn attachment_project_roots(&self, primary: &Path) -> Vec<PathBuf> {
         let mut roots = vec![primary.to_path_buf()];
-        if self.config.project_root != primary {
-            roots.push(self.config.project_root.clone());
+        if let Some(default_root) = self.config.project_root.as_deref() {
+            if default_root != primary {
+                roots.push(default_root.to_path_buf());
+            }
         }
         roots
     }
@@ -1108,14 +1116,34 @@ impl SessionSupervisor {
             .lock()
             .map(|log| log.session_id().to_string())
             .unwrap_or_else(|_| path_file_name(&log_dir));
-        let project_root =
-            match resolve_project_root_override(project_root, &self.config.project_root) {
-                Ok(root) => root,
-                Err(e) => {
-                    self.loop_error(format!("Project load failed: {}", e));
-                    return;
-                }
-            };
+        let project_root = match resolve_project_root_override(
+            project_root,
+            self.config.project_root.as_deref(),
+        ) {
+            Ok(root) => root,
+            Err(ProjectRootResolveError::NoProject) => {
+                let reason = no_project_reason();
+                // Close out the just-opened session log honestly, keep the
+                // log-shaped failure the dashboard's pending-spawn notice
+                // already keys on ("Session create failed:"), and emit the
+                // structured end event so any client can act on the class
+                // without parsing prose (the unfueled precedent).
+                slog(&session_log, |l| {
+                    l.write_summary(&task, &format!("error: {reason}"), 0)
+                });
+                self.loop_error(format!("Session create failed: {reason}"));
+                self.config.bus.send(AppEvent::SessionEnded {
+                    session_id,
+                    reason: format!("error: {reason}"),
+                    error_kind: Some(NO_PROJECT_ERROR_KIND.to_string()),
+                });
+                return;
+            }
+            Err(e) => {
+                self.loop_error(format!("Project load failed: {}", e));
+                return;
+            }
+        };
         let project = match Project::from_root(project_root) {
             Ok(project) => project,
             Err(e) => {
@@ -1466,7 +1494,7 @@ impl SessionSupervisor {
             match resolve_external_resume_project_root(
                 project_root,
                 session_agent_config.as_ref(),
-                &self.config.project_root,
+                self.config.project_root.as_deref(),
             ) {
                 Ok(root) => root,
                 Err(e) => {
@@ -1475,9 +1503,20 @@ impl SessionSupervisor {
                 }
             }
         } else {
-            project_root
+            // Native resume: explicit request → daemon default → the root
+            // recorded in the session's own meta (reached only on a
+            // projectless daemon; rooted daemons behave exactly as before).
+            let resolved = project_root
                 .map(PathBuf::from)
-                .unwrap_or_else(|| self.config.project_root.clone())
+                .or_else(|| self.config.project_root.clone())
+                .or_else(|| native_session_meta_project_root(&session_id));
+            match resolved {
+                Some(root) => root,
+                None => {
+                    self.loop_error(format!("Project load failed: {}", no_project_reason()));
+                    return;
+                }
+            }
         };
 
         if resume_task.is_none() {
@@ -4470,36 +4509,75 @@ fn path_file_name(path: &std::path::Path) -> String {
         .to_string()
 }
 
+/// Structured `SessionEnded.error_kind` for "no project selected on a
+/// projectless daemon" — lets UIs point at the project picker instead of
+/// parsing prose (the `unfueled` precedent).
+pub(crate) const NO_PROJECT_ERROR_KIND: &str = "no_project";
+
+fn no_project_reason() -> String {
+    "no project selected — this daemon runs without a default project; \
+     pick a project directory in the New Session pane"
+        .to_string()
+}
+
+/// How a session's project root failed to resolve.
+#[derive(Debug, PartialEq, Eq)]
+enum ProjectRootResolveError {
+    /// No usable override and the daemon has no default project
+    /// (projectless). Surfaces as the structured `no_project` error kind.
+    NoProject,
+    /// An override was given but is unusable (relative, missing, not a
+    /// directory).
+    Invalid(String),
+}
+
+impl std::fmt::Display for ProjectRootResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoProject => f.write_str(&no_project_reason()),
+            Self::Invalid(msg) => f.write_str(msg),
+        }
+    }
+}
+
 fn resolve_project_root_override(
     project_root: Option<String>,
-    default_root: &Path,
-) -> Result<PathBuf, String> {
+    default_root: Option<&Path>,
+) -> Result<PathBuf, ProjectRootResolveError> {
+    let fall_back_to_default = || match default_root {
+        Some(root) => Ok(root.to_path_buf()),
+        None => Err(ProjectRootResolveError::NoProject),
+    };
     let Some(raw) = project_root else {
-        return Ok(default_root.to_path_buf());
+        return fall_back_to_default();
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(default_root.to_path_buf());
+        return fall_back_to_default();
     }
+    let invalid = ProjectRootResolveError::Invalid;
     let path = if trimmed == "~" {
-        dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?
+        dirs::home_dir().ok_or_else(|| invalid("could not resolve home directory".to_string()))?
     } else if let Some(rest) = trimmed.strip_prefix("~/") {
         dirs::home_dir()
-            .ok_or_else(|| "could not resolve home directory".to_string())?
+            .ok_or_else(|| invalid("could not resolve home directory".to_string()))?
             .join(rest)
     } else {
         PathBuf::from(trimmed)
     };
     if !path.is_absolute() {
-        return Err(format!(
+        return Err(invalid(format!(
             "project directory must be absolute or start with ~/ (got {})",
             trimmed
-        ));
+        )));
     }
     let canonical = std::fs::canonicalize(&path)
-        .map_err(|e| format!("{} is not accessible: {}", path.display(), e))?;
+        .map_err(|e| invalid(format!("{} is not accessible: {}", path.display(), e)))?;
     if !canonical.is_dir() {
-        return Err(format!("{} is not a directory", canonical.display()));
+        return Err(invalid(format!(
+            "{} is not a directory",
+            canonical.display()
+        )));
     }
     Ok(canonical)
 }
@@ -4507,8 +4585,8 @@ fn resolve_project_root_override(
 fn resolve_external_resume_project_root(
     project_root: Option<String>,
     config: Option<&crate::session_config::SessionAgentConfig>,
-    default_root: &Path,
-) -> Result<PathBuf, String> {
+    default_root: Option<&Path>,
+) -> Result<PathBuf, ProjectRootResolveError> {
     if let Some(root) = project_root
         .as_deref()
         .and_then(|root| crate::session_config::normalize_project_root(Some(root)))
@@ -4521,7 +4599,21 @@ fn resolve_external_resume_project_root(
     {
         return resolve_project_root_override(Some(root), default_root);
     }
-    Ok(default_root.to_path_buf())
+    match default_root {
+        Some(root) => Ok(root.to_path_buf()),
+        None => Err(ProjectRootResolveError::NoProject),
+    }
+}
+
+/// Last-resort project root for resuming a *native* session on a
+/// projectless daemon: the root the session was created with, recorded in
+/// its `session_meta.json`. Rooted daemons never reach this (the daemon
+/// default wins first, exactly as before).
+fn native_session_meta_project_root(session_id: &str) -> Option<PathBuf> {
+    let dir = crate::session_log::SessionLog::find_session_by_id(session_id)?;
+    let raw = std::fs::read_to_string(dir.join("session_meta.json")).ok()?;
+    let meta: crate::session_log::SessionMeta = serde_json::from_str(&raw).ok()?;
+    meta.project_root.map(PathBuf::from)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5413,7 +5505,7 @@ mod tests {
     fn test_supervisor(project_root: PathBuf, bus: EventBus) -> SessionSupervisor {
         SessionSupervisor::new(SessionSupervisorConfig {
             bus,
-            project_root,
+            project_root: Some(project_root),
             autonomy: crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
             session_registry: None,
             shared_external_agent: Arc::new(tokio::sync::RwLock::new(None)),
@@ -6060,7 +6152,8 @@ mod tests {
         config.project_root = Some(station_root.to_string_lossy().to_string());
 
         let resolved =
-            resolve_external_resume_project_root(None, Some(&config), &helper_root).unwrap();
+            resolve_external_resume_project_root(None, Some(&config), Some(helper_root.as_path()))
+                .unwrap();
         assert_eq!(resolved, station_root.canonicalize().unwrap());
     }
 
@@ -6087,10 +6180,49 @@ mod tests {
         let resolved = resolve_external_resume_project_root(
             Some(requested_root.to_string_lossy().to_string()),
             Some(&config),
-            &helper_root,
+            Some(helper_root.as_path()),
         )
         .unwrap();
         assert_eq!(resolved, requested_root);
+    }
+
+    #[test]
+    fn project_root_override_without_default_is_the_structured_no_project_error() {
+        // A projectless daemon (no default root) must fail closed with the
+        // structured class — never adopt cwd or improvise a root.
+        assert_eq!(
+            resolve_project_root_override(None, None).unwrap_err(),
+            ProjectRootResolveError::NoProject
+        );
+        assert_eq!(
+            resolve_project_root_override(Some("   ".to_string()), None).unwrap_err(),
+            ProjectRootResolveError::NoProject
+        );
+        // An unusable override is a different class: the caller keeps its
+        // prose error instead of sending the user to the project picker.
+        assert!(matches!(
+            resolve_project_root_override(Some("relative/path".to_string()), None).unwrap_err(),
+            ProjectRootResolveError::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn project_root_override_with_explicit_root_works_without_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_project_root_override(
+            Some(dir.path().to_string_lossy().to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(resolved, dir.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn external_resume_project_root_without_any_source_is_no_project() {
+        assert_eq!(
+            resolve_external_resume_project_root(None, None, None).unwrap_err(),
+            ProjectRootResolveError::NoProject
+        );
     }
 
     #[tokio::test]

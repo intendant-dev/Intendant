@@ -115,12 +115,13 @@ pub(crate) fn build_transcriber(
     }
 }
 
-/// Project file watcher for rewind snapshots. Fallback roots (no .git
-/// / intendant.toml — e.g. a service's $HOME WorkingDirectory) must
+/// Project file watcher for rewind snapshots. A projectless daemon
+/// (`None`) watches nothing at all, and fallback roots (no .git /
+/// intendant.toml — e.g. a service's $HOME WorkingDirectory) must
 /// never be baseline-scanned: it blocks boot for minutes and
 /// shadow-copies the whole tree.
 pub(crate) fn start_project_file_watcher(
-    project_root: &Path,
+    project_root: Option<&Path>,
     log_dir: &Path,
     bus: &EventBus,
 ) -> (
@@ -128,6 +129,12 @@ pub(crate) fn start_project_file_watcher(
     Option<tokio::task::JoinHandle<()>>,
     Option<tokio::task::JoinHandle<()>>,
 ) {
+    let Some(project_root) = project_root else {
+        eprintln!(
+            "[file_watcher] rewind snapshots off: the daemon has no project — nothing to watch"
+        );
+        return (None, None, None);
+    };
     if !file_watcher::root_is_snapshot_worthy(project_root) {
         eprintln!(
             "[file_watcher] rewind snapshots off: {} is not a project root (no .git or \
@@ -168,6 +175,12 @@ pub(crate) struct GatewaySpawn {
 pub(crate) fn spawn_mode_web_gateway(
     flags: &CliFlags,
     project: &Project,
+    // The mode's project root as served to gateway routes (project-root
+    // endpoint, Changes tab, worktree scan, settings persistence). `None`
+    // = projectless daemon; the gateway routes already answer honestly
+    // ("no project root") in that case. Non-daemon modes pass
+    // `Some(project.root)`.
+    project_root: Option<PathBuf>,
     autonomy: &SharedAutonomy,
     log_dir: &Path,
     session_log: &SharedSessionLog,
@@ -210,7 +223,7 @@ pub(crate) fn spawn_mode_web_gateway(
         recording_registry: Some(recording_registry.clone()),
         session_registry: Some(session_registry.clone()),
         snapshot_dir: Some(log_dir.join("file_snapshots")),
-        project_root_for_changes: Some(project.root.clone()),
+        project_root_for_changes: project_root.clone(),
         runtime_settings: web_gateway::RuntimeSettingsState {
             external_agent: Some(shared_external_agent.clone()),
             presence_enabled: Some(runtime_presence_enabled),
@@ -245,7 +258,7 @@ pub(crate) fn spawn_mode_web_gateway(
         shared_session.clone(),
         transcriber,
         None, // task_tx: browser SubmitTask routes via the EventBus → dispatcher path
-        Some(project.root.clone()),
+        project_root,
         mcp_http_server,
         Some(peer_registry),
         advertise_urls,
