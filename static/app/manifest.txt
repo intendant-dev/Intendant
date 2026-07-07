@@ -15,15 +15,18 @@
 13-styles-sessions-terminal.css
 14-styles-displays-voice.css
 16-styles-v2-tokens.css
+ui2-chrome.css
 19-style-close.html
 
 20-shell.html
 21-access-dialogs.html
 22-voice-bootstrap.html
 23-voice-dialogs.html
+ui2-shell.html
 
 30-module-open.html
 31-ui2-foundation.js
+ui2-chrome.js
 31-init-identity-fleet.js
 32-vault-custody.js
 33-station-core.js
