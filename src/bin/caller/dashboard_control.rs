@@ -12672,8 +12672,10 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        let session_dir = crate::platform::home_dir()
-            .join(".intendant")
+        // The RPC resolves sessions from the process state root
+        // (`platform::intendant_home()` — a per-process scratch in
+        // unit-test builds, so this never touches the live ~/.intendant).
+        let session_dir = crate::platform::intendant_home()
             .join("logs")
             .join(&session_id);
         let frames_dir = session_dir.join("frames");
@@ -13743,8 +13745,9 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        let session_dir = crate::platform::home_dir()
-            .join(".intendant")
+        // Fixture under the process state root, matching what the transfer
+        // path resolves (per-process scratch in unit-test builds).
+        let session_dir = crate::platform::intendant_home()
             .join("logs")
             .join(&session_id);
         let frames_dir = session_dir.join("frames");

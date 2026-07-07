@@ -2423,17 +2423,12 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            let prior_home = std::env::var_os("HOME");
-            let prior_userprofile = std::env::var_os("USERPROFILE");
-            let home = tempdir().unwrap();
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("USERPROFILE", home.path());
-
+            // Persisted-session resolution defaults to the process state
+            // root (`platform::intendant_home()`, a per-process scratch in
+            // unit-test builds) — drop the fixture there instead of racing
+            // the parallel runner over the process HOME.
             let wrapper_session_id = "6eee2a11-51f2-453b-b993-b47744f34792";
-            let wrapper_dir = home
-                .path()
-                .join(".intendant")
+            let wrapper_dir = crate::platform::intendant_home()
                 .join("logs")
                 .join(wrapper_session_id);
             std::fs::create_dir_all(&wrapper_dir).unwrap();
@@ -2505,15 +2500,6 @@ mod tests {
             assert_eq!(entries[0].id, 1);
             assert_eq!(entries[0].level, "agent");
             assert_eq!(entries[0].content, "codex output");
-
-            match prior_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match prior_userprofile {
-                Some(value) => std::env::set_var("USERPROFILE", value),
-                None => std::env::remove_var("USERPROFILE"),
-            }
         });
     }
 
@@ -2575,13 +2561,10 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            let prior_home = std::env::var_os("HOME");
-            let prior_userprofile = std::env::var_os("USERPROFILE");
+            // Persisted-wrapper resolution is anchored by the state's
+            // session_logs_home_override (threaded, race-free) instead of
+            // mutating the process HOME.
             let home = tempdir().unwrap();
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("USERPROFILE", home.path());
-
             let wrapper_session_id = "724fafac-36d7-41e5-b822-e0a08c1f4701";
             let backend_session_id = "019e9f80-bd44-7a00-bcef-f28ff529514e";
             let project_root = home.path().join("project");
@@ -2614,6 +2597,7 @@ mod tests {
             .unwrap();
 
             let state = test_state();
+            state.write().await.session_logs_home_override = Some(home.path().to_path_buf());
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
             let server = IntendantServer::new(state, bus);
@@ -2669,15 +2653,6 @@ mod tests {
                     assert_eq!(codex_context_archive.as_deref(), Some("summary"));
                 }
                 other => panic!("expected ResumeSession control event, got {other:?}"),
-            }
-
-            match prior_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match prior_userprofile {
-                Some(value) => std::env::set_var("USERPROFILE", value),
-                None => std::env::remove_var("USERPROFILE"),
             }
         });
     }
@@ -2897,13 +2872,9 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            let prior_home = std::env::var_os("HOME");
-            let prior_userprofile = std::env::var_os("USERPROFILE");
+            // Threaded session_logs_home_override replaces the old process
+            // HOME mutation (racy under the parallel runner).
             let home = tempdir().unwrap();
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("USERPROFILE", home.path());
-
             let session_id = "b74df098-9823-4f73-8ddf-e27bcb92f923";
             let project_root = home.path().join("project");
             std::fs::create_dir_all(&project_root).unwrap();
@@ -2915,7 +2886,9 @@ mod tests {
 
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
-            let server = IntendantServer::new(test_state(), bus);
+            let state = test_state();
+            state.write().await.session_logs_home_override = Some(home.path().to_path_buf());
+            let server = IntendantServer::new(state, bus);
             let result = server
                 .call_tool_by_name_for_session(
                     "start_task",
@@ -2940,14 +2913,6 @@ mod tests {
                 "inactive persisted non-external session should not broadcast a misleading StartTask"
             );
 
-            match prior_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match prior_userprofile {
-                Some(value) => std::env::set_var("USERPROFILE", value),
-                None => std::env::remove_var("USERPROFILE"),
-            }
         });
     }
 
@@ -3315,19 +3280,12 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _guard = TEST_ENV_LOCK.lock().await;
-            let prior_home = std::env::var_os("HOME");
-            let prior_userprofile = std::env::var_os("USERPROFILE");
-            let home = tempdir().unwrap();
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("USERPROFILE", home.path());
-
-            // A supervised parent logs under ~/.intendant/logs/<id>/, which is
-            // NOT the MCP server's primary log dir.
+            // A supervised parent logs under `<state root>/logs/<id>/`, which
+            // is NOT the MCP server's primary log dir. Resolution defaults to
+            // `platform::intendant_home()` (a per-process scratch in unit-test
+            // builds), so the fixture goes there — no HOME mutation.
             let parent_session_id = "0f5b3a52-9f51-4ad8-8a96-fsbstatus001";
-            let parent_dir = home
-                .path()
-                .join(".intendant")
+            let parent_dir = crate::platform::intendant_home()
                 .join("logs")
                 .join(parent_session_id);
             std::fs::create_dir_all(&parent_dir).unwrap();
@@ -3393,15 +3351,6 @@ mod tests {
                 value.pointer("/lineage_ledger/groups/0/branches/0/session_id"),
                 Some(&serde_json::Value::String("fsb-status-branch".to_string()))
             );
-
-            match prior_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match prior_userprofile {
-                Some(value) => std::env::set_var("USERPROFILE", value),
-                None => std::env::remove_var("USERPROFILE"),
-            }
         });
     }
 
