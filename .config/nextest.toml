@@ -12,19 +12,18 @@ final-status-level = "slow"
 # Per-test timings for slow-test audits (target/nextest/default/junit.xml).
 path = "junit.xml"
 
-# macOS keychain reality: the access backend is the real keychain, so any
-# test that adds a peer or touches an identity shells out to `security`
-# (serialized behind securityd) and pays 30-60s — rustc optimization
-# cannot help a subprocess, and the affected tests span peer::, access::,
-# startup::peer_boot, and the web_gateway peer-API routes. Until the
-# access backend is test-injectable (planned), macOS gets a realistic
-# global ceiling; Linux/Windows keep the tight default above.
-[[profile.default.overrides]]
-platform = 'cfg(target_os = "macos")'
-slow-timeout = { period = "30s", terminate-after = 8 }
-
 # Heavy-crypto tests (subprocess `security` import, real keygen) need
-# headroom on loaded Linux boxes too.
+# headroom on loaded boxes. (The broader "macOS is slow" class turned out
+# to be spawn_web_gateway's session-index warm scan walking the real
+# ~/.intendant per test process — gated out under cfg(test) in
+# listener.rs, after which peer/gateway tests run in milliseconds.)
 [[profile.default.overrides]]
 filter = 'test(/p12_|_recert|keychain/)'
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+# worktree_inventory tests spawn real git subprocesses (init, worktree
+# add); on a box saturated by parallel agents the fork/exec latency alone
+# can cross 30s. Load headroom, not a slow test.
+[[profile.default.overrides]]
+filter = 'test(/^worktree_inventory::/)'
 slow-timeout = { period = "60s", terminate-after = 4 }
