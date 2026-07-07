@@ -1,0 +1,720 @@
+/* ── ui-v2: Terminal + Files surfaces (design-overhaul P2) ─────────────
+   Re-skin of the existing Terminal (xterm PTY) and Files (IDE workbench +
+   Transfers) panes onto the v2 token system. Every rule except the two
+   v1 guards at the top is scoped under html.ui-v2; the DOM, element ids,
+   and QA bridges (window.intendantDashboardFilesIde/_debug*, status
+   element ids) are untouched — this file plus small ui2-gated JS in
+   44-shell-frames.js / 55-files-ide.js is the whole change.
+
+   The xterm and CodeMirror content areas keep the design rule that code
+   surfaces stay dark: xterm's palette is a JS theme object built from
+   these tokens at init (ui2ShellTheme in 44-shell-frames.js); CodeMirror
+   is pure CSS via the .cm-s-intendant overrides below. */
+
+/* v1 guards: elements that exist only for the v2 design (the ^C/^D/⏎ key
+   chips and the Ln/Col statusbar span) stay invisible — and layout-inert —
+   under the v1 UI. These are deliberately the only unscoped rules here. */
+.shell-key.ui2-key { display: none; }
+.files-ide-status-lncol { display: none; }
+
+/* ═══ TERMINAL ═══════════════════════════════════════════════════════ */
+
+/* Single sub-tab: the strip is hidden; the Keys toggle is reparented into
+   the shell toolbar by wireShellKeybar() under the flag. */
+html.ui-v2 #tab-terminal .subtabs { display: none; }
+
+html.ui-v2 #term-pane-shell { padding: 0 20px 14px; }
+
+html.ui-v2 #tab-terminal .shell-toolbar {
+  background: transparent;
+  border-bottom: 0;
+  padding: 13px 0 11px;
+  gap: 10px;
+}
+html.ui-v2 #tab-terminal .shell-toolbar label {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* Select skin shared by both surfaces: the design's "Target: atlas ▾"
+   dropdown-button, expressed on the existing native <select>. */
+html.ui-v2 #tab-terminal .shell-toolbar select,
+html.ui-v2 #tab-files select {
+  appearance: none;
+  -webkit-appearance: none;
+  min-height: 32px;
+  padding: 6px 30px 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background-color: var(--surface);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23A7AEBE' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 14px;
+  color: var(--text);
+  font: 700 12.5px var(--sans);
+  transition: background-color var(--t-med), border-color var(--t-med);
+}
+html.ui-v2 #tab-terminal .shell-toolbar select:hover,
+html.ui-v2 #tab-files select:hover {
+  background-color: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2 #tab-files select:focus {
+  border-color: var(--files-accent);
+}
+
+html.ui-v2 .shell-host-status {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+html.ui-v2 .shell-host-status.error { color: var(--rose); }
+html.ui-v2 .shell-host-status.warn { color: var(--amber); }
+html.ui-v2 .shell-host-status.ok { color: var(--green); }
+
+html.ui-v2 .shell-share-btn {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--surface);
+  color: var(--text-2);
+  font: 600 12px var(--sans);
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 .shell-share-btn:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+  color: var(--text);
+}
+html.ui-v2 .shell-share-btn.is-shared {
+  background: rgba(var(--green-rgb), .12);
+  border-color: rgba(var(--green-rgb), .26);
+  color: var(--green);
+}
+
+html.ui-v2 #tab-terminal .shell-toolbar .target-summary {
+  border-left: 1px solid var(--line);
+}
+
+/* The stage: --code-bg mono surface with the design's terminal elevation.
+   The inner padding lives on .xterm so the FitAddon subtracts it when
+   computing cols/rows (parent padding would skew the fit math). */
+html.ui-v2 .terminal-container {
+  border: 1px solid var(--line-2);
+  border-radius: 14px;
+  background: var(--code-bg);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03), 0 20px 50px rgba(0, 0, 0, .4);
+  overflow: hidden;
+}
+html.ui-v2 #shell-container .xterm { padding: 12px 14px; }
+
+/* Key bar: design chips — mono 11.5/600, radius 8, line border on surface. */
+html.ui-v2 .shell-keybar {
+  background: transparent;
+  border-top: 0;
+  padding: 11px 2px 1px;
+  gap: 8px;
+}
+html.ui-v2 .shell-key {
+  min-width: 38px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-2);
+  font: 600 11.5px var(--mono);
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .shell-key:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 .shell-key:active { background: var(--surface-3); color: var(--text); }
+html.ui-v2 .shell-key.sticky.armed {
+  background: linear-gradient(180deg, rgba(var(--iris-rgb), .24), rgba(var(--iris-rgb), .1));
+  border-color: transparent;
+  box-shadow: inset 0 0 0 1px rgba(var(--iris-rgb), .3);
+  color: var(--iris-2);
+}
+html.ui-v2 .shell-key.ui2-key { display: inline-block; }
+
+html.ui-v2 .keybar-toggle {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: transparent;
+  color: var(--text-2);
+  font: 600 12px var(--sans);
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .keybar-toggle:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 .keybar-toggle.active {
+  background: rgba(var(--iris-rgb), .12);
+  border-color: rgba(var(--iris-rgb), .3);
+  color: var(--iris-2);
+}
+
+/* Target-summary (shared component) inside these surfaces: quieter, mono
+   detail line, design-tinted capability chips. */
+html.ui-v2 #tab-terminal .target-summary-detail,
+html.ui-v2 #tab-files .target-summary-detail {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-terminal .target-summary-kind,
+html.ui-v2 #tab-files .target-summary-kind {
+  font-family: var(--mono);
+  color: var(--text-3);
+}
+html.ui-v2 #tab-terminal .target-chip,
+html.ui-v2 #tab-files .target-chip {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0;
+  border-color: var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+html.ui-v2 #tab-terminal .target-chip.ok,
+html.ui-v2 #tab-files .target-chip.ok {
+  background: rgba(var(--green-rgb), .12);
+  border-color: rgba(var(--green-rgb), .26);
+  color: var(--green);
+}
+html.ui-v2 #tab-terminal .target-chip.ready,
+html.ui-v2 #tab-files .target-chip.ready {
+  background: rgba(var(--sky-rgb), .12);
+  border-color: rgba(var(--sky-rgb), .26);
+  color: var(--sky);
+}
+html.ui-v2 #tab-terminal .target-chip.warn,
+html.ui-v2 #tab-files .target-chip.warn {
+  background: rgba(var(--amber-rgb), .14);
+  border-color: rgba(var(--amber-rgb), .26);
+  color: var(--amber);
+}
+
+/* ═══ FILES ══════════════════════════════════════════════════════════ */
+
+/* Host accent under v2: sky = this daemon, violet = peer (the JS sets the
+   inline value on host switch; this is the pre-render default). */
+html.ui-v2 #tab-files { --files-accent: var(--sky); }
+
+/* Editor | Transfers as the design's neutral segmented control. */
+html.ui-v2 #tab-files .subtabs {
+  align-self: flex-start;
+  display: inline-flex;
+  gap: 3px;
+  margin: 12px 20px 0;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-2);
+}
+html.ui-v2 #tab-files .subtab-btn {
+  min-height: 0;
+  padding: 6px 13px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-2);
+  font: 700 12.5px var(--sans);
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #tab-files .subtab-btn:hover { color: var(--text); }
+html.ui-v2 #tab-files .subtab-btn.active {
+  background: var(--surface-3);
+  border-color: transparent;
+  color: var(--text);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, .2);
+}
+
+/* Buttons inside both surfaces: v2 secondary / primary / danger recipes
+   on the existing .ui-btn hooks. */
+html.ui-v2 #tab-terminal .ui-btn,
+html.ui-v2 #tab-files .ui-btn,
+html.ui-v2 #fs-picker-modal .modal-cancel,
+html.ui-v2 #fs-picker-modal .modal-confirm {
+  min-height: 30px;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: 600 12px var(--sans);
+  line-height: 1.2;
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #tab-terminal .ui-btn:hover,
+html.ui-v2 #tab-files .ui-btn:hover,
+html.ui-v2 #fs-picker-modal .modal-cancel:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2 #tab-files .ui-btn.primary,
+html.ui-v2 #fs-picker-modal .modal-confirm {
+  border: 0;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .25);
+}
+html.ui-v2 #tab-files .ui-btn.primary:hover,
+html.ui-v2 #fs-picker-modal .modal-confirm:hover {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  filter: brightness(1.08);
+}
+html.ui-v2 #tab-files .ui-btn.danger {
+  border-color: rgba(var(--rose-rgb), .4);
+  background: transparent;
+  color: var(--rose);
+  font-weight: 700;
+}
+html.ui-v2 #tab-files .ui-btn.danger:hover {
+  border-color: rgba(var(--rose-rgb), .4);
+  background: rgba(var(--rose-rgb), .1);
+}
+html.ui-v2 #tab-files .ui-btn:disabled { opacity: .45; }
+
+/* Text inputs across the Files surfaces: v2 input recipe, mono for paths. */
+html.ui-v2 #tab-files input[type="text"],
+html.ui-v2 #tab-files .files-ide-create-row input {
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  transition: border-color var(--t-fast);
+}
+html.ui-v2 #tab-files input[type="text"]:focus,
+html.ui-v2 #tab-files .files-ide-create-row input:focus {
+  border-color: var(--files-accent);
+}
+html.ui-v2 #tab-files input[type="text"]::placeholder { color: var(--text-3); }
+
+/* — Editor sub-tab — */
+
+html.ui-v2 .files-ide-toolbar {
+  min-height: 0;
+  padding: 11px 20px;
+  background: transparent;
+  border-bottom: 0;
+}
+html.ui-v2 .files-ide-toolbar label {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+html.ui-v2 .files-ide-body {
+  grid-template-columns: minmax(226px, 280px) minmax(0, 1fr);
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+}
+html.ui-v2 .files-ide-tree-pane {
+  background: var(--bg-1);
+  border-right: 1px solid var(--line);
+}
+html.ui-v2 .files-ide-tree-toolbar {
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 #tab-files .files-ide-tree-toolbar input {
+  padding: 5px 8px;
+  font-size: 11.5px;
+}
+html.ui-v2 #tab-files .files-ide-tree-toolbar .ui-btn {
+  min-height: 0;
+  padding: 4px 9px;
+  font-size: 11.5px;
+}
+html.ui-v2 #tab-files .files-ide-tree-toolbar .ui-btn[aria-pressed="true"] {
+  border-color: rgba(var(--iris-rgb), .3);
+  background: rgba(var(--iris-rgb), .12);
+  color: var(--iris-2);
+}
+
+/* Tree rows: design file-tree items — mono 12.5, radius 7, accent-tinted
+   active row with the inset bar. Indent stays the renderer's inline
+   padding-left. */
+html.ui-v2 .files-ide-tree { padding: 5px 0; }
+html.ui-v2 .files-ide-tree-row {
+  width: auto;
+  margin: 1px 6px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  padding-right: 6px;
+  border-radius: 7px;
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+html.ui-v2 .files-ide-tree-row:hover { background: var(--hover-wash); color: var(--text); }
+html.ui-v2 .files-ide-tree-row.active {
+  background: color-mix(in srgb, var(--files-accent) 14%, transparent);
+  box-shadow: inset 2px 0 0 var(--files-accent);
+  color: var(--text);
+}
+html.ui-v2 .files-ide-tree-row .files-ide-tree-caret { color: var(--text-3); }
+html.ui-v2 .files-ide-tree-row.dir .files-ide-tree-caret { color: var(--amber); }
+html.ui-v2 .files-ide-tree-row.dir .files-ide-tree-name { color: var(--text); }
+html.ui-v2 .files-ide-tree-row.hidden-entry .files-ide-tree-caret,
+html.ui-v2 .files-ide-tree-row.hidden-entry .files-ide-tree-name { color: var(--text-3); }
+html.ui-v2 .files-ide-tree-notice {
+  color: var(--text-3);
+  font-size: 11px;
+}
+html.ui-v2 #tab-files .files-ide-create-row input { padding: 3px 7px; }
+html.ui-v2 #tab-files .files-ide-create-row input,
+html.ui-v2 #tab-files .files-ide-create-row input:focus {
+  border-color: var(--files-accent);
+}
+
+html.ui-v2 .files-ide-row-act {
+  border-radius: 6px;
+  color: var(--text-3);
+}
+html.ui-v2 .files-ide-row-act:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+html.ui-v2 .files-ide-row-act.delete:hover { color: var(--rose); }
+html.ui-v2 .files-ide-row-act.delete.armed {
+  background: var(--rose);
+  color: var(--on-accent);
+}
+
+/* Buffer tabs: mono strip on bg-1; active = code-bg + accent top bar;
+   dirty dot iris; two-step Discard? in rose. */
+html.ui-v2 .files-ide-tabs {
+  min-height: 36px;
+  padding: 0;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 .files-ide-tab {
+  padding: 0 10px 0 14px;
+  border-right: 1px solid var(--line);
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 12px;
+  box-shadow: inset 0 2px 0 transparent;
+}
+html.ui-v2 .files-ide-tab:hover { color: var(--text-2); }
+html.ui-v2 .files-ide-tab.active {
+  background: var(--code-bg);
+  color: var(--text);
+  box-shadow: inset 0 2px 0 var(--files-accent);
+}
+html.ui-v2 .files-ide-tab .files-ide-tab-dirty { color: var(--iris); }
+html.ui-v2 .files-ide-tab .files-ide-tab-close {
+  border-radius: 6px;
+  color: var(--text-3);
+}
+html.ui-v2 .files-ide-tab .files-ide-tab-close:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+html.ui-v2 .files-ide-tab .files-ide-tab-close.confirm-discard {
+  color: var(--rose);
+  font-family: var(--sans);
+}
+
+/* Conflict / error banner: the design's amber attention-card language
+   (rose for errors), kept as a strip above the editor. */
+html.ui-v2 .files-ide-banner {
+  padding: 8px 14px;
+  border-bottom: 1px solid rgba(var(--amber-rgb), .32);
+  box-shadow: none;
+  background: linear-gradient(180deg, rgba(var(--amber-rgb), .1), rgba(var(--amber-rgb), .04));
+  color: var(--amber);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+html.ui-v2 .files-ide-banner.error {
+  border-bottom-color: rgba(var(--rose-rgb), .32);
+  box-shadow: none;
+  background: linear-gradient(180deg, rgba(var(--rose-rgb), .1), rgba(var(--rose-rgb), .04));
+  color: var(--rose);
+}
+html.ui-v2 #tab-files .files-ide-banner .ui-btn { min-height: 24px; padding: 3px 9px; font-size: 11.5px; }
+
+/* Find bar: floating v2 panel. */
+html.ui-v2 .files-ide-find {
+  padding: 6px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+html.ui-v2 .files-ide-find input { padding: 4px 8px; }
+html.ui-v2 #tab-files .files-ide-find .ui-btn { min-height: 24px; padding: 3px 8px; font-size: 11.5px; }
+html.ui-v2 .files-ide-find-count {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+html.ui-v2 .files-ide-find-count.none { color: var(--rose); }
+
+html.ui-v2 .files-ide-empty .ui-empty-title {
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 700;
+}
+html.ui-v2 .files-ide-empty .ui-empty-sub {
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* Statusbar: mono line on bg-1. Right padding stays clear of the floating
+   mic/screenshot controls, as in v1. */
+html.ui-v2 .files-ide-statusbar {
+  min-height: 34px;
+  padding: 5px 96px 5px 14px;
+  background: var(--bg-1);
+  border-top: 1px solid var(--line);
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+html.ui-v2 .files-ide-status-host {
+  padding: 2px 9px 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--text-2);
+  font-weight: 600;
+}
+html.ui-v2 .files-ide-host-dot {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--files-accent) 16%, transparent);
+}
+html.ui-v2 .files-ide-status-meta { color: var(--text-3); }
+html.ui-v2 .files-ide-status-lncol { display: inline; color: var(--text-3); white-space: nowrap; }
+html.ui-v2 .files-ide-status-lncol:empty { display: none; }
+html.ui-v2 .files-ide-save-status { color: var(--text-3); }
+html.ui-v2 .files-ide-save-status.error { color: var(--rose); }
+html.ui-v2 .files-ide-save-status.ok { color: var(--green); }
+html.ui-v2 #tab-files .files-ide-statusbar .ui-btn.primary { min-height: 26px; padding: 4px 12px; }
+
+/* Editor: CodeMirror on --code-bg with the design mono scale. */
+html.ui-v2 .files-ide-editor-host .CodeMirror {
+  background: var(--code-bg);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+/* CodeMirror token theme, v2 variant of .cm-s-intendant (design mapping:
+   keywords iris-2, strings green, calls/builtins sky, comments text-3). */
+html.ui-v2 .cm-s-intendant.CodeMirror {
+  background: var(--code-bg);
+  color: var(--text);
+}
+html.ui-v2 .cm-s-intendant .CodeMirror-gutters {
+  background: var(--code-bg);
+  border-right: 0;
+}
+html.ui-v2 .cm-s-intendant .CodeMirror-linenumber {
+  padding: 0 14px 0 10px;
+  color: color-mix(in srgb, var(--text-3) 72%, transparent);
+}
+html.ui-v2 .cm-s-intendant .CodeMirror-cursor { border-left: 2px solid var(--text); }
+html.ui-v2 .cm-s-intendant .CodeMirror-selected { background: rgba(var(--iris-rgb), .22); }
+html.ui-v2 .cm-s-intendant.CodeMirror-focused .CodeMirror-selected { background: rgba(var(--iris-rgb), .25); }
+html.ui-v2 .cm-s-intendant .CodeMirror-activeline-background { background: var(--hover-wash); }
+html.ui-v2 .cm-s-intendant .CodeMirror-matchingbracket {
+  color: var(--sky) !important;
+  border-bottom: 1px solid var(--sky);
+}
+html.ui-v2 .cm-s-intendant .CodeMirror-nonmatchingbracket { color: var(--rose) !important; }
+html.ui-v2 .cm-s-intendant .cm-keyword { color: var(--iris-2); }
+html.ui-v2 .cm-s-intendant .cm-atom { color: var(--violet); }
+html.ui-v2 .cm-s-intendant .cm-number { color: var(--amber); }
+html.ui-v2 .cm-s-intendant .cm-def { color: var(--sky); }
+html.ui-v2 .cm-s-intendant .cm-variable { color: var(--text); }
+html.ui-v2 .cm-s-intendant .cm-variable-2 { color: var(--iris-2); }
+html.ui-v2 .cm-s-intendant .cm-variable-3,
+html.ui-v2 .cm-s-intendant .cm-type { color: var(--violet); }
+html.ui-v2 .cm-s-intendant .cm-property { color: var(--text); }
+html.ui-v2 .cm-s-intendant .cm-operator { color: var(--text-2); }
+html.ui-v2 .cm-s-intendant .cm-comment { color: var(--text-3); }
+html.ui-v2 .cm-s-intendant .cm-string { color: var(--green); }
+html.ui-v2 .cm-s-intendant .cm-string-2 { color: var(--sky); }
+html.ui-v2 .cm-s-intendant .cm-meta { color: var(--sky); }
+html.ui-v2 .cm-s-intendant .cm-qualifier { color: var(--amber); }
+html.ui-v2 .cm-s-intendant .cm-builtin { color: var(--sky); }
+html.ui-v2 .cm-s-intendant .cm-bracket { color: var(--text-2); }
+html.ui-v2 .cm-s-intendant .cm-tag { color: var(--rose); }
+html.ui-v2 .cm-s-intendant .cm-attribute { color: var(--amber); }
+html.ui-v2 .cm-s-intendant .cm-header { color: var(--iris-2); }
+html.ui-v2 .cm-s-intendant .cm-quote { color: var(--green); }
+html.ui-v2 .cm-s-intendant .cm-hr { color: var(--text-3); }
+html.ui-v2 .cm-s-intendant .cm-link { color: var(--sky); }
+html.ui-v2 .cm-s-intendant .cm-error { color: var(--rose); }
+html.ui-v2 .cm-s-intendant .cm-negative { color: var(--rose); }
+html.ui-v2 .cm-s-intendant .cm-positive { color: var(--green); }
+
+/* — Transfers sub-tab (undesigned in the handoff; composed from the v2
+     card/row/meter/tint recipes) — */
+
+html.ui-v2 .files-pane {
+  max-width: 880px;
+  padding: 18px 24px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+html.ui-v2 #tab-files .files-tool {
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  padding: 16px 18px;
+}
+html.ui-v2 #tab-files .ui-section-title {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 800;
+}
+html.ui-v2 #tab-files .ui-section-sub {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+html.ui-v2 .files-download-status {
+  color: var(--text-2);
+  font-size: 12px;
+}
+html.ui-v2 .files-download-status.ok { color: var(--green); }
+html.ui-v2 .files-download-status.warn { color: var(--amber); }
+html.ui-v2 .files-download-status.error { color: var(--rose); }
+html.ui-v2 #files-ide-tree-status { padding: 0 10px 8px; }
+
+html.ui-v2 #tab-files .files-download-meter,
+html.ui-v2 #tab-files .ui-meter {
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+}
+html.ui-v2 .files-download-meter-fill {
+  background: linear-gradient(90deg, var(--sky), var(--iris));
+}
+
+/* Transfer + staged rows: v2 rows with a semantic status edge. */
+html.ui-v2 .files-transfer-row,
+html.ui-v2 .files-staged-row {
+  padding: 11px 14px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-2);
+  border-radius: 11px;
+  background: var(--surface-2);
+}
+html.ui-v2 .files-transfer-row.running { border-color: var(--line); border-left-color: var(--sky); }
+html.ui-v2 .files-transfer-row.queued { border-color: var(--line); border-left-color: var(--text-3); }
+html.ui-v2 .files-transfer-row.completed { border-color: var(--line); border-left-color: var(--green); }
+html.ui-v2 .files-transfer-row.failed { border-color: var(--line); border-left-color: var(--rose); }
+html.ui-v2 .files-transfer-row.cancelled { border-color: var(--line); border-left-color: var(--text-3); }
+html.ui-v2 .files-transfer-row.paused { border-color: var(--line); border-left-color: var(--amber); }
+html.ui-v2 .files-transfer-row.server {
+  background: linear-gradient(180deg, rgba(var(--iris-rgb), .07), rgba(var(--iris-rgb), .03)),
+    var(--surface-2);
+}
+html.ui-v2 .files-transfer-title,
+html.ui-v2 .files-staged-title {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text);
+}
+html.ui-v2 .files-transfer-meta,
+html.ui-v2 .files-staged-meta {
+  color: var(--text-3);
+  font-size: 11px;
+}
+html.ui-v2 .files-transfer-meter {
+  height: 5px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+}
+html.ui-v2 .files-transfer-meter-fill {
+  background: linear-gradient(90deg, var(--sky), var(--iris));
+}
+html.ui-v2 #tab-files .ui-empty-title { color: var(--text); font-size: 13.5px; font-weight: 700; }
+html.ui-v2 #tab-files .ui-empty-hint { color: var(--text-3); font-size: 11.5px; line-height: 1.5; }
+
+/* Uploads. */
+html.ui-v2 .files-upload-config input,
+html.ui-v2 .files-upload-config select { min-height: 32px; }
+html.ui-v2 .files-upload-dropzone {
+  border: 1px dashed var(--line-2);
+  border-radius: 11px;
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: 12px;
+}
+html.ui-v2 .files-upload-dropzone.dragover {
+  border-color: var(--iris);
+  background: rgba(var(--iris-rgb), .08);
+  color: var(--text);
+}
+
+/* — Shared fs-picker modal (Browse flows here + Sessions pickers) — */
+html.ui-v2 .fs-picker-dialog {
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-panel);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  box-shadow: var(--shadow-overlay);
+}
+html.ui-v2 .fs-picker-path-row input {
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+html.ui-v2 .fs-picker-path-row input:focus { border-color: var(--iris); }
+html.ui-v2 .fs-picker-path-row button {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: 600 12px var(--sans);
+}
+html.ui-v2 .fs-picker-path-row button:hover { background: var(--surface-2); border-color: var(--line-2); }
+html.ui-v2 .fs-picker-entry {
+  border-radius: 7px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+html.ui-v2 .fs-picker-entry:hover { background: var(--hover-wash); color: var(--text); }
+html.ui-v2 .fs-picker-entry.selected {
+  background: rgba(var(--iris-rgb), .14);
+  color: var(--text);
+}
+html.ui-v2 .fs-picker-status { font-size: 12px; color: var(--text-2); }
+html.ui-v2 .fs-picker-status.error { color: var(--rose); }
+html.ui-v2 .fs-picker-status.ok { color: var(--green); }
+html.ui-v2 .fs-picker-status.warn { color: var(--amber); }
+html.ui-v2 .fs-picker-close {
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-3);
+}
+html.ui-v2 .fs-picker-close:hover { background: var(--surface-2); color: var(--text); }
+
+/* — Responsive parity: the v1 sheets collapse these grids inside media
+     queries; the higher-specificity v2 overrides must collapse with them. */
+@media (max-width: 900px) {
+  html.ui-v2 .files-ide-body { grid-template-columns: 1fr; }
+  html.ui-v2 .files-ide-tree-pane {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  html.ui-v2 .files-pane { padding: 12px; }
+}

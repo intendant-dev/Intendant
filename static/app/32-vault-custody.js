@@ -2684,6 +2684,10 @@ const shellModifiers = { ctrl: false, alt: false };
 const SHELL_KEY_SEQS = {
   esc: '\x1b',
   tab: '\t',
+  // ^C / ^D / ⏎ chips (ui-v2 design bar; buttons are hidden under v1).
+  ctrlc: '\x03',
+  ctrld: '\x04',
+  enter: '\r',
   up: '\x1b[A',
   down: '\x1b[B',
   left: '\x1b[D',

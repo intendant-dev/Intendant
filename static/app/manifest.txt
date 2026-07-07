@@ -16,6 +16,7 @@
 14-styles-displays-voice.css
 16-styles-v2-tokens.css
 ui2-chrome.css
+ui2-terminal-files.css
 19-style-close.html
 
 20-shell.html
