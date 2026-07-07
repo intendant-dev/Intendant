@@ -121,7 +121,7 @@ pub use handle::{
     spawn_peer, ConnectionState, PeerHandle, PeerSnapshot, BROADCAST_CAPACITY, COMMANDS_CAPACITY,
     EVENTS_CAPACITY,
 };
-pub use id::{PeerId, PeerKind};
+pub use id::PeerId;
 pub use log_writer::{spawn_peer_log_writer, LOG_CHANNEL_CAPACITY};
 pub use registry::{PeerRegistry, RegistryEvent, REGISTRY_BROADCAST_CAPACITY};
 pub use traits::{check_feature, PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures};

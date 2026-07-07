@@ -2087,7 +2087,7 @@ mod tests {
         // Identity fields must be populated from live state.
         assert_eq!(
             card.id.kind(),
-            Some(crate::peer::PeerKind::Intendant),
+            Some(crate::peer::id::PeerKind::Intendant),
             "local daemon must identify as Intendant kind: id = {:?}",
             card.id
         );
