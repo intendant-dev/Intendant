@@ -159,6 +159,14 @@ accessibility). This is the "full immersive 3D experience" milestone: the
 scene is no longer a backdrop behind the UI — the scene *is* the UI,
 spatially.
 
+*In flight behind `?station_panes=on`*: the depth attachment, a
+billboarded depth-tested pane pipeline (`panes.rs`), and glyph-atlas text
+on those panes (`text_atlas.rs` — the HUD font baked to a mip-chained R8
+coverage texture, sampled by a textured pipeline) are live, proven by one
+card beside the selected node. Raycast picking and the promotion of real
+panels into the scene are next; the flag flips to opt-out when the pane
+presentation graduates.
+
 ### Phase D — XR spatial computing
 
 WebXR immersive sessions over the same scene graph: head-tracked cameras,

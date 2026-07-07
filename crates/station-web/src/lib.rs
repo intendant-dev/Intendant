@@ -9,6 +9,7 @@ mod input;
 mod model;
 mod panes;
 mod scene;
+mod text_atlas;
 mod util;
 
 use std::cell::RefCell;
@@ -247,6 +248,15 @@ impl StationWeb {
             // ?station_panes=on + a selected node.
             "panes": inner.frame.pane_vertices.len() / 6,
             "panesEnabled": inner.panes_enabled,
+            // Slice 3: glyph quads on those panes (6 vertices each), and
+            // the baked atlas's dimensions/footprint (null until a bake
+            // succeeded — the bake is flag-gated like the panes).
+            "textQuads": inner.frame.text_vertices.len() / 6,
+            "textAtlas": inner.text_atlas.as_ref().map(|atlas| serde_json::json!({
+                "width": atlas.width,
+                "height": atlas.height,
+                "bytes": atlas.pixels.len(),
+            })),
             "mood": inner.mood.label(),
             "motion": inner.motion,
             "composer": {
@@ -420,6 +430,11 @@ struct StationInner {
     /// World-space panes (Phase C), opt-in via `?station_panes=on` while
     /// the program is in flight. Read once at construction.
     panes_enabled: bool,
+    /// Glyph atlas for pane text, baked once at construction when panes
+    /// are enabled (None otherwise, or if the bake failed — panes then
+    /// draw without text). CPU-side; the GPU texture is uploaded lazily
+    /// by `GpuState::ensure_atlas`.
+    text_atlas: Option<text_atlas::TextAtlas>,
     pointer_down: Option<PointerDrag>,
     active_pointers: HashMap<i32, Vec2>,
     pinch_zoom: Option<PinchZoom>,
@@ -513,6 +528,23 @@ impl StationInner {
             ));
         }
 
+        let panes_enabled = util::station_enable_panes();
+        // The atlas only serves world-space pane text; skip the bake (a
+        // one-time canvas rasterization + readback) while the flag is off.
+        let text_atlas = if panes_enabled {
+            match text_atlas::TextAtlas::bake() {
+                Ok(atlas) => Some(atlas),
+                Err(err) => {
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "Station glyph atlas bake failed; pane text disabled: {err:?}"
+                    )));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut inner = Self {
             scene_canvas,
             hud_canvas,
@@ -540,7 +572,8 @@ impl StationInner {
             last_input_ms: now_ms(),
             selected_id: None,
             focus_id: None,
-            panes_enabled: util::station_enable_panes(),
+            panes_enabled,
+            text_atlas,
             pointer_down: None,
             active_pointers: HashMap::new(),
             pinch_zoom: None,
@@ -913,7 +946,7 @@ impl StationInner {
             // stale size makes every frame's swapchain texture invalid. The
             // attribute reads are layout-free, so guard each frame.
             gpu.resize(self.scene_canvas.width(), self.scene_canvas.height());
-            if let Err(err) = gpu.render(&self.frame) {
+            if let Err(err) = gpu.render(&self.frame, self.text_atlas.as_ref()) {
                 web_sys::console::warn_1(&JsValue::from_str(&format!(
                     "Station GPU render failed: {err:?}"
                 )));

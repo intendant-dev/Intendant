@@ -10,7 +10,7 @@ use crate::model::{StationAgent, StationHost, StationSnapshot};
 use crate::util::phase_color;
 use crate::util::{
     css_rgba, goal_status_color, relationship_color, role_color, stable_angle, stable_unit, Color,
-    C_BLUE, C_GREEN, C_PEACH, C_RED, C_SAPPHIRE, C_SURFACE0, C_TEAL, C_YELLOW,
+    C_BLUE, C_GREEN, C_PEACH, C_RED, C_SAPPHIRE, C_SUBTEXT0, C_SURFACE0, C_TEAL, C_TEXT, C_YELLOW,
 };
 use crate::StationInner;
 
@@ -126,10 +126,13 @@ impl StationInner {
             true
         });
 
-        // Phase C slice 2, behind ?station_panes=on: one untextured card
-        // beside the selected node — the throwaway that proves the pane
-        // pipeline (billboarding, per-pixel depth against the wireframe)
-        // before real panels migrate into the scene.
+        // Phase C slices 2–3, behind ?station_panes=on: one card beside
+        // the selected node — the throwaway that proves the pane pipeline
+        // (billboarding, per-pixel depth against the wireframe) and the
+        // glyph-atlas text on it, before real panels migrate into the
+        // scene. Title is the selected id; rows reuse the cached
+        // control-center summaries (fresh: render() recomputes them
+        // before building the frame).
         if self.panes_enabled {
             if let Some(pos) = self
                 .selected_id
@@ -138,16 +141,51 @@ impl StationInner {
                 .copied()
             {
                 let anchor = pos + cam_right * 0.66 + cam_up * 0.52;
-                crate::panes::add_world_pane(
+                let emitted = crate::panes::add_world_pane(
                     &mut frame,
                     &mut project,
                     cam_right,
                     cam_up,
                     anchor,
-                    0.55,
-                    0.34,
+                    PANE_HALF_W,
+                    PANE_HALF_H,
                     Color::rgb(16, 18, 32).with_alpha(0.86),
                 );
+                if emitted {
+                    if let Some(atlas) = self.text_atlas.as_ref() {
+                        let inner_w = (PANE_HALF_W - PANE_MARGIN) * 2.0;
+                        let top_left = anchor - cam_right * (PANE_HALF_W - PANE_MARGIN)
+                            + cam_up * (PANE_HALF_H - PANE_MARGIN);
+                        let title = self.selected_id.as_deref().unwrap_or_default();
+                        crate::text_atlas::add_text_world(
+                            &mut frame,
+                            atlas,
+                            &mut project,
+                            cam_right,
+                            cam_up,
+                            top_left,
+                            PANE_TITLE_H,
+                            &atlas.fit_to_width(title, PANE_TITLE_H, inner_w),
+                            C_TEXT,
+                        );
+                        let mut cursor = top_left - cam_up * (PANE_TITLE_H * 1.3);
+                        for target in self.system_targets.iter().take(3) {
+                            let row = format!("{}  {}", target.title, target.value);
+                            crate::text_atlas::add_text_world(
+                                &mut frame,
+                                atlas,
+                                &mut project,
+                                cam_right,
+                                cam_up,
+                                cursor,
+                                PANE_ROW_H,
+                                &atlas.fit_to_width(&row, PANE_ROW_H, inner_w),
+                                C_SUBTEXT0,
+                            );
+                            cursor = cursor - cam_up * (PANE_ROW_H * 1.25);
+                        }
+                    }
+                }
             }
         }
 
@@ -691,6 +729,16 @@ impl Camera {
 
 /// Half-width (in NDC) of the faint thick pass behind glowing lines.
 pub(crate) const GLOW_WIDTH: f32 = 0.007;
+
+/// Proof-card geometry (Phase C slices 2–3), world units: pane
+/// half-extents, inner text margin, and the title/row glyph-cell heights.
+/// Sized so the text draws near the atlas's baked glyph size at typical
+/// camera distances (see `text_atlas` on sampling quality).
+const PANE_HALF_W: f32 = 0.62;
+const PANE_HALF_H: f32 = 0.40;
+const PANE_MARGIN: f32 = 0.07;
+const PANE_TITLE_H: f32 = 0.14;
+const PANE_ROW_H: f32 = 0.105;
 
 /// Depth-cued brightness: geometry nearer than the orbit center draws a
 /// little brighter, farther a little dimmer. `z` is view-space depth and
