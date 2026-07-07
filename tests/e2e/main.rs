@@ -29,6 +29,14 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 /// on a cold CI runner.
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Deadline for the load-sensitive cross-daemon waits in the federated peer
+/// test (the A->B connection forming, the delegated task completing on B).
+/// A 90s ceiling was blown twice by a healthy tree on a loaded CI box —
+/// debug binaries, several daemons, and concurrent jobs stack up — and the
+/// suite's wall-clock cost is bounded by how fast the waits *succeed*, not
+/// by this deadline, so be generous.
+const PEER_WAIT_TIMEOUT: Duration = Duration::from_secs(240);
+
 fn intendant_bin() -> &'static str {
     // Referencing the runtime binary's env var makes Cargo build it too —
     // the caller resolves `intendant-runtime` as its sibling on disk.
@@ -152,6 +160,16 @@ fn marker_file(project: &Path, name: &str) -> PathBuf {
     project.join(name)
 }
 
+/// Last `max` bytes of `contents`, starting on a char boundary —
+/// panic-message-sized views of daemon logs and session state.
+fn tail(contents: &str, max: usize) -> String {
+    let mut start = contents.len().saturating_sub(max);
+    while !contents.is_char_boundary(start) {
+        start += 1;
+    }
+    contents[start..].to_string()
+}
+
 /// Two distinct free loopback ports, grabbed while both listeners are
 /// alive so the kernel cannot hand out the same port twice. The listeners
 /// are dropped on return and the daemons re-bind moments later; if a port
@@ -183,11 +201,7 @@ impl DaemonRig {
     fn log_tail(&self) -> String {
         let path = self.rig.home.path().join("daemon.log");
         let contents = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut start = contents.len().saturating_sub(4000);
-        while !contents.is_char_boundary(start) {
-            start += 1;
-        }
-        contents[start..].to_string()
+        tail(&contents, 4000)
     }
 }
 
@@ -312,8 +326,16 @@ async fn connected_peer(client: &reqwest::Client, port: u16) -> Option<serde_jso
 
 /// Poll `probe` every 250 ms until it yields `Some`, panicking after
 /// `timeout` — the suite's polling convention for daemon-shaped tests
-/// (one-shot runs use [`TestRig::run`]'s hard timeout instead).
-async fn poll_until<T, Fut>(what: &str, timeout: Duration, mut probe: impl FnMut() -> Fut) -> T
+/// (one-shot runs use [`TestRig::run`]'s hard timeout instead). On timeout
+/// the panic carries `context()`: pass the relevant daemon log/session
+/// tails so the failure says *why* it stalled, not just that it did
+/// (`String::new` when there is nothing useful to dump).
+async fn poll_until<T, Fut>(
+    what: &str,
+    timeout: Duration,
+    mut probe: impl FnMut() -> Fut,
+    context: impl Fn() -> String,
+) -> T
 where
     Fut: std::future::Future<Output = Option<T>>,
 {
@@ -322,10 +344,12 @@ where
         if let Some(found) = probe().await {
             return found;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out after {timeout:?} waiting for {what}"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out after {timeout:?} waiting for {what}:\n{}",
+                context()
+            );
+        }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
@@ -495,6 +519,77 @@ where
     }
 }
 
+/// Drive a supervised session over `/ws` through its happy-path completion
+/// contract: wait for the session's `round_complete`, then send an explicit
+/// `stop_session`, then require a `session_ended` without an `error_kind`.
+///
+/// This encodes what "done" means for a supervised daemon session — after
+/// its done signal the loop finishes the round and the session *parks*
+/// awaiting follow-ups; `session_ended` fires only on an explicit stop or an
+/// error. A scenario that asserts `session_ended` straight after completion
+/// therefore hangs for the full harness timeout (a real past failure on
+/// this suite) — use this helper instead. Scenario-specific completion
+/// evidence (done-signal messages, runtime round-trip markers in the
+/// session log) stays in the test; `context` supplies the daemon
+/// stderr/log tail for panic messages when an event never arrives.
+async fn complete_and_stop_session<S>(ws: &mut S, session_id: &str, context: impl Fn() -> String)
+where
+    S: futures_util::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + futures_util::Sink<
+            tokio_tungstenite::tungstenite::Message,
+            Error = tokio_tungstenite::tungstenite::Error,
+        > + Unpin,
+{
+    use futures_util::SinkExt;
+
+    // Task completion: the loop finishes its round (done signal) and the
+    // session parks for follow-ups — by design there is no SessionEnded
+    // here, so round_complete is the completion signal.
+    next_matching_ws_event(ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "session {session_id} never completed its round; daemon context:\n{}",
+            context()
+        )
+    });
+
+    // The parked session ends when explicitly stopped — the one place a
+    // supervised session emits session_ended on the happy path.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "stop_session",
+            "session_id": session_id,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send stop_session");
+    let ended = next_matching_ws_event(ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_ended")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "stopped session {session_id} never ended; daemon context:\n{}",
+            context()
+        )
+    });
+    assert!(
+        ended.get("error_kind").is_none_or(|v| v.is_null()),
+        "user-stopped session must end without an error class, got {ended}"
+    );
+}
+
 /// The daemon lane, projectless: booted from an empty (markerless) temp
 /// cwd it must come up serving — no cwd baseline scan, `project_root:
 /// null` on the gateway — run a CreateSession that carries an explicit
@@ -503,8 +598,8 @@ where
 ///
 /// "Completion" for a supervised session is `round_complete` plus the done
 /// signal in its log: by design the session then parks awaiting follow-ups
-/// (no SessionEnded on task completion); `session_ended` is asserted via an
-/// explicit stop_session afterwards.
+/// (no SessionEnded on task completion); [`complete_and_stop_session`]
+/// encodes that contract, ending with an explicit stop.
 #[tokio::test]
 async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
     use futures_util::SinkExt;
@@ -575,7 +670,9 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
         }
     };
     assert!(
-        project_root_body.get("project_root").is_some_and(|v| v.is_null()),
+        project_root_body
+            .get("project_root")
+            .is_some_and(|v| v.is_null()),
         "projectless daemon must report project_root: null, got {project_root_body}"
     );
 
@@ -661,56 +758,21 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
         .and_then(|v| v.as_str())
         .expect("session_started carries a session id")
         .to_string();
-    // Task completion: the loop finishes its round (done signal) and the
-    // session parks for follow-ups — by design there is no SessionEnded
-    // here, so round_complete is the completion signal.
-    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
-        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
-            && json.get("session_id").and_then(|v| v.as_str()) == Some(started_id.as_str())
+    // Completion + shutdown ride the suite's supervised-session contract:
+    // round_complete, an explicit stop, then a clean session_ended.
+    complete_and_stop_session(&mut ws, &started_id, || {
+        stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
     })
-    .await
-    .unwrap_or_else(|| {
-        panic!(
-            "rooted session never completed its round; daemon stderr:\n{}",
-            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
-        )
-    });
+    .await;
     let logs = rig.session_logs();
     assert!(
         logs.contains("projectless mock run complete"),
         "session log missing the done signal:\n{logs}"
     );
     assert!(
-        logs.contains("PROJECTLESS_E2E_ROUNDTRIP") || rig.turn_artifacts().contains("PROJECTLESS_E2E_ROUNDTRIP"),
+        logs.contains("PROJECTLESS_E2E_ROUNDTRIP")
+            || rig.turn_artifacts().contains("PROJECTLESS_E2E_ROUNDTRIP"),
         "missing the runtime round-trip evidence"
-    );
-
-    // The idle session ends when explicitly stopped — the one place a
-    // supervised session emits session_ended on the happy path.
-    ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::json!({
-            "action": "stop_session",
-            "session_id": started_id,
-        })
-        .to_string()
-        .into(),
-    ))
-    .await
-    .expect("send stop_session");
-    let ended = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
-        json.get("event").and_then(|v| v.as_str()) == Some("session_ended")
-            && json.get("session_id").and_then(|v| v.as_str()) == Some(started_id.as_str())
-    })
-    .await
-    .unwrap_or_else(|| {
-        panic!(
-            "stopped session never ended; daemon stderr:\n{}",
-            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
-        )
-    });
-    assert!(
-        ended.get("error_kind").is_none_or(|v| v.is_null()),
-        "user-stopped session must end without an error class, got {ended}"
     );
 
     child.kill().await.expect("stop the daemon");
@@ -828,10 +890,17 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
     );
     let peer = poll_until(
         "daemon A reporting peer B connected",
-        Duration::from_secs(45),
+        PEER_WAIT_TIMEOUT,
         || {
             let client = client.clone();
             async move { connected_peer(&client, port_a).await }
+        },
+        || {
+            format!(
+                "--- daemon A log tail ---\n{}\n--- daemon B log tail ---\n{}",
+                a.log_tail(),
+                b.log_tail()
+            )
         },
     )
     .await;
@@ -901,10 +970,17 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
     // round-tripped.
     poll_until(
         "the delegated task completing on peer daemon B",
-        Duration::from_secs(90),
+        PEER_WAIT_TIMEOUT,
         || {
             let logs = b.rig.session_logs();
             async move { logs.contains(DONE_MESSAGE).then_some(()) }
+        },
+        || {
+            format!(
+                "--- daemon B log tail ---\n{}\n--- daemon B session logs (tail) ---\n{}",
+                b.log_tail(),
+                tail(&b.rig.session_logs(), 4000)
+            )
         },
     )
     .await;
