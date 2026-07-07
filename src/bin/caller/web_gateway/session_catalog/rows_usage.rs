@@ -941,6 +941,7 @@ pub(crate) mod tests {
             turns: 2,
             file_updated_at: Some("2026-07-02T09:30:00Z".to_string()),
             bytes: 64,
+            preview: None,
         };
 
         // The fork baseline comes out of the first event's day only.
@@ -989,6 +990,7 @@ pub(crate) mod tests {
             turns: 2,
             file_updated_at: None,
             bytes: 64,
+            preview: None,
         };
         let mut baselines: HashMap<(String, i64), Option<SessionUsage>> = HashMap::new();
         baselines.insert(

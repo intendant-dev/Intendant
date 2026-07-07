@@ -218,6 +218,10 @@ pub(crate) struct CodexSessionListSummary {
     turns: u64,
     file_updated_at: Option<String>,
     bytes: u64,
+    /// Conversation preview entries (same shape as the row `preview`
+    /// field); absent on entries persisted before the field existed.
+    #[serde(default)]
+    preview: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
