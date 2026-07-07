@@ -12,8 +12,9 @@ mod replay;
 pub(crate) use replay::*;
 mod history;
 pub(crate) use history::*;
+// bus_events carries only `impl SessionLog` methods — nothing importable,
+// so no glob re-export.
 mod bus_events;
-pub(crate) use bus_events::*;
 
 /// Structured event written as one JSON line in session.jsonl.
 #[derive(Serialize)]
@@ -1184,7 +1185,6 @@ impl Drop for SessionLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::AppEvent;
 
     #[test]
     fn open_creates_directory_structure() {
@@ -1491,13 +1491,6 @@ mod tests {
         let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
         assert_eq!(last["event"], "presence_disconnected");
     }
-
-    // ------------------------------------------------------------------
-    // Round-trip tests for `session_log_entry_to_app_event`.
-    // Each test writes to session.jsonl using the typed writer methods,
-    // parses the resulting line, runs it through the inverse function,
-    // and asserts the reconstructed AppEvent matches expectations.
-    // ------------------------------------------------------------------
 
     /// Helper: drop `log`, read session.jsonl, and return the last entry
     /// whose `event` field matches `event_type`.

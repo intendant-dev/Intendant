@@ -1094,6 +1094,13 @@ mod tests {
     use crate::event::AppEvent;
     use crate::session_log::tests::{read_events, read_last_event};
 
+    // ------------------------------------------------------------------
+    // Round-trip tests for `session_log_entry_to_app_event`.
+    // Each test writes to session.jsonl using the typed writer methods,
+    // parses the resulting line, runs it through the inverse function,
+    // and asserts the reconstructed AppEvent matches expectations.
+    // ------------------------------------------------------------------
+
     #[test]
     fn context_snapshot_preserves_session_id_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
