@@ -926,10 +926,14 @@
             <button class="shell-key" data-key="tab">Tab</button>
             <button class="shell-key sticky wide" data-sticky="ctrl">Ctrl</button>
             <button class="shell-key sticky wide" data-sticky="alt">Alt</button>
+            <!-- ui2-key chips are part of the ui-v2 design bar; hidden under v1. -->
+            <button class="shell-key ui2-key" data-key="ctrlc" title="Ctrl+C (interrupt)">^C</button>
+            <button class="shell-key ui2-key" data-key="ctrld" title="Ctrl+D (end of input)">^D</button>
             <button class="shell-key" data-key="up" title="Up">&#x2191;</button>
             <button class="shell-key" data-key="down" title="Down">&#x2193;</button>
             <button class="shell-key" data-key="left" title="Left">&#x2190;</button>
             <button class="shell-key" data-key="right" title="Right">&#x2192;</button>
+            <button class="shell-key ui2-key" data-key="enter" title="Enter">&#x23CE;</button>
             <button class="shell-key" data-key="home" title="Home">Home</button>
             <button class="shell-key" data-key="end" title="End">End</button>
             <button class="shell-key" data-key="pgup" title="Page Up">PgUp</button>
@@ -1530,6 +1534,7 @@
                 <span id="files-ide-status-host" class="files-ide-status-host"><span class="files-ide-host-dot"></span><span id="files-ide-status-host-label"></span></span>
                 <span id="files-ide-status-path" class="files-ide-status-path" title=""></span>
                 <span id="files-ide-status-meta" class="files-ide-status-meta"></span>
+                <span id="files-ide-status-lncol" class="files-ide-status-lncol"></span>
                 <span class="files-ide-statusbar-spacer"></span>
                 <span id="files-ide-save-status" class="files-ide-save-status" aria-live="polite"></span>
                 <button id="files-ide-save-btn" class="ui-btn primary" type="button" onclick="filesIdeSaveActive()" disabled>Save</button>

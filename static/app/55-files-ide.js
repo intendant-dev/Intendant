@@ -22,12 +22,15 @@ function switchFilesSubtab(name) {
 }
 
 // The machine tint: one accent answers "whose disk is this?" — blue for
-// this daemon, mauve for a peer. Applied to the active editor tab, tree
-// selection, and the statusbar host chip via --files-accent.
+// this daemon, mauve for a peer (ui-v2 maps the same rule onto the design
+// palette: sky = this daemon, violet = peer). Applied to the active editor
+// tab, tree selection, and the statusbar host chip via --files-accent.
 function filesIdeApplyAccent(hostId) {
-  document
-    .getElementById('tab-files')
-    ?.style.setProperty('--files-accent', hostId ? 'var(--mauve)' : 'var(--blue)');
+  const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
+  const accent = hostId
+    ? (ui2 ? 'var(--violet)' : 'var(--mauve)')
+    : (ui2 ? 'var(--sky)' : 'var(--blue)');
+  document.getElementById('tab-files')?.style.setProperty('--files-accent', accent);
 }
 
 function filesIdeSelectedHostId() {
@@ -864,6 +867,9 @@ function filesIdeActivate(key) {
         },
       },
     });
+    // Ln/Col statusbar indicator (ui-v2 design add; span is hidden and
+    // stays empty under v1).
+    filesIdeCm.on('cursorActivity', filesIdeUpdateLnCol);
   }
   if (empty) empty.classList.add('hidden');
   if (filesIdeCm) {
@@ -958,6 +964,22 @@ function filesIdeSetSaveStatus(kind, text) {
   el.className = 'files-ide-save-status' + (kind ? ` ${kind}` : '');
 }
 
+// Ln/Col cursor indicator, ui-v2 only: the design statusbar reads
+// `host · Language · LF · Ln 8, Col 24`. Under v1 the span is display:none
+// and kept empty so the flex gap contributes nothing.
+function filesIdeUpdateLnCol() {
+  const el = document.getElementById('files-ide-status-lncol');
+  if (!el) return;
+  const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
+  const buffer = filesIdeActiveBuffer();
+  if (!ui2 || !buffer || !filesIdeCm) {
+    if (el.textContent) el.textContent = '';
+    return;
+  }
+  const pos = filesIdeCm.getCursor();
+  el.textContent = `Ln ${pos.line + 1}, Col ${pos.ch + 1}`;
+}
+
 function filesIdeRenderChrome() {
   const buffer = filesIdeActiveBuffer();
   const pathEl = document.getElementById('files-ide-status-path');
@@ -1015,6 +1037,7 @@ function filesIdeRenderChrome() {
       banner.innerHTML = '';
     }
   }
+  filesIdeUpdateLnCol();
 }
 
 function filesIdeSerializeBuffer(buffer) {
