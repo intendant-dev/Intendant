@@ -67779,6 +67779,7 @@ window.sessionsFuelProbe = () => ({
   fueled: dashboardControlTransport?.lastStatus?.fueled ?? null,
   haveStatus: !!dashboardControlTransport?.lastStatus,
   unfueledCached: daemonUnfueledCached,
+  projectless: daemonProjectless,
   effectiveAgent: effectiveNewSessionAgentId(),
   configuredAgent: newSessionConfiguredAgent || '',
   bannerHidden: !!document.getElementById('new-session-unfueled-banner')?.classList.contains('hidden'),
