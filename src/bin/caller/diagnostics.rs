@@ -48,9 +48,8 @@ pub fn sanitize_session_id(raw: &str) -> Option<String> {
 /// reject the request before reaching the disk).
 ///
 /// Path shape: `<intendant_state_dir>/diagnostics/visual-freshness/<session_id>.ndjson`.
-/// `intendant_state_dir` resolves to `$HOME/.intendant` (or `/tmp/.intendant`
-/// when `HOME` is unset, matching the convention the session-log writer
-/// already uses).
+/// `intendant_state_dir` is `platform::intendant_home()` — `~/.intendant`
+/// unless `$INTENDANT_HOME` overrides it, matching the session-log writer.
 pub fn visual_freshness_path(session_id: &str) -> Option<PathBuf> {
     let slug = sanitize_session_id(session_id)?;
     Some(
@@ -91,13 +90,12 @@ pub fn append_visual_freshness_record(session_id: &str, body: &[u8]) -> std::io:
     Ok(body.len())
 }
 
-/// Resolve the Intendant state directory (`~/.intendant`) via the shared
-/// cross-platform `platform::home_dir()` helper (honoring `$HOME` on Unix,
-/// `%USERPROFILE%` on Windows). Pulled into its own helper so test code can
-/// override the home env and verify path construction without touching
-/// production calls.
+/// Resolve the Intendant state directory via the shared
+/// `platform::intendant_home()` seam (`~/.intendant` by default,
+/// `$INTENDANT_HOME` when set; a per-process scratch root in unit-test
+/// builds so diagnostics tests never write the live state dir).
 fn intendant_state_dir() -> PathBuf {
-    crate::platform::home_dir().join(".intendant")
+    crate::platform::intendant_home()
 }
 
 #[cfg(test)]
@@ -168,14 +166,10 @@ mod tests {
 
     #[test]
     fn append_creates_parent_dirs_and_writes_body() {
-        // Sandbox the home dir to a tempdir so the test doesn't write into
-        // the user's real .intendant directory — HOME on Unix, USERPROFILE
-        // on Windows (the variable `platform::home_dir()` honors there).
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        let prev_home = std::env::var(home_var).ok();
-        std::env::set_var(home_var, tmp.path());
-
+        // In unit-test builds `platform::intendant_home()` resolves to a
+        // per-process scratch root, never the live `~/.intendant`, so the
+        // default path is already hermetic (this test used to mutate the
+        // process HOME, which raced parallel tests into the real home).
         let session_id = "phase0-test-12345";
         let body = b"{\"t\":\"transition\",\"v\":1}\n{\"t\":\"transition\",\"v\":2}\n";
         let written = append_visual_freshness_record(session_id, body).expect("append");
@@ -193,12 +187,6 @@ mod tests {
         assert_eq!(read2.len(), body.len() + body2.len());
         assert!(read2.starts_with(body));
         assert!(read2.ends_with(body2));
-
-        // Restore the home variable.
-        match prev_home {
-            Some(v) => std::env::set_var(home_var, v),
-            None => std::env::remove_var(home_var),
-        }
     }
 
     #[test]

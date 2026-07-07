@@ -59,9 +59,7 @@ fn host_label_candidates(primary_cert_dir: &std::path::Path) -> Vec<String> {
     if let Some(data_dir) = dirs::data_dir() {
         paths.push(data_dir.join("intendant").join("access-certs"));
     }
-    if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(".intendant").join("access-certs"));
-    }
+    paths.push(crate::platform::intendant_home().join("access-certs"));
 
     let mut out = Vec::new();
     for path in dedup_paths(paths) {

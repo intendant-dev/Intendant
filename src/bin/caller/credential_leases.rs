@@ -240,9 +240,7 @@ lives under ~/.intendant, outside any project worktree, so the
 rewind/snapshot machinery never sees it. */
 
 fn materialization_root() -> PathBuf {
-    crate::platform::home_dir()
-        .join(".intendant")
-        .join("leased-auth")
+    crate::platform::intendant_home().join("leased-auth")
 }
 
 fn restrict_dir(path: &Path) -> Result<(), String> {

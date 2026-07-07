@@ -99,7 +99,7 @@ fn overlay_lookup(
 }
 
 fn overlay_path(home: &Path) -> PathBuf {
-    home.join(".intendant").join(OVERLAY_FILE)
+    crate::platform::intendant_home_in(home).join(OVERLAY_FILE)
 }
 
 fn read_overlay_map(home: &Path) -> HashMap<String, HashMap<String, String>> {
@@ -191,7 +191,7 @@ fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<Path
         return intendant_session_dir_from_slash_path(home, session_id);
     }
 
-    let logs_dir = home.join(".intendant").join("logs");
+    let logs_dir = crate::platform::intendant_home_in(home).join("logs");
     let direct = logs_dir.join(session_id);
     if direct.is_dir() {
         return Some(direct);
@@ -250,7 +250,7 @@ pub(crate) fn intendant_session_dir_from_slash_path(
     if !candidate.is_dir() {
         return None;
     }
-    let logs_dir = home.join(".intendant").join("logs");
+    let logs_dir = crate::platform::intendant_home_in(home).join("logs");
     let logs_dir = std::fs::canonicalize(logs_dir).ok()?;
     let candidate = std::fs::canonicalize(candidate).ok()?;
     candidate.starts_with(&logs_dir).then_some(candidate)

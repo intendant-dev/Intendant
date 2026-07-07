@@ -711,18 +711,16 @@ fn start_fission_lifecycle(
     session_log: &SharedSessionLog,
 ) -> tokio::task::JoinHandle<()> {
     let watcher = fission_lifecycle::spawn_fission_lifecycle_watcher(bus.subscribe());
-    if let Some(home) = dirs::home_dir() {
-        match fission_lifecycle::rehydrate_from_logs(&home.join(".intendant").join("logs")) {
-            Ok(0) => {}
-            Ok(count) => slog(session_log, |l| {
-                l.info(&format!(
-                    "Rehydrated {count} fission branch route(s) from persisted ledgers"
-                ))
-            }),
-            Err(err) => slog(session_log, |l| {
-                l.warn(&format!("Fission branch route rehydration failed: {err}"))
-            }),
-        }
+    match fission_lifecycle::rehydrate_from_logs(&platform::intendant_home().join("logs")) {
+        Ok(0) => {}
+        Ok(count) => slog(session_log, |l| {
+            l.info(&format!(
+                "Rehydrated {count} fission branch route(s) from persisted ledgers"
+            ))
+        }),
+        Err(err) => slog(session_log, |l| {
+            l.warn(&format!("Fission branch route rehydration failed: {err}"))
+        }),
     }
     watcher
 }

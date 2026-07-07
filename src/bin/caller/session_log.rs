@@ -361,8 +361,7 @@ impl SessionLog {
 
         // A fresh UUID-named directory for each top-level caller invocation.
         let session_id = Uuid::new_v4().to_string();
-        crate::platform::home_dir()
-            .join(".intendant")
+        crate::platform::intendant_home()
             .join("logs")
             .join(&session_id)
     }
@@ -371,7 +370,7 @@ impl SessionLog {
     /// Scans `~/.intendant/logs/*/session_meta.json`, filters by project_root,
     /// and returns the most recently created session.
     pub fn find_latest_session(project_root: &Path) -> Option<(String, PathBuf)> {
-        let logs_dir = crate::platform::home_dir().join(".intendant").join("logs");
+        let logs_dir = crate::platform::intendant_home().join("logs");
         if !logs_dir.is_dir() {
             return None;
         }
@@ -430,7 +429,7 @@ impl SessionLog {
             return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
         }
 
-        let logs_dir = home.join(".intendant").join("logs");
+        let logs_dir = crate::platform::intendant_home_in(home).join("logs");
 
         // Direct match (dir name == session_id)
         let direct = logs_dir.join(session_id);

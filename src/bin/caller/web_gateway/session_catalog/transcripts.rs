@@ -1194,7 +1194,7 @@ pub(crate) fn recent_intendant_log_dirs(home: &Path, limit: usize) -> Vec<PathBu
     if limit == 0 {
         return Vec::new();
     }
-    let logs_dir = home.join(".intendant").join("logs");
+    let logs_dir = crate::platform::intendant_home_in(home).join("logs");
     let Ok(entries) = std::fs::read_dir(logs_dir) else {
         return Vec::new();
     };

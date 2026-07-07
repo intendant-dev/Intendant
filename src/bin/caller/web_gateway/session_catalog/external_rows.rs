@@ -37,7 +37,7 @@ pub(crate) fn intendant_session_dir_from_id_or_path(
         }
     }
 
-    let logs_dir = home.join(".intendant").join("logs");
+    let logs_dir = crate::platform::intendant_home_in(home).join("logs");
     let direct = logs_dir.join(session_id);
     if direct.is_dir() {
         return Some(direct);
@@ -474,7 +474,7 @@ pub(crate) fn resolve_bare_session_dir_from_home(home: &Path, session_id: &str) 
         return None;
     }
 
-    let logs_dir = home.join(".intendant").join("logs");
+    let logs_dir = crate::platform::intendant_home_in(home).join("logs");
 
     if logs_dir.join(session_id).is_dir() {
         return Some(logs_dir.join(session_id));
@@ -527,7 +527,7 @@ pub(crate) fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn deleted_external_sessions_path(home: &Path) -> PathBuf {
-    home.join(".intendant").join(DELETED_EXTERNAL_SESSIONS_FILE)
+    crate::platform::intendant_home_in(home).join(DELETED_EXTERNAL_SESSIONS_FILE)
 }
 
 pub(crate) fn read_deleted_external_sessions(home: &Path) -> HashSet<(String, String)> {
