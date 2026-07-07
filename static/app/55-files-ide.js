@@ -2448,12 +2448,59 @@ const NEW_SESSION_UNFUELED_MESSAGE =
   'This daemon has no model credentials, so the internal agent can’t start. ' +
   'External agents (Codex, Claude Code) sign in with their own accounts and still work.';
 
+// ── Projectless preflight ──
+// A daemon launched outside any project reports project_root: null and has
+// no default project — a session cannot start without one. Mirrors the
+// unfueled preflight: known-projectless blocks submit with a pointer at the
+// Project field; unknown (fetch failed, older daemon) never blocks — the
+// daemon's structured no_project failure is the backstop.
+let daemonProjectless = null; // null = unknown
+
+const NEW_SESSION_NO_PROJECT_MESSAGE =
+  'This daemon has no project open. Pick a project directory in the Project field to start a session.';
+
+function newSessionPickProjectAction() {
+  return {
+    label: 'Pick project',
+    onClick: () => {
+      const input = document.getElementById('new-session-project-root');
+      input?.focus();
+      input?.scrollIntoView?.({ block: 'center' });
+    },
+  };
+}
+
+// Shared submit guard (Sessions pane + Station launch): true = blocked.
+function newSessionProjectlessBlocked(requestedProjectRoot) {
+  if (requestedProjectRoot || daemonProjectless !== true) return false;
+  setNewSessionSpawnNotice('error', NEW_SESSION_NO_PROJECT_MESSAGE, newSessionPickProjectAction());
+  return true;
+}
+
+// A no_project SessionEnded can only come from a failed create (no session
+// ever starts under it), so one arriving while a spawn is pending is ours:
+// fail the pending notice with the structured class instead of leaving it
+// to the timeout or prose-matched log entries.
+function maybeFailPendingNewSessionSpawnNoProject(errorKind) {
+  if (errorKind !== 'no_project' || !newSessionSpawnPending) return false;
+  clearNewSessionSpawnTimers();
+  clearNewSessionSpawnRecent();
+  newSessionSpawnPending = false;
+  newSessionSpawnTask = '';
+  newSessionSpawnName = '';
+  setNewSessionStartButtonPending(false);
+  setNewSessionSpawnNotice('error', NEW_SESSION_NO_PROJECT_MESSAGE, newSessionPickProjectAction());
+  showControlToast('error', NEW_SESSION_NO_PROJECT_MESSAGE);
+  return true;
+}
+
 // QA hook (stationProbe convention): the preflight inputs the
 // validate-dashboard harness asserts on — module scope hides them.
 window.sessionsFuelProbe = () => ({
   fueled: dashboardControlTransport?.lastStatus?.fueled ?? null,
   haveStatus: !!dashboardControlTransport?.lastStatus,
   unfueledCached: daemonUnfueledCached,
+  projectless: daemonProjectless,
   effectiveAgent: effectiveNewSessionAgentId(),
   configuredAgent: newSessionConfiguredAgent || '',
   bannerHidden: !!document.getElementById('new-session-unfueled-banner')?.classList.contains('hidden'),
@@ -2558,7 +2605,11 @@ function maybeFailRecentNewSessionSpawn(sessionId, reason, errorKind) {
   newSessionSpawnName = '';
   setNewSessionStartButtonPending(false);
   // Structured failure classes carry an action instead of prose-parsing.
-  const action = errorKind === 'unfueled' ? newSessionAddKeysAction() : null;
+  const action = errorKind === 'unfueled'
+    ? newSessionAddKeysAction()
+    : errorKind === 'no_project'
+      ? newSessionPickProjectAction()
+      : null;
   setNewSessionSpawnNotice('error', message, action);
   showControlToast('error', message);
   return true;
@@ -2646,6 +2697,10 @@ function maybeFailNewSessionSpawnFromLog(c) {
 async function loadNewSessionProjectRoot() {
   try {
     const d = await fetchProjectRoot();
+    // project_root: null = projectless daemon (a rooted daemon always
+    // reports a non-empty string). On fetch failure the flag stays
+    // unknown and never blocks.
+    daemonProjectless = !d.project_root;
     setNewSessionProjectRoot(d.project_root || '');
   } catch (e) {
     console.warn('Failed to load project root:', e);
@@ -2680,6 +2735,7 @@ async function startNewSession() {
   const attachments = pendingAttachments.map(a => a.frameId);
   const attachmentReceipt = pendingAttachments.slice();
   const requestedProjectRoot = document.getElementById('new-session-project-root')?.value.trim() || '';
+  if (newSessionProjectlessBlocked(requestedProjectRoot)) return;
   beginNewSessionSpawnNotice(
     task,
     requestedProjectRoot ? 'Checking project directory...' : 'Spawning new session...',

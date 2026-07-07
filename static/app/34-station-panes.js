@@ -317,6 +317,11 @@ async function stationStartSession() {
   }
   const name = String(stationLaunchDraft.name || '').trim();
   const requestedProjectRoot = String(stationLaunchDraft.project || '').trim();
+  if (newSessionProjectlessBlocked(requestedProjectRoot)) {
+    showControlToast?.('error', NEW_SESSION_NO_PROJECT_MESSAGE);
+    stationOpenPanel?.('system:controls', 'Pick a project directory for the session');
+    return;
+  }
   beginNewSessionSpawnNotice(
     task,
     requestedProjectRoot ? 'Checking project directory...' : 'Spawning new session...',
