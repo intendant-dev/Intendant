@@ -1,7 +1,7 @@
 //! From SDP offer to connected peer: answer-SDP sanitization, SSRC/ufrag
 //! generation, RTP codec parameters, offer parsing (video mid, simulcast
 //! recv rids, federated detection), and the `impl WebRtcPeer` construction
-//! + command API (`build_with_codec_set`, `new`, the send_* methods,
+//! and command API (`build_with_codec_set`, `new`, the send_* methods,
 //! `add_ice_candidate`, `close`).
 
 use super::*;
