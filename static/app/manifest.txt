@@ -16,6 +16,7 @@
 14-styles-displays-voice.css
 16-styles-v2-tokens.css
 ui2-chrome.css
+ui2-voice.css
 19-style-close.html
 
 20-shell.html
@@ -27,6 +28,7 @@ ui2-shell.html
 30-module-open.html
 31-ui2-foundation.js
 ui2-chrome.js
+ui2-voice.js
 31-init-identity-fleet.js
 32-vault-custody.js
 33-station-core.js

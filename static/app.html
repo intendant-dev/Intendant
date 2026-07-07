@@ -12325,6 +12325,108 @@ html.ui-v2 .ui2-palette-empty {
   html.ui-v2 .ui2-nav-item-label, html.ui-v2 .ui2-nav-badge { display: none; }
   html.ui-v2 .ui2-nav-bottom { display: none; }
 }
+/* ── static/app/ui2-voice.css ── */
+/* ── ui-v2 voice: mic button + in-call panel (user-approved design) ────
+   All scoped html.ui-v2. The v1 floating overlay stays in the DOM
+   (bootstrap asserts it) but hidden; its live controls are re-parented
+   into the panel by ui2-voice.js. */
+
+html.ui-v2 #voiceOverlay { display: none !important; }
+
+html.ui-v2 .ui2-micbtn {
+  position: relative;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; flex-shrink: 0;
+  border: 1px solid var(--line); border-radius: var(--r-ctl);
+  background: transparent; color: var(--text-2); cursor: pointer;
+  transition: background var(--t-med), color var(--t-med);
+}
+html.ui-v2 .ui2-micbtn:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 .ui2-micbtn-dot {
+  position: absolute; top: 5px; right: 5px;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: transparent;
+}
+html.ui-v2 .ui2-micbtn[data-state="live"] { color: var(--green); border-color: rgba(var(--green-rgb), .4); }
+html.ui-v2 .ui2-micbtn[data-state="live"] .ui2-micbtn-dot { background: var(--green); animation: ui2-pulse 1.3s infinite; }
+html.ui-v2 .ui2-micbtn[data-state="passive"] { color: var(--sky); }
+html.ui-v2 .ui2-micbtn[data-state="passive"] .ui2-micbtn-dot { background: var(--sky); }
+html.ui-v2 .ui2-micbtn[data-state="error"] { color: var(--rose); border-color: rgba(var(--rose-rgb), .4); }
+html.ui-v2 .ui2-micbtn[data-state="error"] .ui2-micbtn-dot { background: var(--rose); }
+
+html.ui-v2 #ui2-voice-panel {
+  position: fixed;
+  top: calc(var(--ui2-ovs-h) + 8px);
+  right: 14px;
+  width: 320px;
+  z-index: 90;
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-panel);
+  box-shadow: var(--shadow-overlay);
+  animation: ui2-rise .2s ease;
+  overflow: hidden;
+}
+html.ui-v2 .ui2-vp-head {
+  display: flex; align-items: center; gap: 9px;
+  padding: 13px 15px; border-bottom: 1px solid var(--line);
+}
+html.ui-v2 .ui2-vp-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--neutral-dot); }
+html.ui-v2 #ui2-voice-panel[data-state="live"] .ui2-vp-dot { background: var(--green); box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16); }
+html.ui-v2 #ui2-voice-panel[data-state="passive"] .ui2-vp-dot { background: var(--sky); box-shadow: 0 0 0 3px rgba(var(--sky-rgb), .16); }
+html.ui-v2 #ui2-voice-panel[data-state="error"] .ui2-vp-dot { background: var(--rose); box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .16); }
+html.ui-v2 .ui2-vp-title { font-size: 13px; font-weight: 800; flex: 1; }
+html.ui-v2 .ui2-vp-sub { font-family: var(--mono); font-size: 10px; color: var(--text-3); }
+html.ui-v2 .ui2-vp-close {
+  border: 0; background: transparent; color: var(--text-3); cursor: pointer;
+  display: flex; padding: 3px; border-radius: 6px;
+}
+html.ui-v2 .ui2-vp-close:hover { color: var(--text); background: var(--surface-2); }
+html.ui-v2 .ui2-vp-body { padding: 14px 15px; display: flex; flex-direction: column; gap: 12px; }
+
+/* Re-parented v1 controls, restyled by id under the flag. */
+html.ui-v2 .ui2-vp-controls { display: flex; gap: 8px; }
+html.ui-v2 .ui2-vp-controls #micBtn,
+html.ui-v2 .ui2-vp-controls #videoBtn,
+html.ui-v2 .ui2-vp-controls #makeActiveBtn {
+  flex: 1; width: auto; height: auto; position: static;
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  padding: 9px 10px; border-radius: 10px;
+  font-family: var(--sans); font-size: 12.5px; font-weight: 700; cursor: pointer;
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--text);
+  box-shadow: none;
+}
+html.ui-v2 .ui2-vp-controls #micBtn.mic-on,
+html.ui-v2 .ui2-vp-controls #videoBtn.video-on {
+  border-color: rgba(var(--green-rgb), .4); color: var(--green); background: transparent;
+}
+html.ui-v2 .ui2-vp-controls #makeActiveBtn {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent); border: 0; font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+}
+/* The v1 controls are icon-only rounds; in panel context give them
+   text labels so the row reads like the approved mockup. */
+html.ui-v2 .ui2-vp-controls #micBtn::after { content: 'Mic'; }
+html.ui-v2 .ui2-vp-controls #videoBtn::after { content: 'Camera'; }
+html.ui-v2 #ui2-voice-panel[data-state="idle"] .ui2-vp-note::before {
+  content: 'Start the mic to talk to this daemon live. ';
+  color: var(--text-2);
+}
+html.ui-v2 .ui2-vp-status-slot:empty, html.ui-v2 .ui2-vp-cam-slot:empty { display: none; }
+html.ui-v2 .ui2-vp-status-slot #voiceStatus {
+  position: static; display: block; max-width: none;
+  background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: 999px; padding: 4px 11px;
+  font-size: 11px; font-weight: 700; color: var(--text-2);
+}
+html.ui-v2 .ui2-vp-cam-slot #videoPreviewWrap {
+  position: static; width: 100%; height: auto;
+  border-radius: 10px; overflow: hidden;
+  border: 1px solid var(--line); background: var(--code-bg);
+}
+html.ui-v2 .ui2-vp-cam-slot #videoPreviewEl { width: 100%; height: auto; display: block; }
+html.ui-v2 .ui2-vp-note { font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
 </style>
 <!-- ── static/app/20-shell.html ── -->
 </head>
@@ -15525,6 +15627,104 @@ if (ui2Enabled()) {
   const wire = () => { ui2WireMirrors(); ui2WirePalette(); };
   document.addEventListener('DOMContentLoaded', wire, { once: true });
   if (document.readyState !== 'loading') wire();
+}
+/* ── static/app/ui2-voice.js ── */
+// ── ui-v2 voice: oversight mic button + in-call popover panel ──────────
+// User-approved design (2026-07-07): 5 states, transcript stays in the
+// Activity log, camera off by default (unchanged v1 behavior).
+//
+// Mechanism: the WASM presence callbacks hold direct references to the
+// v1 overlay's elements (#micBtn #videoBtn #makeActiveBtn #voiceStatus
+// #videoPreviewWrap) with no null guards — so under ui-v2 those exact
+// nodes are RE-PARENTED into the panel (ids, listeners, and WASM refs
+// survive; the v1 overlay shell stays in the DOM, hidden, because
+// 22-voice-bootstrap.html asserts it exists). v1 without the flag is
+// byte-identical. No presence-web changes.
+
+function ui2VoiceBuildPanel() {
+  const bar = document.getElementById('ui2-oversight');
+  if (!bar || document.getElementById('ui2-mic-btn')) return;
+
+  const mic = document.createElement('button');
+  mic.type = 'button';
+  mic.id = 'ui2-mic-btn';
+  mic.className = 'ui2-micbtn';
+  mic.title = 'Voice';
+  mic.dataset.state = 'idle';
+  mic.innerHTML = `<span class="ui2-micbtn-icon">${ui2Icon('mic', 16)}</span><span class="ui2-micbtn-dot"></span>`;
+  const search = document.getElementById('ui2-search-btn');
+  bar.insertBefore(mic, search);
+
+  const panel = document.createElement('div');
+  panel.id = 'ui2-voice-panel';
+  panel.hidden = true;
+  panel.innerHTML = `
+    <div class="ui2-vp-head">
+      <span class="ui2-vp-dot"></span>
+      <span class="ui2-vp-title" id="ui2-vp-title">Voice</span>
+      <span class="ui2-vp-sub" id="ui2-vp-sub"></span>
+      <button type="button" class="ui2-vp-close" id="ui2-vp-close" title="Close">${ui2Icon('close', 13)}</button>
+    </div>
+    <div class="ui2-vp-body">
+      <div class="ui2-vp-status-slot" id="ui2-vp-status-slot"></div>
+      <div class="ui2-vp-cam-slot" id="ui2-vp-cam-slot"></div>
+      <div class="ui2-vp-controls" id="ui2-vp-controls"></div>
+      <div class="ui2-vp-note" id="ui2-vp-note">Live transcript appears in the Activity log.</div>
+    </div>`;
+  document.body.appendChild(panel);
+
+  // Re-parent the live v1 controls (ids/listeners/WASM refs intact).
+  const controls = panel.querySelector('#ui2-vp-controls');
+  for (const id of ['micBtn', 'videoBtn', 'makeActiveBtn']) {
+    const el = document.getElementById(id);
+    if (el) controls.appendChild(el);
+  }
+  const status = document.getElementById('voiceStatus');
+  if (status) panel.querySelector('#ui2-vp-status-slot').appendChild(status);
+  const cam = document.getElementById('videoPreviewWrap');
+  if (cam) panel.querySelector('#ui2-vp-cam-slot').appendChild(cam);
+
+  const toggle = (open) => { panel.hidden = open === undefined ? !panel.hidden : !open ? true : false; };
+  mic.addEventListener('click', () => toggle());
+  panel.querySelector('#ui2-vp-close').addEventListener('click', () => toggle(false));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !panel.hidden) { e.stopPropagation(); toggle(false); }
+  }, true);
+  document.addEventListener('mousedown', (e) => {
+    if (!panel.hidden && !panel.contains(e.target) && e.target !== mic && !mic.contains(e.target)) toggle(false);
+  });
+
+  // State machine mirrors: #sb-voice (ok/err + provider label) and
+  // #sb-active-badge (Active/Passive) stay v1-truth; we re-present.
+  const applyState = () => {
+    const sbVoice = document.getElementById('sb-voice');
+    const sbLabel = document.getElementById('sb-voice-label');
+    const badge = document.getElementById('sb-active-badge');
+    const cls = (sbVoice && sbVoice.className) || '';
+    const label = ((sbLabel && sbLabel.textContent) || '').trim();
+    const badgeText = ((badge && badge.textContent) || '').trim().toLowerCase();
+    let state = 'idle';
+    if (/err/.test(cls)) state = 'error';
+    else if (/ok/.test(cls)) state = 'live';
+    else if (badgeText.includes('passive')) state = 'passive';
+    mic.dataset.state = state;
+    panel.dataset.state = state;
+    const title = panel.querySelector('#ui2-vp-title');
+    title.textContent = state === 'live' ? 'Voice · live'
+      : state === 'error' ? 'Voice · error'
+      : state === 'passive' ? 'Voice · passive' : 'Voice';
+    panel.querySelector('#ui2-vp-sub').textContent = label;
+  };
+  for (const id of ['sb-voice', 'sb-voice-label', 'sb-active-badge']) {
+    const el = document.getElementById(id);
+    if (el) new MutationObserver(applyState).observe(el, { attributes: true, childList: true, characterData: true, subtree: true });
+  }
+  applyState();
+}
+
+if (ui2Enabled()) {
+  document.addEventListener('DOMContentLoaded', ui2VoiceBuildPanel, { once: true });
+  if (document.readyState !== 'loading') ui2VoiceBuildPanel();
 }
 /* ── static/app/31-init-identity-fleet.js ── */
 'use strict';
