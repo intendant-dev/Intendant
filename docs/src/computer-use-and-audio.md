@@ -15,7 +15,8 @@ the *model* seeing and acting, not the human-facing video transport.
 The CU abstraction (`src/bin/caller/computer_use.rs`) gives any provider a
 common action set and dispatches it through a platform backend. Provider-
 specific parsing of CU tool calls (OpenAI computer-use, Anthropic
-`computer_20251124`, Gemini) lives in `provider.rs`; the executor here is
+`computer_20251124`, Gemini) lives in the `provider/` per-provider modules
+(`openai.rs`, `anthropic.rs`, `gemini.rs`); the executor here is
 provider-neutral. Anthropic `wait`/`hold_key` durations arrive in **seconds**
 and are converted to milliseconds (clamped to 30 s) at parse time.
 
