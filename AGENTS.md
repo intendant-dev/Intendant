@@ -329,7 +329,8 @@ GitHub Actions on push / PR to `main`, and — for the required checks — on ev
 and `merge_group`**: GitHub only lets a PR enter the merge queue after its own
 required checks pass, so a paths-skipped required check blocks queue entry
 (and on the group side wedges the entry at "Expected"). Only the push-to-main
-triggers keep paths filters — they exist for cache warming, not gating.
+triggers keep paths filters — push runs are check-only warm passes, not gates
+(`smokes.yml` has no push trigger at all).
 
 Trusted refs (pushes, merge-queue refs, same-repo PRs) run on the
 **self-hosted fleet** (`dell-206` = `intendant-linux`, `macbook-vm` =
@@ -343,8 +344,8 @@ not just first-timers). The Dell and Windows runners run as dedicated
 non-admin `ci` users, and the check *names* stay pinned to the
 `test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os` is
 the name key, `runner` is the fleet placement):
-- **`windows.yml`** — cross-platform `cargo test` (the `intendant` bins + the `intendant-core`/`intendant-display`/`intendant-platform` lib crates) + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Outside the merge group the Windows **and macOS** legs run `cargo check` only (fast pre-queue signal on PRs, cheap warm on main pushes); the full non-Linux suites run in the merge group — the actual gate. Linux runs the full suite on every trigger. Headless-safe: needs no display or API keys. **Required check.**
-- **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real binaries on Linux only (debug profile; the drivers are platform-agnostic protocol probes, so a second platform mostly duplicated coverage while doubling flake surface). **Required check.**
+- **`windows.yml`** — cross-platform `cargo test` (the `intendant` bins + the `intendant-core`/`intendant-display`/`intendant-platform` lib crates) + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Full suites run in exactly two places: the **merge group** (all three platforms — the actual gate) and the **Linux `pull_request` leg** (the pre-queue runtime signal); everything else — non-Linux PR legs, every push-to-main warm run — is `cargo check` only. The Windows and Linux legs build with debuginfo off (`CARGO_PROFILE_DEV_DEBUG=0` — the Linux leg measured ~95% compile+link vs ~12s of test execution; repro locally with default debuginfo when a CI backtrace is too thin). Headless-safe: needs no display or API keys. **Required check.**
+- **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real binaries on Linux only (debug profile with debuginfo off, sharing the runner's warm tree with the test job; the drivers are platform-agnostic protocol probes, so a second platform mostly duplicated coverage while doubling flake surface). PR + merge group only — no push trigger. **Required check.**
 - **`app-html.yml`** — the `static/app/` fragments ↔ generated `static/app.html` regen gate. **Required check.**
 - **`agents-md-sync.yml`** — CLAUDE.md ↔ AGENTS.md byte-parity. **Required check.**
 - **`audit.yml`** — `cargo audit` on push/PR plus a weekly cron (Mondays 08:00 UTC). Advisory only — new upstream advisories must not block unrelated landings.
