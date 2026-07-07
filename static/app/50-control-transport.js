@@ -878,11 +878,20 @@ class DashboardControlTransport {
     return body;
   }
 
+  /* One cached /api/me fetch serves both the CSRF header and the signed
+     account claim on v2 offers. */
+  async connectMe() {
+    if (!this.connectMeInfo) {
+      const resp = await fetch('/api/me');
+      this.connectMeInfo = await resp.json().catch(() => ({}));
+    }
+    return this.connectMeInfo || {};
+  }
+
   async connectSignalHeaders() {
     if (!this.connectCsrfToken) {
-      const resp = await fetch('/api/me');
-      const body = await resp.json().catch(() => ({}));
-      this.connectCsrfToken = String(body.csrf_token || '');
+      const me = await this.connectMe();
+      this.connectCsrfToken = String(me.csrf_token || '');
     }
     const headers = { 'content-type': 'application/json' };
     if (this.connectCsrfToken) headers['x-intendant-csrf'] = this.connectCsrfToken;
@@ -902,10 +911,18 @@ class DashboardControlTransport {
       if (!DASHBOARD_CONNECT_DAEMON_ID) {
         throw new Error('Connect dashboard missing daemon_id');
       }
+      // Sign the browser's own account claim into the offer (v2) so the
+      // daemon's pending-enrollment card can show an account attested by
+      // this device key rather than asserted by the relay.
+      const me = await this.connectMe().catch(() => ({}));
+      const account = me?.authenticated && me?.user?.id
+        ? { userId: String(me.user.id), name: String(me.user.account_name || '') }
+        : null;
       const identity = await clientIdentityOfferFields(
         DASHBOARD_CONNECT_DAEMON_ID,
         this.clientNonce,
-        sdp
+        sdp,
+        account
       );
       // A stored org grant rides along so a daemon that trusts the org
       // materializes it before resolving this very offer (one-round-trip

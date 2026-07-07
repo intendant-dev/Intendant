@@ -2326,8 +2326,14 @@ window.intendantVault = {
 /* Sign an offer. Absence is legacy-compatible (the daemon falls back to
    account/trusted-transport identity); a present-but-invalid signature is
    rejected by the daemon, so a signaling relay can neither forge nor splice
-   a key binding. */
-async function clientIdentityOfferFields(daemonId, clientNonce, sdp) {
+   a key binding.
+
+   With `account` ({userId, name}) the signature covers the v2 payload,
+   which additionally binds this browser's OWN account claim — the pending
+   enrollment then shows "@name" attested by the device key instead of
+   whatever the relay asserts. Mirrors access/client_key.rs payloads
+   byte-for-byte. */
+async function clientIdentityOfferFields(daemonId, clientNonce, sdp, account) {
   try {
     const identity = await clientIdentityGet();
     if (!identity) return {};
@@ -2335,8 +2341,13 @@ async function clientIdentityOfferFields(daemonId, clientNonce, sdp) {
     const sdpDigest = dashboardBytesToBase64Url(
       new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sdp)))
     );
+    const accountUserId = account?.userId ? String(account.userId).trim() : '';
+    const accountName = account?.name ? String(account.name).trim() : '';
+    const v2 = Boolean(accountUserId);
     const payload = new TextEncoder().encode(
-      `intendant-client-key-offer-v1\n${daemonId || ''}\n${clientNonce || ''}\n${sdpDigest}\n${ts}`
+      v2
+        ? `intendant-client-key-offer-v2\n${daemonId || ''}\n${clientNonce || ''}\n${sdpDigest}\n${ts}\n${accountUserId}\n${accountName}`
+        : `intendant-client-key-offer-v1\n${daemonId || ''}\n${clientNonce || ''}\n${sdpDigest}\n${ts}`
     );
     const signature = await crypto.subtle.sign(
       { name: 'ECDSA', hash: 'SHA-256' },
@@ -2347,6 +2358,13 @@ async function clientIdentityOfferFields(daemonId, clientNonce, sdp) {
       client_key: identity.publicRawB64u,
       client_key_sig: dashboardBytesToBase64Url(new Uint8Array(signature)),
       client_key_ts: ts,
+      ...(v2
+        ? {
+            client_key_proto: 'intendant-client-key-offer-v2',
+            client_key_account_user_id: accountUserId,
+            ...(accountName ? { client_key_account_name: accountName } : {}),
+          }
+        : {}),
     };
   } catch (err) {
     console.warn('[client-identity] offer signing failed:', err?.message || err);

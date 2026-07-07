@@ -84,7 +84,29 @@ protocol sealed each claim.
 
 Claiming grants **no authority** — sessions still resolve against the
 daemon's local IAM (see the role ceilings and org lanes in the trust
-chapter).
+chapter) — with one deliberate, tightly-scoped exception below.
+
+## First-owner bootstrap (fresh boxes)
+
+A daemon whose local IAM is completely empty (no principals, no grants —
+a fresh VPS) **mints its own claim phrase** instead of accepting a
+service-minted one: it registers only the SHA-256 of the normalized
+phrase, so the rendezvous can route a claim but never sees plaintext.
+The claim page hashes what the user types (plaintext codes stop leaving
+the browser altogether) and, when the service answers
+`needs_bootstrap_arm`, arms the claim: it loads-or-mints this origin's
+browser identity key and posts it with an HMAC tag keyed by the phrase,
+binding that exact key and account. The daemon recomputes the tag — a
+valid tag proves the claimer read the phrase off the box (the same proof
+SSH access would be) and endorses exactly that key, so the daemon
+enrolls it as `role:root` (recorded with the sentinel origin
+`connect-bootstrap`, which no hosted-origin role ceiling caps) and only
+then co-signs the claim. A relay cannot substitute its own key (the tag
+would not verify), a wrong phrase refuses the whole claim with the real
+reason surfaced to the page, and the window closes forever the moment
+any principal or grant exists. This completes the zero-install story:
+`curl … | sh` on a fresh box, read twelve words from its log, and the
+browser that claims it owns it.
 
 Bindings are releasable from both sides, and both paths append
 `daemon_unclaimed` transparency-log entries: the account owner revokes

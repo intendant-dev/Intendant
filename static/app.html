@@ -17895,8 +17895,14 @@ window.intendantVault = {
 /* Sign an offer. Absence is legacy-compatible (the daemon falls back to
    account/trusted-transport identity); a present-but-invalid signature is
    rejected by the daemon, so a signaling relay can neither forge nor splice
-   a key binding. */
-async function clientIdentityOfferFields(daemonId, clientNonce, sdp) {
+   a key binding.
+
+   With `account` ({userId, name}) the signature covers the v2 payload,
+   which additionally binds this browser's OWN account claim — the pending
+   enrollment then shows "@name" attested by the device key instead of
+   whatever the relay asserts. Mirrors access/client_key.rs payloads
+   byte-for-byte. */
+async function clientIdentityOfferFields(daemonId, clientNonce, sdp, account) {
   try {
     const identity = await clientIdentityGet();
     if (!identity) return {};
@@ -17904,8 +17910,13 @@ async function clientIdentityOfferFields(daemonId, clientNonce, sdp) {
     const sdpDigest = dashboardBytesToBase64Url(
       new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sdp)))
     );
+    const accountUserId = account?.userId ? String(account.userId).trim() : '';
+    const accountName = account?.name ? String(account.name).trim() : '';
+    const v2 = Boolean(accountUserId);
     const payload = new TextEncoder().encode(
-      `intendant-client-key-offer-v1\n${daemonId || ''}\n${clientNonce || ''}\n${sdpDigest}\n${ts}`
+      v2
+        ? `intendant-client-key-offer-v2\n${daemonId || ''}\n${clientNonce || ''}\n${sdpDigest}\n${ts}\n${accountUserId}\n${accountName}`
+        : `intendant-client-key-offer-v1\n${daemonId || ''}\n${clientNonce || ''}\n${sdpDigest}\n${ts}`
     );
     const signature = await crypto.subtle.sign(
       { name: 'ECDSA', hash: 'SHA-256' },
@@ -17916,6 +17927,13 @@ async function clientIdentityOfferFields(daemonId, clientNonce, sdp) {
       client_key: identity.publicRawB64u,
       client_key_sig: dashboardBytesToBase64Url(new Uint8Array(signature)),
       client_key_ts: ts,
+      ...(v2
+        ? {
+            client_key_proto: 'intendant-client-key-offer-v2',
+            client_key_account_user_id: accountUserId,
+            ...(accountName ? { client_key_account_name: accountName } : {}),
+          }
+        : {}),
     };
   } catch (err) {
     console.warn('[client-identity] offer signing failed:', err?.message || err);
@@ -42300,11 +42318,33 @@ function accessPeerGrantCounts(overview = accessOverviewModel()) {
   };
 }
 
+/* This device's own identity-key fingerprint, cached for synchronous
+   renderers. The SAS property of the knock ceremony: the approving human
+   compares the fingerprint the REQUESTING device displays locally against
+   the pending entry on the trusted session — approval by comparison, not
+   by timing coincidence. */
+let accessOwnDeviceFingerprint = '';
+let accessOwnDeviceFingerprintRequested = false;
+function accessEnsureOwnFingerprint() {
+  if (accessOwnDeviceFingerprintRequested) return;
+  accessOwnDeviceFingerprintRequested = true;
+  (async () => {
+    try {
+      const identity = await clientIdentityGet();
+      if (identity?.fingerprint) {
+        accessOwnDeviceFingerprint = String(identity.fingerprint);
+        renderAccessAdminSummaries();
+      }
+    } catch { /* no identity available — the hint below stays generic */ }
+  })();
+}
+
 /* Overview: actionable warnings first — an empty div when all is well. */
 function renderAccessAttention() {
   const mount = document.getElementById('access-attention');
   if (!mount) return;
   mount.innerHTML = '';
+  accessEnsureOwnFingerprint();
   const items = [];
   const status = dashboardTransport?.status
     ? dashboardTransport.status()
@@ -42321,6 +42361,9 @@ function renderAccessAttention() {
         steps: [
           'Open the daemon directly (its https://host:8765 address) with root access.',
           'Go to Access → People & Devices and grant your Connect account a role.',
+          accessOwnDeviceFingerprint
+            ? `Verify it is really this device: this browser's key fingerprint is ${accessOwnDeviceFingerprint} — approve the pending request only if it matches.`
+            : 'Compare the pending request’s key fingerprint against this device before approving.',
           'Reload this page — Connect is only the route; the daemon decides.',
         ],
         action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
@@ -42783,7 +42826,9 @@ function renderAccessConnectCard() {
     const expiresText = expires
       ? ` · expires ${new Date(expires).toLocaleTimeString()} (a fresh phrase mints automatically)`
       : '';
-    hint.textContent = `Sign in and enter this phrase to claim this daemon into your fleet${expiresText}`;
+    hint.textContent = status.bootstrap
+      ? `First-owner bootstrap: this daemon minted the phrase itself (the rendezvous holds only its hash). Entering it claims the daemon AND enrolls the claiming browser as owner${expiresText || ' · valid while this daemon runs'}`
+      : `Sign in and enter this phrase to claim this daemon into your fleet${expiresText}`;
     card.appendChild(hint);
     if (accessConnectRevealed.claim_url) {
       const linkRow = document.createElement('div');
@@ -42922,6 +42967,11 @@ function renderAccessEnrollmentRequests() {
     headRow.append(glyphEl, nameWrap);
     if (request.origin) {
       headRow.appendChild(accessRouteChip('connect', 'via hosted route', `The offer arrived through ${request.origin}; the key will be recorded with that origin, so the role ceiling applies until it is re-enrolled from an anchor origin.`));
+    }
+    if (request.account_hint) {
+      headRow.appendChild(request.account_attested
+        ? accessRouteChip('webrtc', 'account attested ✓', 'The device key itself signed this account claim (v2 offer) — the name is as trustworthy as the key fingerprint below.')
+        : accessRouteChip('remembered', 'account via route', 'The account name is asserted by the signaling relay, not signed by the device key. Verify the key fingerprint against the requesting device before trusting the name.'));
     }
     card.appendChild(headRow);
 
@@ -54803,11 +54853,20 @@ class DashboardControlTransport {
     return body;
   }
 
+  /* One cached /api/me fetch serves both the CSRF header and the signed
+     account claim on v2 offers. */
+  async connectMe() {
+    if (!this.connectMeInfo) {
+      const resp = await fetch('/api/me');
+      this.connectMeInfo = await resp.json().catch(() => ({}));
+    }
+    return this.connectMeInfo || {};
+  }
+
   async connectSignalHeaders() {
     if (!this.connectCsrfToken) {
-      const resp = await fetch('/api/me');
-      const body = await resp.json().catch(() => ({}));
-      this.connectCsrfToken = String(body.csrf_token || '');
+      const me = await this.connectMe();
+      this.connectCsrfToken = String(me.csrf_token || '');
     }
     const headers = { 'content-type': 'application/json' };
     if (this.connectCsrfToken) headers['x-intendant-csrf'] = this.connectCsrfToken;
@@ -54827,10 +54886,18 @@ class DashboardControlTransport {
       if (!DASHBOARD_CONNECT_DAEMON_ID) {
         throw new Error('Connect dashboard missing daemon_id');
       }
+      // Sign the browser's own account claim into the offer (v2) so the
+      // daemon's pending-enrollment card can show an account attested by
+      // this device key rather than asserted by the relay.
+      const me = await this.connectMe().catch(() => ({}));
+      const account = me?.authenticated && me?.user?.id
+        ? { userId: String(me.user.id), name: String(me.user.account_name || '') }
+        : null;
       const identity = await clientIdentityOfferFields(
         DASHBOARD_CONNECT_DAEMON_ID,
         this.clientNonce,
-        sdp
+        sdp,
+        account
       );
       // A stored org grant rides along so a daemon that trusts the org
       // materializes it before resolving this very offer (one-round-trip
