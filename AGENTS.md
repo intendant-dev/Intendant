@@ -101,7 +101,7 @@ src/
 │   ├── startup/                # web bind/TLS + peer boot; the three mode branches (daemon, mcp_mode, headless)
 │   ├── control_plane.rs, event.rs, frontend.rs   # single-writer state; EventBus + ControlMsg; state snapshots
 │   ├── session_supervisor.rs, task_dispatch.rs, file_watcher.rs   # daemon: sessions, dispatch, rewind snapshots
-│   ├── provider.rs, tools.rs, prompts.rs, approval.rs
+│   ├── provider/, tools.rs, prompts.rs, approval.rs   # provider/: ChatProvider + selection (mod.rs), per-provider openai/anthropic/gemini
 │   ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, agent_runner.rs   # native multi-agent
 │   ├── context_rewind.rs, fission_ledger.rs, fission_lifecycle.rs, lineage_ledger.rs   # managed context: rewinds, fission, lineage
 │   ├── external_agent/         # supervise Codex / Claude Code (+ external_wrapper_index.rs)
