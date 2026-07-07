@@ -96,7 +96,7 @@ src/
 │   ├── startup/                # web bind/TLS + peer boot; the three mode branches (daemon, mcp_mode, headless)
 │   ├── control_plane.rs, event.rs, frontend.rs   # single-writer state; EventBus + ControlMsg; state snapshots
 │   ├── session_supervisor.rs, task_dispatch.rs, file_watcher.rs   # daemon: sessions, dispatch, rewind snapshots
-│   ├── provider.rs, conversation.rs, tools.rs, prompts.rs, skills.rs, autonomy.rs, approval.rs
+│   ├── provider.rs, tools.rs, prompts.rs, approval.rs
 │   ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, agent_runner.rs   # native multi-agent
 │   ├── context_rewind.rs, fission_ledger.rs, fission_lifecycle.rs, lineage_ledger.rs   # managed context: rewinds, fission, lineage
 │   ├── external_agent/         # supervise Codex / Claude Code (+ external_wrapper_index.rs)
@@ -110,11 +110,13 @@ src/
 │   ├── dashboard_control.rs, terminal.rs, browser_workspace.rs   # dashboard tunnel; PTY registry; agent browser
 │   ├── mcp/, mcp_client.rs, control.rs
 │   ├── transfer_store.rs, upload_store.rs, peer_file_transfer.rs   # transfer jobs; upload/attachment stores
-│   ├── session_log.rs, session_names.rs, knowledge.rs, project.rs, app_state_pricing.rs
+│   ├── session_log.rs, session_names.rs, project.rs, app_state_pricing.rs
 │   ├── sandbox.rs, daemon_log_tee.rs, diagnostics.rs, …
 └── bin/connect/                # intendant-connect: hosted rendezvous (accounts, daemon claims, fleet sync, vault blobs, push, transparency log)
 crates/{presence-core, presence-web, station-web}   # WASM: shared presence types/tools/dispatch, browser presence client, Station renderer
 crates/intendant-platform   # OS integration leaf: platform probes/spawn (platform.rs), DisplayTarget, virtual-display mgmt (vision.rs)
+crates/intendant-core       # shared-vocabulary leaf: error, autonomy, frames, net probes, usage (TokenUsage), vitals, conversation, knowledge, skills
+crates/intendant-display    # the WebRTC display pipeline (encoder pool, tiles, capture backends, per-OS input)
 crates/app-html-assembler   # assembles static/app.html from static/app/ (build.rs + the CI regen gate)
 static/         # dashboard SPA: app/ fragments (source) → generated app.html; compiled wasm-web/ + wasm-station/
 macos-app/      # native macOS WKWebView wrapper (built by scripts/bundle-macos.sh)
