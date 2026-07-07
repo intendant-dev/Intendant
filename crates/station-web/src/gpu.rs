@@ -6,6 +6,7 @@ use wasm_bindgen::JsValue;
 #[cfg(target_arch = "wasm32")]
 use web_sys::HtmlCanvasElement;
 
+use crate::panes::PaneTarget;
 use crate::scene::{rotate_x, rotate_y, Plane, ProjectedNode, Vec2, Vec3};
 use crate::text_atlas::TextAtlas;
 use crate::util::Color;
@@ -684,6 +685,10 @@ pub(crate) struct GpuFrame {
     /// the textured text pipeline.
     pub(crate) text_vertices: Vec<TextVertex>,
     pub(crate) projected_nodes: Vec<ProjectedNode>,
+    /// World-space pick targets for the panes — the raycast counterpart
+    /// of `projected_nodes` (`input::pick_pane` intersects pointer rays
+    /// with these).
+    pub(crate) pane_targets: Vec<PaneTarget>,
 }
 
 impl GpuFrame {
@@ -694,6 +699,7 @@ impl GpuFrame {
         self.pane_vertices.clear();
         self.text_vertices.clear();
         self.projected_nodes.clear();
+        self.pane_targets.clear();
     }
 
     pub(crate) fn add_line_ndc(&mut self, a: Vec2, za: f32, b: Vec2, zb: f32, color: Color) {
@@ -1107,12 +1113,21 @@ mod tests {
             uv: [0.0, 0.0],
             color: [1.0; 4],
         });
+        frame.pane_targets.push(crate::panes::PaneTarget {
+            id: "op".into(),
+            anchor: Vec3::ZERO,
+            right: Vec3::new(1.0, 0.0, 0.0),
+            up: Vec3::Y,
+            half_w: 1.0,
+            half_h: 1.0,
+        });
         let cap = frame.tri_vertices.capacity();
         frame.clear();
         assert!(frame.tri_vertices.is_empty());
         assert!(frame.line_vertices.is_empty());
         assert!(frame.text_vertices.is_empty());
         assert!(frame.projected_nodes.is_empty());
+        assert!(frame.pane_targets.is_empty());
         assert_eq!(frame.tri_vertices.capacity(), cap);
     }
 }
