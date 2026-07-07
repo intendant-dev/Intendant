@@ -89,7 +89,7 @@ html, body {
    element rules. Component-specific rules (e.g. .shell-keybar) still win
    on specificity. */
 html {
-  scrollbar-color: rgba(88, 91, 112, 0.55) transparent;
+  scrollbar-color: color-mix(in srgb, var(--surface2) 55%, transparent) transparent;
 }
 ::-webkit-scrollbar {
   width: 10px;
@@ -99,13 +99,13 @@ html {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(88, 91, 112, 0.45);
+  background: color-mix(in srgb, var(--surface2) 45%, transparent);
   border: 2px solid transparent;
   border-radius: 8px;
   background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(108, 112, 134, 0.65);
+  background: color-mix(in srgb, var(--overlay0) 65%, transparent);
   background-clip: padding-box;
 }
 ::-webkit-scrollbar-corner {
@@ -233,7 +233,7 @@ html {
   transform: translateX(-50%);
   /* Translucent layered glass, deliberately blur-free: the open picker can
      extend over tab content (including the Station canvases). */
-  background: linear-gradient(180deg, rgba(49, 50, 68, 0.94), rgba(30, 30, 46, 0.96));
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface0) 94%, transparent), color-mix(in srgb, var(--base) 96%, transparent));
   border: 1px solid var(--glass-hairline-bright);
   border-radius: 10px;
   padding: 4px 0;
@@ -393,7 +393,7 @@ body.access-page #tab-access {
 }
 .tab-btn:hover {
   color: var(--subtext1);
-  background: rgba(205, 214, 244, 0.045);
+  background: color-mix(in srgb, var(--text) 4.5%, transparent);
 }
 .tab-btn.active {
   color: var(--blue);
@@ -463,7 +463,7 @@ body.access-page #tab-access {
   padding: 3px 10px;
   border: 1px solid var(--glass-hairline-bright);
   border-radius: 999px;
-  background: rgba(49, 50, 68, 0.5);
+  background: color-mix(in srgb, var(--surface0) 50%, transparent);
   color: var(--subtext1);
   font-family: inherit;
   font-size: 11px;
@@ -475,12 +475,12 @@ body.access-page #tab-access {
   transition: border-color 0.15s, background 0.15s, color 0.15s;
 }
 .station-peer-chip:hover:not(:disabled) {
-  border-color: rgba(137, 180, 250, 0.55);
-  background: rgba(137, 180, 250, 0.1);
+  border-color: color-mix(in srgb, var(--blue) 55%, transparent);
+  background: color-mix(in srgb, var(--blue) 10%, transparent);
   color: var(--blue);
 }
 .station-peer-chip:focus-visible {
-  outline: 2px solid rgba(137, 180, 250, 0.72);
+  outline: 2px solid color-mix(in srgb, var(--blue) 72%, transparent);
   outline-offset: 1px;
 }
 .station-peer-chip:disabled {
@@ -588,7 +588,7 @@ body.access-page #tab-access {
   padding: 5px 9px;
   border: 1px solid var(--glass-hairline-bright);
   border-radius: 9px;
-  background: linear-gradient(180deg, rgba(30, 30, 46, 0.78), rgba(17, 17, 27, 0.84));
+  background: linear-gradient(180deg, color-mix(in srgb, var(--base) 78%, transparent), color-mix(in srgb, var(--crust) 84%, transparent));
   box-shadow: var(--glass-highlight), 0 4px 14px rgba(0, 0, 0, 0.35);
   overflow: hidden;
   white-space: nowrap;
@@ -599,7 +599,7 @@ body.access-page #tab-access {
   color: var(--subtext0);
   padding-right: 7px;
   margin-right: 7px;
-  border-right: 1px solid rgba(205, 214, 244, 0.16);
+  border-right: 1px solid var(--glass-hairline-bright);
 }
 .station-status-metrics:empty { display: none; }
 .station-status-text {
@@ -799,7 +799,7 @@ body.access-page #tab-access {
 .access-matrix-table th,
 .access-matrix-table td {
   padding: 9px 10px;
-  border-bottom: 1px solid rgba(205, 214, 244, 0.1);
+  border-bottom: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
   color: var(--subtext0);
   font-size: 11px;
   text-align: left;
@@ -834,20 +834,20 @@ body.access-page #tab-access {
   white-space: nowrap;
 }
 .access-matrix-cell.yes {
-  border-color: rgba(166, 227, 161, 0.28);
+  border-color: color-mix(in srgb, var(--green) 28%, transparent);
   color: var(--green);
-  background: rgba(166, 227, 161, 0.08);
+  background: color-mix(in srgb, var(--green) 8%, transparent);
 }
 .access-matrix-cell.no {
-  border-color: rgba(243, 139, 168, 0.28);
+  border-color: color-mix(in srgb, var(--red) 28%, transparent);
   color: var(--red);
-  background: rgba(243, 139, 168, 0.08);
+  background: color-mix(in srgb, var(--red) 8%, transparent);
 }
 .access-matrix-cell.conditional,
 .access-matrix-cell.planned {
-  border-color: rgba(249, 226, 175, 0.28);
+  border-color: color-mix(in srgb, var(--yellow) 28%, transparent);
   color: var(--yellow);
-  background: rgba(249, 226, 175, 0.08);
+  background: color-mix(in srgb, var(--yellow) 8%, transparent);
 }
 .access-model-details {
   display: grid;
@@ -897,7 +897,7 @@ body.access-page #tab-access {
   padding: 9px 11px;
 }
 .access-model-row + .access-model-row {
-  border-top: 1px solid rgba(205, 214, 244, 0.1);
+  border-top: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
 }
 .access-model-main,
 .access-model-meta,
@@ -937,24 +937,24 @@ body.access-page #tab-access {
 .access-model-status.connected,
 .access-model-status.enforced,
 .access-model-status.current {
-  border-color: rgba(166, 227, 161, 0.28);
+  border-color: color-mix(in srgb, var(--green) 28%, transparent);
   color: var(--green);
-  background: rgba(166, 227, 161, 0.08);
+  background: color-mix(in srgb, var(--green) 8%, transparent);
 }
 .access-model-status.offline,
 .access-model-status.planned,
 .access-model-status.expired,
 .access-model-status.draft {
-  border-color: rgba(249, 226, 175, 0.28);
+  border-color: color-mix(in srgb, var(--yellow) 28%, transparent);
   color: var(--yellow);
-  background: rgba(249, 226, 175, 0.08);
+  background: color-mix(in srgb, var(--yellow) 8%, transparent);
 }
 .access-model-status.revoked,
 .access-model-status.disabled,
 .access-model-status.failed {
-  border-color: rgba(243, 139, 168, 0.28);
+  border-color: color-mix(in srgb, var(--red) 28%, transparent);
   color: var(--red);
-  background: rgba(243, 139, 168, 0.08);
+  background: color-mix(in srgb, var(--red) 8%, transparent);
 }
 .access-target-row {
   --access-target-accent: var(--blue);
@@ -1007,10 +1007,10 @@ body.access-page #tab-access {
 .access-target-badge {
   flex: 0 0 auto;
   padding: 1px 6px;
-  border: 1px solid rgba(137, 180, 250, 0.26);
+  border: 1px solid color-mix(in srgb, var(--blue) 26%, transparent);
   border-radius: 999px;
   color: var(--blue);
-  background: rgba(137, 180, 250, 0.08);
+  background: color-mix(in srgb, var(--blue) 8%, transparent);
   font-size: 10px;
   font-weight: 700;
   line-height: 1.45;
@@ -1085,7 +1085,7 @@ body.access-page #tab-access {
   font-weight: 800;
 }
 .access-target-actions button.danger {
-  border-color: rgba(243, 139, 168, 0.7);
+  border-color: color-mix(in srgb, var(--red) 70%, transparent);
   color: var(--red);
 }
 .access-target-actions button:hover {
