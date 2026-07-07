@@ -28,3 +28,13 @@ slow-timeout = { period = "30s", terminate-after = 8 }
 [[profile.default.overrides]]
 filter = 'test(/p12_|_recert|keychain/)'
 slow-timeout = { period = "60s", terminate-after = 4 }
+
+# Federation gateway rigs: each spins a real web gateway + WebSocket
+# transport (+ card fetch) and polls with multi-second deadlines; when
+# several run concurrently on a loaded box they blow the default budget
+# (observed as TIMEOUT batches across registry/handle/coordinator runs
+# at load average ~20) while passing comfortably under `cargo test` and
+# in isolation.
+[[profile.default.overrides]]
+filter = 'test(/peer::(registry::tests::add_peer_|handle::tests::snapshot_carries_folded_|coordinator::tests::)/)'
+slow-timeout = { period = "60s", terminate-after = 4 }

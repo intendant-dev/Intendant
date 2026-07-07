@@ -2377,6 +2377,12 @@ function snapshotToDaemonEntry(p) {
     // live peer_session_updated events produced this list, so wholesale
     // row replacement never loses session state.
     sessions: Array.isArray(p.sessions) ? p.sessions : [],
+    // The peer's advertised displays as folded server-side from its
+    // event stream ({display_id, width, height}, ascending display_id).
+    // Snapshots are authoritative — the same actor fold that feeds the
+    // live peer_display_ready/removed events produced this list, so
+    // wholesale row replacement never loses display state.
+    displays: Array.isArray(p.displays) ? p.displays : [],
   };
 }
 
@@ -2402,6 +2408,44 @@ function removePeerSession(hostId, sessionId) {
   if (idx < 0) return;
   d.sessions.splice(idx, 1);
   stationScheduleUpdate();
+}
+
+// Upsert one advertised display into a peer row's display list (live
+// peer_display_ready push). Unknown hosts are ignored — same
+// stale-push reasoning as updateDaemonSnapshot. display_id 0 is a
+// legitimate id, so guard with == null rather than falsiness. Unlike
+// sessions (Station-scene-only), displays also drive the header peer
+// chips, so this re-renders the daemons list — the same path the peer
+// add/remove/state pushes take, which refreshes the chips
+// (stationRenderPeerChips) and ends with the stationScheduleUpdate the
+// session helpers call.
+function upsertPeerDisplay(hostId, display) {
+  if (!hostId || !display || display.display_id == null) return;
+  const d = daemons.find(x => x.host_id === hostId);
+  if (!d) return;
+  if (!Array.isArray(d.displays)) d.displays = [];
+  const idx = d.displays.findIndex(x => x.display_id === display.display_id);
+  if (idx >= 0) d.displays[idx] = display;
+  else d.displays.push(display);
+  // Keep ascending display_id order — snapshots arrive sorted, so the
+  // live path must preserve the invariant for stable chip/lane order.
+  d.displays.sort((a, b) => a.display_id - b.display_id);
+  renderDaemonsList();
+}
+
+function removePeerDisplay(hostId, displayId) {
+  if (!hostId || displayId == null) return;
+  const d = daemons.find(x => x.host_id === hostId);
+  if (!d || !Array.isArray(d.displays)) return;
+  const idx = d.displays.findIndex(x => x.display_id === displayId);
+  if (idx < 0) return;
+  d.displays.splice(idx, 1);
+  // A removed display is no longer viewable — tear down any open pane
+  // still streaming it rather than leaving its RTCPeerConnection to
+  // stall on ICE failure (same reasoning as removeDaemonById, scoped
+  // to the one display).
+  closePeerDisplay(hostId, displayId).catch(() => {});
+  renderDaemonsList();
 }
 
 // Apply a pushed PeerSnapshot to the local daemons list — replace the

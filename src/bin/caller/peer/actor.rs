@@ -23,11 +23,11 @@
 //! own retry policy.
 
 use crate::peer::card::AgentCard;
-use crate::peer::event::{PeerEvent, PeerStatus, SessionInfo, TaggedPeerEvent};
+use crate::peer::event::{PeerDisplayInfo, PeerEvent, PeerStatus, SessionInfo, TaggedPeerEvent};
 use crate::peer::handle::{ConnectionState, PeerCommand};
 use crate::peer::id::PeerId;
 use crate::peer::traits::PeerTransport;
-use crate::peer::upcast::MAX_TRACKED_PEER_SESSIONS;
+use crate::peer::upcast::{MAX_TRACKED_PEER_DISPLAYS, MAX_TRACKED_PEER_SESSIONS};
 use crate::peer::PeerError;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -101,6 +101,14 @@ pub(crate) struct PeerActor {
     pub sessions_tx: watch::Sender<Arc<Vec<SessionInfo>>>,
     /// Fold backing `sessions_tx`, keyed by session id.
     pub sessions: BTreeMap<String, SessionInfo>,
+    /// Published view of the peer's available displays, folded from the
+    /// `DisplayReady` / `DisplayLost` stream. Connection-scoped like
+    /// `sessions_tx` — cleared on disconnect; the peer's gateway replays
+    /// `display_ready` for every live display on reconnect, so the view
+    /// re-converges without carrying ghosts across a peer restart.
+    pub displays_tx: watch::Sender<Arc<Vec<PeerDisplayInfo>>>,
+    /// Fold backing `displays_tx`, keyed by display id.
+    pub displays: BTreeMap<u32, PeerDisplayInfo>,
     pub seq: u64,
     /// Operator's via-URL override, preserved across card refreshes.
     ///
@@ -352,10 +360,30 @@ impl PeerActor {
                     self.publish_sessions();
                 }
             }
+            PeerEvent::DisplayReady { display } => {
+                // Same bound as the upcaster fold — defense in depth for
+                // transports that construct DisplayReady directly. New
+                // ids are refused at the cap; existing ids keep updating.
+                if self.displays.contains_key(&display.display_id)
+                    || self.displays.len() < MAX_TRACKED_PEER_DISPLAYS
+                {
+                    self.displays.insert(display.display_id, display.clone());
+                    self.publish_displays();
+                }
+            }
+            PeerEvent::DisplayLost { display_id, .. } => {
+                if self.displays.remove(display_id).is_some() {
+                    self.publish_displays();
+                }
+            }
             PeerEvent::Disconnected { .. } => {
                 if !self.sessions.is_empty() {
                     self.sessions.clear();
                     self.publish_sessions();
+                }
+                if !self.displays.is_empty() {
+                    self.displays.clear();
+                    self.publish_displays();
                 }
             }
             _ => {}
@@ -374,6 +402,13 @@ impl PeerActor {
                 .then_with(|| a.session_id.cmp(&b.session_id))
         });
         let _ = self.sessions_tx.send(Arc::new(sessions));
+    }
+
+    /// Publish the current displays fold, ascending display id (the
+    /// BTreeMap order — stable for pickers and chips).
+    fn publish_displays(&mut self) {
+        let displays: Vec<PeerDisplayInfo> = self.displays.values().cloned().collect();
+        let _ = self.displays_tx.send(Arc::new(displays));
     }
 
     /// Durable-first fan-out: await on the log sink (must not drop),

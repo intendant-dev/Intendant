@@ -1216,6 +1216,32 @@ async function closePeerDisplaysForHost(hostId) {
   stationScheduleUpdate();
 }
 
+// Close only the connection(s) streaming one specific display of a
+// host — used when the peer retires a display (peer_display_removed)
+// while its other displays may stay viewable. No-op when nothing is
+// streaming that display. Containers are keyed per host, not per
+// display, so they're only cleared when no connections remain for the
+// host (with slice 3a's one-session-per-host that's every close).
+async function closePeerDisplay(hostId, displayId) {
+  const closes = [];
+  for (const [key, conn] of peerDisplayConnections.entries()) {
+    if (conn.hostId === hostId && Number(conn.displayId) === Number(displayId)) {
+      closes.push(conn.close().catch(() => {}));
+      peerDisplayConnections.delete(key);
+    }
+  }
+  if (!closes.length) return;
+  await Promise.all(closes);
+  const hostStillStreaming = [...peerDisplayConnections.values()].some(c => c.hostId === hostId);
+  if (!hostStillStreaming) {
+    for (const container of stationPeerDisplayContainersForHost(hostId)) {
+      container.innerHTML = '';
+      container.style.display = 'none';
+    }
+  }
+  stationScheduleUpdate();
+}
+
 function handlePeerWebRtcSignal(hostId, displayId, sessionId, signal) {
   const sessionKey = `${hostId}|${displayId}|${sessionId}`;
   const conn = peerDisplayConnections.get(sessionKey);
