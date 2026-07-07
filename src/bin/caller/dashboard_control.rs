@@ -1686,44 +1686,47 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
-        if t.transport.transport_protocol == TransportProtocol::UDP {
-            if t.transport.local_addr.is_ipv4() != t.transport.peer_addr.is_ipv4() {
-                continue;
+        // Route by connection before trusting the engine's protocol stamp:
+        // rtc 0.9 marks DTLS and SCTP transmits `TransportProtocol::UDP`
+        // even when the selected pair is TCP ("TransportProtocol doesn't
+        // matter" — rtc/src/peer_connection/transport/dtls/mod.rs), so a
+        // peer that reached us over ICE-TCP must be matched by its tuple,
+        // not by the stamp, or every post-ICE packet misses the stream and
+        // DTLS times out.
+        if let Some(sender) = tcp_senders.get(&t.transport.peer_addr) {
+            let contents = t.message.to_vec();
+            match sender.try_send(contents) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tcp_senders.remove(&t.transport.peer_addr);
+                }
             }
-            if t.transport.local_addr.ip().is_loopback() != t.transport.peer_addr.ip().is_loopback()
-            {
-                continue;
-            }
+            continue;
         }
-        match t.transport.transport_protocol {
-            TransportProtocol::UDP => {
-                let Some(sock) = sockets_by_addr.get(&t.transport.local_addr) else {
-                    eprintln!(
-                        "[dashboard/control] UDP transmit from unknown source {}, dropping",
-                        t.transport.local_addr
-                    );
-                    continue;
-                };
-                if let Err(e) = sock.send_to(&t.message, t.transport.peer_addr).await {
-                    eprintln!(
-                        "[dashboard/control] udp send {} -> {} failed: {e}",
-                        t.transport.local_addr, t.transport.peer_addr
-                    );
-                }
-            }
-            TransportProtocol::TCP => {
-                let Some(sender) = tcp_senders.get(&t.transport.peer_addr) else {
-                    continue;
-                };
-                let contents = t.message.to_vec();
-                match sender.try_send(contents) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        tcp_senders.remove(&t.transport.peer_addr);
-                    }
-                }
-            }
+        if t.transport.transport_protocol == TransportProtocol::TCP {
+            // TCP-stamped transmit with no live stream for the tuple: the
+            // connection is gone and there is nothing to write to.
+            continue;
+        }
+        if t.transport.local_addr.is_ipv4() != t.transport.peer_addr.is_ipv4() {
+            continue;
+        }
+        if t.transport.local_addr.ip().is_loopback() != t.transport.peer_addr.ip().is_loopback() {
+            continue;
+        }
+        let Some(sock) = sockets_by_addr.get(&t.transport.local_addr) else {
+            eprintln!(
+                "[dashboard/control] UDP transmit from unknown source {}, dropping",
+                t.transport.local_addr
+            );
+            continue;
+        };
+        if let Err(e) = sock.send_to(&t.message, t.transport.peer_addr).await {
+            eprintln!(
+                "[dashboard/control] udp send {} -> {} failed: {e}",
+                t.transport.local_addr, t.transport.peer_addr
+            );
         }
     }
 
