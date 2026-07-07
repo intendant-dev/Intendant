@@ -19,7 +19,7 @@
 
 use super::card::{AgentCard, McpTransportKind, TransportSpec};
 use super::handle::PeerHandle;
-use super::transport::intendant::PEER_CLIENT_HEADER;
+use super::transport::intendant::{PEER_CLIENT_HEADER, PEER_CLIENT_HEADER_VALUE};
 use super::transport::{tls_client, ws_url_to_http_base};
 use std::time::Duration;
 
@@ -112,7 +112,7 @@ pub async fn call_peer_mcp_tool(
     // downgrade to the anonymous path.
     let mut request = client
         .post(&endpoint)
-        .header(PEER_CLIENT_HEADER, "1")
+        .header(PEER_CLIENT_HEADER, PEER_CLIENT_HEADER_VALUE)
         .json(&body);
     if let Some(token) = &creds.bearer_token {
         request = request.bearer_auth(token);

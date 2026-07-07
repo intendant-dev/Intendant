@@ -322,6 +322,28 @@ surface (with the stage-1 display chips for discovery), and delegation
 work — reach for direct CU when this agent needs to see or drive the peer's
 screen itself.
 
+The same side-channel is reachable from the CLI with **no daemon in the
+loop**: `intendant ctl --peer <id> …` resolves the `[[peer]]` entry from
+`intendant.toml` (label case-insensitive, card_url host, exact card_url, or
+the suffix of an `intendant:<label>` peer id), derives the `/mcp` endpoint
+from the card_url origin, and builds the same pinned mTLS client — explicit
+`client_cert`/`client_key` first (the peer-boot pairing rule; half-set
+config errors out), else the installed access identity for TLS targets.
+Every existing ctl subcommand then drives the peer:
+
+```bash
+intendant ctl --peer dell display screenshot --output peer.png
+intendant ctl --peer dell cu actions --actions '[{"type":"click","x":100,"y":200}]'
+```
+
+`--peer` conflicts with `--url`, silently overrides the env URL/port, sends
+the configured `bearer_token` and the `x-intendant-peer` marker, and appends
+no `session_id`/`managed_context` — local session scoping is meaningless
+cross-daemon. Because this path reads key material from disk rather than
+acting as a session, it is not gated by the local daemon's IAM at all; the
+peer's profile for this daemon is the sole authority (exactly like the
+`intendant peer request/approve` pairing CLI).
+
 ## Transports
 
 Phase 1 ships the native Intendant↔Intendant transport. A2A, OpenClaw, and
