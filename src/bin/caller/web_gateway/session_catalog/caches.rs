@@ -958,6 +958,7 @@ mod tests {
             turns: 1,
             file_updated_at: None,
             bytes: 5,
+            preview: None,
         };
         store_persisted_session_entry_in(dir.path(), &key, &summary);
         let loaded = load_persisted_session_entry_in::<CodexSessionListSummary>(dir.path(), &key)
