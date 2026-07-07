@@ -111,10 +111,7 @@ const CODEX_DANGER_FULL_ACCESS_SANDBOX: &str = "danger-full-access";
 const CODEX_NEVER_APPROVAL_POLICY: &str = "never";
 const CODEX_INHERIT_MCP_SERVERS_ENV: &str = "INTENDANT_CODEX_INHERIT_MCP_SERVERS";
 
-pub(super) use super::{
-    normalize_goal_status, parse_goal_token_budget, validate_goal_objective,
-    MAX_THREAD_GOAL_OBJECTIVE_CHARS,
-};
+pub(super) use super::{normalize_goal_status, parse_goal_token_budget, validate_goal_objective};
 
 pub struct CodexAgent {
     command: String,
@@ -200,14 +197,14 @@ pub struct CodexAgent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CodexContextPressureFloor {
+pub(crate) struct CodexContextPressureFloor {
     token_count: u64,
     context_window: u64,
     hard_context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CodexTraceFingerprint {
+pub(crate) struct CodexTraceFingerprint {
     files: Vec<CodexTraceFileFingerprint>,
 }
 
@@ -1978,6 +1975,7 @@ impl Drop for CodexAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::external_agent::MAX_THREAD_GOAL_OBJECTIVE_CHARS;
 
     #[tokio::test]
     async fn resumed_thread_context_baseline_suppresses_old_trace_snapshots() {
