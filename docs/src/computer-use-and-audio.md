@@ -140,7 +140,7 @@ can produce screenshots while leaving keyboard/mouse injection unavailable. See
 
 Frame-grounded work goes to a fast CU model, with escalation to the heavy
 agent for anything that turns out to need code changes. The routing decision
-lives in the session supervisor (`session_supervisor.rs`,
+lives in the session supervisor (`session_supervisor/launch.rs`,
 `start_new_session` → `spawn_cu_task`):
 
 ```

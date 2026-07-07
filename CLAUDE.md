@@ -100,7 +100,7 @@ src/
 │   ├── agent_loop.rs, run_modes.rs, external_mode.rs, external_supervision.rs, display_glue.rs   # carved from main.rs: the native loop + orchestration handlers; native/external mode runners; external supervision helpers; frame/CU/user-display glue
 │   ├── startup/                # web bind/TLS + peer boot; the three mode branches (daemon, mcp_mode, headless)
 │   ├── control_plane.rs, event.rs, frontend.rs   # single-writer state; EventBus + ControlMsg; state snapshots
-│   ├── session_supervisor.rs, task_dispatch.rs, file_watcher.rs   # daemon: sessions, dispatch, rewind snapshots
+│   ├── session_supervisor/, task_dispatch.rs, file_watcher.rs   # daemon: sessions (dispatch/launch/sub_agents/routing/agent_config/registry slices), dispatch, rewind snapshots
 │   ├── provider/, tools.rs, prompts.rs, approval.rs   # provider/: ChatProvider + selection (mod.rs), per-provider openai/anthropic/gemini
 │   ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, agent_runner.rs   # native multi-agent
 │   ├── context_rewind.rs, fission_ledger.rs, fission_lifecycle.rs, lineage_ledger.rs   # managed context: rewinds, fission, lineage
