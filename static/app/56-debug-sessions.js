@@ -307,7 +307,7 @@ function setSessionsHost(hostId) {
   const next = !hostId || hostId === selfPeerId ? '' : String(hostId);
   if (next === sessionsActiveHostId) return;
   sessionsActiveHostId = next;
-  sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
+  sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
   renderSessionsHostStrip();
   loadSessions({ force: true });
 }
@@ -405,8 +405,10 @@ function loadSessions(options = {}) {
   if (cached) {
     applyLoadedSessions(cached, aggEl, hostId);
   } else if (listEl) {
-    // Fresh (uncached) load replaces the list — reset the Show-more window.
-    sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
+    // Fresh (uncached) load replaces the list — reset the Show-more window
+    // and drop the render-pass state (the skeleton wipe orphans its DOM).
+    sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
+    resetSessionsListRenderState(listEl.id);
     listEl.innerHTML = '<div class="ui-skel sessions-skel-card"></div>'.repeat(6);
   }
 
@@ -530,6 +532,7 @@ function loadSessions(options = {}) {
           requestedLimit,
         );
         if (!cached && listEl) {
+          resetSessionsListRenderState(listEl.id);
           listEl.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
         }
       });
@@ -659,7 +662,17 @@ function sessionLineageRelationshipLabel(kind) {
   return kind || 'related';
 }
 
+// Single-slot memo: the index costs two sessionConfigMetadata sweeps over
+// the whole corpus, and every render pass (each search keystroke included)
+// wants it. The rowset array is replaced whenever data changes
+// (mergeSessionRows), so array identity is the invalidation key.
+let _sessionLineageIndexFor = null;
+let _sessionLineageIndexMemo = null;
+
 function buildSessionLineageIndex(sessions) {
+  if (sessions && sessions === _sessionLineageIndexFor && _sessionLineageIndexMemo) {
+    return _sessionLineageIndexMemo;
+  }
   const byId = new Map();
   const childrenByParentId = new Map();
   const rows = Array.isArray(sessions) ? sessions : [];
@@ -678,7 +691,15 @@ function buildSessionLineageIndex(sessions) {
     if (!childrenByParentId.has(parentId)) childrenByParentId.set(parentId, []);
     childrenByParentId.get(parentId).push(session);
   }
-  return { byId, childrenByParentId };
+  // Deterministic child ordering regardless of the caller's sort: newest
+  // first (the index used to inherit the list's sort order).
+  for (const children of childrenByParentId.values()) {
+    children.sort((a, b) => sessionDateSortValue(b, 'updated_at') - sessionDateSortValue(a, 'updated_at'));
+  }
+  const index = { byId, childrenByParentId };
+  _sessionLineageIndexFor = sessions;
+  _sessionLineageIndexMemo = index;
+  return index;
 }
 
 function sessionLineageParentForSession(index, session, meta = null) {
@@ -713,7 +734,9 @@ function sessionLineageOpenSession(sourceSession, targetSession, targetId, ev = 
   }
   const id = compactSessionText(targetId || targetSession?.session_id || targetSession?.resume_id);
   if (!id) return;
-  const target = targetSession || {
+  // Re-resolve at click time: lineage chips can outlive the row snapshot
+  // they were built from (cards are cached across stream refreshes).
+  const target = findCachedSessionByAnyId(id) || targetSession || {
     session_id: id,
     source: sessionLineageSource(sourceSession),
     task: shortSessionId(id),
@@ -861,7 +884,7 @@ function _refilterSessions() {
 // Filter/search/sort change: the visible set changes shape, so the
 // Show-more window snaps back to the default page size.
 function _refreshSessionsFilters() {
-  sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
+  sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
   _refilterSessions();
 }
 
@@ -886,6 +909,20 @@ function sessionChangedSortValue(session) {
   );
 }
 
+// Throwaway scratch paths (agent test homes, e2e rigs, OS temp) can easily
+// outnumber real projects in the corpus. They collapse into one synthetic
+// menu entry instead of ballooning the picker; selecting it matches every
+// temp-shaped path.
+const SESSION_TEMP_PROJECTS_FILTER_VALUE = '::temp-projects::';
+
+function sessionPathLooksTemporary(path) {
+  if (!path) return false;
+  if (/^\/(private\/)?var\/folders\//.test(path)) return true;
+  return String(path)
+    .split(/[\\/]+/)
+    .some(seg => seg === 'tmp' || seg === 'temp' || seg === 'Temp' || seg === 'TEMP');
+}
+
 function sessionProjectFilterOptions(sessions) {
   const buckets = new Map();
   for (const session of Array.isArray(sessions) ? sessions : []) {
@@ -901,7 +938,27 @@ function sessionProjectFilterOptions(sessions) {
     existing.latestChanged = Math.max(existing.latestChanged, sessionChangedSortValue(session));
     buckets.set(path, existing);
   }
-  return Array.from(buckets.values()).sort((a, b) => {
+  const options = [];
+  let temp = null;
+  for (const item of buckets.values()) {
+    if (!sessionPathLooksTemporary(item.path)) {
+      options.push(item);
+      continue;
+    }
+    temp = temp || {
+      path: SESSION_TEMP_PROJECTS_FILTER_VALUE,
+      label: 'Temporary directories',
+      title: 'Sessions whose project directory is a throwaway temp path (/tmp, /var/folders, %TEMP%)',
+      count: 0,
+      paths: 0,
+      latestChanged: 0,
+    };
+    temp.count += item.count;
+    temp.paths += 1;
+    temp.latestChanged = Math.max(temp.latestChanged, item.latestChanged);
+  }
+  if (temp) options.push(temp);
+  return options.sort((a, b) => {
     const byChanged = b.latestChanged - a.latestChanged;
     if (byChanged) return byChanged;
     const byLabel = a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
@@ -912,10 +969,49 @@ function sessionProjectFilterOptions(sessions) {
 function sessionProjectMultiFilterOptions(sessions) {
   return sessionProjectFilterOptions(sessions).map(item => ({
     value: item.path,
-    label: `${item.label} (${item.count.toLocaleString()})`,
-    title: item.path,
+    label: item.paths
+      ? `${item.label} (${item.paths.toLocaleString()} paths, ${item.count.toLocaleString()})`
+      : `${item.label} (${item.count.toLocaleString()})`,
+    title: item.title || item.path,
     plural: 'projects',
   }));
+}
+
+// The project menus render a bounded page of the full option set: every
+// selected value (unchecking must always be possible), then the most
+// recently active projects up to the cap, with an inline filter box that
+// narrows against the whole set. An uncapped render once ballooned the
+// hidden DOM with hundreds of scratch-path checkboxes per menu.
+const SESSION_PROJECT_MENU_CAP = 40;
+const _sessionProjectMenuFilterText = new Map(); // menuId → live filter text
+
+function sessionProjectMenuScaffold(menu, kind, cfg) {
+  let optionsWrap = menu.querySelector(':scope > .sessions-multi-filter-options');
+  if (optionsWrap) {
+    return { search: menu.querySelector(':scope > .sessions-multi-filter-search'), optionsWrap };
+  }
+  menu.textContent = '';
+  const search = document.createElement('div');
+  search.className = 'sessions-multi-filter-search';
+  const input = document.createElement('input');
+  input.type = 'search';
+  input.addEventListener('input', () => {
+    _sessionProjectMenuFilterText.set(cfg.menuId, input.value.trim());
+    renderSessionProjectFilterMenu(kind);
+  });
+  input.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Escape' || !input.value) return;
+    input.value = '';
+    _sessionProjectMenuFilterText.set(cfg.menuId, '');
+    renderSessionProjectFilterMenu(kind);
+    ev.stopPropagation();
+  });
+  search.appendChild(input);
+  optionsWrap = document.createElement('div');
+  optionsWrap.className = 'sessions-multi-filter-options';
+  menu.appendChild(search);
+  menu.appendChild(optionsWrap);
+  return { search, optionsWrap };
 }
 
 function renderSessionProjectFilterMenu(kind) {
@@ -923,16 +1019,43 @@ function renderSessionProjectFilterMenu(kind) {
   const menu = document.getElementById(cfg.menuId);
   if (!menu) return;
   const selected = new Set(parseStoredSessionMultiFilter(kind));
-  menu.innerHTML = '';
+  const { search, optionsWrap } = sessionProjectMenuScaffold(menu, kind, cfg);
+  const filterText = (_sessionProjectMenuFilterText.get(cfg.menuId) || '').toLowerCase();
+  const searchInput = search.querySelector('input');
+  searchInput.placeholder = `Filter ${cfg.options.length.toLocaleString()} projects...`;
+  search.classList.toggle('hidden', cfg.options.length <= SESSION_PROJECT_MENU_CAP && !filterText);
+  optionsWrap.textContent = '';
 
-  if (cfg.options.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'sessions-multi-filter-empty';
-    empty.textContent = 'No project directories';
-    menu.appendChild(empty);
+  const matchesFilter = opt => !filterText
+    || opt.label.toLowerCase().includes(filterText)
+    || String(opt.value).toLowerCase().includes(filterText)
+    || String(opt.title || '').toLowerCase().includes(filterText);
+  const visible = [];
+  for (const opt of cfg.options) {
+    if (selected.has(opt.value)) visible.push(opt);
+  }
+  let overflow = 0;
+  let shown = 0;
+  for (const opt of cfg.options) {
+    if (selected.has(opt.value) || !matchesFilter(opt)) continue;
+    if (shown >= SESSION_PROJECT_MENU_CAP) {
+      overflow += 1;
+      continue;
+    }
+    visible.push(opt);
+    shown += 1;
   }
 
-  for (const opt of cfg.options) {
+  if (visible.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'sessions-multi-filter-empty';
+    empty.textContent = filterText
+      ? `No projects match "${filterText}"`
+      : 'No project directories';
+    optionsWrap.appendChild(empty);
+  }
+
+  for (const opt of visible) {
     const label = document.createElement('label');
     if (opt.title) label.title = opt.title;
     const input = document.createElement('input');
@@ -944,7 +1067,14 @@ function renderSessionProjectFilterMenu(kind) {
     text.textContent = opt.label;
     label.appendChild(input);
     label.appendChild(text);
-    menu.appendChild(label);
+    optionsWrap.appendChild(label);
+  }
+
+  if (overflow > 0) {
+    const more = document.createElement('div');
+    more.className = 'sessions-multi-filter-more';
+    more.textContent = `+${overflow.toLocaleString()} more — type to narrow`;
+    optionsWrap.appendChild(more);
   }
 
   const validSelected = Array.from(selected).filter(value =>
@@ -958,10 +1088,29 @@ function renderSessionProjectFilterMenu(kind) {
   setSessionMultiFilterValues(kind, validSelected);
 }
 
+let _sessionProjectOptionsSerialized = null;
+
 function updateSessionProjectFilterOptions(sessions = _cachedSessions) {
   sessionProjectFilterOptionsCache = sessionProjectMultiFilterOptions(sessions);
-  renderSessionProjectFilterMenu('project');
-  renderSessionProjectFilterMenu('deep-project');
+  // Streamed refreshes call this on every flush; skip the DOM work when the
+  // option set didn't change, and never rebuild a menu the user has open —
+  // it re-renders on its next open instead.
+  const serialized = JSON.stringify(sessionProjectFilterOptionsCache.map(o => [o.value, o.label]));
+  const changed = serialized !== _sessionProjectOptionsSerialized;
+  _sessionProjectOptionsSerialized = serialized;
+  for (const kind of ['project', 'deep-project']) {
+    const menu = document.getElementById(sessionMultiFilterConfig(kind).menuId);
+    if (!menu) continue;
+    const rendered = menu.dataset.optionsRendered === '1';
+    if (rendered && !changed) continue;
+    if (rendered && !menu.classList.contains('hidden')) {
+      menu.dataset.staleOptions = '1';
+      continue;
+    }
+    renderSessionProjectFilterMenu(kind);
+    menu.dataset.optionsRendered = '1';
+    delete menu.dataset.staleOptions;
+  }
 }
 
 function sessionMultiFilterConfig(kind) {
@@ -1103,11 +1252,20 @@ function setupSessionMultiFilter(kind, onChange) {
     ev.stopPropagation();
     const willOpen = menu.classList.contains('hidden');
     closeSessionMultiFilterMenus(willOpen ? kind : '');
+    if (willOpen && menu.dataset.staleOptions === '1') {
+      // Option refreshes are deferred while the menu is open (see
+      // updateSessionProjectFilterOptions) — catch up before showing it.
+      renderSessionProjectFilterMenu(kind);
+      delete menu.dataset.staleOptions;
+    }
     menu.classList.toggle('hidden', !willOpen);
     button.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
   });
   menu.addEventListener('click', ev => ev.stopPropagation());
-  menu.addEventListener('change', () => {
+  menu.addEventListener('change', (ev) => {
+    // The project menus embed a text filter input; only checkbox toggles
+    // are selection changes.
+    if (ev.target && ev.target.type !== 'checkbox') return;
     const values = sessionMultiFilterValues(kind);
     localStorage.setItem(cfg.key, JSON.stringify(values));
     updateSessionMultiFilterSummary(kind);
@@ -1306,7 +1464,9 @@ function sessionDeepProjectFilterValue() {
 function sessionMatchesProjectFilter(session, filter) {
   const filters = Array.isArray(filter) ? filter : (filter && filter !== 'all' ? [filter] : []);
   if (filters.length === 0) return true;
-  return filters.includes(sessionProjectDirectory(session));
+  const dir = sessionProjectDirectory(session);
+  if (filters.includes(SESSION_TEMP_PROJECTS_FILTER_VALUE) && sessionPathLooksTemporary(dir)) return true;
+  return filters.includes(dir);
 }
 
 function sessionMatchesSourceFilter(source, filter) {
@@ -1612,7 +1772,19 @@ function updateSessionsSearchStatus() {
   }
 }
 
+// Per-row haystack memo: without it every quick-search keystroke rebuilds
+// a ~30-field string for every row in the corpus. Keyed by row object
+// identity — mergeSessionRows keeps identity for untouched rows and swaps
+// it when a row changes, so entries invalidate themselves; the two inputs
+// that can drift independently of the row (current-session status override)
+// revalidate explicitly. source/shortId derive from the row and need no key.
+const _sessionSearchTextCache = new WeakMap();
+
 function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
+  const cached = _sessionSearchTextCache.get(session);
+  if (cached && cached.status === displayStatus && cached.current === isCurrent) {
+    return cached.text;
+  }
   const totalBytes = session.total_bytes || 0;
   const fields = [
     session.session_id,
@@ -1650,10 +1822,12 @@ function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
     session.total_tokens != null ? `${session.total_tokens} tokens` : '',
     session.estimated_cost != null ? `$${Number(session.estimated_cost).toFixed(4)}` : '',
   ];
-  return fields
+  const text = fields
     .filter(v => v !== null && v !== undefined && v !== '')
     .join(' ')
     .toLowerCase();
+  _sessionSearchTextCache.set(session, { status: displayStatus, current: isCurrent, text });
+  return text;
 }
 
 function sessionMatchesSearch(session, query, displayStatus, source, shortId, isCurrent) {
