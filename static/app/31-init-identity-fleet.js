@@ -634,6 +634,11 @@ let dashboardServerMessageDispatcher = null;
 const wsDeniedToastShown = new Set();
 let dashboardControlEventsActive = false;
 let dashboardControlLastError = '';
+// Coarse failure class for dashboardControlLastError so panes can give
+// honest guidance: 'refused' (the daemon itself rejected the offer),
+// 'transport' (answer received but ICE/DTLS/DataChannel never became
+// ready), 'signaling' (no answer at all), or '' (unclassified).
+let dashboardControlLastErrorKind = '';
 let dashboardConnectReconnectTimer = null;
 let dashboardConnectReconnectAttempt = 0;
 let dashboardConnectReconnectInFlight = false;

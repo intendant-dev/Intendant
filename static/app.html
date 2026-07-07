@@ -16499,6 +16499,11 @@ let dashboardServerMessageDispatcher = null;
 const wsDeniedToastShown = new Set();
 let dashboardControlEventsActive = false;
 let dashboardControlLastError = '';
+// Coarse failure class for dashboardControlLastError so panes can give
+// honest guidance: 'refused' (the daemon itself rejected the offer),
+// 'transport' (answer received but ICE/DTLS/DataChannel never became
+// ready), 'signaling' (no answer at all), or '' (unclassified).
+let dashboardControlLastErrorKind = '';
 let dashboardConnectReconnectTimer = null;
 let dashboardConnectReconnectAttempt = 0;
 let dashboardConnectReconnectInFlight = false;
@@ -27674,7 +27679,7 @@ async function main() {
       setConnectEventStatus('ok', 'Dashboard events are live through verified Hosted Connect');
     } catch (err) {
       console.warn('[dashboard-control] Connect dashboard bootstrap failed', err);
-      dashboardSetControlLastError(err?.message || String(err));
+      dashboardSetControlLastError(err?.message || String(err), err?.controlErrorKind || '');
       dashboardUpdateTransportStatus();
       setConnectEventStatus('err', 'Hosted Connect dashboard events failed');
       scheduleDashboardConnectReconnect(err?.message || String(err), { delayMs: 1000 });
@@ -43835,21 +43840,63 @@ function renderAccessAttention() {
   const lastError = String(status.lastError || dashboardControlLastError || '').trim();
   if (summary.kind === 'err') {
     if (dashboardConnectModeEnabled()) {
-      items.push({
-        kind: 'err',
-        icon: '!',
-        message: 'Hosted Connect reached this daemon, but the daemon refused dashboard control.',
-        detail: lastError,
-        steps: [
-          'Open the daemon directly (its https://host:8765 address) with root access.',
-          'Go to Access → People & Devices and grant your Connect account a role.',
-          accessOwnDeviceFingerprint
-            ? `Verify it is really this device: this browser's key fingerprint is ${accessOwnDeviceFingerprint} — approve the pending request only if it matches.`
-            : 'Compare the pending request’s key fingerprint against this device before approving.',
-          'Reload this page — Connect is only the route; the daemon decides.',
-        ],
-        action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
-      });
+      // Three distinct failures share this err state; the transport records
+      // which one happened ('refused' | 'transport' | 'signaling') so the
+      // guidance matches reality. IAM advice is reserved for a genuine
+      // daemon refusal — sending someone to grant roles over a firewall
+      // problem wastes their debugging on the wrong layer.
+      const failureKind = String(status.lastErrorKind || dashboardControlLastErrorKind || '').trim();
+      if (failureKind === 'refused') {
+        items.push({
+          kind: 'err',
+          icon: '!',
+          message: 'Hosted Connect reached this daemon, but the daemon refused dashboard control.',
+          detail: lastError,
+          steps: [
+            'Open the daemon directly (its https://host:8765 address) with root access.',
+            'Go to Access → People & Devices and grant your Connect account a role.',
+            accessOwnDeviceFingerprint
+              ? `Verify it is really this device: this browser's key fingerprint is ${accessOwnDeviceFingerprint} — approve the pending request only if it matches.`
+              : 'Compare the pending request’s key fingerprint against this device before approving.',
+            'Reload this page — Connect is only the route; the daemon decides.',
+          ],
+          action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
+        });
+      } else if (failureKind === 'transport') {
+        items.push({
+          kind: 'err',
+          icon: '!',
+          message: 'This daemon answered through Hosted Connect, but the connection could not be established.',
+          detail: lastError,
+          steps: [
+            'Check that the daemon’s gateway port (its https://host:8765 listener) accepts inbound connections from the internet — a cloud box needs an inbound firewall rule.',
+            'The daemon advertises the public address the rendezvous observed for it; an extra NAT or proxy layer can make that address unreachable.',
+            'Hard-reload this page to retry with a fresh connection.',
+          ],
+          action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
+        });
+      } else if (failureKind === 'signaling') {
+        items.push({
+          kind: 'err',
+          icon: '!',
+          message: 'This daemon did not answer the Hosted Connect offer.',
+          detail: lastError,
+          steps: [
+            'Check that the daemon is running and has internet access — offers only reach it while it polls the rendezvous.',
+            'Confirm Connect is still enabled on the daemon and that it is claimed by this account.',
+            'Wait a moment and reload this page — a daemon that just started can take a few seconds to begin polling.',
+          ],
+          action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
+        });
+      } else {
+        items.push({
+          kind: 'err',
+          icon: '!',
+          message: 'The Hosted Connect control channel failed.',
+          detail: lastError,
+          action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
+        });
+      }
     } else {
       items.push({
         kind: 'err',
@@ -53425,8 +53472,9 @@ function dashboardConnectSignalUrl(path) {
   return `${DASHBOARD_CONNECT_SIGNALING_BASE}${normalized.startsWith('/') ? '' : '/'}${normalized}`;
 }
 
-function dashboardSetControlLastError(message = '') {
+function dashboardSetControlLastError(message = '', kind = '') {
   dashboardControlLastError = String(message || '').trim();
+  dashboardControlLastErrorKind = dashboardControlLastError ? String(kind || '').trim() : '';
 }
 
 function dashboardUpdateTransportStatus() {
@@ -53883,9 +53931,10 @@ class DashboardTransport {
     dashboardUpdateTransportStatus();
     this.controlStartPromise = dashboardControlTransport.connect().then(() => true).catch(err => {
       console.warn('[dashboard-control] connect failed', err);
-      dashboardSetControlLastError(err?.message || String(err));
+      dashboardSetControlLastError(err?.message || String(err), err?.controlErrorKind || '');
       if (dashboardControlTransport) {
         dashboardControlTransport.lastError = dashboardControlLastError;
+        dashboardControlTransport.lastErrorKind = dashboardControlLastErrorKind;
       }
       dashboardUpdateTransportStatus();
       dashboardControlTransport = null;
@@ -53920,6 +53969,7 @@ class DashboardTransport {
       enabled: this.enabled(),
       connected: false,
       lastError: dashboardControlLastError,
+      lastErrorKind: dashboardControlLastErrorKind,
       ...reconnect,
     };
   }
@@ -54168,12 +54218,18 @@ async function waitForDashboardControlReady(timeoutMs = 30000) {
     if (dashboardTransport?.canUseRpc?.()) return true;
     await new Promise(resolve => setTimeout(resolve, 100));
   }
-  throw new Error('dashboard Connect transport did not become ready');
+  // Signaling already succeeded by this point (the offer resolved to a
+  // verified answer) — what never happened is the WebRTC transport itself.
+  const err = new Error('dashboard Connect transport did not become ready');
+  err.controlErrorKind = 'transport';
+  throw err;
 }
 
 async function hydrateDashboardFromControl() {
   if (!dashboardTransport?.canUseRpc?.()) {
-    throw new Error('dashboard Connect transport is not connected');
+    const err = new Error('dashboard Connect transport is not connected');
+    err.controlErrorKind = 'transport';
+    throw err;
   }
   const [status, config, card, accessOverview, targets] = await Promise.all([
     dashboardTransport.request('status', {}, { timeoutMs: 15000 }).catch(() => null),
@@ -54262,7 +54318,7 @@ async function runDashboardConnectReconnect(reason = 'dashboard transport discon
   } catch (err) {
     retryReason = err?.message || String(err);
     console.warn('[dashboard-control] Hosted Connect reconnect failed', err);
-    dashboardSetControlLastError(retryReason);
+    dashboardSetControlLastError(retryReason, err?.controlErrorKind || '');
     setConnectEventStatus('err', 'Hosted Connect dashboard reconnect failed');
   } finally {
     dashboardConnectReconnectInFlight = false;
@@ -55465,6 +55521,7 @@ class DashboardControlTransport {
     this.localOfferSdp = '';
     this.lastStatus = null;
     this.lastError = '';
+    this.lastErrorKind = '';
     this.iceRoute = '';
     this.iceCandidatePair = '';
     this.pendingIce = [];
@@ -55482,6 +55539,7 @@ class DashboardControlTransport {
 
   async connect() {
     this.lastError = '';
+    this.lastErrorKind = '';
     dashboardSetControlLastError('');
     dashboardUpdateTransportStatus();
     const iceServers = buildIceServersFromGatewayConfig(gatewayConfig);
@@ -55496,7 +55554,8 @@ class DashboardControlTransport {
     };
     this.channel.onerror = () => {
       this.lastError = 'DataChannel error';
-      dashboardSetControlLastError(this.lastError);
+      this.lastErrorKind = 'transport';
+      dashboardSetControlLastError(this.lastError, this.lastErrorKind);
       dashboardUpdateTransportStatus();
       this.scheduleReconnect(this.lastError, { delayMs: 1000 });
     };
@@ -55512,6 +55571,11 @@ class DashboardControlTransport {
     this.pc.onconnectionstatechange = () => {
       const state = this.pc?.connectionState || 'closed';
       console.info('[dashboard-control] pc state', state);
+      // A peer connection that reaches `failed` did get signaling through
+      // (there was something to fail); the loss is ICE/DTLS-level. Record
+      // that durably on this transport so status renders long after the
+      // event still classify the failure honestly.
+      if (state === 'failed' && !this.lastErrorKind) this.lastErrorKind = 'transport';
       this.refreshIceRoute().catch(err => console.debug('[dashboard-control] route stats failed', err));
       dashboardUpdateTransportStatus();
       if (state === 'failed' || state === 'closed') {
@@ -55598,7 +55662,8 @@ class DashboardControlTransport {
   handleError(error) {
     console.warn('[dashboard-control] signaling error', error);
     this.lastError = String(error || 'signaling error');
-    dashboardSetControlLastError(this.lastError);
+    this.lastErrorKind = 'signaling';
+    dashboardSetControlLastError(this.lastError, this.lastErrorKind);
     dashboardUpdateTransportStatus();
     this.close();
     this.scheduleReconnect(this.lastError, { delayMs: 1000 });
@@ -55611,6 +55676,7 @@ class DashboardControlTransport {
 
   handleOpen() {
     this.lastError = '';
+    this.lastErrorKind = '';
     dashboardSetControlLastError('');
     this.refreshIceRoute().catch(() => {});
     dashboardUpdateTransportStatus();
@@ -56326,7 +56392,11 @@ class DashboardControlTransport {
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok || body.ok === false) {
-      throw new Error(body.error || `${path} returned ${resp.status}`);
+      const err = new Error(body.error || `${path} returned ${resp.status}`);
+      // The rendezvous encodes who failed in the status: callers use it to
+      // tell a daemon-authored refusal from "no answer ever came back".
+      err.connectHttpStatus = resp.status;
+      throw err;
     }
     return body;
   }
@@ -56381,13 +56451,26 @@ class DashboardControlTransport {
       // materializes it before resolving this very offer (one-round-trip
       // first contact). The daemon re-verifies everything.
       const orgGrant = await orgGrantForOffer(DASHBOARD_CONNECT_DAEMON_ID);
-      const answer = await this.postConnectSignal('/api/browser/offer', {
-        daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
-        sdp,
-        client_nonce: this.clientNonce,
-        ...identity,
-        ...(orgGrant ? { org_grant: orgGrant } : {}),
-      });
+      let answer;
+      try {
+        answer = await this.postConnectSignal('/api/browser/offer', {
+          daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
+          sdp,
+          client_nonce: this.clientNonce,
+          ...identity,
+          ...(orgGrant ? { org_grant: orgGrant } : {}),
+        });
+      } catch (err) {
+        // 502 relays the daemon's own words: it received the offer and
+        // posted an explicit refusal back through the rendezvous (the one
+        // exception is the service-internal "daemon answer channel
+        // closed"). Everything else — 504 offer timeout, 404 unknown
+        // daemon, a fetch failure — means no answer ever arrived.
+        const daemonSpoke = err?.connectHttpStatus === 502 &&
+          !/daemon answer channel closed/i.test(String(err?.message || ''));
+        err.controlErrorKind = daemonSpoke ? 'refused' : 'signaling';
+        throw err;
+      }
       this.signalingMode = 'connect-rendezvous';
       dashboardUpdateTransportStatus();
       return answer;
@@ -56539,6 +56622,7 @@ class DashboardControlTransport {
       iceRoute: this.iceRoute,
       iceCandidatePair: this.iceCandidatePair,
       lastError: this.lastError,
+      lastErrorKind: this.lastErrorKind,
       eventsActive: dashboardControlEventsActive,
       grantKind: this.lastStatus?.grant_kind ?? null,
       grantLabel: this.lastStatus?.grant_label ?? null,

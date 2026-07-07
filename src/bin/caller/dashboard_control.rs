@@ -1074,6 +1074,7 @@ impl DashboardControlPeer {
             presence,
             ice_config,
             tcp_peer_registry,
+            tcp_advertised,
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
             display_peer_id: NEXT_DASHBOARD_DISPLAY_PEER_ID.fetch_add(1, Ordering::Relaxed),
@@ -1152,6 +1153,13 @@ struct ControlRuntime {
     presence: Option<DashboardPresenceBridge>,
     ice_config: crate::display::IceConfig,
     tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
+    /// The ICE-TCP tuple this control session itself advertised (the
+    /// rendezvous-observed public address on the gateway port for hosted
+    /// Connect sessions; `None` for locally-signaled sessions, whose
+    /// browsers signal displays over the gateway WS instead). Display
+    /// offers arriving on the control channel advertise the same tuple —
+    /// the browser reached us through it, so display traffic can too.
+    tcp_advertised: Option<SocketAddr>,
     media_clip_ops: Arc<Mutex<HashMap<String, DashboardMediaClipOperation>>>,
     control_frames_tx: Option<mpsc::UnboundedSender<serde_json::Value>>,
     display_peer_id: crate::display::PeerId,
@@ -1181,6 +1189,29 @@ struct InboundPacket {
     destination: SocketAddr,
     bytes: Vec<u8>,
     received_at: Instant,
+}
+
+/// Outbound transmits the drain dropped, by reason. Individual drops stay
+/// silent (cross-family pairs are routine noise while ICE probes candidate
+/// combinations), but a connection that dies with a nonzero tally logs the
+/// summary — a misrouted-transmit bug then names itself instead of
+/// presenting as a bare DTLS timeout (which once cost a full debugging
+/// round on the hosted-Connect path).
+#[derive(Debug, Default)]
+struct TransmitDropStats {
+    cross_family: u64,
+    loopback_mismatch: u64,
+    unknown_udp_source: u64,
+    tcp_without_stream: u64,
+}
+
+impl TransmitDropStats {
+    fn any(&self) -> bool {
+        self.cross_family != 0
+            || self.loopback_mismatch != 0
+            || self.unknown_udp_source != 0
+            || self.tcp_without_stream != 0
+    }
 }
 
 struct ControlTaskResponse {
@@ -1382,12 +1413,14 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
         .display_authority
         .as_ref()
         .map(DashboardDisplayAuthorityBridge::subscribe);
+    let mut drop_stats = TransmitDropStats::default();
 
     loop {
         let timeout_at = match drain_control_outputs(
             &mut rtc,
             &sockets_by_addr,
             &mut tcp_senders,
+            &mut drop_stats,
             &mut channels,
             &mut runtime,
             &task_tx,
@@ -1676,6 +1709,7 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
     tcp_senders: &mut HashMap<SocketAddr, TcpFrameSender>,
+    drop_stats: &mut TransmitDropStats,
     channels: &mut HashMap<String, rtc::data_channel::RTCDataChannelId>,
     runtime: &mut ControlRuntime,
     task_tx: &mpsc::Sender<ControlTaskResponse>,
@@ -1686,44 +1720,51 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
-        if t.transport.transport_protocol == TransportProtocol::UDP {
-            if t.transport.local_addr.is_ipv4() != t.transport.peer_addr.is_ipv4() {
-                continue;
+        // Route by connection before trusting the engine's protocol stamp:
+        // rtc 0.9 marks DTLS and SCTP transmits `TransportProtocol::UDP`
+        // even when the selected pair is TCP ("TransportProtocol doesn't
+        // matter" — rtc/src/peer_connection/transport/dtls/mod.rs), so a
+        // peer that reached us over ICE-TCP must be matched by its tuple,
+        // not by the stamp, or every post-ICE packet misses the stream and
+        // DTLS times out.
+        if let Some(sender) = tcp_senders.get(&t.transport.peer_addr) {
+            let contents = t.message.to_vec();
+            match sender.try_send(contents) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tcp_senders.remove(&t.transport.peer_addr);
+                }
             }
-            if t.transport.local_addr.ip().is_loopback() != t.transport.peer_addr.ip().is_loopback()
-            {
-                continue;
-            }
+            continue;
         }
-        match t.transport.transport_protocol {
-            TransportProtocol::UDP => {
-                let Some(sock) = sockets_by_addr.get(&t.transport.local_addr) else {
-                    eprintln!(
-                        "[dashboard/control] UDP transmit from unknown source {}, dropping",
-                        t.transport.local_addr
-                    );
-                    continue;
-                };
-                if let Err(e) = sock.send_to(&t.message, t.transport.peer_addr).await {
-                    eprintln!(
-                        "[dashboard/control] udp send {} -> {} failed: {e}",
-                        t.transport.local_addr, t.transport.peer_addr
-                    );
-                }
-            }
-            TransportProtocol::TCP => {
-                let Some(sender) = tcp_senders.get(&t.transport.peer_addr) else {
-                    continue;
-                };
-                let contents = t.message.to_vec();
-                match sender.try_send(contents) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        tcp_senders.remove(&t.transport.peer_addr);
-                    }
-                }
-            }
+        if t.transport.transport_protocol == TransportProtocol::TCP {
+            // TCP-stamped transmit with no live stream for the tuple: the
+            // connection is gone and there is nothing to write to.
+            drop_stats.tcp_without_stream += 1;
+            continue;
+        }
+        if t.transport.local_addr.is_ipv4() != t.transport.peer_addr.is_ipv4() {
+            drop_stats.cross_family += 1;
+            continue;
+        }
+        if t.transport.local_addr.ip().is_loopback() != t.transport.peer_addr.ip().is_loopback() {
+            drop_stats.loopback_mismatch += 1;
+            continue;
+        }
+        let Some(sock) = sockets_by_addr.get(&t.transport.local_addr) else {
+            drop_stats.unknown_udp_source += 1;
+            eprintln!(
+                "[dashboard/control] UDP transmit from unknown source {}, dropping",
+                t.transport.local_addr
+            );
+            continue;
+        };
+        if let Err(e) = sock.send_to(&t.message, t.transport.peer_addr).await {
+            eprintln!(
+                "[dashboard/control] udp send {} -> {} failed: {e}",
+                t.transport.local_addr, t.transport.peer_addr
+            );
         }
     }
 
@@ -1780,6 +1821,15 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
                     rtc::peer_connection::state::RTCPeerConnectionState::Failed
                         | rtc::peer_connection::state::RTCPeerConnectionState::Closed
                 ) {
+                    if drop_stats.any() {
+                        eprintln!(
+                            "[dashboard/control] transmit drops this session: {} cross-family, {} loopback-mismatch, {} unknown-udp-source, {} tcp-without-stream",
+                            drop_stats.cross_family,
+                            drop_stats.loopback_mismatch,
+                            drop_stats.unknown_udp_source,
+                            drop_stats.tcp_without_stream
+                        );
+                    }
                     return Err(());
                 }
             }
@@ -8431,7 +8481,7 @@ async fn api_display_webrtc_offer_response(
             &sdp,
             &runtime.ice_config,
             Some(Arc::clone(&runtime.tcp_peer_registry)),
-            None,
+            runtime.tcp_advertised,
             ice_tx,
             input_authorized,
             authority_handler,
@@ -10368,6 +10418,7 @@ mod tests {
             presence: None,
             ice_config: crate::display::IceConfig::default(),
             tcp_peer_registry: crate::display::webrtc::TcpPeerRegistry::new(),
+            tcp_advertised: None,
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
             display_peer_id: 1,

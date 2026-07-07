@@ -370,7 +370,7 @@ async function main() {
     }, daemonLogs);
 
     await waitFor(
-      () => daemonLogs.join('').includes(`Web TUI: https://0.0.0.0:${options.daemonPort}`),
+      () => daemonLogs.join('').includes(`Dashboard: https://0.0.0.0:${options.daemonPort}`),
       START_TIMEOUT_MS,
       'daemon web startup'
     );
