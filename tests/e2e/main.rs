@@ -1044,16 +1044,16 @@ fn line_suffix(text: &str, prefix: &str) -> String {
         .to_string()
 }
 
-/// Run `intendant ctl --peer peer-e2e-b <args…>` from side A's project —
+/// Run `intendant ctl --peer <peer> <args…>` from side A's project —
 /// deliberately no `--port` and no daemon on side A: peer routing reads
 /// `[[peer]]` from the project config and dials the peer directly.
-async fn ctl_peer(rig: &TestRig, args: &[&str]) -> std::process::Output {
+async fn ctl_peer(rig: &TestRig, peer: &str, args: &[&str]) -> std::process::Output {
     let mut cmd = rig.command();
     cmd.env_remove("INTENDANT_MCP_URL")
         .env_remove("INTENDANT_PORT")
         .env_remove("INTENDANT_SESSION_ID")
         .env_remove("INTENDANT_MANAGED_CONTEXT");
-    cmd.arg("ctl").args(["--peer", "peer-e2e-b"]).args(args);
+    cmd.arg("ctl").args(["--peer", peer]).args(args);
     rig.run(cmd).await
 }
 
@@ -1071,7 +1071,11 @@ async fn ctl_peer(rig: &TestRig, args: &[&str]) -> std::process::Output {
 /// hard 403, so success cannot be an anonymous fallback. The denied call
 /// proves the same principal is refused display input, and the diagnostic
 /// must name the peer-daemon principal — a transport failure or a
-/// non-peer denial would not.
+/// non-peer denial would not. A second ceremony under `peer-operator`
+/// then completes the matrix: the swapped-in cert clears the
+/// display-input gate for the very tool the read-only principal was
+/// refused (pinned via the handler's pre-display "No actions provided"
+/// reply, so the leg holds on headless rigs).
 ///
 /// Not on Windows: the `intendant access` provisioning CLI is
 /// `#[cfg(not(target_os = "windows"))]` and `WindowsBackend::cert_dir()`
@@ -1218,7 +1222,7 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
     );
 
     // Allowed: display list is display-view, within read-only-display.
-    let allowed = ctl_peer(&rig_a, &["display", "list"]).await;
+    let allowed = ctl_peer(&rig_a, "peer-e2e-b", &["display", "list"]).await;
     let allowed_text = text_of(&allowed);
     assert!(
         allowed.status.success(),
@@ -1233,6 +1237,7 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
     // Denied: cu actions is display-input, above the profile ceiling.
     let denied = ctl_peer(
         &rig_a,
+        "peer-e2e-b",
         &["cu", "actions", "--actions", r#"[{"type":"screenshot"}]"#],
     )
     .await;
@@ -1245,6 +1250,114 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
     assert!(
         denied_text.contains("principal:peer-daemon:"),
         "denial should carry the peer-daemon principal:\n{denied_text}"
+    );
+
+    // Upgrade: a second ceremony under `peer-operator` completes the
+    // gate matrix. `peer complete` upserts keyed by card_url, so side
+    // A's single [[peer]] entry swaps in place to the operator label
+    // and cert pair — B then resolves the newly presented cert to the
+    // higher profile (both identities stay approved on B; the
+    // presented cert decides).
+    let request_op = {
+        let mut cmd = rig_a.command();
+        cmd.args([
+            "peer",
+            "request",
+            &format!("https://127.0.0.1:{port_b}"),
+            "--label",
+            "peer-e2e-a-op",
+            "--profile",
+            "peer-operator",
+        ]);
+        rig_a.run(cmd).await
+    };
+    assert!(
+        request_op.status.success(),
+        "operator peer request failed:\n{}\ndaemon B log:\n{}",
+        text_of(&request_op),
+        daemon_b.log_tail()
+    );
+    let request_op_stdout = String::from_utf8_lossy(&request_op.stdout).into_owned();
+    let request_op_id = line_suffix(&request_op_stdout, ":: request id: ");
+    let approval_op_code = line_suffix(&request_op_stdout, ":: approval code: ");
+
+    let approve_op = {
+        let mut cmd = daemon_b.rig.command();
+        cmd.args(["peer", "approve", &approval_op_code, "--profile", "peer-operator"]);
+        daemon_b.rig.run(cmd).await
+    };
+    assert!(
+        approve_op.status.success(),
+        "operator peer approve failed:\n{}",
+        text_of(&approve_op)
+    );
+
+    let complete_op = {
+        let mut cmd = rig_a.command();
+        cmd.args(["peer", "complete", &request_op_id, "--label", "peer-e2e-b-op"]);
+        rig_a.run(cmd).await
+    };
+    let complete_op_text = text_of(&complete_op);
+    assert!(
+        complete_op.status.success(),
+        "operator peer complete failed:\n{complete_op_text}"
+    );
+    assert!(
+        complete_op_text.contains(":: client cert:"),
+        "operator peer complete did not install an identity (still pending?):\n{complete_op_text}"
+    );
+    let peer_config = std::fs::read_to_string(rig_a.project.path().join("intendant.toml"))
+        .expect("read side A's intendant.toml after upgrade");
+    assert!(
+        peer_config.contains("peer-e2e-b-op"),
+        "upgrade did not relabel the [[peer]] entry:\n{peer_config}"
+    );
+    assert_eq!(
+        peer_config.matches("[[peer]]").count(),
+        1,
+        "same-card_url completion must update in place, not duplicate:\n{peer_config}"
+    );
+
+    let identities = {
+        let mut cmd = daemon_b.rig.command();
+        cmd.args(["peer", "identities"]);
+        daemon_b.rig.run(cmd).await
+    };
+    let identities_text = text_of(&identities);
+    assert!(
+        identities_text.contains("profile=peer-operator"),
+        "operator identity not recorded on B:\n{identities_text}"
+    );
+
+    // Allowed input: the same tool the read-only principal was refused
+    // now reaches its handler. `--args {"actions":[]}` deliberately
+    // bypasses ctl's client-side validation (`cu actions` rejects empty
+    // arrays locally), so the affirmative signal is the handler's own
+    // "No actions provided" — emitted before any display-target
+    // resolution, which is what makes the leg meaningful on a headless
+    // rig: the gate opened, and only the (absent) display stops it.
+    let allowed_input = ctl_peer(
+        &rig_a,
+        "peer-e2e-b-op",
+        &[
+            "tools",
+            "call",
+            "execute_cu_actions",
+            "--args",
+            r#"{"actions":[]}"#,
+        ],
+    )
+    .await;
+    let allowed_input_text = text_of(&allowed_input);
+    assert!(
+        !allowed_input_text.contains("Permission denied"),
+        "display input should be allowed under peer-operator:\n{allowed_input_text}\ndaemon B log:\n{}",
+        daemon_b.log_tail()
+    );
+    assert!(
+        allowed_input_text.contains("No actions provided"),
+        "the empty-actions probe should reach the tool handler:\n{allowed_input_text}\ndaemon B log:\n{}",
+        daemon_b.log_tail()
     );
 
     let _ = daemon_b.child.kill().await;

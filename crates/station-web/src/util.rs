@@ -31,6 +31,8 @@ impl From<Color> for [f32; 4] {
     }
 }
 
+pub(crate) const C_TEXT: Color = Color::rgb(205, 214, 244);
+pub(crate) const C_SUBTEXT0: Color = Color::rgb(166, 173, 200);
 pub(crate) const C_SURFACE0: Color = Color::rgb(49, 50, 68);
 pub(crate) const C_OVERLAY1: Color = Color::rgb(127, 132, 156);
 pub(crate) const C_BLUE: Color = Color::rgb(137, 180, 250);

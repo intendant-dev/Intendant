@@ -17,6 +17,7 @@
 16-styles-v2-tokens.css
 ui2-chrome.css
 ui2-terminal-files.css
+ui2-debug.css
 19-style-close.html
 
 20-shell.html

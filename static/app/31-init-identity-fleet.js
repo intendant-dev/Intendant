@@ -109,12 +109,17 @@ let apiKeyStatusLoaded = false;
 // sessions/worktrees module state they touch must be declared up here,
 // not next to their renderers (TDZ).
 const SESSION_LIST_RECENT_LIMIT = 600;
-const SESSION_CARD_RENDER_LIMIT = 300;
+// Sessions render in viewport-sized pages: the initial window, the
+// IntersectionObserver auto-append step, and the Show-more fallback step
+// are all one page. Small pages keep the tab's DOM budget flat no matter
+// how large the corpus grows.
+const SESSION_CARD_RENDER_PAGE = 60;
 const WORKTREE_CARD_RENDER_LIMIT = 200;
 // Show-more render windows: how many cards the list renderers paint before
-// offering a "Show N more" button. Reset on filter/search/sort changes and
-// on a fresh (uncached) list load.
-let sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
+// offering a "Show N more" button (sessions also auto-grow via a scroll
+// sentinel). Reset on filter/search/sort changes and on a fresh (uncached)
+// list load.
+let sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
 let worktreesRenderWindow = WORKTREE_CARD_RENDER_LIMIT;
 let _sessionsLoadToken = 0;
 let _sessionsStreamAbort = null;
@@ -148,6 +153,11 @@ let _sessionsHydrationState = {
 let _sessionsRenderTimer = null;
 let _sessionsRenderLastTs = 0;
 const SESSIONS_RENDER_MIN_INTERVAL_MS = 250;
+// Sessions list render-pass state (see 57-sessions-replay.js): the
+// #sessions deep link runs loadSessions → resetSessionsListRenderState on
+// this same script-evaluation path.
+const _sessionsListRenderState = new Map(); // list element id → pass state
+let _sessionCardBuildSeq = 0; // stamps built cards; QA asserts node identity by it
 let worktreesRequestSerial = 0;
 let worktreesActivityClearTimeout = null;
 let worktreesLoadPromise = null;

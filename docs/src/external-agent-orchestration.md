@@ -102,7 +102,7 @@ loop.
 
 | | **Codex** (reference impl) | **Claude Code** |
 |---|---|---|
-| Module | `external_agent/codex.rs` (~200 KB) | `external_agent/claude_code.rs` |
+| Module | `external_agent/codex/` (mod, threads, wire, context_trace, reader) | `external_agent/claude_code.rs` |
 | Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio` |
 | Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio |
 | MCP injection | Per-process `-c mcp_servers.intendant.{type,url}` overrides plus scoped env; no workspace config file | Inline `--mcp-config '{…}'` JSON string |
@@ -329,7 +329,7 @@ features it lacks.
   that every project pays a token tax for — this repository's own file carries
   the `validate-dashboard.cjs` usage and helper retry discipline above.
 
-- **Rich `thread_action` ops** (`codex.rs`): `compact`, `fast`, `fork`,
+- **Rich `thread_action` ops** (`codex/threads.rs`): `compact`, `fast`, `fork`,
   `side`/`btw` (open a side conversation) and `side-close`, `review`,
   `goal`/`goal-set`/`goal-get`/`goal-edit`/`goal-clear`/`goal-pause`/`goal-resume`/
   `goal-complete`/`goal-budget-limited`, and `memory-reset`. Side threads can be
@@ -402,7 +402,7 @@ per-fork config override appending the main repo's common `.git` directory to
 `sandbox_workspace_write.writable_roots` (re-including launch-level roots,
 which a per-fork value would otherwise replace), so branch commits work under
 Codex's `workspace-write` sandbox (`fork_thread_with_options_params`,
-`codex.rs`). Any failed spawn step removes the worktree that branch created,
+`codex/threads.rs`). Any failed spawn step removes the worktree that branch created,
 and a fission fork leaves the parent thread untouched — its context-pressure
 floor persists.
 
@@ -459,7 +459,7 @@ detached branch's results manually via its `raw_log` pointer, or revisit the
 parent's pre-rewind lineage with `rewind_backout` on the covering record.
 
 **Fission is ex-ante, rewind is ex-post.** The managed developer-instructions
-block carries a fission policy (`codex.rs`): prefer `fission_spawn` with a
+block carries a fission policy (`codex/threads.rs`): prefer `fission_spawn` with a
 self-contained charter over a deep in-context detour when a subtask is
 separable, favor breadth before pressure builds, keep working after spawning
 instead of idling behind a branch, and wait only when genuinely blocked. The
