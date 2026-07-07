@@ -127,7 +127,11 @@ When `start_new_session` runs, it:
 1. resolves a fresh session log directory (`SessionLog::resolve_path(None)` →
    `~/.intendant/logs/<uuid>/`) and opens the `SessionLog`;
 2. resolves the project root (per-session override or the daemon's default) and
-   loads the `Project`;
+   loads the `Project`. On a **projectless daemon** (see below) there is no
+   default: a `CreateSession` without an explicit `project_root` fails with
+   `SessionEnded { error_kind: "no_project" }` — a structured class the
+   dashboard turns into the project picker — instead of silently rooting the
+   session at the daemon's launch directory;
 3. writes `session_meta.json` and activates the shared active-session handle;
 4. resolves the backend (one-shot `agent` override → configured default →
    internal) and applies the runtime external-agent config;
@@ -179,7 +183,8 @@ by it, so the supervisor picks it up.
 
 ## File Watcher, Snapshots, and Rewind
 
-`file_watcher.rs` is a live filesystem watcher rooted at the project directory.
+`file_watcher.rs` is a live filesystem watcher rooted at the project directory
+(a projectless daemon starts no watcher — there is nothing to watch).
 It works for **all** agent types — internal, Codex, Claude Code —
 because it watches the filesystem directly rather than diffing git, so an
 external CLI's edits show up the same as Intendant's own. It does two jobs:
@@ -256,6 +261,23 @@ many sessions over its lifetime, driven entirely from frontends. Passing a task
 on the command line instead runs it as the foreground session under the same
 gateway (the headless arm), which falls through to this daemon loop when the
 session ends.
+
+**Projectless daemons.** The daemon path's `project_root` is an
+`Option<PathBuf>`. When the daemon starts in a directory with no project
+marker — no `.git` (directory or worktree file) and no `intendant.toml`; the
+single definition lives in `project::root_has_project_marker`, which the
+boot-scan gate (`file_watcher::root_is_snapshot_worthy`) also uses — it runs
+*projectless* instead of adopting cwd as an implicit project. Concretely: no
+file-watcher baseline (nothing is watched at all), no cwd-derived sandbox
+write scope (scratch + log dir + `~/.intendant` + explicit absolute grants
+only), no project-root `.env` layer at startup, `GET /api/project-root`
+returns `project_root: null` (the dashboard's New Session pane requires a
+project before submitting), and there is **no default session project** —
+each `CreateSession`/resume carries its own `project_root`, and a create
+without one gets the structured `no_project` failure. This is the normal
+shape for installed-app and service deployments, whose launch cwd (`$HOME`,
+`/Applications`, …) is an accident; CLI invocations keep cwd-as-project,
+which is correct for `intendant "task"` inside a repo.
 
 Ctrl+C in this mode is handled by the global signal handler installed in `main`
 (it marks the session interrupted and exits 130); the daemon loop deliberately

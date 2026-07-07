@@ -1,7 +1,7 @@
 use crate::autonomy::ApprovalConfig;
 use crate::error::CallerError;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1276,6 +1276,21 @@ fn detect_project_root() -> Result<PathBuf, CallerError> {
 
     std::env::current_dir()
         .map_err(|e| CallerError::Config(format!("Failed to get current directory: {}", e)))
+}
+
+/// Whether `root` is a *real* project root — it carries a project marker:
+/// a `.git` (directory, or file for git worktrees) or an `intendant.toml`.
+///
+/// This is the single definition of "has a project" (the boot-scan gate in
+/// `file_watcher::root_is_snapshot_worthy` delegates here). When
+/// `detect_project_root()` fell back to cwd and that cwd has no marker, a
+/// daemon must run projectless rather than adopt the launch directory as an
+/// implicit project (sandbox write scope, watcher root, default session
+/// project). CLI (non-daemon) invocations keep cwd-as-project.
+pub fn root_has_project_marker(root: &Path) -> bool {
+    // A git worktree's `.git` is a file, not a directory — exists()
+    // covers both shapes.
+    root.join(".git").exists() || root.join("intendant.toml").exists()
 }
 
 #[cfg(test)]

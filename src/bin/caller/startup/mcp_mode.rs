@@ -83,7 +83,7 @@ pub(crate) async fn run_mcp_mode(
     let _log_sinks = startup::wiring::spawn_log_sinks(&bus, &session_log);
 
     let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) =
-        startup::wiring::start_project_file_watcher(&project.root, &log_dir, &bus);
+        startup::wiring::start_project_file_watcher(Some(&project.root), &log_dir, &bus);
 
     // Web gateway (WebSocket)
     let _web_handle = if use_web {
@@ -95,6 +95,7 @@ pub(crate) async fn run_mcp_mode(
         let gateway = startup::wiring::spawn_mode_web_gateway(
             flags,
             project,
+            Some(project.root.clone()),
             &autonomy,
             &log_dir,
             &session_log,

@@ -340,8 +340,9 @@ pub enum AppEvent {
         session_id: String,
         reason: String,
         /// Structured failure class the UI can act on without parsing
-        /// prose (e.g. "unfueled" → an Add-API-keys action). None for
-        /// normal ends and unclassified errors.
+        /// prose (e.g. "unfueled" → an Add-API-keys action; "no_project"
+        /// → the project picker). None for normal ends and unclassified
+        /// errors.
         error_kind: Option<String>,
     },
     DebugScreenReady {

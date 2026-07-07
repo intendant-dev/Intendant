@@ -74,7 +74,7 @@ pub(crate) async fn run_headless_mode(
     let _log_sinks = startup::wiring::spawn_log_sinks(&bus, &session_log);
 
     let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) =
-        startup::wiring::start_project_file_watcher(&project.root, &log_dir, &bus);
+        startup::wiring::start_project_file_watcher(Some(&project.root), &log_dir, &bus);
 
     // JSON stdout subscriber: prints OutboundEvents as JSONL to stdout
     if flags.json_output {
@@ -399,6 +399,7 @@ pub(crate) async fn run_headless_mode(
         let gateway = startup::wiring::spawn_mode_web_gateway(
             flags,
             &project,
+            Some(project.root.clone()),
             &autonomy,
             &log_dir,
             &session_log,
@@ -473,7 +474,7 @@ pub(crate) async fn run_headless_mode(
             session_supervisor::SessionSupervisor::new(
                 session_supervisor::SessionSupervisorConfig {
                     bus: bus.clone(),
-                    project_root: project.root.clone(),
+                    project_root: Some(project.root.clone()),
                     autonomy: autonomy.clone(),
                     shared_external_agent: shared_external_agent.clone(),
                     shared_codex_config: shared_codex_config.clone(),
@@ -693,7 +694,7 @@ pub(crate) async fn run_headless_mode(
 
         run_daemon_loop(DaemonConfig {
             bus: bus.clone(),
-            project_root: project_root.clone(),
+            project_root: Some(project_root.clone()),
             autonomy: autonomy_for_daemon.clone(),
             shared_external_agent: shared_external_agent.clone(),
             shared_codex_config: shared_codex_config.clone(),
