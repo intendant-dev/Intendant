@@ -23361,7 +23361,11 @@ function stationOperateBrowserWorkspace(op) {
       url: draft.url || undefined,
       provider: draft.provider || 'auto',
       label: draft.label || undefined,
-      owner_session_id: currentSessionId || undefined,
+      // The old `currentSessionId` global died in the AppWeb→PresenceWeb
+      // merge (9285c7b6); the bare read threw ReferenceError and silently
+      // broke Station's workspace create. Same fallback chain as the
+      // Debug pane's debugPaneSessionId() (PR #70 fix).
+      owner_session_id: currentSessionFullId || daemonSessionFullId || undefined,
     });
     stationSetPeerStatus('Browser workspace create requested', 'ok');
     stationScheduleUpdate();
