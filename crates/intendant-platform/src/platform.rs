@@ -1142,15 +1142,22 @@ pub fn home_dir() -> std::path::PathBuf {
 /// no effect. Tests must thread explicit paths instead of mutating the
 /// environment (which races the parallel test runner anyway).
 ///
-/// In unit-test builds (`cfg(test)`) the unset-`INTENDANT_HOME` default
-/// swaps from the live `~/.intendant` to a per-process scratch root under
-/// the OS temp dir: unit tests exercising call-time defaults must never
-/// read or write the developer's real daemon state (fixture session rows
-/// used to pollute the live dashboard, and tests observed the live
-/// daemon's concurrent writes — a flake class). Tests that assert on
-/// specific state files keep threading explicit `home`/path parameters;
-/// the scratch root only redirects paths nothing injected. It keeps a
-/// trailing `.intendant` component so shape-sensitive code
+/// In THIS CRATE's unit-test builds (`cfg(test)`) the unset-`INTENDANT_HOME`
+/// default swaps from the live `~/.intendant` to a per-instance scratch
+/// root under the OS temp dir: unit tests exercising call-time defaults
+/// must never read or write the developer's real daemon state (fixture
+/// session rows used to pollute the live dashboard, and tests observed the
+/// live daemon's concurrent writes — a flake class).
+///
+/// IMPORTANT LIMIT: `cfg(test)` does not cross crates. When a DEPENDENT
+/// crate's test binary (e.g. the intendant bin's 2.5k unit tests) is
+/// built, this crate compiles WITHOUT `cfg(test)` and the default here is
+/// the live home. Dependent crates therefore get no ambient protection
+/// from this branch — their tests must thread explicit `home`/`_in(path)`
+/// parameters (the seam's primary convention; see
+/// `diagnostics::append_visual_freshness_record_in` for the pattern and
+/// the incident that proved the gap). The scratch root keeps a trailing
+/// `.intendant` component so shape-sensitive code
 /// (`external_wrapper_index::home_from_log_dir`) parses it like a real
 /// home's state root. This mirrors the `credential_audit::trail_path`
 /// precedent, now subsumed by this seam.
@@ -1160,8 +1167,22 @@ pub fn intendant_home() -> std::path::PathBuf {
         intendant_home_override(std::env::var_os("INTENDANT_HOME")).unwrap_or_else(|| {
             #[cfg(test)]
             {
+                // PID alone is NOT unique across runs: busy CI boxes recycle
+                // PIDs fast, and a recycled PID inherits a previous test
+                // process's scratch home — stale state files included (seen
+                // live: a diagnostics append test read a prior run's records
+                // on the loaded Linux runner). A startup-time nanos component
+                // makes the root unique per process INSTANCE; OnceLock keeps
+                // it stable within the process.
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
                 std::env::temp_dir()
-                    .join(format!("intendant-test-home-{}", std::process::id()))
+                    .join(format!(
+                        "intendant-test-home-{}-{nanos}",
+                        std::process::id()
+                    ))
                     .join(".intendant")
             }
             #[cfg(not(test))]
