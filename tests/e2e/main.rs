@@ -314,6 +314,11 @@ where
 /// null` on the gateway — run a CreateSession that carries an explicit
 /// `project_root` to completion, and fail one without it with the
 /// structured `no_project` error kind instead of adopting cwd.
+///
+/// "Completion" for a supervised session is `round_complete` plus the done
+/// signal in its log: by design the session then parks awaiting follow-ups
+/// (no SessionEnded on task completion); `session_ended` is asserted via an
+/// explicit stop_session afterwards.
 #[tokio::test]
 async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
     use futures_util::SinkExt;
@@ -470,21 +475,20 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
         .and_then(|v| v.as_str())
         .expect("session_started carries a session id")
         .to_string();
-    let ended = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
-        json.get("event").and_then(|v| v.as_str()) == Some("session_ended")
+    // Task completion: the loop finishes its round (done signal) and the
+    // session parks for follow-ups — by design there is no SessionEnded
+    // here, so round_complete is the completion signal.
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
             && json.get("session_id").and_then(|v| v.as_str()) == Some(started_id.as_str())
     })
     .await
     .unwrap_or_else(|| {
         panic!(
-            "rooted session never ended; daemon stderr:\n{}",
+            "rooted session never completed its round; daemon stderr:\n{}",
             stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
         )
     });
-    assert!(
-        ended.get("error_kind").is_none_or(|v| v.is_null()),
-        "explicit-project session must end cleanly, got {ended}"
-    );
     let logs = rig.session_logs();
     assert!(
         logs.contains("projectless mock run complete"),
@@ -493,6 +497,34 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
     assert!(
         logs.contains("PROJECTLESS_E2E_ROUNDTRIP") || rig.turn_artifacts().contains("PROJECTLESS_E2E_ROUNDTRIP"),
         "missing the runtime round-trip evidence"
+    );
+
+    // The idle session ends when explicitly stopped — the one place a
+    // supervised session emits session_ended on the happy path.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "stop_session",
+            "session_id": started_id,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send stop_session");
+    let ended = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_ended")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(started_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "stopped session never ended; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    assert!(
+        ended.get("error_kind").is_none_or(|v| v.is_null()),
+        "user-stopped session must end without an error class, got {ended}"
     );
 
     child.kill().await.expect("stop the daemon");
