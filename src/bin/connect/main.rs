@@ -131,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/vault", get(api_vault_fetch).post(api_vault_publish))
         .route("/api/claims/claim", post(api_claim_start))
         .route("/api/claims/{claim_id}", get(api_claim_status))
+        .route("/api/claims/{claim_id}/arm", post(api_claim_arm))
         .route("/api/audit", get(api_audit))
         .route("/api/status", get(api_status))
         .route("/api/attest/dns", post(attest_dns))
@@ -592,6 +593,13 @@ struct DaemonRecord {
     daemon_public_key: String,
     owner_user_id: Option<Uuid>,
     claim_code_hash: Option<String>,
+    /// True when `claim_code_hash` was minted by the daemon itself
+    /// (first-owner bootstrap): this service holds only the hash, the
+    /// freshness is presence-bound (refreshed on every register poll
+    /// instead of the 10-minute TTL), and a claim against it requires the
+    /// arm step before the challenge fires.
+    #[serde(default)]
+    claim_code_daemon_minted: bool,
     claim_code_created_unix_ms: Option<u64>,
     registered_unix_ms: u64,
     last_seen_unix_ms: u64,
@@ -749,6 +757,11 @@ struct PendingClaim {
     daemon_id: String,
     challenge: String,
     created_unix_ms: u64,
+    /// First-owner bootstrap (daemon-minted phrase): the challenge does
+    /// not fire until the browser arms the claim with its identity key
+    /// and phrase-derived tag.
+    bootstrap_required: bool,
+    armed: bool,
     status: ClaimStatus,
 }
 
@@ -3722,7 +3735,12 @@ async fn api_daemon_label(
 
 #[derive(Debug, Deserialize)]
 struct ClaimStartRequest {
+    #[serde(default)]
     claim_code: String,
+    /// Preferred: SHA-256 (base64url) of the normalized phrase, computed
+    /// client-side — this service never needs to see plaintext codes.
+    #[serde(default)]
+    claim_code_hash: Option<String>,
 }
 
 async fn api_claim_start(
@@ -3733,11 +3751,27 @@ async fn api_claim_start(
     let user = require_user(&state, &headers).await?;
     require_csrf(&state, &headers).await?;
     check_rate_limit(&state, &headers, "claim_start", 10, 60_000).await?;
-    let code = normalize_claim_code(&body.claim_code);
-    if code.is_empty() {
-        return Err(ApiError::bad_request("claim_code is required"));
-    }
-    let code_hashes = claim_code_hash_candidates(&body.claim_code);
+    let code_hashes = match body
+        .claim_code_hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty())
+    {
+        Some(hash) => {
+            if !is_sha256_b64u(hash) {
+                return Err(ApiError::bad_request(
+                    "claim_code_hash must be an unpadded base64url SHA-256 digest",
+                ));
+            }
+            vec![hash.to_string()]
+        }
+        None => {
+            if normalize_claim_code(&body.claim_code).is_empty() {
+                return Err(ApiError::bad_request("claim_code is required"));
+            }
+            claim_code_hash_candidates(&body.claim_code)
+        }
+    };
     let now = now_unix_ms();
     let daemon = {
         let store = state.store.lock().await;
@@ -3749,12 +3783,17 @@ async fn api_claim_start(
                     && d.claim_code_hash
                         .as_deref()
                         .is_some_and(|hash| code_hashes.iter().any(|candidate| candidate == hash))
-                    && d.claim_code_created_unix_ms
-                        .is_some_and(|created| now.saturating_sub(created) <= CLAIM_CODE_TTL_MS)
+                    && d.claim_code_created_unix_ms.is_some_and(|created| {
+                        // Daemon-minted hashes are presence-fresh (renewed
+                        // on every register poll), so the same TTL check
+                        // naturally covers both kinds.
+                        now.saturating_sub(created) <= CLAIM_CODE_TTL_MS
+                    })
             })
             .cloned()
             .ok_or_else(|| ApiError::not_found("claim code not found"))?
     };
+    let needs_bootstrap_arm = daemon.claim_code_daemon_minted;
     let claim_id = Uuid::new_v4().to_string();
     let challenge = random_b64u(32);
     state.pending_claims.lock().await.insert(
@@ -3765,22 +3804,123 @@ async fn api_claim_start(
             daemon_id: daemon.daemon_id.clone(),
             challenge: challenge.clone(),
             created_unix_ms: now_unix_ms(),
+            bootstrap_required: needs_bootstrap_arm,
+            armed: false,
             status: ClaimStatus::Pending,
         },
     );
     // The challenge names the claiming account so the daemon can co-sign
     // *who* it is being claimed by (v2 proofs) and show "claimed by
     // @handle" from its own signed record rather than this service's word.
+    // Bootstrap claims hold the challenge until the browser arms them
+    // with its identity key + phrase-derived tag (api_claim_arm).
+    if !needs_bootstrap_arm {
+        enqueue_event(
+            &state,
+            &daemon.daemon_id,
+            RendezvousEvent {
+                id: Uuid::new_v4().to_string(),
+                kind: "claim_challenge".to_string(),
+                claim_id: Some(claim_id.clone()),
+                challenge: Some(challenge),
+                user_id: Some(user.id.to_string()),
+                account_name: Some(user.account_name.clone()),
+                ..RendezvousEvent::default()
+            },
+        )
+        .await;
+    }
+    {
+        let mut store = state.store.lock().await;
+        audit(
+            &mut store,
+            "daemon_claim_started",
+            Some(user.id),
+            Some(daemon.daemon_id.clone()),
+            json!({ "claim_id": claim_id, "bootstrap": needs_bootstrap_arm }),
+        );
+        persist_locked(&state, &store)?;
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "claim_id": claim_id,
+        "daemon_id": daemon.daemon_id,
+        "daemon_public_key": daemon.daemon_public_key,
+        "needs_bootstrap_arm": needs_bootstrap_arm,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimArmRequest {
+    client_key: String,
+    client_key_tag: String,
+}
+
+/// Arm a first-owner bootstrap claim: the browser presents its identity
+/// key plus an HMAC tag derived from the daemon-minted phrase, and only
+/// then does the claim challenge fire. This service relays both blind —
+/// it holds the phrase's hash, not the phrase, so it can neither compute
+/// a tag for a key of its own nor alter the browser's (the daemon
+/// recomputes the tag over the exact key it enrolls).
+async fn api_claim_arm(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(claim_id): AxumPath<String>,
+    Json(body): Json<ClaimArmRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    require_csrf(&state, &headers).await?;
+    check_rate_limit(&state, &headers, "claim_arm", 10, 60_000).await?;
+    let client_key = body.client_key.trim().to_string();
+    let client_key_tag = body.client_key_tag.trim().to_string();
+    if client_key.is_empty() || client_key_tag.is_empty() {
+        return Err(ApiError::bad_request(
+            "client_key and client_key_tag are required",
+        ));
+    }
+    let (daemon_id, challenge, user_id_string, account_name) = {
+        let mut claims = state.pending_claims.lock().await;
+        let claim = claims
+            .get_mut(claim_id.trim())
+            .ok_or_else(|| ApiError::not_found("claim not found"))?;
+        if claim.user_id != user.id {
+            return Err(ApiError::forbidden("claim belongs to a different account"));
+        }
+        if !matches!(claim.status, ClaimStatus::Pending) {
+            return Err(ApiError::bad_request("claim is already resolved"));
+        }
+        if now_unix_ms().saturating_sub(claim.created_unix_ms) > CLAIM_TIMEOUT_MS {
+            claim.status = ClaimStatus::Rejected {
+                error: "claim timed out".to_string(),
+            };
+            return Err(ApiError::bad_request("claim timed out"));
+        }
+        if !claim.bootstrap_required {
+            return Err(ApiError::bad_request("claim does not need arming"));
+        }
+        if claim.armed {
+            return Err(ApiError::bad_request("claim is already armed"));
+        }
+        claim.armed = true;
+        (
+            claim.daemon_id.clone(),
+            claim.challenge.clone(),
+            claim.user_id.to_string(),
+            claim.account_name.clone(),
+        )
+    };
     enqueue_event(
         &state,
-        &daemon.daemon_id,
+        &daemon_id,
         RendezvousEvent {
             id: Uuid::new_v4().to_string(),
             kind: "claim_challenge".to_string(),
-            claim_id: Some(claim_id.clone()),
+            claim_id: Some(claim_id.trim().to_string()),
             challenge: Some(challenge),
-            user_id: Some(user.id.to_string()),
-            account_name: Some(user.account_name.clone()),
+            user_id: Some(user_id_string),
+            account_name: Some(account_name),
+            bootstrap_client_key: Some(client_key),
+            bootstrap_client_key_tag: Some(client_key_tag),
             ..RendezvousEvent::default()
         },
     )
@@ -3789,18 +3929,14 @@ async fn api_claim_start(
         let mut store = state.store.lock().await;
         audit(
             &mut store,
-            "daemon_claim_started",
+            "daemon_claim_armed",
             Some(user.id),
-            Some(daemon.daemon_id.clone()),
-            json!({ "claim_id": claim_id }),
+            Some(daemon_id),
+            json!({ "claim_id": claim_id.trim() }),
         );
         persist_locked(&state, &store)?;
     }
-    Ok(Json(json!({
-        "ok": true,
-        "claim_id": claim_id,
-        "daemon_id": daemon.daemon_id,
-    })))
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn api_claim_status(
@@ -3912,6 +4048,13 @@ struct DaemonRegisterRequest {
     protocol: String,
     daemon_id: String,
     daemon_public_key: String,
+    /// First-owner bootstrap (fresh boxes): the daemon minted its own
+    /// claim phrase locally and registers only the SHA-256 (base64url) of
+    /// its normalized form. This service never sees the plaintext, so it
+    /// can route a claim to the daemon but cannot claim (or enroll
+    /// against) the daemon itself.
+    #[serde(default)]
+    bootstrap_code_hash: Option<String>,
 }
 
 async fn daemon_register(
@@ -3931,7 +4074,20 @@ async fn daemon_register(
             "daemon_id and daemon_public_key are required",
         ));
     }
+    let bootstrap_code_hash = body
+        .bootstrap_code_hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty());
+    if let Some(hash) = bootstrap_code_hash {
+        if !is_sha256_b64u(hash) {
+            return Err(ApiError::bad_request(
+                "bootstrap_code_hash must be an unpadded base64url SHA-256 digest",
+            ));
+        }
+    }
     let mut claim_code = None;
+    let mut daemon_minted = false;
     let (claimed, claimed_by, claim_code_expires_unix_ms) = {
         let mut claim_codes = state.claim_codes.lock().await;
         let mut store = state.store.lock().await;
@@ -3940,6 +4096,41 @@ async fn daemon_register(
             claim_codes.remove(&stale_id);
         }
         let active_claim_hashes = active_claim_code_hashes(&store, &daemon_id, now);
+        // Applies the unclaimed-record claim-code policy: a daemon-minted
+        // bootstrap hash wins (presence-fresh, plaintext never seen here);
+        // otherwise the service mints and remints on the usual TTL.
+        let apply_claim_code = |record: &mut DaemonRecord,
+                                claim_codes: &mut HashMap<String, String>,
+                                claim_code: &mut Option<String>|
+         -> ApiResult<()> {
+            match bootstrap_code_hash {
+                Some(hash) => {
+                    if active_claim_hashes.contains(hash) {
+                        return Err(ApiError::conflict(
+                            "bootstrap claim hash collides with another active claim code",
+                        ));
+                    }
+                    claim_codes.remove(&record.daemon_id);
+                    record.claim_code_hash = Some(hash.to_string());
+                    record.claim_code_daemon_minted = true;
+                    // Presence-bound freshness: valid while the daemon
+                    // polls, instead of the 10-minute TTL.
+                    record.claim_code_created_unix_ms = Some(now);
+                }
+                None => {
+                    if record.claim_code_daemon_minted {
+                        // The daemon stopped offering bootstrap (an owner
+                        // appeared locally) — revert to service-minted.
+                        record.claim_code_hash = None;
+                        record.claim_code_daemon_minted = false;
+                        record.claim_code_created_unix_ms = None;
+                    }
+                    *claim_code =
+                        Some(ensure_claim_code(claim_codes, record, &active_claim_hashes)?);
+                }
+            }
+            Ok(())
+        };
         let (owner_user_id, code_created_unix_ms) = if let Some(existing) =
             store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id)
         {
@@ -3953,11 +4144,8 @@ async fn daemon_register(
             record_presence_hour(&mut existing.presence_hours, now);
             existing.updated_unix_ms = now;
             if existing.owner_user_id.is_none() {
-                claim_code = Some(ensure_claim_code(
-                    &mut claim_codes,
-                    existing,
-                    &active_claim_hashes,
-                )?);
+                apply_claim_code(existing, &mut claim_codes, &mut claim_code)?;
+                daemon_minted = existing.claim_code_daemon_minted;
             }
             (existing.owner_user_id, existing.claim_code_created_unix_ms)
         } else {
@@ -3967,17 +4155,15 @@ async fn daemon_register(
                 daemon_public_key: daemon_public_key.clone(),
                 owner_user_id: None,
                 claim_code_hash: None,
+                claim_code_daemon_minted: false,
                 claim_code_created_unix_ms: None,
                 registered_unix_ms: now,
                 last_seen_unix_ms: now,
                 updated_unix_ms: now,
                 presence_hours: Vec::new(),
             };
-            claim_code = Some(ensure_claim_code(
-                &mut claim_codes,
-                &mut record,
-                &active_claim_hashes,
-            )?);
+            apply_claim_code(&mut record, &mut claim_codes, &mut claim_code)?;
+            daemon_minted = record.claim_code_daemon_minted;
             let created = record.claim_code_created_unix_ms;
             store.daemons.push(record);
             (None, created)
@@ -3997,9 +4183,11 @@ async fn daemon_register(
                     .unwrap_or_default(),
             )
         });
-        let expires = if owner_user_id.is_none() {
+        let expires = if owner_user_id.is_none() && !daemon_minted {
             code_created_unix_ms.map(|created| created.saturating_add(CLAIM_CODE_TTL_MS))
         } else {
+            // Claimed, or daemon-minted (presence-bound: fresh while the
+            // daemon keeps polling).
             None
         };
         (owner_user_id.is_some(), claimed_by, expires)
@@ -4022,10 +4210,20 @@ async fn daemon_register(
             .map(|(_, handle)| handle.clone())
             .filter(|handle| !handle.is_empty()),
         "claim_code": claim_code,
+        "claim_code_daemon_minted": daemon_minted,
         "claim_code_expires_unix_ms": claim_code_expires_unix_ms,
         "claim_url": claim_url,
         "daemon_public_key": daemon_public_key,
     })))
+}
+
+/// Shape check for a daemon-minted bootstrap hash: unpadded base64url of
+/// a SHA-256 digest — exactly 43 characters of the base64url alphabet.
+fn is_sha256_b64u(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn ensure_claim_code(
@@ -4236,6 +4434,13 @@ struct RendezvousEvent {
     claim_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     challenge: Option<String>,
+    // First-owner bootstrap arm fields, relayed blind: the daemon
+    // recomputes the phrase-derived tag itself, so this service cannot
+    // substitute a key of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bootstrap_client_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bootstrap_client_key_tag: Option<String>,
 }
 
 async fn enqueue_event(state: &AppState, daemon_id: &str, event: RendezvousEvent) {
@@ -4427,6 +4632,10 @@ fn validate_dashboard_binding(
 struct DaemonErrorRequest {
     daemon_id: String,
     request_id: String,
+    /// Claim-scoped errors name their claim so the claiming page shows
+    /// the daemon's reason instead of timing out.
+    #[serde(default)]
+    claim_id: Option<String>,
     error: String,
 }
 
@@ -4443,7 +4652,21 @@ async fn daemon_error(
         .remove(body.request_id.trim())
     {
         if pending.daemon_id == body.daemon_id {
-            let _ = pending.response_tx.send(Err(body.error));
+            let _ = pending.response_tx.send(Err(body.error.clone()));
+        }
+    }
+    if let Some(claim_id) = body
+        .claim_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        let mut claims = state.pending_claims.lock().await;
+        if let Some(claim) = claims.get_mut(claim_id) {
+            // Only the daemon the claim targets may reject it.
+            if claim.daemon_id == body.daemon_id && matches!(claim.status, ClaimStatus::Pending) {
+                claim.status = ClaimStatus::Rejected { error: body.error };
+            }
         }
     }
     Ok(Json(json!({ "ok": true })))
@@ -6683,22 +6906,132 @@ async function login() {{
   }}
 }}
 
+/* Mirrors the daemon/service normalize_claim_code: lowercase alphanumeric
+   runs joined by '-'. */
+function normalizeClaimPhrase(input) {{
+  return String(input || '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean)
+    .join('-');
+}}
+
+async function sha256B64uOfText(text) {{
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return bufToB64u(digest);
+}}
+
+/* Load or CREATE this origin's browser identity key — the exact record
+   the dashboard app uses (IndexedDB intendant-client-identity/keys/v1,
+   non-extractable P-256, {{privateKey, publicRaw, createdAtMs}}).
+   Creating here is what makes bootstrap one ceremony: the key that
+   claims is the key the daemon enrolls, and the dashboard then signs in
+   with it. */
+async function ensureOwnIdentity() {{
+  if (!window.indexedDB || !crypto?.subtle) throw new Error('WebCrypto unavailable');
+  const db = await new Promise((resolve, reject) => {{
+    const req = indexedDB.open('intendant-client-identity', 1);
+    req.onupgradeneeded = () => {{
+      if (!req.result.objectStoreNames.contains('keys')) req.result.createObjectStore('keys');
+    }};
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }});
+  try {{
+    let record = await new Promise((resolve, reject) => {{
+      const tx = db.transaction('keys', 'readonly');
+      const req = tx.objectStore('keys').get('v1');
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    }});
+    if (!record?.privateKey || !record?.publicRaw) {{
+      const pair = await crypto.subtle.generateKey(
+        {{ name: 'ECDSA', namedCurve: 'P-256' }},
+        false,
+        ['sign']
+      );
+      const publicRaw = await crypto.subtle.exportKey('raw', pair.publicKey);
+      record = {{ privateKey: pair.privateKey, publicRaw, createdAtMs: Date.now() }};
+      await new Promise((resolve, reject) => {{
+        const tx = db.transaction('keys', 'readwrite');
+        tx.objectStore('keys').put(record, 'v1');
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      }});
+    }}
+    return {{ publicRawB64u: bufToB64u(record.publicRaw) }};
+  }} finally {{
+    db.close();
+  }}
+}}
+
+/* First-owner bootstrap tag (mirrors connect_rendezvous.rs): HMAC-SHA256
+   keyed by SHA-256(normalized phrase) over a payload binding this
+   browser's key and account. The service relays it blind — it holds the
+   phrase's hash, never the phrase, so only a phrase-holder can endorse a
+   key for enrollment. */
+async function bootstrapTag(normalizedPhrase, daemonId, daemonPublicKey, clientKeyB64u, userId, accountName) {{
+  const phraseDigest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(normalizedPhrase)
+  );
+  const hmacKey = await crypto.subtle.importKey(
+    'raw',
+    phraseDigest,
+    {{ name: 'HMAC', hash: 'SHA-256' }},
+    false,
+    ['sign']
+  );
+  const payload = `intendant-connect-bootstrap-v1\n${{daemonId}}\n${{daemonPublicKey}}\n${{clientKeyB64u}}\n${{userId}}\n${{accountName}}\n`;
+  const tag = await crypto.subtle.sign('HMAC', hmacKey, new TextEncoder().encode(payload));
+  return bufToB64u(tag);
+}}
+
 async function claimDaemon() {{
   const claimCode = $('claim-code').value.trim();
   if (!claimCode) throw new Error('Claim phrase is required');
   setBusy('claim', true);
   setStatus('claim-status', 'Waiting for daemon proof', '');
   try {{
+    const normalized = normalizeClaimPhrase(claimCode);
+    if (!normalized) throw new Error('Claim phrase is required');
+    // Hash-only claim: the service routes by digest and never sees the
+    // plaintext phrase (a daemon-minted phrase must stay between the
+    // daemon and this browser).
     const start = await api('/api/claims/claim', {{
       method: 'POST',
-      body: JSON.stringify({{ claim_code: claimCode }}),
+      body: JSON.stringify({{ claim_code_hash: await sha256B64uOfText(normalized) }}),
     }});
+    let bootstrap = false;
+    if (start.needs_bootstrap_arm) {{
+      bootstrap = true;
+      setStatus('claim-status', 'Fresh daemon — enrolling this browser as its first owner', '');
+      const identity = await ensureOwnIdentity();
+      const tag = await bootstrapTag(
+        normalized,
+        String(start.daemon_id || ''),
+        String(start.daemon_public_key || ''),
+        identity.publicRawB64u,
+        String(state.user?.id || ''),
+        String(state.user?.account_name || '')
+      );
+      await api(`/api/claims/${{encodeURIComponent(start.claim_id)}}/arm`, {{
+        method: 'POST',
+        body: JSON.stringify({{ client_key: identity.publicRawB64u, client_key_tag: tag }}),
+      }});
+    }}
     const deadline = Date.now() + 65000;
     while (Date.now() < deadline) {{
       await new Promise(resolve => setTimeout(resolve, 750));
       const status = await api(`/api/claims/${{encodeURIComponent(start.claim_id)}}`);
       if (status.result?.status === 'approved') {{
-        setStatus('claim-status', `Rendezvous route claimed for ${{status.result.daemon_id}}. Next: open that daemon directly (its https://host:8765 address) as root, go to Access → People & Devices, and grant this account a role — until then the daemon will refuse hosted dashboard control.`, 'ok');
+        setStatus(
+          'claim-status',
+          bootstrap
+            ? `Claimed ${{status.result.daemon_id}} — and this browser is enrolled as its first owner (role: root, co-signed by the daemon). Open it from your computers list; the dashboard signs in with this browser's key.`
+            : `Rendezvous route claimed for ${{status.result.daemon_id}}. Next: open that daemon directly (its https://host:8765 address) as root, go to Access → People & Devices, and grant this account a role — until then the daemon will refuse hosted dashboard control.`,
+          'ok'
+        );
         $('claim-code').value = '';
         await refreshAll();
         return;
@@ -7409,6 +7742,7 @@ mod tests {
             daemon_public_key: format!("{daemon_id}-key"),
             owner_user_id,
             claim_code_hash: claim_code.map(claim_code_hash),
+            claim_code_daemon_minted: false,
             claim_code_created_unix_ms,
             registered_unix_ms: 1,
             last_seen_unix_ms: 1,
@@ -7726,6 +8060,25 @@ mod tests {
         ));
     }
 
+    /// Twin of the daemon's `claim_code_hash_matches_the_service_construction`
+    /// (and the /connect page JS): one shared literal pins the hash across
+    /// all three implementations.
+    #[test]
+    fn claim_code_hash_pins_the_cross_binary_literal() {
+        assert_eq!(
+            claim_code_hash("  Abandon ABILITY__able "),
+            "Q4-Jf1pewq3jBEyujMeltvQLFADs3UikZAMej9Iu4j0"
+        );
+        assert!(is_sha256_b64u(
+            "Q4-Jf1pewq3jBEyujMeltvQLFADs3UikZAMej9Iu4j0"
+        ));
+        assert!(!is_sha256_b64u("too-short"));
+        assert!(!is_sha256_b64u(&format!(
+            "{}=",
+            "Q4-Jf1pewq3jBEyujMeltvQLFADs3UikZAMej9Iu4j0"
+        )));
+    }
+
     #[test]
     fn claim_code_normalization_accepts_case_and_separator_variants() {
         let code = "abandon-ability-able-about-above-absent-absorb";
@@ -7939,6 +8292,7 @@ mod tests {
                 daemon_public_key: "daemon-key".to_string(),
                 owner_user_id: Some(user_id),
                 claim_code_hash: None,
+                claim_code_daemon_minted: false,
                 claim_code_created_unix_ms: None,
                 registered_unix_ms: 10,
                 last_seen_unix_ms: now_unix_ms(),

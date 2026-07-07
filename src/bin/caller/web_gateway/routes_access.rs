@@ -446,6 +446,7 @@ pub(crate) fn access_connect_status_response_value() -> serde_json::Value {
         "signed_claim": status.signed_claim,
         "claim_code_available": status.claim_code.is_some(),
         "claim_code_expires_unix_ms": status.claim_code_expires_unix_ms,
+        "bootstrap": status.bootstrap,
         "default_rendezvous_url": crate::project::DEFAULT_CONNECT_RENDEZVOUS_URL,
     })
 }

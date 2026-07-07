@@ -10,6 +10,7 @@
 use crate::daemon_identity::DaemonIdentity;
 use crate::dashboard_control::DashboardControlRegistry;
 use crate::project::ConnectConfig;
+use base64::Engine as _;
 use reqwest::{Client, RequestBuilder, Url};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -30,6 +31,12 @@ const CLAIM_PROTOCOL_V1: &str = "intendant-connect-claim-v1";
 const CLAIM_PROTOCOL_V2: &str = "intendant-connect-claim-v2";
 /// Daemon-signed release of a claim binding, mirrored by the service.
 const UNCLAIM_PROTOCOL: &str = "intendant-connect-unclaim-v1";
+/// First-owner bootstrap tag (mirrored by the /connect claim page): an
+/// HMAC-SHA256 keyed by the daemon-minted phrase, binding the claiming
+/// browser's identity key and account. Possession of the phrase is
+/// box-grade proof (it exists only in this daemon's log/Access card), so
+/// a valid tag is what authorizes minting the FIRST owner grant.
+const BOOTSTRAP_TAG_PROTOCOL: &str = "intendant-connect-bootstrap-v1";
 
 /// Register failures split by what retrying can fix. `Rejected` is a 4xx
 /// verdict from the service — a missing/invalid daemon token or a gated
@@ -48,6 +55,12 @@ struct RegisterRequest {
     protocol: &'static str,
     daemon_id: String,
     daemon_public_key: String,
+    /// First-owner bootstrap: SHA-256 (base64url) of this daemon's own
+    /// normalized claim phrase, sent only while the box is fresh (empty
+    /// IAM). The rendezvous stores the hash for claim routing and never
+    /// sees the plaintext.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bootstrap_code_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +75,10 @@ struct RegisterResponse {
     claimed_by_handle: Option<String>,
     #[serde(default)]
     claim_code: Option<String>,
+    /// The service accepted this daemon's bootstrap hash — the phrase to
+    /// show is the local one, not a service-minted code.
+    #[serde(default)]
+    claim_code_daemon_minted: bool,
     #[serde(default)]
     claim_code_expires_unix_ms: Option<u64>,
     #[serde(default)]
@@ -106,6 +123,12 @@ struct RendezvousEvent {
     claim_id: Option<String>,
     #[serde(default)]
     challenge: Option<String>,
+    /// First-owner bootstrap arm fields, relayed blind by the service —
+    /// this daemon recomputes the phrase-derived tag itself.
+    #[serde(default)]
+    bootstrap_client_key: Option<String>,
+    #[serde(default)]
+    bootstrap_client_key_tag: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +145,11 @@ struct AnswerRequest {
 struct ErrorRequest {
     daemon_id: String,
     request_id: String,
+    /// When the error concerns a claim, its id — the service then rejects
+    /// the pending claim so the claiming page shows the real reason
+    /// instead of timing out. Older services ignore the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claim_id: Option<String>,
     error: String,
 }
 
@@ -200,6 +228,234 @@ fn clear_signed_claim_record() {
     }
 }
 
+/// A box is first-owner-bootstrap eligible while its local IAM holds
+/// nothing at all: no principals, no grants. The auto-minted mTLS client
+/// bundle does NOT count as ownership — it exists on every daemon from
+/// first boot, and holding its P12 is box-grade access, exactly what the
+/// bootstrap phrase proves too. The window closes the moment any
+/// principal or grant is written, and unreadable IAM state fails closed.
+fn first_owner_bootstrap_eligible() -> bool {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    match crate::access::iam::load_state(&cert_dir) {
+        Ok(state) => state.principals.is_empty() && state.grants.is_empty(),
+        Err(_) => false,
+    }
+}
+
+fn bootstrap_phrase_registry() -> &'static Mutex<Option<String>> {
+    static REGISTRY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(None))
+}
+
+/// The daemon-minted first-owner phrase for this process: minted on first
+/// use while the box is eligible, dropped forever once an owner exists.
+/// Regenerated per boot — the phrase is a bootstrap secret, not durable
+/// state.
+fn current_bootstrap_phrase() -> Option<String> {
+    let mut slot = bootstrap_phrase_registry()
+        .lock()
+        .expect("bootstrap phrase poisoned");
+    if !first_owner_bootstrap_eligible() {
+        if slot.take().is_some() {
+            eprintln!("[connect] first-owner bootstrap closed (this daemon now has an owner)");
+        }
+        return None;
+    }
+    if slot.is_none() {
+        let mut entropy = [0u8; 16];
+        if let Err(e) =
+            ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut entropy)
+        {
+            eprintln!("[connect] bootstrap phrase entropy unavailable: {e:?}");
+            return None;
+        }
+        match bip39::Mnemonic::from_entropy(&entropy) {
+            Ok(mnemonic) => *slot = Some(mnemonic.to_string().replace(' ', "-")),
+            Err(e) => {
+                eprintln!("[connect] bootstrap phrase generation failed: {e}");
+                return None;
+            }
+        }
+    }
+    slot.clone()
+}
+
+fn clear_bootstrap_phrase() {
+    bootstrap_phrase_registry()
+        .lock()
+        .expect("bootstrap phrase poisoned")
+        .take();
+}
+
+/// Mirrors `normalize_claim_code` in `intendant-connect`: lowercase
+/// alphanumeric runs joined by `-`.
+fn normalize_claim_code(input: &str) -> String {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            parts.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts.join("-")
+}
+
+/// Mirrors `claim_code_hash` in `intendant-connect` (and the /connect
+/// page JS): SHA-256 of the normalized phrase, base64url unpadded.
+fn claim_code_hash(code: &str) -> String {
+    crate::daemon_identity::b64u(
+        ring::digest::digest(
+            &ring::digest::SHA256,
+            normalize_claim_code(code).as_bytes(),
+        )
+        .as_ref(),
+    )
+}
+
+/// The exact string the /connect page HMACs with the phrase-derived key.
+/// Binds the claiming browser's identity key and account, so the relay
+/// (which never sees the phrase) cannot substitute a key of its own.
+fn bootstrap_tag_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    client_key_b64u: &str,
+    account_user_id: &str,
+    account_name: &str,
+) -> String {
+    format!(
+        "{BOOTSTRAP_TAG_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{client_key_b64u}\n{account_user_id}\n{account_name}\n"
+    )
+}
+
+/// Verify a bootstrap arm and enroll the claiming browser as this
+/// daemon's FIRST owner (`role:root`). Authority basis: the tag proves
+/// possession of the daemon-minted phrase, which only box-grade access
+/// (this daemon's log, or its Access card behind AccessManage) reveals —
+/// the same proof SSH access would be. Recorded with the sentinel origin
+/// `connect-bootstrap`, which is not a hosted origin, so no role ceiling
+/// demotes the owner it mints. Fails closed on any mismatch and on any
+/// non-empty IAM.
+fn bootstrap_enroll_first_owner(
+    client_key_b64u: &str,
+    tag_b64u: &str,
+    account_user_id: &str,
+    account_name: &str,
+    daemon_id: &str,
+    daemon_public_key: &str,
+) -> Result<String, String> {
+    let Some(phrase) = current_bootstrap_phrase() else {
+        return Err(
+            "this daemon is not offering first-owner bootstrap (it already has an owner)"
+                .to_string(),
+        );
+    };
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let fingerprint = bootstrap_enroll_first_owner_at(
+        &cert_dir,
+        &phrase,
+        client_key_b64u,
+        tag_b64u,
+        account_user_id,
+        account_name,
+        daemon_id,
+        daemon_public_key,
+    )?;
+    clear_bootstrap_phrase();
+    eprintln!(
+        "[connect] first-owner bootstrap: enrolled client key {fingerprint} as role:root{}",
+        if account_name.is_empty() {
+            String::new()
+        } else {
+            format!(" (@{account_name})")
+        }
+    );
+    Ok(fingerprint)
+}
+
+/// Testable core: explicit state directory and phrase.
+#[allow(clippy::too_many_arguments)]
+fn bootstrap_enroll_first_owner_at(
+    cert_dir: &std::path::Path,
+    phrase: &str,
+    client_key_b64u: &str,
+    tag_b64u: &str,
+    account_user_id: &str,
+    account_name: &str,
+    daemon_id: &str,
+    daemon_public_key: &str,
+) -> Result<String, String> {
+    let engine = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let raw_key = engine
+        .decode(client_key_b64u)
+        .map_err(|_| "bootstrap client key is not valid base64url".to_string())?;
+    if raw_key.len() != 65 || raw_key[0] != 0x04 {
+        return Err("bootstrap client key must be a 65-byte uncompressed P-256 point".to_string());
+    }
+    let tag = engine
+        .decode(tag_b64u)
+        .map_err(|_| "bootstrap tag is not valid base64url".to_string())?;
+    let hmac_key = ring::hmac::Key::new(
+        ring::hmac::HMAC_SHA256,
+        ring::digest::digest(
+            &ring::digest::SHA256,
+            normalize_claim_code(phrase).as_bytes(),
+        )
+        .as_ref(),
+    );
+    let payload = bootstrap_tag_payload(
+        daemon_id,
+        daemon_public_key,
+        client_key_b64u,
+        account_user_id,
+        account_name,
+    );
+    ring::hmac::verify(&hmac_key, payload.as_bytes(), &tag).map_err(|_| {
+        "bootstrap tag verification failed — the phrase entered does not match this daemon's"
+            .to_string()
+    })?;
+
+    let mut state = crate::access::iam::load_state(cert_dir)
+        .map_err(|e| format!("load local IAM state: {e}"))?;
+    // Re-check under the state we are about to write: eligibility may
+    // have closed between the phrase snapshot and now.
+    if !(state.principals.is_empty() && state.grants.is_empty()) {
+        return Err("this daemon already has an owner; bootstrap enrollment is closed".to_string());
+    }
+    let fingerprint = crate::access::client_key::client_key_fingerprint(&raw_key);
+    let request = crate::access::iam::UserClientGrantUpsertRequest {
+        kind: "client_key".to_string(),
+        label: Some(if account_name.is_empty() {
+            "First owner (bootstrap)".to_string()
+        } else {
+            format!("@{account_name} (first owner)")
+        }),
+        client_key_fingerprint: Some(fingerprint.clone()),
+        client_key: Some(client_key_b64u.to_string()),
+        client_key_origin: Some("connect-bootstrap".to_string()),
+        role_id: Some("role:root".to_string()),
+        user_id: (!account_user_id.is_empty()).then(|| account_user_id.to_string()),
+        account_name: (!account_name.is_empty()).then(|| account_name.to_string()),
+        reason: Some(
+            "first-owner bootstrap: phrase-holder enrolled at claim time".to_string(),
+        ),
+        ..Default::default()
+    };
+    let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+        "connect-bootstrap",
+        "connect-rendezvous",
+    );
+    crate::access::iam::upsert_user_client_grant(&mut state, request, &actor)
+        .map_err(|e| e.to_string())?;
+    crate::access::iam::save_state(cert_dir, &state)
+        .map_err(|e| format!("save local IAM state: {e}"))?;
+    Ok(fingerprint)
+}
+
 /// How the daemon's local signed claim record relates to the owner the
 /// service currently asserts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -239,6 +495,10 @@ pub(crate) struct ConnectStatus {
     pub claim_code: Option<String>,
     pub claim_url: Option<String>,
     pub claim_code_expires_unix_ms: Option<u64>,
+    /// The current claim phrase is this daemon's own first-owner
+    /// bootstrap phrase: claiming with it also enrolls the claiming
+    /// browser as role:root.
+    pub bootstrap: bool,
 }
 
 fn status_registry() -> &'static Mutex<ConnectStatus> {
@@ -457,7 +717,7 @@ async fn run_connect_rendezvous_client(
 
     loop {
         match register(&client, &base_url, &config, &daemon_id, &daemon_public_key).await {
-            Ok(response) => note_register_response(&response),
+            Ok(response) => note_register_response(&response, &base_url),
             Err(RegisterError::Rejected(e)) => {
                 eprintln!(
                     "[connect] register rejected: {e} — the rendezvous refused this daemon \
@@ -518,7 +778,7 @@ async fn run_connect_rendezvous_client(
             if force_register || last_register.elapsed() >= REGISTER_REFRESH_INTERVAL {
                 match register(&client, &base_url, &config, &daemon_id, &daemon_public_key).await {
                     Ok(response) => {
-                        note_register_response(&response);
+                        note_register_response(&response, &base_url);
                         last_register = Instant::now();
                     }
                     Err(RegisterError::Rejected(e)) => {
@@ -555,7 +815,19 @@ fn note_register_error(error: &str) {
 /// and print the claim line when the code actually changed (the old
 /// every-60s repeat was log noise; the current code is always visible in
 /// the Access card).
-fn note_register_response(response: &RegisterResponse) {
+fn note_register_response(response: &RegisterResponse, base_url: &Url) {
+    // Daemon-minted bootstrap: the service echoes no code (it only holds
+    // the hash) — the phrase to show, in the log and the Access card, is
+    // the local one. Build the claim URL against the rendezvous origin
+    // exactly like service-minted claim URLs.
+    let bootstrap = if !response.claimed && response.claim_code_daemon_minted {
+        current_bootstrap_phrase().map(|phrase| {
+            let url = format!("{}/connect?claim_code={phrase}", base_origin(base_url));
+            (phrase, url)
+        })
+    } else {
+        None
+    };
     let now = crate::access::client_key::now_unix_ms();
     let mut print_claim: Option<String> = None;
     with_status(|status| {
@@ -569,6 +841,7 @@ fn note_register_response(response: &RegisterResponse) {
             status.claim_code = None;
             status.claim_url = None;
             status.claim_code_expires_unix_ms = None;
+            status.bootstrap = false;
             status.claim_binding =
                 Some(match (&status.signed_claim, &response.claimed_by_user_id) {
                     (Some(record), Some(asserted)) if record.account_user_id == *asserted => {
@@ -599,21 +872,29 @@ fn note_register_response(response: &RegisterResponse) {
             status.claimed_by_user_id = None;
             status.claimed_by_handle = None;
             status.claim_binding = None;
-            if status.claim_code != response.claim_code {
-                print_claim = Some(match (&response.claim_url, &response.claim_code) {
-                    (Some(url), _) if !url.is_empty() => {
-                        format!("claim this daemon at {url}")
+            let (effective_code, effective_url) = match &bootstrap {
+                Some((phrase, url)) => (Some(phrase.clone()), Some(url.clone())),
+                None => (response.claim_code.clone(), response.claim_url.clone()),
+            };
+            if status.claim_code != effective_code {
+                print_claim = match (&bootstrap, &effective_url, &effective_code) {
+                    (Some(_), Some(url), _) => Some(format!(
+                        "first-owner bootstrap: claim this daemon at {url} — entering the \
+                         phrase also enrolls the claiming browser as this daemon's first owner"
+                    )),
+                    (None, Some(url), _) if !url.is_empty() => {
+                        Some(format!("claim this daemon at {url}"))
                     }
-                    (_, Some(code)) if !code.is_empty() => {
-                        format!("claim this daemon with code {code}")
+                    (None, _, Some(code)) if !code.is_empty() => {
+                        Some(format!("claim this daemon with code {code}"))
                     }
-                    _ => String::new(),
-                })
-                .filter(|line| !line.is_empty());
+                    _ => None,
+                };
             }
-            status.claim_code = response.claim_code.clone();
-            status.claim_url = response.claim_url.clone();
+            status.claim_code = effective_code;
+            status.claim_url = effective_url;
             status.claim_code_expires_unix_ms = response.claim_code_expires_unix_ms;
+            status.bootstrap = bootstrap.is_some();
         }
     });
     if let Some(line) = print_claim {
@@ -674,6 +955,13 @@ async fn register(
         protocol: "intendant-connect-rendezvous-v1",
         daemon_id: daemon_id.to_string(),
         daemon_public_key: daemon_public_key.to_string(),
+        // Fresh boxes offer first-owner bootstrap: mint (or keep) the
+        // local phrase and register only its hash. `None` the moment an
+        // owner exists — the service then reverts to minting its own
+        // display-only codes.
+        bootstrap_code_hash: current_bootstrap_phrase()
+            .as_deref()
+            .map(claim_code_hash),
     };
     authenticated(
         config,
@@ -1009,6 +1297,45 @@ async fn handle_event(
                 .unwrap_or("")
                 .to_string();
             let daemon_public_key = identity.public_key_b64u();
+            // First-owner bootstrap: an armed claim carries the browser's
+            // identity key plus a tag derived from the daemon-minted
+            // phrase. Verify and enroll BEFORE acknowledging the claim —
+            // a claim that promised ownership must never half-complete as
+            // a metadata-only binding.
+            if let (Some(bootstrap_key), Some(bootstrap_tag)) = (
+                event
+                    .bootstrap_client_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+                event
+                    .bootstrap_client_key_tag
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            ) {
+                if let Err(e) = bootstrap_enroll_first_owner(
+                    bootstrap_key,
+                    bootstrap_tag,
+                    account_user_id.as_deref().unwrap_or(""),
+                    &account_name,
+                    daemon_id,
+                    &daemon_public_key,
+                ) {
+                    eprintln!("[connect] first-owner bootstrap refused: {e}");
+                    let _ = post_claim_error(
+                        client,
+                        base_url,
+                        config,
+                        daemon_id,
+                        &event.id,
+                        claim_id,
+                        &format!("first-owner bootstrap refused: {e}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
             let (protocol, payload) = match account_user_id.as_deref() {
                 Some(user_id) => (
                     CLAIM_PROTOCOL_V2,
@@ -1393,9 +1720,45 @@ async fn post_error(
     request_id: &str,
     error: &str,
 ) -> Result<(), String> {
+    post_error_inner(client, base_url, config, daemon_id, request_id, None, error).await
+}
+
+/// Claim-scoped error: also names the claim so the service rejects it and
+/// the claiming page surfaces the reason instead of timing out.
+async fn post_claim_error(
+    client: &Client,
+    base_url: &Url,
+    config: &ConnectConfig,
+    daemon_id: &str,
+    request_id: &str,
+    claim_id: &str,
+    error: &str,
+) -> Result<(), String> {
+    post_error_inner(
+        client,
+        base_url,
+        config,
+        daemon_id,
+        request_id,
+        Some(claim_id),
+        error,
+    )
+    .await
+}
+
+async fn post_error_inner(
+    client: &Client,
+    base_url: &Url,
+    config: &ConnectConfig,
+    daemon_id: &str,
+    request_id: &str,
+    claim_id: Option<&str>,
+    error: &str,
+) -> Result<(), String> {
     let body = ErrorRequest {
         daemon_id: daemon_id.to_string(),
         request_id: request_id.to_string(),
+        claim_id: claim_id.map(str::to_string),
         error: error.to_string(),
     };
     authenticated(config, client.post(join_url(base_url, "api/daemon/error")?))
@@ -1730,6 +2093,133 @@ mod tests {
         );
     }
 
+    /// Twin of the service's normalize/hash tests — one shared literal
+    /// pins the cross-binary (and /connect-page JS) hash construction.
+    #[test]
+    fn claim_code_hash_matches_the_service_construction() {
+        assert_eq!(
+            normalize_claim_code("  Abandon ABILITY__able "),
+            "abandon-ability-able"
+        );
+        assert_eq!(
+            claim_code_hash("  Abandon ABILITY__able "),
+            "Q4-Jf1pewq3jBEyujMeltvQLFADs3UikZAMej9Iu4j0"
+        );
+    }
+
+    #[test]
+    fn bootstrap_enrolls_first_owner_only_with_a_valid_tag_on_a_fresh_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_dir = dir.path();
+        let phrase =
+            "legal-winner-thank-year-wave-sausage-worth-useful-legal-winner-thank-yellow";
+        let mut raw = vec![0x04u8];
+        raw.extend_from_slice(&[7u8; 64]);
+        let client_key_b64u = crate::daemon_identity::b64u(&raw);
+        let tag = {
+            let hmac_key = ring::hmac::Key::new(
+                ring::hmac::HMAC_SHA256,
+                ring::digest::digest(
+                    &ring::digest::SHA256,
+                    normalize_claim_code(phrase).as_bytes(),
+                )
+                .as_ref(),
+            );
+            let payload = bootstrap_tag_payload(
+                "daemon-1",
+                "DaemonPub",
+                &client_key_b64u,
+                "user-1",
+                "alice",
+            );
+            crate::daemon_identity::b64u(ring::hmac::sign(&hmac_key, payload.as_bytes()).as_ref())
+        };
+
+        // Wrong phrase → refused, nothing written.
+        let err = bootstrap_enroll_first_owner_at(
+            cert_dir,
+            "wrong-phrase",
+            &client_key_b64u,
+            &tag,
+            "user-1",
+            "alice",
+            "daemon-1",
+            "DaemonPub",
+        )
+        .unwrap_err();
+        assert!(err.contains("tag verification failed"), "{err}");
+        assert!(crate::access::iam::load_state(cert_dir)
+            .unwrap()
+            .principals
+            .is_empty());
+
+        // Tag bound to a different key → refused (the relay cannot swap
+        // the enrolled key).
+        let mut other_raw = vec![0x04u8];
+        other_raw.extend_from_slice(&[9u8; 64]);
+        let other_key_b64u = crate::daemon_identity::b64u(&other_raw);
+        let err = bootstrap_enroll_first_owner_at(
+            cert_dir,
+            phrase,
+            &other_key_b64u,
+            &tag,
+            "user-1",
+            "alice",
+            "daemon-1",
+            "DaemonPub",
+        )
+        .unwrap_err();
+        assert!(err.contains("tag verification failed"), "{err}");
+
+        // Right phrase, right key → enrolls role:root with the bootstrap
+        // sentinel origin (not a hosted origin, so no ceiling demotes it).
+        let fingerprint = bootstrap_enroll_first_owner_at(
+            cert_dir,
+            phrase,
+            &client_key_b64u,
+            &tag,
+            "user-1",
+            "alice",
+            "daemon-1",
+            "DaemonPub",
+        )
+        .unwrap();
+        let state = crate::access::iam::load_state(cert_dir).unwrap();
+        assert_eq!(state.grants.len(), 1);
+        assert_eq!(state.grants[0].role_id, "role:root");
+        assert_eq!(state.principals.len(), 1);
+        let authn = &state.principals[0].authn;
+        assert!(authn.iter().any(|entry| {
+            entry.get("fingerprint").and_then(|v| v.as_str()) == Some(fingerprint.as_str())
+                && entry.get("origin").and_then(|v| v.as_str()) == Some("connect-bootstrap")
+        }));
+        let principal = crate::access::iam::principal_for_client_key(
+            &state,
+            &fingerprint,
+            "connect-dashboard-control",
+        )
+        .expect("bootstrap principal resolves");
+        assert_eq!(
+            crate::access::iam::role_ceiling_for_session(&state, &principal),
+            None,
+            "the bootstrap sentinel origin must not be ceiling-capped"
+        );
+
+        // A second bootstrap of any kind is refused: the box has an owner.
+        let err = bootstrap_enroll_first_owner_at(
+            cert_dir,
+            phrase,
+            &client_key_b64u,
+            &tag,
+            "user-1",
+            "alice",
+            "daemon-1",
+            "DaemonPub",
+        )
+        .unwrap_err();
+        assert!(err.contains("already has an owner"), "{err}");
+    }
+
     #[test]
     fn register_response_reads_claimed_by_and_expiry_fields() {
         let response: RegisterResponse = serde_json::from_str(
@@ -1777,43 +2267,56 @@ mod tests {
             status.signed_claim = Some(record);
         });
 
-        note_register_response(&RegisterResponse {
-            claimed: true,
-            claimed_by_user_id: Some("alice-user-id".to_string()),
-            claimed_by_handle: Some("alice".to_string()),
-            claim_code: None,
-            claim_code_expires_unix_ms: None,
-            claim_url: None,
-        });
+        let base_url = Url::parse("https://connect.example").unwrap();
+        note_register_response(
+            &RegisterResponse {
+                claimed: true,
+                claimed_by_user_id: Some("alice-user-id".to_string()),
+                claimed_by_handle: Some("alice".to_string()),
+                claim_code: None,
+                claim_code_daemon_minted: false,
+                claim_code_expires_unix_ms: None,
+                claim_url: None,
+            },
+            &base_url,
+        );
         assert_eq!(
             status_snapshot().claim_binding,
             Some(ClaimBinding::DaemonSigned)
         );
 
-        note_register_response(&RegisterResponse {
-            claimed: true,
-            claimed_by_user_id: Some("mallory-user-id".to_string()),
-            claimed_by_handle: Some("mallory".to_string()),
-            claim_code: None,
-            claim_code_expires_unix_ms: None,
-            claim_url: None,
-        });
+        note_register_response(
+            &RegisterResponse {
+                claimed: true,
+                claimed_by_user_id: Some("mallory-user-id".to_string()),
+                claimed_by_handle: Some("mallory".to_string()),
+                claim_code: None,
+                claim_code_daemon_minted: false,
+                claim_code_expires_unix_ms: None,
+                claim_url: None,
+            },
+            &base_url,
+        );
         assert_eq!(
             status_snapshot().claim_binding,
             Some(ClaimBinding::Mismatch)
         );
 
         // Unclaimed responses clear the claim view and surface the code.
-        note_register_response(&RegisterResponse {
-            claimed: false,
-            claimed_by_user_id: None,
-            claimed_by_handle: None,
-            claim_code: Some("word-word-word".to_string()),
-            claim_code_expires_unix_ms: Some(1_700_000_600_000),
-            claim_url: Some(
-                "https://connect.example/connect?claim_code=word-word-word".to_string(),
-            ),
-        });
+        note_register_response(
+            &RegisterResponse {
+                claimed: false,
+                claimed_by_user_id: None,
+                claimed_by_handle: None,
+                claim_code: Some("word-word-word".to_string()),
+                claim_code_daemon_minted: false,
+                claim_code_expires_unix_ms: Some(1_700_000_600_000),
+                claim_url: Some(
+                    "https://connect.example/connect?claim_code=word-word-word".to_string(),
+                ),
+            },
+            &base_url,
+        );
         let status = status_snapshot();
         assert_eq!(status.claimed, Some(false));
         assert_eq!(status.claim_binding, None);

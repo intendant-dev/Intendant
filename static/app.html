@@ -42754,7 +42754,9 @@ function renderAccessConnectCard() {
     const expiresText = expires
       ? ` · expires ${new Date(expires).toLocaleTimeString()} (a fresh phrase mints automatically)`
       : '';
-    hint.textContent = `Sign in and enter this phrase to claim this daemon into your fleet${expiresText}`;
+    hint.textContent = status.bootstrap
+      ? `First-owner bootstrap: this daemon minted the phrase itself (the rendezvous holds only its hash). Entering it claims the daemon AND enrolls the claiming browser as owner${expiresText || ' · valid while this daemon runs'}`
+      : `Sign in and enter this phrase to claim this daemon into your fleet${expiresText}`;
     card.appendChild(hint);
     if (accessConnectRevealed.claim_url) {
       const linkRow = document.createElement('div');
