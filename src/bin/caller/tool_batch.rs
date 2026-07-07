@@ -25,6 +25,9 @@ pub struct ToolBatchResult {
     /// Shared-view calls extracted from shared_view tool calls.
     /// Vec of (call_id, raw_args_json).
     pub shared_view_calls: Vec<(String, serde_json::Value)>,
+    /// Peer-federation calls extracted from peer tool calls.
+    /// Vec of (call_id, raw_args_json).
+    pub peer_calls: Vec<(String, serde_json::Value)>,
     /// Live audio spawn requests extracted from spawn_live_audio tool calls.
     /// Vec of (call_id, session_id, full_args_json).
     pub live_audio_spawns: Vec<(String, String, serde_json::Value)>,
@@ -52,6 +55,7 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
     let mut precomputed_results = Vec::new();
     let mut skill_invocations = Vec::new();
     let mut shared_view_calls = Vec::new();
+    let mut peer_calls = Vec::new();
     let mut live_audio_spawns = Vec::new();
     let mut sub_agent_spawns = Vec::new();
     let mut sub_agent_waits = Vec::new();
@@ -85,6 +89,11 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
                 if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                     shared_view_calls.push((tc.call_id.clone(), args));
                 }
+            }
+            "peer" => {
+                let args =
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or_default();
+                peer_calls.push((tc.call_id.clone(), args));
             }
             "spawn_live_audio" => {
                 if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
@@ -174,6 +183,7 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
         precomputed_results,
         skill_invocations,
         shared_view_calls,
+        peer_calls,
         live_audio_spawns,
         sub_agent_spawns,
         sub_agent_waits,
@@ -250,6 +260,7 @@ pub fn map_results_to_tool_responses(
             || tool_name == "signal_done"
             || tool_name == "invoke_skill"
             || tool_name == "shared_view"
+            || tool_name == "peer"
             || tool_name == "spawn_live_audio"
             || tool_name == "spawn_sub_agent"
             || tool_name == "wait_sub_agents"

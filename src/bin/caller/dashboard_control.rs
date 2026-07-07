@@ -128,6 +128,13 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     method("api_access_iam_state", PeerOperation::AccessInspect),
     method("api_access_enrollment_requests", PeerOperation::AccessInspect),
     method("api_dashboard_targets", PeerOperation::AccessInspect),
+    // Connect rendezvous administration. Status is inspect-grade and
+    // never carries the claim phrase; the phrase reveal, config toggle,
+    // and unclaim are manage-gated (mirrors the HTTP route rows).
+    method("api_access_connect_status", PeerOperation::AccessInspect),
+    method("api_access_connect_claim_code", PeerOperation::AccessManage),
+    method("api_access_connect_config", PeerOperation::AccessManage),
+    method("api_access_connect_unclaim", PeerOperation::AccessManage),
     // Credential custody (vault leases + client egress): granting, renewing,
     // revoking, and even reading lease status all sit behind the dedicated
     // gate — a scoped guest session can neither fuel nor drain a daemon, nor
@@ -358,6 +365,9 @@ fn control_method_runtime_ready(runtime: &ControlRuntime, method: &str) -> bool 
         | "api_peer_dashboard_control_signal"
         | "api_coordinator_route" => runtime.peer_registry.is_some(),
         "api_settings_save" => runtime.project_root.is_some(),
+        "api_access_connect_config" | "api_access_connect_unclaim" => {
+            runtime.project_root.is_some()
+        }
         "api_mcp_tool_call" => runtime.mcp_server.is_some(),
         method if method.starts_with("api_transfer_") => runtime.project_root.is_some(),
         method if method.starts_with("api_display_input_authority_") => {
@@ -2796,6 +2806,38 @@ fn control_frame_response(
                         })),
                     }
                 }
+                "api_access_connect_status" => Some(serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": true,
+                    "result": crate::web_gateway::access_connect_status_response_value(),
+                })),
+                "api_access_connect_claim_code" => Some(serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": true,
+                    "result": crate::web_gateway::access_connect_claim_code_response_value(),
+                })),
+                "api_access_connect_config" => {
+                    let params = params.unwrap_or_else(|| serde_json::json!({}));
+                    match crate::web_gateway::access_connect_config_response_value(
+                        params,
+                        runtime.project_root.as_deref(),
+                    ) {
+                        Ok(result) => Some(serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": true,
+                            "result": result,
+                        })),
+                        Err(error) => Some(serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": false,
+                            "error": error,
+                        })),
+                    }
+                }
                 "api_access_org_trust"
                 | "api_access_org_revoke"
                 | "api_access_org_issue"
@@ -3030,6 +3072,7 @@ fn control_frame_response(
                 | "api_peer_pairing_identities"
                 | "api_peer_pairing_identity_revoke"
                 | "api_credential_egress_probe"
+                | "api_access_connect_unclaim"
                 | "api_coordinator_route" => {
                     spawn_control_request(
                         id,
@@ -4628,6 +4671,26 @@ async fn control_request_response(
     match method.as_str() {
         "api_credential_egress_probe" => {
             api_credential_egress_probe_response(id, params.as_ref()).await
+        }
+        "api_access_connect_unclaim" => {
+            match crate::web_gateway::access_connect_unclaim_response_value(
+                runtime.project_root.clone(),
+            )
+            .await
+            {
+                Ok(result) => serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": true,
+                    "result": result,
+                }),
+                Err(error) => serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": false,
+                    "error": error,
+                }),
+            }
         }
         "api_sessions" => api_sessions_response(id, params.as_ref()).await,
         "api_session_detail" => api_session_detail_response(id, params.as_ref()).await,
@@ -12432,12 +12495,61 @@ mod tests {
         )
         .is_none());
 
-        let opened = tokio::time::timeout(Duration::from_secs(3), terminal_rx.recv())
+        // Generous budget: the PTY spawn behind terminal_open (PowerShell
+        // under ConPTY on a loaded Windows runner, especially) can take
+        // tens of seconds before the shell paints; a passing run returns
+        // the moment each frame arrives and never waits the budget out.
+        let budget = Duration::from_secs(60);
+        let opened = tokio::time::timeout(budget, terminal_rx.recv())
             .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(opened["t"], "terminal_opened");
+            .expect("no terminal frame within budget after terminal_open")
+            .expect("terminal frame channel closed before terminal_opened");
+        assert_eq!(opened["t"], "terminal_opened", "got frame: {opened}");
         assert_eq!(opened["terminal_id"], terminal_id);
+
+        // Drain frames until the accumulated decoded output satisfies
+        // `until`, panicking loudly — with everything received — on the
+        // deadline. Matching runs on the accumulated transcript, not per
+        // frame, so output split across chunks still matches.
+        async fn drain_output_until(
+            terminal_rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+            budget: Duration,
+            phase: &str,
+            until: impl Fn(&str) -> bool,
+        ) -> String {
+            let deadline = tokio::time::Instant::now() + budget;
+            let mut transcript = String::new();
+            let mut other_frames: Vec<String> = Vec::new();
+            loop {
+                match tokio::time::timeout_at(deadline, terminal_rx.recv()).await {
+                    Ok(Some(frame)) if frame["t"] == "terminal_output" => {
+                        let data = frame["data"].as_str().unwrap_or("");
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .unwrap_or_default();
+                        transcript.push_str(&String::from_utf8_lossy(&bytes));
+                        if until(&transcript) {
+                            return transcript;
+                        }
+                    }
+                    Ok(Some(frame)) => other_frames.push(frame.to_string()),
+                    Ok(None) => panic!(
+                        "{phase}: terminal frame channel closed; output so far: \
+                         {transcript:?}; other frames: {other_frames:?}"
+                    ),
+                    Err(_) => panic!(
+                        "{phase}: no matching terminal output within {budget:?}; \
+                         output so far: {transcript:?}; other frames: {other_frames:?}"
+                    ),
+                }
+            }
+        }
+
+        // Don't type until the shell has painted something — bytes written
+        // during shell startup can be silently discarded (see terminal.rs
+        // tests); a dashboard user typing at a rendered prompt never races
+        // this.
+        drain_output_until(&mut terminal_rx, budget, "shell startup", |t| !t.is_empty()).await;
 
         let token = "dashboard_terminal_frame_ok";
         let input = serde_json::json!({
@@ -12459,29 +12571,10 @@ mod tests {
         )
         .is_none());
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut saw_token = false;
-        while Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(200), terminal_rx.recv()).await {
-                Ok(Some(frame)) if frame["t"] == "terminal_output" => {
-                    let data = frame["data"].as_str().unwrap_or("");
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(data)
-                        .unwrap_or_default();
-                    if String::from_utf8_lossy(&bytes).contains(token) {
-                        saw_token = true;
-                        break;
-                    }
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => {}
-            }
-        }
-        assert!(
-            saw_token,
-            "did not receive terminal output over control frames"
-        );
+        drain_output_until(&mut terminal_rx, budget, "token echo", |t| {
+            t.contains(token)
+        })
+        .await;
 
         let close = serde_json::json!({
             "t": "terminal_close",

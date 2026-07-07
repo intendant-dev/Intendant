@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 /// Extra tool definitions registered at runtime (e.g. from MCP servers).
 static EXTRA_TOOLS: Mutex<Vec<ToolDefinition>> = Mutex::new(Vec::new());
-const BUILT_IN_TOOL_COUNT: usize = 17;
+const BUILT_IN_TOOL_COUNT: usize = 18;
 
 /// Provider-agnostic tool definition.
 #[derive(Debug, Clone, Serialize)]
@@ -560,6 +560,43 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         }),
     });
 
+    // 18. peer (caller-handled, federated peer daemons)
+    tools.push(ToolDefinition {
+        name: "peer".to_string(),
+        description: "Interact with federated peer daemons. Actions: list enumerates peers with their connection state, capabilities, and visible sessions; message sends text to a peer's agent; task delegates work that the peer's own agent executes on its machine under its own autonomy and approval policy (returns a task id; progress streams to the dashboard's peers rail). Peers are siblings, not subordinates: the receiving daemon authorizes every action against its own grants for this daemon. Requires peer federation to be configured.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "message", "task"],
+                    "description": "Peer verb to perform."
+                },
+                "peer_id": {
+                    "type": "string",
+                    "description": "Peer daemon id from the list action. Required for message and task."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Message text delivered to the peer's agent (message action)."
+                },
+                "instructions": {
+                    "type": "string",
+                    "description": "Free-form natural-language instructions for the peer's agent (task action)."
+                },
+                "context": {
+                    "description": "Optional structured context passed through with a task (file paths, prior state)."
+                },
+                "session": {
+                    "type": "string",
+                    "description": "Optional peer-side session id to scope a message to."
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }),
+    });
+
     // Append any extra tools registered at runtime (MCP servers, etc.)
     if let Ok(extra) = EXTRA_TOOLS.lock() {
         tools.extend(extra.iter().cloned());
@@ -627,6 +664,7 @@ mod tests {
         "spawn_sub_agent",
         "wait_sub_agents",
         "submit_result",
+        "peer",
     ];
 
     #[test]

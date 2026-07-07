@@ -159,6 +159,10 @@ pub(crate) struct GatewaySpawn {
     pub(crate) _handle: tokio::task::JoinHandle<()>,
     pub(crate) shared_session: web_gateway::SharedActiveSession,
     pub(crate) log_line: String,
+    /// The federated peer registry the gateway serves. Mode runners
+    /// thread it into session launches so the native `peer` tool and
+    /// the MCP peer tools act on the same registry.
+    pub(crate) peer_registry: crate::peer::PeerRegistry,
 }
 
 /// Build and spawn the web gateway the way every mode does: gateway
@@ -217,6 +221,7 @@ pub(crate) fn spawn_mode_web_gateway(
         },
         file_watcher: shared_file_watcher.clone(),
     }));
+    let peer_registry = build_and_hydrate_peer_registry(log_dir, &project.config.peers);
     let mut mcp_http_state = mcp::McpAppState::new(
         "none".into(),
         "none".into(),
@@ -228,12 +233,12 @@ pub(crate) fn spawn_mode_web_gateway(
     mcp_http_state.configured_codex_managed_context = mcp_http_state.codex_managed_context;
     mcp_http_state.frame_registry = Some(frame_registry.clone());
     mcp_http_state.session_registry = Some(session_registry.clone());
+    mcp_http_state.peer_registry = Some(peer_registry.clone());
     mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
     let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
         Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
         bus.clone(),
     )));
-    let peer_registry = build_and_hydrate_peer_registry(log_dir, &project.config.peers);
     let advertise_urls = resolve_advertise_urls_from_flags_and_config(flags, project);
     let handle = web_gateway::spawn_web_gateway(
         web_listener
@@ -247,7 +252,7 @@ pub(crate) fn spawn_mode_web_gateway(
         None, // task_tx: browser SubmitTask routes via the EventBus → dispatcher path
         Some(project.root.clone()),
         mcp_http_server,
-        Some(peer_registry),
+        Some(peer_registry.clone()),
         advertise_urls,
         project.config.server.auth.bearer_token.clone(),
         build_local_advertised_auth(
@@ -261,5 +266,6 @@ pub(crate) fn spawn_mode_web_gateway(
         _handle: handle,
         shared_session,
         log_line: dashboard_log_line(web_tls_acceptor, web_port, web_bind_ip),
+        peer_registry,
     })
 }

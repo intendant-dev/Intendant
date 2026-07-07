@@ -345,11 +345,18 @@ daemon-signed DataChannel binding before sending dashboard RPC.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable outbound Connect rendezvous polling |
-| `rendezvous_url` | string | unset | Base URL of the Connect/rendezvous service |
+| `rendezvous_url` | string | `https://connect.intendant.dev` when `enabled` | Base URL of the Connect/rendezvous service (the hosted instance unless overridden) |
 | `daemon_id` | string | daemon identity public key | Public daemon id at the rendezvous service |
 | `auth_token` | string | unset | Optional bearer token for daemon-to-service authentication; not dashboard authorization |
 | `poll_timeout_ms` | integer | `15000` | Long-poll timeout per daemon `/next` request |
 | `retry_delay_ms` | integer | `1000` | Delay after transient rendezvous errors |
+
+No file editing is required for the common case: the dashboard's
+**Access → Intendant Connect** card toggles `enabled` (persisting it
+here), shows registration/claim state, reveals the twelve-word claim
+phrase to manage-grade sessions, and can release the claim binding. The
+`INTENDANT_CONNECT_RENDEZVOUS_URL` environment variable still force-enables
+the client and overrides the file (the card reports when it does).
 
 Hosted Connect uses the same daemon-side settings:
 

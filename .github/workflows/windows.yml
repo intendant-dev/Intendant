@@ -63,12 +63,22 @@ concurrency:
 jobs:
   test:
     name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.runner }}
-    # Self-hosted hardening: never run pull_request code from a fork on our
-    # own hardware — only same-repo branches (every agent landing) and the
-    # merge queue's own refs. Fork PRs are the rare external-contribution
-    # case and get handled manually behind the Actions fork-approval gate.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Trust-based routing: our own refs (pushes, merge-queue refs, same-repo
+    # PRs — every agent landing) run on the self-hosted fleet for speed;
+    # fork PRs run on GitHub-hosted runners so external code never executes
+    # on our hardware, while still getting real required-check results
+    # (a skipped check would read as satisfied — routing closes that hole).
+    # `matrix.os` doubles as the hosted runner label. Fork-PR workflows
+    # additionally sit behind the repo's all-outside-collaborators approval
+    # gate, so nothing runs anywhere without a maintainer's click.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
+    env:
+      # CI needs pass/fail and panic messages, not debugger-grade binaries.
+      # Debug info is the dominant MSVC link cost across these large test
+      # binaries, so the Windows leg builds without it; Linux/macOS keep
+      # the default — their links are cheap and rich backtraces stay
+      # useful when a failure does need reading in place.
+      CARGO_PROFILE_DEV_DEBUG: ${{ matrix.cargo_debug }}
     # Full test builds are much heavier than the old `cargo check`; a cold
     # Windows runner can take a while, but a hung run shouldn't burn hours.
     timeout-minutes: 90
@@ -79,26 +89,26 @@ jobs:
       matrix:
         # `os` is the check-name key ("test (ubuntu-latest)" is pinned as a
         # required context in the main ruleset — renaming it means a
-        # coordinated ruleset edit); `runner` is where the job actually
-        # runs. All three legs live on the self-hosted fleet (dell-206,
-        # macbook-vm, samsung-win): persistent target/ dirs make warm runs
-        # minutes instead of half-hours. `hosted` gates the
-        # runner-provisioning steps — the self-hosted boxes are
-        # pre-provisioned (deps, toolchains) and keep their build state, so
-        # cache actions and dep installs are hosted-only.
+        # coordinated ruleset edit) AND the hosted-runner label fork PRs
+        # route to; `runner` is the self-hosted fleet placement for trusted
+        # refs (dell-206, macbook-vm, samsung-win — persistent target/ dirs
+        # make warm runs minutes instead of half-hours). Provisioning steps
+        # (dep installs, cache actions) gate on `runner.environment ==
+        # 'github-hosted'`: the fleet boxes are pre-provisioned and keep
+        # their build state.
         include:
           - os: windows-latest
             runner: [self-hosted, intendant-windows]
             target: x86_64-pc-windows-msvc
-            hosted: false
+            cargo_debug: "0"
           - os: macos-latest
             runner: [self-hosted, intendant-macos]
             target: aarch64-apple-darwin
-            hosted: false
+            cargo_debug: "2"
           - os: ubuntu-latest
             runner: [self-hosted, intendant-linux]
             target: x86_64-unknown-linux-gnu
-            hosted: false
+            cargo_debug: "2"
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -108,13 +118,66 @@ jobs:
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
+      # Doc-only diffs don't need a 13-minute build. Detect relevance INSIDE
+      # the job so the required check still runs and reports green — a
+      # `paths:` filter on a required workflow would block queue entry
+      # instead (verified live on this repo's first docs-only PR). The
+      # safe-list is deliberately tiny and inverted: anything not clearly
+      # documentation counts as CI-relevant. Pure git against the checkout
+      # (fetch the base at depth 1, two-dot diff): the fleet boxes have no
+      # gh CLI and the Windows box resolves no `bash`, so the step exists
+      # per shell and later steps AND the two outputs together (a skipped
+      # step's output is empty, which passes the != 'false' tests).
+      - name: Detect CI-relevant changes (unix)
+        id: relevance_unix
+        if: runner.os != 'Windows' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.merge_group.base_sha }}"
+          fi
+          git fetch --quiet --depth=1 origin "$base"
+          relevant=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              docs/*|*.md|LICENSE|.gitignore) ;;
+              *) relevant=true; break ;;
+            esac
+          done < <(git diff --name-only "$base" HEAD)
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "CI-relevant change detected: $relevant"
+
+      - name: Detect CI-relevant changes (windows)
+        id: relevance_win
+        if: runner.os == 'Windows' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+        shell: pwsh
+        run: |
+          $base = if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+            '${{ github.event.pull_request.base.sha }}'
+          } else {
+            '${{ github.event.merge_group.base_sha }}'
+          }
+          git fetch --quiet --depth=1 origin $base
+          $files = git diff --name-only $base HEAD
+          $relevant = 'false'
+          foreach ($f in $files) {
+            if (-not $f) { continue }
+            if ($f -like 'docs/*' -or $f -like '*.md' -or $f -eq 'LICENSE' -or $f -eq '.gitignore') { continue }
+            $relevant = 'true'; break
+          }
+          "relevant=$relevant" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Output "CI-relevant change detected: $relevant"
+
       # `ring` (our TLS provider — aws-lc-rs is deliberately disabled) builds
       # its x86_64 perlasm assembly with NASM on the MSVC target. Hosted-only,
       # like the other provisioning steps: the self-hosted Windows box has
       # NASM preinstalled on the machine PATH, and its runner user neither
       # has nor needs choco.
       - name: Install NASM (Windows, for ring)
-        if: matrix.hosted && runner.os == 'Windows'
+        if: runner.environment == 'github-hosted' && runner.os == 'Windows'
         run: |
           if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
             choco install nasm --no-progress -y
@@ -131,7 +194,7 @@ jobs:
       # libpng.) Hosted-only: the self-hosted boxes are pre-provisioned and
       # the runner user deliberately has no sudo.
       - name: Install Linux build deps
-        if: matrix.hosted && runner.os == 'Linux'
+        if: runner.environment == 'github-hosted' && runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -148,7 +211,7 @@ jobs:
       # already present on the runner image. Hosted-only: the self-hosted Mac
       # is a provisioned dev box.
       - name: Install macOS build deps
-        if: matrix.hosted && runner.os == 'macOS'
+        if: runner.environment == 'github-hosted' && runner.os == 'macOS'
         run: brew install pkg-config libvpx
 
       # Restore the cargo cache on every run, but only *save* it on pushes to
@@ -160,10 +223,32 @@ jobs:
       # runs — that persistence IS the cache, and shipping it to GitHub's
       # cache store would only add minutes.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        if: matrix.hosted
+        if: runner.environment == 'github-hosted'
         with:
           key: ${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Fast pre-queue signal vs the real merge gate: outside the merge
+      # group, the WINDOWS and MACOS legs run a compile check only —
+      # cross-platform compile breakage is the dominant non-Linux
+      # regression class, the full suites would otherwise run twice per
+      # landing (PR + group) on near-identical trees, and the merge queue
+      # re-runs everything on merge_group before anything lands, so the
+      # group run stays the full three-platform gate. Linux keeps full
+      # tests on every trigger: it is the fastest suite, dell carries two
+      # runner instances, and it preserves pre-queue runtime signal.
+      # macOS joined the Windows fast path 2026-07-07: the single Mac
+      # hosts both mac runner instances PLUS the interactive agents and
+      # their local builds, and stacked full-suite runs starved the label
+      # queue (~55-minute waits for a slot) while Windows PR legs cleared
+      # in ~2 minutes. This condition also covers push-to-main warm runs:
+      # the merge-group run just built the identical tree, so non-Linux
+      # push legs only refresh the cheap check artifacts.
+      - name: cargo check (non-Linux fast path)
+        if: github.event_name != 'merge_group' && runner.os != 'Linux' && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
+        run: |
+          cargo check -p intendant --bins --locked --target ${{ matrix.target }}
+          cargo check -p intendant-core -p intendant-display -p intendant-platform --tests --locked --target ${{ matrix.target }}
 
       # Build and run the unit tests of the whole `intendant` package — both
       # binaries (the `intendant` controller and the `intendant-runtime`
@@ -175,7 +260,13 @@ jobs:
       # `--locked` makes lockfile drift a hard failure: CI must test exactly
       # the dependency set main pins, never a silent re-resolution of it.
       - name: cargo test
-        run: cargo test -p intendant --bins -p intendant-core -p intendant-display --locked --target ${{ matrix.target }}
+        if: (github.event_name == 'merge_group' || runner.os == 'Linux') && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
+        run: |
+          cargo test -p intendant --bins --locked --target ${{ matrix.target }}
+          # Lib crates get their own invocation: a global `--bins` filter
+          # silently no-ops packages that have no bin targets, which is
+          # how the core/display lib tests went dark after extraction.
+          cargo test -p intendant-core -p intendant-display -p intendant-platform --locked --target ${{ matrix.target }}
 
       # Headless end-to-end: the real `intendant` + `intendant-runtime`
       # binaries driven by the scripted mock provider (see tests/e2e/main.rs).
@@ -183,4 +274,5 @@ jobs:
       # unit suite can't reach (process spawn, sandbox, tool round-trips,
       # session logging).
       - name: cargo test e2e (mock provider, headless)
+        if: (github.event_name == 'merge_group' || runner.os == 'Linux') && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: cargo test -p intendant --test e2e --locked --target ${{ matrix.target }}

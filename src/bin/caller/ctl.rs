@@ -55,6 +55,7 @@ pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
         "controller" => run_controller(&client, &config, &command[1..]).await?,
         "context" => run_context(&client, &config, &command[1..]).await?,
         "audio" => run_audio(&client, &config, &command[1..]).await?,
+        "peer" | "peers" => run_peer(&client, &config, &command[1..]).await?,
         other => {
             return Err(format!(
                 "unknown command '{other}'. Run `intendant ctl --help`."
@@ -1161,6 +1162,86 @@ async fn run_audio(
     Ok(())
 }
 
+async fn run_peer(client: &reqwest::Client, config: &Config, raw: &[String]) -> Result<(), String> {
+    if raw.is_empty() || is_help(raw) {
+        help_peer();
+        return Ok(());
+    }
+    match raw[0].as_str() {
+        "list" => {
+            let response =
+                call_tool(client, config, "list_peers", Value::Object(Map::new())).await?;
+            print_tool_response(response, config, None)?;
+        }
+        "message" => {
+            let response = call_tool(
+                client,
+                config,
+                "peer_send_message",
+                peer_message_args(&raw[1..])?,
+            )
+            .await?;
+            print_tool_response(response, config, None)?;
+        }
+        "task" => {
+            let response = call_tool(
+                client,
+                config,
+                "peer_delegate_task",
+                peer_task_args(&raw[1..])?,
+            )
+            .await?;
+            print_tool_response(response, config, None)?;
+        }
+        other => return Err(format!("unknown peer command '{other}'")),
+    }
+    Ok(())
+}
+
+fn peer_message_args(raw: &[String]) -> Result<Value, String> {
+    let args = parse_command_args(raw, &["--session"], &[])?;
+    let peer_id = args
+        .positional
+        .first()
+        .ok_or_else(|| "peer message requires a peer id".to_string())?;
+    let message = args
+        .positional
+        .get(1..)
+        .filter(|rest| !rest.is_empty())
+        .map(|rest| rest.join(" "))
+        .ok_or_else(|| "peer message requires message text".to_string())?;
+    let mut map = Map::new();
+    map.insert("peer_id".to_string(), Value::String(peer_id.clone()));
+    map.insert("message".to_string(), Value::String(message));
+    insert_string(&mut map, "session", args.one("--session"));
+    Ok(Value::Object(map))
+}
+
+fn peer_task_args(raw: &[String]) -> Result<Value, String> {
+    let args = parse_command_args(raw, &["--context"], &[])?;
+    let peer_id = args
+        .positional
+        .first()
+        .ok_or_else(|| "peer task requires a peer id".to_string())?;
+    let instructions = args
+        .positional
+        .get(1..)
+        .filter(|rest| !rest.is_empty())
+        .map(|rest| rest.join(" "))
+        .ok_or_else(|| "peer task requires instructions".to_string())?;
+    let mut map = Map::new();
+    map.insert("peer_id".to_string(), Value::String(peer_id.clone()));
+    map.insert("instructions".to_string(), Value::String(instructions));
+    if let Some(context) = args.one("--context") {
+        // Free-form context is legal: forward valid JSON parsed, anything else
+        // as a plain string value.
+        let value = serde_json::from_str::<Value>(context)
+            .unwrap_or_else(|_| Value::String(context.to_string()));
+        map.insert("context".to_string(), value);
+    }
+    Ok(Value::Object(map))
+}
+
 async fn call_tool(
     client: &reqwest::Client,
     config: &Config,
@@ -1604,6 +1685,7 @@ Commands:\n\
   controller                Controller loop and restart controls\n\
   context                   Managed-context rewind/backout controls\n\
   audio                     Live-audio controls\n\
+  peer                      Federated peers, messaging, task delegation\n\
 \n\
 Run `intendant ctl <command> --help` for focused help."
     );
@@ -1813,6 +1895,20 @@ The JSON object is the spawn_live_audio parameter object."
     );
 }
 
+fn help_peer() {
+    println!(
+        "Usage:\n\
+  intendant ctl peer list\n\
+  intendant ctl peer message PEER_ID TEXT... [--session ID]\n\
+  intendant ctl peer task PEER_ID INSTRUCTIONS... [--context JSON|TEXT]\n\
+\n\
+`list` shows the federated peers and their capabilities.\n\
+`message` sends text to the peer's agent.\n\
+`task` delegates work the peer's own agent executes under its own autonomy and approvals.\n\
+--context accepts a JSON value; non-JSON text is passed through as a string."
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1923,6 +2019,86 @@ mod tests {
             value.pointer("/orchestrate").and_then(Value::as_bool),
             Some(false)
         );
+    }
+
+    #[test]
+    fn peer_message_args_joins_text_and_omits_absent_session() {
+        let value = peer_message_args(&args(&["peer-1", "hello", "over", "there"]))
+            .expect("message args should parse");
+
+        assert_eq!(
+            value.pointer("/peer_id").and_then(Value::as_str),
+            Some("peer-1")
+        );
+        assert_eq!(
+            value.pointer("/message").and_then(Value::as_str),
+            Some("hello over there")
+        );
+        assert!(value.get("session").is_none());
+    }
+
+    #[test]
+    fn peer_message_args_accepts_session_flag() {
+        let value = peer_message_args(&args(&["--session", "sess-1", "peer-1", "ping", "pong"]))
+            .expect("message args should parse");
+
+        assert_eq!(
+            value.pointer("/session").and_then(Value::as_str),
+            Some("sess-1")
+        );
+        assert_eq!(
+            value.pointer("/message").and_then(Value::as_str),
+            Some("ping pong")
+        );
+    }
+
+    #[test]
+    fn peer_message_args_requires_peer_id_and_message_text() {
+        assert!(peer_message_args(&args(&[])).is_err());
+        assert!(peer_message_args(&args(&["peer-1"])).is_err());
+    }
+
+    #[test]
+    fn peer_task_args_joins_instructions_and_parses_json_context() {
+        let value = peer_task_args(&args(&[
+            "peer-1",
+            "audit",
+            "the",
+            "logs",
+            "--context",
+            r#"{"repo":"intendant"}"#,
+        ]))
+        .expect("task args should parse");
+
+        assert_eq!(
+            value.pointer("/peer_id").and_then(Value::as_str),
+            Some("peer-1")
+        );
+        assert_eq!(
+            value.pointer("/instructions").and_then(Value::as_str),
+            Some("audit the logs")
+        );
+        assert_eq!(
+            value.pointer("/context/repo").and_then(Value::as_str),
+            Some("intendant")
+        );
+    }
+
+    #[test]
+    fn peer_task_args_passes_free_form_context_as_string() {
+        let value = peer_task_args(&args(&["peer-1", "task", "--context", "just some notes"]))
+            .expect("task args should parse");
+
+        assert_eq!(
+            value.pointer("/context").and_then(Value::as_str),
+            Some("just some notes")
+        );
+    }
+
+    #[test]
+    fn peer_task_args_omits_absent_context() {
+        let value = peer_task_args(&args(&["peer-1", "go"])).expect("task args should parse");
+        assert!(value.get("context").is_none());
     }
 
     #[test]

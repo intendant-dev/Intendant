@@ -28,7 +28,10 @@ import urllib.error
 import urllib.request
 
 WORKTREE = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
-BIN = os.path.join(WORKTREE, "target/release/intendant")
+# CI passes the debug binary via INTENDANT_BIN (the smokes are protocol
+# probes — profile doesn't change what they catch); the local post-landing
+# battery keeps exercising the release artifact by default.
+BIN = os.environ.get("INTENDANT_BIN") or os.path.join(WORKTREE, "target/release/intendant")
 SCRATCH = os.environ.get("PEER_RIG_SCRATCH") or tempfile.mkdtemp(prefix="peer-rig-")
 A_PORT, B_PORT, CDP_PORT = 18777, 18778, 9333
 BROWSER = "--browser" in sys.argv

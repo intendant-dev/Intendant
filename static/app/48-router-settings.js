@@ -292,6 +292,7 @@ function switchTab(tabId) {
     renderAccessAdminSummaries();
     refreshAccessOverviewFromApi({ silent: true }).catch(() => {});
     refreshAccessEnrollments({ silent: true }).catch(() => {});
+    refreshAccessConnectStatus({ silent: true }).catch(() => {});
     if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
   }
   flushPaneRenders(tabId);
@@ -1953,6 +1954,9 @@ function switchAccessSubtab(name) {
   if (activeAccessSubtab === 'daemons') renderDaemonsList();
   if (activeAccessSubtab === 'overview' || activeAccessSubtab === 'people') {
     refreshAccessEnrollments({ silent: true }).catch(() => {});
+  }
+  if (activeAccessSubtab === 'overview') {
+    refreshAccessConnectStatus({ silent: true }).catch(() => {});
   }
   if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
 }

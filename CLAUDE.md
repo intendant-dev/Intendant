@@ -58,7 +58,9 @@ Read the relevant chapter before changing a subsystem:
 cargo build --release     # → target/release/{intendant-runtime, intendant}
 cargo build               # debug
 cargo check               # type-check only
-cargo test --bins         # unit tests (fast, no API keys)
+cargo test --bins         # unit tests (no API keys; what CI runs)
+cargo nextest run --bins  # same tests, much faster: one process per test
+                          # (needs cargo-nextest; config in .config/nextest.toml)
 cargo clippy              # lint
 ```
 
@@ -102,16 +104,17 @@ src/
 │   ├── credential_leases.rs, credential_egress.rs, daemon_identity.rs, connect_rendezvous.rs   # credential custody; Connect client
 │   ├── peer/, web_tls.rs       # peer federation (transport, pairing, access profiles); native HTTPS/WSS
 │   ├── display/                # WebRTC: encode/{pool,vp8,h264_*}, tile/, capture/, webrtc, {x11,wayland,macos,windows}
-│   ├── computer_use.rs, ax.rs, vision.rs, recording.rs, frames.rs
+│   ├── computer_use.rs, ax.rs, recording.rs, frames.rs
 │   ├── presence.rs, live_audio.rs, audio_routing.rs, transcription.rs, quarantine.rs, schema_validator.rs
 │   ├── web_gateway/                # HTTP/WS gateway: listener (accept/TLS), ws_session (WS tasks), http_dispatch (route dispatch), http, routes_{sessions,files,peers,access}, session_catalog/, settings, access_gates, input_authority, dashboard_presence, connect_bootstrap, peer_requests, agent_card, mcp_gate, static_assets
 │   ├── dashboard_control.rs, terminal.rs, browser_workspace.rs   # dashboard tunnel; PTY registry; agent browser
 │   ├── mcp/, mcp_client.rs, control.rs
 │   ├── transfer_store.rs, upload_store.rs, peer_file_transfer.rs   # transfer jobs; upload/attachment stores
 │   ├── session_log.rs, session_names.rs, knowledge.rs, project.rs, app_state_pricing.rs
-│   ├── sandbox.rs, platform.rs, daemon_log_tee.rs, diagnostics.rs, …
+│   ├── sandbox.rs, daemon_log_tee.rs, diagnostics.rs, …
 └── bin/connect/                # intendant-connect: hosted rendezvous (accounts, daemon claims, fleet sync, vault blobs, push, transparency log)
 crates/{presence-core, presence-web, station-web}   # WASM: shared presence types/tools/dispatch, browser presence client, Station renderer
+crates/intendant-platform   # OS integration leaf: platform probes/spawn (platform.rs), DisplayTarget, virtual-display mgmt (vision.rs)
 crates/app-html-assembler   # assembles static/app.html from static/app/ (build.rs + the CI regen gate)
 static/         # dashboard SPA: app/ fragments (source) → generated app.html; compiled wasm-web/ + wasm-station/
 macos-app/      # native macOS WKWebView wrapper (built by scripts/bundle-macos.sh)
@@ -168,7 +171,7 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   hand-reconcile the generated file.
 - Pure-safe Rust by default. The Unix (macOS / Linux) code paths keep `unsafe`
   confined to documented islands: small platform probes/signals and display or
-  identity queries in `platform.rs`; macOS Accessibility bindings in `ax.rs`
+  identity queries in `platform.rs` (now `crates/intendant-platform`); macOS Accessibility bindings in `ax.rs`
   (raw `accessibility-sys` FFI wrapped once there — no safe wrapper crate exists
   without dragging in a duplicate `core-graphics`/legacy `objc` stack); and the
   Vortex direct POSIX shared-memory bridge in `live_audio.rs` (`shm_open`,
@@ -272,6 +275,36 @@ queueing: the queue gate is the deterministic subset, not the full battery, and 
 red queue entry wastes everyone's cycle time. Never bypass the ruleset; if the
 queue itself is wedged, that is an operator (org-owner) decision.
 
+**Land small, land immediately.** This main takes hundreds of commits a month
+from concurrent agents; every hour a green change sits unqueued is another
+chance main moves under it (a real one-PR landing ate three conflict
+reconciles this way, and two sessions once wrote the same fix in parallel
+because neither had landed it). So: an independent fix ships as its own PR
+the moment it's green — never held back to ride a batch. Two habits make the
+collisions cheap:
+
+- **Open a draft PR when you start, not when you finish** (`gh pr create
+  --draft --fill`, then `gh pr ready` once green). Drafts are the fleet's
+  files-in-flight signal — before touching hot files, check what's already
+  in motion: `gh pr list --state open --json number,title,headRefName,isDraft,files`.
+- **Auto-merge silently disarms** whenever the PR stops being mergeable (main
+  conflict) or a check fails — after every conflict-resolution push or flake
+  rerun, re-run `gh pr merge <n> --merge --auto` and confirm
+  `autoMergeRequest` is set again. While the PR sits IN the queue,
+  `autoMergeRequest` nulling and `mergeStateStatus: UNKNOWN` are normal;
+  only `state` (`MERGED`/`CLOSED`) is terminal. A queued branch is frozen —
+  pushes are rejected until the entry merges or is dequeued.
+
+After arming auto-merge, confirm the PR actually **enters the queue** once its
+checks go green (GraphQL `pullRequest.mergeQueueEntry`). Known stall: a job
+that dies mid-run (runner lost communication) and auto-recovers in place can
+leave its per-commit **check run** stuck at `failure` while the workflow run
+shows success — auto-merge reads the check run and waits forever. Detect it by
+comparing `gh pr checks` against `gh run view`; remedy with
+`gh run rerun --job <id>` to mint a fresh check run. Treat any
+"green run, armed auto-merge, still not queued after ~5 minutes" as this
+class of stall, not as normal latency.
+
 **Post-landing: fast-forward the shared mirror.** The queue owns origin/main;
 nothing updates the repo root's local `main` anymore. After your PR merges, run
 `git -C <repo-root> pull --ff-only` (and `git merge --ff-only origin/main` in
@@ -296,16 +329,20 @@ required checks pass, so a paths-skipped required check blocks queue entry
 (and on the group side wedges the entry at "Expected"). Only the push-to-main
 triggers keep paths filters — they exist for cache warming, not gating.
 
-All three legs run on the **self-hosted fleet** (`dell-206` =
-`intendant-linux`, `macbook-vm` = `intendant-macos`, `samsung-win` =
-`intendant-windows`) with persistent incremental `target/` dirs — warm gate
-runs are minutes, not half-hours. Self-hosted jobs carry a same-repo guard
-(fork-PR code never executes on our hardware), the Dell and Windows runners
-run as dedicated non-admin `ci` users, and the check *names* stay pinned to
-the `test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os`
-is the name key, `runner` is the placement):
-- **`windows.yml`** — cross-platform `cargo test -p intendant --bins -p intendant-core -p intendant-display` + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Headless-safe: needs no display or API keys. **Required check.**
-- **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real release binaries on Linux + macOS. **Required check.**
+Trusted refs (pushes, merge-queue refs, same-repo PRs) run on the
+**self-hosted fleet** (`dell-206` = `intendant-linux`, `macbook-vm` =
+`intendant-macos`, `samsung-win` = `intendant-windows`) with persistent
+incremental `target/` dirs — warm gate runs are minutes, not half-hours.
+**Fork PRs route to GitHub-hosted runners instead** (dynamic `runs-on`;
+`matrix.os` doubles as the hosted label): external code never executes on
+our hardware, yet its required checks really run. Fork-PR workflows also
+need maintainer approval before anything runs (all outside collaborators,
+not just first-timers). The Dell and Windows runners run as dedicated
+non-admin `ci` users, and the check *names* stay pinned to the
+`test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os` is
+the name key, `runner` is the fleet placement):
+- **`windows.yml`** — cross-platform `cargo test` (the `intendant` bins + the `intendant-core`/`intendant-display`/`intendant-platform` lib crates) + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Outside the merge group the Windows **and macOS** legs run `cargo check` only (fast pre-queue signal on PRs, cheap warm on main pushes); the full non-Linux suites run in the merge group — the actual gate. Linux runs the full suite on every trigger. Headless-safe: needs no display or API keys. **Required check.**
+- **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real binaries on Linux only (debug profile; the drivers are platform-agnostic protocol probes, so a second platform mostly duplicated coverage while doubling flake surface). **Required check.**
 - **`app-html.yml`** — the `static/app/` fragments ↔ generated `static/app.html` regen gate. **Required check.**
 - **`agents-md-sync.yml`** — CLAUDE.md ↔ AGENTS.md byte-parity. **Required check.**
 - **`audit.yml`** — `cargo audit` on push/PR plus a weekly cron (Mondays 08:00 UTC). Advisory only — new upstream advisories must not block unrelated landings.
