@@ -83,6 +83,26 @@ jobs:
             target: x86_64-unknown-linux-gnu
 
     steps:
+      # Fleet preflight — same rationale as windows.yml: fail fast on a
+      # nearly-full disk (ENOSPC mid-compile reads as toolchain corruption),
+      # warn on pathological load. This matrix is unix-only so one bash
+      # step suffices; hosted runners skip it.
+      - name: Fleet preflight
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          avail_kb=$(df -Pk . | awk 'NR==2 {print $4}')
+          avail_gb=$((avail_kb / 1024 / 1024))
+          echo "disk available: ${avail_gb}G"
+          if [ "$avail_gb" -lt 20 ]; then
+            echo "::error::fleet preflight: only ${avail_gb}G free on this runner — below the 20G floor. Reclaim disk (merged worktrees' target/ dirs are the usual culprits) and rerun."
+            exit 1
+          fi
+          cores=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          load=$(awk '{print $1}' /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg | awk '{print $2}')
+          echo "load average: $load (cores: $cores)"
+          awk -v l="$load" -v c="$cores" 'BEGIN { if (l > 3*c) print "::warning::fleet preflight: load " l " is over 3x the " c " cores — timing-sensitive tests may flake; consider draining the box" }'
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust target
