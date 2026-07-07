@@ -25,6 +25,19 @@ use uuid::Uuid;
 
 const PROTOCOL: &str = "intendant-connect-rendezvous-v1";
 const CLAIM_PROTOCOL: &str = "intendant-connect-claim-v1";
+/// v2 claim proofs bind the claiming account (user id + handle at claim
+/// time) into the payload the daemon signs, so the account↔daemon binding
+/// this service records is co-signed by the daemon's own key instead of
+/// merely asserted by this service. v1 (account-blind) stays accepted
+/// from older daemons.
+const CLAIM_PROTOCOL_V2: &str = "intendant-connect-claim-v2";
+/// Daemon-signed release of a claim binding (the box evicting its own
+/// claim — the recovery path when the account side would never revoke).
+const UNCLAIM_PROTOCOL: &str = "intendant-connect-unclaim-v1";
+/// Freshness window for daemon-signed unclaim payloads: signatures bind a
+/// timestamp so a captured release cannot be replayed to evict a future
+/// re-claim.
+const UNCLAIM_MAX_SKEW_MS: u64 = 5 * 60 * 1000;
 const COOKIE_NAME: &str = "ic_session";
 const SESSION_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const OFFER_TIMEOUT_MS: u64 = 30_000;
@@ -157,6 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/daemon/answer", post(daemon_answer))
         .route("/api/daemon/error", post(daemon_error))
         .route("/api/daemon/claim-proof", post(daemon_claim_proof))
+        .route("/api/daemon/unclaim", post(daemon_unclaim))
         .route("/api/daemon/dry", post(daemon_dry))
         .route("/api/browser/offer", post(browser_offer))
         .route("/api/browser/ice", post(browser_ice))
@@ -728,6 +742,10 @@ struct PendingOffer {
 #[derive(Debug, Clone)]
 struct PendingClaim {
     user_id: Uuid,
+    /// Handle snapshot at claim start — the exact string offered to the
+    /// daemon for v2 proof signing, so verification reconstructs the
+    /// payload byte-for-byte even if the handle is renamed mid-claim.
+    account_name: String,
     daemon_id: String,
     challenge: String,
     created_unix_ms: u64,
@@ -3599,12 +3617,25 @@ async fn api_daemon_revoke(
     daemon.claim_code_hash = None;
     daemon.claim_code_created_unix_ms = None;
     daemon.updated_unix_ms = now_unix_ms();
+    let revoked_daemon_public_key = daemon.daemon_public_key.clone();
     store.fleet_targets.retain(|target| {
         !(target.user_id == user.id
             && (target.host_id == daemon_id
                 || target.id == daemon_id
                 || target.connect_daemon_id.as_deref() == Some(daemon_id.as_str())))
     });
+    // Binding removals belong in the transparency log just like the
+    // claims that created them — otherwise re-claim history is ambiguous.
+    append_log_entry(
+        &mut store,
+        "daemon_unclaimed",
+        json!({
+            "daemon_id": daemon_id,
+            "daemon_public_key": revoked_daemon_public_key,
+            "handle": user.account_name.clone(),
+            "initiated_by": "account",
+        }),
+    );
     audit(
         &mut store,
         "daemon_revoked",
@@ -3730,12 +3761,16 @@ async fn api_claim_start(
         claim_id.clone(),
         PendingClaim {
             user_id: user.id,
+            account_name: user.account_name.clone(),
             daemon_id: daemon.daemon_id.clone(),
             challenge: challenge.clone(),
             created_unix_ms: now_unix_ms(),
             status: ClaimStatus::Pending,
         },
     );
+    // The challenge names the claiming account so the daemon can co-sign
+    // *who* it is being claimed by (v2 proofs) and show "claimed by
+    // @handle" from its own signed record rather than this service's word.
     enqueue_event(
         &state,
         &daemon.daemon_id,
@@ -3744,6 +3779,8 @@ async fn api_claim_start(
             kind: "claim_challenge".to_string(),
             claim_id: Some(claim_id.clone()),
             challenge: Some(challenge),
+            user_id: Some(user.id.to_string()),
+            account_name: Some(user.account_name.clone()),
             ..RendezvousEvent::default()
         },
     )
@@ -3895,7 +3932,7 @@ async fn daemon_register(
         ));
     }
     let mut claim_code = None;
-    let claimed = {
+    let (claimed, claimed_by, claim_code_expires_unix_ms) = {
         let mut claim_codes = state.claim_codes.lock().await;
         let mut store = state.store.lock().await;
         let now = now_unix_ms();
@@ -3903,7 +3940,7 @@ async fn daemon_register(
             claim_codes.remove(&stale_id);
         }
         let active_claim_hashes = active_claim_code_hashes(&store, &daemon_id, now);
-        let claimed_now = if let Some(existing) =
+        let (owner_user_id, code_created_unix_ms) = if let Some(existing) =
             store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id)
         {
             if existing.owner_user_id.is_some() && existing.daemon_public_key != daemon_public_key {
@@ -3922,7 +3959,7 @@ async fn daemon_register(
                     &active_claim_hashes,
                 )?);
             }
-            existing.owner_user_id.is_some()
+            (existing.owner_user_id, existing.claim_code_created_unix_ms)
         } else {
             let mut record = DaemonRecord {
                 daemon_id: daemon_id.clone(),
@@ -3941,11 +3978,31 @@ async fn daemon_register(
                 &mut record,
                 &active_claim_hashes,
             )?);
+            let created = record.claim_code_created_unix_ms;
             store.daemons.push(record);
-            false
+            (None, created)
         };
         persist_locked(&state, &store)?;
-        claimed_now
+        // Current handle, not a claim-time snapshot: a renamed account
+        // shows its new name here. The daemon's own signed claim record
+        // (v2 proofs) keeps the at-claim-time identity.
+        let claimed_by = owner_user_id.map(|uid| {
+            (
+                uid,
+                store
+                    .users
+                    .iter()
+                    .find(|u| u.id == uid)
+                    .map(|u| u.account_name.clone())
+                    .unwrap_or_default(),
+            )
+        });
+        let expires = if owner_user_id.is_none() {
+            code_created_unix_ms.map(|created| created.saturating_add(CLAIM_CODE_TTL_MS))
+        } else {
+            None
+        };
+        (owner_user_id.is_some(), claimed_by, expires)
     };
     let claim_url = claim_code
         .as_ref()
@@ -3959,7 +4016,13 @@ async fn daemon_register(
     Ok(Json(json!({
         "ok": true,
         "claimed": claimed,
+        "claimed_by_user_id": claimed_by.as_ref().map(|(uid, _)| uid.to_string()),
+        "claimed_by_handle": claimed_by
+            .as_ref()
+            .map(|(_, handle)| handle.clone())
+            .filter(|handle| !handle.is_empty()),
         "claim_code": claim_code,
+        "claim_code_expires_unix_ms": claim_code_expires_unix_ms,
         "claim_url": claim_url,
         "daemon_public_key": daemon_public_key,
     })))
@@ -4382,6 +4445,10 @@ async fn daemon_error(
 
 #[derive(Debug, Deserialize)]
 struct ClaimProofRequest {
+    /// Which payload shape the signature covers. Absent/empty from daemons
+    /// that predate the field — those always signed the v1 payload.
+    #[serde(default)]
+    protocol: String,
     daemon_id: String,
     request_id: String,
     claim_id: String,
@@ -4520,12 +4587,34 @@ async fn daemon_claim_proof(
             .cloned()
             .ok_or_else(|| ApiError::not_found("daemon not found"))?
     };
-    let payload = claim_signing_payload(
-        &body.claim_id,
-        &body.daemon_id,
-        &daemon.daemon_public_key,
-        &body.challenge,
-    );
+    let proof_protocol = if body.protocol.trim().is_empty() {
+        // Daemons that predate the protocol field always signed v1.
+        CLAIM_PROTOCOL
+    } else {
+        body.protocol.trim()
+    };
+    let payload = match proof_protocol {
+        CLAIM_PROTOCOL => claim_signing_payload(
+            &body.claim_id,
+            &body.daemon_id,
+            &daemon.daemon_public_key,
+            &body.challenge,
+        ),
+        CLAIM_PROTOCOL_V2 => claim_signing_payload_v2(
+            &body.claim_id,
+            &body.daemon_id,
+            &daemon.daemon_public_key,
+            &body.challenge,
+            &pending.user_id.to_string(),
+            &pending.account_name,
+        ),
+        other => {
+            reject_claim(&state, &body.claim_id, "unsupported claim proof protocol").await;
+            return Err(ApiError::bad_request(format!(
+                "unsupported claim proof protocol {other:?}"
+            )));
+        }
+    };
     if !verify_ed25519_b64u(
         &daemon.daemon_public_key,
         payload.as_bytes(),
@@ -4554,6 +4643,9 @@ async fn daemon_claim_proof(
                 .find(|u| u.id == pending.user_id)
                 .map(|u| u.account_name.clone())
                 .unwrap_or_default(),
+            // v2 = the daemon co-signed the claiming account; v1 = the
+            // binding rests on this service's account assertion alone.
+            "proof": proof_protocol,
         });
         append_log_entry(&mut store, "daemon_claimed", log_event);
         audit(
@@ -4593,6 +4685,149 @@ fn claim_signing_payload(
     challenge: &str,
 ) -> String {
     format!("{CLAIM_PROTOCOL}\n{claim_id}\n{daemon_id}\n{daemon_public_key}\n{challenge}\n")
+}
+
+/// Mirrors `connect_rendezvous::claim_signing_payload_v2` in the daemon —
+/// stable protocol, replicated rather than shared, like
+/// [`orl_signing_payload`]. The account fields are the `PendingClaim`
+/// snapshot, so a mid-claim handle rename cannot desync the two sides.
+fn claim_signing_payload_v2(
+    claim_id: &str,
+    daemon_id: &str,
+    daemon_public_key: &str,
+    challenge: &str,
+    user_id: &str,
+    account_name: &str,
+) -> String {
+    format!(
+        "{CLAIM_PROTOCOL_V2}\n{claim_id}\n{daemon_id}\n{daemon_public_key}\n{challenge}\n{user_id}\n{account_name}\n"
+    )
+}
+
+/// Mirrors `connect_rendezvous::unclaim_signing_payload` in the daemon.
+fn unclaim_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+) -> String {
+    format!("{UNCLAIM_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n")
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonUnclaimRequest {
+    protocol: String,
+    daemon_id: String,
+    daemon_public_key: String,
+    issued_at_unix_ms: u64,
+    signature: String,
+}
+
+/// Daemon-initiated release of a claim binding. This is the recovery path
+/// the account side cannot provide: a squatted or mis-claimed box evicts
+/// the binding with its own key (the account holder would never revoke).
+/// The release is signed and timestamp-fresh, verified against the
+/// *registered* daemon key, and logged to the transparency log like the
+/// claim it undoes. A fresh claim code mints on the next register poll.
+async fn daemon_unclaim(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DaemonUnclaimRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_daemon_auth(&state, &headers)?;
+    check_rate_limit(&state, &headers, "daemon_unclaim", 10, 60_000).await?;
+    if body.protocol != UNCLAIM_PROTOCOL {
+        return Err(ApiError::bad_request("unsupported unclaim protocol"));
+    }
+    let daemon_id = body.daemon_id.trim().to_string();
+    let now = now_unix_ms();
+    if now.abs_diff(body.issued_at_unix_ms) > UNCLAIM_MAX_SKEW_MS {
+        return Err(ApiError::bad_request(
+            "unclaim payload is stale — check the daemon clock and retry",
+        ));
+    }
+    let daemon = {
+        let store = state.store.lock().await;
+        store
+            .daemons
+            .iter()
+            .find(|d| d.daemon_id == daemon_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("daemon not found"))?
+    };
+    // The signature must verify against the key this service has bound to
+    // the daemon_id — the body copy only makes the signed payload
+    // self-describing.
+    if body.daemon_public_key.trim() != daemon.daemon_public_key {
+        return Err(ApiError::bad_request(
+            "daemon_public_key does not match the registered key",
+        ));
+    }
+    let payload = unclaim_signing_payload(
+        &daemon_id,
+        &daemon.daemon_public_key,
+        body.issued_at_unix_ms,
+    );
+    if !verify_ed25519_b64u(
+        &daemon.daemon_public_key,
+        payload.as_bytes(),
+        body.signature.trim(),
+    ) {
+        return Err(ApiError::bad_request("unclaim signature invalid"));
+    }
+    let Some(owner_user_id) = daemon.owner_user_id else {
+        // Idempotent: releasing an unclaimed daemon is a no-op success, so
+        // a daemon retrying after a lost response converges.
+        return Ok(Json(json!({ "ok": true, "changed": false })));
+    };
+    let active_session_ids = active_dashboard_session_ids(&state, &daemon_id).await;
+    let closed_sessions = active_session_ids.len();
+    {
+        let mut store = state.store.lock().await;
+        let Some(record) = store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id) else {
+            return Err(ApiError::not_found("daemon not found"));
+        };
+        record.owner_user_id = None;
+        record.claim_code_hash = None;
+        record.claim_code_created_unix_ms = None;
+        record.updated_unix_ms = now;
+        store.fleet_targets.retain(|target| {
+            !(target.user_id == owner_user_id
+                && (target.host_id == daemon_id
+                    || target.id == daemon_id
+                    || target.connect_daemon_id.as_deref() == Some(daemon_id.as_str())))
+        });
+        let handle = store
+            .users
+            .iter()
+            .find(|u| u.id == owner_user_id)
+            .map(|u| u.account_name.clone())
+            .unwrap_or_default();
+        append_log_entry(
+            &mut store,
+            "daemon_unclaimed",
+            json!({
+                "daemon_id": daemon_id.clone(),
+                "daemon_public_key": daemon.daemon_public_key.clone(),
+                "handle": handle,
+                "initiated_by": "daemon",
+            }),
+        );
+        audit(
+            &mut store,
+            "daemon_unclaimed",
+            Some(owner_user_id),
+            Some(daemon_id.clone()),
+            json!({ "initiated_by": "daemon", "closed_sessions": closed_sessions }),
+        );
+        persist_locked(&state, &store)?;
+    }
+    state.claim_codes.lock().await.remove(&daemon_id);
+    close_active_dashboard_sessions(&state, &daemon_id, active_session_ids).await;
+    log_json(
+        "daemon_unclaimed",
+        json!({ "daemon_id": daemon_id, "closed_sessions": closed_sessions }),
+    );
+    Ok(Json(json!({ "ok": true, "changed": true })))
 }
 
 fn verify_ed25519_b64u(public_key_b64u: &str, payload: &[u8], signature_b64u: &str) -> bool {
@@ -7387,6 +7622,75 @@ mod tests {
         let mnemonic = Mnemonic::parse_in_normalized(Language::English, &code.replace('-', " "))
             .expect("generated phrase must be a valid BIP39 mnemonic");
         assert_eq!(mnemonic.to_entropy().len(), CLAIM_CODE_ENTROPY_BYTES);
+    }
+
+    /// Pins the exact byte strings daemons sign. The daemon replicates
+    /// these in `connect_rendezvous.rs` (same golden literals there) —
+    /// a drift on either side fails one of the twin tests instead of
+    /// shipping as an unverifiable signature.
+    #[test]
+    fn claim_and_unclaim_payloads_pin_the_wire_format() {
+        assert_eq!(
+            claim_signing_payload("claim-1", "daemon-1", "PubKey", "challenge-1"),
+            "intendant-connect-claim-v1\nclaim-1\ndaemon-1\nPubKey\nchallenge-1\n"
+        );
+        assert_eq!(
+            claim_signing_payload_v2(
+                "claim-1",
+                "daemon-1",
+                "PubKey",
+                "challenge-1",
+                "user-uuid-1",
+                "lenny"
+            ),
+            "intendant-connect-claim-v2\nclaim-1\ndaemon-1\nPubKey\nchallenge-1\nuser-uuid-1\nlenny\n"
+        );
+        assert_eq!(
+            unclaim_signing_payload("daemon-1", "PubKey", 1_700_000_000_000),
+            "intendant-connect-unclaim-v1\ndaemon-1\nPubKey\n1700000000000\n"
+        );
+    }
+
+    /// The v2 property the whole exercise exists for: the signature is
+    /// only valid for the account the daemon actually co-signed — a
+    /// service (or relay) re-binding the proof to a different account
+    /// fails verification.
+    #[test]
+    fn v2_claim_proof_signature_binds_the_claiming_account() {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        use ring::signature::KeyPair as _;
+        let public_key = b64u(key.public_key().as_ref());
+
+        let signed_for_alice = claim_signing_payload_v2(
+            "claim-1",
+            "daemon-1",
+            &public_key,
+            "challenge-1",
+            "alice-user-id",
+            "alice",
+        );
+        let signature = b64u(key.sign(signed_for_alice.as_bytes()).as_ref());
+        assert!(verify_ed25519_b64u(
+            &public_key,
+            signed_for_alice.as_bytes(),
+            &signature
+        ));
+
+        let rebound_to_mallory = claim_signing_payload_v2(
+            "claim-1",
+            "daemon-1",
+            &public_key,
+            "challenge-1",
+            "mallory-user-id",
+            "mallory",
+        );
+        assert!(!verify_ed25519_b64u(
+            &public_key,
+            rebound_to_mallory.as_bytes(),
+            &signature
+        ));
     }
 
     #[test]

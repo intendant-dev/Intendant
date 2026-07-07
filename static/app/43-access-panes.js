@@ -656,6 +656,222 @@ function renderAccessPeopleCurrent() {
   }));
 }
 
+/* Overview: Intendant Connect — this daemon's hosted reachability and
+   claim binding. States: off → one-click enable; registering; unclaimed
+   → reveal the twelve words (manage-gated, fetched only on click);
+   claimed → who owns it, with binding provenance (daemon co-signed vs
+   service-asserted vs MISMATCH), plus the daemon-signed release. */
+let accessConnectRevealed = null; // claim-code payload cache; dropped on expiry/state change
+
+function accessConnectStateLabel(status) {
+  if (!status.configured) return 'Off';
+  if (!status.running) return 'Enabled, not running';
+  if (!status.registered) return 'Registering…';
+  if (status.claimed === true) {
+    return status.claimed_by_handle
+      ? `Claimed by @${status.claimed_by_handle}`
+      : 'Claimed';
+  }
+  if (status.claimed === false) return 'Awaiting claim';
+  return 'Connecting…';
+}
+
+function renderAccessConnectCard() {
+  const mount = document.getElementById('access-connect-card');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const status = accessConnectStatus;
+  // Older daemon or a principal without AccessInspect: stay invisible.
+  if (!status || typeof status !== 'object') return;
+  if (accessConnectRevealed) {
+    const expires = Number(accessConnectRevealed.claim_code_expires_unix_ms || 0);
+    const stale = (expires && Date.now() > expires)
+      || status.claimed !== false
+      || !status.claim_code_available;
+    if (stale) accessConnectRevealed = null;
+  }
+  const canConfig = dashboardControlTransport?.lastStatus?.api_access_connect_config_available !== false;
+  const canReveal = dashboardControlTransport?.lastStatus?.api_access_connect_claim_code_available !== false;
+  const canUnclaim = dashboardControlTransport?.lastStatus?.api_access_connect_unclaim_available !== false;
+
+  const head = document.createElement('div');
+  head.className = 'acc-section-head';
+  const title = document.createElement('div');
+  title.className = 'acc-section-title';
+  title.textContent = 'Intendant Connect';
+  const sub = document.createElement('div');
+  sub.className = 'acc-section-sub';
+  sub.textContent = 'Hosted reachability for this daemon: it registers with a rendezvous, you claim it into your fleet with a twelve-word phrase, and any browser signed into your account can find it. Claiming grants no authority — every session still resolves against this daemon’s IAM.';
+  head.append(title, sub);
+  mount.appendChild(head);
+
+  const card = document.createElement('div');
+  card.className = 'acc-principal-card';
+
+  const headRow = document.createElement('div');
+  headRow.className = 'acc-principal-head';
+  const glyphEl = document.createElement('div');
+  glyphEl.className = 'acc-principal-glyph kind-connect';
+  glyphEl.textContent = 'NET';
+  const nameWrap = document.createElement('div');
+  const name = document.createElement('div');
+  name.className = 'acc-principal-name';
+  name.textContent = accessConnectStateLabel(status);
+  const kind = document.createElement('div');
+  kind.className = 'acc-principal-kind';
+  const bits = [];
+  if (status.rendezvous_url) bits.push(status.rendezvous_url.replace(/^https?:\/\//, ''));
+  if (status.registered && status.last_register_unix_ms) {
+    bits.push(`registered ${new Date(Number(status.last_register_unix_ms)).toLocaleTimeString()}`);
+  }
+  kind.textContent = bits.join(' · ');
+  nameWrap.append(name, kind);
+  headRow.append(glyphEl, nameWrap);
+  if (status.env_forced) {
+    headRow.appendChild(accessRouteChip('remembered', 'forced by env',
+      'INTENDANT_CONNECT_RENDEZVOUS_URL is set in this daemon’s environment; it overrides intendant.toml, so the toggle here cannot turn Connect off.'));
+  }
+  if (status.claimed === true) {
+    const binding = status.claim_binding;
+    if (binding === 'daemon-signed') {
+      headRow.appendChild(accessRouteChip('webrtc', 'co-signed ✓',
+        'This daemon’s own key co-signed exactly this claim (v2 proof) — the binding is provable, not just asserted by the rendezvous.'));
+    } else if (binding === 'mismatch') {
+      headRow.appendChild(accessRouteChip('danger', 'BINDING MISMATCH',
+        'The rendezvous asserts an owner this daemon never co-signed. Treat the hosted binding as suspect: release the claim and re-claim it yourself.'));
+    } else {
+      headRow.appendChild(accessRouteChip('remembered', 'service-asserted',
+        'No local co-signed record for this claim (made before this daemon kept records, or via an older service) — the owner shown is the rendezvous’s assertion.'));
+    }
+  }
+  card.appendChild(headRow);
+
+  if (status.claimed === true && status.claim_binding === 'mismatch') {
+    const warn = document.createElement('div');
+    warn.className = 'acc-connect-warn';
+    const signed = status.signed_claim || {};
+    warn.textContent = `The rendezvous says this daemon belongs to ${status.claimed_by_handle ? '@' + status.claimed_by_handle : (status.claimed_by_user_id || 'an unknown account')}, but this daemon co-signed a claim by ${signed.account_name ? '@' + signed.account_name : (signed.account_user_id || 'a different account')}. Release the claim below and re-claim from your own account.`;
+    card.appendChild(warn);
+  }
+
+  if (status.last_error) {
+    const err = document.createElement('div');
+    err.className = 'acc-connect-warn';
+    err.textContent = `Last error: ${status.last_error}`;
+    card.appendChild(err);
+  }
+
+  // The reveal: the twelve words, full-width, with where to type them.
+  if (accessConnectRevealed?.claim_code) {
+    const phraseWrap = document.createElement('div');
+    phraseWrap.className = 'acc-connect-phrase';
+    for (const word of String(accessConnectRevealed.claim_code).split('-')) {
+      const el = document.createElement('span');
+      el.className = 'acc-connect-word';
+      el.textContent = word;
+      phraseWrap.appendChild(el);
+    }
+    card.appendChild(phraseWrap);
+    const hint = document.createElement('div');
+    hint.className = 'acc-principal-kind';
+    const expires = Number(accessConnectRevealed.claim_code_expires_unix_ms || 0);
+    const expiresText = expires
+      ? ` · expires ${new Date(expires).toLocaleTimeString()} (a fresh phrase mints automatically)`
+      : '';
+    hint.textContent = `Sign in and enter this phrase to claim this daemon into your fleet${expiresText}`;
+    card.appendChild(hint);
+    if (accessConnectRevealed.claim_url) {
+      const linkRow = document.createElement('div');
+      linkRow.className = 'acc-principal-authn';
+      const link = document.createElement('a');
+      link.href = accessConnectRevealed.claim_url;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.textContent = accessConnectRevealed.claim_url;
+      linkRow.appendChild(link);
+      card.appendChild(linkRow);
+    }
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'acc-grant-flow-actions';
+  if (!status.configured) {
+    const enable = document.createElement('button');
+    enable.type = 'button';
+    enable.className = 'acc-btn primary';
+    enable.textContent = 'Turn on Connect';
+    enable.title = `Registers this daemon with ${status.default_rendezvous_url || 'the hosted rendezvous'} and writes [connect] to intendant.toml. You can claim it with the twelve-word phrase afterwards.`;
+    enable.disabled = !canConfig;
+    enable.addEventListener('click', () => accessConnectSetEnabled(true));
+    actions.appendChild(enable);
+  } else {
+    if (status.claimed === false && status.claim_code_available && !accessConnectRevealed) {
+      const reveal = document.createElement('button');
+      reveal.type = 'button';
+      reveal.className = 'acc-btn primary';
+      reveal.textContent = 'Reveal claim phrase';
+      reveal.title = 'Shows the twelve words that bind this daemon to an account. Anyone who sees them (for their ten-minute lifetime) can claim this daemon into their fleet — claiming grants no session authority, but release requires this card or the account side.';
+      reveal.disabled = !canReveal;
+      reveal.addEventListener('click', async () => {
+        try {
+          accessConnectRevealed = await accessConnectFetchClaimCode();
+        } catch (err) {
+          showControlToast?.('error', err?.message || 'Claim phrase fetch failed');
+          accessConnectRevealed = null;
+        }
+        renderAccessAdminSummaries();
+      });
+      actions.appendChild(reveal);
+    }
+    if (accessConnectRevealed) {
+      const hide = document.createElement('button');
+      hide.type = 'button';
+      hide.className = 'acc-btn';
+      hide.textContent = 'Hide phrase';
+      hide.addEventListener('click', () => {
+        accessConnectRevealed = null;
+        renderAccessAdminSummaries();
+      });
+      actions.appendChild(hide);
+    }
+    if (status.claimed === true) {
+      const release = document.createElement('button');
+      release.type = 'button';
+      release.className = 'acc-btn danger';
+      release.textContent = 'Release claim';
+      release.title = 'Daemon-signed release: detaches this daemon from the account that claimed it (fleet entry, presence, notifications). Sessions and IAM grants are untouched. A fresh claim phrase mints right after.';
+      release.disabled = !canUnclaim;
+      // Two-click confirm — no blocking dialogs in the dashboard.
+      release.addEventListener('click', () => {
+        if (release.dataset.armed === '1') {
+          release.disabled = true;
+          accessConnectUnclaim();
+          return;
+        }
+        release.dataset.armed = '1';
+        release.textContent = 'Confirm release';
+        setTimeout(() => {
+          release.dataset.armed = '';
+          release.textContent = 'Release claim';
+        }, 5000);
+      });
+      actions.appendChild(release);
+    }
+    const disable = document.createElement('button');
+    disable.type = 'button';
+    disable.className = 'acc-btn';
+    disable.textContent = 'Turn off';
+    disable.title = status.env_forced
+      ? 'Connect is forced on by INTENDANT_CONNECT_RENDEZVOUS_URL in the daemon’s environment; unset it to allow turning off here.'
+      : 'Stops registering with the rendezvous and persists [connect] enabled = false. An existing claim binding stays at the service until released.';
+    disable.disabled = !canConfig || status.env_forced;
+    disable.addEventListener('click', () => accessConnectSetEnabled(false));
+    actions.appendChild(disable);
+  }
+  card.appendChild(actions);
+  mount.appendChild(card);
+}
+
 /* People & Devices: devices knocking on this daemon, awaiting a decision.
    Empty (and invisible) when nothing is pending. */
 function renderAccessEnrollmentRequests() {
@@ -1722,6 +1938,7 @@ function renderAccessAdminSummaries() {
   }
   renderAccessAttention();
   renderAccessIdentityHero();
+  renderAccessConnectCard();
   renderAccessFleetStrip();
   renderAccessExplainer();
   renderAccessTargetsSurface();
