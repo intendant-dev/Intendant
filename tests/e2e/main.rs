@@ -69,6 +69,14 @@ impl TestRig {
             // A host shell exporting the Connect rendezvous URL would make
             // the daemon-lane tests dial out; the suite is no-network.
             .env_remove("INTENDANT_CONNECT_RENDEZVOUS_URL")
+            // The suite is display-free by contract, but a host with a live
+            // X session at :0 (a self-hosted runner doubling as a desktop)
+            // breaks that hermeticity: the caller's vision probe finds the
+            // socket, exports DISPLAY=:0, and the runtime's fail-closed
+            // user-display gate then refuses every exec_command without a
+            // grant. Pin the virtual-display convention instead — nothing
+            // here opens an X connection, and display ids > 0 need no grant.
+            .env("DISPLAY", ":99")
             .env("PROVIDER", "mock");
         cmd
     }
@@ -267,12 +275,13 @@ async fn wait_for_output(
     }
 }
 
-/// Read WebSocket text frames until one satisfies `pred`, with a timeout.
-async fn wait_for_ws_event<S>(
+/// Read WebSocket text frames until one satisfies `pred`; `None` on
+/// timeout (callers decide whether that is fatal and what context to dump).
+async fn next_matching_ws_event<S>(
     ws: &mut S,
     timeout: Duration,
     mut pred: impl FnMut(&serde_json::Value) -> bool,
-) -> serde_json::Value
+) -> Option<serde_json::Value>
 where
     S: futures_util::Stream<
             Item = Result<
@@ -284,18 +293,16 @@ where
     use futures_util::StreamExt;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .unwrap_or_else(|| panic!("timed out waiting for a matching /ws event"));
+        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
         let msg = tokio::time::timeout(remaining, ws.next())
             .await
-            .expect("timed out waiting for a /ws event")
+            .ok()?
             .expect("/ws stream ended unexpectedly")
             .expect("/ws read failed");
         if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                 if pred(&json) {
-                    return json;
+                    return Some(json);
                 }
             }
         }
@@ -386,22 +393,37 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
         .expect("connect /ws");
 
     // (c) CreateSession WITHOUT a project root: the structured failure,
-    // not a dead session and not a cwd-rooted one.
-    ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::json!({
-            "action": "create_session",
-            "task": "must not start without a project",
-            "direct": true,
+    // not a dead session and not a cwd-rooted one. The very first control
+    // message can race daemon startup on a saturated box — the gateway
+    // task accepts /ws a beat before the supervisor's bus subscription —
+    // so retry the send until the structured failure arrives.
+    let mut ended = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "must not start without a project",
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send projectless create_session");
+        ended = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("session_ended")
         })
-        .to_string()
-        .into(),
-    ))
-    .await
-    .expect("send projectless create_session");
-    let ended = wait_for_ws_event(&mut ws, RUN_TIMEOUT, |json| {
-        json.get("event").and_then(|v| v.as_str()) == Some("session_ended")
-    })
-    .await;
+        .await;
+        if ended.is_some() {
+            break;
+        }
+    }
+    let ended = ended.unwrap_or_else(|| {
+        panic!(
+            "no session_ended for the projectless create; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
     assert_eq!(
         ended.get("error_kind").and_then(|v| v.as_str()),
         Some("no_project"),
@@ -429,24 +451,36 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
     ))
     .await
     .expect("send rooted create_session");
-    let started = wait_for_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+    let started = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
         json.get("event").and_then(|v| v.as_str()) == Some("session_started")
             && json
                 .get("task")
                 .and_then(|v| v.as_str())
                 .is_some_and(|task| task.contains("explicit project"))
     })
-    .await;
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "rooted create never started; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
     let started_id = started
         .get("session_id")
         .and_then(|v| v.as_str())
         .expect("session_started carries a session id")
         .to_string();
-    let ended = wait_for_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+    let ended = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
         json.get("event").and_then(|v| v.as_str()) == Some("session_ended")
             && json.get("session_id").and_then(|v| v.as_str()) == Some(started_id.as_str())
     })
-    .await;
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "rooted session never ended; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
     assert!(
         ended.get("error_kind").is_none_or(|v| v.is_null()),
         "explicit-project session must end cleanly, got {ended}"
