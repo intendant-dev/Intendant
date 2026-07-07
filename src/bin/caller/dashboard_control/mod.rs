@@ -1144,7 +1144,7 @@ impl DashboardControlPeer {
 }
 
 #[derive(Clone)]
-struct ControlRuntime {
+pub(crate) struct ControlRuntime {
     session_id: String,
     daemon_public_key: String,
     created_unix_ms: i64,
@@ -1180,7 +1180,7 @@ struct ControlRuntime {
 }
 
 #[derive(Debug)]
-struct DashboardMediaClipOperation {
+pub(crate) struct DashboardMediaClipOperation {
     stream: String,
     note: String,
     inject: bool,
@@ -1191,7 +1191,7 @@ struct DashboardMediaClipOperation {
     frames: Vec<(String, String)>,
 }
 
-enum ControlCommand {
+pub(crate) enum ControlCommand {
     AddIceCandidate(String),
 }
 
@@ -1211,7 +1211,7 @@ struct InboundPacket {
 /// presenting as a bare DTLS timeout (which once cost a full debugging
 /// round on the hosted-Connect path).
 #[derive(Debug, Default)]
-struct TransmitDropStats {
+pub(crate) struct TransmitDropStats {
     cross_family: u64,
     loopback_mismatch: u64,
     unknown_udp_source: u64,
@@ -1227,14 +1227,14 @@ impl TransmitDropStats {
     }
 }
 
-struct ControlTaskResponse {
+pub(crate) struct ControlTaskResponse {
     id: String,
     frame: serde_json::Value,
     byte_stream: Option<ControlByteStream>,
     done: bool,
 }
 
-struct ControlByteStream {
+pub(crate) struct ControlByteStream {
     id: String,
     stream_id: String,
     content_type: String,
@@ -1243,7 +1243,7 @@ struct ControlByteStream {
     result: serde_json::Value,
 }
 
-struct InboundUploadState {
+pub(crate) struct InboundUploadState {
     method: String,
     params: serde_json::Value,
     tmp: tempfile::NamedTempFile,
@@ -1253,7 +1253,7 @@ struct InboundUploadState {
     received_bytes: usize,
 }
 
-struct OutboundControlQueue {
+pub(crate) struct OutboundControlQueue {
     frames: VecDeque<QueuedControlFrame>,
 }
 
@@ -1273,7 +1273,7 @@ struct QueuedChunkedFrame {
     started: bool,
 }
 
-enum ControlFrameTexts {
+pub(crate) enum ControlFrameTexts {
     Immediate(Vec<String>),
     Chunked {
         request_id: String,
