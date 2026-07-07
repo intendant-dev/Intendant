@@ -15,6 +15,7 @@ use crate::util::Color;
 /// per-pixel against the scene. A pane with any corner culled is skipped
 /// whole — a partially projected billboard warps unpredictably near the
 /// frustum edge. Returns whether the pane was emitted.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn add_world_pane(
     frame: &mut GpuFrame,
     project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
