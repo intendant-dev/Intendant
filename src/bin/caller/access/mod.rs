@@ -11,6 +11,7 @@
 
 use std::{fmt, net::IpAddr, path::PathBuf};
 
+pub mod access_policy;
 pub mod backend;
 // `certs` is pure-Rust (rcgen + p12-keystore) and compiles on every
 // platform, so it stays ungated — `read_server_cert_fingerprint` backs the

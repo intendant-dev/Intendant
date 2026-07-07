@@ -89,7 +89,7 @@
 //! `transport::openclaw`, `transport::mcp_client`, `registry`,
 //! `coordinator`) once the abstractions here are settled.
 
-pub mod access_policy;
+pub use crate::access::access_policy;
 pub mod access_request;
 mod actor;
 pub mod card;
