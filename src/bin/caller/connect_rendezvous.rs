@@ -83,6 +83,12 @@ struct RegisterResponse {
     claim_code_expires_unix_ms: Option<u64>,
     #[serde(default)]
     claim_url: Option<String>,
+    /// This daemon's public address as the rendezvous observed it —
+    /// what a cloud box behind 1:1 NAT advertises as its ICE-TCP
+    /// candidate on Connect offers (reachability metadata, not
+    /// authority).
+    #[serde(default)]
+    observed_ip: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -499,6 +505,8 @@ pub(crate) struct ConnectStatus {
     /// bootstrap phrase: claiming with it also enrolls the claiming
     /// browser as role:root.
     pub bootstrap: bool,
+    /// Public address the rendezvous observes for this daemon.
+    pub observed_ip: Option<String>,
 }
 
 fn status_registry() -> &'static Mutex<ConnectStatus> {
@@ -532,6 +540,9 @@ fn register_nudge() -> &'static Notify {
 struct ClientState {
     handle: Option<JoinHandle<()>>,
     dashboard_control: Option<Arc<DashboardControlRegistry>>,
+    /// The web gateway's TCP port — combined with the rendezvous-observed
+    /// IP to advertise an ICE-TCP candidate on Connect offers.
+    gateway_tcp_port: Option<u16>,
 }
 
 fn client_state() -> &'static Mutex<ClientState> {
@@ -540,6 +551,7 @@ fn client_state() -> &'static Mutex<ClientState> {
         Mutex::new(ClientState {
             handle: None,
             dashboard_control: None,
+            gateway_tcp_port: None,
         })
     })
 }
@@ -547,12 +559,14 @@ fn client_state() -> &'static Mutex<ClientState> {
 pub fn spawn_connect_rendezvous_client(
     config: ConnectConfig,
     dashboard_control: Arc<DashboardControlRegistry>,
+    gateway_tcp_port: Option<u16>,
 ) {
-    client_state()
-        .lock()
-        .expect("connect client state poisoned")
-        .dashboard_control = Some(dashboard_control.clone());
-    start_client(config, dashboard_control);
+    {
+        let mut state = client_state().lock().expect("connect client state poisoned");
+        state.dashboard_control = Some(dashboard_control.clone());
+        state.gateway_tcp_port = gateway_tcp_port;
+    }
+    start_client(config, dashboard_control, gateway_tcp_port);
 }
 
 /// Stop the running client task, if any. All of the task's awaits are
@@ -591,13 +605,13 @@ pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
         });
         return Ok(false);
     }
-    let dashboard_control = client_state()
-        .lock()
-        .expect("connect client state poisoned")
-        .dashboard_control
-        .clone()
+    let (dashboard_control, gateway_tcp_port) = {
+        let state = client_state().lock().expect("connect client state poisoned");
+        (state.dashboard_control.clone(), state.gateway_tcp_port)
+    };
+    let dashboard_control = dashboard_control
         .ok_or_else(|| "connect client cannot start before the web gateway".to_string())?;
-    start_client(config, dashboard_control);
+    start_client(config, dashboard_control, gateway_tcp_port);
     Ok(client_state()
         .lock()
         .expect("connect client state poisoned")
@@ -607,7 +621,11 @@ pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
 
 /// Shared by boot (`spawn_connect_rendezvous_client`) and the runtime
 /// toggle (`apply_config`).
-fn start_client(config: ConnectConfig, dashboard_control: Arc<DashboardControlRegistry>) {
+fn start_client(
+    config: ConnectConfig,
+    dashboard_control: Arc<DashboardControlRegistry>,
+    gateway_tcp_port: Option<u16>,
+) {
     with_status(|status| {
         status.configured = config.enabled;
         status.env_forced = ConnectConfig::env_forced();
@@ -656,7 +674,7 @@ fn start_client(config: ConnectConfig, dashboard_control: Arc<DashboardControlRe
         }
     };
     let handle = tokio::spawn(async move {
-        run_connect_rendezvous_client(config, base_url, dashboard_control).await;
+        run_connect_rendezvous_client(config, base_url, dashboard_control, gateway_tcp_port).await;
         // Natural exit (identity or HTTP-client construction failure) —
         // an abort via `stop_client` never reaches this line, but that
         // path flips the flag itself.
@@ -674,6 +692,7 @@ async fn run_connect_rendezvous_client(
     config: ConnectConfig,
     base_url: Url,
     dashboard_control: Arc<DashboardControlRegistry>,
+    gateway_tcp_port: Option<u16>,
 ) {
     let identity = match DaemonIdentity::load_or_create_default() {
         Ok(identity) => identity,
@@ -754,6 +773,7 @@ async fn run_connect_rendezvous_client(
                                 &daemon_id,
                                 &identity,
                                 &dashboard_control,
+                                gateway_tcp_port,
                                 event,
                             )
                             .await;
@@ -834,6 +854,7 @@ fn note_register_response(response: &RegisterResponse, base_url: &Url) {
         status.registered = true;
         status.last_register_unix_ms = Some(now);
         status.last_error = None;
+        status.observed_ip = response.observed_ip.clone();
         status.claimed = Some(response.claimed);
         if response.claimed {
             status.claimed_by_user_id = response.claimed_by_user_id.clone();
@@ -1022,6 +1043,7 @@ async fn handle_event(
     daemon_id: &str,
     identity: &DaemonIdentity,
     dashboard_control: &Arc<DashboardControlRegistry>,
+    gateway_tcp_port: Option<u16>,
     event: RendezvousEvent,
 ) {
     match event.kind.as_str() {
@@ -1196,8 +1218,26 @@ async fn handle_event(
                     return;
                 }
             };
+            // A cloud box's interface addresses are private (the public IP
+            // lives on the provider's 1:1 NAT), and this engine gathers no
+            // server-reflexive candidates — so hosted offers advertise an
+            // ICE-TCP candidate at the rendezvous-observed public address
+            // on the gateway port, the one address the world can reach.
+            let tcp_advertised_addr = status_snapshot()
+                .observed_ip
+                .as_deref()
+                .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+                .zip(gateway_tcp_port)
+                .map(|(ip, port)| std::net::SocketAddr::new(ip, port));
             match dashboard_control
-                .answer_offer_with_grant(sdp.to_string(), session_grant, client_nonce, grant)
+                .answer_offer_with_session_id_grant_and_tcp(
+                    uuid::Uuid::new_v4().to_string(),
+                    sdp.to_string(),
+                    session_grant,
+                    client_nonce,
+                    grant,
+                    tcp_advertised_addr,
+                )
                 .await
             {
                 Ok(answer) => {
@@ -2277,6 +2317,7 @@ mod tests {
                 claim_code_daemon_minted: false,
                 claim_code_expires_unix_ms: None,
                 claim_url: None,
+                observed_ip: None,
             },
             &base_url,
         );
@@ -2294,6 +2335,7 @@ mod tests {
                 claim_code_daemon_minted: false,
                 claim_code_expires_unix_ms: None,
                 claim_url: None,
+                observed_ip: None,
             },
             &base_url,
         );
@@ -2314,6 +2356,7 @@ mod tests {
                 claim_url: Some(
                     "https://connect.example/connect?claim_code=word-word-word".to_string(),
                 ),
+                observed_ip: None,
             },
             &base_url,
         );

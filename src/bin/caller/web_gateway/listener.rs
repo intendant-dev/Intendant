@@ -551,6 +551,7 @@ pub fn spawn_web_gateway(
     crate::connect_rendezvous::spawn_connect_rendezvous_client(
         config.connect.clone(),
         dashboard_control.clone(),
+        tcp_advertised_port,
     );
 
     // F-1.3b3 federated authority subscribers. Federated counterpart
