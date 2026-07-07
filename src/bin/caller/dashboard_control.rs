@@ -1074,6 +1074,7 @@ impl DashboardControlPeer {
             presence,
             ice_config,
             tcp_peer_registry,
+            tcp_advertised,
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
             display_peer_id: NEXT_DASHBOARD_DISPLAY_PEER_ID.fetch_add(1, Ordering::Relaxed),
@@ -1152,6 +1153,13 @@ struct ControlRuntime {
     presence: Option<DashboardPresenceBridge>,
     ice_config: crate::display::IceConfig,
     tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
+    /// The ICE-TCP tuple this control session itself advertised (the
+    /// rendezvous-observed public address on the gateway port for hosted
+    /// Connect sessions; `None` for locally-signaled sessions, whose
+    /// browsers signal displays over the gateway WS instead). Display
+    /// offers arriving on the control channel advertise the same tuple —
+    /// the browser reached us through it, so display traffic can too.
+    tcp_advertised: Option<SocketAddr>,
     media_clip_ops: Arc<Mutex<HashMap<String, DashboardMediaClipOperation>>>,
     control_frames_tx: Option<mpsc::UnboundedSender<serde_json::Value>>,
     display_peer_id: crate::display::PeerId,
@@ -8434,7 +8442,7 @@ async fn api_display_webrtc_offer_response(
             &sdp,
             &runtime.ice_config,
             Some(Arc::clone(&runtime.tcp_peer_registry)),
-            None,
+            runtime.tcp_advertised,
             ice_tx,
             input_authorized,
             authority_handler,
@@ -10371,6 +10379,7 @@ mod tests {
             presence: None,
             ice_config: crate::display::IceConfig::default(),
             tcp_peer_registry: crate::display::webrtc::TcpPeerRegistry::new(),
+            tcp_advertised: None,
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
             display_peer_id: 1,
