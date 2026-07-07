@@ -563,18 +563,18 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     // 18. peer (caller-handled, federated peer daemons)
     tools.push(ToolDefinition {
         name: "peer".to_string(),
-        description: "Interact with federated peer daemons. Actions: list enumerates peers with their connection state, capabilities, and visible sessions; message sends text to a peer's agent; task delegates work that the peer's own agent executes on its machine under its own autonomy and approval policy (returns a task id; progress streams to the dashboard's peers rail). Peers are siblings, not subordinates: the receiving daemon authorizes every action against its own grants for this daemon. Requires peer federation to be configured.".to_string(),
+        description: "Interact with federated peer daemons. Actions: list enumerates peers with their connection state, capabilities, visible sessions, and available displays; message sends text to a peer's agent; task delegates work that the peer's own agent executes on its machine under its own autonomy and approval policy (returns a task id; progress streams to the dashboard's peers rail); displays lists a peer's displays; screenshot captures a peer display (the image comes back in the tool result so you can see the peer's screen); cu executes computer-use actions on a peer display and returns the annotated post-action screenshot. Peers are siblings, not subordinates: the receiving daemon authorizes every action against the IAM profile it granted this daemon — screenshots need a profile with display view, cu needs display input (peer-operator or peer-root). Requires peer federation to be configured.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "message", "task"],
+                    "enum": ["list", "message", "task", "displays", "screenshot", "cu"],
                     "description": "Peer verb to perform."
                 },
                 "peer_id": {
                     "type": "string",
-                    "description": "Peer daemon id from the list action. Required for message and task."
+                    "description": "Peer daemon id from the list action. Required for every action except list."
                 },
                 "message": {
                     "type": "string",
@@ -590,6 +590,19 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "session": {
                     "type": "string",
                     "description": "Optional peer-side session id to scope a message to."
+                },
+                "display_target": {
+                    "type": "string",
+                    "description": "Peer-side display selector for screenshot/cu (e.g. \"display_99\", \"user_session\"; from the displays action or list's displays field). Auto-detects when omitted."
+                },
+                "actions": {
+                    "type": "array",
+                    "description": "Computer-use actions for cu, in the peer's CuAction vocabulary: tagged objects like {\"type\":\"click\",\"x\":100,\"y\":200}, {\"type\":\"type\",\"text\":\"hi\"}, {\"type\":\"key\",\"key\":\"Return\"}, {\"type\":\"scroll\",\"x\":0,\"y\":300,\"direction\":\"down\",\"amount\":3}, {\"type\":\"screenshot\"}, {\"type\":\"wait\",\"ms\":500}."
+                },
+                "coordinate_space": {
+                    "type": "string",
+                    "enum": ["pixel", "normalized_1000"],
+                    "description": "Coordinate space for cu actions (default pixel)."
                 }
             },
             "required": ["action"],

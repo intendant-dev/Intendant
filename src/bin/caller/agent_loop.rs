@@ -628,11 +628,14 @@ pub(crate) async fn handle_wait_sub_agents_call(
 /// Handle a native `peer` tool call: validate the action and its
 /// arguments, then route to the shared `crate::peer::ops`
 /// implementations (the same bodies behind the MCP peer tools and
-/// `intendant ctl peer`, so the surfaces cannot drift).
+/// `intendant ctl peer`, so the surfaces cannot drift). The direct
+/// computer-use actions return screenshots as image attachments so
+/// the agent sees the peer's screen in the conversation.
 pub(crate) async fn handle_peer_tool_call(
     args: &serde_json::Value,
     peer_registry: Option<&crate::peer::PeerRegistry>,
-) -> String {
+) -> crate::peer::ops::PeerToolOutput {
+    use crate::peer::ops::PeerToolOutput;
     fn required_str<'a>(
         args: &'a serde_json::Value,
         key: &str,
@@ -651,59 +654,118 @@ pub(crate) async fn handle_peer_tool_call(
             })
     }
 
+    fn optional_str(args: &serde_json::Value, key: &str) -> Option<String> {
+        args.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
     let action = args
         .get("action")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     match action {
-        "list" => crate::peer::ops::list_peers_json(peer_registry),
+        "list" => PeerToolOutput::text_only(crate::peer::ops::list_peers_json(peer_registry)),
         "message" => {
             let peer_id = match required_str(args, "peer_id", "message") {
                 Ok(value) => value,
-                Err(error) => return error,
+                Err(error) => return PeerToolOutput::error(error),
             };
             let message = match required_str(args, "message", "message") {
                 Ok(value) => value,
-                Err(error) => return error,
+                Err(error) => return PeerToolOutput::error(error),
             };
-            let session = args
-                .get("session")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            crate::peer::ops::send_message_json(
-                peer_registry,
-                peer_id,
-                message.to_string(),
-                session,
+            let session = optional_str(args, "session");
+            PeerToolOutput::text_only(
+                crate::peer::ops::send_message_json(
+                    peer_registry,
+                    peer_id,
+                    message.to_string(),
+                    session,
+                )
+                .await,
             )
-            .await
         }
         "task" => {
             let peer_id = match required_str(args, "peer_id", "task") {
                 Ok(value) => value,
-                Err(error) => return error,
+                Err(error) => return PeerToolOutput::error(error),
             };
             let instructions = match required_str(args, "instructions", "task") {
                 Ok(value) => value,
-                Err(error) => return error,
+                Err(error) => return PeerToolOutput::error(error),
             };
             let context = args
                 .get("context")
                 .filter(|value| !value.is_null())
                 .cloned();
-            crate::peer::ops::delegate_task_json(
+            PeerToolOutput::text_only(
+                crate::peer::ops::delegate_task_json(
+                    peer_registry,
+                    peer_id,
+                    instructions.to_string(),
+                    context,
+                )
+                .await,
+            )
+        }
+        "displays" => {
+            let peer_id = match required_str(args, "peer_id", "displays") {
+                Ok(value) => value,
+                Err(error) => return PeerToolOutput::error(error),
+            };
+            PeerToolOutput::text_only(
+                crate::peer::ops::list_displays_json(peer_registry, peer_id).await,
+            )
+        }
+        "screenshot" => {
+            let peer_id = match required_str(args, "peer_id", "screenshot") {
+                Ok(value) => value,
+                Err(error) => return PeerToolOutput::error(error),
+            };
+            let display_target = optional_str(args, "display_target");
+            crate::peer::ops::take_screenshot(peer_registry, peer_id, display_target).await
+        }
+        "cu" => {
+            let peer_id = match required_str(args, "peer_id", "cu") {
+                Ok(value) => value,
+                Err(error) => return PeerToolOutput::error(error),
+            };
+            let Some(actions) = args.get("actions").filter(|value| value.is_array()).cloned()
+            else {
+                return PeerToolOutput::error(
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "the cu action requires a non-empty 'actions' array \
+                                  (the peer's CuAction vocabulary, e.g. \
+                                  [{\"type\":\"click\",\"x\":100,\"y\":200}])",
+                    })
+                    .to_string(),
+                );
+            };
+            let display_target = optional_str(args, "display_target");
+            let coordinate_space = optional_str(args, "coordinate_space");
+            crate::peer::ops::execute_cu_actions(
                 peer_registry,
                 peer_id,
-                instructions.to_string(),
-                context,
+                actions,
+                display_target,
+                coordinate_space,
             )
             .await
         }
-        other => serde_json::json!({
-            "ok": false,
-            "error": format!("unknown peer action '{other}' (expected list, message, or task)"),
-        })
-        .to_string(),
+        other => PeerToolOutput::error(
+            serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "unknown peer action '{other}' \
+                     (expected list, message, task, displays, screenshot, or cu)"
+                ),
+            })
+            .to_string(),
+        ),
     }
 }
 
@@ -1357,13 +1419,20 @@ pub(crate) async fn run_agent_loop(
                 }
             }
 
-            // Peer-federation tool calls (list / message / task), routed
-            // through the shared `crate::peer::ops` bodies — the same
-            // implementations behind the MCP tools and `intendant ctl peer`.
+            // Peer-federation tool calls (list / message / task /
+            // displays / screenshot / cu), routed through the shared
+            // `crate::peer::ops` bodies — the same implementations
+            // behind the MCP tools and `intendant ctl peer`. Peer
+            // screenshots attach as images so the model sees them.
             for (call_id, args) in &batch.peer_calls {
                 handled_call_ids.insert(call_id.clone());
                 let response = handle_peer_tool_call(args, peer_registry).await;
-                conversation.add_tool_result(call_id, "peer", &response);
+                conversation.add_tool_result_with_images(
+                    call_id,
+                    "peer",
+                    &response.text,
+                    response.images,
+                );
             }
 
             // Spawn supervised sub-agent sessions (spawn_sub_agent).

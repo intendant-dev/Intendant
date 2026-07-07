@@ -199,14 +199,22 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "claim_fission_canonical"
         | "fission_spawn"
         | "fission_control" => PeerOperation::SessionManage,
-        // Peer federation. Listing is peer-topology inspection; messaging
-        // and delegation act *through* a connected peer and are peer use —
-        // the same classification the `/api/peers` HTTP routes and the
-        // dashboard-control RPCs carry: using a peer delegates this
-        // daemon's peer identity, and the receiving peer authorizes the
-        // action against its own grants for this daemon.
+        // Peer federation. The rule: reading *local* federation state
+        // (the registry) is peer-topology inspection; anything that
+        // causes traffic *on* a peer — messaging, delegation, remote
+        // display view or input — is peer use, the same classification
+        // the `/api/peers` HTTP routes and the dashboard-control RPCs
+        // carry: using a peer delegates this daemon's peer identity,
+        // and the receiving peer's IAM (the profile it granted this
+        // daemon) is the authority over what the call may do there —
+        // its own gate classifies the remote take_screenshot as
+        // DisplayView and execute_cu_actions as DisplayInput.
         "list_peers" => PeerOperation::PeerInspect,
-        "peer_send_message" | "peer_delegate_task" => PeerOperation::PeerUse,
+        "peer_send_message"
+        | "peer_delegate_task"
+        | "peer_list_displays"
+        | "peer_take_screenshot"
+        | "peer_execute_cu_actions" => PeerOperation::PeerUse,
         // Viewing displays, frames, and shared-view surfaces.
         "list_displays"
         | "take_screenshot"
@@ -420,7 +428,7 @@ pub(crate) fn append_manual_http_tool_definitions(
         "list_peers",
         manual_http_tool_definition!(
             "list_peers",
-            "List federated peer daemons: id, label, connection state, advertised capabilities, and currently visible sessions.",
+            "List federated peer daemons: id, label, connection state, advertised capabilities, currently visible sessions, and available displays.",
             EmptyToolParams
         ),
     );
@@ -438,6 +446,30 @@ pub(crate) fn append_manual_http_tool_definitions(
             "peer_delegate_task",
             "Delegate a task to a federated peer daemon: the peer's own agent executes the natural-language instructions on its machine under its own autonomy and approval policy. Returns a task id; progress streams to the dashboard's peers rail.",
             PeerDelegateTaskParams
+        ),
+    );
+    push(
+        "peer_list_displays",
+        manual_http_tool_definition!(
+            "peer_list_displays",
+            "List the displays a federated peer daemon currently offers (ids, names, resolutions). Invoked over the peer's /mcp with this daemon's identity; gated peer-side by the display-view grant of the profile the peer issued this daemon.",
+            PeerListDisplaysParams
+        ),
+    );
+    push(
+        "peer_take_screenshot",
+        manual_http_tool_definition!(
+            "peer_take_screenshot",
+            "Take a screenshot of a federated peer daemon's display. Returns an MCP image content block. Needs a peer-granted profile with display view (read-only-display or better).",
+            PeerTakeScreenshotParams
+        ),
+    );
+    push(
+        "peer_execute_cu_actions",
+        manual_http_tool_definition!(
+            "peer_execute_cu_actions",
+            "Execute computer-use actions on a federated peer daemon's display (click, type, scroll, etc — the peer's CuAction vocabulary). Returns per-action status plus the annotated post-action screenshot. Needs a peer-granted profile with display input (peer-operator or peer-root).",
+            PeerExecuteCuActionsParams
         ),
     );
 }
@@ -461,6 +493,50 @@ mod tests {
             (
                 "list_rewind_anchors",
                 IntendantServer::list_rewind_anchors_tool_attr(),
+            ),
+        ] {
+            let manual_description = manual
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .and_then(|tool| tool["description"].as_str())
+                .unwrap_or_else(|| panic!("missing manual HTTP definition for {name}"));
+            let attr_description = attr.description.as_deref().unwrap_or_default();
+            assert_eq!(
+                manual_description, attr_description,
+                "{name} manual HTTP description drifted from its #[tool] attribute"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_http_peer_tool_descriptions_match_tool_attributes() {
+        // Same drift guard as the rewind tools: the peer family lives
+        // in a non-router impl block, so the HTTP transport serves the
+        // manual definitions while the #[tool] attributes document the
+        // methods.
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, true, None);
+        for (name, attr) in [
+            ("list_peers", IntendantServer::list_peers_tool_attr()),
+            (
+                "peer_send_message",
+                IntendantServer::peer_send_message_tool_attr(),
+            ),
+            (
+                "peer_delegate_task",
+                IntendantServer::peer_delegate_task_tool_attr(),
+            ),
+            (
+                "peer_list_displays",
+                IntendantServer::peer_list_displays_tool_attr(),
+            ),
+            (
+                "peer_take_screenshot",
+                IntendantServer::peer_take_screenshot_tool_attr(),
+            ),
+            (
+                "peer_execute_cu_actions",
+                IntendantServer::peer_execute_cu_actions_tool_attr(),
             ),
         ] {
             let manual_description = manual
@@ -562,8 +638,10 @@ mod tests {
             mcp_tool_operation("request_shared_view_input"),
             PeerOperation::DisplayInput
         );
-        // Peer federation: listing inspects topology; message/task act
-        // through the peer and ride peer.use like their /api/peers twins.
+        // Peer federation: listing inspects topology; message/task and
+        // the direct peer-CU trio act through the peer and ride
+        // peer.use like their /api/peers twins — the peer's own IAM
+        // then gates view vs input per its granted profile.
         assert_eq!(mcp_tool_operation("list_peers"), PeerOperation::PeerInspect);
         assert_eq!(
             mcp_tool_operation("peer_send_message"),
@@ -571,6 +649,18 @@ mod tests {
         );
         assert_eq!(
             mcp_tool_operation("peer_delegate_task"),
+            PeerOperation::PeerUse
+        );
+        assert_eq!(
+            mcp_tool_operation("peer_list_displays"),
+            PeerOperation::PeerUse
+        );
+        assert_eq!(
+            mcp_tool_operation("peer_take_screenshot"),
+            PeerOperation::PeerUse
+        );
+        assert_eq!(
+            mcp_tool_operation("peer_execute_cu_actions"),
             PeerOperation::PeerUse
         );
         assert_eq!(mcp_tool_operation("quit"), PeerOperation::RuntimeControl);

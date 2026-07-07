@@ -239,11 +239,13 @@ it — no display id needs to be guessed or typed.
 
 ## Agent-Facing Peer Control (ctl + MCP)
 
-Federation is not a dashboard-only surface. A stage-0 control surface exposes
-the delegation verbs to agents in three shapes with identical semantics:
+Federation is not a dashboard-only surface. An agent-facing control surface
+exposes the delegation verbs *and* direct computer use on peers in three
+shapes with identical semantics:
 
 - **MCP tools** on the daemon's `/mcp` surface — `list_peers`,
-  `peer_send_message`, `peer_delegate_task`.
+  `peer_send_message`, `peer_delegate_task`, plus the direct-CU trio
+  `peer_list_displays`, `peer_take_screenshot`, `peer_execute_cu_actions`.
 - **CLI** — the `intendant ctl peer` verb group (distinct from the top-level
   `intendant peer …` pairing commands below, which provision relationships
   rather than acting through them):
@@ -254,9 +256,14 @@ the delegation verbs to agents in three shapes with identical semantics:
   intendant ctl peer task <peer-id> "instructions" [--context JSON]
   ```
 
+  and, one level up, a global `--peer <id>` flag that points *any* ctl
+  subcommand at a federated peer's `/mcp` directly (see below).
+
 - **Native agent tool** — a `peer` tool with actions `list` | `message` |
-  `task`, so supervised and native agent sessions reach federation without
-  the dashboard.
+  `task` | `displays` | `screenshot` | `cu`, so supervised and native agent
+  sessions reach federation without the dashboard. Peer screenshots come
+  back as image attachments in the tool result — the agent literally sees
+  the peer's screen in its conversation.
 
 `list_peers` returns the same peer snapshot list as `GET /api/peers` — id,
 label, connection state, capabilities, and the folded per-peer `sessions`
@@ -269,21 +276,73 @@ executes on the peer's machine, by the peer's own agent, under the peer's own
 autonomy/approval policy. The caller gets a `task_id` to follow up on, not a
 supervised child process.
 
-All three are IAM-gated at call time (`mcp_tool_operation`), mirroring the
-classification of the HTTP routes they parallel: `list_peers` requires
-`peer.inspect` (same as `GET /api/peers`); `peer_send_message` and
-`peer_delegate_task` require `peer.use` (same as
-`POST /api/peers/{id}/message` and `…/task`). `peer.use` is the gate because
-acting through a peer delegates **this daemon's peer identity** — the caller
-acts with the daemon's peer credentials, and what is actually permitted is
-decided by the *receiving* peer's grants for this daemon, not by anything the
-caller holds locally (the same split the signaling relays above ride).
+All of these are IAM-gated at call time (`mcp_tool_operation`), mirroring the
+classification of the HTTP routes they parallel, under one rule: reading
+*local* federation state is inspection; causing traffic *on* a peer is use.
+`list_peers` requires `peer.inspect` (same as `GET /api/peers`); everything
+else — `peer_send_message`, `peer_delegate_task`, and the direct-CU trio —
+requires `peer.use` (same as `POST /api/peers/{id}/message` and `…/task`).
+`peer.use` is the gate because acting through a peer delegates **this
+daemon's peer identity** — the caller acts with the daemon's peer
+credentials, and what is actually permitted is decided by the *receiving*
+peer's grants for this daemon, not by anything the caller holds locally (the
+same split the signaling relays above ride).
 
-Stage 0 is deliberately the delegation surface only: no display or
-computer-use invocation on peers rides these tools. Cross-machine display
-viewing remains the browser WebRTC path below, and peer session activity
-already streams to the dashboard peers rail and the Station scene without any
-of this surface.
+### Direct computer use on peers — the `/mcp` side-channel
+
+The direct-CU operations (`peer_list_displays`, `peer_take_screenshot`,
+`peer_execute_cu_actions`; `peer` tool actions `displays`/`screenshot`/`cu`)
+do not ride the WebSocket transport at all. Each is one stateless JSON-RPC
+`tools/call` POST to the **peer's** `/mcp` endpoint (`peer/mcp_http.rs`),
+authenticated with the exact identity the federation transport uses: the
+registry retains the assembled `TransportCredentials` (bearer, parsed pin
+bytes, mTLS client identity) on the `PeerHandle` at spawn time, and the
+side-channel builds its pinned rustls client from them. The endpoint is the
+card's advertised streamable-HTTP MCP transport when present, else derived
+from the WS transport URL (`wss://host/ws` → `https://host/mcp` — same
+gateway, same origin). Requests carry the `x-intendant-peer` marker, so an
+unresolvable client cert is a hard 403, never an anonymous fallback.
+
+On the receiving side this is the ordinary peer-principal path: the peer's
+`/mcp` gate binds the client cert to the IAM profile the peer's owner granted
+this daemon, then classifies the inner tool per its own gate —
+`take_screenshot`/`list_displays` need **display view** (`read-only-display`
+or better), `execute_cu_actions` needs **display input** (`peer-operator` /
+`peer-root` only). A denial comes back as a structured `isError` tool result
+with the peer's diagnostic text, which every caller surface passes through
+verbatim.
+
+Screenshot and CU replies carry real MCP image content blocks; the native
+tool folds them into the conversation as image attachments
+(`add_tool_result_with_images`), and the MCP twins re-emit them as image
+blocks. This is why agent-driven CU on peers needs **no WebRTC**: capture is
+request/response. The browser WebRTC path below remains the human viewing
+surface (with the stage-1 display chips for discovery), and delegation
+(`task`) remains the preferred verb when the peer's own agent can do the
+work — reach for direct CU when this agent needs to see or drive the peer's
+screen itself.
+
+The same side-channel is reachable from the CLI with **no daemon in the
+loop**: `intendant ctl --peer <id> …` resolves the `[[peer]]` entry from
+`intendant.toml` (label case-insensitive, card_url host, exact card_url, or
+the suffix of an `intendant:<label>` peer id), derives the `/mcp` endpoint
+from the card_url origin, and builds the same pinned mTLS client — explicit
+`client_cert`/`client_key` first (the peer-boot pairing rule; half-set
+config errors out), else the installed access identity for TLS targets.
+Every existing ctl subcommand then drives the peer:
+
+```bash
+intendant ctl --peer dell display screenshot --output peer.png
+intendant ctl --peer dell cu actions --actions '[{"type":"click","x":100,"y":200}]'
+```
+
+`--peer` conflicts with `--url`, silently overrides the env URL/port, sends
+the configured `bearer_token` and the `x-intendant-peer` marker, and appends
+no `session_id`/`managed_context` — local session scoping is meaningless
+cross-daemon. Because this path reads key material from disk rather than
+acting as a session, it is not gated by the local daemon's IAM at all; the
+peer's profile for this daemon is the sole authority (exactly like the
+`intendant peer request/approve` pairing CLI).
 
 ## Transports
 
