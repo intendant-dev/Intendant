@@ -381,6 +381,7 @@ pub(crate) async fn run_headless_mode(
     // injections reach the agent loop in --no-presence mode too. When
     // presence is disabled, agent_state is a fresh empty snapshot (no
     // live updates), but context_injection is still wired through.
+    let mut headless_peer_registry: Option<peer::PeerRegistry> = None;
     let headless_shared_session: Option<web_gateway::SharedActiveSession> = if use_web {
         let (transcriber, transcriber_err) =
             startup::wiring::build_transcriber(&project.config.transcription);
@@ -420,6 +421,7 @@ pub(crate) async fn run_headless_mode(
             Some(session_log.clone()),
         )?;
         eprintln!("{}", gateway.log_line);
+        headless_peer_registry = Some(gateway.peer_registry.clone());
         Some(gateway.shared_session)
     } else {
         None
@@ -478,6 +480,7 @@ pub(crate) async fn run_headless_mode(
                     shared_claude_config: shared_claude_config.clone(),
                     frame_registry: frame_registry.clone(),
                     session_registry: Some(session_registry.clone()),
+                    peer_registry: headless_peer_registry.clone(),
                     web_port: web_port_for_agent,
                     flags_direct: flags.direct,
                     shared_session: headless_shared_session.clone(),
@@ -580,6 +583,7 @@ pub(crate) async fn run_headless_mode(
             frame_registry.clone(),
             context_injection.clone(),
             session_registry.clone(),
+            headless_peer_registry.clone(),
             agent_backend,
             shared_external_agent.clone(),
             shared_codex_config.clone(),
@@ -637,6 +641,7 @@ pub(crate) async fn run_headless_mode(
             approval_registry.clone(),
             context_injection.clone(),
             Some(session_registry.clone()),
+            headless_peer_registry.clone(),
             !use_web, // under the gateway, approvals surface in the dashboard
             UserAttachments::default(),
             NativeSessionConfig::direct(),
@@ -695,6 +700,7 @@ pub(crate) async fn run_headless_mode(
             shared_claude_config: shared_claude_config.clone(),
             frame_registry: frame_registry.clone(),
             session_registry: Some(session_registry.clone()),
+            peer_registry: headless_peer_registry.clone(),
             web_port: web_port_for_agent,
             flags_direct: flags.direct,
             shared_session: headless_shared_session.clone(),

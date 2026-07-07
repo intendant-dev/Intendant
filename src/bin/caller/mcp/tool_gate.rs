@@ -199,6 +199,14 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "claim_fission_canonical"
         | "fission_spawn"
         | "fission_control" => PeerOperation::SessionManage,
+        // Peer federation. Listing is peer-topology inspection; messaging
+        // and delegation act *through* a connected peer and are peer use —
+        // the same classification the `/api/peers` HTTP routes and the
+        // dashboard-control RPCs carry: using a peer delegates this
+        // daemon's peer identity, and the receiving peer authorizes the
+        // action against its own grants for this daemon.
+        "list_peers" => PeerOperation::PeerInspect,
+        "peer_send_message" | "peer_delegate_task" => PeerOperation::PeerUse,
         // Viewing displays, frames, and shared-view surfaces.
         "list_displays"
         | "take_screenshot"
@@ -408,6 +416,30 @@ pub(crate) fn append_manual_http_tool_definitions(
             ExecuteCuActionsParams
         ),
     );
+    push(
+        "list_peers",
+        manual_http_tool_definition!(
+            "list_peers",
+            "List federated peer daemons: id, label, connection state, advertised capabilities, and currently visible sessions.",
+            EmptyToolParams
+        ),
+    );
+    push(
+        "peer_send_message",
+        manual_http_tool_definition!(
+            "peer_send_message",
+            "Send a text message to a federated peer daemon's agent. Addresses the peer's current/default session unless 'session' targets one. The receiving peer authorizes against its own grants for this daemon.",
+            PeerSendMessageParams
+        ),
+    );
+    push(
+        "peer_delegate_task",
+        manual_http_tool_definition!(
+            "peer_delegate_task",
+            "Delegate a task to a federated peer daemon: the peer's own agent executes the natural-language instructions on its machine under its own autonomy and approval policy. Returns a task id; progress streams to the dashboard's peers rail.",
+            PeerDelegateTaskParams
+        ),
+    );
 }
 
 #[cfg(test)]
@@ -529,6 +561,17 @@ mod tests {
         assert_eq!(
             mcp_tool_operation("request_shared_view_input"),
             PeerOperation::DisplayInput
+        );
+        // Peer federation: listing inspects topology; message/task act
+        // through the peer and ride peer.use like their /api/peers twins.
+        assert_eq!(mcp_tool_operation("list_peers"), PeerOperation::PeerInspect);
+        assert_eq!(
+            mcp_tool_operation("peer_send_message"),
+            PeerOperation::PeerUse
+        );
+        assert_eq!(
+            mcp_tool_operation("peer_delegate_task"),
+            PeerOperation::PeerUse
         );
         assert_eq!(mcp_tool_operation("quit"), PeerOperation::RuntimeControl);
         assert_eq!(

@@ -625,6 +625,88 @@ pub(crate) async fn handle_wait_sub_agents_call(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Handle a native `peer` tool call: validate the action and its
+/// arguments, then route to the shared `crate::peer::ops`
+/// implementations (the same bodies behind the MCP peer tools and
+/// `intendant ctl peer`, so the surfaces cannot drift).
+pub(crate) async fn handle_peer_tool_call(
+    args: &serde_json::Value,
+    peer_registry: Option<&crate::peer::PeerRegistry>,
+) -> String {
+    fn required_str<'a>(
+        args: &'a serde_json::Value,
+        key: &str,
+        action: &str,
+    ) -> Result<&'a str, String> {
+        args.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("the {action} action requires a non-empty '{key}'"),
+                })
+                .to_string()
+            })
+    }
+
+    let action = args
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    match action {
+        "list" => crate::peer::ops::list_peers_json(peer_registry),
+        "message" => {
+            let peer_id = match required_str(args, "peer_id", "message") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let message = match required_str(args, "message", "message") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let session = args
+                .get("session")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            crate::peer::ops::send_message_json(
+                peer_registry,
+                peer_id,
+                message.to_string(),
+                session,
+            )
+            .await
+        }
+        "task" => {
+            let peer_id = match required_str(args, "peer_id", "task") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let instructions = match required_str(args, "instructions", "task") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let context = args
+                .get("context")
+                .filter(|value| !value.is_null())
+                .cloned();
+            crate::peer::ops::delegate_task_json(
+                peer_registry,
+                peer_id,
+                instructions.to_string(),
+                context,
+            )
+            .await
+        }
+        other => serde_json::json!({
+            "ok": false,
+            "error": format!("unknown peer action '{other}' (expected list, message, or task)"),
+        })
+        .to_string(),
+    }
+}
+
 pub(crate) async fn run_agent_loop(
     provider: &dyn provider::ChatProvider,
     conversation: &mut Conversation,
@@ -643,6 +725,10 @@ pub(crate) async fn run_agent_loop(
     context_injection: &event::ContextInjectionQueue,
     xvfb_guard: &mut Option<vision::XvfbGuard>,
     session_registry: Option<&display::SharedSessionRegistry>,
+    // Federated peer registry: backs the `peer` tool (list / message /
+    // task). None outside the web-gateway daemon shapes, where the tool
+    // answers with a clear federation-inactive note.
+    peer_registry: Option<&crate::peer::PeerRegistry>,
     // When true, askHuman is unavailable and approvals without a json_approval
     // slot are auto-denied (headless non-JSON mode).
     headless: bool,
@@ -1269,6 +1355,15 @@ pub(crate) async fn run_agent_loop(
                         );
                     }
                 }
+            }
+
+            // Peer-federation tool calls (list / message / task), routed
+            // through the shared `crate::peer::ops` bodies — the same
+            // implementations behind the MCP tools and `intendant ctl peer`.
+            for (call_id, args) in &batch.peer_calls {
+                handled_call_ids.insert(call_id.clone());
+                let response = handle_peer_tool_call(args, peer_registry).await;
+                conversation.add_tool_result(call_id, "peer", &response);
             }
 
             // Spawn supervised sub-agent sessions (spawn_sub_agent).
@@ -2229,6 +2324,7 @@ pub(crate) async fn run_round_loop(
     approval_registry: &event::ApprovalRegistry,
     context_injection: &event::ContextInjectionQueue,
     session_registry: Option<&display::SharedSessionRegistry>,
+    peer_registry: Option<&crate::peer::PeerRegistry>,
     headless: bool,
     orchestration: Option<&session_supervisor::SessionOrchestration>,
 ) -> Result<LoopStats, CallerError> {
@@ -2255,6 +2351,7 @@ pub(crate) async fn run_round_loop(
             context_injection,
             &mut xvfb_guard,
             session_registry,
+            peer_registry,
             headless,
             orchestration,
         )

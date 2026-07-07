@@ -24,6 +24,7 @@ Useful groups:
   CDP workspaces prefer managed Chromium/Chrome-for-Testing; run `"${INTENDANT:-intendant}" setup browsers` to install/repair the managed browser cache, and use `--provider system_cdp` or `INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER=1` to opt into system Chrome/Chromium on macOS.
 - `"${INTENDANT:-intendant}" ctl cu --help` for computer-use actions; `ctl cu actions --help` prints the per-action JSON shapes with an example. `ctl cu elements` reads the frontmost app's UI element tree (cheap textual grounding — click the center of a reported frame; user-session only via macOS AX, Linux AT-SPI, or Windows UIA).
 - `"${INTENDANT:-intendant}" ctl shared --help` for shared display collaboration.
+- `"${INTENDANT:-intendant}" ctl peer --help` for federated peers — list peers, message a peer's agent, delegate tasks (`ctl peer list|message|task`; the peer executes under its own autonomy/IAM).
 - `"${INTENDANT:-intendant}" ctl approval --help` and `"${INTENDANT:-intendant}" ctl input --help` for pending approval/input flows.
 - `"${INTENDANT:-intendant}" ctl context --help` for managed-context rewind/backout.
 - `"${INTENDANT:-intendant}" ctl controller --help` for controller-loop and restart controls.

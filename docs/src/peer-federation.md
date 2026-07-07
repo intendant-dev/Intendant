@@ -8,8 +8,9 @@ displays across machines.
 
 This chapter covers what federation is and how it differs from external agents,
 the Agent Card and discovery model, the peer actor/registry/coordinator layer,
-the transport stack (native WebSocket, multi-URL probing, cert pinning), the
-cross-machine display path, and dashboard TLS/mTLS setup. For the local display pipeline
+the agent-facing control surface (`ctl peer` + MCP tools), the transport stack
+(native WebSocket, multi-URL probing, cert pinning), the cross-machine display
+path, and dashboard TLS/mTLS setup. For the local display pipeline
 those federated displays plug into, see [Display Pipeline](./display-pipeline.md).
 
 Peer federation is **not** the same security domain as a browser dashboard login.
@@ -210,6 +211,54 @@ exhaustive list). Action pills stay off peer session nodes in v1: the
 session-action handlers assume local session ids. None of this changes what a
 peer exposes — the sessions rail is derived entirely from the event stream the
 peer already sends under its access profile.
+
+## Agent-Facing Peer Control (ctl + MCP)
+
+Federation is not a dashboard-only surface. A stage-0 control surface exposes
+the delegation verbs to agents in three shapes with identical semantics:
+
+- **MCP tools** on the daemon's `/mcp` surface — `list_peers`,
+  `peer_send_message`, `peer_delegate_task`.
+- **CLI** — the `intendant ctl peer` verb group (distinct from the top-level
+  `intendant peer …` pairing commands below, which provision relationships
+  rather than acting through them):
+
+  ```bash
+  intendant ctl peer list
+  intendant ctl peer message <peer-id> "text" [--session ID]
+  intendant ctl peer task <peer-id> "instructions" [--context JSON]
+  ```
+
+- **Native agent tool** — a `peer` tool with actions `list` | `message` |
+  `task`, so supervised and native agent sessions reach federation without
+  the dashboard.
+
+`list_peers` returns the same peer snapshot list as `GET /api/peers` — id,
+label, connection state, capabilities, and the folded per-peer `sessions`
+rail above. `peer_send_message` (`peer_id`, `message`, optional `session`)
+sends a message to the peer's agent. `peer_delegate_task` (`peer_id`,
+`instructions`, optional `context`) delegates a task and returns a `task_id`.
+
+Delegation keeps the sibling-not-subordinate contract: a delegated task
+executes on the peer's machine, by the peer's own agent, under the peer's own
+autonomy/approval policy. The caller gets a `task_id` to follow up on, not a
+supervised child process.
+
+All three are IAM-gated at call time (`mcp_tool_operation`), mirroring the
+classification of the HTTP routes they parallel: `list_peers` requires
+`peer.inspect` (same as `GET /api/peers`); `peer_send_message` and
+`peer_delegate_task` require `peer.use` (same as
+`POST /api/peers/{id}/message` and `…/task`). `peer.use` is the gate because
+acting through a peer delegates **this daemon's peer identity** — the caller
+acts with the daemon's peer credentials, and what is actually permitted is
+decided by the *receiving* peer's grants for this daemon, not by anything the
+caller holds locally (the same split the signaling relays above ride).
+
+Stage 0 is deliberately the delegation surface only: no display or
+computer-use invocation on peers rides these tools. Cross-machine display
+viewing remains the browser WebRTC path below, and peer session activity
+already streams to the dashboard peers rail and the Station scene without any
+of this surface.
 
 ## Transports
 
