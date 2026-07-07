@@ -1009,7 +1009,8 @@ mod tests {
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
-            let server = IntendantServer::new(test_state(), bus.clone());
+            let state = test_state();
+            let server = IntendantServer::new(state.clone(), bus.clone());
 
             let result = server
                 .call_tool_by_name_for_session(
@@ -1046,10 +1047,12 @@ mod tests {
                 }
                 other => panic!("expected SharedView event, got {other:?}"),
             }
-            assert_eq!(
-                std::env::var("INTENDANT_USER_DISPLAY_GRANTED").as_deref(),
-                Ok("1")
-            );
+            // Assert the per-test source of truth, not the process-global
+            // env mirror: any unlocked env toucher anywhere in the binary
+            // can race a mirror read (fleet flake 2026-07-06). The mirror
+            // itself is covered by user_display_env_mirror_tracks_grant_and_revoke.
+            let autonomy = { state.read().await.autonomy.clone() };
+            assert!(autonomy.read().await.user_display_granted);
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         });
     }
@@ -1145,10 +1148,10 @@ mod tests {
                 }
                 other => panic!("expected UserDisplayGranted event, got {other:?}"),
             }
-            assert_eq!(
-                std::env::var("INTENDANT_USER_DISPLAY_GRANTED").as_deref(),
-                Ok("1")
-            );
+            // Source-of-truth assert (see the mirror-race note in the
+            // shared_view test above).
+            let autonomy = { state.read().await.autonomy.clone() };
+            assert!(autonomy.read().await.user_display_granted);
             assert!(
                 !state
                     .read()
@@ -1178,8 +1181,57 @@ mod tests {
                 }
                 other => panic!("expected UserDisplayRevoked event, got {other:?}"),
             }
-            assert!(std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err());
             assert!(!autonomy.read().await.user_display_granted);
+        });
+    }
+
+    /// The ONLY test asserting the process-env mirror of
+    /// `user_display_granted` — everything else asserts the autonomy guard
+    /// (per-test state, race-free). One serialized reader keeps mirror
+    /// coverage without exposing every flow test to cross-test env races.
+    #[test]
+    fn user_display_env_mirror_tracks_grant_and_revoke() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+            let state = test_state();
+            {
+                let mut state_guard = state.write().await;
+                state_guard
+                    .user_display_activation_pending
+                    .insert(3, std::time::Instant::now());
+            }
+            let bus = EventBus::new();
+            let server = IntendantServer::new(state.clone(), bus);
+
+            server
+                .call_tool_by_name_for_session(
+                    "grant_user_display",
+                    serde_json::json!({ "display_id": 3 }),
+                    Some("managed-session"),
+                    Some(true),
+                )
+                .await
+                .expect("grant_user_display should route");
+            assert_eq!(
+                std::env::var("INTENDANT_USER_DISPLAY_GRANTED").as_deref(),
+                Ok("1")
+            );
+
+            server
+                .call_tool_by_name_for_session(
+                    "revoke_user_display",
+                    serde_json::json!({ "display_id": 3, "note": "done" }),
+                    Some("managed-session"),
+                    Some(true),
+                )
+                .await
+                .expect("revoke_user_display should route");
+            assert!(std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err());
         });
     }
 
