@@ -6,7 +6,9 @@ use wasm_bindgen::JsValue;
 #[cfg(target_arch = "wasm32")]
 use web_sys::HtmlCanvasElement;
 
+use crate::panes::PaneTarget;
 use crate::scene::{rotate_x, rotate_y, Plane, ProjectedNode, Vec2, Vec3};
+use crate::text_atlas::TextAtlas;
 use crate::util::Color;
 
 #[cfg(target_arch = "wasm32")]
@@ -21,15 +23,25 @@ pub(crate) struct GpuState {
     /// real depth compare — the wireframe's written depth occludes panes
     /// and panes occlude it.
     pub(crate) pane_pipeline: wgpu::RenderPipeline,
+    /// Glyph-atlas text on those panes (slice 3): textured quads sampled
+    /// from the atlas, depth-tested but never depth-written.
+    pub(crate) text_pipeline: wgpu::RenderPipeline,
     /// Persistent vertex buffers, uploaded via `Queue::write_buffer` and
     /// grown geometrically on demand; never recreated per frame.
     pub(crate) line_buffer: GpuVertexBuffer,
     pub(crate) tri_buffer: GpuVertexBuffer,
     pub(crate) pane_buffer: GpuVertexBuffer,
+    pub(crate) text_buffer: GpuVertexBuffer,
     /// Depth attachment, always sized to `config`. Must be recreated
     /// wherever the surface is resized or every later frame renders
     /// against a stale-sized attachment.
     pub(crate) depth_view: wgpu::TextureView,
+    /// Glyph-atlas binding — the crate's only bind group. The layout and
+    /// sampler exist from init; the texture + bind group are built by
+    /// `ensure_atlas` on the first frame that carries text.
+    pub(crate) atlas_layout: wgpu::BindGroupLayout,
+    pub(crate) atlas_sampler: wgpu::Sampler,
+    pub(crate) atlas_bind: Option<wgpu::BindGroup>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -66,11 +78,11 @@ impl GpuVertexBuffer {
     }
 
     /// Upload this frame's vertices, growing the buffer if needed.
-    pub(crate) fn upload(
+    pub(crate) fn upload<V: Pod>(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        vertices: &[GpuVertex],
+        vertices: &[V],
     ) {
         if vertices.is_empty() {
             return;
@@ -210,6 +222,90 @@ impl GpuState {
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::CompareFunction::LessEqual,
         );
+
+        // The text pipeline is the one consumer of a bind group: the glyph
+        // atlas texture + sampler. It tests against the depth the panes and
+        // wireframe wrote but never writes its own — glyph quads are mostly
+        // transparent, and writing would occlude by invisible bounding
+        // boxes.
+        let atlas_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Station Atlas Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let text_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Station Text Pipeline Layout"),
+                bind_group_layouts: &[Some(&atlas_layout)],
+                immediate_size: 0,
+            });
+        let text_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Station Text Pipeline"),
+            layout: Some(&text_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_text"),
+                buffers: &[TextVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_text"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Station Atlas Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            // Trilinear across the CPU-baked mip chain: pane text draws
+            // well below the baked glyph size, where bilinear-only
+            // sampling visibly drops thin strokes.
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
         if let Some(error) = error_scope.pop().await {
             return Err(JsValue::from_str(&format!(
                 "WebGPU pipeline validation failed: {error}"
@@ -218,6 +314,7 @@ impl GpuState {
         let line_buffer = GpuVertexBuffer::new(&device, "Station Lines");
         let tri_buffer = GpuVertexBuffer::new(&device, "Station Triangles");
         let pane_buffer = GpuVertexBuffer::new(&device, "Station Panes");
+        let text_buffer = GpuVertexBuffer::new(&device, "Station Text");
         let depth_view = Self::create_depth_view(&device, width, height);
 
         Ok(Self {
@@ -228,11 +325,76 @@ impl GpuState {
             line_pipeline,
             tri_pipeline,
             pane_pipeline,
+            text_pipeline,
             line_buffer,
             tri_buffer,
             pane_buffer,
+            text_buffer,
             depth_view,
+            atlas_layout,
+            atlas_sampler,
+            atlas_bind: None,
         })
+    }
+
+    /// Create the glyph-atlas texture + bind group from the CPU-side bake,
+    /// uploading the full mip chain. Idempotent per GpuState — a rebuilt
+    /// GpuState (context loss) simply re-uploads on its next text frame.
+    pub(crate) fn ensure_atlas(&mut self, atlas: &TextAtlas) {
+        if self.atlas_bind.is_some() {
+            return;
+        }
+        let mips = atlas.mip_chain();
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Station Glyph Atlas"),
+            size: wgpu::Extent3d {
+                width: atlas.width,
+                height: atlas.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mips.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (level, (width, height, pixels)) in mips.iter().enumerate() {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(*width),
+                    rows_per_image: Some(*height),
+                },
+                wgpu::Extent3d {
+                    width: *width,
+                    height: *height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.atlas_bind = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Station Glyph Atlas Bind"),
+            layout: &self.atlas_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                },
+            ],
+        }));
     }
 
     fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
@@ -263,7 +425,11 @@ impl GpuState {
         self.depth_view = Self::create_depth_view(&self.device, self.config.width, self.config.height);
     }
 
-    pub(crate) fn render(&mut self, frame: &GpuFrame) -> Result<(), JsValue> {
+    pub(crate) fn render(
+        &mut self,
+        frame: &GpuFrame,
+        atlas: Option<&TextAtlas>,
+    ) -> Result<(), JsValue> {
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
             | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
@@ -300,6 +466,11 @@ impl GpuState {
             .upload(&self.device, &self.queue, &frame.tri_vertices);
         self.pane_buffer
             .upload(&self.device, &self.queue, &frame.pane_vertices);
+        self.text_buffer
+            .upload(&self.device, &self.queue, &frame.text_vertices);
+        if let Some(atlas) = atlas.filter(|_| !frame.text_vertices.is_empty()) {
+            self.ensure_atlas(atlas);
+        }
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -345,7 +516,7 @@ impl GpuState {
                 pass.set_vertex_buffer(0, self.tri_buffer.buffer.slice(..bytes));
                 pass.draw(0..frame.tri_vertices.len() as u32, 0..1);
             }
-            // Panes draw last: the wireframe has written its depth by
+            // Panes draw after the wireframe: it has written its depth by
             // now, so the pane pipeline's LessEqual compare sorts panes
             // against the whole scene per-pixel.
             if !frame.pane_vertices.is_empty() {
@@ -353,6 +524,18 @@ impl GpuState {
                 pass.set_pipeline(&self.pane_pipeline);
                 pass.set_vertex_buffer(0, self.pane_buffer.buffer.slice(..bytes));
                 pass.draw(0..frame.pane_vertices.len() as u32, 0..1);
+            }
+            // Text draws last, over its pane, against everything's depth.
+            // Skipped until the atlas bind exists (first text frame builds
+            // it just above, so in practice this never lags a frame).
+            if !frame.text_vertices.is_empty() {
+                if let Some(bind) = self.atlas_bind.as_ref() {
+                    let bytes = std::mem::size_of_val(frame.text_vertices.as_slice()) as u64;
+                    pass.set_pipeline(&self.text_pipeline);
+                    pass.set_bind_group(0, bind, &[]);
+                    pass.set_vertex_buffer(0, self.text_buffer.buffer.slice(..bytes));
+                    pass.draw(0..frame.text_vertices.len() as u32, 0..1);
+                }
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -368,7 +551,11 @@ pub(crate) struct GpuState;
 impl GpuState {
     pub(crate) fn resize(&mut self, _width: u32, _height: u32) {}
 
-    pub(crate) fn render(&mut self, _frame: &GpuFrame) -> Result<(), JsValue> {
+    pub(crate) fn render(
+        &mut self,
+        _frame: &GpuFrame,
+        _atlas: Option<&TextAtlas>,
+    ) -> Result<(), JsValue> {
         Ok(())
     }
 }
@@ -400,6 +587,38 @@ fn vs_main(
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   return in.color;
 }
+
+// Glyph-atlas text (Phase C slice 3): the atlas is an R8 coverage mask
+// (white text baked on transparent), so the sample's red channel scales
+// the vertex color's alpha and the tint stays fully vertex-driven.
+@group(0) @binding(0) var atlas_tex: texture_2d<f32>;
+@group(0) @binding(1) var atlas_smp: sampler;
+
+struct TextOut {
+  @builtin(position) position: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+  @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_text(
+  @location(0) position: vec2<f32>,
+  @location(1) depth: f32,
+  @location(2) uv: vec2<f32>,
+  @location(3) color: vec4<f32>,
+) -> TextOut {
+  var out: TextOut;
+  out.position = vec4<f32>(position, depth, 1.0);
+  out.uv = uv;
+  out.color = color;
+  return out;
+}
+
+@fragment
+fn fs_text(in: TextOut) -> @location(0) vec4<f32> {
+  let coverage = textureSample(atlas_tex, atlas_smp, in.uv).r;
+  return vec4<f32>(in.color.rgb, in.color.a * coverage);
+}
 "#;
 
 #[repr(C)]
@@ -429,6 +648,32 @@ impl GpuVertex {
     }
 }
 
+/// Vertex for the textured text pipeline: `GpuVertex`'s NDC-plus-clip-depth
+/// scheme with an atlas UV. Producers stay inside `text_atlas`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct TextVertex {
+    pub(crate) pos: [f32; 2],
+    pub(crate) depth: f32,
+    pub(crate) uv: [f32; 2],
+    pub(crate) color: [f32; 4],
+}
+
+impl TextVertex {
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) const ATTRS: [wgpu::VertexAttribute; 4] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32x2, 3 => Float32x4];
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<TextVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRS,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct GpuFrame {
     pub(crate) line_vertices: Vec<GpuVertex>,
@@ -436,7 +681,14 @@ pub(crate) struct GpuFrame {
     /// World-space pane geometry (panes.rs) — drawn through the
     /// depth-tested pane pipeline, after the wireframe.
     pub(crate) pane_vertices: Vec<GpuVertex>,
+    /// Glyph quads on those panes (text_atlas.rs) — drawn last through
+    /// the textured text pipeline.
+    pub(crate) text_vertices: Vec<TextVertex>,
     pub(crate) projected_nodes: Vec<ProjectedNode>,
+    /// World-space pick targets for the panes — the raycast counterpart
+    /// of `projected_nodes` (`input::pick_pane` intersects pointer rays
+    /// with these).
+    pub(crate) pane_targets: Vec<PaneTarget>,
 }
 
 impl GpuFrame {
@@ -445,7 +697,9 @@ impl GpuFrame {
         self.line_vertices.clear();
         self.tri_vertices.clear();
         self.pane_vertices.clear();
+        self.text_vertices.clear();
         self.projected_nodes.clear();
+        self.pane_targets.clear();
     }
 
     pub(crate) fn add_line_ndc(&mut self, a: Vec2, za: f32, b: Vec2, zb: f32, color: Color) {
@@ -853,11 +1107,27 @@ mod tests {
     fn clear_empties_but_keeps_capacity() {
         let mut frame = GpuFrame::default();
         frame.add_quad_ndc(0.0, 0.0, 0.1, [1.0; 4], 0.0);
+        frame.text_vertices.push(TextVertex {
+            pos: [0.0, 0.0],
+            depth: 0.5,
+            uv: [0.0, 0.0],
+            color: [1.0; 4],
+        });
+        frame.pane_targets.push(crate::panes::PaneTarget {
+            id: "op".into(),
+            anchor: Vec3::ZERO,
+            right: Vec3::new(1.0, 0.0, 0.0),
+            up: Vec3::Y,
+            half_w: 1.0,
+            half_h: 1.0,
+        });
         let cap = frame.tri_vertices.capacity();
         frame.clear();
         assert!(frame.tri_vertices.is_empty());
         assert!(frame.line_vertices.is_empty());
+        assert!(frame.text_vertices.is_empty());
         assert!(frame.projected_nodes.is_empty());
+        assert!(frame.pane_targets.is_empty());
         assert_eq!(frame.tri_vertices.capacity(), cap);
     }
 }

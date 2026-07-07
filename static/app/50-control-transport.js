@@ -12,6 +12,7 @@ class DashboardControlTransport {
     this.localOfferSdp = '';
     this.lastStatus = null;
     this.lastError = '';
+    this.lastErrorKind = '';
     this.iceRoute = '';
     this.iceCandidatePair = '';
     this.pendingIce = [];
@@ -29,6 +30,7 @@ class DashboardControlTransport {
 
   async connect() {
     this.lastError = '';
+    this.lastErrorKind = '';
     dashboardSetControlLastError('');
     dashboardUpdateTransportStatus();
     const iceServers = buildIceServersFromGatewayConfig(gatewayConfig);
@@ -43,7 +45,8 @@ class DashboardControlTransport {
     };
     this.channel.onerror = () => {
       this.lastError = 'DataChannel error';
-      dashboardSetControlLastError(this.lastError);
+      this.lastErrorKind = 'transport';
+      dashboardSetControlLastError(this.lastError, this.lastErrorKind);
       dashboardUpdateTransportStatus();
       this.scheduleReconnect(this.lastError, { delayMs: 1000 });
     };
@@ -59,6 +62,11 @@ class DashboardControlTransport {
     this.pc.onconnectionstatechange = () => {
       const state = this.pc?.connectionState || 'closed';
       console.info('[dashboard-control] pc state', state);
+      // A peer connection that reaches `failed` did get signaling through
+      // (there was something to fail); the loss is ICE/DTLS-level. Record
+      // that durably on this transport so status renders long after the
+      // event still classify the failure honestly.
+      if (state === 'failed' && !this.lastErrorKind) this.lastErrorKind = 'transport';
       this.refreshIceRoute().catch(err => console.debug('[dashboard-control] route stats failed', err));
       dashboardUpdateTransportStatus();
       if (state === 'failed' || state === 'closed') {
@@ -145,7 +153,8 @@ class DashboardControlTransport {
   handleError(error) {
     console.warn('[dashboard-control] signaling error', error);
     this.lastError = String(error || 'signaling error');
-    dashboardSetControlLastError(this.lastError);
+    this.lastErrorKind = 'signaling';
+    dashboardSetControlLastError(this.lastError, this.lastErrorKind);
     dashboardUpdateTransportStatus();
     this.close();
     this.scheduleReconnect(this.lastError, { delayMs: 1000 });
@@ -158,6 +167,7 @@ class DashboardControlTransport {
 
   handleOpen() {
     this.lastError = '';
+    this.lastErrorKind = '';
     dashboardSetControlLastError('');
     this.refreshIceRoute().catch(() => {});
     dashboardUpdateTransportStatus();
@@ -873,7 +883,11 @@ class DashboardControlTransport {
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok || body.ok === false) {
-      throw new Error(body.error || `${path} returned ${resp.status}`);
+      const err = new Error(body.error || `${path} returned ${resp.status}`);
+      // The rendezvous encodes who failed in the status: callers use it to
+      // tell a daemon-authored refusal from "no answer ever came back".
+      err.connectHttpStatus = resp.status;
+      throw err;
     }
     return body;
   }
@@ -928,13 +942,26 @@ class DashboardControlTransport {
       // materializes it before resolving this very offer (one-round-trip
       // first contact). The daemon re-verifies everything.
       const orgGrant = await orgGrantForOffer(DASHBOARD_CONNECT_DAEMON_ID);
-      const answer = await this.postConnectSignal('/api/browser/offer', {
-        daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
-        sdp,
-        client_nonce: this.clientNonce,
-        ...identity,
-        ...(orgGrant ? { org_grant: orgGrant } : {}),
-      });
+      let answer;
+      try {
+        answer = await this.postConnectSignal('/api/browser/offer', {
+          daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
+          sdp,
+          client_nonce: this.clientNonce,
+          ...identity,
+          ...(orgGrant ? { org_grant: orgGrant } : {}),
+        });
+      } catch (err) {
+        // 502 relays the daemon's own words: it received the offer and
+        // posted an explicit refusal back through the rendezvous (the one
+        // exception is the service-internal "daemon answer channel
+        // closed"). Everything else — 504 offer timeout, 404 unknown
+        // daemon, a fetch failure — means no answer ever arrived.
+        const daemonSpoke = err?.connectHttpStatus === 502 &&
+          !/daemon answer channel closed/i.test(String(err?.message || ''));
+        err.controlErrorKind = daemonSpoke ? 'refused' : 'signaling';
+        throw err;
+      }
       this.signalingMode = 'connect-rendezvous';
       dashboardUpdateTransportStatus();
       return answer;
@@ -1086,6 +1113,7 @@ class DashboardControlTransport {
       iceRoute: this.iceRoute,
       iceCandidatePair: this.iceCandidatePair,
       lastError: this.lastError,
+      lastErrorKind: this.lastErrorKind,
       eventsActive: dashboardControlEventsActive,
       grantKind: this.lastStatus?.grant_kind ?? null,
       grantLabel: this.lastStatus?.grant_label ?? null,

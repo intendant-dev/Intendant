@@ -186,6 +186,29 @@
   color: var(--overlay0);
   font-size: 12px;
 }
+/* Inline filter box atop the (capped) project menus. */
+.sessions-multi-filter-search {
+  position: sticky;
+  top: 0;
+  padding: 2px 2px 6px;
+  background: var(--mantle);
+}
+.sessions-multi-filter-search.hidden { display: none; }
+.sessions-multi-filter-search input {
+  width: 100%;
+  padding: 5px 7px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--base);
+  color: var(--text);
+  font-size: 12px;
+}
+.sessions-multi-filter-more {
+  padding: 6px 7px;
+  color: var(--overlay0);
+  font-size: 11px;
+  font-style: italic;
+}
 .sessions-toggle {
   display: flex;
   align-items: center;
@@ -835,6 +858,12 @@
   display: flex;
   justify-content: center;
   padding: 10px 0 4px;
+}
+/* Invisible IntersectionObserver target that auto-grows the sessions
+   render window as the user scrolls toward the bottom of the list. */
+.sessions-scroll-sentinel {
+  height: 1px;
+  pointer-events: none;
 }
 /* Long-tail stats inside the session-detail overlay. */
 .sd-meta-strip {
@@ -1522,6 +1551,33 @@
   letter-spacing: 0.04em;
 }
 .session-card .sc-search-hit-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Quick-search match inside the row's conversation preview. */
+.session-card .sc-preview-hit {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin: 3px 0 5px;
+  padding: 4px 7px;
+  border-left: 2px solid var(--mauve);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--mauve) 8%, transparent);
+  font-size: 12px;
+  color: var(--subtext0);
+}
+.session-card .sc-preview-hit-role {
+  flex: 0 0 auto;
+  color: var(--mauve);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.session-card .sc-preview-hit-text {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;

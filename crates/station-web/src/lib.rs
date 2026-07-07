@@ -9,6 +9,7 @@ mod input;
 mod model;
 mod panes;
 mod scene;
+mod text_atlas;
 mod util;
 
 use std::cell::RefCell;
@@ -26,7 +27,7 @@ use gpu::{GpuFrame, GpuState};
 use hud::{Hud, SystemTarget};
 use input::{HitZone, PinchZoom, PointerDrag, ScrollZone};
 use model::{StationEvent, StationSnapshot, StationTranscript};
-use scene::{layout_positions, LayoutName, Mood, Particle, Vec2, Vec3};
+use scene::{layout_positions, ndc_to_screen, LayoutName, Mood, Particle, Vec2, Vec3};
 use util::{lcg, level_color, now_ms, station_enable_webgpu, unit};
 
 #[wasm_bindgen]
@@ -232,6 +233,40 @@ impl StationWeb {
                 }))
             })
             .collect();
+        // Slice 4: projected screen rects (CSS px) for the pane pick
+        // targets — deterministic click coordinates for the rig today,
+        // the a11y hotspot feed when real panels move in-scene. A pane
+        // with any corner culled reports no rect (matching the draw).
+        let camera = inner.camera();
+        let aspect = inner.width as f32 / inner.height.max(1) as f32;
+        let pane_rects: Vec<serde_json::Value> = inner
+            .frame
+            .pane_targets
+            .iter()
+            .filter_map(|target| {
+                let mut min = (f32::MAX, f32::MAX);
+                let mut max = (f32::MIN, f32::MIN);
+                for corner in [
+                    target.anchor - target.right * target.half_w - target.up * target.half_h,
+                    target.anchor + target.right * target.half_w - target.up * target.half_h,
+                    target.anchor + target.right * target.half_w + target.up * target.half_h,
+                    target.anchor - target.right * target.half_w + target.up * target.half_h,
+                ] {
+                    let (ndc, _z) = camera.project_depth(corner, aspect, inner.fov_deg)?;
+                    let p = ndc_to_screen([ndc.x, ndc.y], inner.width, inner.height);
+                    min = (min.0.min(p.x), min.1.min(p.y));
+                    max = (max.0.max(p.x), max.1.max(p.y));
+                }
+                let dpr = inner.dpr as f32;
+                Some(serde_json::json!({
+                    "id": target.id,
+                    "x": min.0 / dpr,
+                    "y": min.1 / dpr,
+                    "w": (max.0 - min.0) / dpr,
+                    "h": (max.1 - min.1) / dpr,
+                }))
+            })
+            .collect();
         serde_json::json!({
             "fps": inner.present_fps(),
             "renderer": if inner.gpu.is_some() { "WebGPU" } else { "Canvas" },
@@ -247,6 +282,19 @@ impl StationWeb {
             // ?station_panes=on + a selected node.
             "panes": inner.frame.pane_vertices.len() / 6,
             "panesEnabled": inner.panes_enabled,
+            // Slice 3: glyph quads on those panes (6 vertices each), and
+            // the baked atlas's dimensions/footprint (null until a bake
+            // succeeded — the bake is flag-gated like the panes).
+            "textQuads": inner.frame.text_vertices.len() / 6,
+            "textAtlas": inner.text_atlas.as_ref().map(|atlas| serde_json::json!({
+                "width": atlas.width,
+                "height": atlas.height,
+                "bytes": atlas.pixels.len(),
+            })),
+            // Slice 4: raycast pick targets registered by the last built
+            // frame, with their projected screen rects (CSS px).
+            "paneTargets": inner.frame.pane_targets.len(),
+            "paneRects": pane_rects,
             "mood": inner.mood.label(),
             "motion": inner.motion,
             "composer": {
@@ -420,6 +468,11 @@ struct StationInner {
     /// World-space panes (Phase C), opt-in via `?station_panes=on` while
     /// the program is in flight. Read once at construction.
     panes_enabled: bool,
+    /// Glyph atlas for pane text, baked once at construction when panes
+    /// are enabled (None otherwise, or if the bake failed — panes then
+    /// draw without text). CPU-side; the GPU texture is uploaded lazily
+    /// by `GpuState::ensure_atlas`.
+    text_atlas: Option<text_atlas::TextAtlas>,
     pointer_down: Option<PointerDrag>,
     active_pointers: HashMap<i32, Vec2>,
     pinch_zoom: Option<PinchZoom>,
@@ -513,6 +566,23 @@ impl StationInner {
             ));
         }
 
+        let panes_enabled = util::station_enable_panes();
+        // The atlas only serves world-space pane text; skip the bake (a
+        // one-time canvas rasterization + readback) while the flag is off.
+        let text_atlas = if panes_enabled {
+            match text_atlas::TextAtlas::bake() {
+                Ok(atlas) => Some(atlas),
+                Err(err) => {
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "Station glyph atlas bake failed; pane text disabled: {err:?}"
+                    )));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut inner = Self {
             scene_canvas,
             hud_canvas,
@@ -540,7 +610,8 @@ impl StationInner {
             last_input_ms: now_ms(),
             selected_id: None,
             focus_id: None,
-            panes_enabled: util::station_enable_panes(),
+            panes_enabled,
+            text_atlas,
             pointer_down: None,
             active_pointers: HashMap::new(),
             pinch_zoom: None,
@@ -913,7 +984,7 @@ impl StationInner {
             // stale size makes every frame's swapchain texture invalid. The
             // attribute reads are layout-free, so guard each frame.
             gpu.resize(self.scene_canvas.width(), self.scene_canvas.height());
-            if let Err(err) = gpu.render(&self.frame) {
+            if let Err(err) = gpu.render(&self.frame, self.text_atlas.as_ref()) {
                 web_sys::console::warn_1(&JsValue::from_str(&format!(
                     "Station GPU render failed: {err:?}"
                 )));

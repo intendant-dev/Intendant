@@ -4184,61 +4184,65 @@ async fn drain_outputs<I: rtc::interceptor::Interceptor>(
             }
             continue;
         }
-        // Routability filtering only applies to UDP: for UDP we need the
-        // kernel's `sendto` to succeed from our bound socket, and a
-        // loopback-source-to-routable-destination pair would be rejected with
-        // EINVAL. For TCP the connection is already established and we own the
-        // stream directly.
-        if t.transport.transport_protocol == TransportProtocol::UDP {
-            if t.transport.local_addr.is_ipv4() != t.transport.peer_addr.is_ipv4() {
-                continue;
+        // Route by connection before trusting the engine's protocol stamp:
+        // rtc 0.9 marks DTLS and SCTP transmits `TransportProtocol::UDP`
+        // even when the selected pair is TCP ("TransportProtocol doesn't
+        // matter" — rtc/src/peer_connection/transport/dtls/mod.rs), so a
+        // peer that reached us over ICE-TCP must be matched by its tuple,
+        // not by the stamp, or every post-ICE packet misses the stream and
+        // DTLS times out. (The relay check above stays first: relay
+        // transmits key on our relayed *local* address, which is never a
+        // TCP peer tuple.)
+        if let Some(sender) = tcp_senders.get(&t.transport.peer_addr) {
+            let contents: Vec<u8> = t.message.to_vec();
+            // Enqueue onto the connection's ordered writer channel.
+            // `try_send` (never `send().await`) keeps the rtc poll loop
+            // non-blocking: a full queue means the writer task can't
+            // keep up with the encoder, so we drop *this* frame as
+            // backpressure rather than stalling the driver or
+            // overflowing the kernel send buffer. The writer task,
+            // not the scheduler, controls wire order.
+            match sender.try_send(contents) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Slow/saturated TCP path — drop and let RTP
+                    // recovery (PLI/FIR + keyframes) catch the peer up.
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Writer task exited (connection torn down). Forget
+                    // the dead sender so we stop trying to route to it.
+                    tcp_senders.remove(&t.transport.peer_addr);
+                }
             }
-            if t.transport.local_addr.ip().is_loopback() != t.transport.peer_addr.ip().is_loopback()
-            {
-                continue;
-            }
+            continue;
         }
-        match t.transport.transport_protocol {
-            TransportProtocol::UDP => {
-                let Some(sock) = sockets_by_addr.get(&t.transport.local_addr) else {
-                    eprintln!(
-                        "[display/webrtc] UDP transmit from unknown source {}, dropping",
-                        t.transport.local_addr
-                    );
-                    continue;
-                };
-                if let Err(e) = sock.send_to(&t.message, t.transport.peer_addr).await {
-                    eprintln!(
-                        "[display/webrtc] udp send {} -> {} failed: {e}",
-                        t.transport.local_addr, t.transport.peer_addr
-                    );
-                }
-            }
-            TransportProtocol::TCP => {
-                let Some(sender) = tcp_senders.get(&t.transport.peer_addr) else {
-                    continue;
-                };
-                let contents: Vec<u8> = t.message.to_vec();
-                // Enqueue onto the connection's ordered writer channel.
-                // `try_send` (never `send().await`) keeps the rtc poll loop
-                // non-blocking: a full queue means the writer task can't
-                // keep up with the encoder, so we drop *this* frame as
-                // backpressure rather than stalling the driver or
-                // overflowing the kernel send buffer. The writer task,
-                // not the scheduler, controls wire order.
-                match sender.try_send(contents) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        // Slow/saturated TCP path — drop and let RTP
-                        // recovery (PLI/FIR + keyframes) catch the peer up.
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        // Writer task exited (connection torn down). Forget
-                        // the dead sender so we stop trying to route to it.
-                        tcp_senders.remove(&t.transport.peer_addr);
-                    }
-                }
-            }
+        if t.transport.transport_protocol == TransportProtocol::TCP {
+            // TCP-stamped transmit with no live stream for the tuple: the
+            // connection is gone and there is nothing to write to.
+            continue;
+        }
+        // Routability filtering only applies to UDP: we need the kernel's
+        // `sendto` to succeed from our bound socket, and a
+        // loopback-source-to-routable-destination pair would be rejected
+        // with EINVAL.
+        if t.transport.local_addr.is_ipv4() != t.transport.peer_addr.is_ipv4() {
+            continue;
+        }
+        if t.transport.local_addr.ip().is_loopback() != t.transport.peer_addr.ip().is_loopback() {
+            continue;
+        }
+        let Some(sock) = sockets_by_addr.get(&t.transport.local_addr) else {
+            eprintln!(
+                "[display/webrtc] UDP transmit from unknown source {}, dropping",
+                t.transport.local_addr
+            );
+            continue;
+        };
+        if let Err(e) = sock.send_to(&t.message, t.transport.peer_addr).await {
+            eprintln!(
+                "[display/webrtc] udp send {} -> {} failed: {e}",
+                t.transport.local_addr, t.transport.peer_addr
+            );
         }
     }
 

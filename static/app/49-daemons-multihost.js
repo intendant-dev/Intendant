@@ -194,8 +194,9 @@ function dashboardConnectSignalUrl(path) {
   return `${DASHBOARD_CONNECT_SIGNALING_BASE}${normalized.startsWith('/') ? '' : '/'}${normalized}`;
 }
 
-function dashboardSetControlLastError(message = '') {
+function dashboardSetControlLastError(message = '', kind = '') {
   dashboardControlLastError = String(message || '').trim();
+  dashboardControlLastErrorKind = dashboardControlLastError ? String(kind || '').trim() : '';
 }
 
 function dashboardUpdateTransportStatus() {
@@ -652,9 +653,10 @@ class DashboardTransport {
     dashboardUpdateTransportStatus();
     this.controlStartPromise = dashboardControlTransport.connect().then(() => true).catch(err => {
       console.warn('[dashboard-control] connect failed', err);
-      dashboardSetControlLastError(err?.message || String(err));
+      dashboardSetControlLastError(err?.message || String(err), err?.controlErrorKind || '');
       if (dashboardControlTransport) {
         dashboardControlTransport.lastError = dashboardControlLastError;
+        dashboardControlTransport.lastErrorKind = dashboardControlLastErrorKind;
       }
       dashboardUpdateTransportStatus();
       dashboardControlTransport = null;
@@ -689,6 +691,7 @@ class DashboardTransport {
       enabled: this.enabled(),
       connected: false,
       lastError: dashboardControlLastError,
+      lastErrorKind: dashboardControlLastErrorKind,
       ...reconnect,
     };
   }
@@ -937,12 +940,18 @@ async function waitForDashboardControlReady(timeoutMs = 30000) {
     if (dashboardTransport?.canUseRpc?.()) return true;
     await new Promise(resolve => setTimeout(resolve, 100));
   }
-  throw new Error('dashboard Connect transport did not become ready');
+  // Signaling already succeeded by this point (the offer resolved to a
+  // verified answer) — what never happened is the WebRTC transport itself.
+  const err = new Error('dashboard Connect transport did not become ready');
+  err.controlErrorKind = 'transport';
+  throw err;
 }
 
 async function hydrateDashboardFromControl() {
   if (!dashboardTransport?.canUseRpc?.()) {
-    throw new Error('dashboard Connect transport is not connected');
+    const err = new Error('dashboard Connect transport is not connected');
+    err.controlErrorKind = 'transport';
+    throw err;
   }
   const [status, config, card, accessOverview, targets] = await Promise.all([
     dashboardTransport.request('status', {}, { timeoutMs: 15000 }).catch(() => null),
@@ -1031,7 +1040,7 @@ async function runDashboardConnectReconnect(reason = 'dashboard transport discon
   } catch (err) {
     retryReason = err?.message || String(err);
     console.warn('[dashboard-control] Hosted Connect reconnect failed', err);
-    dashboardSetControlLastError(retryReason);
+    dashboardSetControlLastError(retryReason, err?.controlErrorKind || '');
     setConnectEventStatus('err', 'Hosted Connect dashboard reconnect failed');
   } finally {
     dashboardConnectReconnectInFlight = false;

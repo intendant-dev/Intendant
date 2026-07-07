@@ -42,8 +42,8 @@ on:
   # required check leaves the PR BLOCKED at "Expected" forever (verified
   # live on the first docs-only PR through this repo's queue). Every PR
   # pays the full matrix; that is the price of a required check. The push
-  # trigger above keeps its paths — its job is warming the main-branch
-  # cache, not gating.
+  # trigger above keeps its paths — push runs are check-only warm passes
+  # (see the fast-path step), not gates.
   pull_request:
     branches: [main]
   # Required-check trigger #2 — the merge-queue revalidation against the
@@ -74,10 +74,15 @@ jobs:
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
     env:
       # CI needs pass/fail and panic messages, not debugger-grade binaries.
-      # Debug info is the dominant MSVC link cost across these large test
-      # binaries, so the Windows leg builds without it; Linux/macOS keep
-      # the default — their links are cheap and rich backtraces stay
-      # useful when a failure does need reading in place.
+      # Debug info is the dominant compile+link cost across these large
+      # test binaries, so the Windows AND Linux legs build without it
+      # (Linux joined 2026-07-07: its 12.5-minute leg measured ~95%
+      # compile+link vs ~12s of test execution, and it runs the full suite
+      # on the most triggers — the biggest single lever on the dell
+      # bottleneck). macOS keeps the default: it only builds the full
+      # suite in the merge group, and rich backtraces stay useful when a
+      # failure does need reading in place. Repro locally with default
+      # debuginfo when a CI backtrace is too thin.
       CARGO_PROFILE_DEV_DEBUG: ${{ matrix.cargo_debug }}
     # Full test builds are much heavier than the old `cargo check`; a cold
     # Windows runner can take a while, but a hung run shouldn't burn hours.
@@ -108,7 +113,7 @@ jobs:
           - os: ubuntu-latest
             runner: [self-hosted, intendant-linux]
             target: x86_64-unknown-linux-gnu
-            cargo_debug: "2"
+            cargo_debug: "0"
 
     steps:
       # Fleet preflight: a self-hosted box with a nearly-full disk produces
@@ -263,24 +268,27 @@ jobs:
           key: ${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # Fast pre-queue signal vs the real merge gate: outside the merge
-      # group, the WINDOWS and MACOS legs run a compile check only —
-      # cross-platform compile breakage is the dominant non-Linux
-      # regression class, the full suites would otherwise run twice per
-      # landing (PR + group) on near-identical trees, and the merge queue
-      # re-runs everything on merge_group before anything lands, so the
-      # group run stays the full three-platform gate. Linux keeps full
-      # tests on every trigger: it is the fastest suite, dell carries two
-      # runner instances, and it preserves pre-queue runtime signal.
-      # macOS joined the Windows fast path 2026-07-07: the single Mac
-      # hosts both mac runner instances PLUS the interactive agents and
-      # their local builds, and stacked full-suite runs starved the label
-      # queue (~55-minute waits for a slot) while Windows PR legs cleared
-      # in ~2 minutes. This condition also covers push-to-main warm runs:
-      # the merge-group run just built the identical tree, so non-Linux
-      # push legs only refresh the cheap check artifacts.
-      - name: cargo check (non-Linux fast path)
-        if: github.event_name != 'merge_group' && runner.os != 'Linux' && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
+      # Fast pre-queue signal vs the real merge gate. Full suites run in
+      # exactly two places: the merge group (all three platforms — the
+      # actual gate, revalidating the speculative merge state) and the
+      # Linux pull_request leg (the one pre-queue runtime signal — most
+      # test failures are platform-agnostic, and catching them before the
+      # queue saves a far more expensive group ejection). Everything else
+      # runs a compile check only:
+      #   - non-Linux PR legs (since 2026-07: cross-platform compile
+      #     breakage is the dominant non-Linux regression class, and the
+      #     single Mac hosts both mac runner instances PLUS the
+      #     interactive agents — stacked full-suite runs starved the
+      #     label queue at ~55-minute waits);
+      #   - ALL push-to-main warm runs (since 2026-07-07: the merge-group
+      #     run just built and tested the identical tree on this same
+      #     fleet, so a push-side full suite re-validates nothing — its
+      #     cache-warming value IS the compile, which the constant PR +
+      #     group flow already provides; dropping the Linux push suite
+      #     returned ~19 runner-minutes per landing on the dell, the
+      #     fleet's current bottleneck).
+      - name: cargo check (fast path)
+        if: github.event_name != 'merge_group' && (runner.os != 'Linux' || github.event_name == 'push') && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: |
           cargo check -p intendant --bins --locked --target ${{ matrix.target }}
           cargo check -p intendant-core -p intendant-display -p intendant-platform --tests --locked --target ${{ matrix.target }}
@@ -295,7 +303,7 @@ jobs:
       # `--locked` makes lockfile drift a hard failure: CI must test exactly
       # the dependency set main pins, never a silent re-resolution of it.
       - name: cargo test
-        if: (github.event_name == 'merge_group' || runner.os == 'Linux') && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
+        if: (github.event_name == 'merge_group' || (runner.os == 'Linux' && github.event_name == 'pull_request')) && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: |
           cargo test -p intendant --bins --locked --target ${{ matrix.target }}
           # Lib crates get their own invocation: a global `--bins` filter
@@ -309,5 +317,5 @@ jobs:
       # unit suite can't reach (process spawn, sandbox, tool round-trips,
       # session logging).
       - name: cargo test e2e (mock provider, headless)
-        if: (github.event_name == 'merge_group' || runner.os == 'Linux') && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
+        if: (github.event_name == 'merge_group' || (runner.os == 'Linux' && github.event_name == 'pull_request')) && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: cargo test -p intendant --test e2e --locked --target ${{ matrix.target }}

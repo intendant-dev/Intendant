@@ -1443,7 +1443,7 @@ async function main() {
 
   let browser;
   try {
-    await waitFor(() => daemonLogs.join('').includes(`Web TUI: https://0.0.0.0:${options.daemonPort}`), START_TIMEOUT_MS, 'daemon web startup');
+    await waitFor(() => daemonLogs.join('').includes(`Dashboard: https://0.0.0.0:${options.daemonPort}`), START_TIMEOUT_MS, 'daemon web startup');
     const daemonNoAuthStatus = await httpStatus(`http://127.0.0.1:${options.rendezvousPort}/api/daemon/next?daemon_id=${encodeURIComponent(options.daemonId)}&timeout_ms=1`);
     assert.strictEqual(daemonNoAuthStatus, 401, `/api/daemon/next without bearer returned ${daemonNoAuthStatus}`);
     const registeredStatus = await waitFor(async () => {
