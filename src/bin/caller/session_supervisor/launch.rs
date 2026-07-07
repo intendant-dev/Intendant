@@ -1391,7 +1391,6 @@ pub(crate) fn external_attach_dedupe_keys(source: &str, session_id: &str, resume
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
     use crate::session_supervisor::tests::{managed_session, test_supervisor, test_supervisor_with_mock_provider};
 
     fn write_external_wrapper_identity(

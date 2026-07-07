@@ -22,9 +22,7 @@ pub(crate) use routing::*;
 mod agent_config;
 pub(crate) use agent_config::*;
 mod registry;
-pub(crate) use registry::*;
 mod dispatch;
-pub(crate) use dispatch::*;
 
 #[derive(Clone)]
 pub struct SessionSupervisorConfig {
@@ -88,7 +86,7 @@ const TEXT_STEER_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::fr
 const TEXT_STEER_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
 
 #[derive(Default)]
-struct SupervisorState {
+pub(crate) struct SupervisorState {
     sessions: HashMap<String, ManagedSession>,
     session_aliases: HashMap<String, String>,
     related_sessions: HashMap<String, RelatedSession>,
@@ -110,7 +108,7 @@ struct SupervisorState {
 }
 
 #[derive(Debug, Clone)]
-struct RelatedSession {
+pub(crate) struct RelatedSession {
     parent_session_id: String,
     relationship: String,
 }
@@ -246,14 +244,14 @@ struct ManagedSession {
     sub_agent_children: Option<SubAgentChildrenMap>,
 }
 
-struct StoppedManagedSession {
+pub(crate) struct StoppedManagedSession {
     session_id: String,
     source: String,
     finished_rx: Option<oneshot::Receiver<()>>,
 }
 
 #[derive(Clone)]
-struct EditRouteTarget {
+pub(crate) struct EditRouteTarget {
     managed_id: String,
     source: String,
     project_root: PathBuf,
@@ -262,7 +260,7 @@ struct EditRouteTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct EditAttachRequest {
+pub(crate) struct EditAttachRequest {
     source: String,
     resume_id: Option<String>,
     project_root: Option<String>,
@@ -270,7 +268,7 @@ struct EditAttachRequest {
 }
 
 #[derive(Debug, Clone)]
-struct EditUserMessageRequest {
+pub(crate) struct EditUserMessageRequest {
     requested_id: String,
     user_turn_index: u32,
     user_turn_revision: Option<u32>,

@@ -586,7 +586,6 @@ pub(crate) fn control_msg_can_attach_unmanaged_session(msg: &event::ControlMsg) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
     use crate::session_supervisor::tests::{managed_session, test_supervisor};
 
     #[tokio::test]

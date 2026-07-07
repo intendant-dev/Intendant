@@ -347,8 +347,7 @@ impl SessionSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
-    use crate::session_supervisor::tests::{managed_session, test_supervisor, test_supervisor_with_mock_provider};
+    use crate::session_supervisor::tests::{managed_session, test_supervisor};
 
     /// The scripted mock provider behind a test-held gate: every chat call
     /// waits for the test to release the gate first. This pins a spawned

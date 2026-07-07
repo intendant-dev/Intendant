@@ -1427,7 +1427,6 @@ pub(crate) fn steer_ack_targets_session(actual: &Option<String>, expected: &Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
     use crate::session_supervisor::tests::{managed_session, test_supervisor};
 
     fn slash(text: &str) -> CodexSlashCommand {
