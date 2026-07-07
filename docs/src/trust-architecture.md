@@ -394,7 +394,7 @@ kept short-lived without the issuer in the loop.
 
 **Peer-daemon subjects.** An org grant whose subject is a *peer daemon*
 materializes into the peer identity store
-(`peer/access_policy.rs::PeerIdentityRecord`), not IAM — daemons are
+(`access/access_policy.rs::PeerIdentityRecord`), not IAM — daemons are
 peers, never people, and the peer lane's profile vocabulary is the right
 authority language for them. Format: `subject` carries
 `peer_fingerprint` instead of `client_key_fingerprint` (exactly one must

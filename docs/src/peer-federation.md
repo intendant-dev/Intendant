@@ -72,7 +72,7 @@ authenticate*:
 
 Key fields:
 
-- **`id`** — a stable opaque `PeerId` (`peer/id.rs`). `id.kind()` is the source of
+- **`id`** — a stable opaque `PeerId` (`intendant-core`'s `peer_id.rs`). `id.kind()` is the source of
   truth for the daemon kind (`intendant`, `a2a`, `openclaw`, `mcp`, …); there is
   no separate `kind` field, by design.
 - **`transports`** — one or more addresses **in preference order** (highest first).
@@ -371,7 +371,7 @@ support once connected.
 
 ### Cert pinning over mTLS — `PinnedMutualTls`
 
-`peer/transport/pinning.rs` provides a custom rustls `ServerCertVerifier` that
+`access/pinning.rs` provides a custom rustls `ServerCertVerifier` that
 accepts a presented server cert **iff its SHA-256 fingerprint matches one of the
 operator-supplied pinned values**. This is defense in depth on top of (or instead
 of) plain mTLS: mTLS alone trusts every cert a trusted CA signed, so a CA
