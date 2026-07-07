@@ -12432,12 +12432,61 @@ mod tests {
         )
         .is_none());
 
-        let opened = tokio::time::timeout(Duration::from_secs(3), terminal_rx.recv())
+        // Generous budget: the PTY spawn behind terminal_open (PowerShell
+        // under ConPTY on a loaded Windows runner, especially) can take
+        // tens of seconds before the shell paints; a passing run returns
+        // the moment each frame arrives and never waits the budget out.
+        let budget = Duration::from_secs(60);
+        let opened = tokio::time::timeout(budget, terminal_rx.recv())
             .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(opened["t"], "terminal_opened");
+            .expect("no terminal frame within budget after terminal_open")
+            .expect("terminal frame channel closed before terminal_opened");
+        assert_eq!(opened["t"], "terminal_opened", "got frame: {opened}");
         assert_eq!(opened["terminal_id"], terminal_id);
+
+        // Drain frames until the accumulated decoded output satisfies
+        // `until`, panicking loudly — with everything received — on the
+        // deadline. Matching runs on the accumulated transcript, not per
+        // frame, so output split across chunks still matches.
+        async fn drain_output_until(
+            terminal_rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+            budget: Duration,
+            phase: &str,
+            until: impl Fn(&str) -> bool,
+        ) -> String {
+            let deadline = tokio::time::Instant::now() + budget;
+            let mut transcript = String::new();
+            let mut other_frames: Vec<String> = Vec::new();
+            loop {
+                match tokio::time::timeout_at(deadline, terminal_rx.recv()).await {
+                    Ok(Some(frame)) if frame["t"] == "terminal_output" => {
+                        let data = frame["data"].as_str().unwrap_or("");
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .unwrap_or_default();
+                        transcript.push_str(&String::from_utf8_lossy(&bytes));
+                        if until(&transcript) {
+                            return transcript;
+                        }
+                    }
+                    Ok(Some(frame)) => other_frames.push(frame.to_string()),
+                    Ok(None) => panic!(
+                        "{phase}: terminal frame channel closed; output so far: \
+                         {transcript:?}; other frames: {other_frames:?}"
+                    ),
+                    Err(_) => panic!(
+                        "{phase}: no matching terminal output within {budget:?}; \
+                         output so far: {transcript:?}; other frames: {other_frames:?}"
+                    ),
+                }
+            }
+        }
+
+        // Don't type until the shell has painted something — bytes written
+        // during shell startup can be silently discarded (see terminal.rs
+        // tests); a dashboard user typing at a rendered prompt never races
+        // this.
+        drain_output_until(&mut terminal_rx, budget, "shell startup", |t| !t.is_empty()).await;
 
         let token = "dashboard_terminal_frame_ok";
         let input = serde_json::json!({
@@ -12459,29 +12508,10 @@ mod tests {
         )
         .is_none());
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut saw_token = false;
-        while Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(200), terminal_rx.recv()).await {
-                Ok(Some(frame)) if frame["t"] == "terminal_output" => {
-                    let data = frame["data"].as_str().unwrap_or("");
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(data)
-                        .unwrap_or_default();
-                    if String::from_utf8_lossy(&bytes).contains(token) {
-                        saw_token = true;
-                        break;
-                    }
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => {}
-            }
-        }
-        assert!(
-            saw_token,
-            "did not receive terminal output over control frames"
-        );
+        drain_output_until(&mut terminal_rx, budget, "token echo", |t| {
+            t.contains(token)
+        })
+        .await;
 
         let close = serde_json::json!({
             "t": "terminal_close",
