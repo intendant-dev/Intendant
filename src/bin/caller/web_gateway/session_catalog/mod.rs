@@ -59,6 +59,10 @@ pub(crate) const EXTERNAL_TRANSCRIPT_CACHE_LIMIT: usize = 32;
 
 pub(crate) const SESSION_LIST_ROW_CACHE_LIMIT: usize = 8_192;
 
+/// Ceiling for explicit numeric `limit=` requests, and the cache-slot key the
+/// unlimited list is stored under. The unlimited (`limit=all`) list itself is
+/// NOT capped by this: Stats and the Sessions header fold it for lifetime
+/// usage totals, so it must serve every row.
 pub(crate) const SESSION_LIST_LIMIT: usize = 5_000;
 
 pub(crate) const SESSION_LIST_RESPONSE_CACHE_TTL_SECS: u64 = 30;
@@ -1958,7 +1962,7 @@ pub(crate) fn apply_external_context_to_intendant_wrapper(
 }
 
 pub(crate) fn list_sessions_from_home(home_path: &Path) -> String {
-    list_sessions_from_home_impl(home_path, true, EXTERNAL_SESSION_SCAN_LIMIT, None)
+    list_sessions_from_home_impl(home_path, EXTERNAL_SESSION_SCAN_LIMIT, None)
 }
 
 pub(crate) fn list_sessions_from_home_with_limit(home_path: &Path, limit: Option<usize>) -> String {
@@ -1970,7 +1974,7 @@ pub(crate) fn list_sessions_from_home_with_limit(home_path: &Path, limit: Option
                 .clamp(SESSION_SOURCE_FLOOR, EXTERNAL_SESSION_SCAN_LIMIT)
         })
         .unwrap_or(EXTERNAL_SESSION_SCAN_LIMIT);
-    list_sessions_from_home_impl(home_path, true, external_scan_limit, limit)
+    list_sessions_from_home_impl(home_path, external_scan_limit, limit)
 }
 
 pub(crate) fn intendant_session_skeleton_from_dir(
@@ -2105,14 +2109,18 @@ pub(crate) fn merge_quick_session_rows_with_wrapper_index(
 }
 
 pub(crate) fn list_sessions_for_deep_search_from_home(home_path: &Path) -> String {
-    list_sessions_from_home_impl(home_path, false, usize::MAX, None)
+    list_sessions_from_home_impl(home_path, usize::MAX, None)
 }
 
+/// `row_cap: None` serves the complete corpus. Only explicit numeric limits
+/// truncate: usage totals (Stats, Sessions header) fold the unlimited body,
+/// and any silent cap deletes real history from them — a 5k-row cap on the
+/// unlimited slot once ate ~36B of old-session tokens when test litter
+/// pushed the corpus past it.
 pub(crate) fn list_sessions_from_home_impl(
     home_path: &Path,
-    truncate_for_list_view: bool,
     external_scan_limit: usize,
-    requested_limit: Option<usize>,
+    row_cap: Option<usize>,
 ) -> String {
     preload_session_index();
     let logs_dir = home_path.join(".intendant").join("logs");
@@ -2139,8 +2147,8 @@ pub(crate) fn list_sessions_from_home_impl(
     crate::session_config::apply_overlays_to_sessions(home_path, &mut external_sessions);
     if !logs_dir.is_dir() {
         sort_sessions_newest_first(&mut external_sessions);
-        if truncate_for_list_view {
-            truncate_sessions_preserving_sources(&mut external_sessions);
+        if let Some(cap) = row_cap {
+            truncate_sessions_preserving_sources_to(&mut external_sessions, cap);
         }
         return serde_json::to_string(&external_sessions).unwrap_or_else(|_| "[]".to_string());
     }
@@ -2164,14 +2172,12 @@ pub(crate) fn list_sessions_from_home_impl(
             Some((dir, mtime))
         })
         .collect::<Vec<_>>();
-    if truncate_for_list_view {
+    if let Some(cap) = row_cap {
         dirs.sort_by(|a, b| b.1.cmp(&a.1));
-        if let Some(limit) = requested_limit {
-            let scan_limit = limit
-                .saturating_add(SESSION_SOURCE_FLOOR * 3)
-                .clamp(limit, SESSION_LIST_LIMIT);
-            dirs.truncate(scan_limit);
-        }
+        let scan_limit = cap
+            .saturating_add(SESSION_SOURCE_FLOOR * 3)
+            .clamp(cap, SESSION_LIST_LIMIT);
+        dirs.truncate(scan_limit);
     }
 
     for (dir, _) in dirs {
@@ -2215,10 +2221,8 @@ pub(crate) fn list_sessions_from_home_impl(
     apply_external_wrapper_index_to_sessions(home_path, &mut sessions);
 
     sort_sessions_newest_first(&mut sessions);
-    if let Some(limit) = requested_limit {
-        truncate_sessions_preserving_sources_to(&mut sessions, limit);
-    } else if truncate_for_list_view {
-        truncate_sessions_preserving_sources(&mut sessions);
+    if let Some(cap) = row_cap {
+        truncate_sessions_preserving_sources_to(&mut sessions, cap);
     }
 
     serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".to_string())
@@ -2668,6 +2672,48 @@ mod tests {
         let body = list_sessions_from_home_with_limit(home.path(), Some(2));
         let sessions: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
         assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn unlimited_session_list_serves_every_row() {
+        let home = tempfile::tempdir().unwrap();
+        let logs_dir = home.path().join(".intendant").join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        for idx in 0..4 {
+            let session_id = format!("complete-session-{idx}");
+            let log_dir = logs_dir.join(&session_id);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            std::fs::write(
+                log_dir.join("session_meta.json"),
+                serde_json::json!({
+                    "created_at": format!("2026-06-07T16:0{idx}:00Z"),
+                    "task": format!("complete task {idx}"),
+                    "status": "idle"
+                })
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                log_dir.join("session.jsonl"),
+                serde_json::json!({
+                    "ts": format!("2026-06-07T16:0{idx}:00Z"),
+                    "event": "session_start"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        // The unlimited list is what Stats and the Sessions header fold for
+        // lifetime usage totals — it must never truncate, only explicit
+        // numeric limits may.
+        let body = list_sessions_from_home(home.path());
+        let sessions: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(sessions.len(), 4);
+
+        let capped = list_sessions_from_home_impl(home.path(), usize::MAX, Some(3));
+        let sessions: Vec<serde_json::Value> = serde_json::from_str(&capped).unwrap();
+        assert_eq!(sessions.len(), 3);
     }
 
     #[test]
