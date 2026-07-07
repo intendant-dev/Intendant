@@ -5471,6 +5471,65 @@ mod tests {
         SessionSupervisor::new(config)
     }
 
+    /// The scripted mock provider behind a test-held gate: every chat call
+    /// waits for the test to release the gate first. This pins a spawned
+    /// child session provably alive — its loop cannot get a model response,
+    /// so it cannot complete and retire the state under assertion — turning
+    /// "assert before the child happens to finish" races into deterministic
+    /// sequencing. A dropped sender (test panicked) errors the call instead
+    /// of hanging the child loop forever.
+    struct GatedMockProvider {
+        inner: provider::mock::MockOrchestrationProvider,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl provider::ChatProvider for GatedMockProvider {
+        async fn chat(
+            &self,
+            messages: &[crate::conversation::Message],
+        ) -> Result<provider::ChatResponse, crate::error::CallerError> {
+            let mut release = self.release.clone();
+            release
+                .wait_for(|released| *released)
+                .await
+                .map_err(|_| crate::error::CallerError::Config("provider gate dropped".into()))?;
+            self.inner.chat(messages).await
+        }
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn model(&self) -> &str {
+            self.inner.model()
+        }
+        fn context_window(&self) -> u64 {
+            self.inner.context_window()
+        }
+        fn max_output_tokens(&self) -> u64 {
+            self.inner.max_output_tokens()
+        }
+        fn use_tools(&self) -> bool {
+            self.inner.use_tools()
+        }
+    }
+
+    /// [`test_supervisor_with_mock_provider`], but every spawned loop's
+    /// provider blocks until the returned sender publishes `true`.
+    fn test_supervisor_with_gated_mock_provider(
+        project_root: PathBuf,
+        bus: EventBus,
+    ) -> (SessionSupervisor, tokio::sync::watch::Sender<bool>) {
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let mut config = (*test_supervisor(project_root, bus).config).clone();
+        config.provider_factory = Some(Arc::new(move || {
+            Box::new(GatedMockProvider {
+                inner: provider::mock::MockOrchestrationProvider::new(),
+                release: release_rx.clone(),
+            }) as Box<dyn provider::ChatProvider>
+        }));
+        (SessionSupervisor::new(config), release_tx)
+    }
+
     fn slash(text: &str) -> CodexSlashCommand {
         parse_codex_slash_command(text)
             .expect("recognized slash command")
@@ -6414,6 +6473,13 @@ mod tests {
     /// wait_sub_agents reads, the relationship is recorded, the parent is
     /// woken with a notification follow-up, and the completion resolves
     /// through the registry like a model-spawned child's would.
+    ///
+    /// The child's provider is gated: it cannot get its first model
+    /// response — so it provably cannot complete and retire its state —
+    /// until every spawn-time assertion has run. Without the gate the mock
+    /// child completes near-instantly and `finish_session` →
+    /// `remove_session` purges `related_sessions`, so state reads raced
+    /// child completion and flaked under CI load.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dashboard_delegate_tracks_child_in_parent_registry_and_wakes_parent() {
         let bus = EventBus::new();
@@ -6422,8 +6488,8 @@ mod tests {
         // subscribe.
         let mut bus_rx = bus.subscribe();
         let project_dir = tempfile::tempdir().unwrap();
-        let supervisor =
-            test_supervisor_with_mock_provider(project_dir.path().to_path_buf(), bus.clone());
+        let (supervisor, release_gate) =
+            test_supervisor_with_gated_mock_provider(project_dir.path().to_path_buf(), bus.clone());
         let (follow_up_tx, mut follow_up_rx) = mpsc::channel(4);
         let children: SubAgentChildrenMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         {
@@ -6469,11 +6535,18 @@ mod tests {
                 child.rx.take().expect("completion receiver present"),
             )
         };
-        // Assert the relationship via its bus event, not by peeking
-        // supervisor state: the state entry is transient — the mock child
-        // completes near-instantly and its retirement purges
-        // `related_sessions`, so a state read here races the child and
-        // flakes under CI load. The event is the durable signal frontends
+        // The relationship is recorded in supervisor state (the gate keeps
+        // the child alive, so the entry cannot have been retired) …
+        {
+            let state = supervisor.state.lock().await;
+            let relation = state
+                .related_sessions
+                .get(&child_id)
+                .expect("relationship recorded");
+            assert_eq!(relation.parent_session_id, "parent");
+            assert_eq!(relation.relationship, "subagent");
+        }
+        // … and announced on the bus — the durable signal frontends
         // consume, emitted synchronously during the spawn.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -6511,6 +6584,9 @@ mod tests {
             "notice should point the model at wait_sub_agents: {}",
             notice.text
         );
+
+        // Spawn-time state is verified — release the child and let it run.
+        release_gate.send(true).expect("child loop holds a receiver");
 
         // The completion resolves through the registry exactly like a
         // model-spawned child's (mock research child ends text-only; the
