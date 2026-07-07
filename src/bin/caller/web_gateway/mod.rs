@@ -85,7 +85,7 @@ static INTENDANT_SESSION_LIST_CACHE: OnceLock<
     Mutex<HashMap<String, IntendantSessionListCacheEntry>>,
 > = OnceLock::new();
 
-pub const DEFAULT_PORT: u16 = 8765;
+pub use intendant_core::net::DEFAULT_GATEWAY_PORT as DEFAULT_PORT;
 
 /// Session-specific state that changes when a new agent session starts.
 /// Wrapped in `Arc<tokio::sync::RwLock<...>>` so the web gateway can observe

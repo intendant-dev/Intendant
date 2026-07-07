@@ -229,7 +229,7 @@ impl Default for AccessArgs {
     fn default() -> Self {
         Self {
             action: AccessAction::Help,
-            https_port: crate::web_gateway::DEFAULT_PORT,
+            https_port: intendant_core::net::DEFAULT_GATEWAY_PORT,
             cert_port: 9999,
             ips: Vec::new(),
             hosts: Vec::new(),

@@ -22,6 +22,11 @@
 /// the codebase already depends on for other unix interop.
 use tokio::net::TcpListener;
 
+/// Default TCP port for the daemon's web gateway (dashboard + API).
+/// Canonical here so access/ and peer/ can name it without reaching
+/// upward into the gateway module.
+pub const DEFAULT_GATEWAY_PORT: u16 = 8765;
+
 pub fn routable_local_addrs(include_loopback: bool) -> Vec<std::net::IpAddr> {
     use std::net::{IpAddr, Ipv4Addr};
 

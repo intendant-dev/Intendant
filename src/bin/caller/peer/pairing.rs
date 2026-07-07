@@ -22,7 +22,7 @@ use crate::project::{PeerConfig, Project};
 
 const INVITE_PREFIX: &str = "intendant-peer-v1.";
 pub(crate) const AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
-const DEFAULT_WEB_PORT: u16 = crate::web_gateway::DEFAULT_PORT;
+const DEFAULT_WEB_PORT: u16 = intendant_core::net::DEFAULT_GATEWAY_PORT;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerInvite {
