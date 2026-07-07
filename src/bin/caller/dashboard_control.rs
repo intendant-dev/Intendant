@@ -1191,6 +1191,29 @@ struct InboundPacket {
     received_at: Instant,
 }
 
+/// Outbound transmits the drain dropped, by reason. Individual drops stay
+/// silent (cross-family pairs are routine noise while ICE probes candidate
+/// combinations), but a connection that dies with a nonzero tally logs the
+/// summary — a misrouted-transmit bug then names itself instead of
+/// presenting as a bare DTLS timeout (which once cost a full debugging
+/// round on the hosted-Connect path).
+#[derive(Debug, Default)]
+struct TransmitDropStats {
+    cross_family: u64,
+    loopback_mismatch: u64,
+    unknown_udp_source: u64,
+    tcp_without_stream: u64,
+}
+
+impl TransmitDropStats {
+    fn any(&self) -> bool {
+        self.cross_family != 0
+            || self.loopback_mismatch != 0
+            || self.unknown_udp_source != 0
+            || self.tcp_without_stream != 0
+    }
+}
+
 struct ControlTaskResponse {
     id: String,
     frame: serde_json::Value,
@@ -1390,12 +1413,14 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
         .display_authority
         .as_ref()
         .map(DashboardDisplayAuthorityBridge::subscribe);
+    let mut drop_stats = TransmitDropStats::default();
 
     loop {
         let timeout_at = match drain_control_outputs(
             &mut rtc,
             &sockets_by_addr,
             &mut tcp_senders,
+            &mut drop_stats,
             &mut channels,
             &mut runtime,
             &task_tx,
@@ -1684,6 +1709,7 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
     tcp_senders: &mut HashMap<SocketAddr, TcpFrameSender>,
+    drop_stats: &mut TransmitDropStats,
     channels: &mut HashMap<String, rtc::data_channel::RTCDataChannelId>,
     runtime: &mut ControlRuntime,
     task_tx: &mpsc::Sender<ControlTaskResponse>,
@@ -1715,15 +1741,19 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
         if t.transport.transport_protocol == TransportProtocol::TCP {
             // TCP-stamped transmit with no live stream for the tuple: the
             // connection is gone and there is nothing to write to.
+            drop_stats.tcp_without_stream += 1;
             continue;
         }
         if t.transport.local_addr.is_ipv4() != t.transport.peer_addr.is_ipv4() {
+            drop_stats.cross_family += 1;
             continue;
         }
         if t.transport.local_addr.ip().is_loopback() != t.transport.peer_addr.ip().is_loopback() {
+            drop_stats.loopback_mismatch += 1;
             continue;
         }
         let Some(sock) = sockets_by_addr.get(&t.transport.local_addr) else {
+            drop_stats.unknown_udp_source += 1;
             eprintln!(
                 "[dashboard/control] UDP transmit from unknown source {}, dropping",
                 t.transport.local_addr
@@ -1791,6 +1821,15 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
                     rtc::peer_connection::state::RTCPeerConnectionState::Failed
                         | rtc::peer_connection::state::RTCPeerConnectionState::Closed
                 ) {
+                    if drop_stats.any() {
+                        eprintln!(
+                            "[dashboard/control] transmit drops this session: {} cross-family, {} loopback-mismatch, {} unknown-udp-source, {} tcp-without-stream",
+                            drop_stats.cross_family,
+                            drop_stats.loopback_mismatch,
+                            drop_stats.unknown_udp_source,
+                            drop_stats.tcp_without_stream
+                        );
+                    }
                     return Err(());
                 }
             }

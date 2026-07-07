@@ -128,8 +128,12 @@ reach, over the same port that already serves the dashboard. Browsers
 dial it directly; no STUN or TURN is required for the hosted
 dashboard-control path (the box's firewall must allow the gateway port
 inbound). Display sessions opened through a hosted dashboard advertise
-the same tuple. Reachability metadata only: a lying proxy chain could at
-worst advertise an unreachable candidate.
+the same tuple. The echoed address family follows how the daemon reached
+the service — a daemon polling over IPv6 advertises a v6 candidate that
+v4-only visitors cannot dial, so pin the daemon's egress (or the service
+hostname it resolves) to v4 if your visitors are. Reachability metadata
+only: a lying proxy chain could at worst advertise an unreachable
+candidate.
 
 Because the service reads the caller's address from `X-Forwarded-For`
 (falling back to `X-Real-IP`), the reverse proxy in front of a
