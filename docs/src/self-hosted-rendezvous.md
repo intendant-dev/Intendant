@@ -116,7 +116,19 @@ recovery verb for a squatted or mis-claimed box (whose claiming account
 would never revoke), also exposed as the Access card's "Release claim".
 A fresh claim phrase mints on the next register poll.
 
-## Revocation bulletin board
+## Reachability for NAT'd daemons
+
+Register responses echo `observed_ip` — the public address the service
+saw the poll arrive from. A cloud box's interfaces carry only private
+addresses (the public IP lives on the provider's 1:1 NAT), and the
+dashboard-control engine gathers no server-reflexive candidates, so
+Connect offers advertise an **ICE-TCP candidate at
+`observed_ip:gateway_port`** — the one address the world can actually
+reach, over the same port that already serves the dashboard. Browsers
+dial it directly; no STUN or TURN is required for the hosted
+dashboard-control path (the box's firewall must allow the gateway port
+inbound). Reachability metadata only: a lying proxy chain could at worst
+advertise an unreachable candidate.
 
 The service stores each org's latest root-signed revocation list, blind:
 `POST /api/orgs/revocations/publish` accepts a list whose embedded
