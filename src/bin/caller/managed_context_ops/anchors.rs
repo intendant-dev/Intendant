@@ -1962,7 +1962,6 @@ pub(crate) fn context_rewind_pressure_at_record_creation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
 
     #[test]
     fn context_rewind_carries_unrepeated_prior_primer_facts_from_pruned_span() {
