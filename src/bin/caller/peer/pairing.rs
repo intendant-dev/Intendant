@@ -87,6 +87,7 @@ enum PeerAction {
     Deny,
     Complete,
     Identities,
+    SetProfile,
     Revoke,
     #[default]
     Help,
@@ -117,6 +118,7 @@ pub async fn run(argv: Vec<String>) -> Result<(), CallerError> {
         PeerAction::Deny => cmd_deny(args),
         PeerAction::Complete => cmd_complete(args).await,
         PeerAction::Identities => cmd_identities(),
+        PeerAction::SetProfile => cmd_set_profile(args),
         PeerAction::Revoke => cmd_revoke(args),
     }
 }
@@ -140,11 +142,12 @@ fn parse_args(argv: &[String]) -> Result<PeerArgs, CallerError> {
         "deny" => PeerAction::Deny,
         "complete" | "poll" => PeerAction::Complete,
         "identities" | "identity" => PeerAction::Identities,
+        "set-profile" => PeerAction::SetProfile,
         "revoke" => PeerAction::Revoke,
         "help" | "-h" | "--help" => return Ok(args),
         other => {
             return Err(CallerError::Config(format!(
-                "unknown peer subcommand '{other}' (expected invite/join/request/requests/approve/deny/complete/identities/revoke)"
+                "unknown peer subcommand '{other}' (expected invite/join/request/requests/approve/deny/complete/identities/set-profile/revoke)"
             )));
         }
     };
@@ -174,7 +177,11 @@ fn parse_args(argv: &[String]) -> Result<PeerArgs, CallerError> {
                 let value = iter
                     .next()
                     .ok_or_else(|| CallerError::Config("missing value for --profile".into()))?;
-                args.profile = Some(value.clone());
+                // Loud, local-only validation: a typo'd profile must fail
+                // here, not silently degrade to a presence-only grant.
+                // Aliases resolve to their canonical name; wire-side
+                // parsing stays lenient (see `require_known_profile`).
+                args.profile = Some(crate::peer::access_policy::require_known_profile(value)?);
             }
             "--requester-card-url" => {
                 let value = iter.next().ok_or_else(|| {
@@ -223,7 +230,9 @@ fn parse_args(argv: &[String]) -> Result<PeerArgs, CallerError> {
 }
 
 /// Whether the parsed action takes a positional code/id that is still
-/// unfilled.
+/// unfilled. (`set-profile` also takes a positional, but it is a hex
+/// fingerprint, which can never start with '-', so it stays out of the
+/// single-dash tolerance this gates.)
 fn expects_code_or_id(args: &PeerArgs) -> bool {
     matches!(
         args.action,
@@ -240,7 +249,11 @@ fn take_positional(args: &mut PeerArgs, other: &str) -> Result<(), CallerError> 
         PeerAction::Request if args.target_url.is_none() => {
             args.target_url = Some(other.to_string());
         }
-        PeerAction::Approve | PeerAction::Deny | PeerAction::Complete | PeerAction::Revoke
+        PeerAction::Approve
+        | PeerAction::Deny
+        | PeerAction::Complete
+        | PeerAction::SetProfile
+        | PeerAction::Revoke
             if args.code_or_id.is_none() =>
         {
             args.code_or_id = Some(other.to_string());
@@ -265,7 +278,7 @@ fn take_positional(args: &mut PeerArgs, other: &str) -> Result<(), CallerError> 
                 "unexpected extra request argument '{other}'"
             )));
         }
-        PeerAction::Revoke => {
+        PeerAction::SetProfile | PeerAction::Revoke => {
             return Err(CallerError::Config(format!(
                 "unexpected extra identity argument '{other}'"
             )));
@@ -292,6 +305,7 @@ fn print_help() {
     println!("    intendant peer deny <CODE_OR_ID>");
     println!("    intendant peer complete <REQUEST_ID> [--label NAME]");
     println!("    intendant peer identities");
+    println!("    intendant peer set-profile <FINGERPRINT> --profile <NAME>");
     println!("    intendant peer revoke <FINGERPRINT_OR_LABEL>");
     println!();
     println!("ACTIONS:");
@@ -303,6 +317,7 @@ fn print_help() {
     println!("    deny          Deny an incoming access request");
     println!("    complete      Poll an outgoing access request and install it if approved");
     println!("    identities    List approved/revoked inbound peer identities");
+    println!("    set-profile   Change an approved inbound identity's profile (no re-pairing)");
     println!("    revoke        Revoke an inbound peer identity certificate");
     println!();
     println!("FLAGS:");
@@ -311,13 +326,17 @@ fn print_help() {
     println!("    --port <N>           Port for the default Agent Card URL (default 8765)");
     println!("    --label <NAME>       Display label for this peer in the joining daemon");
     println!("    --client-name <NAME> Common name hint for the issued client certificate");
-    println!("    --profile <NAME>     Requested or approved peer profile (default peer-operator; use peer-root for full peer access)");
+    println!("    --profile <NAME>     Peer profile to request, approve, or set (default peer-operator; use peer-root for full peer access)");
     println!("    --requester-card-url <URL>  Optional Agent Card URL for the requesting daemon");
     println!();
     println!("NOTES:");
     println!("    Run invite on the daemon that will accept inbound peer connections.");
     println!("    Run join on the daemon that should connect to it.");
     println!("    The invite contains a client private key; treat it as a secret.");
+    println!("    --profile accepts only known profile names (aliases resolve; typos error).");
+    println!("    set-profile takes the fingerprint (or unique prefix) shown by identities;");
+    println!("    the daemon rereads identities per request, so the new profile applies on");
+    println!("    the peer's next request — no daemon restart or re-pairing needed.");
 }
 
 fn cmd_invite(args: PeerArgs) -> Result<(), CallerError> {
@@ -517,6 +536,30 @@ fn cmd_identities() -> Result<(), CallerError> {
                 .unwrap_or_default(),
         );
     }
+    Ok(())
+}
+
+fn cmd_set_profile(args: PeerArgs) -> Result<(), CallerError> {
+    let selector = args.code_or_id.ok_or_else(|| {
+        CallerError::Config(
+            "`intendant peer set-profile` requires an identity fingerprint (see `intendant peer identities`)"
+                .into(),
+        )
+    })?;
+    let profile = args.profile.ok_or_else(|| {
+        CallerError::Config("`intendant peer set-profile` requires --profile <NAME>".into())
+    })?;
+    let cert_dir = access::backend::select_backend().cert_dir();
+    let change =
+        crate::peer::access_policy::set_identity_profile(&cert_dir, &selector, &profile)?;
+    println!(
+        ":: peer identity {} ({}) profile: {} -> {}",
+        change.record.fingerprint,
+        change.record.label,
+        change.previous_profile,
+        change.record.profile
+    );
+    println!(":: takes effect on the peer's next request; no daemon restart needed");
     Ok(())
 }
 
@@ -899,6 +942,71 @@ mod tests {
     fn dash_token_after_filled_positional_still_errors() {
         let err = parse_args(&argv(&["complete", "req-1", "-extra"])).unwrap_err();
         assert!(err.to_string().contains("unknown peer flag '-extra'"));
+    }
+
+    #[test]
+    fn set_profile_takes_fingerprint_positional_and_profile_flag() {
+        let args = parse_args(&argv(&[
+            "set-profile",
+            "AA:BB:CC",
+            "--profile",
+            "peer-operator",
+        ]))
+        .expect("set-profile grammar");
+        assert!(matches!(args.action, PeerAction::SetProfile));
+        assert_eq!(args.code_or_id.as_deref(), Some("AA:BB:CC"));
+        assert_eq!(args.profile.as_deref(), Some("peer-operator"));
+    }
+
+    #[test]
+    fn set_profile_selector_works_after_double_dash() {
+        let args = parse_args(&argv(&["set-profile", "--profile", "stats", "--", "aabb"]))
+            .expect("-- forces the positional");
+        assert_eq!(args.code_or_id.as_deref(), Some("aabb"));
+        assert_eq!(args.profile.as_deref(), Some("stats"));
+    }
+
+    #[test]
+    fn set_profile_rejects_extra_positionals() {
+        let err = parse_args(&argv(&["set-profile", "aabb", "ccdd"])).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unexpected extra identity argument 'ccdd'"));
+    }
+
+    #[test]
+    fn profile_flag_resolves_aliases_to_canonical_names() {
+        // The documented compatibility aliases keep working on every
+        // profile-taking action, landing canonicalized.
+        let args = parse_args(&argv(&["approve", "AB-12", "--profile", "peer-daemon"])).unwrap();
+        assert_eq!(args.profile.as_deref(), Some("peer-root"));
+        let args = parse_args(&argv(&["request", "https://t", "--profile", "admin"])).unwrap();
+        assert_eq!(args.profile.as_deref(), Some("peer-root"));
+        let args = parse_args(&argv(&["set-profile", "aabb", "--profile", "spectator"])).unwrap();
+        assert_eq!(
+            args.profile.as_deref(),
+            Some("shared-session-spectator")
+        );
+    }
+
+    #[test]
+    fn unknown_profile_names_error_loudly_instead_of_degrading() {
+        // A typo like read-only-dsplay used to parse fine and silently
+        // land as a presence-only grant with exit 0.
+        for action_argv in [
+            vec!["request", "https://t", "--profile", "read-only-dsplay"],
+            vec!["approve", "AB-12", "--profile", "read-only-dsplay"],
+            vec!["set-profile", "aabb", "--profile", "read-only-dsplay"],
+        ] {
+            let err = parse_args(&argv(&action_argv)).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("unknown peer profile 'read-only-dsplay'"),
+                "{action_argv:?}: {msg}"
+            );
+            assert!(msg.contains("read-only-display"), "{msg}");
+            assert!(msg.contains("peer-daemon = peer-root"), "{msg}");
+        }
     }
 
     #[test]

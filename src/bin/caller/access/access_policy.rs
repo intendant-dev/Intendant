@@ -249,19 +249,61 @@ pub(crate) const PROFILE_ALIASES: &[(&str, &str)] = &[
     ("peer-daemon", "peer-root"),
 ];
 
-pub fn profile_class(profile: &str) -> ProfileClass {
-    let normalized = profile.trim().to_ascii_lowercase();
+/// Resolve a trimmed, lowercased profile string to its canonical
+/// [`PROFILES`] entry, applying [`PROFILE_ALIASES`]. `None` when the name
+/// is outside the vocabulary.
+fn canonical_profile_entry(normalized: &str) -> Option<(&'static str, ProfileClass)> {
     let canonical = PROFILE_ALIASES
         .iter()
         .find(|(alias, _)| *alias == normalized)
         .map(|(_, canonical)| *canonical)
-        .unwrap_or(normalized.as_str());
+        .unwrap_or(normalized);
     PROFILES
         .iter()
         .find(|(name, _)| *name == canonical)
-        .map(|(_, class)| *class)
-        // Unknown profiles degrade to the least-capable class.
+        .copied()
+}
+
+pub fn profile_class(profile: &str) -> ProfileClass {
+    let normalized = profile.trim().to_ascii_lowercase();
+    canonical_profile_entry(&normalized)
+        .map(|(_, class)| class)
+        // Unknown profiles degrade to the least-capable class. This is the
+        // wire-side contract: a profile string this daemon does not know
+        // (stored by an older build, minted by a newer one) fails closed
+        // instead of failing the request. Locally-typed profile names are
+        // validated loudly before they get here — see
+        // [`require_known_profile`].
         .unwrap_or(ProfileClass::PresenceOnly)
+}
+
+/// Strict, operator-facing counterpart to [`normalize_profile`]:
+/// canonicalize a locally-typed profile name against the [`PROFILES`]
+/// vocabulary, resolving [`PROFILE_ALIASES`] to the canonical spelling,
+/// and error loudly on anything else. CLI-entered profiles (`peer
+/// request/approve/set-profile --profile`) go through here so a typo
+/// fails with the vocabulary listed instead of silently landing as a
+/// presence-only grant. Wire-side parsing is deliberately *not* strict:
+/// an unknown profile arriving on the wire is stored as-is and stays
+/// fail-closed via [`profile_class`]'s presence-only degrade.
+pub fn require_known_profile(raw: &str) -> Result<String, CallerError> {
+    let normalized = normalize_profile(raw)?;
+    if let Some((name, _)) = canonical_profile_entry(&normalized) {
+        return Ok(name.to_string());
+    }
+    let known = PROFILES
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let aliases = PROFILE_ALIASES
+        .iter()
+        .map(|(alias, canonical)| format!("{alias} = {canonical}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(CallerError::Config(format!(
+        "unknown peer profile '{normalized}'; known profiles: {known}; accepted aliases: {aliases}"
+    )))
 }
 
 pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
@@ -663,6 +705,91 @@ pub fn revoke_identity(
     Ok(record)
 }
 
+/// Outcome of [`set_identity_profile`]: the updated record plus the
+/// profile it replaced.
+#[derive(Debug, Clone)]
+pub struct ProfileChange {
+    pub record: PeerIdentityRecord,
+    pub previous_profile: String,
+}
+
+/// Change the profile of an approved inbound peer identity in place — no
+/// revoke/re-pair ceremony. `selector` is the identity's certificate
+/// fingerprint as printed by `intendant peer identities`: the full 64-hex
+/// value or an unambiguous hex prefix. The profile must be a known name
+/// or alias ([`require_known_profile`]) — a local edit has no legitimate
+/// use for an unknown profile, unlike wire ingestion.
+///
+/// This is the same offline state-file write `peer approve` performs: the
+/// gateway resolves a presented client certificate to its stored profile
+/// per request, so the change takes effect on the peer's next request
+/// with no daemon restart.
+pub fn set_identity_profile(
+    cert_dir: &Path,
+    selector: &str,
+    profile: &str,
+) -> Result<ProfileChange, CallerError> {
+    let profile = require_known_profile(profile)?;
+    let mut record = find_identity_by_fingerprint(cert_dir, selector)?;
+    if !matches!(record.status, PeerIdentityStatus::Approved) {
+        return Err(CallerError::Config(format!(
+            "peer identity {} ({}) is revoked; approve a new pairing instead of changing its profile",
+            record.fingerprint, record.label
+        )));
+    }
+    let previous_profile = std::mem::replace(&mut record.profile, profile);
+    write_identity_record(cert_dir, &record)?;
+    Ok(ProfileChange {
+        record,
+        previous_profile,
+    })
+}
+
+/// Find exactly one recorded identity by fingerprint — full 64-hex or an
+/// unambiguous prefix (':' separators tolerated, as in `normalize_fingerprint`).
+/// Errors loudly on no match and lists the candidates on an ambiguous one.
+fn find_identity_by_fingerprint(
+    cert_dir: &Path,
+    selector: &str,
+) -> Result<PeerIdentityRecord, CallerError> {
+    let needle: String = selector
+        .trim()
+        .chars()
+        .filter(|c| *c != ':')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if needle.is_empty() {
+        return Err(CallerError::Config(
+            "peer identity fingerprint is required".into(),
+        ));
+    }
+    if needle.len() > 64 || !needle.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(CallerError::Config(format!(
+            "invalid fingerprint selector {selector:?}: fingerprints are hex — copy one from `intendant peer identities`"
+        )));
+    }
+    let mut matches: Vec<PeerIdentityRecord> = list_identities(cert_dir)?
+        .into_iter()
+        .filter(|record| record.fingerprint.starts_with(&needle))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(CallerError::Config(format!(
+            "no peer identity matches fingerprint {selector:?}; run `intendant peer identities` to list them"
+        ))),
+        _ => {
+            let candidates = matches
+                .iter()
+                .map(|record| format!("{} ({})", record.fingerprint, record.label))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(CallerError::Config(format!(
+                "fingerprint prefix {selector:?} is ambiguous; candidates: {candidates}"
+            )))
+        }
+    }
+}
+
 pub fn fingerprint_der(der: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
@@ -1007,6 +1134,143 @@ mod tests {
         let revoked = revoke_identity(tmp.path(), "peer-a").unwrap();
         assert_eq!(revoked.status, PeerIdentityStatus::Revoked);
         assert!(revoked.revoked_at_unix.is_some());
+    }
+
+    #[test]
+    fn require_known_profile_accepts_canonical_and_resolves_aliases() {
+        for (name, _) in PROFILES {
+            assert_eq!(require_known_profile(name).unwrap(), *name);
+        }
+        for (alias, canonical) in PROFILE_ALIASES {
+            assert_eq!(require_known_profile(alias).unwrap(), *canonical);
+        }
+        // The documented upgrade path: the peer-daemon alias keeps working.
+        assert_eq!(require_known_profile("peer-daemon").unwrap(), "peer-root");
+        assert_eq!(require_known_profile("  Peer-Root ").unwrap(), "peer-root");
+    }
+
+    #[test]
+    fn require_known_profile_errors_loudly_with_the_vocabulary() {
+        // The typo class that used to silently degrade to presence-only.
+        let err = require_known_profile("read-only-dsplay").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown peer profile 'read-only-dsplay'"), "{msg}");
+        for (name, _) in PROFILES {
+            assert!(msg.contains(name), "missing {name} in: {msg}");
+        }
+        assert!(msg.contains("peer-daemon = peer-root"), "{msg}");
+        // Charset violations keep their dedicated diagnostic.
+        let err = require_known_profile("peer root").unwrap_err();
+        assert!(err.to_string().contains("may contain only"), "{err}");
+    }
+
+    #[test]
+    fn unknown_profiles_still_degrade_fail_closed_on_the_wire_side() {
+        // The strict CLI check must not tighten wire semantics: a stored
+        // profile this build does not know keeps authorizing as the
+        // least-capable class rather than erroring.
+        assert_eq!(
+            profile_class("future-profile"),
+            ProfileClass::PresenceOnly
+        );
+        assert!(profile_allows_operation(
+            "future-profile",
+            PeerOperation::PresenceRead
+        ));
+        assert!(!profile_allows_operation(
+            "future-profile",
+            PeerOperation::StatsRead
+        ));
+    }
+
+    #[test]
+    fn set_identity_profile_updates_the_stored_record_in_place() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        write_approved_identity(
+            tmp.path(),
+            fp,
+            "peer-a",
+            "read-only-display",
+            Some("https://peer/.well-known/agent-card.json"),
+            Some("req-1"),
+        )
+        .unwrap();
+
+        let change = set_identity_profile(tmp.path(), fp, "peer-operator").unwrap();
+        assert_eq!(change.previous_profile, "read-only-display");
+        assert_eq!(change.record.profile, "peer-operator");
+        assert_eq!(change.record.status, PeerIdentityStatus::Approved);
+        // Only the profile changes; provenance fields survive the edit.
+        assert_eq!(change.record.request_id.as_deref(), Some("req-1"));
+
+        // Persisted through the same store `peer approve` writes and the
+        // gateway rereads per request.
+        let loaded = lookup_identity(tmp.path(), fp).unwrap().unwrap();
+        assert_eq!(loaded.profile, "peer-operator");
+
+        // Aliases keep working and land canonicalized.
+        let change = set_identity_profile(tmp.path(), fp, "peer-daemon").unwrap();
+        assert_eq!(change.record.profile, "peer-root");
+    }
+
+    #[test]
+    fn set_identity_profile_resolves_unambiguous_prefixes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fp_a = "aa11111111111111111111111111111111111111111111111111111111111111";
+        let fp_b = "ab22222222222222222222222222222222222222222222222222222222222222";
+        write_approved_identity(tmp.path(), fp_a, "peer-a", "stats", None, None).unwrap();
+        write_approved_identity(tmp.path(), fp_b, "peer-b", "stats", None, None).unwrap();
+
+        let change = set_identity_profile(tmp.path(), "aa11", "file-reader").unwrap();
+        assert_eq!(change.record.fingerprint, fp_a);
+        assert_eq!(change.record.profile, "file-reader");
+
+        // A shared prefix is ambiguous and must list the candidates.
+        let err = set_identity_profile(tmp.path(), "a", "file-reader").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "{msg}");
+        assert!(msg.contains(fp_a) && msg.contains(fp_b), "{msg}");
+        assert!(msg.contains("peer-a") && msg.contains("peer-b"), "{msg}");
+    }
+
+    #[test]
+    fn set_identity_profile_rejects_unknown_selectors_and_profiles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        write_approved_identity(tmp.path(), fp, "peer-a", "stats", None, None).unwrap();
+
+        let err = set_identity_profile(tmp.path(), "ffff", "stats").unwrap_err();
+        assert!(
+            err.to_string().contains("no peer identity matches"),
+            "{err}"
+        );
+
+        let err = set_identity_profile(tmp.path(), "not-hex!", "stats").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid fingerprint selector"),
+            "{err}"
+        );
+
+        // Unknown profile fails loudly and leaves the record untouched.
+        let err = set_identity_profile(tmp.path(), fp, "read-only-dsplay").unwrap_err();
+        assert!(err.to_string().contains("unknown peer profile"), "{err}");
+        let loaded = lookup_identity(tmp.path(), fp).unwrap().unwrap();
+        assert_eq!(loaded.profile, "stats");
+    }
+
+    #[test]
+    fn set_identity_profile_refuses_revoked_identities() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        write_approved_identity(tmp.path(), fp, "peer-a", "stats", None, None).unwrap();
+        revoke_identity(tmp.path(), fp).unwrap();
+
+        let err = set_identity_profile(tmp.path(), fp, "peer-operator").unwrap_err();
+        assert!(err.to_string().contains("is revoked"), "{err}");
+        let loaded = lookup_identity(tmp.path(), fp).unwrap().unwrap();
+        assert_eq!(loaded.status, PeerIdentityStatus::Revoked);
+        assert_eq!(loaded.profile, "stats");
     }
 
     #[test]

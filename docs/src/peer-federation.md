@@ -698,6 +698,28 @@ headless and should be approved from its own CLI/logs.
    pins the target server fingerprint, and starts the live peer registration
    when the dashboard daemon is running.
 
+A granted profile can be changed later without re-pairing:
+
+```bash
+intendant peer set-profile <fingerprint> --profile peer-operator
+```
+
+`set-profile` rewrites the stored identity record for an approved inbound peer
+— copy the fingerprint from `intendant peer identities` (an unambiguous prefix
+works; no match and ambiguous prefixes error with the candidates listed). Like
+approval, this is an offline state-file write: the gateway resolves a presented
+client certificate to its stored profile on every request, so the new profile
+takes effect on the peer's next request with no daemon restart. Revoked
+identities cannot be edited — approve a new pairing instead.
+
+`--profile` values typed at the CLI (`request`, `approve`, `set-profile`) are
+validated against the canonical profile vocabulary and fail loudly on unknown
+names, listing the known profiles and aliases — a typo no longer silently
+lands as a presence-only grant. Aliases (e.g. `peer-daemon` for `peer-root`)
+keep working and resolve to their canonical name. Unknown profile strings
+arriving *on the wire* are still accepted and stay fail-closed: they degrade
+to presence-only at authorization time.
+
 The unauthenticated public surface for this flow is intentionally tiny:
 `POST /api/peer-pairing/requests` creates a pending request and
 `GET /api/peer-pairing/requests/<id>` lets the requester poll. Those endpoints do
