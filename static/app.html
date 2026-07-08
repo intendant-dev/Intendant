@@ -72806,6 +72806,22 @@ function renderTokenActivityHeatmap(days, startIso, todayIso) {
     }
     el.appendChild(div);
   }
+  // Recent end in view: below the grid's width floor the wrap overflows and
+  // scrollLeft 0 shows the oldest (all-empty) weeks — every lit cell sat
+  // off-screen right. Reposition only an untouched wrap so data-refresh
+  // re-renders don't fight a manual scroll.
+  const wrap = el.closest('.token-activity-heatmap-wrap');
+  if (wrap && wrap.scrollWidth > wrap.clientWidth) {
+    if (!wrap.dataset.scrollWired) {
+      wrap.dataset.scrollWired = '1';
+      wrap.addEventListener('scroll', () => {
+        const atEnd = wrap.scrollLeft + wrap.clientWidth >= wrap.scrollWidth - 4;
+        if (atEnd) delete wrap.dataset.userScrolled;
+        else wrap.dataset.userScrolled = '1';
+      }, { passive: true });
+    }
+    if (!wrap.dataset.userScrolled) wrap.scrollLeft = wrap.scrollWidth;
+  }
 }
 
 function tokenActivityMetricHtml(label, value) {
@@ -73054,9 +73070,23 @@ function renderAllSessionsUsage(sessions) {
   const grid = document.getElementById('all-sessions-grid');
   const emptyEl = document.getElementById('usage-empty');
   if (!el || !grid) return;
-  if (emptyEl) emptyEl.style.display = 'none';
   renderSessionStatsFallback(sessions);
   renderAgentUsage(sessions);
+  // "No usage yet" means zero recorded usage, not zero sessions — a bare
+  // daemon always carries its resident foreground session, so a count-based
+  // check could never fire. Show the designed empty card instead of a
+  // zeroed table until any session has usage entries (the card was hidden
+  // unconditionally after the first fetch).
+  const hasUsage = Array.isArray(sessions)
+    && sessions.some((s) => sessionUsageEntries(s).some((e) =>
+      e.total > 0 || e.input > 0 || e.cached > 0 || e.output > 0 || e.cost > 0));
+  if (!hasUsage) {
+    if (emptyEl) emptyEl.style.display = '';
+    el.style.display = 'none';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+  el.style.display = '';
 
   const todayIso = tokenActivityIsoToday();
 
