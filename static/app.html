@@ -17033,6 +17033,1120 @@ html.ui-v2 #tab-sessions .session-detail .empty-state {
     grid-template-columns: 1fr;
   }
 }
+/* ── static/app/ui2-live.css ── */
+/* ── ui-v2 Live display (Video tab) re-skin (design-overhaul P2) ───────
+   Everything here is scoped under `html.ui-v2` and restyles the EXISTING
+   displays DOM (display-slot toolbars/stages, banners, recording replay,
+   annotation + clip editors, peer-display pane controls) to the v2
+   design language — v1 stays pixel-identical.
+
+   HARD GUARDRAILS honoured throughout (audit §5, displays.md):
+   - No CSS touches video/canvas element DIMENSIONS with !important, and
+     no transforms on media elements: annotation overlays, the shared-view
+     focus box and interactive-input normalization all compute geometry
+     from getBoundingClientRect() + intrinsic dims assuming a pure
+     letterbox layout inside an untransformed element.
+   - The rounded "stage" clips via the WRAPPER (.display-canvas /
+     .recording-player-wrap): border-radius + overflow:hidden + an INSET
+     box-shadow ring. Deliberately no border and no padding on
+     .display-canvas — its absolutely-positioned overlay children anchor
+     to the padding box while getBoundingClientRect() measures the border
+     box, so a border would skew every overlay by its width.
+   - The single-<video>-reparented-everywhere pattern is untouched; the
+     activity-thumb and fullscreen contexts neutralize the stage chrome.
+   - The replay scrubber lives inside #recording-section, which the
+     existing JS only reveals when recordings actually exist — nothing
+     here implies a live-DVR scrub of the live stage.
+   - Honest input-authority language: taking control is last-take-wins
+     displacement (no request/approve ceremony), and the third state —
+     another viewer holding input — renders as an amber chip + rail row.
+
+   The right rail (.ui2-live-rail) is injected by the ui2Enabled()-gated
+   mirror block at the end of 45-displays-webrtc.js: it renders FROM the
+   existing slot DOM / station peer chips / sb-display-access chip and
+   proxies clicks to the existing controls. Display-only, v1 untouched. */
+
+/* ── tab scaffold: content column + fixed right rail ── */
+html.ui-v2 #tab-displays { padding-right: 284px; }
+html.ui-v2 #tab-displays > :not(.ui2-live-rail) { min-width: 0; }
+
+/* ── degraded state: macOS capture-approval banner (amber = needs you) ── */
+html.ui-v2 .display-approval-banner {
+  margin: 14px 16px 0;
+  padding: 13px 16px;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid rgba(var(--amber-rgb), .32);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02));
+}
+html.ui-v2 .display-approval-banner .icon {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  overflow: hidden;
+  font-size: 0;
+  color: transparent;
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .16);
+  animation: ui2-pulse 2s infinite;
+}
+html.ui-v2 .display-approval-banner .title {
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--amber);
+  margin-bottom: 3px;
+}
+html.ui-v2 .display-approval-banner .subtitle { font-size: 12px; color: var(--text-2); }
+
+/* ── shared-view banner (sky = live/info) ── */
+html.ui-v2 .shared-view-banner {
+  margin: 14px 16px 0;
+  padding: 10px 14px;
+  gap: 10px;
+  border: 1px solid rgba(var(--sky-rgb), .32);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(var(--sky-rgb), .10), rgba(var(--sky-rgb), .03));
+  font-size: 12.5px;
+}
+html.ui-v2 .shared-view-kicker {
+  color: var(--sky);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .08em;
+}
+html.ui-v2 .shared-view-message { color: var(--text-2); }
+html.ui-v2 .shared-view-action {
+  min-height: 0;
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 800;
+  transition: filter var(--t-med);
+}
+html.ui-v2 .shared-view-action:hover {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  filter: brightness(1.08);
+}
+html.ui-v2 .shared-view-close {
+  width: 26px;
+  min-height: 26px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 14px;
+  transition: color var(--t-fast), border-color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .shared-view-close:hover {
+  border-color: rgba(var(--rose-rgb), .4);
+  color: var(--rose);
+  background: rgba(var(--rose-rgb), .08);
+}
+/* compact variant docks flush inside the activity strip */
+html.ui-v2 .shared-view-banner-compact {
+  margin: 0;
+  border-radius: 0;
+  border-left: 0;
+  border-right: 0;
+  border-top-color: rgba(var(--sky-rgb), .22);
+  border-bottom-color: rgba(var(--sky-rgb), .22);
+  padding: 6px 12px;
+}
+
+/* ── displays container + empty state ── */
+html.ui-v2 .displays-container { padding: 2px 16px 14px; }
+html.ui-v2 .displays-container:not(.has-displays) { padding: 24px 16px; }
+html.ui-v2 #tab-displays .ui-empty-glyph {
+  width: 40px;
+  height: 40px;
+  border-radius: 11px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-2);
+  color: var(--text-3);
+}
+html.ui-v2 #tab-displays .ui-empty-title {
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 700;
+}
+html.ui-v2 #tab-displays .ui-empty-hint {
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* ── per-slot toolbar → the design's live toolbar ── */
+html.ui-v2 .display-slot + .display-slot { margin-top: 8px; }
+html.ui-v2 .display-toolbar {
+  background: transparent;
+  border-bottom: 0;
+  padding: 10px 2px 10px;
+  gap: 8px;
+}
+/* display name wears the design's picker-button look (static: every
+   granted display renders simultaneously — no dropdown to fake) */
+html.ui-v2 .display-label {
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+}
+/* connection status: dotted text when healthy, rose pill when degraded
+   (reconnect countdown / failed / disconnected / capture lost) */
+html.ui-v2 .display-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+html.ui-v2 .display-status::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--neutral-dot);
+}
+html.ui-v2 .display-status.connected { color: var(--text-2); }
+html.ui-v2 .display-status.connected::before {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16);
+}
+html.ui-v2 .display-status.error {
+  padding: 3px 10px;
+  border: 1px solid rgba(var(--rose-rgb), .26);
+  border-radius: var(--r-pill);
+  background: rgba(var(--rose-rgb), .10);
+  color: var(--rose);
+  font-weight: 700;
+  font-size: 11.5px;
+}
+html.ui-v2 .display-status.error::before { background: var(--rose); }
+
+/* input-authority chip — the three real states, honestly labeled:
+   you (green) / another viewer (amber, the displacement-aware third
+   state) / shared (neutral). 'unknown' stays hidden via JS. */
+html.ui-v2 .display-input-authority {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  margin-left: 0;
+  border-radius: var(--r-pill);
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--surface-3);
+  color: var(--text-2);
+  border: 1px solid var(--line-2);
+}
+html.ui-v2 .display-input-authority.you {
+  background: rgba(var(--green-rgb), .12);
+  border-color: rgba(var(--green-rgb), .26);
+  color: var(--green);
+}
+html.ui-v2 .display-input-authority.other {
+  background: rgba(var(--amber-rgb), .14);
+  border-color: rgba(var(--amber-rgb), .26);
+  color: var(--amber);
+}
+html.ui-v2 .display-input-authority.unclaimed {
+  background: var(--surface-3);
+  border-color: var(--line-2);
+  color: var(--text-2);
+}
+
+/* toolbar buttons: quiet secondaries by default */
+html.ui-v2 .display-toolbar button {
+  min-height: 0;
+  padding: 6px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast), filter var(--t-fast);
+}
+html.ui-v2 .display-toolbar button:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+  color: var(--text);
+}
+/* streaming to the presence model = sky (live/info) while active */
+html.ui-v2 .display-toolbar .stream-btn:hover { color: var(--sky); border-color: rgba(var(--sky-rgb), .4); background: rgba(var(--sky-rgb), .08); }
+html.ui-v2 .display-toolbar .stream-btn.active {
+  background: rgba(var(--sky-rgb), .14);
+  border-color: rgba(var(--sky-rgb), .32);
+  color: var(--sky);
+  font-weight: 700;
+}
+html.ui-v2 .display-toolbar .annotate-btn:hover,
+html.ui-v2 .display-toolbar .annotate-btn.active {
+  background: rgba(var(--iris-rgb), .14);
+  border-color: rgba(var(--iris-rgb), .3);
+  color: var(--iris-2);
+}
+/* Record: rose intent; recording state fills. (No ::before dot — the v1
+   JS swaps in its own ⏺/⏹ glyph on recording_started/stopped, and a CSS
+   dot would double it.) */
+html.ui-v2 .display-toolbar .record-btn {
+  border-color: rgba(var(--rose-rgb), .4);
+  color: var(--rose);
+  font-weight: 700;
+}
+html.ui-v2 .display-toolbar .record-btn:hover {
+  background: rgba(var(--rose-rgb), .10);
+  border-color: rgba(var(--rose-rgb), .55);
+  color: var(--rose);
+}
+html.ui-v2 .display-toolbar .record-btn.active {
+  background: var(--rose);
+  border-color: var(--rose);
+  color: var(--on-accent);
+}
+html.ui-v2 .display-toolbar .display-fullscreen-btn,
+html.ui-v2 .display-toolbar .display-close-btn {
+  width: 30px;
+  padding: 6px 0;
+  text-align: center;
+}
+html.ui-v2 .display-toolbar .display-close-btn:hover {
+  background: rgba(var(--rose-rgb), .08);
+  border-color: rgba(var(--rose-rgb), .4);
+  color: var(--rose);
+}
+/* Take control — the design's iris primary. The verb is honest: it takes
+   (displacing any other viewer), it does not request. */
+html.ui-v2 .display-toolbar .take-control-btn {
+  border: 0;
+  padding: 7px 14px;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-size: 12.5px;
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+}
+html.ui-v2 .display-toolbar .take-control-btn:hover {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  border: 0;
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+/* Release: you are holding input — amber = attention state */
+html.ui-v2 .display-toolbar .release-control-btn {
+  background: rgba(var(--amber-rgb), .14);
+  border-color: rgba(var(--amber-rgb), .32);
+  color: var(--amber);
+  font-weight: 700;
+}
+html.ui-v2 .display-toolbar .release-control-btn:hover {
+  background: rgba(var(--amber-rgb), .2);
+  border-color: rgba(var(--amber-rgb), .45);
+  color: var(--amber);
+}
+html.ui-v2 .display-toolbar .delete-recording-btn {
+  border-color: rgba(var(--rose-rgb), .4);
+  color: var(--rose);
+  font-size: 11.5px;
+}
+html.ui-v2 .display-toolbar .delete-recording-btn:hover {
+  background: rgba(var(--rose-rgb), .10);
+  border-color: rgba(var(--rose-rgb), .55);
+  color: var(--rose);
+}
+html.ui-v2 .display-toolbar .release-note {
+  border: 1px solid var(--line-2);
+  border-radius: 9px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  padding: 6px 10px;
+  width: 150px;
+}
+html.ui-v2 .display-toolbar .release-note::placeholder { color: var(--text-3); }
+html.ui-v2 .display-toolbar .release-note:focus { border-color: var(--iris); outline: none; box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25); }
+html.ui-v2 .stream-frame-id { font-family: var(--mono); }
+
+/* ── the stage: rounded dark viewport (WRAPPER does the clipping) ──
+   No border / no padding / no transform here — see the header note.
+   Flex centering only repositions the in-flow video element; all
+   overlay + input math measures live rects, and the letterbox lives
+   inside the untouched <video> box. */
+html.ui-v2 .display-canvas {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 16px;
+  overflow: hidden;
+  background: radial-gradient(120% 120% at 30% 0%, #10131b, #070810 70%);
+  box-shadow:
+    inset 0 0 0 1px var(--line-2),
+    inset 0 1px 0 rgba(255, 255, 255, .04),
+    0 24px 60px rgba(0, 0, 0, .5);
+}
+/* LIVE pill — pure CSS, derived from the real connection state; any
+   reconnect/degraded state drops .connected and the pill vanishes. */
+html.ui-v2 .display-slot:has(.display-status.connected) .display-canvas::after {
+  content: 'LIVE';
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  z-index: 6;
+  padding: 5px 11px 5px 24px;
+  border-radius: var(--r-pill);
+  background: rgba(11, 12, 16, .72);
+  border: 1px solid var(--line-2);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  color: var(--rose);
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: .04em;
+  pointer-events: none;
+}
+html.ui-v2 .display-slot:has(.display-status.connected) .display-canvas::before {
+  content: '';
+  position: absolute;
+  top: 22px;
+  left: 25px;
+  z-index: 7;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--rose);
+  animation: ui2-pulse 1.4s infinite;
+  pointer-events: none;
+}
+/* shared-view focus ring on the stage instead of a square slot outline */
+html.ui-v2 .display-slot.shared-view-active { outline: 0; }
+html.ui-v2 .display-slot.shared-view-active .display-canvas {
+  box-shadow:
+    inset 0 0 0 2px rgba(var(--sky-rgb), .74),
+    inset 0 1px 0 rgba(255, 255, 255, .04),
+    0 24px 60px rgba(0, 0, 0, .5);
+}
+html.ui-v2 .shared-view-focus-box {
+  border-radius: 6px;
+  border-color: var(--amber);
+  background: rgba(var(--amber-rgb), .06);
+  box-shadow:
+    0 0 0 1px rgba(7, 8, 16, .72),
+    0 0 12px rgba(var(--amber-rgb), .38);
+}
+html.ui-v2 .shared-view-focus-box::after {
+  border-radius: 8px;
+  background: rgba(11, 13, 18, .92);
+  border-color: rgba(var(--amber-rgb), .5);
+  font-family: var(--sans);
+}
+/* contexts that must NOT wear the stage chrome: activity thumbnails and
+   in-page fullscreen (the reparented canvas keeps its geometry honest) */
+html.ui-v2 .activity-display-thumb > .display-canvas {
+  border-radius: 3px;
+  box-shadow: none;
+}
+html.ui-v2 .display-slot.display-fullscreen { background: var(--bg); }
+html.ui-v2 .display-slot.display-fullscreen .display-canvas {
+  border-radius: 0;
+  box-shadow: none;
+}
+html.ui-v2 .display-slot.display-fullscreen .display-toolbar { padding: 10px 14px; }
+
+/* ── collapse bar + split handles ── */
+html.ui-v2 .displays-collapse-bar {
+  background: transparent;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 .displays-collapse-bar button {
+  color: var(--text-3);
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 600;
+  min-height: 0;
+}
+html.ui-v2 .displays-collapse-bar button:hover { color: var(--text); }
+html.ui-v2 .displays-split-handle,
+html.ui-v2 .activity-split-handle {
+  background: linear-gradient(180deg, transparent 2px, var(--line) 2px, var(--line) 3px, transparent 3px);
+}
+html.ui-v2 .displays-split-handle:hover,
+html.ui-v2 .displays-split-handle.dragging,
+html.ui-v2 .activity-split-handle:hover,
+html.ui-v2 .activity-split-handle.dragging {
+  background: rgba(var(--iris-rgb), .45);
+}
+
+/* ── recordings: shown only when recordings exist (JS-owned reveal) ── */
+html.ui-v2 .recording-section { background: transparent; border-top: 1px solid var(--line); }
+html.ui-v2 .recording-header {
+  background: transparent;
+  border-bottom: 0;
+  padding: 12px 16px 6px;
+  font-family: var(--sans);
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--text);
+}
+html.ui-v2 .recording-header select {
+  min-height: 0;
+  padding: 5px 9px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 400;
+}
+html.ui-v2 .recording-header .rec-status {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--green);
+}
+html.ui-v2 .recording-player-wrap {
+  margin: 4px 16px 0;
+  border-radius: 16px;
+  background: radial-gradient(120% 120% at 30% 0%, #10131b, #070810 70%);
+  box-shadow:
+    inset 0 0 0 1px var(--line-2),
+    inset 0 1px 0 rgba(255, 255, 255, .04);
+}
+
+/* replay scrubber: 6px iris→violet track, white playhead. The 28px strip
+   keeps its full hit-area and marker coordinate system; only paint moves.
+   (transforms below are on plain divs, never on media elements) */
+html.ui-v2 .recording-timeline {
+  background: transparent;
+  border-top: 0;
+  border-bottom: 0;
+  margin: 6px 16px 0;
+}
+html.ui-v2 .timeline-bar {
+  top: 50%;
+  height: 6px;
+  transform: translateY(-50%);
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+}
+html.ui-v2 .timeline-progress {
+  top: 50%;
+  height: 6px;
+  transform: translateY(-50%);
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, var(--iris), var(--violet));
+  opacity: 1;
+}
+html.ui-v2 .timeline-cursor {
+  top: 50%;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .5);
+  transform: translate(-6px, -50%);
+}
+html.ui-v2 .timeline-segment-mark {
+  top: 50%;
+  height: 6px;
+  transform: translateY(-50%);
+  background: rgba(var(--text-rgb), .22);
+  opacity: 1;
+}
+html.ui-v2 .timeline-event-mark { background: var(--amber); top: 4px; }
+
+/* clip range decorations riding the same strip */
+html.ui-v2 .timeline-clip-region { background: rgba(var(--amber-rgb), .16); opacity: 1; }
+html.ui-v2 .timeline-clip-marker { background: var(--amber); border-radius: 2px; }
+html.ui-v2 .timeline-clip-marker::after { color: var(--amber); font-family: var(--sans); }
+html.ui-v2 .timeline-keyframe-mark { background: var(--amber); border-radius: 1px; }
+html.ui-v2 .timeline-keyframe-mark:hover { background: var(--rose); }
+html.ui-v2 .timeline-ann-range { border-radius: 3px; }
+html.ui-v2 .timeline-ann-range.selected { outline-color: var(--text); }
+
+html.ui-v2 .recording-controls {
+  background: transparent;
+  padding: 6px 16px 12px;
+  gap: 8px;
+}
+html.ui-v2 .recording-controls button {
+  min-height: 0;
+  min-width: 34px;
+  padding: 6px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .recording-controls button:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+  color: var(--text);
+}
+html.ui-v2 .recording-controls .rec-time {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 .recording-controls select {
+  min-height: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+/* ── MSE loading overlay ── */
+html.ui-v2 .mse-loading-overlay { background: rgba(7, 8, 16, .8); }
+html.ui-v2 .mse-loading-inner .bar-track {
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+}
+html.ui-v2 .mse-loading-inner .bar-fill {
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, var(--iris), var(--violet));
+}
+html.ui-v2 .mse-loading-inner span { font-size: 12px; color: var(--text-2); }
+
+/* ── annotation toolbar ── */
+html.ui-v2 .annotation-toolbar {
+  background: var(--bg-1);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  padding: 8px 16px;
+  gap: 10px;
+}
+html.ui-v2 .ann-btn,
+html.ui-v2 .ann-thick,
+html.ui-v2 .ann-act,
+html.ui-v2 .ann-close {
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 13px;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .ann-btn:hover,
+html.ui-v2 .ann-thick:hover,
+html.ui-v2 .ann-act:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+  color: var(--text);
+}
+html.ui-v2 .ann-btn.active,
+html.ui-v2 .ann-thick.active {
+  background: rgba(var(--iris-rgb), .16);
+  border-color: rgba(var(--iris-rgb), .3);
+  color: var(--iris-2);
+}
+html.ui-v2 .ann-close:hover {
+  background: rgba(var(--rose-rgb), .08);
+  border-color: rgba(var(--rose-rgb), .4);
+  color: var(--rose);
+}
+html.ui-v2 .ann-color { border: 2px solid transparent; transition: box-shadow var(--t-fast), border-color var(--t-fast); }
+html.ui-v2 .ann-color:hover { border-color: var(--text-3); }
+html.ui-v2 .ann-color.active {
+  border-color: var(--text);
+  box-shadow: 0 0 0 3px rgba(var(--text-rgb), .14);
+}
+html.ui-v2 .ann-note {
+  border: 1px solid var(--line-2);
+  border-radius: 9px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  padding: 6px 10px;
+  width: 190px;
+}
+html.ui-v2 .ann-note::placeholder { color: var(--text-3); }
+html.ui-v2 .ann-note:focus { border-color: var(--iris); box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25); }
+/* triple action: Send = primary; Attach = secondary; Save = ghost */
+html.ui-v2 .ann-submit-btn,
+html.ui-v2 .clip-toolbar .clip-send-btn {
+  min-height: 0;
+  padding: 6px 13px;
+  border: 0;
+  border-radius: 9px;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .28);
+  transition: filter var(--t-med), opacity var(--t-med);
+}
+html.ui-v2 .ann-submit-btn:hover,
+html.ui-v2 .clip-toolbar .clip-send-btn:hover {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  opacity: 1;
+  filter: brightness(1.08);
+}
+html.ui-v2 .ann-submit-btn:disabled,
+html.ui-v2 .clip-toolbar .clip-send-btn:disabled {
+  opacity: .4;
+  background: var(--surface-2);
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  box-shadow: none;
+}
+html.ui-v2 .ann-submit-btn:disabled:hover,
+html.ui-v2 .clip-toolbar .clip-send-btn:disabled:hover {
+  opacity: .4;
+  background: var(--surface-2);
+  filter: none;
+}
+html.ui-v2 .ann-attach-btn {
+  min-height: 0;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .ann-attach-btn:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+  color: var(--text);
+}
+html.ui-v2 .ann-save-btn,
+html.ui-v2 .clip-toolbar .clip-save-btn {
+  min-height: 0;
+  padding: 6px 12px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  transition: color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .ann-save-btn:hover,
+html.ui-v2 .clip-toolbar .clip-save-btn:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+html.ui-v2 .ann-result { font-size: 11px; color: var(--text-3); }
+html.ui-v2 .ann-result:hover { color: var(--iris-2); }
+
+/* refs panels (saved frame/clip ids) */
+html.ui-v2 .annotation-refs-panel {
+  background: transparent;
+  border-top: 1px solid var(--line);
+  padding: 6px 16px;
+}
+html.ui-v2 .ann-ref-item {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--surface-3);
+  color: var(--sky);
+}
+html.ui-v2 .ann-ref-item:hover { background: var(--surface-2); }
+html.ui-v2 .ann-copy-all-btn {
+  font-family: var(--sans);
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-3);
+}
+html.ui-v2 .ann-copy-all-btn:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+  color: var(--text);
+}
+
+/* ── clip toolbar ── */
+html.ui-v2 .clip-toolbar {
+  background: var(--bg-1);
+  border-top: 1px solid var(--line);
+  padding: 8px 16px;
+  gap: 10px;
+}
+html.ui-v2 .clip-range-display { font-size: 11px; color: var(--text-2); }
+html.ui-v2 .clip-range-display a { color: var(--text-3); }
+html.ui-v2 .clip-range-display a:hover { color: var(--rose); }
+html.ui-v2 .clip-toolbar label { font-size: 11px; font-weight: 600; color: var(--text-3); }
+html.ui-v2 .clip-frame-count { font-size: 11px; color: var(--text-3); font-family: var(--mono); }
+html.ui-v2 .clip-toolbar select {
+  min-height: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+html.ui-v2 .clip-toolbar button {
+  min-height: 0;
+  padding: 6px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .clip-toolbar button:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+  color: var(--text);
+}
+html.ui-v2 .clip-toolbar button.active {
+  background: rgba(var(--iris-rgb), .16);
+  border-color: rgba(var(--iris-rgb), .3);
+  color: var(--iris-2);
+}
+html.ui-v2 .clip-ann-prompt { color: var(--amber); font-size: 11px; }
+html.ui-v2 .clip-status { color: var(--green); font-family: var(--mono); font-size: 11px; }
+html.ui-v2 .clip-progress .bar-track {
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+}
+html.ui-v2 .clip-progress .bar-fill {
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, var(--iris), var(--violet));
+}
+html.ui-v2 .clip-progress-text { color: var(--text-3); }
+html.ui-v2 .clip-progress .clip-cancel-btn {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-3);
+}
+html.ui-v2 .clip-progress .clip-cancel-btn:hover { border-color: rgba(var(--rose-rgb), .4); color: var(--rose); }
+html.ui-v2 .clip-preview-strip { background: var(--bg-1); border-top: 1px solid var(--line); }
+html.ui-v2 .clip-preview-thumb { border: 2px solid var(--line-2); border-radius: 7px; }
+html.ui-v2 .clip-preview-thumb:hover { border-color: var(--iris); }
+html.ui-v2 .clip-preview-thumb.keyframe { border-color: var(--amber); }
+html.ui-v2 .clip-preview-thumb.annotated { border-color: var(--rose); }
+html.ui-v2 .clip-preview-thumb .thumb-time {
+  background: rgba(7, 8, 16, .78);
+  color: var(--text-2);
+  font-family: var(--mono);
+}
+html.ui-v2 .clip-ann-banner {
+  background: var(--amber);
+  color: var(--on-accent);
+  border-radius: 9px;
+  font-family: var(--sans);
+  font-weight: 800;
+}
+
+/* ── activity display strip (shared classes; owned by the Activity pass,
+      re-tinted minimally here so the shared banner/thumbs cohere) ── */
+html.ui-v2 .activity-display-strip { background: var(--bg-1); border-bottom-color: var(--line); }
+html.ui-v2 .activity-display-header { color: var(--text-3); }
+html.ui-v2 .activity-display-header:hover { background: var(--hover-wash); }
+html.ui-v2 .activity-display-thumb { border-color: var(--line); border-radius: 7px; }
+html.ui-v2 .activity-display-thumb:hover { border-color: rgba(var(--iris-rgb), .4); }
+html.ui-v2 .thumb-label {
+  color: var(--text-2);
+  background: rgba(11, 13, 18, .78);
+  font-family: var(--mono);
+}
+
+/* ── user-display picker popover (opens from the status-bar chip; the
+      rail's "Your screen" card proxies the same control) ── */
+html.ui-v2 .display-picker {
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  padding: 5px;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, .6);
+}
+html.ui-v2 .display-picker-item {
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  padding: 8px 11px;
+}
+html.ui-v2 .display-picker-item:hover { background: rgba(var(--iris-rgb), .1); }
+html.ui-v2 .display-picker-item .dp-primary {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-2);
+  background: var(--surface-3);
+  border-radius: 6px;
+  padding: 1px 7px;
+  margin-left: 6px;
+}
+
+/* ── peer display pane controls (hosted in Access rows / Station
+      endpoints; video/tile elements untouched) ── */
+html.ui-v2 .peer-display-controls { gap: 8px; padding: 4px 0; }
+html.ui-v2 .peer-display-status { font-size: 11.5px; font-weight: 600; color: var(--text-2); }
+html.ui-v2 .peer-display-status.connected { color: var(--green); }
+html.ui-v2 .peer-display-status.error { color: var(--rose); }
+html.ui-v2 .peer-display-controls .take-control-btn,
+html.ui-v2 .peer-display-controls .release-control-btn,
+html.ui-v2 .peer-display-close {
+  min-height: 0;
+  padding: 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 11.5px;
+  font-weight: 600;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast), filter var(--t-fast);
+}
+html.ui-v2 .peer-display-controls .take-control-btn {
+  border: 0;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 800;
+}
+html.ui-v2 .peer-display-controls .take-control-btn:hover { filter: brightness(1.08); }
+html.ui-v2 .peer-display-controls .release-control-btn {
+  background: rgba(var(--amber-rgb), .14);
+  border-color: rgba(var(--amber-rgb), .32);
+  color: var(--amber);
+  font-weight: 700;
+}
+html.ui-v2 .peer-display-close { color: var(--rose); border-color: rgba(var(--rose-rgb), .4); }
+html.ui-v2 .peer-display-close:hover { background: rgba(var(--rose-rgb), .1); }
+
+/* ── right rail (injected, display-only mirror) ── */
+html.ui-v2 .ui2-live-rail {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 284px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  padding: 20px 18px;
+  overflow-y: auto;
+  border-left: 1px solid var(--line);
+  background: var(--bg-1);
+}
+html.ui-v2 .ui2-live-rail-eyebrow {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  margin-bottom: 10px;
+}
+html.ui-v2 .ui2-live-rail-list { display: flex; flex-direction: column; gap: 8px; }
+html.ui-v2 .ui2-live-rail-empty { font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
+html.ui-v2 .ui2-live-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 0;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--sans);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .ui2-live-row:hover { border-color: var(--line-2); background: var(--surface-2); }
+html.ui-v2 .ui2-live-row:disabled { opacity: .55; cursor: default; }
+html.ui-v2 .ui2-live-row:disabled:hover { border-color: var(--line); background: var(--surface); }
+html.ui-v2 .ui2-live-row.viewing {
+  border-color: var(--iris);
+  background: rgba(var(--iris-rgb), .08);
+}
+html.ui-v2 .ui2-live-row-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--neutral-dot);
+}
+html.ui-v2 .ui2-live-row.ok .ui2-live-row-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16);
+}
+html.ui-v2 .ui2-live-row.err .ui2-live-row-dot {
+  background: var(--rose);
+  box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .16);
+}
+html.ui-v2 .ui2-live-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+html.ui-v2 .ui2-live-row-title {
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+html.ui-v2 .ui2-live-row-meta {
+  margin-top: 2px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+html.ui-v2 .ui2-live-row-tag {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  color: var(--iris-2);
+}
+html.ui-v2 .ui2-live-row-chev { flex: 0 0 auto; color: var(--text-3); font-size: 14px; }
+
+html.ui-v2 .ui2-live-card {
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--surface);
+  padding: 14px 15px;
+}
+html.ui-v2 .ui2-live-card-title { font-size: 13.5px; font-weight: 800; color: var(--text); }
+html.ui-v2 .ui2-live-card-sub {
+  margin-top: 6px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-2);
+}
+html.ui-v2 .ui2-live-auth-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 11px;
+}
+html.ui-v2 .ui2-live-auth-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+html.ui-v2 .ui2-live-state-pill {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line-2);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+html.ui-v2 .ui2-live-state-pill.you {
+  background: rgba(var(--green-rgb), .12);
+  border-color: rgba(var(--green-rgb), .26);
+  color: var(--green);
+}
+html.ui-v2 .ui2-live-state-pill.other {
+  background: rgba(var(--amber-rgb), .14);
+  border-color: rgba(var(--amber-rgb), .26);
+  color: var(--amber);
+}
+html.ui-v2 .ui2-live-card-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 0;
+  margin-top: 9px;
+  padding: 9px;
+  border: 0;
+  border-radius: 9px;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  transition: filter var(--t-med);
+}
+html.ui-v2 .ui2-live-card-btn:hover { filter: brightness(1.08); }
+html.ui-v2 .ui2-live-card-btn.release {
+  background: rgba(var(--amber-rgb), .14);
+  border: 1px solid rgba(var(--amber-rgb), .32);
+  color: var(--amber);
+  box-shadow: none;
+}
+html.ui-v2 .ui2-live-card-btn.secondary {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  box-shadow: none;
+  font-weight: 700;
+}
+html.ui-v2 .ui2-live-card-btn.secondary:hover { background: var(--surface-3); border-color: var(--line-2); filter: none; }
+html.ui-v2 .ui2-live-card-btn.danger {
+  background: transparent;
+  border: 1px solid rgba(var(--rose-rgb), .4);
+  color: var(--rose);
+  box-shadow: none;
+  font-weight: 700;
+}
+html.ui-v2 .ui2-live-card-btn.danger:hover { background: rgba(var(--rose-rgb), .1); filter: none; }
+
+/* narrow: the rail yields to the stage */
+@media (max-width: 1100px) {
+  html.ui-v2 #tab-displays { padding-right: 0; }
+  html.ui-v2 .ui2-live-rail { display: none; }
+}
 </style>
 <!-- ── static/app/20-shell.html ── -->
 </head>
@@ -52659,6 +53773,272 @@ function applyDisplayStripState() {
   });
 }
 
+
+// ── ui-v2 Live-display right rail (design-overhaul P2) ─────────────────
+// Display-only mirror chrome, active only under the ?ui=v2 flag: renders
+// rail rows FROM existing state (displaySlots + slot DOM, the Station
+// peer-display chips, the sb-display-access grant chip) via
+// MutationObservers, and proxies every click to the existing controls.
+// It owns no state, sends no messages, and never touches the WebRTC
+// slots, the single-reparented <video> elements, or v1 markup. Honest
+// authority copy: taking control is last-take-wins displacement between
+// viewers (no request/approve ceremony), and "another viewer has input"
+// is a first-class rendered state.
+if (typeof ui2Enabled === 'function' && ui2Enabled()) (() => {
+  const tab = document.getElementById('tab-displays');
+  if (!tab) return;
+  const rail = document.createElement('aside');
+  rail.className = 'ui2-live-rail';
+  rail.id = 'ui2-live-rail';
+  rail.innerHTML = `
+    <section>
+      <div class="ui2-live-rail-eyebrow">Displays</div>
+      <div class="ui2-live-rail-list" id="ui2-live-displays-list"></div>
+    </section>
+    <section>
+      <div class="ui2-live-rail-eyebrow">Input authority</div>
+      <div id="ui2-live-authority-card"></div>
+    </section>
+    <section>
+      <div class="ui2-live-rail-eyebrow">Peer displays</div>
+      <div class="ui2-live-rail-list" id="ui2-live-peer-list"></div>
+    </section>
+    <section>
+      <div class="ui2-live-rail-eyebrow">Your screen</div>
+      <div id="ui2-live-yourscreen"></div>
+    </section>`;
+  tab.appendChild(rail);
+  const displaysList = rail.querySelector('#ui2-live-displays-list');
+  const authorityCard = rail.querySelector('#ui2-live-authority-card');
+  const peerList = rail.querySelector('#ui2-live-peer-list');
+  const yourScreen = rail.querySelector('#ui2-live-yourscreen');
+
+  const emptyHint = (text) => {
+    const div = document.createElement('div');
+    div.className = 'ui2-live-rail-empty';
+    div.textContent = text;
+    return div;
+  };
+
+  function renderDisplayRows() {
+    displaysList.textContent = '';
+    const slots = Array.from(displaySlots.values());
+    if (!slots.length) {
+      displaysList.appendChild(emptyHint('No displays active. They appear here when the agent launches a GUI or you share your screen.'));
+      return;
+    }
+    for (const slot of slots) {
+      const row = document.createElement('button');
+      row.type = 'button';
+      const err = slot.statusEl && slot.statusEl.classList.contains('error');
+      row.className = 'ui2-live-row' + (slot.connected ? ' ok viewing' : (err ? ' err' : ''));
+      const dot = document.createElement('span');
+      dot.className = 'ui2-live-row-dot';
+      const main = document.createElement('span');
+      main.className = 'ui2-live-row-main';
+      const title = document.createElement('span');
+      title.className = 'ui2-live-row-title';
+      const labelEl = slot.el && slot.el.querySelector('.display-label');
+      title.textContent = (labelEl && labelEl.textContent) || `Display ${slot.displayId}`;
+      const meta = document.createElement('span');
+      meta.className = 'ui2-live-row-meta';
+      meta.textContent = (slot.statusEl && slot.statusEl.textContent) || '';
+      main.appendChild(title);
+      main.appendChild(meta);
+      row.appendChild(dot);
+      row.appendChild(main);
+      if (slot.connected) {
+        const tag = document.createElement('span');
+        tag.className = 'ui2-live-row-tag';
+        tag.textContent = 'VIEWING';
+        row.appendChild(tag);
+      }
+      row.title = 'Scroll this display into view';
+      row.addEventListener('click', () => {
+        if (slot.el && slot.el.isConnected) slot.el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      });
+      displaysList.appendChild(row);
+    }
+  }
+
+  const AUTH_LABEL = {
+    you: 'you',
+    other: 'another viewer',
+    unclaimed: 'shared',
+    unknown: 'view-only',
+  };
+  function renderAuthorityCard() {
+    authorityCard.textContent = '';
+    const card = document.createElement('div');
+    card.className = 'ui2-live-card';
+    const title = document.createElement('div');
+    title.className = 'ui2-live-card-title';
+    const sub = document.createElement('div');
+    sub.className = 'ui2-live-card-sub';
+    const slots = Array.from(displaySlots.values());
+    if (!slots.length) {
+      title.textContent = 'No live display';
+      sub.textContent = 'Input authority appears here once a display is streaming.';
+      card.appendChild(title);
+      card.appendChild(sub);
+      authorityCard.appendChild(card);
+      return;
+    }
+    const anyYou = slots.some(s => s.authorityState === 'you');
+    const anyOther = slots.some(s => s.authorityState === 'other');
+    title.textContent = anyYou
+      ? 'You have input control'
+      : anyOther
+        ? 'Another viewer has input'
+        : 'You have view-only';
+    sub.textContent = 'Take control forwards your mouse and keyboard to the display. It displaces whoever holds input — last take wins, there is no approval step. Release hands the display back.';
+    card.appendChild(title);
+    card.appendChild(sub);
+    for (const slot of slots) {
+      const row = document.createElement('div');
+      row.className = 'ui2-live-auth-row';
+      const name = document.createElement('span');
+      name.className = 'ui2-live-auth-name';
+      const labelEl = slot.el && slot.el.querySelector('.display-label');
+      name.textContent = (labelEl && labelEl.textContent) || `Display ${slot.displayId}`;
+      const pill = document.createElement('span');
+      const st = slot.authorityState || 'unknown';
+      pill.className = 'ui2-live-state-pill' + (st === 'you' ? ' you' : st === 'other' ? ' other' : '');
+      pill.textContent = AUTH_LABEL[st] || AUTH_LABEL.unknown;
+      row.appendChild(name);
+      row.appendChild(pill);
+      card.appendChild(row);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      if (st === 'you') {
+        btn.className = 'ui2-live-card-btn release';
+        btn.textContent = 'Release control';
+        btn.title = 'Release input and return this display to view-only';
+        btn.addEventListener('click', () => {
+          const b = document.getElementById(`ds-release-${slot.displayId}`);
+          if (b) b.click();
+        });
+      } else {
+        btn.className = 'ui2-live-card-btn';
+        btn.textContent = st === 'other' ? 'Take control anyway' : 'Take control';
+        btn.title = st === 'other'
+          ? 'Takes input immediately and displaces the current viewer'
+          : 'Take interactive control of this display (keyboard and mouse)';
+        btn.addEventListener('click', () => {
+          const b = document.getElementById(`ds-take-${slot.displayId}`);
+          if (b) b.click();
+        });
+      }
+      card.appendChild(btn);
+    }
+    authorityCard.appendChild(card);
+  }
+
+  function renderPeerRows() {
+    peerList.textContent = '';
+    const chips = document.querySelectorAll('#station-peer-chips .station-peer-chip');
+    if (!chips.length) {
+      peerList.appendChild(emptyHint('No peer displays advertised. Paired daemons that share a display appear here.'));
+      return;
+    }
+    chips.forEach((chip) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'ui2-live-row' + (chip.disabled ? '' : ' ok');
+      row.disabled = chip.disabled;
+      row.title = chip.title || '';
+      const dot = document.createElement('span');
+      dot.className = 'ui2-live-row-dot';
+      const main = document.createElement('span');
+      main.className = 'ui2-live-row-main';
+      const title = document.createElement('span');
+      title.className = 'ui2-live-row-title';
+      title.textContent = chip.textContent || '';
+      const meta = document.createElement('span');
+      meta.className = 'ui2-live-row-meta';
+      meta.textContent = chip.disabled ? 'peer offline' : 'peer · view display';
+      main.appendChild(title);
+      main.appendChild(meta);
+      const chev = document.createElement('span');
+      chev.className = 'ui2-live-row-chev';
+      chev.textContent = '›';
+      row.appendChild(dot);
+      row.appendChild(main);
+      row.appendChild(chev);
+      row.addEventListener('click', () => chip.click());
+      peerList.appendChild(row);
+    });
+  }
+
+  function renderYourScreen() {
+    yourScreen.textContent = '';
+    const chip = document.getElementById('sb-display-access');
+    const card = document.createElement('div');
+    card.className = 'ui2-live-card';
+    const head = document.createElement('div');
+    head.style.display = 'flex';
+    head.style.alignItems = 'center';
+    head.style.gap = '8px';
+    const title = document.createElement('div');
+    title.className = 'ui2-live-card-title';
+    title.style.flex = '1';
+    title.textContent = 'Your screen';
+    const granted = !!(chip && chip.classList.contains('granted'));
+    const pill = document.createElement('span');
+    pill.className = 'ui2-live-state-pill' + (granted ? ' you' : '');
+    pill.textContent = granted ? 'shared' : 'off';
+    head.appendChild(title);
+    head.appendChild(pill);
+    const sub = document.createElement('div');
+    sub.className = 'ui2-live-card-sub';
+    sub.textContent = granted
+      ? 'The agent can see and drive this screen for computer-use tasks until you revoke access.'
+      : 'Share your own screen with the agent for computer-use tasks. You choose the display and can revoke at any time.';
+    card.appendChild(head);
+    card.appendChild(sub);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ui2-live-card-btn ' + (granted ? 'danger' : 'secondary');
+    btn.textContent = granted ? 'Revoke access' : 'Share your screen…';
+    btn.title = chip ? chip.title : '';
+    btn.disabled = !chip;
+    btn.addEventListener('click', (e) => {
+      // Same flow as the status-bar chip (single display → instant
+      // grant; multiple → picker popover anchored at the chip).
+      e.stopPropagation();
+      if (chip) chip.click();
+    });
+    card.appendChild(btn);
+    yourScreen.appendChild(card);
+  }
+
+  let railRaf = 0;
+  function renderRail() {
+    railRaf = 0;
+    renderDisplayRows();
+    renderAuthorityCard();
+    renderPeerRows();
+    renderYourScreen();
+  }
+  function scheduleRail() {
+    if (railRaf) return;
+    railRaf = requestAnimationFrame(renderRail);
+  }
+  const observe = (el, opts) => {
+    if (!el) return;
+    new MutationObserver(scheduleRail).observe(el, opts);
+  };
+  // Slots come and go / status text + authority chips restyle in place.
+  observe(document.getElementById('displays-container'),
+    { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'style'], characterData: true });
+  // Station peer chips re-render on peer_display_ready/removed.
+  observe(document.getElementById('station-peer-chips'),
+    { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'disabled', 'title'] });
+  // user_session grant chip flips text + .granted.
+  observe(document.getElementById('sb-display-access'),
+    { childList: true, attributes: true, attributeFilter: ['class'], characterData: true, subtree: true });
+  renderRail();
+})();
 /* ── static/app/46-recording-replay.js ── */
 // ── Recording Replay ──
 
