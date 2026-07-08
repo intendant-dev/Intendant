@@ -34,6 +34,10 @@ html.ui-v2 {
   --text-2: #A7AEBE;
   --text-3: #6C7482;
 
+  /* — type recipes (one eyebrow, everywhere — drift killer) — */
+  --eyebrow-size: 10px;
+  --eyebrow-track: .1em;
+
   /* — brand + semantics — */
   --iris: #7E8CFA;
   --iris-2: #A6AEFF;
@@ -146,7 +150,7 @@ html.ui-v2[data-theme="light"] {
   /* — ink — */
   --text: #171A23;
   --text-2: #4B5265;
-  --text-3: #7B8296;
+  --text-3: #6B7286; /* AA for the 10px copy this carries (4.5:1 on --bg; #7B8296 was 3.55:1) */
 
   /* — brand + semantics — */
   --iris: #5A69EE;

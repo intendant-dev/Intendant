@@ -269,6 +269,11 @@ function ui2SettingsSyncMirrors() {
 // pane toggle so section-shown work runs on real switches.
 function ui2SettingsOnSubtabShown(name) {
   if (typeof ui2Enabled !== 'function' || !ui2Enabled() || !ui2SettingsBuilt) return;
+  // Sections share one scroll container — land each switch at its top,
+  // not wherever the previous section was scrolled to. (Deep-link scrolls
+  // like focusSettingsApiKeys run after this, in their own rAF.)
+  const tab = document.getElementById('tab-settings');
+  if (tab) tab.scrollTop = 0;
   if (name === 'autonomy') {
     // Re-pull the live rules (shared refreshControlPane path) each visit.
     refreshControlPane();
@@ -417,10 +422,6 @@ function ui2SettingsBuild() {
     const keys = cardOf('settings-keys-heading');
     if (keys) panes.providers.appendChild(keys);
 
-    // "take effect on next task" note from the old Agent pane.
-    const agentNote = document.querySelector('#settings-pane-agent .settings-note');
-    if (agentNote) panes.providers.appendChild(agentNote);
-
     // External agent → "Managed backend" with a segmented proxy over the
     // existing select + an Advanced fold for binaries and tier.
     const ext = cardOf('settings-external-agent-heading');
@@ -452,6 +453,13 @@ function ui2SettingsBuild() {
       const routingRows = document.getElementById('cu-routing-rows');
       if (fold && routingRows) fold.querySelector('.ui2-fold-body').prepend(routingRows);
     }
+
+    // "saved to intendant.toml / next task" note from the old Agent pane
+    // — placed LAST, directly above the Save/Reset row it describes.
+    // (Between the API-keys and External-agent cards it read as if the
+    // keys saved to intendant.toml; they save to ~/.config/intendant/.env.)
+    const agentNote = document.querySelector('#settings-pane-agent .settings-note');
+    if (agentNote) panes.providers.appendChild(agentNote);
   }
 
   // ── Presence & voice ──
@@ -562,6 +570,11 @@ function ui2SettingsBuild() {
     const el = document.getElementById('ui2-ro-model');
     if (el) el.textContent = (src.textContent || '').trim() || '—';
   });
+  // Theme truth is the <html> data-theme attribute — observe it (like the
+  // chrome button's icon does) so EVERY flip path repaints the Appearance
+  // segmented, not just the click paths that remember to call us.
+  new MutationObserver(() => ui2SettingsRenderAppearance()).observe(
+    document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
   ui2SettingsRenderRules();
   ui2SettingsRenderAppearance();

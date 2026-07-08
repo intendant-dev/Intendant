@@ -565,10 +565,10 @@ function sendShellResize(cols, rows, options = {}) {
 
 // Build the xterm theme object from the ui-v2 design tokens. xterm paints
 // into canvas/inline-styled DOM, so CSS custom properties cannot cascade in —
-// they are resolved here once at init (the ui-v2 flag is fixed pre-paint for
-// the whole page load, and v2 keeps terminal surfaces dark in every app
-// theme). Returns null when the tokens are unavailable so the caller can
-// fall back to the v1 palette.
+// they are resolved here at init and re-resolved on every live theme flip
+// (the data-theme observer in initShell re-applies them; since the light
+// token import, code surfaces follow the app theme). Returns null when the
+// tokens are unavailable so the caller can fall back to the v1 palette.
 function ui2ShellTheme() {
   const styles = getComputedStyle(document.documentElement);
   const token = name => styles.getPropertyValue(name).trim();
@@ -632,6 +632,16 @@ function initShell() {
     shellTerm.open(document.getElementById('shell-container'));
     syncTerminalPaneAccessibility();
     shellFitAddon.fit();
+    // Live theme flips: xterm latched the palette resolved above; re-apply
+    // from the current tokens whenever data-theme changes (a light terminal
+    // otherwise sits inside a dark app, and vice versa).
+    if (ui2) {
+      new MutationObserver(() => {
+        if (!shellTerm || typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
+        const t = ui2ShellTheme();
+        if (t) shellTerm.options.theme = t;
+      }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    }
 
     // Forward every byte the user types straight to the PTY. We use
     // `onData` (not `onKey`) so sequences like arrow keys, Ctrl+C, and

@@ -1,5 +1,9 @@
 </head>
 <body>
+<!-- First focusable in the document: the v2 chrome renders at body end,
+     so without this the nav rail would be the LAST tab stop. Inert (display:
+     none) under v1; styles in ui2-chrome.css. -->
+<a class="ui2-skip" href="#ui2-nav">Skip to navigation</a>
 <div id="app">
 
   <!-- Status Bar -->

@@ -16,6 +16,19 @@ html.ui-v2 .session-window-grid {
   border-bottom: 1px solid var(--line);
   background: var(--bg);
 }
+/* Resized grid: v1 pins a fixed height with overflow:visible, and a
+   definite height COMPRESSES the auto rows — at 5-6 windows row 1's
+   cards painted over row 2 (measured: 320px cards in 298px tracks;
+   ledger finding #4). Under v2 the dragged size is a CAP the area
+   scrolls within, so tracks keep content size and rows never overlap.
+   Cost: a ⋯ menu taller than the remaining grid area scrolls instead of
+   escaping — the lesser evil vs overlapping cards. */
+html.ui-v2 .session-window-grid.resized {
+  height: auto;
+  max-height: var(--session-window-grid-height);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
 html.ui-v2 .session-window-grid-resize-handle::before {
   width: 44px;
   height: 4px;
@@ -175,8 +188,11 @@ html.ui-v2 .session-window-menu-separator {
 
 /* — per-window log — */
 html.ui-v2 .session-window-log { padding: 4px 10px 8px; }
-/* narrower gutter inside windows than the main timeline */
-html.ui-v2 .session-window-log .log-entry { grid-template-columns: 44px 14px max-content max-content max-content max-content minmax(0, 1fr); }
+/* narrower gutter inside windows than the main timeline — but wide
+   enough for a full 8-char mono timestamp (44px ellipsized "18:31…");
+   col 2 shrinks to 10px because the role dot is hidden in windows */
+html.ui-v2 .session-window-log .log-entry { grid-template-columns: 54px 10px max-content max-content max-content max-content minmax(0, 1fr); }
+html.ui-v2 .session-window-log .log-entry .log-ts { font-size: 10px; }
 html.ui-v2 .session-window-empty {
   color: var(--text-3);
   font-size: 12px;
@@ -229,3 +245,11 @@ html.ui-v2 .concurrent-log-action[aria-pressed="true"] { color: var(--iris-2); }
 html.ui-v2 .session-window { background: var(--surface); }
 html.ui-v2 .session-window-header { background: var(--surface-2); }
 html.ui-v2 .concurrent-log-region { background: var(--bg); }
+
+/* Light theme: the session-badge vars are dark-theme pastels (see the
+   matching remap in ui2-activity.css) — re-derive the window id chip
+   toward ink so per-session identity stays legible on light surfaces. */
+html.ui-v2[data-theme="light"] .session-window-id {
+  color: color-mix(in srgb, var(--session-badge-fg, var(--text-2)) 34%, var(--text));
+  border-color: color-mix(in srgb, var(--session-badge-border, var(--line-2)) 55%, var(--line-2));
+}

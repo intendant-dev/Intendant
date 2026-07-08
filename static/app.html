@@ -11964,6 +11964,10 @@ html.ui-v2 {
   --text-2: #A7AEBE;
   --text-3: #6C7482;
 
+  /* — type recipes (one eyebrow, everywhere — drift killer) — */
+  --eyebrow-size: 10px;
+  --eyebrow-track: .1em;
+
   /* — brand + semantics — */
   --iris: #7E8CFA;
   --iris-2: #A6AEFF;
@@ -12076,7 +12080,7 @@ html.ui-v2[data-theme="light"] {
   /* — ink — */
   --text: #171A23;
   --text-2: #4B5265;
-  --text-3: #7B8296;
+  --text-3: #6B7286; /* AA for the 10px copy this carries (4.5:1 on --bg; #7B8296 was 3.55:1) */
 
   /* — brand + semantics — */
   --iris: #5A69EE;
@@ -12259,7 +12263,7 @@ html.ui-v2 .ui2-host-chev { color: var(--text-3); display: flex; }
 html.ui-v2 .ui2-nav-groups { flex: 1; overflow-y: auto; padding: 4px 10px 10px; }
 html.ui-v2 .ui2-nav-group { margin-bottom: 12px; }
 html.ui-v2 .ui2-nav-eyebrow {
-  font-size: 10px; font-weight: 700; letter-spacing: .11em; text-transform: uppercase;
+  font-size: var(--eyebrow-size); font-weight: 700; letter-spacing: var(--eyebrow-track); text-transform: uppercase;
   color: var(--text-3); padding: 6px 8px 5px;
 }
 html.ui-v2 .ui2-nav-item {
@@ -12298,7 +12302,7 @@ html.ui-v2 .ui2-autonomy:hover { background: var(--surface-2); border-color: var
 html.ui-v2 .ui2-autonomy-icon { color: var(--amber); display: flex; flex-shrink: 0; }
 html.ui-v2 .ui2-autonomy-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 html.ui-v2 .ui2-autonomy-eyebrow {
-  font-size: 9px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase;
+  font-size: 9px; font-weight: 700; letter-spacing: var(--eyebrow-track); text-transform: uppercase;
   color: var(--text-3);
 }
 html.ui-v2 .ui2-autonomy-level { font-size: 13px; font-weight: 700; }
@@ -12310,7 +12314,7 @@ html.ui-v2 .ui2-autonomy[data-level="full"] .ui2-autonomy-icon { color: var(--gr
 html.ui-v2 .ui2-identity { display: flex; align-items: center; gap: 10px; padding: 5px 4px 3px; }
 html.ui-v2 .ui2-identity-avatar {
   width: 28px; height: 28px; border-radius: 50%; flex-shrink: 0;
-  background: linear-gradient(145deg, #3a4152, #20242f);
+  background: linear-gradient(145deg, var(--surface-3), var(--surface-2));
   border: 1px solid var(--line-2);
   display: flex; align-items: center; justify-content: center;
   font-size: 11px; font-weight: 800; color: var(--text);
@@ -12340,10 +12344,14 @@ html.ui-v2 .ui2-pill {
   display: inline-flex; align-items: center; gap: 8px;
   padding: 5px 12px 5px 10px; border-radius: var(--r-pill);
   white-space: nowrap; flex-shrink: 0;
+  max-width: 340px;
   background: var(--surface-2); border: 1px solid var(--line);
 }
 html.ui-v2 .ui2-pill-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--neutral-dot); }
-html.ui-v2 .ui2-pill-text { font-size: 12.5px; font-weight: 700; color: var(--text-2); }
+html.ui-v2 .ui2-pill-text {
+  font-size: 12.5px; font-weight: 700; color: var(--text-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 html.ui-v2 .ui2-pill[data-cat="waiting"] {
   background: rgba(var(--amber-rgb), .12); border-color: rgba(var(--amber-rgb), .26);
 }
@@ -12377,10 +12385,14 @@ html.ui-v2 .ui2-stop[hidden] { display: none; }
 html.ui-v2 .ui2-stop-icon { display: flex; }
 
 html.ui-v2 .ui2-ovs-divider { width: 1px; height: 20px; background: var(--line); flex-shrink: 0; }
-html.ui-v2 .ui2-ovs-title-group { display: flex; align-items: center; gap: 8px; min-width: 0; overflow: hidden; }
-html.ui-v2 .ui2-ovs-title { font-size: 13px; font-weight: 700; white-space: nowrap; color: var(--text); }
+/* The title keeps a floor (the tab name must always render — the collapsed
+   rail is icon-only, so nothing else names the screen); the mono session id
+   soaks flex squeeze first. */
+html.ui-v2 .ui2-ovs-title-group { display: flex; align-items: center; gap: 8px; flex: 0 1 auto; min-width: 72px; overflow: hidden; }
+html.ui-v2 .ui2-ovs-title { font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
 html.ui-v2 .ui2-ovs-session {
   font-family: var(--mono); font-size: 11px; color: var(--text-3);
+  flex: 0 10 auto; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 html.ui-v2 .ui2-ovs-spacer { flex: 1; }
@@ -12467,8 +12479,9 @@ html.ui-v2 #ui2-palette-input {
   color: var(--text); font-family: inherit; font-size: 14px;
 }
 html.ui-v2 #ui2-palette-input:focus-visible { outline: none; }
+html.ui-v2 #ui2-palette-input::placeholder { color: var(--text-3); }
 html.ui-v2 .ui2-palette-eyebrow {
-  font-size: 10.5px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+  font-size: var(--eyebrow-size); font-weight: 700; letter-spacing: var(--eyebrow-track); text-transform: uppercase;
   color: var(--text-3); padding: 10px 15px 4px;
 }
 html.ui-v2 #ui2-palette-list { overflow-y: auto; padding: 4px 6px 8px; }
@@ -12548,12 +12561,15 @@ html.ui-v2 .ui2-ovs-facts {
 }
 html.ui-v2 .ui2-fact { overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
 html.ui-v2 #ui2-fact-model { color: var(--sky); }
+/* the 3-char turn counter never truncates while its giant neighbors ellipsize */
+html.ui-v2 #ui2-fact-turn { flex-shrink: 0; }
 
 html.ui-v2 .ui2-session-switcher {
   display: none;
   appearance: none;
   -webkit-appearance: none;
   max-width: 190px;
+  height: 29px; /* the inline-pill height class (matches the layout toggle) */
   padding: 5px 26px 5px 11px;
   border: 1px solid var(--line);
   border-radius: var(--r-pill);
@@ -12659,6 +12675,7 @@ html.ui-v2 .global-attach-btn {
   border: 1px solid var(--line);
   background: transparent;
   color: var(--text-3);
+  font-family: var(--sans); /* buttons don't inherit — Arial otherwise */
   font-size: 13px;
 }
 html.ui-v2 .global-attach-btn:hover { color: var(--text); background: var(--surface-2); }
@@ -12668,8 +12685,9 @@ html.ui-v2 .global-send-btn {
   border: 0;
   border-radius: var(--r-pill);
   padding: 8px 16px;
+  font-family: var(--sans); /* buttons don't inherit — the primary CTA rendered in Arial */
   font-size: 12.5px;
-  font-weight: 750;
+  font-weight: 700;
   flex-shrink: 0;
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
@@ -12677,11 +12695,30 @@ html.ui-v2 .global-send-btn {
 }
 html.ui-v2 .global-send-btn:hover { filter: brightness(1.08); background: linear-gradient(180deg, var(--iris), var(--iris-deep)); }
 
-/* ── responsive ── */
-@media (max-width: 1179px) {
-  html.ui-v2 .ui2-ovs-compact-hide { display: none; }
+/* ── keyboard skip link ─────────────────────────────────────────────────
+   The chrome renders at body end, so without this the rail is the LAST
+   tab stop. The link itself lives at the top of #app's fragment (first
+   focusable in the document); inert under v1. */
+.ui2-skip { display: none; }
+html.ui-v2 .ui2-skip {
+  display: block;
+  position: fixed; top: -48px; left: 8px; z-index: 120;
+  padding: 8px 14px; border-radius: var(--r-ctl);
+  background: var(--surface); border: 1px solid var(--line-2);
+  color: var(--text); font-weight: 700; font-size: 13px;
+  text-decoration: none;
+  transition: top var(--t-fast);
 }
-@media (max-width: 819px) {
+html.ui-v2 .ui2-skip:focus-visible { top: 8px; outline: 2px solid var(--iris); outline-offset: 2px; }
+
+/* ── responsive ──
+   Inclusive bounds: at the design's stated widths (1180/820) the compact
+   layout applies — "at the breakpoint, be the compact thing". */
+@media (max-width: 1180px) {
+  html.ui-v2 .ui2-ovs-compact-hide { display: none; }
+  html.ui-v2 .ui2-pill { max-width: 200px; }
+}
+@media (max-width: 820px) {
   html.ui-v2 { --ui2-nav-w: 66px; }
   html.ui-v2 .ui2-nav-label { display: none; }
   html.ui-v2 .ui2-nav-top { padding: 14px 0; align-items: center; }
@@ -12699,15 +12736,18 @@ html.ui-v2 .global-send-btn:hover { filter: brightness(1.08); background: linear
 
 html.ui-v2 #voiceOverlay { display: none !important; }
 
+/* Oversight-bar mic button: matches #ui2-theme-btn's 32px icon-control
+   rhythm exactly (size, border, hover, transition). */
 html.ui-v2 .ui2-micbtn {
   position: relative;
   display: inline-flex; align-items: center; justify-content: center;
-  width: 34px; height: 34px; flex-shrink: 0;
+  width: 32px; height: 32px; padding: 0; flex-shrink: 0;
   border: 1px solid var(--line); border-radius: var(--r-ctl);
   background: transparent; color: var(--text-2); cursor: pointer;
-  transition: background var(--t-med), color var(--t-med);
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
 }
-html.ui-v2 .ui2-micbtn:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 .ui2-micbtn:hover { background: var(--surface-2); color: var(--text); border-color: var(--line-2); }
+html.ui-v2 .ui2-micbtn-icon { display: flex; }
 html.ui-v2 .ui2-micbtn-dot {
   position: absolute; top: 5px; right: 5px;
   width: 7px; height: 7px; border-radius: 50%;
@@ -12723,9 +12763,9 @@ html.ui-v2 .ui2-micbtn[data-state="error"] .ui2-micbtn-dot { background: var(--r
 html.ui-v2 #ui2-voice-panel {
   position: fixed;
   top: calc(var(--ui2-ovs-h) + 8px);
-  right: 14px;
-  width: 320px;
-  z-index: 90;
+  right: 18px;                     /* shares the oversight bar's content edge */
+  width: min(320px, calc(100vw - 36px));
+  z-index: 90;                     /* above content + composer (70), below ⌘K (100) */
   background: var(--surface);
   border: 1px solid var(--line-2);
   border-radius: var(--r-panel);
@@ -12734,64 +12774,114 @@ html.ui-v2 #ui2-voice-panel {
   overflow: hidden;
 }
 html.ui-v2 .ui2-vp-head {
-  display: flex; align-items: center; gap: 9px;
-  padding: 13px 15px; border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 16px; border-bottom: 1px solid var(--line);
 }
 html.ui-v2 .ui2-vp-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--neutral-dot); }
 html.ui-v2 #ui2-voice-panel[data-state="live"] .ui2-vp-dot { background: var(--green); box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16); }
 html.ui-v2 #ui2-voice-panel[data-state="passive"] .ui2-vp-dot { background: var(--sky); box-shadow: 0 0 0 3px rgba(var(--sky-rgb), .16); }
 html.ui-v2 #ui2-voice-panel[data-state="error"] .ui2-vp-dot { background: var(--rose); box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .16); }
-html.ui-v2 .ui2-vp-title { font-size: 13px; font-weight: 800; flex: 1; }
-html.ui-v2 .ui2-vp-sub { font-family: var(--mono); font-size: 10px; color: var(--text-3); }
+html.ui-v2 .ui2-vp-title {
+  font-size: 13px; font-weight: 800; flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+html.ui-v2 .ui2-vp-sub {
+  font-family: var(--mono); font-size: 10.5px; color: var(--text-3);
+  max-width: 45%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 html.ui-v2 .ui2-vp-close {
   border: 0; background: transparent; color: var(--text-3); cursor: pointer;
-  display: flex; padding: 3px; border-radius: 6px;
+  display: flex; padding: 5px; margin-right: -5px; /* glyph optically flush with the 16px inset */
+  border-radius: var(--r-inset);
+  transition: background var(--t-fast), color var(--t-fast);
 }
 html.ui-v2 .ui2-vp-close:hover { color: var(--text); background: var(--surface-2); }
-html.ui-v2 .ui2-vp-body { padding: 14px 15px; display: flex; flex-direction: column; gap: 12px; }
+html.ui-v2 .ui2-vp-body { padding: 12px 16px 16px; display: flex; flex-direction: column; gap: 12px; }
 
-/* Re-parented v1 controls, restyled by id under the flag. */
-html.ui-v2 .ui2-vp-controls { display: flex; gap: 8px; }
+/* The slots are layout-transparent: their re-parented children keep the
+   v1 show/hide classes (.hidden !important / .visible), so a present-
+   but-hidden child must not leave a phantom flex gap behind. */
+html.ui-v2 .ui2-vp-status-slot, html.ui-v2 .ui2-vp-cam-slot { display: contents; }
+
+/* Re-parented v1 controls, restyled by id under the flag. The row wraps
+   so the passive-state CTA gets its own full-width line instead of
+   squeezing three labels into one (which wrapped "Make Active"). */
+html.ui-v2 .ui2-vp-controls { display: flex; flex-wrap: wrap; gap: 8px; }
 html.ui-v2 .ui2-vp-controls #micBtn,
 html.ui-v2 .ui2-vp-controls #videoBtn,
 html.ui-v2 .ui2-vp-controls #makeActiveBtn {
-  flex: 1; width: auto; height: auto; position: static;
+  flex: 1; width: auto; height: auto; position: static; min-width: 0;
+  white-space: nowrap;
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
-  padding: 9px 10px; border-radius: 10px;
+  padding: 9px 10px; border-radius: var(--r-ctl);
   font-family: var(--sans); font-size: 12.5px; font-weight: 700; cursor: pointer;
   border: 1px solid var(--line); background: var(--surface-2); color: var(--text);
   box-shadow: none;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
 }
-html.ui-v2 .ui2-vp-controls #micBtn.mic-on,
-html.ui-v2 .ui2-vp-controls #videoBtn.video-on {
-  border-color: rgba(var(--green-rgb), .4); color: var(--green); background: transparent;
+html.ui-v2 .ui2-vp-controls #micBtn:not(.is-disabled):not(.active):hover,
+html.ui-v2 .ui2-vp-controls #videoBtn:not(.is-disabled):not(.active):hover {
+  background: var(--surface-3); border-color: var(--line-2);
 }
+/* Capture-on truth class is v1's .active (36-voice-wasm-init toggles
+   .active — there is no .mic-on/.video-on vocabulary). */
+html.ui-v2 .ui2-vp-controls #micBtn.active,
+html.ui-v2 .ui2-vp-controls #videoBtn.active {
+  border-color: rgba(var(--green-rgb), .4); color: var(--green);
+  background: rgba(var(--green-rgb), .08);
+}
+html.ui-v2 .ui2-vp-controls #micBtn.active:hover,
+html.ui-v2 .ui2-vp-controls #videoBtn.active:hover { background: rgba(var(--green-rgb), .13); }
+html.ui-v2 .ui2-vp-controls #micBtn.is-disabled,
+html.ui-v2 .ui2-vp-controls #videoBtn.is-disabled { opacity: .55; cursor: default; }
 html.ui-v2 .ui2-vp-controls #makeActiveBtn {
+  flex: 1 1 100%;                  /* full-width CTA line under Mic/Camera */
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent); border: 0; font-weight: 800;
-  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  box-shadow: var(--shadow-primary);
 }
-/* The v1 controls are icon-only rounds; in panel context give them
-   text labels so the row reads like the approved mockup. */
-html.ui-v2 .ui2-vp-controls #micBtn::after { content: 'Mic'; }
-html.ui-v2 .ui2-vp-controls #videoBtn::after { content: 'Camera'; }
+html.ui-v2 .ui2-vp-controls #makeActiveBtn:hover {
+  filter: brightness(1.08);
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+}
+html.ui-v2 .ui2-vp-controls #makeActiveBtn:disabled { opacity: .6; cursor: default; filter: none; }
+html.ui-v2 .ui2-vp-btn-icon { display: flex; color: inherit; }
+
 html.ui-v2 #ui2-voice-panel[data-state="idle"] .ui2-vp-note::before {
   content: 'Start the mic to talk to this daemon live. ';
   color: var(--text-2);
 }
-html.ui-v2 .ui2-vp-status-slot:empty, html.ui-v2 .ui2-vp-cam-slot:empty { display: none; }
 html.ui-v2 .ui2-vp-status-slot #voiceStatus {
-  position: static; display: block; max-width: none;
+  position: static; display: block; width: fit-content; max-width: 100%;
   background: var(--surface-2); border: 1px solid var(--line);
-  border-radius: 999px; padding: 4px 11px;
+  border-radius: var(--r-pill); padding: 4px 12px;
   font-size: 11px; font-weight: 700; color: var(--text-2);
+  text-align: left;
+}
+html.ui-v2 .ui2-vp-status-slot #voiceStatus.connected {
+  color: var(--green); border-color: rgba(var(--green-rgb), .26);
+  background: rgba(var(--green-rgb), .1);
+}
+html.ui-v2 .ui2-vp-status-slot #voiceStatus.error {
+  color: var(--rose); border-color: rgba(var(--rose-rgb), .26);
+  background: rgba(var(--rose-rgb), .1);
 }
 html.ui-v2 .ui2-vp-cam-slot #videoPreviewWrap {
   position: static; width: 100%; height: auto;
-  border-radius: 10px; overflow: hidden;
+  border-radius: var(--r-inset); overflow: hidden;
   border: 1px solid var(--line); background: var(--code-bg);
 }
-html.ui-v2 .ui2-vp-cam-slot #videoPreviewEl { width: 100%; height: auto; display: block; }
+html.ui-v2 .ui2-vp-cam-slot #videoPreviewEl {
+  width: 100%; height: auto; display: block;
+  border: 0; border-radius: 0;     /* the wrap is the frame — no v1 double border */
+}
+html.ui-v2 .ui2-vp-cam-slot .video-preview-info {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 4px 8px 5px;
+  font-family: var(--mono); font-size: 10px; color: var(--text-3);
+}
+html.ui-v2 .ui2-vp-cam-slot .video-preview-info .frame-id { color: var(--sky); }
+html.ui-v2 .ui2-vp-cam-slot #videoFps { display: none; } /* dead readout (never updated) — hidden under v2 */
 html.ui-v2 .ui2-vp-note { font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
 /* ── static/app/ui2-access.css ── */
 /* ── ui-v2 Access surface re-skin (design-overhaul P2) ─────────────────
@@ -12880,7 +12970,7 @@ html.ui-v2 #tab-access .acc-section-title {
 html.ui-v2 #tab-access .acc-section-sub {
   font-size: 12px;
   line-height: 1.55;
-  color: var(--text-3);
+  color: var(--text-2); /* running copy at text-3 fell under AA on light; vault parity */
   max-width: 860px;
 }
 html.ui-v2 #tab-access .acc-section-actions { margin-left: auto; }
@@ -12890,7 +12980,7 @@ html.ui-v2 .acc-btn {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  min-height: 0;
+  min-height: 36px; /* one control height across form action rows */
   padding: 8px 14px;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -12912,7 +13002,7 @@ html.ui-v2 .acc-btn.primary {
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-weight: 800;
-  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  box-shadow: var(--shadow-primary);
 }
 html.ui-v2 .acc-btn.primary:hover {
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
@@ -13114,7 +13204,7 @@ html.ui-v2 .acc-hero-card {
 html.ui-v2 #access-identity-hero .acc-hero-card:first-child {
   background: linear-gradient(145deg, var(--surface-2), var(--surface));
   border-color: var(--line-2);
-  box-shadow: 0 12px 34px rgba(0, 0, 0, .28);
+  box-shadow: var(--shadow-card); /* token, not literal: light theme softens it */
 }
 html.ui-v2 .acc-hero-glyph {
   width: 44px;
@@ -13366,9 +13456,21 @@ html.ui-v2 .acc-choice-card:has(input:checked)::after {
   font-size: 10px;
   font-weight: 800;
 }
-html.ui-v2 .acc-choice-card .t { font-size: 13.5px; font-weight: 700; padding-right: 20px; }
+html.ui-v2 .acc-choice-card .t { font-size: 13.5px; font-weight: 700; padding-right: 32px; } /* clear the 17px ✓ badge + its 12px inset */
 html.ui-v2 .acc-choice-card .d { font-size: 11.5px; color: var(--text-2); }
 html.ui-v2 .acc-choice-card:has(input:disabled) { opacity: .55; cursor: not-allowed; }
+/* Keyboard focus: the selection inputs are visually hidden (opacity 0,
+   zero-size), so the browser ring lands on nothing. Draw it on the card
+   the keyboard user is actually looking at. */
+html.ui-v2 .acc-choice-card:has(input:focus-visible),
+html.ui-v2 .acc-role-card:has(input:focus-visible) {
+  outline: 2px solid var(--iris);
+  outline-offset: 2px;
+}
+html.ui-v2 .acc-status-toggle label:has(input:focus-visible) span {
+  outline: 2px solid var(--iris);
+  outline-offset: 2px;
+}
 html.ui-v2 .acc-detected {
   border: 1px solid rgba(var(--green-rgb), .26);
   border-radius: 10px;
@@ -13396,6 +13498,26 @@ html.ui-v2 .acc-field-grid select {
 html.ui-v2 .acc-field-grid input::placeholder { color: var(--text-3); }
 html.ui-v2 .acc-field-grid input:focus,
 html.ui-v2 .acc-field-grid select:focus {
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+/* Fields that carry their own border+ring focus treatment suppress the
+   global outline (double-ring otherwise; same convention as the chrome
+   search field). Keyboard visibility is preserved by the ring itself. */
+html.ui-v2 .acc-field-grid input:focus-visible,
+html.ui-v2 .acc-field-grid select:focus-visible,
+html.ui-v2 .acc-grant-fs-roots textarea:focus-visible,
+html.ui-v2 .daemon-pairing-row input:focus-visible,
+html.ui-v2 .daemon-pairing-row select:focus-visible,
+html.ui-v2 .daemon-add-row input:focus-visible,
+html.ui-v2 .daemon-pairing-textarea:focus-visible,
+html.ui-v2 #tab-access .coord-row input:focus-visible,
+html.ui-v2 #tab-access .coord-textarea:focus-visible {
+  outline: none;
+}
+html.ui-v2 .acc-grant-fs-roots textarea:focus,
+html.ui-v2 #tab-access .coord-row input:focus,
+html.ui-v2 #tab-access .coord-textarea:focus {
   border-color: var(--iris);
   box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25);
 }
@@ -13429,7 +13551,35 @@ html.ui-v2 .acc-grant-fs-scope {
   background: var(--bg-1);
   padding: 10px 12px;
 }
-html.ui-v2 .acc-grant-fs-scope summary { font-size: 12.5px; font-weight: 600; color: var(--text-2); }
+/* The fold grammar (custom ▸ caret), not the browser's default
+   disclosure triangle — every sibling fold on the pane speaks it. */
+html.ui-v2 .acc-grant-fs-scope > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-2);
+  user-select: none;
+}
+html.ui-v2 .acc-grant-fs-scope > summary::-webkit-details-marker { display: none; }
+html.ui-v2 .acc-grant-fs-scope > summary::before {
+  content: '\25B8';
+  color: var(--text-3);
+  font-size: 11px;
+  transition: transform var(--t-fast);
+}
+html.ui-v2 .acc-grant-fs-scope[open] > summary::before { transform: rotate(90deg); }
+html.ui-v2 .acc-grant-fs-scope > summary:hover { color: var(--text); }
+/* Read/write-roots captions wear the same eyebrow as sibling field labels. */
+html.ui-v2 .acc-grant-fs-roots > span {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
 html.ui-v2 .acc-grant-fs-roots textarea {
   border: 1px solid var(--line-2);
   border-radius: 10px;
@@ -13447,10 +13597,12 @@ html.ui-v2 .acc-status-toggle {
   overflow: visible;
 }
 html.ui-v2 .acc-status-toggle span {
+  display: inline-block;
   border-radius: 7px;
-  padding: 6px 14px;
+  padding: 5px 13px;
   font-size: 12.5px;
   font-weight: 700;
+  line-height: 18px; /* 3+3 wrapper + 5+5 pad + 18 line + 2 borders = 36, level with the row's buttons */
   color: var(--text-2);
   transition: background var(--t-fast), color var(--t-fast);
 }
@@ -13612,7 +13764,7 @@ html.ui-v2 .access-target-actions button.primary {
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-weight: 800;
-  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  box-shadow: var(--shadow-primary);
 }
 html.ui-v2 .access-target-actions button.primary:hover { filter: brightness(1.08); background: linear-gradient(180deg, var(--iris), var(--iris-deep)); }
 html.ui-v2 .access-target-actions button.danger {
@@ -13821,7 +13973,7 @@ html.ui-v2 .daemon-access-request-actions button.approve {
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-weight: 800;
-  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  box-shadow: var(--shadow-primary);
 }
 html.ui-v2 .daemon-access-request-actions button.approve:hover { filter: brightness(1.08); }
 html.ui-v2 .daemon-access-request-actions button.deny,
@@ -13888,6 +14040,16 @@ html.ui-v2 #tab-access .access-card-kind {
   font-size: 10.5px;
   font-weight: 700;
   letter-spacing: .02em;
+}
+/* Semantic tint when the emitter stamps a state (42-usage-terminal.js
+   diagnostics cards); stateless count pills stay neutral. */
+html.ui-v2 #tab-access .access-card-kind.ok {
+  background: rgba(var(--green-rgb), .12);
+  color: var(--green);
+}
+html.ui-v2 #tab-access .access-card-kind.warn {
+  background: rgba(var(--amber-rgb), .12);
+  color: var(--amber);
 }
 html.ui-v2 #tab-access .access-card-detail { font-size: 12px; color: var(--text-3); }
 html.ui-v2 #tab-access .access-card-actions button {
@@ -14025,6 +14187,27 @@ html.ui-v2 #tab-access .access-matrix-table td {
   color: var(--text-3);
   font-size: 11px;
 }
+/* Sticky policy column: with ~23 permission columns the row identity
+   scrolled out with the table; pin it (opaque background so pills pass
+   underneath, hairline seam marks the edge). The width floor stops the
+   policy blurbs collapsing into ten-line towers that inflate every row. */
+html.ui-v2 #tab-access .access-matrix-table th:first-child,
+html.ui-v2 #tab-access .access-matrix-table td:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  min-width: 200px;
+  max-width: 260px;
+  background: var(--surface);
+  box-shadow: inset -1px 0 0 var(--line);
+}
+html.ui-v2 #tab-access .access-matrix-table th:first-child { z-index: 2; background: var(--bg-1); }
+/* Scanning aid on a two-screen-wide table (deliberate on a read-only
+   grid): the wash keeps the row legible while the eye travels. */
+html.ui-v2 #tab-access .access-matrix-table tbody tr:hover td { background: var(--hover-wash); }
+html.ui-v2 #tab-access .access-matrix-table tbody tr:hover td:first-child {
+  background: color-mix(in srgb, var(--text) 4%, var(--surface));
+}
 html.ui-v2 #tab-access .access-matrix-policy {
   font-family: var(--mono);
   font-size: 12.5px;
@@ -14123,16 +14306,57 @@ html.ui-v2 #tab-access .access-model-status.failed {
 }
 
 /* ── shared bits ── */
+/* Empty states: centered quiet copy in a dashed placeholder frame (the
+   fleet's "+ Link a daemon" affordance grammar, minus the affordance). */
 html.ui-v2 #tab-access .access-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 64px;
+  padding: 18px 16px;
+  border: 1px dashed var(--line-2);
+  border-radius: 12px;
+  text-align: center;
   font-size: 12.5px;
   color: var(--text-3);
-  padding: 10px 0;
+}
+/* …but inside an already-framed model section, quiet text only —
+   a dashed box nested in a bordered card reads twice. */
+html.ui-v2 #tab-access .access-model-table .access-empty {
+  border: 0;
+  min-height: 0;
+  padding: 14px 16px;
 }
 
 /* ── responsive ── */
 @media (max-width: 940px) {
   html.ui-v2 #access-identity-hero { grid-template-columns: 1fr; }
   html.ui-v2 #tab-access .acc-explainer { grid-template-columns: 1fr; }
+  /* Model-inspector rows: the 4-track grid needs ~630px of floor — at
+     phone-ish widths it forced the whole pane to pan sideways. Stack:
+     name + status pill on the first line, meta and detail below. */
+  html.ui-v2 #tab-access .access-model-row { grid-template-columns: minmax(0, 1fr) auto; }
+  html.ui-v2 #tab-access .access-model-main { grid-column: 1; grid-row: 1; }
+  html.ui-v2 #tab-access .access-model-row .access-model-status { grid-column: 2; grid-row: 1; }
+  html.ui-v2 #tab-access .access-model-meta { grid-column: 1 / -1; grid-row: 2; }
+  html.ui-v2 #tab-access .access-model-detail {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
+/* Daemon target rows: five min-width tracks add up to ~930px — below
+   that the actions column vanished off the pane edge. Collapse to a
+   card: title row full-width, role/route side by side, chips and
+   actions on their own lines. */
+@media (max-width: 1000px) {
+  html.ui-v2 .access-target-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  html.ui-v2 .access-target-main,
+  html.ui-v2 .access-target-chips,
+  html.ui-v2 .access-target-actions { grid-column: 1 / -1; }
+  html.ui-v2 .access-target-actions { justify-content: flex-start; min-width: 0; }
 }
 /* ── static/app/ui2-terminal-files.css ── */
 /* ── ui-v2: Terminal + Files surfaces (design-overhaul P2) ─────────────
@@ -14143,10 +14367,13 @@ html.ui-v2 #tab-access .access-empty {
    element ids) are untouched — this file plus small ui2-gated JS in
    44-shell-frames.js / 55-files-ide.js is the whole change.
 
-   The xterm and CodeMirror content areas keep the design rule that code
-   surfaces stay dark: xterm's palette is a JS theme object built from
-   these tokens at init (ui2ShellTheme in 44-shell-frames.js); CodeMirror
-   is pure CSS via the .cm-s-intendant overrides below. */
+   Code-surface palettes follow the app theme (the light-theme token
+   import remaps --code-bg and the ANSI/CM semantics to darkened light
+   values): xterm's palette is a JS theme object built from these tokens
+   at init (ui2ShellTheme in 44-shell-frames.js — resolved once per page
+   load); CodeMirror is pure CSS via the .cm-s-intendant overrides below,
+   so it re-tints on a live theme flip while xterm keeps its init-time
+   palette until reload (known gap, tracked in 44-shell-frames.js). */
 
 /* v1 guards: elements that exist only for the v2 design (the ^C/^D/⏎ key
    chips and the Ln/Col statusbar span) stay invisible — and layout-inert —
@@ -14160,12 +14387,12 @@ html.ui-v2 #tab-access .access-empty {
    the shell toolbar by wireShellKeybar() under the flag. */
 html.ui-v2 #tab-terminal .subtabs { display: none; }
 
-html.ui-v2 #term-pane-shell { padding: 0 20px 14px; }
+html.ui-v2 #term-pane-shell { padding: 0 20px 16px; }
 
 html.ui-v2 #tab-terminal .shell-toolbar {
   background: transparent;
   border-bottom: 0;
-  padding: 13px 0 11px;
+  padding: 12px 0;
   gap: 10px;
 }
 html.ui-v2 #tab-terminal .shell-toolbar label {
@@ -14201,6 +14428,12 @@ html.ui-v2 #tab-files select:hover {
 html.ui-v2 #tab-files select:focus {
   border-color: var(--files-accent);
 }
+/* Light theme: the chevron's stroke is baked into the data URI (no var()
+   in url()), so it gets its own remap — text-2 light ink. */
+html.ui-v2[data-theme="light"] #tab-terminal .shell-toolbar select,
+html.ui-v2[data-theme="light"] #tab-files select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234B5265' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+}
 
 html.ui-v2 .shell-host-status {
   font-family: var(--mono);
@@ -14212,6 +14445,7 @@ html.ui-v2 .shell-host-status.warn { color: var(--amber); }
 html.ui-v2 .shell-host-status.ok { color: var(--green); }
 
 html.ui-v2 .shell-share-btn {
+  min-height: 32px; /* match the 32px Target select — one control height per row */
   padding: 6px 12px;
   border: 1px solid var(--line);
   border-radius: var(--r-ctl);
@@ -14234,24 +14468,38 @@ html.ui-v2 .shell-share-btn.is-shared {
 html.ui-v2 #tab-terminal .shell-toolbar .target-summary {
   border-left: 1px solid var(--line);
 }
+/* The machine name never word-wraps in the toolbar (the v1 base only
+   ellipsizes; without nowrap a squeezed column breaks "vortex-macos-…"
+   across three lines). */
+html.ui-v2 #tab-terminal .shell-toolbar .target-summary-name {
+  white-space: nowrap;
+}
 
 /* The stage: --code-bg mono surface with the design's terminal elevation.
    The inner padding lives on .xterm so the FitAddon subtracts it when
    computing cols/rows (parent padding would skew the fit math). */
 html.ui-v2 .terminal-container {
   border: 1px solid var(--line-2);
-  border-radius: 14px;
+  border-radius: var(--r-card);
   background: var(--code-bg);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03), 0 20px 50px rgba(0, 0, 0, .4);
   overflow: hidden;
 }
+/* Light theme: the dark elevation recipe reads as a dirty smudge on a
+   light page — swap to the light token shadows. */
+html.ui-v2[data-theme="light"] .terminal-container {
+  box-shadow: var(--glass-highlight), var(--shadow-card);
+}
 html.ui-v2 #shell-container .xterm { padding: 12px 14px; }
 
-/* Key bar: design chips — mono 11.5/600, radius 8, line border on surface. */
+/* Key bar: design chips — mono 11.5/600, radius 8, line border on surface.
+   4px side/bottom padding keeps the 2px focus ring (offset 2) inside the
+   bar's own scroll box — overflow-x:auto + overflow-y:hidden clip
+   anything closer to the edge. */
 html.ui-v2 .shell-keybar {
   background: transparent;
   border-top: 0;
-  padding: 11px 2px 1px;
+  padding: 12px 4px 4px;
   gap: 8px;
 }
 html.ui-v2 .shell-key {
@@ -14276,6 +14524,7 @@ html.ui-v2 .shell-key.sticky.armed {
 html.ui-v2 .shell-key.ui2-key { display: inline-block; }
 
 html.ui-v2 .keybar-toggle {
+  min-height: 32px; /* one control height per toolbar row (select is 32) */
   padding: 6px 12px;
   border: 1px solid var(--line);
   border-radius: var(--r-ctl);
@@ -14415,6 +14664,27 @@ html.ui-v2 #tab-files .ui-btn.danger:hover {
 }
 html.ui-v2 #tab-files .ui-btn:disabled { opacity: .45; }
 
+/* One control height per toolbar row: the Target select renders 32px, so
+   the buttons sharing its row match it (the tree/banner/find minis keep
+   their own compact sizes below). */
+html.ui-v2 #tab-files .files-ide-toolbar .ui-btn,
+html.ui-v2 #tab-files .files-tool .ui-btn {
+  min-height: 32px;
+}
+/* Transfer/staged in-row actions stay compact — list scale, not toolbar
+   scale. */
+html.ui-v2 #tab-files .files-transfer-row .ui-btn,
+html.ui-v2 #tab-files .files-staged-row .ui-btn {
+  min-height: 26px;
+  padding: 4px 10px;
+}
+/* Downloads path input: v1's 8px padding made it 34px tall next to its
+   own 32px row-mates; 6px lands the whole row on 32. */
+html.ui-v2 #tab-files .files-download-row input {
+  min-height: 32px;
+  padding: 6px 10px;
+}
+
 /* Text inputs across the Files surfaces: v2 input recipe, mono for paths. */
 html.ui-v2 #tab-files input[type="text"],
 html.ui-v2 #tab-files .files-ide-create-row input {
@@ -14431,12 +14701,18 @@ html.ui-v2 #tab-files .files-ide-create-row input:focus {
   border-color: var(--files-accent);
 }
 html.ui-v2 #tab-files input[type="text"]::placeholder { color: var(--text-3); }
+/* Single-hue focus: these inputs already signal focus with the machine
+   accent border; the global iris ring on top made a two-color halo. */
+html.ui-v2 #tab-files input[type="text"]:focus-visible,
+html.ui-v2 #tab-files .files-ide-create-row input:focus-visible {
+  outline-color: var(--files-accent);
+}
 
 /* — Editor sub-tab — */
 
 html.ui-v2 .files-ide-toolbar {
   min-height: 0;
-  padding: 11px 20px;
+  padding: 12px 20px;
   background: transparent;
   border-bottom: 0;
 }
@@ -14511,6 +14787,7 @@ html.ui-v2 #tab-files .files-ide-create-row input:focus {
 }
 
 html.ui-v2 .files-ide-row-act {
+  padding: 3px 6px; /* v1's 2px 5px left a 15px hit target */
   border-radius: 6px;
   color: var(--text-3);
 }
@@ -14544,9 +14821,15 @@ html.ui-v2 .files-ide-tab:hover { color: var(--text-2); }
 html.ui-v2 .files-ide-tab.active {
   background: var(--code-bg);
   color: var(--text);
-  box-shadow: inset 0 2px 0 var(--files-accent);
+  /* The 1px drop below paints over the strip's border-bottom so the
+     active tab fuses with the editor surface (no seam). */
+  box-shadow: inset 0 2px 0 var(--files-accent), 0 1px 0 var(--code-bg);
 }
 html.ui-v2 .files-ide-tab .files-ide-tab-dirty { color: var(--iris); }
+/* The dirty dot sits LEFT of the name in this DOM; v1's hover rule hides
+   it (it assumed the dot shared the close slot), which reflowed the tab
+   13px on hover. Keep it visible — dot and ✕ never collide here. */
+html.ui-v2 .files-ide-tab.dirty:hover .files-ide-tab-dirty { display: inline; }
 html.ui-v2 .files-ide-tab .files-ide-tab-close {
   border-radius: 6px;
   color: var(--text-3);
@@ -14822,16 +15105,34 @@ html.ui-v2 .fs-picker-path-row button {
   font: 600 12px var(--sans);
 }
 html.ui-v2 .fs-picker-path-row button:hover { background: var(--surface-2); border-color: var(--line-2); }
+/* Quiet list rows (the v1 base boxes every entry in a bordered button —
+   under v2 the list reads as rows: transparent until hover/selection). */
+html.ui-v2 .fs-picker-list {
+  border-color: var(--line);
+  border-radius: 11px;
+  background: var(--bg-1);
+}
 html.ui-v2 .fs-picker-entry {
+  border-color: transparent;
   border-radius: 7px;
+  background: transparent;
   font-family: var(--mono);
   font-size: 12.5px;
   color: var(--text-2);
 }
-html.ui-v2 .fs-picker-entry:hover { background: var(--hover-wash); color: var(--text); }
-html.ui-v2 .fs-picker-entry.selected {
-  background: rgba(var(--iris-rgb), .14);
+html.ui-v2 .fs-picker-entry:hover {
+  background: var(--hover-wash);
+  border-color: transparent;
   color: var(--text);
+}
+html.ui-v2 .fs-picker-entry.selected,
+html.ui-v2 .fs-picker-entry.selected:hover {
+  background: rgba(var(--iris-rgb), .14);
+  border-color: transparent;
+  color: var(--text);
+}
+html.ui-v2 .fs-picker-dialog.file-mode .fs-picker-entry.file.selected {
+  border-color: rgba(var(--iris-rgb), .4);
 }
 html.ui-v2 .fs-picker-status { font-size: 12px; color: var(--text-2); }
 html.ui-v2 .fs-picker-status.error { color: var(--rose); }
@@ -14854,6 +15155,33 @@ html.ui-v2 .fs-picker-close:hover { background: var(--surface-2); color: var(--t
     border-bottom: 1px solid var(--line);
   }
   html.ui-v2 .files-pane { padding: 12px; }
+
+  /* Files toolbar: v1's wrap rule targets `.files-ide-target-summary`,
+     but the element carries that string as its ID (class is
+     `target-summary`) — the rule never matched, so "New folder" wrapped
+     alone as a widow. Send the summary to its own full-width row. */
+  html.ui-v2 #files-ide-target-summary {
+    order: 5;
+    flex-basis: 100%;
+    max-width: 100%;
+  }
+
+  /* Terminal toolbar: the summary's v1 min-width (260px) + inline chips
+     overflowed the viewport at 820 (clipped capability chips, Keys
+     pushed off-screen). Wrap the toolbar; the summary takes a clean
+     full-width second row without the column divider. */
+  html.ui-v2 #tab-terminal .shell-toolbar { flex-wrap: wrap; }
+  html.ui-v2 #tab-terminal .shell-toolbar .target-summary {
+    order: 9;
+    flex-basis: 100%;
+    min-width: 0;
+    margin: 0;
+    padding: 2px 0 0;
+    border-left: 0;
+  }
+  html.ui-v2 #tab-terminal .shell-toolbar .target-summary-detail {
+    max-width: 100%;
+  }
 }
 /* ── static/app/ui2-debug.css ── */
 /* ── ui-v2 Debug tab: two-card layout (design-overhaul P2) ─────────────
@@ -14875,7 +15203,9 @@ html.ui-v2 #tab-debug .debug-pane {
   max-width: 980px;
   padding: 26px 28px 44px;
 }
-html.ui-v2 #tab-debug .ui2-page-head { grid-column: 1 / -1; margin: 0 0 10px; }
+/* margin 2px + the 16px grid gap = 18px to the cards row (sibling page
+   heads: Usage 18px, Sessions 16px — 10px here read as 26px and drifted). */
+html.ui-v2 #tab-debug .ui2-page-head { grid-column: 1 / -1; margin: 0 0 2px; }
 html.ui-v2 #tab-debug .ui2-page-title {
   margin: 0;
   font-size: 26px;
@@ -14885,7 +15215,7 @@ html.ui-v2 #tab-debug .ui2-page-title {
 }
 html.ui-v2 #tab-debug .ui2-page-sub {
   margin: 7px 0 0;
-  font-size: 13px;
+  font-size: 13.5px; /* sibling page subs: Sessions 13.5 / Usage 14 — 13 was a third value */
   color: var(--text-2);
 }
 
@@ -14923,7 +15253,7 @@ html.ui-v2 #tab-debug .debug-status {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 0 0 13px;
+  margin: 0 0 12px;
   font-size: 12.5px;
   font-weight: 600;
   color: var(--text-2);
@@ -15028,7 +15358,10 @@ html.ui-v2 #tab-debug .debug-workspace-form label {
 }
 html.ui-v2 #tab-debug .debug-workspace-form input,
 html.ui-v2 #tab-debug .debug-workspace-form select {
-  padding: 8px 11px;
+  height: 35px; /* one control height for the row: text input, native select,
+                   and the Create button measured 35/36/34 and their top edges
+                   staggered by 1px each in the shared grid row */
+  padding: 8px 12px;
   border: 1px solid var(--line-2);
   border-radius: 10px;
   background: var(--surface-2);
@@ -15037,10 +15370,12 @@ html.ui-v2 #tab-debug .debug-workspace-form select {
   transition: border-color var(--t-med), box-shadow var(--t-med);
 }
 html.ui-v2 #tab-debug .debug-workspace-form input::placeholder { color: var(--text-3); }
-/* Provider tokens are technical vocabulary → mono (type-system mandate). */
-html.ui-v2 #tab-debug .debug-workspace-form select {
+/* Provider tokens and URLs are technical vocabulary → mono at the Settings
+   tab's 12.5px field size (type-system mandate; endpoints are mono there). */
+html.ui-v2 #tab-debug .debug-workspace-form select,
+html.ui-v2 #tab-debug #browser-workspace-url {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 12.5px;
 }
 html.ui-v2 #tab-debug .debug-workspace-form input:focus-visible,
 html.ui-v2 #tab-debug .debug-workspace-form select:focus-visible {
@@ -15048,7 +15383,7 @@ html.ui-v2 #tab-debug .debug-workspace-form select:focus-visible {
   border-color: var(--iris);
   box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
 }
-html.ui-v2 #tab-debug .debug-workspace-form .ui-btn { min-height: 34px; }
+html.ui-v2 #tab-debug .debug-workspace-form .ui-btn { min-height: 35px; }
 
 /* ── workspace status line + rows ── */
 html.ui-v2 #tab-debug .debug-workspace-status {
@@ -15119,6 +15454,16 @@ html.ui-v2 #tab-debug .debug-workspace-row-actions .ui-btn {
   font-size: 11.5px;
   border-radius: 8px;
 }
+/* Neutral actions sit on a surface-2 row — the generic surface-2 button fill
+   vanishes there (border-only affordance). Card tone restores the raised
+   read on both themes; hover's surface-3 still gives a visible delta.
+   Danger (Close) keeps its own transparent + rose recipe. */
+html.ui-v2 #tab-debug .debug-workspace-row-actions .ui-btn:not(.danger) {
+  background: var(--surface);
+}
+html.ui-v2 #tab-debug .debug-workspace-row-actions .ui-btn:not(.danger):hover {
+  background: var(--surface-3);
+}
 
 /* ── empty state (design States recipe) ── */
 html.ui-v2 #tab-debug .ui-empty.compact {
@@ -15167,9 +15512,13 @@ html.ui-v2 #tab-debug .ui-empty-hint {
      [data-station-hotspot], #station-composer-input, the two canvas
      ids, #station-display-endpoints. #station-dock stays dead.
    - Station stays dark by design even after a light theme ships (the
-     canvas palette is not theme-aware); the pane gradient below reads
-     from --bg/--bg-1, so the P4 light-theme pass owns pinning it dark
-     if those tokens ever flip. */
+     canvas palette is not theme-aware). The light theme HAS shipped and
+     flips --bg/--bg-1/--glass/--text, so every surface that overlays or
+     abuts the canvas is pinned to the dark values below with literals
+     (deliberate token exceptions — a var() here would flip with the
+     theme and put light glass / dark ink on top of the dark scene).
+     The flow-row peer-chip band above the canvas is NOT pinned: it is
+     ordinary chrome and follows the active theme. */
 
 /* ── peer-display chip band (flow row above the canvas) ── */
 html.ui-v2 .station-peer-chips {
@@ -15213,39 +15562,53 @@ html.ui-v2 .station-peer-chip .chip-dot.ok {
 
 /* ── canvas container: the deeper-space backdrop (design §3.19) ──
    Background only — position/overflow/flex stay v1 so canvas pixels,
-   hotspot rects, and the composer slot share one coordinate space. */
+   hotspot rects, and the composer slot share one coordinate space.
+   Pinned to the DARK token values (literals, not var()): the WASM scene
+   is dark regardless of theme, and this backdrop shows pre-first-paint
+   and during resize — a light flash behind a dark scene reads broken. */
 html.ui-v2 .station-pane {
   background:
-    radial-gradient(ellipse 70% 70% at 50% 52%, rgba(var(--iris-rgb), .08), transparent 60%),
-    radial-gradient(circle at 50% 52%, var(--bg-1), var(--bg) 70%);
+    radial-gradient(ellipse 70% 70% at 50% 52%, rgba(126, 140, 250, .08), transparent 60%),
+    radial-gradient(circle at 50% 52%, #0E1015, #0B0C10 70%);
 }
 
-/* ── lower-left status/metrics chip (v2 glass, mono, blur-free) ── */
+/* ── lower-left status/metrics chip (mono, blur-free) ──
+   Sits ON the canvas, over whatever the scene painted there (in loaded
+   states that is the activity runway's bottom row — the WASM layout does
+   not reserve chip clearance yet). Two deliberate choices follow:
+   - OPAQUE background: the old .7-alpha glass double-exposed painted
+     runway text through the chip into unreadable mush.
+   - Dark literals, both themes: the scene below is always dark, so the
+     chip must stay dark glass with light ink even under data-theme=light
+     (theme vars would flip it to a milky pill on a dark canvas). */
 html.ui-v2 .station-status {
-  color: var(--text-3);
+  color: #6C7482;
   font-family: var(--mono);
   font-size: 10.5px;
   padding: 6px 10px;
-  border: 1px solid var(--line-2);
+  border: 1px solid rgba(230, 236, 247, .14);
   border-radius: 10px;
-  background: var(--glass);
+  background: #12141C;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .04), 0 4px 14px rgba(0, 0, 0, .35);
 }
 html.ui-v2 .station-status-metrics {
-  color: var(--text-2);
-  border-right: 1px solid var(--line-2);
+  color: #A7AEBE;
+  border-right: 1px solid rgba(230, 236, 247, .14);
 }
 
 /* ── composer textarea overlay: ink only ──
    The canvas paints the strip chrome and positions this textarea from
-   composer_state() geometry; font-size/line-height/padding stay v1. */
+   composer_state() geometry; font-size/line-height/padding stay v1.
+   Ink pinned to dark-theme literals: the strip below is canvas-painted
+   dark in both themes, and var(--text) would flip to near-black ink on
+   it under the light theme. */
 html.ui-v2 .station-composer-input {
-  color: var(--text);
-  caret-color: var(--iris);
+  color: #EAECF2;
+  caret-color: #7E8CFA;
   font-family: var(--mono);
 }
 html.ui-v2 .station-composer-input::placeholder {
-  color: var(--text-3);
+  color: #6C7482;
   opacity: 1;
 }
 
@@ -15308,7 +15671,7 @@ html.ui-v2 #vault-tab-sections .acc-section-title {
 html.ui-v2 #vault-tab-sections .acc-section-sub {
   font-size: 12px;
   line-height: 1.55;
-  color: var(--text-3);
+  color: var(--text-2); /* running explainer copy — light text-3 is ~3.5:1, under AA */
   max-width: 860px;
 }
 
@@ -15397,9 +15760,18 @@ html.ui-v2 #access-vault-section .vault-entry-row:not(:has(.vault-chip.ok))::bef
   height: 34px;
   flex-shrink: 0;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: 10px;
   background:
     url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23a7aebe" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.5" cy="12" r="3.6"/><path d="M12.1 12H21"/><path d="M18 12v3.4"/><path d="M15 12v2.4"/></svg>')
+    center / 18px 18px no-repeat,
+    var(--surface-2);
+}
+/* Light theme: the glyph stroke is baked into the data URI (no var()
+   inside url()), so restate it in light ink (--text-2 light = #4B5265 —
+   the dark-theme gray reads washed out on light surfaces). */
+html.ui-v2[data-theme="light"] #access-vault-section .vault-entry-row:not(:has(.vault-chip.ok))::before {
+  background:
+    url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%234B5265" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.5" cy="12" r="3.6"/><path d="M12.1 12H21"/><path d="M18 12v3.4"/><path d="M15 12v2.4"/></svg>')
     center / 18px 18px no-repeat,
     var(--surface-2);
 }
@@ -15412,12 +15784,19 @@ html.ui-v2 #access-vault-section .vault-entry-row .lbl {
   font-size: 13.5px;
   font-weight: 700;
   color: var(--text);
+  min-width: 0;
+  overflow-wrap: anywhere; /* an unbroken 80-char label must wrap, not blow the row */
 }
+/* Grow-to-fill + right-align instead of margin-left:auto: when the secret
+   and the actions wrap together onto a second line, two auto margins
+   would split the leftover space and float the secret mid-row. */
 html.ui-v2 #access-vault-section .vault-entry-row .secret {
-  margin-left: auto;
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: right;
   font-family: var(--mono);
   font-size: 11px;
-  color: var(--text-3);
+  color: var(--text-2); /* lease expiry / key tails are real data — text-3 fails AA on light */
 }
 html.ui-v2 #access-vault-section .vault-entry-row .vault-entry-actions { gap: 8px; }
 
@@ -15430,7 +15809,7 @@ html.ui-v2 #access-custody-section .ui-btn {
   gap: 7px;
   padding: 7px 13px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: 10px; /* fleet control radius (Access .acc-btn, Settings controls) */
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -15472,10 +15851,13 @@ html.ui-v2 #access-custody-section .ui-btn:focus-visible {
 }
 
 /* ── notes, warnings, errors ── */
+/* Notes carry real state copy (empty states, lease lifecycle, consent) —
+   text-2 at 12px: light-theme text-3 lands ~3.5:1 on these surfaces,
+   under AA for running copy. */
 html.ui-v2 #access-vault-section .vault-note {
-  font-size: 11.5px;
+  font-size: 12px;
   line-height: 1.55;
-  color: var(--text-3);
+  color: var(--text-2);
 }
 html.ui-v2 #access-vault-section .vault-warning {
   border: 1px solid rgba(var(--amber-rgb), .32);
@@ -15519,26 +15901,34 @@ html.ui-v2 #access-vault-section .vault-words .n {
   color: var(--text-3);
 }
 
-/* ── inputs / selects / textareas ── */
+/* ── inputs / selects / textareas ──
+   36px control height = the Access field-grid recipe, so the two Trust
+   tabs' forms match. Selects are deliberately NOT in this rule: its
+   plain background would bury the chevron artwork the shared select
+   recipe below paints (higher specificity) — they take min-height there. */
 html.ui-v2 #access-vault-section .vault-phrase-input,
-html.ui-v2 #access-vault-section .vault-form-grid input,
-html.ui-v2 #access-vault-section .vault-form-grid select {
+html.ui-v2 #access-vault-section .vault-form-grid input {
+  min-height: 36px;
   border: 1px solid var(--line-2);
   border-radius: 10px;
   background: var(--surface-2);
   color: var(--text);
   font-size: 13px;
-  padding: 10px 12px;
+  padding: 8px 12px;
   outline: none;
 }
 html.ui-v2 #access-vault-section .vault-phrase-input { font-family: var(--mono); font-size: 12.5px; }
+/* The unlock row pairs the phrase input with its button — same 36px
+   control height, or the pair reads misaligned. */
+html.ui-v2 #access-vault-section .vault-actions:has(> .vault-phrase-input) > .ui-btn {
+  min-height: 36px;
+}
 html.ui-v2 #access-vault-section .vault-phrase-input::placeholder,
 html.ui-v2 #access-vault-section .vault-form-grid input::placeholder { color: var(--text-3); }
 html.ui-v2 #access-vault-section .vault-phrase-input:focus-visible,
-html.ui-v2 #access-vault-section .vault-form-grid input:focus-visible,
-html.ui-v2 #access-vault-section .vault-form-grid select:focus-visible {
+html.ui-v2 #access-vault-section .vault-form-grid input:focus-visible {
   border-color: var(--iris);
-  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
 }
 html.ui-v2 #access-vault-section .vault-form-grid {
   grid-template-columns: minmax(120px, 170px) 1fr;
@@ -15554,6 +15944,7 @@ html.ui-v2 #access-vault-section .vault-form-grid label {
 html.ui-v2 #access-vault-section select {
   appearance: none;
   -webkit-appearance: none;
+  min-height: 36px;
   border: 1px solid var(--line-2);
   border-radius: 10px;
   background:
@@ -15568,13 +15959,30 @@ html.ui-v2 #access-vault-section select {
   cursor: pointer;
   outline: none;
 }
+/* Light theme: chevron stroke restated in light ink (see the key tile). */
+html.ui-v2[data-theme="light"] #access-vault-section select {
+  background:
+    url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%234B5265" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>')
+    right 10px center / 15px 15px no-repeat,
+    var(--surface-2);
+}
 html.ui-v2 #access-vault-section select:focus-visible {
   border-color: var(--iris);
-  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
 }
 
-/* The offline-window knob row reads as the security dial it is. */
+/* Form selects drop the dial-grade bold and match the sibling inputs'
+   type size — in a labeled form the value reads like a field, not a
+   control. (Chevron clearance rides on the shared recipe above.) */
+html.ui-v2 #access-vault-section .vault-form-grid select {
+  font-size: 13px;
+  font-weight: 400;
+}
+
+/* The offline-window knob row reads as the security dial it is —
+   label left, control right, the Settings preference-row grammar. */
 html.ui-v2 #access-vault-section .vault-actions:has(> select) {
+  justify-content: space-between;
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--surface);
@@ -15586,7 +15994,11 @@ html.ui-v2 #access-vault-section .vault-actions:has(> select) > .vault-note {
   color: var(--text);
 }
 
-/* ── checkbox toggles (client egress + full-credential OAuth opt-in) ── */
+/* ── checkbox toggles (client egress + full-credential OAuth opt-in) ──
+   Geometry matches the Settings toggle recipe exactly (42×24, 20px #fff
+   knob); the inset hairline + the light-theme track/knob treatment are
+   the delta — an unchecked borderless surface-3 track is near-invisible
+   on light surfaces (~1.2:1). Worth porting back into Settings. */
 html.ui-v2 #access-vault-section input[type="checkbox"] {
   appearance: none;
   -webkit-appearance: none;
@@ -15598,9 +16010,13 @@ html.ui-v2 #access-vault-section input[type="checkbox"] {
   border: 0;
   border-radius: 999px;
   background: var(--surface-3);
+  box-shadow: inset 0 0 0 1px var(--line-2);
   cursor: pointer;
   transition: background var(--t-slow);
   vertical-align: middle;
+}
+html.ui-v2[data-theme="light"] #access-vault-section input[type="checkbox"] {
+  background: var(--line-2); /* over white ≈ a real track, not a ghost */
 }
 html.ui-v2 #access-vault-section input[type="checkbox"]::after {
   content: '';
@@ -15614,14 +16030,25 @@ html.ui-v2 #access-vault-section input[type="checkbox"]::after {
   box-shadow: 0 2px 5px rgba(0, 0, 0, .4);
   transition: left var(--t-slow);
 }
-html.ui-v2 #access-vault-section input[type="checkbox"]:checked { background: var(--iris); }
+html.ui-v2[data-theme="light"] #access-vault-section input[type="checkbox"]::after {
+  box-shadow: 0 1px 3px rgba(23, 28, 50, .3), 0 0 0 1px rgba(18, 23, 42, .08);
+}
+html.ui-v2 #access-vault-section input[type="checkbox"]:checked {
+  background: var(--iris);
+  box-shadow: none;
+}
 html.ui-v2 #access-vault-section input[type="checkbox"]:checked::after { left: 20px; }
 html.ui-v2 #access-vault-section input[type="checkbox"]:focus-visible {
   outline: 2px solid var(--iris);
   outline-offset: 2px;
 }
 
-/* Per-provider relay toggles: the wrap is a .vault-note span. */
+/* Per-provider relay toggles: the wrap is a .vault-note span. The row's
+   column-gap outgrows the 10px toggle↔label gap so the groups separate
+   more than their internals (proximity grouping). */
+html.ui-v2 #access-vault-section .vault-actions:has(> .vault-note > input[type="checkbox"]) {
+  gap: 8px 20px;
+}
 html.ui-v2 #access-vault-section .vault-actions > .vault-note:has(> input[type="checkbox"]) {
   display: inline-flex;
   align-items: center;
@@ -15631,16 +16058,20 @@ html.ui-v2 #access-vault-section .vault-actions > .vault-note:has(> input[type="
   color: var(--text);
 }
 html.ui-v2 #access-vault-section .vault-actions > .vault-note > label { cursor: pointer; }
-/* Full-credential OAuth opt-in: dashed consent card, long-copy label. */
+/* Full-credential OAuth opt-in: dashed consent card, long-copy label.
+   The copy is a first-class security decision, not a footnote — it gets
+   body ink (the note default below is already text-2, this pins it). */
 html.ui-v2 #access-vault-section .vault-actions:has(> #vault-oauth-lease-toggle) {
   flex-wrap: nowrap;
   align-items: flex-start;
+  gap: 12px;
   border: 1px dashed var(--line-2);
   border-radius: 12px;
   padding: 12px 14px;
 }
 html.ui-v2 #access-vault-section .vault-actions:has(> #vault-oauth-lease-toggle) > .vault-note {
   cursor: pointer;
+  color: var(--text-2);
 }
 
 /* ── folds: "Add a credential" reads as a dashed add button; the
@@ -15656,10 +16087,21 @@ html.ui-v2 #access-vault-section .acc-fold > summary {
   font-size: 12.5px;
   font-weight: 700;
   color: var(--text-2);
+  border-radius: 12px; /* the keyboard focus ring follows this — square ring on a rounded card otherwise */
 }
 html.ui-v2 #access-vault-section .acc-fold > summary:hover { color: var(--text); }
 html.ui-v2 #access-vault-section .acc-fold > summary::before { color: var(--text-3); }
 html.ui-v2 #access-vault-section .acc-fold-body { padding: 4px 15px 15px; }
+/* The OAuth textarea and the submit row live OUTSIDE the label/control
+   grid in the DOM; indent them to the control column (170px label col +
+   12px gap) so the form keeps one left edge. */
+html.ui-v2 #access-vault-section .acc-fold:has(.vault-form-grid) > .acc-fold-body > .vault-phrase-input {
+  width: calc(100% - 182px);
+  margin-left: 182px;
+}
+html.ui-v2 #access-vault-section .acc-fold:has(.vault-form-grid) > .acc-fold-body > .vault-actions {
+  margin-left: 182px;
+}
 html.ui-v2 #access-vault-section .acc-fold:has(.vault-form-grid):not([open]) {
   width: max-content;
   max-width: 100%;
@@ -15697,12 +16139,18 @@ html.ui-v2 #access-custody-section .custody-row {
   font-size: 12px;
 }
 html.ui-v2 #access-custody-section .custody-row:last-child { border-bottom: 0; }
+/* Fixed-width timestamp + event-chip columns so every row's main text
+   starts on the same edge — the trail reads as a table, not a ragged
+   list ("Jul 8, 09:41:22" ≈ 102px mono; "relay off" is the widest chip). */
 html.ui-v2 #access-custody-section .custody-ts {
+  min-width: 110px;
   font-family: var(--mono);
   font-size: 10.5px;
   color: var(--text-3);
 }
 html.ui-v2 #access-custody-section .custody-chip {
+  min-width: 66px;
+  text-align: center;
   padding: 2px 8px;
   border-radius: 999px;
   font-size: 10.5px;
@@ -15716,11 +16164,16 @@ html.ui-v2 #access-custody-section .custody-chip.expire { background: var(--surf
 html.ui-v2 #access-custody-section .custody-chip.egress { background: rgba(var(--sky-rgb), .14); color: var(--sky); }
 html.ui-v2 #access-custody-section .custody-chip.reset { background: rgba(var(--rose-rgb), .14); color: var(--rose); }
 html.ui-v2 #access-custody-section .custody-main { color: var(--text); font-weight: 600; font-size: 12.5px; }
-html.ui-v2 #access-custody-section .custody-meta { color: var(--text-3); font-size: 11.5px; }
+html.ui-v2 #access-custody-section .custody-meta { color: var(--text-2); font-size: 12px; }
+/* Narrow panes: the meta fragment takes its own full line instead of
+   splitting mid-row differently on every row. */
+@media (max-width: 900px) {
+  html.ui-v2 #access-custody-section .custody-meta { flex: 1 1 100%; }
+}
 html.ui-v2 #access-custody-section .vault-note {
-  font-size: 11.5px;
+  font-size: 12px;
   line-height: 1.55;
-  color: var(--text-3);
+  color: var(--text-2);
 }
 
 /* ── "Vault moved" pointer card left in Access → Advanced ── */
@@ -15749,7 +16202,7 @@ html.ui-v2 .ui2-vault-moved-sub {
 }
 html.ui-v2 .ui2-vault-moved-go {
   border: 1px solid var(--line-2);
-  border-radius: 9px;
+  border-radius: 10px;
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -15901,7 +16354,7 @@ html.ui-v2 #tab-sessions .sessions-title {
 }
 
 /* Toolbar fold: the full v1 control row, one reveal away. */
-html.ui-v2 #tab-sessions .ui2-tools-toggle { padding: 6px 11px; }
+html.ui-v2 #tab-sessions .ui2-tools-toggle { padding: 7px 11px; } /* equal height with Refresh */
 html.ui-v2 #tab-sessions .ui2-tools-badge {
   font-family: var(--mono);
   font-size: 10px;
@@ -15925,6 +16378,23 @@ html.ui-v2 #tab-sessions .sessions-header.ui2-tools-open .sessions-toolbar {
   border-radius: 12px;
   background: var(--surface);
 }
+/* v1's fixed track plans overflow once the fold adds 26px of card chrome
+   (padding + border): the sort column escaped the card and the fixed-min
+   filter buttons spilled across their gaps. Re-plan per pane with
+   flexible tracks and let every control fill its track. */
+html.ui-v2 #sessions-pane-recent .sessions-header.ui2-tools-open .sessions-toolbar {
+  grid-template-columns: minmax(150px, 1.6fr) minmax(128px, 1.1fr) minmax(112px, 1fr) minmax(112px, 1fr) auto minmax(150px, 1.2fr);
+}
+html.ui-v2 #sessions-pane-deep .sessions-header.ui2-tools-open .sessions-toolbar {
+  grid-template-columns: minmax(150px, 1.6fr) minmax(128px, 1.1fr) minmax(112px, 1fr) minmax(112px, 1fr) minmax(150px, 1.2fr);
+}
+html.ui-v2 #sessions-pane-worktrees .sessions-header.ui2-tools-open .sessions-toolbar {
+  grid-template-columns: minmax(190px, 1fr) auto auto auto auto auto minmax(160px, auto);
+}
+html.ui-v2 #tab-sessions .sessions-toolbar .sessions-control,
+html.ui-v2 #tab-sessions .sessions-toolbar .sessions-project-filter { min-width: 0; }
+html.ui-v2 #tab-sessions .sessions-multi-filter-btn { min-width: 0; width: 100%; }
+html.ui-v2 #tab-sessions .sessions-sort select { width: 100%; min-width: 0; }
 
 /* Toolbar field voice + input recipes. */
 html.ui-v2 #tab-sessions .sessions-toolbar .sessions-search > span,
@@ -15968,7 +16438,7 @@ html.ui-v2 #tab-sessions .sessions-multi-filter-menu {
   border: 1px solid var(--line-2);
   border-radius: 12px;
   background: var(--surface);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, .45);
+  box-shadow: var(--shadow-menu);
 }
 html.ui-v2 #tab-sessions .sessions-multi-filter-menu label {
   padding: 6px 8px;
@@ -16003,6 +16473,12 @@ html.ui-v2 #tab-sessions .sessions-toggle {
   transition: border-color var(--t-med), color var(--t-med), background var(--t-med);
 }
 html.ui-v2 #tab-sessions .sessions-toggle input[type="checkbox"] { accent-color: var(--iris); }
+/* Keyboard focus lands on the hidden-in-plain-sight checkbox — surface it
+   on the chip itself so tabbing through the fold stays visible. */
+html.ui-v2 #tab-sessions .sessions-toggle:focus-within {
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
 html.ui-v2 #tab-sessions .sessions-toggle:has(input:checked) {
   border-color: rgba(var(--iris-rgb), .3);
   background: rgba(var(--iris-rgb), .09);
@@ -16125,7 +16601,7 @@ html.ui-v2 #tab-sessions .sessions-host-chip.offline { opacity: .55; }
 
 html.ui-v2 #tab-sessions .sessions-list { gap: 10px; }
 html.ui-v2 #tab-sessions .session-card {
-  padding: 14px 250px 14px 17px;
+  padding: 14px 282px 14px 17px;
   border: 1px solid var(--line);
   border-radius: 13px;
   background: var(--surface);
@@ -16187,6 +16663,7 @@ html.ui-v2 #tab-sessions .session-card .ui-badge {
   font-size: 10px;
   font-weight: 700;
   letter-spacing: .01em;
+  line-height: 15px; /* pin: button chips (lineage) must match span pills */
   border: 1px solid transparent;
   background: var(--surface-3);
   color: var(--text-2);
@@ -16297,15 +16774,15 @@ html.ui-v2 #tab-sessions .session-card .sc-actions {
   top: 50%;
   right: 14px;
   transform: translateY(-50%);
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: flex-end;
-  max-width: 224px;
+  gap: 6px;
 }
 html.ui-v2 #tab-sessions .session-card .sc-actions .ui-btn {
   min-height: 0;
-  padding: 6px 12px;
+  padding: 6px 11px;
   border-radius: 9px;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 700;
   background: transparent;
   border-color: transparent;
@@ -16360,7 +16837,7 @@ html.ui-v2 #tab-sessions .sc-delete-menu {
   border: 1px solid var(--line-2);
   border-radius: 12px;
   background: var(--surface);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, .45);
+  box-shadow: var(--shadow-menu);
   padding: 5px;
 }
 html.ui-v2 #tab-sessions .sc-delete-menu-item {
@@ -17116,6 +17593,7 @@ html.ui-v2 #tab-sessions .session-detail-action-btn:hover:not(:disabled) {
 }
 html.ui-v2 #tab-sessions .session-resume-btn {
   border: 0;
+  padding: 7px 14px; /* +1px vs bordered siblings: keeps all three 30px tall */
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-weight: 800;
@@ -17322,6 +17800,15 @@ html.ui-v2 #tab-sessions .session-detail .empty-state {
 
 @media (max-width: 980px) {
   html.ui-v2 #tab-sessions .sessions-aggregate { grid-template-columns: repeat(2, 1fr); }
+  /* v1's fixed five-track deep-search row clips Run/Clear off the card at
+     narrow widths — let the controls wrap under the explainer instead. */
+  html.ui-v2 #tab-sessions .sessions-deep-search-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+  }
+  html.ui-v2 #tab-sessions .sessions-deep-search-title { flex: 1 1 100%; min-width: 0; }
+  html.ui-v2 #tab-sessions .sessions-deep-search-query { flex: 1 1 200px; min-width: 0; }
   html.ui-v2 #tab-sessions .sessions-header.ui2-tools-open .sessions-toolbar,
   html.ui-v2 #tab-sessions .worktrees-header .sessions-toolbar {
     grid-template-columns: 1fr 1fr;
@@ -17343,6 +17830,10 @@ html.ui-v2 #tab-sessions .session-detail .empty-state {
     grid-template-columns: 1fr;
   }
 }
+
+/* Session ids ride the design mono, not the UA's ui-monospace stack
+   (chrome-audit cross-surface sweep). */
+html.ui-v2 #tab-sessions .session-card .sc-id { font-family: var(--mono); }
 /* ── static/app/ui2-activity.css ── */
 /* ── ui-v2 Activity slice 1: Focus timeline + approval hero ────────────
    All scoped html.ui-v2. Restyles the EXISTING log-entry scaffold
@@ -17403,12 +17894,18 @@ html.ui-v2 .log-entry .log-icon {
   width: 6px; height: 6px;    /* …become the role dot */
   border-radius: 50%;
   background: var(--text-3);
-  align-self: center;
+  /* Pin to the FIRST text line, not the entry's vertical middle —
+     align-self:center floated the dot between lines on wrapped entries.
+     13.5px × 1.55 line box = ~21px; a 6px dot centers at (21−6)/2 ≈ 7px. */
+  align-self: start;
+  margin-top: 7px;
   justify-self: center;
 }
+/* Meta chips join the row's shared baseline so they ride line 1 on
+   wrapped entries (center-alignment floated them mid-entry). */
 html.ui-v2 .log-entry .log-host,
-html.ui-v2 .log-entry .log-session { margin-right: 7px; align-self: center; }
-html.ui-v2 .log-entry .log-anchor-btn { margin-right: 6px; align-self: center; }
+html.ui-v2 .log-entry .log-session { margin-right: 7px; align-self: baseline; }
+html.ui-v2 .log-entry .log-anchor-btn { margin-right: 6px; align-self: baseline; }
 /* the source string becomes the role eyebrow (gap via padding — grid
    max-content tracks size it reliably even when the glyph is ::after) */
 html.ui-v2 .log-entry .log-level {
@@ -17423,6 +17920,12 @@ html.ui-v2 .log-entry .log-level {
   width: auto;    /* v1 fixes .log-level at width:52px — the longer v2
                      role labels (INTENDANT) would ink past it into the
                      content column */
+  /* Shared body edge: each entry is its own grid, so a max-content level
+     track makes body columns ragged across rows (ℹ vs INTENDANT). A
+     min-width sized to the longest eyebrow (INTENDANT at 9.5px mono +
+     .13em tracking ≈ 62px) lines every body up without reintroducing
+     v1's overflow. */
+  min-width: 63px;
 }
 /* named roles: label overrides (textContent stays untouched — session
    windows and Station read it — so the swap is ::after only) */
@@ -17455,6 +17958,16 @@ html.ui-v2 .log-entry.level-model { color: var(--text); }
 html.ui-v2 .log-entry.level-detail, html.ui-v2 .log-entry.level-debug { color: var(--text-3); }
 html.ui-v2 .log-entry.level-error { color: var(--rose); }
 html.ui-v2 .log-entry.level-warn { color: var(--amber); }
+/* v1 re-tints body prose per role at the child level
+   (.level-model .log-content { color: var(--log-model) } …) which outranks
+   the parent rules above — under v2 the EYEBROW + dot carry the role and
+   the body reads as text ink. Warn/error keep their semantic tint. */
+html.ui-v2 .log-entry.level-model .log-content,
+html.ui-v2 .log-entry.level-agent .log-content,
+html.ui-v2 .log-entry.level-subagent .log-content,
+html.ui-v2 .log-entry.level-presence .log-content { color: var(--text); }
+html.ui-v2 .log-entry.level-detail .log-content,
+html.ui-v2 .log-entry.level-debug .log-content { color: var(--text-3); }
 /* hover actions float over the entry instead of joining the grid flow */
 html.ui-v2 .log-entry .log-copy-entry,
 html.ui-v2 .log-entry .log-edit-message {
@@ -17491,7 +18004,9 @@ html.ui-v2 .log-entry.rollback-marker { color: var(--amber); }
 html.ui-v2 #approval-panel .approval-card {
   border: 1px solid rgba(var(--amber-rgb), .32);
   border-radius: 14px;
-  background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02));
+  /* tint over an OPAQUE base — a bare gradient let the stream ghost
+     through the card (pixel-QA 2026-07-08) */
+  background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02)), var(--surface);
   box-shadow: var(--shadow-card);
   padding: 15px 17px;
 }
@@ -17531,6 +18046,9 @@ html.ui-v2 #approval-panel .approval-category {
   color: var(--amber);
   margin-bottom: 11px;
 }
+/* keep v1's empty-hide winning — the display above outranked it and an
+   empty category rendered as a bare amber crumb */
+html.ui-v2 #approval-panel .approval-category:empty { display: none; }
 html.ui-v2 #approval-panel .approval-actions { display: flex; gap: 9px; flex-wrap: wrap; align-items: center; }
 html.ui-v2 #approval-panel .approval-actions button {
   padding: 9px 15px;
@@ -17544,7 +18062,9 @@ html.ui-v2 #approval-panel .approval-actions button {
 }
 html.ui-v2 #approval-panel .approval-actions button:hover { background: var(--surface-2); color: var(--text); }
 html.ui-v2 #approval-panel .approval-actions button.approve {
-  border: 0;
+  /* transparent border (not 0): keeps this box the same 37px height as
+     its bordered siblings — the row read 35px vs 37px */
+  border: 1px solid transparent;
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-weight: 800;
@@ -17562,7 +18082,13 @@ html.ui-v2 #approval-panel .approval-actions kbd {
   font-size: 10px;
   padding: 1px 5px;
   border-radius: 5px;
-  background: rgba(11, 12, 16, .25);
+  /* text-toned wash: lightens on dark, darkens on light, so the hint
+     stays legible on the iris-filled Approve in BOTH themes (the old
+     fixed dark wash made dark-theme "y" black-on-black) */
+  background: rgba(var(--text-rgb), .16);
+  /* ride the button's own ink (v1 pins kbd to overlay1/text-3, which
+     washes out on the filled Approve) */
+  color: inherit;
 }
 /* the category-rule action (inserted by ui2-activity.js) */
 html.ui-v2 #approval-panel .ui2-approve-category {
@@ -17720,12 +18246,140 @@ html.ui-v2 .ui2-approval-session {
   background: var(--session-badge-bg, var(--surface-2));
   color: var(--session-badge-fg, var(--text-2));
 }
-/* the bottom panel gets a solid backdrop — stream text was bleeding
-   between the hero's buttons */
+/* the bottom panel gets a SOLID backdrop — at 92% the stream still
+   ghosted between the hero's buttons (product bar: no text bleed) */
 html.ui-v2 #activity-log-pane .bottom-panel.visible {
-  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  background: var(--bg);
   padding: 10px 14px 12px;
 }
+/* rail contents pair with the composer column: same 920px cap, centered
+   (the full-pane card dwarfed the dock it sits above) */
+html.ui-v2 #activity-log-pane .bottom-panel .panel-body,
+html.ui-v2 #activity-log-pane .bottom-panel .panel-header {
+  max-width: 920px;
+  margin-inline: auto;
+}
+
+/* — light theme: identity-chip legibility (pixel-QA 2026-07-08; widened
+   past this tab per the sessions agent's file request — the .log-entry
+   chip presentation lives here and the same chips render in
+   session-detail logs) ───────────────────────────────────────────────
+   applySessionBadgeStyle mints dark-theme pastels (fg ≈ 78% lightness) as
+   inline --session-badge-* vars; on light surfaces that is pale-on-pale
+   (~1.3:1). Re-derive the consumed colors toward ink while KEEPING each
+   session's hue — a flat token tint would sever the badge ↔ window-ring
+   ↔ switcher color identity. */
+html.ui-v2[data-theme="light"] .log-entry .log-session,
+html.ui-v2[data-theme="light"] .global-task-bar .task-target-session-badge,
+html.ui-v2[data-theme="light"] #ui2-approval-session {
+  color: color-mix(in srgb, var(--session-badge-fg, var(--text-2)) 34%, var(--text));
+  border-color: color-mix(in srgb, var(--session-badge-border, var(--line-2)) 55%, var(--line-2));
+}
+/* Host badge: hash bg is hsl(h, 32%, 58%) with v1 ink var(--base) — in
+   light that base flips to near-white (~2:1 on the midtone bg). Pin the
+   ink to light's text token (dark keeps --base = near-black, ~7:1). */
+html.ui-v2[data-theme="light"] .log-entry .log-host { color: var(--text); }
+
+/* — operator-question rail (ask_human parks a session here) — the v2
+   hero grammar, sky-tinted: a question asks for input, not permission. */
+html.ui-v2 #human-panel .panel-header {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--sky);
+  padding: 0 3px 6px;
+}
+html.ui-v2 #human-panel .panel-body {
+  border: 1px solid rgba(var(--sky-rgb), .3);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(var(--sky-rgb), .08), rgba(var(--sky-rgb), .02)), var(--surface);
+  box-shadow: var(--shadow-card);
+  padding: 13px 15px;
+}
+html.ui-v2 #human-panel .input-question {
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 650;
+  padding: 0 0 10px;
+}
+html.ui-v2 #human-panel .input-area { gap: 9px; }
+html.ui-v2 #human-panel .input-area textarea {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  padding: 8px 11px;
+  min-height: 38px;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+html.ui-v2 #human-panel .input-area textarea:focus {
+  border-color: rgba(var(--iris-rgb), .45);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+html.ui-v2 #human-panel .input-area button {
+  border: 0;
+  border-radius: 10px;
+  padding: 9px 16px;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-size: 13px;
+  font-weight: 800;
+  box-shadow: var(--shadow-primary);
+  transition: filter var(--t-fast);
+}
+html.ui-v2 #human-panel .input-area button:hover { filter: brightness(1.08); opacity: 1; }
+
+/* — structured user questions (#question-panel) share the sky grammar — */
+html.ui-v2 #question-panel .approval-card {
+  border: 1px solid rgba(var(--sky-rgb), .3);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(var(--sky-rgb), .08), rgba(var(--sky-rgb), .02)), var(--surface);
+  box-shadow: var(--shadow-card);
+  padding: 13px 15px;
+}
+html.ui-v2 #question-panel .approval-icon { display: none; }
+html.ui-v2 #question-panel .question-text { color: var(--text); font-size: 13.5px; }
+html.ui-v2 #question-panel .question-header-chip {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--sky);
+  background: rgba(var(--sky-rgb), .1);
+  border: 1px solid rgba(var(--sky-rgb), .24);
+}
+html.ui-v2 #question-panel .question-option {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 #question-panel .question-option:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2 #question-panel .question-option.selected {
+  border-color: rgba(var(--iris-rgb), .5);
+  background: rgba(var(--iris-rgb), .1);
+}
+html.ui-v2 #question-panel .question-free-text {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+}
+html.ui-v2 #question-panel .question-free-text:focus {
+  border-color: rgba(var(--iris-rgb), .45);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+
+/* Inline command code rides the design mono, not the UA's generic
+   monospace (chrome-audit cross-surface sweep). */
+html.ui-v2 code.log-command-code { font-family: var(--mono); }
 /* ── static/app/ui2-grid.css ── */
 /* ── ui-v2 Activity Grid mode: session-window re-skin ──────────────────
    All scoped html.ui-v2. The v1 window machinery (collapse states,
@@ -17744,6 +18398,19 @@ html.ui-v2 .session-window-grid {
   padding: 12px 14px;
   border-bottom: 1px solid var(--line);
   background: var(--bg);
+}
+/* Resized grid: v1 pins a fixed height with overflow:visible, and a
+   definite height COMPRESSES the auto rows — at 5-6 windows row 1's
+   cards painted over row 2 (measured: 320px cards in 298px tracks;
+   ledger finding #4). Under v2 the dragged size is a CAP the area
+   scrolls within, so tracks keep content size and rows never overlap.
+   Cost: a ⋯ menu taller than the remaining grid area scrolls instead of
+   escaping — the lesser evil vs overlapping cards. */
+html.ui-v2 .session-window-grid.resized {
+  height: auto;
+  max-height: var(--session-window-grid-height);
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 html.ui-v2 .session-window-grid-resize-handle::before {
   width: 44px;
@@ -17904,8 +18571,11 @@ html.ui-v2 .session-window-menu-separator {
 
 /* — per-window log — */
 html.ui-v2 .session-window-log { padding: 4px 10px 8px; }
-/* narrower gutter inside windows than the main timeline */
-html.ui-v2 .session-window-log .log-entry { grid-template-columns: 44px 14px max-content max-content max-content max-content minmax(0, 1fr); }
+/* narrower gutter inside windows than the main timeline — but wide
+   enough for a full 8-char mono timestamp (44px ellipsized "18:31…");
+   col 2 shrinks to 10px because the role dot is hidden in windows */
+html.ui-v2 .session-window-log .log-entry { grid-template-columns: 54px 10px max-content max-content max-content max-content minmax(0, 1fr); }
+html.ui-v2 .session-window-log .log-entry .log-ts { font-size: 10px; }
 html.ui-v2 .session-window-empty {
   color: var(--text-3);
   font-size: 12px;
@@ -17958,6 +18628,14 @@ html.ui-v2 .concurrent-log-action[aria-pressed="true"] { color: var(--iris-2); }
 html.ui-v2 .session-window { background: var(--surface); }
 html.ui-v2 .session-window-header { background: var(--surface-2); }
 html.ui-v2 .concurrent-log-region { background: var(--bg); }
+
+/* Light theme: the session-badge vars are dark-theme pastels (see the
+   matching remap in ui2-activity.css) — re-derive the window id chip
+   toward ink so per-session identity stays legible on light surfaces. */
+html.ui-v2[data-theme="light"] .session-window-id {
+  color: color-mix(in srgb, var(--session-badge-fg, var(--text-2)) 34%, var(--text));
+  border-color: color-mix(in srgb, var(--session-badge-border, var(--line-2)) 55%, var(--line-2));
+}
 /* ── static/app/ui2-live.css ── */
 /* ── ui-v2 Live display (Video tab) re-skin (design-overhaul P2) ───────
    Everything here is scoped under `html.ui-v2` and restyles the EXISTING
@@ -18095,6 +18773,17 @@ html.ui-v2 #tab-displays .ui-empty-glyph {
   background: var(--surface-2);
   border: 1px solid var(--line-2);
   color: var(--text-3);
+  /* v1 leaves the block-level svg at the box's top-left; center it and
+     match the usage tab's 20px glyph so empty states read identically. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+html.ui-v2 #tab-displays .ui-empty-glyph svg {
+  width: 20px;
+  height: 20px;
+  stroke: currentColor;
+  stroke-width: 1.7;
 }
 html.ui-v2 #tab-displays .ui-empty-title {
   color: var(--text);
@@ -18106,6 +18795,26 @@ html.ui-v2 #tab-displays .ui-empty-hint {
   font-size: 11.5px;
   line-height: 1.5;
 }
+/* v1's .ui-empty-btn recipe hover-flips --blue→--sapphire, which under the
+   v2 bridge reads iris→sky — a hue change mid-hover. Re-pin the CTA to the
+   v2 primary recipe (iris gradient, brightness hover) used rail-wide. */
+html.ui-v2 #tab-displays .ui-empty-btn {
+  margin-top: 8px;
+  padding: 8px 18px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  transition: filter var(--t-med);
+}
+html.ui-v2 #tab-displays .ui-empty-btn:hover {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  filter: brightness(1.08);
+}
 
 /* ── per-slot toolbar → the design's live toolbar ── */
 html.ui-v2 .display-slot + .display-slot { margin-top: 8px; }
@@ -18114,6 +18823,9 @@ html.ui-v2 .display-toolbar {
   border-bottom: 0;
   padding: 10px 2px 10px;
   gap: 8px;
+  /* v1 never wraps; at narrow widths the trailing buttons (incl. Take
+     Control) clipped off the right edge with no scroll. Wrap instead. */
+  flex-wrap: wrap;
 }
 /* display name wears the design's picker-button look (static: every
    granted display renders simultaneously — no dropdown to fake) */
@@ -18126,6 +18838,9 @@ html.ui-v2 .display-label {
   border: 1px solid var(--line);
   border-radius: 9px;
   background: var(--surface);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 /* connection status: dotted text when healthy, rose pill when degraded
    (reconnect countdown / failed / disconnected / capture lost) */
@@ -18137,6 +18852,8 @@ html.ui-v2 .display-status {
   font-weight: 600;
   color: var(--text-2);
   font-variant-numeric: tabular-nums;
+  /* pill text must never wrap — a wrapped 999px pill renders as an egg */
+  white-space: nowrap;
 }
 html.ui-v2 .display-status::before {
   content: '';
@@ -18177,6 +18894,7 @@ html.ui-v2 .display-input-authority {
   background: var(--surface-3);
   color: var(--text-2);
   border: 1px solid var(--line-2);
+  white-space: nowrap;
 }
 html.ui-v2 .display-input-authority.you {
   background: rgba(var(--green-rgb), .12);
@@ -18306,7 +19024,7 @@ html.ui-v2 .display-toolbar .release-note {
   width: 150px;
 }
 html.ui-v2 .display-toolbar .release-note::placeholder { color: var(--text-3); }
-html.ui-v2 .display-toolbar .release-note:focus { border-color: var(--iris); outline: none; box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25); }
+html.ui-v2 .display-toolbar .release-note:focus { border-color: var(--iris); outline: none; box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22); }
 html.ui-v2 .stream-frame-id { font-family: var(--mono); }
 
 /* ── the stage: rounded dark viewport (WRAPPER does the clipping) ──
@@ -18383,6 +19101,21 @@ html.ui-v2 .shared-view-focus-box::after {
   border-color: rgba(var(--amber-rgb), .5);
   font-family: var(--sans);
 }
+/* light theme: the stage stays a dark viewport, but its .5-black drop
+   shadow is dark-tuned — soften toward the light elevation vocabulary. */
+html.ui-v2[data-theme="light"] .display-canvas {
+  box-shadow:
+    inset 0 0 0 1px var(--line-2),
+    inset 0 1px 0 rgba(255, 255, 255, .04),
+    0 24px 60px rgba(23, 28, 50, .22);
+}
+html.ui-v2[data-theme="light"] .display-slot.shared-view-active .display-canvas {
+  box-shadow:
+    inset 0 0 0 2px rgba(var(--sky-rgb), .74),
+    inset 0 1px 0 rgba(255, 255, 255, .04),
+    0 24px 60px rgba(23, 28, 50, .22);
+}
+
 /* contexts that must NOT wear the stage chrome: activity thumbnails and
    in-page fullscreen (the reparented canvas keeps its geometry honest) */
 html.ui-v2 .activity-display-thumb > .display-canvas {
@@ -18617,7 +19350,7 @@ html.ui-v2 .ann-note {
   width: 190px;
 }
 html.ui-v2 .ann-note::placeholder { color: var(--text-3); }
-html.ui-v2 .ann-note:focus { border-color: var(--iris); box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25); }
+html.ui-v2 .ann-note:focus { border-color: var(--iris); box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22); }
 /* triple action: Send = primary; Attach = secondary; Save = ghost */
 html.ui-v2 .ann-submit-btn,
 html.ui-v2 .clip-toolbar .clip-send-btn {
@@ -18824,7 +19557,7 @@ html.ui-v2 .display-picker {
   border: 1px solid var(--line-2);
   border-radius: 12px;
   padding: 5px;
-  box-shadow: 0 30px 80px rgba(0, 0, 0, .6);
+  box-shadow: var(--shadow-overlay);
 }
 html.ui-v2 .display-picker-item {
   border-radius: 8px;
@@ -19187,8 +19920,12 @@ html.ui-v2 #tab-stats .ui-stat-value {
 html.ui-v2 #tab-stats #stats-kpi-row .ui-stat:nth-child(4) .ui-stat-value {
   color: var(--iris-2);
 }
-html.ui-v2 #tab-stats .stats-kpi-skel-label { min-height: 11px; }
-html.ui-v2 #tab-stats .stats-kpi-skel-value { min-height: 24px; }
+/* Skeleton bars mirror the real label/value line boxes (11px text at the
+   inherited 1.5 line-height = 16.5px; 24px value at the ui-stat 1.15 =
+   27.6px) so the tiles keep their height when data lands — previously
+   the shimmer tiles were 11px shorter and the whole page shifted. */
+html.ui-v2 #tab-stats .stats-kpi-skel-label { min-height: 16.5px; }
+html.ui-v2 #tab-stats .stats-kpi-skel-value { min-height: 27.6px; }
 
 /* ── empty state ── */
 html.ui-v2 #tab-stats #usage-empty {
@@ -19425,6 +20162,9 @@ html.ui-v2 #tab-stats .token-breakdown .total-row {
 html.ui-v2 #tab-stats .cost-grid {
   font-size: 12.5px;
   gap: 7px 16px;
+  /* Wide grids (the 8-column by-agent table) clipped their trailing
+     columns inside the card below ~900px; scroll the grid instead. */
+  overflow-x: auto;
 }
 html.ui-v2 #tab-stats .cost-grid .label { color: var(--text-2); }
 html.ui-v2 #tab-stats .cost-grid .value {
@@ -19441,9 +20181,20 @@ html.ui-v2 #tab-stats .cost-grid .head {
   text-transform: uppercase;
   color: var(--text-3);
 }
+/* Never wrap headers, row labels, or the amber unpriced note: with the
+   grid scrollable, long content widens its track instead of stacking
+   word-per-line inside a squeezed column ("EST. / COST", four-line
+   unpriced notes at 820). */
+html.ui-v2 #tab-stats .cost-grid .head,
+html.ui-v2 #tab-stats .cost-grid .label,
+html.ui-v2 #tab-stats .cost-grid .unpriced { white-space: nowrap; }
 html.ui-v2 #tab-stats .cost-grid .label.strong { color: var(--text); font-weight: 700; }
 html.ui-v2 #tab-stats .cost-grid .err { color: var(--rose); }
-html.ui-v2 #tab-stats .cost-grid .unpriced { color: var(--amber); }
+html.ui-v2 #tab-stats .cost-grid .unpriced {
+  color: var(--amber);
+  line-height: 1.4;
+  margin-top: 2px;
+}
 html.ui-v2 #tab-stats .cost-grid .total-row {
   border-top: 1px solid var(--line);
   color: var(--text);
@@ -19508,9 +20259,32 @@ html.ui-v2 #tab-stats .token-activity-skyline-bar { border-radius: 2px 2px 0 0; 
 html.ui-v2 #tab-stats .token-activity-months {
   font-size: 10.5px;
   color: var(--text-3);
+  /* Month labels must sit exactly over their week columns. The heatmap's
+     column pitch is (100% + 3px)/53 — 53 cells with 52 interior 3px gaps
+     — while v1's gapless 1fr months tracks are 100%/53, drifting ~3px
+     left by the year's end (and real gaps here would miscount: the last
+     label's `span 4` mints implicit tracks whose extra gap slots shrink
+     every explicit track). Gapless pitch-sized tracks dodge both: only
+     the phantom 3px of the trailing "gap" overflows, clipped below, so
+     the grid's outer width stays equal to the heatmap's and the wrap
+     never gains a phantom scrollbar. */
+  grid-template-columns: repeat(53, calc((100% + 3px) / 53));
+  grid-auto-columns: 0;
+  overflow: hidden;
 }
 /* Design cell geometry: square cells, 2px radius, 3px gap; ramp colors
-   come from the --viz-* tokens the v1 rules already consume. */
+   come from the --viz-* tokens the v1 rules already consume. Design
+   scroll floor is 640px (v1 shipped 720) — both rows share it or the
+   months row would compress on a different curve than the cells. */
+html.ui-v2 #tab-stats .token-activity-months,
+html.ui-v2 #tab-stats .token-activity-heatmap {
+  min-width: 640px;
+}
+html.ui-v2 #tab-stats .token-activity-heatmap-wrap {
+  /* 1px more than v1's 2px so the bottom row's focus frame and the
+     selected-day ring aren't shaved by the scroll clip. */
+  padding-bottom: 3px;
+}
 html.ui-v2 #tab-stats .token-activity-heatmap {
   gap: 3px;
   grid-template-rows: repeat(7, auto);
@@ -19520,10 +20294,20 @@ html.ui-v2 #tab-stats .token-activity-day {
   aspect-ratio: 1 / 1;
   border-radius: 2px;
 }
+html.ui-v2 #tab-stats .token-activity-day:not(.future):hover {
+  border-color: var(--text-2);
+}
+/* Keyboard focus: an inner accent frame instead of the global outline —
+   an outline (or outer ring) on edge columns would be clipped by the
+   wrap's scroll box. Distinct from hover (text-2 border) and from the
+   selected ring below. */
 html.ui-v2 #tab-stats .token-activity-day:not(.future):hover,
 html.ui-v2 #tab-stats .token-activity-day:not(.future):focus-visible {
-  border-color: var(--text-2);
   outline: none;
+}
+html.ui-v2 #tab-stats .token-activity-day:not(.future):focus-visible {
+  border-color: var(--iris-2);
+  box-shadow: inset 0 0 0 1px var(--iris-2);
 }
 html.ui-v2 #tab-stats .token-activity-day.selected {
   border-color: var(--text);
@@ -19538,6 +20322,10 @@ html.ui-v2 #tab-stats .ui2-heat-legend {
   color: var(--text-3);
 }
 html.ui-v2 #tab-stats .ui2-heat-legend span { margin: 0 4px; }
+/* The row's first text node must sit on the card's content edge — the
+   side margins are only separators between the words and the swatches. */
+html.ui-v2 #tab-stats .ui2-heat-legend span:first-child { margin-left: 0; }
+html.ui-v2 #tab-stats .ui2-heat-legend span:last-child { margin-right: 0; }
 html.ui-v2 #tab-stats .ui2-heat-legend i {
   width: 11px;
   height: 11px;
@@ -19741,7 +20529,7 @@ html.ui-v2 .ui2-set-pane.active { display: flex; flex-direction: column; gap: 18
 /* ══ cards ══════════════════════════════════════════════════════════ */
 html.ui-v2 #tab-settings .ui-card {
   border: 1px solid var(--line);
-  border-radius: 15px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 20px 22px;
   margin: 0;
@@ -19767,6 +20555,10 @@ html.ui-v2 #tab-settings .ui-section-title {
 }
 html.ui-v2 #tab-settings .ui-section-sub {
   flex: 1 1 100%;
+  /* measure cap: full card width ran ~122ch. A max-width would clamp the
+     flex hypothetical size and let the sub slide up NEXT to the title
+     (basis 100% is the wrap forcer) — pad the right instead. */
+  padding-right: max(0px, calc(100% - 72ch));
   font-size: 12.5px;
   line-height: 1.55;
   color: var(--text-3);
@@ -19794,6 +20586,7 @@ html.ui-v2 #tab-settings .settings-row input[type="text"],
 html.ui-v2 #tab-settings .settings-row input[type="number"],
 html.ui-v2 #tab-settings .settings-row input[type="password"],
 html.ui-v2 #tab-settings .settings-row select {
+  flex: none;   /* v1 sets flex:1 — un-flexed so the widths below are real */
   width: 280px;
   max-width: 52%;
   border: 1px solid var(--line-2);
@@ -19804,9 +20597,24 @@ html.ui-v2 #tab-settings .settings-row select {
   font-size: 12.5px;
   padding: 8px 12px;
   outline: none;
+  text-overflow: ellipsis;   /* long values + placeholders trail off, not clip */
   transition: border-color var(--t-med), box-shadow var(--t-med);
 }
 html.ui-v2 #tab-settings .settings-row input[type="number"] { width: 110px; }
+/* Selects drop the native widget chrome for the input box + the
+   session-switcher chevron (same fixed mid-gray — data URIs can't
+   consume tokens; #6C7482 reads on both themes). */
+html.ui-v2 #tab-settings .settings-row select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 30px;
+  background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="%236C7482" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>');
+  background-repeat: no-repeat;
+  background-position: right 11px center;
+}
+/* Empty key-status ticks reserve a 16px column and push the API-key
+   inputs off the shared control right edge — show them only once set. */
+html.ui-v2 #tab-settings .key-status:empty { display: none; }
 html.ui-v2 #tab-settings .settings-row input:focus-visible,
 html.ui-v2 #tab-settings .settings-row select:focus-visible {
   border-color: var(--iris);
@@ -19829,6 +20637,9 @@ html.ui-v2 #tab-settings .settings-row input[type="checkbox"] {
   border: 0;
   border-radius: 999px;
   background: var(--surface-3);
+  /* vault-unified toggle recipe: hairline keeps the off track legible on
+     any card surface (checked state drops it — iris carries the shape) */
+  box-shadow: inset 0 0 0 1px var(--line-2);
   cursor: pointer;
   transition: background var(--t-slow);
   flex-shrink: 0;
@@ -19845,8 +20656,17 @@ html.ui-v2 #tab-settings .settings-row input[type="checkbox"]::after {
   box-shadow: 0 2px 5px rgba(0, 0, 0, .4);
   transition: left var(--t-slow);
 }
-html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:checked { background: var(--iris); }
+html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:checked { background: var(--iris); box-shadow: none; }
 html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:checked::after { left: 20px; }
+/* Light theme: surface-3 on a white card is ~1.2:1 — fill the off track
+   with line-2 and crispen the knob (mirrors the vault toggle recipe;
+   geometry untouched). */
+html.ui-v2[data-theme="light"] #tab-settings .settings-row input[type="checkbox"]:not(:checked) {
+  background: var(--line-2);
+}
+html.ui-v2[data-theme="light"] #tab-settings .settings-row input[type="checkbox"]::after {
+  box-shadow: 0 1px 3px rgba(23, 28, 50, .3), 0 0 0 1px rgba(18, 23, 42, .08);
+}
 html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:focus-visible {
   outline: 2px solid var(--iris);
   outline-offset: 2px;
@@ -19949,6 +20769,7 @@ html.ui-v2 .ui2-auto-dial .ui2-seg-btn { flex: 1; padding: 10px 13px; font-size:
 html.ui-v2 .ui2-auto-desc {
   margin: 14px 2px 0;
   min-height: 40px;
+  max-width: 72ch;
   font-size: 13.5px;
   line-height: 1.55;
   color: var(--text-2);
@@ -19981,6 +20802,7 @@ html.ui-v2 .ui2-rule-label {
 }
 html.ui-v2 .ui2-rule-sub {
   margin-top: 2px;
+  max-width: 72ch;
   font-size: 11.5px;
   line-height: 1.45;
   color: var(--text-3);
@@ -20037,6 +20859,10 @@ html.ui-v2 .ui2-ro-value {
   border-radius: 6px;
   background: var(--surface-3);
   color: var(--iris-2);
+  max-width: 100%;
+  white-space: nowrap;   /* long model ids trail off; the pill never wraps */
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 html.ui-v2 .ui2-ro-note { border-top: 1px solid var(--line); padding-top: 12px; }
 
@@ -20048,6 +20874,15 @@ html.ui-v2 #tab-settings .settings-note {
   font-size: 12px;
   line-height: 1.55;
   color: var(--text-3);
+}
+/* Long-form footnotes: cap the measure at ~72ch WITHOUT shortening the
+   full-width divider some of them carry (border wraps the padding box,
+   so a right pad confines the text and the hairline still spans). */
+html.ui-v2 #tab-settings .settings-note,
+html.ui-v2 .ui2-auto-gates,
+html.ui-v2 .ui2-rules-note,
+html.ui-v2 .ui2-appearance-note {
+  padding-right: max(2px, calc(100% - 72ch));
 }
 html.ui-v2 #tab-settings .settings-note code {
   font-family: var(--mono);
@@ -20075,7 +20910,13 @@ html.ui-v2 #tab-settings .settings-keys-actions {
   padding-top: 14px;
   border-top: 1px solid var(--line);
 }
-html.ui-v2 #tab-settings .settings-env-overrides { margin-top: 4px; }
+html.ui-v2 #tab-settings .settings-env-overrides {
+  margin-top: 4px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;   /* v1 ships 6px + bare bg — off the v2 ladder */
+  background: var(--surface);
+}
 html.ui-v2 #tab-settings .settings-env-overrides h4 {
   margin: 0 0 8px;
   font-family: var(--sans);
@@ -20121,7 +20962,7 @@ html.ui-v2 #tab-settings .settings-save-row {
   align-items: center;
   gap: 10px;
   margin: 2px 0 0;
-  padding: 14px 2px 0;
+  padding: 14px 0 0;   /* flush: Save's left edge shares the card edge */
   border-top: 0;
   background: transparent;
   position: static;
@@ -20159,10 +21000,18 @@ html.ui-v2 .ui2-appearance-note {
   line-height: 1.5;
   color: var(--text-3);
 }
+
+/* Inline code in section subtitles rides the design mono (chrome-audit
+   cross-surface sweep). */
+html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
 </style>
 <!-- ── static/app/20-shell.html ── -->
 </head>
 <body>
+<!-- First focusable in the document: the v2 chrome renders at body end,
+     so without this the nav rail would be the LAST tab stop. Inert (display:
+     none) under v1; styles in ui2-chrome.css. -->
+<a class="ui2-skip" href="#ui2-nav">Skip to navigation</a>
 <div id="app">
 
   <!-- Status Bar -->
@@ -22876,7 +23725,7 @@ html.ui-v2 .ui2-appearance-note {
      items below are .tab-btn[data-tab] so the existing router wires their
      clicks and active state exactly like the bar it replaces. -->
 
-<nav id="ui2-nav" aria-label="Primary">
+<nav id="ui2-nav" aria-label="Primary" tabindex="-1">
   <div class="ui2-nav-top">
     <div class="ui2-brand">
       <!-- The real product mark (design-system pass): proscenium arch over
@@ -23034,7 +23883,7 @@ const UI2_ICON_PATHS = {
   station: '<circle cx="12" cy="12" r="8.4"/><path d="M12 12l5.4-6.2"/><circle cx="12" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="8.3" cy="14.9" r="1.3" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.2" r="1.3" fill="currentColor" stroke="none"/>',
   terminal: '<path d="M4.5 6.5 10 12l-5.5 5.5"/><rect x="13" y="15.7" width="6.5" height="2.6" rx="1.1" fill="currentColor" stroke="none"/>',
   files: '<rect x="3.5" y="3.5" width="8" height="4.8" rx="1.4"/><path d="M6.5 8.3v10h6"/><path d="M6.5 12.4h6"/><rect x="14" y="10" width="6.5" height="4.8" rx="1.4"/><rect x="14" y="16" width="6.5" height="4.8" rx="1.4"/>',
-  stats: '<rect x="3.5" y="3.5" width="4.6" height="4.6" rx="1"/><rect x="9.7" y="3.5" width="4.6" height="4.6" rx="1"/><rect x="15.9" y="3.5" width="4.6" height="4.6" rx="1"/><rect x="3.5" y="9.7" width="4.6" height="4.6" rx="1"/><rect x="9.7" y="9.7" width="4.6" height="4.6" rx="1" fill="currentColor" stroke="none"/><rect x="15.9" y="9.7" width="4.6" height="4.6" rx="1" fill="currentColor" stroke="none"/><rect x="3.5" y="15.9" width="4.6" height="4.6" rx="1"/><rect x="9.7" y="15.9" width="4.6" height="4.6" rx="1" fill="currentColor" stroke="none"/><rect x="15.9" y="15.9" width="4.6" height="4.6" rx="1" fill="currentColor" stroke="none"/>',
+  stats: '<rect x="3.5" y="3.5" width="4.6" height="4.6" rx="1"/><rect x="9.7" y="3.5" width="4.6" height="4.6" rx="1"/><rect x="15.9" y="3.5" width="4.6" height="4.6" rx="1"/><rect x="3.5" y="9.7" width="4.6" height="4.6" rx="1"/><rect x="9.7" y="9.7" width="4.6" height="4.6" rx="1" opacity=".55" fill="currentColor" stroke="none"/><rect x="15.9" y="9.7" width="4.6" height="4.6" rx="1" opacity=".55" fill="currentColor" stroke="none"/><rect x="3.5" y="15.9" width="4.6" height="4.6" rx="1"/><rect x="9.7" y="15.9" width="4.6" height="4.6" rx="1" opacity=".55" fill="currentColor" stroke="none"/><rect x="15.9" y="15.9" width="4.6" height="4.6" rx="1" opacity=".55" fill="currentColor" stroke="none"/>',
   access: '<path d="M12 3l7 3v5c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6z"/><circle cx="12" cy="10.2" r="1.9"/><path d="M12 12.1v3"/>',
   vault: '<rect x="3.5" y="3.5" width="17" height="17" rx="4.2"/><circle cx="12" cy="12" r="3.9"/><path d="M12 5.9v2.2"/><path d="M12 15.9v2.2"/><path d="M5.9 12h2.2"/><path d="M15.9 12h2.2"/>',
   settings: '<path d="M4 8h8"/><path d="M16 8h4"/><path d="M4 16h4"/><path d="M12 16h8"/><circle cx="14" cy="8" r="2"/><circle cx="8" cy="16" r="2"/>',
@@ -23322,7 +24171,10 @@ function ui2WireMirrors() {
     const el = document.getElementById('ui2-fact-model');
     if (!el) return;
     const real = (v) => v && v !== '--';
-    el.textContent = real(p) || real(m) ? `${real(p) ? p : '?'} · ${real(m) ? m : '?'}` : '—';
+    // Placeholder facts go quiet instead of reading as debug output ("—").
+    const live = real(p) || real(m);
+    el.textContent = live ? `${real(p) ? p : '?'} · ${real(m) ? m : '?'}` : '';
+    el.style.display = live ? '' : 'none';
   };
   ui2Mirror('sb-provider', factsModel);
   ui2Mirror('sb-model', factsModel);
@@ -23334,7 +24186,11 @@ function ui2WireMirrors() {
     const t = (document.getElementById('tk-tokens')?.textContent || '').trim();
     const c = (document.getElementById('tk-cost')?.textContent || '').trim();
     const el = document.getElementById('ui2-fact-tokens');
-    if (el) el.textContent = c ? `${t} · ${c}` : t;
+    if (!el) return;
+    // "-- tok · $0" at rest is noise; show the fact once tokens are real.
+    const live = t && !/^--/.test(t);
+    el.textContent = live ? (c ? `${t} · ${c}` : t) : '';
+    el.style.display = live ? '' : 'none';
   };
   ui2Mirror('tk-tokens', factsTokens);
   ui2Mirror('tk-cost', factsTokens);
@@ -23500,8 +24356,10 @@ function ui2PaletteRender(filter) {
   const q = (filter || '').trim().toLowerCase();
   const activePane = document.querySelector('.tab-pane.active');
   const activeTab = activePane ? activePane.id.replace(/^tab-/, '') : '';
+  // Label-only matching: users type what they SEE. Id matching surprised —
+  // "sta" surfaced Usage via its internal tab id `stats`.
   ui2Palette.entries = ui2PaletteEntries().filter((item) =>
-    !q || item.label.toLowerCase().includes(q) || (item.tab || '').includes(q));
+    !q || item.label.toLowerCase().includes(q));
   ui2Palette.selected = Math.min(ui2Palette.selected, Math.max(0, ui2Palette.entries.length - 1));
   list.innerHTML = '';
   if (!ui2Palette.entries.length) {
@@ -23607,9 +24465,14 @@ function ui2WirePalette() {
 
 ui2BuildNav();
 if (ui2Enabled()) {
+  // Single-boot: a module script executes at readyState 'interactive', so
+  // the old immediate call + DOMContentLoaded listener both fired and wired
+  // everything twice — the doubled capture-phase keydown made one ⌘K
+  // open-then-close the palette and arrows double-step. Same idiom as the
+  // ui2-activity boot.
   const wire = () => { ui2WireMirrors(); ui2WirePalette(); };
-  document.addEventListener('DOMContentLoaded', wire, { once: true });
-  if (document.readyState !== 'loading') wire();
+  if (document.readyState === 'complete') wire();
+  else document.addEventListener('DOMContentLoaded', wire, { once: true });
 }
 /* ── static/app/ui2-voice.js ── */
 // ── ui-v2 voice: oversight mic button + in-call popover panel ──────────
@@ -23634,6 +24497,8 @@ function ui2VoiceBuildPanel() {
   mic.className = 'ui2-micbtn';
   mic.title = 'Voice';
   mic.dataset.state = 'idle';
+  mic.setAttribute('aria-haspopup', 'dialog');
+  mic.setAttribute('aria-expanded', 'false');
   mic.innerHTML = `<span class="ui2-micbtn-icon">${ui2Icon('mic', 16)}</span><span class="ui2-micbtn-dot"></span>`;
   const search = document.getElementById('ui2-search-btn');
   bar.insertBefore(mic, search);
@@ -23641,6 +24506,8 @@ function ui2VoiceBuildPanel() {
   const panel = document.createElement('div');
   panel.id = 'ui2-voice-panel';
   panel.hidden = true;
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-label', 'Voice');
   panel.innerHTML = `
     <div class="ui2-vp-head">
       <span class="ui2-vp-dot"></span>
@@ -23667,11 +24534,40 @@ function ui2VoiceBuildPanel() {
   const cam = document.getElementById('videoPreviewWrap');
   if (cam) panel.querySelector('#ui2-vp-cam-slot').appendChild(cam);
 
-  const toggle = (open) => { panel.hidden = open === undefined ? !panel.hidden : !open ? true : false; };
+  // Swap the v1 emoji glyphs for line icons + labels (same grid/stroke as
+  // ui2Icon; safe: 36-voice-wasm-init only ever toggles these buttons'
+  // classList, never their content — #makeActiveBtn is text-rewritten by
+  // v1 ("Requesting active...") so it stays text-only).
+  const camSvg = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink:0;display:block"><rect x="3" y="6.5" width="13.5" height="11" rx="2.4"/><path d="M16.5 10.6 21 8v8l-4.5-2.6Z"/></svg>';
+  const decorate = (btn, iconHtml, label) => {
+    if (!btn) return;
+    btn.textContent = '';
+    const ic = document.createElement('span');
+    ic.className = 'ui2-vp-btn-icon';
+    ic.innerHTML = iconHtml;
+    const tx = document.createElement('span');
+    tx.className = 'ui2-vp-btn-label';
+    tx.textContent = label;
+    btn.append(ic, tx);
+  };
+  decorate(document.getElementById('micBtn'), ui2Icon('mic', 14), 'Mic');
+  decorate(document.getElementById('videoBtn'), camSvg, 'Camera');
+
+  const toggle = (open) => {
+    const show = open === undefined ? panel.hidden : !!open;
+    panel.hidden = !show;
+    mic.setAttribute('aria-expanded', String(show));
+  };
   mic.addEventListener('click', () => toggle());
   panel.querySelector('#ui2-vp-close').addEventListener('click', () => toggle(false));
+  // Layered-Escape contract: the ⌘K palette's capture handler runs first
+  // (earlier fragment) and marks its Escape consumed via preventDefault —
+  // honoring that keeps one keypress from closing both layers; we mark
+  // ours the same way so the v1 Escape cascade below us stays quiet.
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !panel.hidden) { e.stopPropagation(); toggle(false); }
+    if (e.key === 'Escape' && !panel.hidden && !e.defaultPrevented) {
+      e.preventDefault(); e.stopPropagation(); toggle(false);
+    }
   }, true);
   document.addEventListener('mousedown', (e) => {
     if (!panel.hidden && !panel.contains(e.target) && e.target !== mic && !mic.contains(e.target)) toggle(false);
@@ -23706,8 +24602,8 @@ function ui2VoiceBuildPanel() {
 }
 
 if (ui2Enabled()) {
-  document.addEventListener('DOMContentLoaded', ui2VoiceBuildPanel, { once: true });
-  if (document.readyState !== 'loading') ui2VoiceBuildPanel();
+  if (document.readyState === 'complete') ui2VoiceBuildPanel();
+  else document.addEventListener('DOMContentLoaded', ui2VoiceBuildPanel, { once: true });
 }
 /* ── static/app/ui2-activity.js ── */
 // ── ui-v2 Activity slice 1: approval-card semantics (user-approved) ────
@@ -23942,9 +24838,13 @@ function ui2RailForegroundSessionId() {
   return '';
 }
 
-function ui2RailTick() {
+function ui2RailTick(force) {
   const rail = document.getElementById('ui2-vitals-rail');
-  if (!rail || !rail.offsetParent) return; // hidden: other tab/subtab, grid layout, or <1180px
+  if (!rail) return;
+  // hidden: other tab/subtab, grid layout, or <1180px — skip the interval
+  // work, but let the build-time call fill values so the rail never shows
+  // placeholder dashes on its first paint.
+  if (!force && !rail.offsetParent) return;
 
   const sid = ui2RailForegroundSessionId();
   const sessionEl = document.getElementById('ui2-rail-session');
@@ -23971,8 +24871,10 @@ function ui2RailTick() {
 
   const cache = (vitals && typeof sessionVitalsCacheSegment === 'function')
     ? sessionVitalsCacheSegment(vitals.cache) : null;
+  // cold = no cache yet — neutral, not an alarm (rose on a fresh session
+  // read as a fault); expiring joins crit like v1's red.
   ui2RailSetRow('ui2-rail-cache', cache ? cache.text : '', cache ? cache.titleLines : null,
-    cache ? (/cache-crit|cache-cold/.test(cache.cls) ? 'crit' : /cache-warn|cache-expiring/.test(cache.cls) ? 'warn' : 'ok') : null);
+    cache ? (/cache-crit|cache-expiring/.test(cache.cls) ? 'crit' : /cache-warn/.test(cache.cls) ? 'warn' : /cache-cold/.test(cache.cls) ? null : 'ok') : null);
 
   const limits = (vitals && typeof sessionVitalsLimitsSegment === 'function')
     ? sessionVitalsLimitsSegment(vitals.limits) : null;
@@ -23999,8 +24901,8 @@ if (ui2Enabled()) {
     ui2WireLayoutToggle();
     ui2DressComposer();
     ui2BuildVitalsRail();
-    ui2RailTick();
-    setInterval(ui2RailTick, 1000);
+    ui2RailTick(true);
+    setInterval(() => ui2RailTick(), 1000);
     // Focus filter + raw-entry hygiene: follow stream appends, target
     // changes (the chip re-renders on every change), and layout flips.
     const stream = document.getElementById('log-stream');
@@ -35710,9 +36612,11 @@ async function main() {
       if (d.event === 'recording_started' && d.stream_name) {
         const slot = slotForRecordingStream(d.stream_name);
         if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = true; slot.recordBtn.innerHTML = '&#x23F9; Stop'; slot.recordBtn.classList.add('active'); slot.deleteRecBtn.style.display = 'none'; }
+        handleDebugRecordingEvent(d); // debug tab's Record button tracks its display's streams
       } else if (d.event === 'recording_stopped' && d.stream_name) {
         const slot = slotForRecordingStream(d.stream_name);
         if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = ''; }
+        handleDebugRecordingEvent(d);
       } else if (d.event === 'recording_deleted' && d.stream_name) {
         const slot = slotForRecordingStream(d.stream_name);
         if (slot) { if (slot.recordingStreamName === d.stream_name) slot.recordingStreamName = null; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = 'none'; }
@@ -50005,7 +50909,9 @@ function accessCreateCard(card) {
   title.className = 'access-card-title';
   title.textContent = card.title || 'Access';
   const kind = document.createElement('div');
-  kind.className = 'access-card-kind';
+  // Semantic state rides as a class (ok|warn) so the pill can carry tint;
+  // cards without a state stay neutral.
+  kind.className = 'access-card-kind' + (card.state ? ` ${card.state}` : '');
   kind.textContent = card.kind || '';
   head.append(title, kind);
 
@@ -51857,12 +52763,14 @@ function accessDiagnosticsCards() {
     {
       title: 'Dashboard route',
       kind: state.summary.kind === 'ok' ? 'Ready' : state.summary.label,
+      state: state.summary.kind === 'ok' ? 'ok' : 'warn',
       detail: `${state.modeLabel} - ${state.summary.title || state.summary.label}`,
       actions: [{ label: 'Open', primary: true, onClick: () => routeTo('access', 'diagnostics') }],
     },
     {
       title: 'Event stream',
       kind: state.status.eventsActive ? 'Active' : 'Inactive',
+      state: state.status.eventsActive ? 'ok' : 'warn',
       detail: state.status.eventsActive
         ? 'Dashboard events are flowing over the selected route.'
         : 'Event delivery is not active on the selected route.',
@@ -54764,10 +55672,10 @@ function sendShellResize(cols, rows, options = {}) {
 
 // Build the xterm theme object from the ui-v2 design tokens. xterm paints
 // into canvas/inline-styled DOM, so CSS custom properties cannot cascade in —
-// they are resolved here once at init (the ui-v2 flag is fixed pre-paint for
-// the whole page load, and v2 keeps terminal surfaces dark in every app
-// theme). Returns null when the tokens are unavailable so the caller can
-// fall back to the v1 palette.
+// they are resolved here at init and re-resolved on every live theme flip
+// (the data-theme observer in initShell re-applies them; since the light
+// token import, code surfaces follow the app theme). Returns null when the
+// tokens are unavailable so the caller can fall back to the v1 palette.
 function ui2ShellTheme() {
   const styles = getComputedStyle(document.documentElement);
   const token = name => styles.getPropertyValue(name).trim();
@@ -54831,6 +55739,16 @@ function initShell() {
     shellTerm.open(document.getElementById('shell-container'));
     syncTerminalPaneAccessibility();
     shellFitAddon.fit();
+    // Live theme flips: xterm latched the palette resolved above; re-apply
+    // from the current tokens whenever data-theme changes (a light terminal
+    // otherwise sits inside a dark app, and vice versa).
+    if (ui2) {
+      new MutationObserver(() => {
+        if (!shellTerm || typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
+        const t = ui2ShellTheme();
+        if (t) shellTerm.options.theme = t;
+      }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    }
 
     // Forward every byte the user types straight to the PTY. We use
     // `onData` (not `onKey`) so sequences like arrow keys, Ctrl+C, and
@@ -60193,7 +61111,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'vault', 'debug', 'settings'];
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['shell'];
-const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug', 'autonomy', 'providers', 'presence', 'advanced'];
+const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug', 'autonomy', 'providers', 'presence', 'advanced', 'appearance'];
 // ui-v2 (design-overhaul) remaps the three legacy Settings sub-tabs onto
 // the four design sections — and back when the flag is off — so both
 // generations of deep link keep landing somewhere sensible. 'network'
@@ -73054,6 +73972,22 @@ function renderTokenActivityHeatmap(days, startIso, todayIso) {
     }
     el.appendChild(div);
   }
+  // Recent end in view: below the grid's width floor the wrap overflows and
+  // scrollLeft 0 shows the oldest (all-empty) weeks — every lit cell sat
+  // off-screen right. Reposition only an untouched wrap so data-refresh
+  // re-renders don't fight a manual scroll.
+  const wrap = el.closest('.token-activity-heatmap-wrap');
+  if (wrap && wrap.scrollWidth > wrap.clientWidth) {
+    if (!wrap.dataset.scrollWired) {
+      wrap.dataset.scrollWired = '1';
+      wrap.addEventListener('scroll', () => {
+        const atEnd = wrap.scrollLeft + wrap.clientWidth >= wrap.scrollWidth - 4;
+        if (atEnd) delete wrap.dataset.userScrolled;
+        else wrap.dataset.userScrolled = '1';
+      }, { passive: true });
+    }
+    if (!wrap.dataset.userScrolled) wrap.scrollLeft = wrap.scrollWidth;
+  }
 }
 
 function tokenActivityMetricHtml(label, value) {
@@ -73302,9 +74236,23 @@ function renderAllSessionsUsage(sessions) {
   const grid = document.getElementById('all-sessions-grid');
   const emptyEl = document.getElementById('usage-empty');
   if (!el || !grid) return;
-  if (emptyEl) emptyEl.style.display = 'none';
   renderSessionStatsFallback(sessions);
   renderAgentUsage(sessions);
+  // "No usage yet" means zero recorded usage, not zero sessions — a bare
+  // daemon always carries its resident foreground session, so a count-based
+  // check could never fire. Show the designed empty card instead of a
+  // zeroed table until any session has usage entries (the card was hidden
+  // unconditionally after the first fetch).
+  const hasUsage = Array.isArray(sessions)
+    && sessions.some((s) => sessionUsageEntries(s).some((e) =>
+      e.total > 0 || e.input > 0 || e.cached > 0 || e.output > 0 || e.cost > 0));
+  if (!hasUsage) {
+    if (emptyEl) emptyEl.style.display = '';
+    el.style.display = 'none';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+  el.style.display = '';
 
   const todayIso = tokenActivityIsoToday();
 
@@ -74077,6 +75025,11 @@ function ui2SettingsSyncMirrors() {
 // pane toggle so section-shown work runs on real switches.
 function ui2SettingsOnSubtabShown(name) {
   if (typeof ui2Enabled !== 'function' || !ui2Enabled() || !ui2SettingsBuilt) return;
+  // Sections share one scroll container — land each switch at its top,
+  // not wherever the previous section was scrolled to. (Deep-link scrolls
+  // like focusSettingsApiKeys run after this, in their own rAF.)
+  const tab = document.getElementById('tab-settings');
+  if (tab) tab.scrollTop = 0;
   if (name === 'autonomy') {
     // Re-pull the live rules (shared refreshControlPane path) each visit.
     refreshControlPane();
@@ -74225,10 +75178,6 @@ function ui2SettingsBuild() {
     const keys = cardOf('settings-keys-heading');
     if (keys) panes.providers.appendChild(keys);
 
-    // "take effect on next task" note from the old Agent pane.
-    const agentNote = document.querySelector('#settings-pane-agent .settings-note');
-    if (agentNote) panes.providers.appendChild(agentNote);
-
     // External agent → "Managed backend" with a segmented proxy over the
     // existing select + an Advanced fold for binaries and tier.
     const ext = cardOf('settings-external-agent-heading');
@@ -74260,6 +75209,13 @@ function ui2SettingsBuild() {
       const routingRows = document.getElementById('cu-routing-rows');
       if (fold && routingRows) fold.querySelector('.ui2-fold-body').prepend(routingRows);
     }
+
+    // "saved to intendant.toml / next task" note from the old Agent pane
+    // — placed LAST, directly above the Save/Reset row it describes.
+    // (Between the API-keys and External-agent cards it read as if the
+    // keys saved to intendant.toml; they save to ~/.config/intendant/.env.)
+    const agentNote = document.querySelector('#settings-pane-agent .settings-note');
+    if (agentNote) panes.providers.appendChild(agentNote);
   }
 
   // ── Presence & voice ──
@@ -74370,6 +75326,11 @@ function ui2SettingsBuild() {
     const el = document.getElementById('ui2-ro-model');
     if (el) el.textContent = (src.textContent || '').trim() || '—';
   });
+  // Theme truth is the <html> data-theme attribute — observe it (like the
+  // chrome button's icon does) so EVERY flip path repaints the Appearance
+  // segmented, not just the click paths that remember to call us.
+  new MutationObserver(() => ui2SettingsRenderAppearance()).observe(
+    document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
   ui2SettingsRenderRules();
   ui2SettingsRenderAppearance();
@@ -77508,7 +78469,13 @@ function filesIdeTreeRows(state, dir, depth, rows) {
     if (entry.hidden && !state.showHidden) continue;
     rows.push({ entry, depth });
     if (entry.is_dir && state.expanded.has(entry.path)) {
+      const before = rows.length;
       filesIdeTreeRows(state, entry.path, depth + 1, rows);
+      // A loaded-but-childless expansion renders nothing — say so (the
+      // root-empty case already has this notice at the container level).
+      if (rows.length === before && state.listings.get(entry.path)) {
+        rows.push({ notice: 'Empty directory', depth: depth + 1 });
+      }
     }
   }
   if (listing.truncated) {
@@ -80265,7 +81232,7 @@ function renderBrowserWorkspaces() {
   window.__stationBrowserWorkspaceCount = rows.length;
   // Zero-count wording lives in the list's empty state; repeating it here
   // stacked two "no workspaces" lines.
-  if (status) status.textContent = rows.length ? `${rows.length} active workspace${rows.length === 1 ? '' : 's'}` : '';
+  if (status && status.dataset.error !== '1') status.textContent = rows.length ? `${rows.length} active workspace${rows.length === 1 ? '' : 's'}` : '';
   if (!rows.length) {
     list.innerHTML = '<div class="ui-empty compact"><div class="ui-empty-title">No browser workspaces</div>' +
       '<div class="ui-empty-hint">Create one above, or the agent will spawn its own when it needs a browser.</div></div>';
@@ -80279,7 +81246,7 @@ function renderBrowserWorkspaces() {
     if (ui2Enabled()) card.dataset.status = String(w.status || '');
     const meta = document.createElement('div');
     meta.className = 'debug-workspace-row-main';
-    const lease = w.lease ? ` leased by ${w.lease.holder_id || 'unknown'}` : ' unleased';
+    const lease = w.lease ? `leased by ${w.lease.holder_id || 'unknown'}` : 'unleased';
     const url = w.url || 'about:blank';
     const executableSource = w.browser_executable_source ? ` · ${w.browser_executable_source}` : '';
     meta.innerHTML =
@@ -80312,6 +81279,8 @@ function handleBrowserWorkspaceMessage(d) {
   if (d.t === 'browser_workspace_snapshot' && Array.isArray(d.workspaces)) {
     browserWorkspaces.clear();
     for (const w of d.workspaces) if (w && w.id) browserWorkspaces.set(String(w.id), w);
+    const snapStatus = document.getElementById('browser-workspace-status');
+    if (snapStatus) delete snapStatus.dataset.error; // fresh truth supersedes a pinned error
     renderBrowserWorkspaces();
     return;
   }
@@ -80322,7 +81291,15 @@ function handleBrowserWorkspaceMessage(d) {
     browserWorkspaces.delete(String(d.workspace_id));
   }
   const status = document.getElementById('browser-workspace-status');
-  if (status && d.kind === 'error') status.textContent = d.message || 'Browser workspace error';
+  if (status && d.kind === 'error') {
+    // Paint the error AFTER the re-render and pin it — renderBrowserWorkspaces
+    // rewrites the status line and was clobbering the message same-tick.
+    renderBrowserWorkspaces();
+    status.dataset.error = '1';
+    status.textContent = d.message || 'Browser workspace error';
+    return;
+  }
+  if (status) delete status.dataset.error;
   renderBrowserWorkspaces();
 }
 
@@ -80377,6 +81354,32 @@ function onDebugScreenReady(displayId) {
   document.getElementById('debug-record-btn').disabled = false;
   document.getElementById('debug-info').classList.remove('hidden');
   document.getElementById('debug-display-id').textContent = displayId;
+}
+
+// The daemon emits recording_started/stopped with stream `display_<id>[_n]`
+// (recording.rs pick_next_display_stream_name); flip the debug Record button
+// when the stream belongs to the debug display. Called from the central WS
+// dispatch (36-voice-wasm-init) — declarations hoist module-wide, so the
+// later-fragment definition is live by event time.
+function debugRecordingStreamIsOurs(streamName) {
+  const idEl = document.getElementById('debug-display-id');
+  const id = ((idEl && idEl.textContent) || '').trim();
+  if (!id) return false;
+  const base = `display_${id}`;
+  return streamName === base || streamName.startsWith(`${base}_`);
+}
+
+function handleDebugRecordingEvent(d) {
+  if (!debugScreenActive || !d.stream_name) return;
+  if (!debugRecordingStreamIsOurs(String(d.stream_name))) return;
+  const btn = document.getElementById('debug-record-btn');
+  if (d.event === 'recording_started') {
+    debugRecording = true;
+    if (btn) btn.textContent = 'Stop recording';
+  } else if (d.event === 'recording_stopped') {
+    debugRecording = false;
+    if (btn) btn.textContent = 'Start recording';
+  }
 }
 
 function onDebugScreenTornDown() {
@@ -85502,6 +86505,31 @@ function showDisplayPicker(displays) {
     createVirtualDisplay();
   });
   picker.appendChild(createItem);
+  // ui-v2 hides #status-bar (the picker's v1 anchor subtree), so an
+  // in-place open can never render — portal to <body> and pin the popover
+  // to the live rail's "Your screen" card (the control that proxies the
+  // grant under v2). Single-display hosts grant instantly and never open
+  // the picker, which is why this only bit multi-display setups.
+  if (typeof ui2Enabled === 'function' && ui2Enabled() && picker.closest('#status-bar')) {
+    document.body.appendChild(picker);
+  }
+  if (typeof ui2Enabled === 'function' && ui2Enabled() && picker.parentElement === document.body) {
+    const anchor = document.getElementById('ui2-live-yourscreen');
+    const rect = anchor ? anchor.getBoundingClientRect() : null;
+    picker.style.position = 'fixed';
+    picker.style.zIndex = '95';
+    if (rect && rect.width) {
+      picker.style.left = `${Math.round(rect.left)}px`;
+      picker.style.top = `${Math.round(rect.bottom + 8)}px`;
+      picker.style.right = 'auto';
+      picker.style.transform = 'none';
+    } else {
+      picker.style.left = '50%';
+      picker.style.top = '96px';
+      picker.style.right = 'auto';
+      picker.style.transform = 'translateX(-50%)';
+    }
+  }
   picker.classList.add('visible');
   displayPickerVisible = true;
 }
