@@ -617,6 +617,14 @@ function renderAccessExplainer() {
   const mount = document.getElementById('access-model-explainer');
   if (!mount || mount.dataset.built === 'true') return;
   mount.dataset.built = 'true';
+  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+    // ui-v2 only: the design's "How access works" section eyebrow. The v1
+    // explainer renders headless, so this is additive and flag-gated.
+    const head = document.createElement('div');
+    head.className = 'ui2-acc-explainer-head';
+    head.textContent = 'How access works';
+    mount.appendChild(head);
+  }
   const steps = [{
     kicker: 'Who',
     title: 'People, devices & daemons',
@@ -2002,8 +2010,30 @@ function renderAccessIamStateCard() {
   }));
 }
 
+/* ui-v2 only (design-overhaul P2): the design's in-page header above the
+   Access subtabs. Injected at render time under the flag so the v1 DOM
+   stays byte-identical; idempotent, so ticks cost one getElementById. */
+function ui2AccessEnsurePageChrome() {
+  if (typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
+  if (document.getElementById('ui2-access-pagehead')) return;
+  const subtabs = document.getElementById('access-subtabs');
+  if (!subtabs || !subtabs.parentElement) return;
+  const head = document.createElement('div');
+  head.id = 'ui2-access-pagehead';
+  head.className = 'ui2-acc-pagehead';
+  const title = document.createElement('h1');
+  title.className = 'ui2-acc-title';
+  title.textContent = 'Access';
+  const sub = document.createElement('div');
+  sub.className = 'ui2-acc-sub';
+  sub.textContent = 'Who can reach this daemon and its fleet — and on whose authority. Every daemon decides for itself.';
+  head.append(title, sub);
+  subtabs.parentElement.insertBefore(head, subtabs);
+}
+
 function renderAccessAdminSummaries() {
   if (!document.getElementById('tab-access')) return;
+  ui2AccessEnsurePageChrome();
   // Transport ticks call this 17-renderer fanout constantly; skip the DOM
   // work while the Access pane is hidden and run once on the next entry.
   if (!paneIsVisible('access')) {

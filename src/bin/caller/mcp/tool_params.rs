@@ -372,7 +372,9 @@ pub(crate) fn default_timeout() -> u64 {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TakeScreenshotParams {
-    /// Display target: "user_session", "display_99", etc. Auto-detects if omitted.
+    /// Display target: "user_session", "display_99", etc. Auto-detects if
+    /// omitted: a live agent virtual display when one exists, else the
+    /// user session.
     #[serde(default)]
     pub display_target: Option<String>,
 }
@@ -444,7 +446,8 @@ pub struct ExecuteCuActionsParams {
     /// with "type" (click, double_click, type, key, scroll, move_mouse, drag,
     /// screenshot, wait) and type-specific fields.
     pub actions: Vec<crate::computer_use::CuAction>,
-    /// Display target. Auto-detects if omitted.
+    /// Display target. Auto-detects if omitted: a live agent virtual
+    /// display when one exists, else the user session.
     #[serde(default)]
     pub display_target: Option<String>,
     /// Coordinate space for click/scroll/move coordinates. Default: "pixel"

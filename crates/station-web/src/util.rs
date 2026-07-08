@@ -45,6 +45,20 @@ pub(crate) const C_PEACH: Color = Color::rgb(250, 179, 135);
 pub(crate) const C_RED: Color = Color::rgb(243, 139, 168);
 pub(crate) const C_MAUVE: Color = Color::rgb(203, 166, 247);
 
+/// Parse a `#rrggbb` CSS color into a scene `Color` (alpha 1.0), so
+/// world-pane consumers reuse the CSS palette the focus content carries
+/// instead of maintaining a mirrored `Color` table. Anything unparsable
+/// falls back to the body text color.
+pub(crate) fn css_color(css: &str) -> Color {
+    let hex = css.strip_prefix('#').unwrap_or(css);
+    if hex.len() == 6 {
+        if let Ok(v) = u32::from_str_radix(hex, 16) {
+            return Color::rgb((v >> 16) as u8, (v >> 8) as u8, v as u8);
+        }
+    }
+    C_TEXT
+}
+
 pub(crate) const C_TEXT_CSS: &str = "#cdd6f4";
 pub(crate) const C_SUBTEXT0_CSS: &str = "#a6adc8";
 pub(crate) const C_OVERLAY1_CSS: &str = "#7f849c";
@@ -329,6 +343,23 @@ pub(crate) fn fmt_countdown(seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn css_color_round_trips_the_palette_and_falls_back() {
+        for (css, color) in [
+            (C_TEXT_CSS, C_TEXT),
+            (C_RED_CSS, C_RED),
+            (C_BLUE_CSS, C_BLUE),
+        ] {
+            let parsed = css_color(css);
+            assert!((parsed.r - color.r).abs() < 1e-6, "{css} r");
+            assert!((parsed.g - color.g).abs() < 1e-6, "{css} g");
+            assert!((parsed.b - color.b).abs() < 1e-6, "{css} b");
+            assert!((parsed.a - 1.0).abs() < 1e-6);
+        }
+        let fallback = css_color("rgba(1,2,3,0.5)");
+        assert!((fallback.r - C_TEXT.r).abs() < 1e-6);
+    }
 
     #[test]
     fn fmt_compact_scales_units() {

@@ -1398,6 +1398,15 @@ impl WebRtcPeer {
         self.shutdown.cancel();
         // Driver exits on the next select! iteration; channels close on drop.
     }
+
+    /// Resolves once this peer has begun teardown — the driver cancels the
+    /// token on exit (ICE failure, drain error), `close()` cancels it for
+    /// external teardown, and the pool intake task cancels it when the peer
+    /// can no longer be served. The session's per-peer reaper keys on this
+    /// to deregister the peer from the session maps.
+    pub(crate) fn closed(&self) -> tokio_util::sync::WaitForCancellationFutureOwned {
+        self.shutdown.clone().cancelled_owned()
+    }
 }
 
 #[cfg(test)]

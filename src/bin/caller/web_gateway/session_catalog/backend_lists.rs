@@ -25,6 +25,11 @@ pub(crate) struct CodexSessionListAccumulator {
     pub(crate) saw_user_message_event: bool,
     pub(crate) event_user_turns: Vec<Option<String>>,
     pub(crate) fallback_user_turns: Vec<Option<String>>,
+    // Assistant prose for the row preview (message-typed response items
+    // only — tool payloads have other types). User preview texts derive
+    // from the turn vectors above at finish(), which already handle
+    // injected-text filtering and thread rollbacks.
+    pub(crate) preview_assistant_texts: Vec<String>,
 }
 
 impl CodexSessionListAccumulator {
@@ -129,6 +134,14 @@ impl CodexSessionListAccumulator {
                             self.fallback_user_turns
                                 .push(Some(compact_text(&text, 180)));
                         }
+                        if role == "assistant"
+                            && self.preview_assistant_texts.len() < SESSION_PREVIEW_ROLE_SLOTS
+                        {
+                            let compacted = compact_text(&text, SESSION_PREVIEW_TEXT_CHARS);
+                            if !compacted.is_empty() {
+                                self.preview_assistant_texts.push(compacted);
+                            }
+                        }
                     }
                 }
             }
@@ -188,6 +201,24 @@ impl CodexSessionListAccumulator {
                 daily_usage.entry(day).or_default().add(self.undated_usage);
             }
         }
+        // User texts follow the same preference as `turns`: event-stream
+        // user_message turns when present, response-item fallbacks
+        // otherwise (both already rollback-adjusted and injection-filtered).
+        // Rollout excerpts don't interleave the two role streams by
+        // timestamp, so entries group users-first.
+        let user_turns = if self.saw_user_message_event {
+            &self.event_user_turns
+        } else {
+            &self.fallback_user_turns
+        };
+        let mut preview_builder = SessionPreviewBuilder::default();
+        for text in user_turns.iter().flatten().take(SESSION_PREVIEW_ROLE_SLOTS) {
+            preview_builder.push_user(text);
+        }
+        for text in &self.preview_assistant_texts {
+            preview_builder.push_assistant(text);
+        }
+        let preview = preview_builder.into_value();
         Some(CodexSessionListSummary {
             id,
             created_at: self.created_at,
@@ -204,6 +235,7 @@ impl CodexSessionListAccumulator {
             turns,
             file_updated_at,
             bytes: file_size(path),
+            preview,
         })
     }
 }
@@ -287,7 +319,7 @@ pub(crate) fn codex_session_list_summary_from_excerpt(
 }
 
 pub(crate) fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListSummary> {
-    let key = session_list_cache_key("codex", path, "")?;
+    let key = session_list_cache_key("codex", path, SESSION_ROW_PREVIEW_FORMAT)?;
     if let Some(entry) = cached_codex_session_list_entry(&key) {
         return Some(entry.summary);
     }
@@ -550,6 +582,9 @@ pub(crate) fn list_codex_sessions_with_limit(
                 obj.insert("goal".to_string(), serde_json::json!(goal));
                 obj.insert("session_goal".to_string(), serde_json::json!(goal));
             }
+        }
+        if let Some(preview) = summary.preview.as_ref() {
+            session["preview"] = preview.clone();
         }
         rows.insert(id, session);
     }
@@ -1082,6 +1117,110 @@ mod tests {
         );
         assert_eq!(session.get("name").and_then(|v| v.as_str()), None);
         assert_eq!(session.get("turns").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    #[test]
+    fn codex_row_preview_pairs_user_turns_with_assistant_prose() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("07");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let id = "019e37ae-preview-pairs";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": id, "timestamp": "2026-07-07T10:00:00Z", "cwd": "/repo"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Port the parser"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Starting with the lexer."}]
+                }
+            }),
+            // Tool payloads are not message-typed — never preview material.
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": "{\"command\":[\"cargo\",\"test\"]}"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:04Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Now the emitter"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:05Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Emitter done."}]
+                }
+            }),
+            // Both assistant slots taken — must not appear.
+            serde_json::json!({
+                "timestamp": "2026-07-07T10:00:06Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Extra reply."}]
+                }
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-07-07T10-00-00-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        let preview = session.get("preview").and_then(|v| v.as_array()).unwrap();
+        let flat: Vec<(&str, &str)> = preview
+            .iter()
+            .map(|e| {
+                (
+                    e.get("role").and_then(|v| v.as_str()).unwrap(),
+                    e.get("text").and_then(|v| v.as_str()).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                ("user", "Port the parser"),
+                ("user", "Now the emitter"),
+                ("assistant", "Starting with the lexer."),
+                ("assistant", "Emitter done."),
+            ]
+        );
     }
 
     #[test]
