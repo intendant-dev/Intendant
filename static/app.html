@@ -49933,7 +49933,9 @@ function accessCreateCard(card) {
   title.className = 'access-card-title';
   title.textContent = card.title || 'Access';
   const kind = document.createElement('div');
-  kind.className = 'access-card-kind';
+  // Semantic state rides as a class (ok|warn) so the pill can carry tint;
+  // cards without a state stay neutral.
+  kind.className = 'access-card-kind' + (card.state ? ` ${card.state}` : '');
   kind.textContent = card.kind || '';
   head.append(title, kind);
 
@@ -51776,12 +51778,14 @@ function accessDiagnosticsCards() {
     {
       title: 'Dashboard route',
       kind: state.summary.kind === 'ok' ? 'Ready' : state.summary.label,
+      state: state.summary.kind === 'ok' ? 'ok' : 'warn',
       detail: `${state.modeLabel} - ${state.summary.title || state.summary.label}`,
       actions: [{ label: 'Open', primary: true, onClick: () => routeTo('access', 'diagnostics') }],
     },
     {
       title: 'Event stream',
       kind: state.status.eventsActive ? 'Active' : 'Inactive',
+      state: state.status.eventsActive ? 'ok' : 'warn',
       detail: state.status.eventsActive
         ? 'Dashboard events are flowing over the selected route.'
         : 'Event delivery is not active on the selected route.',
