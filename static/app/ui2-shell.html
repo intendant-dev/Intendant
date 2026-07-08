@@ -85,9 +85,23 @@
        ui2-activity.js owns the state (html[data-ui2-layout] + localStorage). -->
   <div class="ui2-layout-toggle" id="ui2-layout-toggle" role="group" aria-label="Activity layout">
     <button type="button" id="ui2-layout-focus-btn" data-layout="focus"
-            title="Focus — one centered timeline (session windows hidden)">Focus</button>
+            title="Focus — the targeted session's timeline (session windows hidden)">Focus</button>
     <button type="button" id="ui2-layout-grid-btn" data-layout="grid"
             title="Grid — session windows with the concurrent stream below">Grid</button>
+  </div>
+  <!-- Session switcher (the decision's missing half): picks the Focus
+       session / composer target. Populated from the live session set by
+       ui2-chrome.js; drives the same focus/target mechanism as clicking a
+       session window. Activity-only, like the layout toggle. -->
+  <select class="ui2-session-switcher" id="ui2-session-switcher"
+          aria-label="Focused session" title="Focused session — Focus shows this session's timeline; the composer targets it"></select>
+  <!-- Backend truth absorbed from the v1 status bar (hidden under v2):
+       provider·model, turn counter, live token/cost readout. Values are
+       mirrors of the pinned #sb-*/#tk-* elements. -->
+  <div class="ui2-ovs-facts ui2-ovs-compact-hide" id="ui2-ovs-facts">
+    <span class="ui2-fact" id="ui2-fact-model" title="Provider · model driving the main loop">—</span>
+    <span class="ui2-fact" id="ui2-fact-turn" title="Turn counter">T0</span>
+    <span class="ui2-fact" id="ui2-fact-tokens" title="Session tokens · cached · cost">— tok</span>
   </div>
   <div class="ui2-ctx ui2-ovs-compact-hide" id="ui2-ctx" title="Context budget used">
     <span class="ui2-ctx-label">Context</span>
@@ -98,6 +112,13 @@
   <button type="button" class="ui2-conn" id="ui2-conn" title="Dashboard transport — opens Access → Diagnostics">
     <span class="ui2-conn-dot" id="ui2-conn-dot"></span>
     <span class="ui2-conn-label ui2-ovs-compact-hide" id="ui2-conn-label">connecting…</span>
+  </button>
+  <!-- Prominent theme toggle (product-owner directive): one click from
+       anywhere; Settings → Appearance and the ⌘K action stay as the
+       long-form paths. Icon reflects the CURRENT theme; click flips. -->
+  <button type="button" class="ui2-theme-btn" id="ui2-theme-btn"
+          title="Switch to light theme" aria-label="Switch theme">
+    <span id="ui2-theme-icon"></span>
   </button>
   <button type="button" class="ui2-search" id="ui2-search-btn" title="Command palette">
     <span class="ui2-search-icon" id="ui2-search-icon"></span>

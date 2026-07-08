@@ -223,3 +223,9 @@ html.ui-v2 .concurrent-log-action {
 html.ui-v2 .concurrent-log-action:hover,
 html.ui-v2 .concurrent-log-action:focus { background: var(--surface-2); color: var(--text); }
 html.ui-v2 .concurrent-log-action[aria-pressed="true"] { color: var(--iris-2); }
+
+/* Opaque cards (corrective batch): the translucent v1 window surfaces let
+   the concurrent stream show through — the design's cards are solid. */
+html.ui-v2 .session-window { background: var(--surface); }
+html.ui-v2 .session-window-header { background: var(--surface-2); }
+html.ui-v2 .concurrent-log-region { background: var(--bg); }
