@@ -74,6 +74,7 @@ mod transcription;
 mod transfer_store;
 mod types;
 mod upload_store;
+mod virtual_display;
 pub(crate) use intendant_platform::vision;
 mod web_gateway;
 mod web_tls;
@@ -117,7 +118,7 @@ pub(crate) use display_glue::*;
 use autonomy::{AutonomyLevel, AutonomyState, SharedAutonomy};
 use conversation::Conversation;
 use error::CallerError;
-use event::{AppEvent, EventBus};
+use event::{AppEvent, ControlMsg, EventBus};
 use project::Project;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -2637,6 +2638,12 @@ fn setup_fresh_conversation_with_attachments(
 /// Spawn a listener that reacts to display grant/revoke events.
 /// On grant: create a DisplaySession (Wayland) and emit DisplayReady.
 /// On revoke: stop the session and remove it from the registry.
+///
+/// Also the owner of dashboard-created virtual displays: it consumes
+/// `ControlMsg::CreateVirtualDisplay` off the bus (this task is the one
+/// place with the session/frame registries the create needs), and holds
+/// their `XvfbGuard`s as task-local state — created displays die with the
+/// daemon, on tile close (revoke of their id), or on capture loss.
 pub fn spawn_user_display_listener(
     bus: EventBus,
     session_registry: display::SharedSessionRegistry,
@@ -2644,6 +2651,7 @@ pub fn spawn_user_display_listener(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut rx = bus.subscribe();
+        let mut virtual_display_guards = virtual_display::VirtualDisplayGuards::new();
         loop {
             match rx.recv().await {
                 Ok(AppEvent::UserDisplayGranted { display_id }) => {
@@ -2655,8 +2663,30 @@ pub fn spawn_user_display_listener(
                     )
                     .await;
                 }
+                Ok(AppEvent::ControlCommand(ControlMsg::CreateVirtualDisplay {
+                    width,
+                    height,
+                })) => {
+                    virtual_display::create_virtual_display(
+                        &bus,
+                        &session_registry,
+                        frame_registry.clone(),
+                        &mut virtual_display_guards,
+                        width,
+                        height,
+                    )
+                    .await;
+                }
                 Ok(AppEvent::UserDisplayRevoked { display_id, .. }) => {
                     deactivate_user_display(&session_registry, display_id).await;
+                    // Closing the tile of a dashboard-created display IS its
+                    // destroy: nothing else owns it, and leaving the Xvfb
+                    // running would leak displays with no way to kill them.
+                    virtual_display::reap_virtual_display(
+                        &mut virtual_display_guards,
+                        display_id,
+                        "tile closed",
+                    );
                 }
                 Ok(AppEvent::DisplayCaptureLost {
                     display_id,
@@ -2672,6 +2702,11 @@ pub fn spawn_user_display_listener(
                     if let Some(session) = session_registry.write().await.remove(display_id) {
                         session.stop().await;
                     }
+                    virtual_display::reap_virtual_display(
+                        &mut virtual_display_guards,
+                        display_id,
+                        "capture lost",
+                    );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 _ => {}
