@@ -132,7 +132,7 @@ impl Default for LayerSelector {
 // `run()` method that would loop over encoder subscriptions and write
 // to the peer's RTP track from a dedicated task. That design can't
 // work: the `RTCPeerConnection` instance is owned by the `WebRtcPeer`
-// driver task (`display/webrtc.rs`), and a separate forwarder task
+// driver task (`display/webrtc/driver.rs`), and a separate forwarder task
 // has no path to call into it. Moving the forwarder responsibilities
 // into the driver avoids the cross-task-Rtc-access problem entirely:
 // each peer's driver select!-loops over its pool subscriptions
@@ -370,7 +370,7 @@ mod tests {
 
     // PerPeerForwarder tests were deleted with the type — the
     // keyframe-gate regression guard moves to the driver's write path
-    // (`display/webrtc.rs::write_video_frame`), where `state.keyframe_seen`
+    // (`display/webrtc/driver.rs::write_video_frame`), where `state.keyframe_seen`
     // now lives. Driver-side coverage is via e2e webrtc tests rather
     // than in-unit tests because the relevant path requires a live
     // `Rtc` instance.

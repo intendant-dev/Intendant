@@ -206,7 +206,7 @@ pub(crate) fn peer_identity_allows_ws_control(
 
 /// Map a typed `/ws` frame to the `PeerOperation` it exercises — the
 /// direct-WebSocket mirror of `dashboard_control_frame_operation` and
-/// the `CONTROL_METHODS` table (dashboard_control.rs), so the same
+/// the `CONTROL_METHODS` table (dashboard_control/mod.rs), so the same
 /// IAM grant answers the same way whichever transport a client speaks.
 /// `None` means the frame carries no authority of its own: replies, pings,
 /// and the `dashboard_control_*` signaling frames (the tunnel they establish

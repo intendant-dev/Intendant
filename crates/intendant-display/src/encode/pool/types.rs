@@ -387,7 +387,7 @@ impl LayerSpec {
     /// layer via [`normalize_layer_dims`]) and a bitrate capped at
     /// [`FEDERATED_H264_BITRATE_KBPS`]. Combined with the finite-GOP
     /// periodic IDR (`encode/h264_linux.rs`) and same-SSRC NACK
-    /// retransmission (`display/webrtc.rs`), the small IDR both survives
+    /// retransmission (`display/webrtc/driver.rs`), the small IDR both survives
     /// the relay and is recoverable.
     ///
     /// **Distinct RID.** The layer carries [`SimulcastRid::federated`], not

@@ -382,7 +382,7 @@ pub struct DisplayMetricsCounters {
     /// Total per-peer try_send failures in the fan-out task.
     ///
     /// `Arc<AtomicU64>` (not bare `AtomicU64`) so the per-peer
-    /// `pool_frame_intake` task at `webrtc.rs` can share the same
+    /// `pool_frame_intake` task at `webrtc/pool_glue.rs` can share the same
     /// counter via `Arc::clone(&self.counters.peer_drops)`.
     pub peer_drops: Arc<AtomicU64>,
     /// Current number of connected WebRTC peers.

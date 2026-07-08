@@ -13,7 +13,7 @@
 //! IDR within ~1-2 s rather than waiting indefinitely. The complementary
 //! half of the strategy lives elsewhere: the federated H.264 layer is
 //! encoded at quarter resolution + a capped bitrate (see
-//! `LayerSpec::single` / `single_federated` in `encode/pool.rs`), so even
+//! `LayerSpec::single` / `single_federated` in `encode/pool/types.rs`), so even
 //! the periodic IDR is only a handful of RTP packets and survives the
 //! lossy `browser → TURN → remote peer` relay; and `slice-max-size=1200`
 //! (libx264) keeps each NAL inside a single ~MTU RTP payload so a lost
@@ -596,7 +596,7 @@ impl Drop for FfmpegH264Encoder {
 /// keyframe every ~2 s — short enough that a fresh peer or a
 /// post-loss-burst decoder recovers promptly, long enough that periodic
 /// IDRs don't dominate the bitrate. Combined with the quarter-resolution
-/// + capped-bitrate federated layer (`encode/pool.rs`), each such IDR is
+/// + capped-bitrate federated layer (`encode/pool/types.rs`), each such IDR is
 /// only a handful of RTP packets, so it survives the lossy relay it has
 /// to cross. Replaces the earlier intra-refresh experiment, which left a
 /// desynced decoder with no clean recovery point (Linux ffmpeg ignores
@@ -706,7 +706,7 @@ fn x264_ffmpeg_args(width: u32, height: u32, bitrate_kbps: u32) -> Vec<String> {
 /// **Loss-resilience:** `-g GOP_PERIOD_FRAMES` gives a finite, bounded GOP
 /// so NVENC emits a periodic IDR every ~2 s — a real recovery point for a
 /// desynced decoder. Loss-survivability comes from the upstream
-/// quarter-resolution + capped-bitrate federated layer (`encode/pool.rs`),
+/// quarter-resolution + capped-bitrate federated layer (`encode/pool/types.rs`),
 /// which keeps that IDR small enough to reassemble on the lossy relay. An
 /// earlier iteration pinned an effectively-infinite GOP + `-intra-refresh
 /// 1` (plus `-no-scenecut 1` / `-forced-idr 0`) to suppress all post-seed

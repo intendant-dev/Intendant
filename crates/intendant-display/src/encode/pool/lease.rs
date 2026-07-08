@@ -121,7 +121,7 @@ impl PoolLease {
     /// release ([`Self::release`] or `Drop`).
     ///
     /// Used by the per-peer pool intake at
-    /// `webrtc.rs::pool_frame_intake` after
+    /// `webrtc/pool_glue.rs::pool_frame_intake` after
     /// `active_codec_from_subscriptions` picks the active codec out
     /// of a multi-codec subscription set: the inactive codecs'
     /// subscriptions are partitioned off and their on-demand claims

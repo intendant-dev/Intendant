@@ -759,7 +759,7 @@ mod tests {
     /// The end-to-end chain is pinned by composition with the
     /// existing `release_on_demand_subset_decrements_only_specified_ids`
     /// + `release_on_demand_subset_silently_skips_unknown_ids` tests
-    /// in `display/encode/pool.rs` — they pin the lease side, this
+    /// in `display/encode/pool/lease.rs` — they pin the lease side, this
     /// pins the partition side, and `pool_frame_intake` passes the
     /// returned `inactive_ids` verbatim to `release_on_demand_subset`.
     #[test]
