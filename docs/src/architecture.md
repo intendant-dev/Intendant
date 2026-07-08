@@ -164,7 +164,7 @@ In brief:
   `ControlMsg` mutations land, so a setting changed from the dashboard,
   MCP, or the control socket takes effect identically (and persists to `intendant.toml` where
   relevant).
-- **Session supervisor** (`session_supervisor.rs`) is the long-lived owner of
+- **Session supervisor** (`session_supervisor/`) is the long-lived owner of
   every session launched at runtime. It handles `CreateSession`, `StartTask`,
   `ResumeSession`, and targeted follow-ups off the bus, creates per-session
   resources (log dir, approval registry, follow-up channel), and tracks the

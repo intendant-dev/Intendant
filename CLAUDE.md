@@ -100,7 +100,7 @@ src/
 │   ├── agent_loop.rs, run_modes.rs, external_mode.rs, external_supervision.rs, display_glue.rs   # carved from main.rs: the native loop + orchestration handlers; native/external mode runners; external supervision helpers; frame/CU/user-display glue
 │   ├── startup/                # web bind/TLS + peer boot; the three mode branches (daemon, mcp_mode, headless)
 │   ├── control_plane.rs, event.rs, frontend.rs   # single-writer state; EventBus + ControlMsg; state snapshots
-│   ├── session_supervisor.rs, task_dispatch.rs, file_watcher.rs   # daemon: sessions, dispatch, rewind snapshots
+│   ├── session_supervisor/, task_dispatch.rs, file_watcher.rs   # daemon: sessions (dispatch/launch/sub_agents/routing/agent_config/registry slices), dispatch, rewind snapshots
 │   ├── provider/, tools.rs, prompts.rs, approval.rs   # provider/: ChatProvider + selection (mod.rs), per-provider openai/anthropic/gemini
 │   ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, agent_runner.rs   # native multi-agent
 │   ├── context_rewind.rs, fission_ledger.rs, fission_lifecycle.rs, lineage_ledger.rs   # managed context: rewinds, fission, lineage
@@ -112,7 +112,7 @@ src/
 │   ├── computer_use.rs, ax.rs, recording.rs, frames.rs
 │   ├── presence.rs, live_audio.rs, audio_routing.rs, transcription.rs, quarantine.rs, schema_validator.rs
 │   ├── web_gateway/                # HTTP/WS gateway: listener (accept/TLS), ws_session (WS tasks), http_dispatch (route dispatch), http, routes_{sessions,files,peers,access}, session_catalog/, settings, access_gates, input_authority, dashboard_presence, connect_bootstrap, peer_requests, agent_card, mcp_gate, static_assets
-│   ├── dashboard_control.rs, terminal.rs, browser_workspace.rs   # dashboard tunnel; PTY registry; agent browser
+│   ├── dashboard_control/, terminal.rs, browser_workspace.rs   # dashboard tunnel (method table + wire/dispatch/api slices); PTY registry; agent browser
 │   ├── mcp/, mcp_client.rs, control.rs
 │   ├── transfer_store.rs, upload_store.rs, peer_file_transfer.rs   # transfer jobs; upload/attachment stores
 │   ├── session_log/, session_names.rs, project.rs, app_state_pricing.rs
@@ -154,7 +154,7 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
 - **Derive, don't mirror.** Daemon truth a frontend needs — permission
   catalogs, feature lists, availability booleans, option vocabularies — is
   declared once and derived everywhere else (exemplar: `CONTROL_METHODS` in
-  `dashboard_control.rs` drives the authorizer, the `features` list, and the
+  `dashboard_control/mod.rs` drives the authorizer, the `features` list, and the
   per-method availability booleans). When a static frontend fallback copy is
   unavoidable (app.html's IAM catalog, the peer-profile picker), a
   daemon-side parity test pins its ID sets to the source, so a catalog

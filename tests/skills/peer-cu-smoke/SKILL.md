@@ -88,9 +88,14 @@ ctl --peer <peer-label> cu actions --target user_session \
 
 ## Traps
 
-- **Always pass `--target user_session`.** Omitting the target
-  auto-detects the `:99` virtual-display convention; a box whose only
-  session is `:0` fails with "cannot connect to X display :99".
+- **Pass `--target user_session` explicitly.** Current daemons
+  auto-detect an omitted target availability-aware (a live virtual
+  display when one exists, else the user session), but the explicit
+  flag is deterministic: on a peer running an older daemon, an omitted
+  target blindly assumes `:99` and a box whose only session is `:0`
+  fails with "cannot connect to X display :99" — and on a box that
+  *does* have an agent virtual display, the omitted form captures that
+  display, not the desktop this smoke wants to look at.
 - A denial means the peer's owner has not granted the capability —
   report it, don't retry or work around it.
 - `--peer` resolves by label (case-insensitive), `card_url` host,

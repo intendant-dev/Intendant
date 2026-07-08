@@ -305,7 +305,7 @@ If behavior changes, start with these files instead of rediscovering the whole r
 - `src/bin/caller/event.rs`: `AppEvent` durability allow-list and `write_event_to_session_log()`.
 - `src/agent.rs`: sandboxed runtime log files, screenshot files, `askHuman` temp files, stdout/stderr tailing.
 - `src/bin/caller/main.rs`: controller session creation/resume, daemon log tee install, runtime env, frame/recording/file-watcher setup.
-- `src/bin/caller/session_supervisor.rs`: daemon-created sessions, related sessions, external resume/attach flows.
+- `src/bin/caller/session_supervisor/`: daemon-created sessions, related sessions, external resume/attach flows.
 - `src/bin/caller/web_gateway.rs`: dashboard session list/search/detail/replay, external native log discovery, deleted-session filtering.
 - `src/bin/caller/external_wrapper_index.rs`: global backend-id to wrapper-log index.
 - `src/bin/caller/session_config.rs`: `session_agent_config.json` and effective Codex home.

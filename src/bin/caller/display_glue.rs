@@ -1450,8 +1450,17 @@ pub(crate) async fn execute_cu_calls(
     let display_target = if cu_display.is_some() {
         resolve_cu_display_target(user_display_granted)
     } else {
-        // No CU display configured — default to virtual :99
-        computer_use::DisplayTarget::Virtual { id: 99 }
+        // No CU display configured — resolve availability-aware, but
+        // never auto-target the user's desktop from the model-driven
+        // loop without the user-display grant (the same gating as
+        // resolve_cu_display_target above): ungranted, keep the
+        // conventional virtual display, whose failure is actionable.
+        match computer_use::default_display_target(&session_registry).await {
+            computer_use::DisplayTarget::UserSession if !user_display_granted => {
+                computer_use::DisplayTarget::Virtual { id: 99 }
+            }
+            target => target,
+        }
     };
 
     for cu_call in cu_calls {
