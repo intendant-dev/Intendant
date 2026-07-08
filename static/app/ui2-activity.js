@@ -230,9 +230,13 @@ function ui2RailForegroundSessionId() {
   return '';
 }
 
-function ui2RailTick() {
+function ui2RailTick(force) {
   const rail = document.getElementById('ui2-vitals-rail');
-  if (!rail || !rail.offsetParent) return; // hidden: other tab/subtab, grid layout, or <1180px
+  if (!rail) return;
+  // hidden: other tab/subtab, grid layout, or <1180px — skip the interval
+  // work, but let the build-time call fill values so the rail never shows
+  // placeholder dashes on its first paint.
+  if (!force && !rail.offsetParent) return;
 
   const sid = ui2RailForegroundSessionId();
   const sessionEl = document.getElementById('ui2-rail-session');
@@ -259,8 +263,10 @@ function ui2RailTick() {
 
   const cache = (vitals && typeof sessionVitalsCacheSegment === 'function')
     ? sessionVitalsCacheSegment(vitals.cache) : null;
+  // cold = no cache yet — neutral, not an alarm (rose on a fresh session
+  // read as a fault); expiring joins crit like v1's red.
   ui2RailSetRow('ui2-rail-cache', cache ? cache.text : '', cache ? cache.titleLines : null,
-    cache ? (/cache-crit|cache-cold/.test(cache.cls) ? 'crit' : /cache-warn|cache-expiring/.test(cache.cls) ? 'warn' : 'ok') : null);
+    cache ? (/cache-crit|cache-expiring/.test(cache.cls) ? 'crit' : /cache-warn/.test(cache.cls) ? 'warn' : /cache-cold/.test(cache.cls) ? null : 'ok') : null);
 
   const limits = (vitals && typeof sessionVitalsLimitsSegment === 'function')
     ? sessionVitalsLimitsSegment(vitals.limits) : null;
@@ -287,8 +293,8 @@ if (ui2Enabled()) {
     ui2WireLayoutToggle();
     ui2DressComposer();
     ui2BuildVitalsRail();
-    ui2RailTick();
-    setInterval(ui2RailTick, 1000);
+    ui2RailTick(true);
+    setInterval(() => ui2RailTick(), 1000);
     // Focus filter + raw-entry hygiene: follow stream appends, target
     // changes (the chip re-renders on every change), and layout flips.
     const stream = document.getElementById('log-stream');
