@@ -62,7 +62,20 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'vault', 'debug', 'settings'];
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['shell'];
-const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
+const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug', 'autonomy', 'providers', 'presence', 'advanced'];
+// ui-v2 (design-overhaul) remaps the three legacy Settings sub-tabs onto
+// the four design sections — and back when the flag is off — so both
+// generations of deep link keep landing somewhere sensible. 'network'
+// stays out of both maps: its Access redirect below handles it.
+const SETTINGS_SUBTAB_TO_V2 = { account: 'providers', agent: 'providers', debug: 'advanced' };
+const SETTINGS_SUBTAB_TO_V1 = { autonomy: 'agent', providers: 'account', presence: 'agent', advanced: 'debug' };
+function normalizeSettingsSubtab(name) {
+  const raw = String(name || '').trim();
+  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+    return SETTINGS_SUBTAB_TO_V2[raw] || raw;
+  }
+  return SETTINGS_SUBTAB_TO_V1[raw] || raw;
+}
 const ACCESS_SUBTAB_ALIASES = {
   targets: 'daemons',
   invitations: 'peers',
@@ -1936,7 +1949,7 @@ window.openNewSessionFromPrompt = openNewSessionFromPrompt;
 const SETTINGS_SUBTAB_KEY = 'intendant_settings_subtab';
 const ACCESS_SUBTAB_KEY = 'intendant_access_subtab';
 let activeSettingsSubtab =
-  localStorage.getItem(SETTINGS_SUBTAB_KEY) || 'account';
+  normalizeSettingsSubtab(localStorage.getItem(SETTINGS_SUBTAB_KEY) || 'account');
 if (activeSettingsSubtab === 'network') {
   activeSettingsSubtab = 'account';
   localStorage.setItem(SETTINGS_SUBTAB_KEY, activeSettingsSubtab);
@@ -1972,6 +1985,7 @@ function switchAccessSubtab(name) {
 }
 
 function switchSettingsSubtab(name) {
+  name = normalizeSettingsSubtab(name);
   if (name === 'network') {
     routeTo('access', 'overview');
     return;
@@ -1986,6 +2000,7 @@ function switchSettingsSubtab(name) {
     pane.classList.toggle('active', pane.id === `settings-pane-${name}`);
   });
   updateSettingsSaveRow();
+  if (typeof ui2SettingsOnSubtabShown === 'function') ui2SettingsOnSubtabShown(name);
 }
 
 // Deep link to the Settings → Account API-keys card — the remediation
@@ -1994,7 +2009,11 @@ function switchSettingsSubtab(name) {
 // inline onclick handlers (the unfueled banner's Add-keys button) and the
 // validate-dashboard harness need an explicit global.
 function focusSettingsApiKeys() {
-  routeTo('settings', 'account');
+  // Under ui-v2 the API-keys card lives in the Providers & models
+  // section (same DOM node, re-parented) — route to the canonical
+  // per-generation section so the hash stays truthful.
+  const keysSubtab = (typeof ui2Enabled === 'function' && ui2Enabled()) ? 'providers' : 'account';
+  routeTo('settings', keysSubtab);
   requestAnimationFrame(() => {
     const heading = document.getElementById('settings-keys-heading');
     const card = heading?.closest('.ui-card') || heading;
@@ -2033,7 +2052,13 @@ function applyInitialSettingsSubtab() {
 function updateSettingsSaveRow() {
   const row = document.querySelector('#tab-settings .settings-save-row');
   if (!row) return;
-  row.style.display = (activeSettingsSubtab === 'agent') ? '' : 'none';
+  // ui-v2: the batch-saved /api/settings fields live in the Providers &
+  // models and Presence & voice sections; Autonomy is live-apply and
+  // Account & advanced is read-only.
+  const visible = (typeof ui2Enabled === 'function' && ui2Enabled())
+    ? (activeSettingsSubtab === 'providers' || activeSettingsSubtab === 'presence')
+    : (activeSettingsSubtab === 'agent');
+  row.style.display = visible ? '' : 'none';
 }
 
 let initialRouteAppliedFromHash = false;

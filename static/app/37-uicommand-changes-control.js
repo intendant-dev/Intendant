@@ -1152,6 +1152,9 @@ function renderControlPane() {
     if (sel && controlApprovalRules[cat]) sel.value = controlApprovalRules[cat];
   }
   updateControlAppliesNote();
+  // ui-v2: the Settings → Autonomy card renders the same rules — keep it
+  // in step whenever this pane refreshes (inert without the flag).
+  if (typeof ui2SettingsSyncFromControl === 'function') ui2SettingsSyncFromControl();
 }
 
 function updateControlAppliesNote() {

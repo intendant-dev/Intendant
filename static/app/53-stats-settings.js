@@ -214,6 +214,9 @@ async function loadSettings() {
       if (debugEmpty) debugEmpty.classList.remove('hidden');
     }
     settingsLoaded = true;
+    // ui-v2: the segmented proxies mirror selects whose .value was just
+    // assigned programmatically (no change events) — re-sync them.
+    if (typeof ui2SettingsSyncMirrors === 'function') ui2SettingsSyncMirrors();
   } catch (e) {
     console.error('Failed to load settings:', e);
   }

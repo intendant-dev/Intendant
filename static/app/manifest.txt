@@ -23,8 +23,10 @@ ui2-debug.css
 ui2-station.css
 ui2-vault.css
 ui2-sessions.css
+ui2-activity.css
 ui2-live.css
 ui2-usage.css
+ui2-settings.css
 19-style-close.html
 
 20-shell.html
@@ -37,6 +39,7 @@ ui2-shell.html
 31-ui2-foundation.js
 ui2-chrome.js
 ui2-voice.js
+ui2-activity.js
 31-init-identity-fleet.js
 32-vault-custody.js
 33-station-core.js
@@ -62,6 +65,7 @@ ui2-voice.js
 51-peer-approvals.js
 52-peer-display.js
 53-stats-settings.js
+ui2-settings.js
 54-session-lifecycle.js
 55-files-ide.js
 56-debug-sessions.js
