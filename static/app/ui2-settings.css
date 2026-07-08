@@ -1,0 +1,480 @@
+/* ── ui-v2 Settings surface (design-overhaul P2) ───────────────────────
+   Everything here is scoped under `html.ui-v2` — v1 stays
+   pixel-identical. ui2-settings.js re-parents the EXISTING Settings
+   cards (ids + save path intact) into the design's four sections with a
+   left section nav; this file skins that layout plus the new
+   autonomy-dial / approval-rules cards.
+
+   Recipes come from the design-system reference: tint formula (fill
+   8–16%, border ~26%, text full color), radius ladder (8 inset · 9–10
+   control · 12–14 card · 15 panel · 999 pill), segmented grammar
+   (nav = neutral, value choice = accent, per-category RISK = semantic
+   green/amber/rose), eyebrow labels, mono mandate (models, paths,
+   env names — never body UI). */
+
+/* v1 chrome of the Settings tab is replaced by the section shell. */
+html.ui-v2 #tab-settings > .subtabs { display: none; }
+html.ui-v2 #tab-settings > .subtab-panes { display: none; }
+/* Rows whose <select> is proxied by a segmented control. */
+html.ui-v2 #tab-settings .settings-row.ui2-seg-carrier { display: none; }
+
+/* ══ shell: side nav + content ══════════════════════════════════════ */
+html.ui-v2 #tab-settings { overflow-y: auto; }
+html.ui-v2 .ui2-set-shell {
+  display: flex;
+  gap: 34px;
+  width: 100%;
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 30px 24px 64px;
+  align-items: flex-start;
+}
+html.ui-v2 .ui2-set-side {
+  width: 218px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 12px;
+}
+html.ui-v2 .ui2-set-title {
+  margin: 0 0 18px;
+  font-family: var(--sans);
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -.02em;
+  color: var(--text);
+}
+html.ui-v2 .ui2-set-nav { display: flex; flex-direction: column; gap: 2px; }
+html.ui-v2 .ui2-set-nav-btn {
+  display: block;
+  width: 100%;
+  padding: 9px 11px;
+  border: 0;
+  border-radius: 9px;
+  min-height: 0;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 13.5px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 .ui2-set-nav-btn:hover { background: var(--hover-wash); color: var(--text); }
+html.ui-v2 .ui2-set-nav-btn.active {
+  background: linear-gradient(90deg, rgba(var(--iris-rgb), .16), transparent);
+  color: var(--iris-2);
+  box-shadow: inset 2px 0 0 var(--iris);
+}
+html.ui-v2 .ui2-set-content {
+  flex: 1;
+  min-width: 0;
+  max-width: 780px;
+}
+html.ui-v2 .ui2-set-pane.active { display: flex; flex-direction: column; gap: 18px; }
+
+/* ══ cards ══════════════════════════════════════════════════════════ */
+html.ui-v2 #tab-settings .ui-card {
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--surface);
+  padding: 20px 22px;
+  margin: 0;
+  box-shadow: none;
+}
+html.ui-v2 #tab-settings .ui-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  margin: 0 0 6px;
+  padding: 0;
+  border: 0;
+}
+html.ui-v2 #tab-settings .ui-section-title {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text);
+}
+html.ui-v2 #tab-settings .ui-section-sub {
+  flex: 1 1 100%;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+
+/* ══ setting rows ═══════════════════════════════════════════════════ */
+html.ui-v2 #tab-settings .settings-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 0;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+html.ui-v2 #tab-settings .settings-row:first-of-type { border-top: 0; }
+html.ui-v2 #tab-settings .settings-row label {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--sans);
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+html.ui-v2 #tab-settings .settings-row input[type="text"],
+html.ui-v2 #tab-settings .settings-row input[type="number"],
+html.ui-v2 #tab-settings .settings-row input[type="password"],
+html.ui-v2 #tab-settings .settings-row select {
+  width: 280px;
+  max-width: 52%;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--mono);   /* models, binaries, endpoints, keys */
+  font-size: 12.5px;
+  padding: 8px 12px;
+  outline: none;
+  transition: border-color var(--t-med), box-shadow var(--t-med);
+}
+html.ui-v2 #tab-settings .settings-row input[type="number"] { width: 110px; }
+html.ui-v2 #tab-settings .settings-row input:focus-visible,
+html.ui-v2 #tab-settings .settings-row select:focus-visible {
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+html.ui-v2 #tab-settings .settings-row input::placeholder { color: var(--text-3); }
+html.ui-v2 #tab-settings .settings-row-warning {
+  font-size: 11px;
+  color: var(--amber);
+}
+
+/* checkboxes → design toggles (same inputs, same ids) */
+html.ui-v2 #tab-settings .settings-row input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  width: 42px;
+  height: 24px;
+  margin: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--surface-3);
+  cursor: pointer;
+  transition: background var(--t-slow);
+  flex-shrink: 0;
+}
+html.ui-v2 #tab-settings .settings-row input[type="checkbox"]::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, .4);
+  transition: left var(--t-slow);
+}
+html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:checked { background: var(--iris); }
+html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:checked::after { left: 20px; }
+html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--iris);
+  outline-offset: 2px;
+}
+
+/* ══ segmented controls ═════════════════════════════════════════════ */
+html.ui-v2 #tab-settings .ui2-seg {
+  display: inline-flex;
+  gap: 3px;
+  padding: 3px;
+  border-radius: 11px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+html.ui-v2 #tab-settings .ui2-seg-btn {
+  border: 0;
+  border-radius: 8px;
+  min-height: 0;
+  padding: 7px 13px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #tab-settings .ui2-seg-btn:hover { color: var(--text); }
+html.ui-v2 #tab-settings .ui2-seg-btn:focus-visible {
+  outline: 2px solid var(--iris);
+  outline-offset: 1px;
+}
+/* value choice → accent */
+html.ui-v2 #tab-settings .ui2-seg-btn.is-accent {
+  background: linear-gradient(180deg, rgba(var(--iris-rgb), .24), rgba(var(--iris-rgb), .1));
+  color: var(--iris-2);
+  box-shadow: inset 0 0 0 1px rgba(var(--iris-rgb), .3);
+}
+/* full-width choice segments (managed backend) */
+html.ui-v2 #tab-settings .ui2-seg-wide { display: flex; width: 100%; margin: 12px 0 2px; }
+html.ui-v2 #tab-settings .ui2-seg-wide .ui2-seg-btn { flex: 1; padding: 9px 13px; }
+/* labeled seg row (Live voice) */
+html.ui-v2 #tab-settings .ui2-seg-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+html.ui-v2 #tab-settings .ui2-seg-row-label {
+  font-family: var(--sans);
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+html.ui-v2 #tab-settings .ui2-seg-row .ui2-seg { display: flex; width: 100%; }
+html.ui-v2 #tab-settings .ui2-seg-row .ui2-seg-btn { flex: 1; padding: 9px 13px; }
+
+/* ══ autonomy card ══════════════════════════════════════════════════ */
+html.ui-v2 .ui2-auto-head { align-items: center; }
+html.ui-v2 .ui2-auto-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--surface-3);
+  color: var(--text-2);
+}
+html.ui-v2 .ui2-auto-pill[data-level="low"] {
+  background: rgba(var(--rose-rgb), .14);
+  border: 1px solid rgba(var(--rose-rgb), .26);
+  color: var(--rose);
+}
+html.ui-v2 .ui2-auto-pill[data-level="medium"] {
+  background: rgba(var(--amber-rgb), .14);
+  border: 1px solid rgba(var(--amber-rgb), .26);
+  color: var(--amber);
+}
+html.ui-v2 .ui2-auto-pill[data-level="high"] {
+  background: rgba(var(--sky-rgb), .14);
+  border: 1px solid rgba(var(--sky-rgb), .26);
+  color: var(--sky);
+}
+html.ui-v2 .ui2-auto-pill[data-level="full"] {
+  background: rgba(var(--green-rgb), .12);
+  border: 1px solid rgba(var(--green-rgb), .26);
+  color: var(--green);
+}
+html.ui-v2 .ui2-auto-hint {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 .ui2-auto-dial { display: flex; width: 100%; margin: 12px 0 0; border-radius: 12px; }
+html.ui-v2 .ui2-auto-dial .ui2-seg-btn { flex: 1; padding: 10px 13px; font-size: 13px; }
+html.ui-v2 .ui2-auto-desc {
+  margin: 14px 2px 0;
+  min-height: 40px;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--text-2);
+}
+html.ui-v2 .ui2-auto-gates {
+  margin: 12px 2px 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+
+/* ══ approval rules card ════════════════════════════════════════════ */
+html.ui-v2 .ui2-rule-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+html.ui-v2 .ui2-rule-row:first-of-type { border-top: 0; }
+html.ui-v2 .ui2-rules-card .ui-section-head + .ui2-rule-row { border-top: 0; }
+html.ui-v2 .ui2-rule-meta { flex: 1; min-width: 0; }
+html.ui-v2 .ui2-rule-label {
+  font-family: var(--sans);
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+html.ui-v2 .ui2-rule-sub {
+  margin-top: 2px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-3);
+}
+html.ui-v2 .ui2-rule-seg { flex-shrink: 0; }
+html.ui-v2 .ui2-rule-seg .ui2-seg-btn { min-width: 52px; text-align: center; }
+/* per-category risk actives → semantic (the #tab-settings id keeps
+   specificity above the base .ui2-seg-btn rule, which also carries it) */
+html.ui-v2 #tab-settings .ui2-rule-seg .ui2-seg-btn.is-auto { background: rgba(var(--green-rgb), .18); color: var(--green); }
+html.ui-v2 #tab-settings .ui2-rule-seg .ui2-seg-btn.is-ask  { background: rgba(var(--amber-rgb), .18); color: var(--amber); }
+html.ui-v2 #tab-settings .ui2-rule-seg .ui2-seg-btn.is-deny { background: rgba(var(--rose-rgb), .16); color: var(--rose); }
+html.ui-v2 .ui2-rules-note {
+  margin: 12px 2px 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+
+/* ══ advanced folds ═════════════════════════════════════════════════ */
+html.ui-v2 #tab-settings .ui2-fold { margin-top: 4px; border-top: 1px solid var(--line); }
+html.ui-v2 #tab-settings .ui2-fold-summary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 11px 0 9px;
+  list-style: none;
+  cursor: pointer;
+  font-family: var(--sans);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  transition: color var(--t-fast);
+}
+html.ui-v2 #tab-settings .ui2-fold-summary:hover { color: var(--text-2); }
+html.ui-v2 #tab-settings .ui2-fold-summary::-webkit-details-marker { display: none; }
+html.ui-v2 #tab-settings .ui2-fold-summary:focus-visible {
+  outline: 2px solid var(--iris);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+html.ui-v2 #tab-settings .ui2-fold-chev { display: flex; transition: transform var(--t-med); }
+html.ui-v2 #tab-settings .ui2-fold[open] > .ui2-fold-summary .ui2-fold-chev { transform: rotate(90deg); }
+html.ui-v2 #tab-settings .ui2-fold-body > .settings-row:first-of-type { border-top: 0; padding-top: 4px; }
+
+/* ══ read-only main-model card ══════════════════════════════════════ */
+html.ui-v2 .ui2-ro-value {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  padding: 3px 9px;
+  border-radius: 6px;
+  background: var(--surface-3);
+  color: var(--iris-2);
+}
+html.ui-v2 .ui2-ro-note { border-top: 1px solid var(--line); padding-top: 12px; }
+
+/* ══ notes, keys, env overrides, save row ═══════════════════════════ */
+html.ui-v2 #tab-settings .settings-note {
+  margin: 0;
+  padding: 0 2px;
+  font-family: var(--sans);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-settings .settings-note code {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--surface-3);
+  color: var(--text-2);
+}
+html.ui-v2 #tab-settings .settings-note a,
+html.ui-v2 #tab-settings .ui2-crosslink a { color: var(--iris-2); text-decoration: none; }
+html.ui-v2 #tab-settings .settings-note a:hover,
+html.ui-v2 #tab-settings .ui2-crosslink a:hover { text-decoration: underline; }
+html.ui-v2 #tab-settings .ui2-crosslink {
+  margin-top: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+html.ui-v2 #tab-settings .key-status { font-size: 12px; }
+html.ui-v2 #tab-settings .settings-keys-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+html.ui-v2 #tab-settings .settings-env-overrides { margin-top: 4px; }
+html.ui-v2 #tab-settings .settings-env-overrides h4 {
+  margin: 0 0 8px;
+  font-family: var(--sans);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-settings .settings-env-overrides code { font-family: var(--mono); font-size: 12px; }
+
+/* buttons in scope: primary gradient + secondary */
+html.ui-v2 #tab-settings .ui-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: background var(--t-med), border-color var(--t-med), filter var(--t-med);
+}
+html.ui-v2 #tab-settings .ui-btn:hover { background: var(--surface-2); border-color: var(--line-2); }
+html.ui-v2 #tab-settings .ui-btn.primary {
+  border: 0;
+  padding: 9px 16px;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+}
+html.ui-v2 #tab-settings .ui-btn.primary:hover { filter: brightness(1.08); background: linear-gradient(180deg, var(--iris), var(--iris-deep)); }
+html.ui-v2 #tab-settings .ui-btn:focus-visible { outline: 2px solid var(--iris); outline-offset: 2px; }
+
+html.ui-v2 #tab-settings .settings-save-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 2px 0 0;
+  padding: 14px 2px 0;
+  border-top: 0;
+  background: transparent;
+  position: static;
+}
+
+/* ══ narrow width ═══════════════════════════════════════════════════ */
+@media (max-width: 900px) {
+  html.ui-v2 .ui2-set-shell { flex-direction: column; gap: 18px; }
+  html.ui-v2 .ui2-set-side { width: 100%; position: static; }
+  html.ui-v2 .ui2-set-nav { flex-direction: row; flex-wrap: wrap; gap: 4px; }
+  html.ui-v2 .ui2-set-nav-btn { width: auto; }
+  html.ui-v2 .ui2-set-nav-btn.active { box-shadow: inset 0 -2px 0 var(--iris); }
+  html.ui-v2 #tab-settings .ui2-rule-row { flex-wrap: wrap; }
+  html.ui-v2 #tab-settings .settings-row input[type="text"],
+  html.ui-v2 #tab-settings .settings-row input[type="password"],
+  html.ui-v2 #tab-settings .settings-row select { max-width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.ui-v2 #tab-settings * { transition: none !important; }
+}

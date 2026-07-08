@@ -160,17 +160,19 @@ function ui2WireMirrors() {
   const conn = document.getElementById('ui2-conn');
   if (conn) conn.addEventListener('click', () => routeTo('access', 'diagnostics'));
 
-  // Autonomy chip: level text mirrored; click opens Settings (the design's
-  // behavior — one-click cycling stays available on the v1 strip).
+  // Autonomy chip: level text mirrored (+ the truthful short tag); click
+  // opens Settings → Autonomy & approvals (the design's behavior —
+  // one-click cycling stays available on the v1 strip).
   ui2Mirror('sb-autonomy', (src) => {
     const level = (src.textContent || '').trim() || '—';
+    const tag = UI2_AUTONOMY_TAGS[level];
     const out = document.getElementById('ui2-autonomy-level');
     const btn = document.getElementById('ui2-autonomy-btn');
-    if (out) out.textContent = level;
+    if (out) out.textContent = tag ? `${level} · ${tag}` : level;
     if (btn) btn.dataset.level = level.toLowerCase();
   });
   const autonomyBtn = document.getElementById('ui2-autonomy-btn');
-  if (autonomyBtn) autonomyBtn.addEventListener('click', () => routeTo('settings', 'agent'));
+  if (autonomyBtn) autonomyBtn.addEventListener('click', () => routeTo('settings', 'autonomy'));
 
   // Host identity: nav host button + avatar initials.
   ui2Mirror('sb-host-label', (src) => {
