@@ -27,17 +27,18 @@ html.ui-v2 .session-window-grid-resize-handle.dragging::before {
   background: var(--iris);
 }
 
-/* — window card — */
+/* — window card (design-system polish: no shadow at rest — shadows are
+     reserved for overlays, primary buttons, and the approval hero) — */
 html.ui-v2 .session-window {
   border: 1px solid var(--line);
   border-radius: var(--r-card);
-  box-shadow: var(--shadow-card);
+  box-shadow: none;
   transition: border-color var(--t-fast), box-shadow var(--t-fast);
 }
 html.ui-v2 .session-window:hover { border-color: var(--line-2); }
 html.ui-v2 .session-window.foreground {
   border-color: rgba(var(--iris-rgb), .55);
-  box-shadow: inset 0 0 0 1px rgba(var(--iris-rgb), .22), var(--shadow-card);
+  box-shadow: inset 0 0 0 1px rgba(var(--iris-rgb), .22);
 }
 /* prompt-target keeps the badge-var ring (correct per-session color);
    only the outer glow is softened to the v2 shadow scale */
@@ -89,11 +90,12 @@ html.ui-v2 .session-window-relation-chip.side { border-color: rgba(var(--violet-
 html.ui-v2 .session-window-relation-chip.fork { border-color: rgba(var(--iris-rgb), .4); }
 html.ui-v2 .session-window-relation-chip.subagent { border-color: rgba(var(--green-rgb), .38); }
 
-/* — status chip: dot + label, same grammar as the oversight phase pill — */
+/* — status pill: TEXT-ONLY (design-system polish — dots and pulses
+     belong to the live phase pill and the approval hero, not session
+     state chips) — */
 html.ui-v2 .session-window-status {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
   font-family: var(--mono);
   font-size: 9.5px;
   font-weight: 700;
@@ -101,21 +103,24 @@ html.ui-v2 .session-window-status {
   text-transform: uppercase;
   padding: 3px 9px;
   border: 1px solid var(--line);
-  background: transparent;
+  background: var(--surface-3);
+  color: var(--text-2);
 }
-html.ui-v2 .session-window-status::before {
-  content: '';
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--neutral-dot);
+html.ui-v2 .session-window-status.active {
+  color: var(--iris-2);
+  border-color: rgba(var(--iris-rgb), .26);
+  background: rgba(var(--iris-rgb), .12);
 }
-html.ui-v2 .session-window-status.active { color: var(--iris-2); border-color: rgba(var(--iris-rgb), .4); }
-html.ui-v2 .session-window-status.active::before { background: var(--iris); animation: ui2-pulse 2s infinite; }
-html.ui-v2 .session-window-status.waiting { color: var(--amber); border-color: rgba(var(--amber-rgb), .4); }
-html.ui-v2 .session-window-status.waiting::before { background: var(--amber); animation: ui2-pulse 2s infinite; }
-html.ui-v2 .session-window-status.done { color: var(--green); border-color: rgba(var(--green-rgb), .38); }
-html.ui-v2 .session-window-status.done::before { background: var(--green); }
+html.ui-v2 .session-window-status.waiting {
+  color: var(--amber);
+  border-color: rgba(var(--amber-rgb), .26);
+  background: rgba(var(--amber-rgb), .12);
+}
+html.ui-v2 .session-window-status.done {
+  color: var(--green);
+  border-color: rgba(var(--green-rgb), .26);
+  background: rgba(var(--green-rgb), .12);
+}
 
 /* — goal / tier / vitals chips — */
 html.ui-v2 .session-window-goal,
@@ -148,7 +153,7 @@ html.ui-v2 .session-window-submenu-panel {
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--surface);
-  box-shadow: var(--shadow-overlay);
+  box-shadow: var(--shadow-menu);
   padding: 4px;
 }
 html.ui-v2 .session-window-menu button,
@@ -210,7 +215,6 @@ html.ui-v2 .concurrent-log-label {
   border: 1px solid var(--line);
   border-radius: var(--r-pill);
   background: var(--surface);
-  box-shadow: var(--shadow-card);
 }
 html.ui-v2 .concurrent-log-action {
   border-radius: var(--r-ctl);

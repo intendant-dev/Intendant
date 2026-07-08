@@ -4,10 +4,12 @@ The web dashboard is Intendant's **default frontend**. It is a single-page app
 served by the controller's built-in HTTP/WebSocket gateway, running entirely in
 the browser with WASM-powered state management (the `presence-web` crate,
 mobile-responsive). Since the design-overhaul flip the default look is the
-**v2 chrome** (dark, Iris accent: left navigation rail, oversight bar, ⌘K
-command palette, bottom composer); the previous Catppuccin Mocha generation
-remains reachable at `?ui=v1` as an escape hatch during the soak period, after
-which it will be deleted. The SPA is served as one
+**v2 chrome** (Iris accent: left navigation rail, oversight bar, ⌘K command
+palette, bottom composer). Dark is the default theme; a **light theme** ships
+alongside it (Settings → Appearance, or the ⌘K theme toggle — browser-scoped,
+persisted per browser). The previous Catppuccin Mocha generation remains
+reachable at `?ui=v1` as an escape hatch during the soak period, after which
+it will be deleted. The SPA is served as one
 self-contained file, `static/app.html` — a **generated artifact**: `build.rs`
 assembles it from the ordered fragments in `static/app/` (`manifest.txt` fixes
 the order) via `crates/app-html-assembler`, and CI rejects any drift between

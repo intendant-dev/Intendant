@@ -10,18 +10,29 @@
 // (filled play triangle, record dot). No emoji anywhere.
 
 const UI2_ICON_PATHS = {
-  // — destinations —
-  activity: '<path d="M3 12h3l2.4 7 5-16 3 9h4.6"/>',
-  sessions: '<path d="M12 3 3 8l9 5 9-5-9-5Z"/><path d="M3 13l9 5 9-5"/>',
-  live: '<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M9 21h6"/><path d="M11 8.6l4.2 2.9-4.2 2.9Z" fill="currentColor" stroke="none"/>',
-  station: '<circle cx="12" cy="12" r="2.4"/><ellipse cx="12" cy="12" rx="9" ry="3.6"/><ellipse cx="12" cy="12" rx="9" ry="3.6" transform="rotate(62 12 12)"/><ellipse cx="12" cy="12" rx="9" ry="3.6" transform="rotate(-62 12 12)"/>',
-  terminal: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9.5l3 2.5-3 2.5"/><path d="M13 15h4"/>',
-  files: '<path d="M4 7a2 2 0 0 1 2-2h3l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/>',
-  stats: '<path d="M5 20V11"/><path d="M12 20V4"/><path d="M19 20v-6"/>',
-  access: '<path d="M12 3l7 3v5c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/>',
-  vault: '<circle cx="8.5" cy="12" r="3.6"/><path d="M12.1 12H21"/><path d="M18 12v3.4"/><path d="M15 12v2.4"/>',
+  // — destinations (redesigned in the design-system pass, 2026-07-08:
+  //   drawn from the product's own motifs — timeline grammar, lineage
+  //   fan, broadcast, radar, prompt+cursor, tree, heatmap, keyhole,
+  //   safe wheel; settings/debug kept) —
+  activity: '<circle cx="5" cy="6.2" r="1.3" fill="currentColor" stroke="none"/><circle cx="5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="5" cy="17.8" r="1.3" fill="currentColor" stroke="none"/><path d="M9 6.2h7.5"/><path d="M9 12h11"/><path d="M9 17.8h5.5"/>',
+  sessions: '<circle cx="12" cy="5.4" r="2.1"/><path d="M10.9 7.2 6.6 14.6"/><path d="M12 7.5v7.9"/><path d="M13.1 7.2l4.3 7.4"/><circle cx="5.8" cy="16.9" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="17.6" r="1.5" fill="currentColor" stroke="none"/><circle cx="18.2" cy="16.9" r="1.5" fill="currentColor" stroke="none"/>',
+  live: '<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M9 21h6"/><circle cx="12" cy="10.5" r="1.4" fill="currentColor" stroke="none"/><path d="M9.2 13.3a4.4 4.4 0 0 1 0-5.6"/><path d="M14.8 7.7a4.4 4.4 0 0 1 0 5.6"/>',
+  station: '<circle cx="12" cy="12" r="8.4"/><path d="M12 12l5.4-6.2"/><circle cx="12" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="8.3" cy="14.9" r="1.3" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.2" r="1.3" fill="currentColor" stroke="none"/>',
+  terminal: '<path d="M4.5 6.5 10 12l-5.5 5.5"/><rect x="13" y="15.7" width="6.5" height="2.6" rx="1.1" fill="currentColor" stroke="none"/>',
+  files: '<rect x="3.5" y="3.5" width="8" height="4.8" rx="1.4"/><path d="M6.5 8.3v10h6"/><path d="M6.5 12.4h6"/><rect x="14" y="10" width="6.5" height="4.8" rx="1.4"/><rect x="14" y="16" width="6.5" height="4.8" rx="1.4"/>',
+  stats: '<rect x="3.5" y="3.5" width="4.6" height="4.6" rx="1"/><rect x="9.7" y="3.5" width="4.6" height="4.6" rx="1"/><rect x="15.9" y="3.5" width="4.6" height="4.6" rx="1"/><rect x="3.5" y="9.7" width="4.6" height="4.6" rx="1"/><rect x="9.7" y="9.7" width="4.6" height="4.6" rx="1" fill="currentColor" stroke="none"/><rect x="15.9" y="9.7" width="4.6" height="4.6" rx="1" fill="currentColor" stroke="none"/><rect x="3.5" y="15.9" width="4.6" height="4.6" rx="1"/><rect x="9.7" y="15.9" width="4.6" height="4.6" rx="1" fill="currentColor" stroke="none"/><rect x="15.9" y="15.9" width="4.6" height="4.6" rx="1" fill="currentColor" stroke="none"/>',
+  access: '<path d="M12 3l7 3v5c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6z"/><circle cx="12" cy="10.2" r="1.9"/><path d="M12 12.1v3"/>',
+  vault: '<rect x="3.5" y="3.5" width="17" height="17" rx="4.2"/><circle cx="12" cy="12" r="3.9"/><path d="M12 5.9v2.2"/><path d="M12 15.9v2.2"/><path d="M5.9 12h2.2"/><path d="M15.9 12h2.2"/>',
   settings: '<path d="M4 8h8"/><path d="M16 8h4"/><path d="M4 16h4"/><path d="M12 16h8"/><circle cx="14" cy="8" r="2"/><circle cx="8" cy="16" r="2"/>',
   debug: '<rect x="8" y="9" width="8" height="10" rx="4"/><path d="M12 5v4"/><path d="M8 12.5H4"/><path d="M8 16H4.5"/><path d="M20 12.5h-4"/><path d="M20 16h-3.5"/><path d="M9 9 6.8 6.4"/><path d="M15 9l2.2-2.6"/>',
+
+  // — product concepts (logo motifs + fleet vocabulary; same pass) —
+  daemon: '<rect x="4" y="5" width="16" height="6.2" rx="1.8"/><rect x="4" y="12.8" width="16" height="6.2" rx="1.8"/><circle cx="7.4" cy="8.1" r="1" fill="currentColor" stroke="none"/><circle cx="7.4" cy="15.9" r="1" fill="currentColor" stroke="none"/><path d="M13 8.1h4"/><path d="M13 15.9h4"/>',
+  peers: '<circle cx="6.7" cy="6.7" r="2.7"/><circle cx="17.3" cy="17.3" r="2.7"/><path d="M8.7 8.7l6.6 6.6"/>',
+  lease: '<circle cx="7.2" cy="16.8" r="3.4"/><path d="M9.7 14.3 19.5 4.5"/><path d="M14.8 9.2l2.8 2.8"/><path d="M17.7 6.3l2.3 2.3"/>',
+  baton: '<path d="M5 19 17.8 6.2"/><circle cx="18.6" cy="5.4" r="1.8" fill="currentColor" stroke="none"/><circle cx="4.6" cy="19.4" r="1.1" fill="currentColor" stroke="none"/>',
+  org: '<path d="M4.5 20.5v-9Q4.5 4 12 4t7.5 7.5v9"/><path d="M2.5 20.5h19"/>',
+  phone: '<path d="M7 3.8c.9 0 2.8 3.2 2.3 4.1-.4.8-1.6 1.2-1.6 1.2s.5 2 2.1 3.6c1.6 1.6 3.6 2.1 3.6 2.1s.4-1.2 1.2-1.6c.9-.5 4.1 1.4 4.1 2.3 0 1.6-2 3.2-3.5 3.2-2.5 0-5.5-1.4-7.8-3.7C5.1 12.7 3.7 9.7 3.7 7.2c0-1.5 1.7-3.4 3.3-3.4z"/>',
 
   // — actions & affordances —
   search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/>',
@@ -79,6 +90,21 @@ function ui2SetEnabled(on) {
   location.replace(url.toString());
 }
 
+// Theme (design-system import): dark is the default; light remaps the
+// same token names under data-theme="light". Live flip — pure CSS vars,
+// no reload; browser-scoped ("daemons don't care what you wear").
+function ui2Theme() {
+  return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+}
+function ui2SetTheme(theme) {
+  const light = theme === 'light';
+  if (light) document.documentElement.setAttribute('data-theme', 'light');
+  else document.documentElement.removeAttribute('data-theme');
+  try { localStorage.setItem('intendant.ui2.theme', light ? 'light' : 'dark'); } catch (e) { /* private mode */ }
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', light ? '#F5F6FB' : '#0B0C10');
+}
+
 function ui2Icon(name, size = 18) {
   const inner = UI2_ICON_PATHS[name];
   if (!inner) {
@@ -89,4 +115,7 @@ function ui2Icon(name, size = 18) {
 }
 
 // QA/debug facade (mirrors the window.qa / stationProbe convention).
-window.__ui2 = { enabled: ui2Enabled, setEnabled: ui2SetEnabled, icon: ui2Icon };
+window.__ui2 = {
+  enabled: ui2Enabled, setEnabled: ui2SetEnabled, icon: ui2Icon,
+  theme: ui2Theme, setTheme: ui2SetTheme,
+};

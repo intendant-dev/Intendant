@@ -28,6 +28,7 @@ const UI2_SET_SECTIONS = [
   { id: 'autonomy', label: 'Autonomy & approvals' },
   { id: 'providers', label: 'Providers & models' },
   { id: 'presence', label: 'Presence & voice' },
+  { id: 'appearance', label: 'Appearance' },
   { id: 'advanced', label: 'Account & advanced' },
 ];
 
@@ -214,6 +215,17 @@ function ui2SettingsRenderAutonomy() {
       ? spec.desc
       : 'Autonomy level unknown — waiting for the daemon.';
   }
+}
+
+// Sync the Appearance theme segmented from the live document state
+// (boot stamp, this card, or the palette toggle — one source of truth).
+function ui2SettingsRenderAppearance() {
+  const current = typeof ui2Theme === 'function' ? ui2Theme() : 'dark';
+  document.querySelectorAll('#ui2-set-theme-seg .ui2-seg-btn').forEach((b) => {
+    const on = b.dataset.value === current;
+    b.classList.toggle('is-accent', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
 }
 
 function ui2SettingsRenderRules() {
@@ -485,6 +497,43 @@ function ui2SettingsBuild() {
     }
   }
 
+  // ── Appearance (design-system import: theme lives client-side) ──
+  {
+    const card = ui2SettingsEl('section', 'ui-card ui2-appearance-card');
+    const head = ui2SettingsEl('div', 'ui-section-head');
+    head.appendChild(ui2SettingsEl('h3', 'ui-section-title', 'Appearance'));
+    head.appendChild(ui2SettingsEl(
+      'div', 'ui-section-sub',
+      "Theme applies to this browser only; daemons don't care what you wear.",
+    ));
+    card.appendChild(head);
+    const label = ui2SettingsEl('div', 'ui2-appearance-label', 'Theme');
+    card.appendChild(label);
+    const seg = ui2SettingsEl('div', 'ui2-seg ui2-seg-wide');
+    seg.id = 'ui2-set-theme-seg';
+    seg.setAttribute('role', 'group');
+    seg.setAttribute('aria-label', 'Theme');
+    for (const t of [
+      { value: 'dark', label: 'Dark' },
+      { value: 'light', label: 'Light' },
+    ]) {
+      const btn = ui2SettingsEl('button', 'ui2-seg-btn', t.label);
+      btn.type = 'button';
+      btn.dataset.value = t.value;
+      btn.addEventListener('click', () => {
+        ui2SetTheme(t.value);
+        ui2SettingsRenderAppearance();
+      });
+      seg.appendChild(btn);
+    }
+    card.appendChild(seg);
+    card.appendChild(ui2SettingsEl(
+      'p', 'ui2-appearance-note',
+      'Same token names, remapped — iris deepens, semantics darken, shadows soften.',
+    ));
+    panes.appearance.appendChild(card);
+  }
+
   // ── Account & advanced (the old Debug pane, re-homed) ──
   {
     const debugBody = document.querySelector('#settings-pane-debug .settings-pane-body');
@@ -515,6 +564,7 @@ function ui2SettingsBuild() {
   });
 
   ui2SettingsRenderRules();
+  ui2SettingsRenderAppearance();
   ui2SettingsSyncMirrors();
   ui2SettingsApplyActive();
   // Populate approval rules early so the Autonomy section is live on

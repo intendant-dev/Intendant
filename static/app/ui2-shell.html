@@ -10,7 +10,25 @@
 <nav id="ui2-nav" aria-label="Primary">
   <div class="ui2-nav-top">
     <div class="ui2-brand">
-      <div class="ui2-brand-glyph"><div class="ui2-brand-inner"></div></div>
+      <!-- The real product mark (design-system pass): proscenium arch over
+           the serif I, golden conductor's baton, three sub-agent nodes.
+           Self-colored — theme-agnostic on both dark and light. -->
+      <div class="ui2-brand-glyph"><svg viewBox="70 80 372 372" width="26" height="26" aria-hidden="true">
+        <defs>
+          <linearGradient id="ui2bg-accent" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#89b4fa"/><stop offset="100%" stop-color="#74c7ec"/></linearGradient>
+          <linearGradient id="ui2bg-gold" x1="0" y1="1" x2="1" y2="0"><stop offset="0%" stop-color="#a68a5b"/><stop offset="50%" stop-color="#f9e2af"/><stop offset="100%" stop-color="#fff8e7"/></linearGradient>
+          <linearGradient id="ui2bg-arch" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#585b70"/><stop offset="100%" stop-color="#313244"/></linearGradient>
+        </defs>
+        <path d="M 105 405 L 105 185 Q 105 95, 195 95 L 317 95 Q 407 95, 407 185 L 407 405" fill="none" stroke="url(#ui2bg-arch)" stroke-width="14" stroke-linecap="round"/>
+        <rect x="206" y="150" width="100" height="14" rx="4" fill="url(#ui2bg-accent)"/>
+        <rect x="239" y="150" width="34" height="230" rx="5" fill="url(#ui2bg-accent)"/>
+        <rect x="206" y="368" width="100" height="14" rx="4" fill="url(#ui2bg-accent)"/>
+        <line x1="185" y1="330" x2="335" y2="175" stroke="url(#ui2bg-gold)" stroke-width="12" stroke-linecap="round"/>
+        <circle cx="335" cy="175" r="10" fill="#f9e2af"/>
+        <circle cx="206" cy="432" r="11" fill="#a6e3a1" opacity=".6"/>
+        <circle cx="256" cy="437" r="11" fill="#a6e3a1" opacity=".6"/>
+        <circle cx="306" cy="432" r="11" fill="#a6e3a1" opacity=".6"/>
+      </svg></div>
       <div class="ui2-brand-word ui2-nav-label">Intendant</div>
     </div>
     <button type="button" class="ui2-host-btn ui2-nav-label" id="ui2-host-btn"
