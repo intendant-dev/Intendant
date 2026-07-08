@@ -5,15 +5,18 @@
 
 html.ui-v2 #voiceOverlay { display: none !important; }
 
+/* Oversight-bar mic button: matches #ui2-theme-btn's 32px icon-control
+   rhythm exactly (size, border, hover, transition). */
 html.ui-v2 .ui2-micbtn {
   position: relative;
   display: inline-flex; align-items: center; justify-content: center;
-  width: 34px; height: 34px; flex-shrink: 0;
+  width: 32px; height: 32px; padding: 0; flex-shrink: 0;
   border: 1px solid var(--line); border-radius: var(--r-ctl);
   background: transparent; color: var(--text-2); cursor: pointer;
-  transition: background var(--t-med), color var(--t-med);
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
 }
-html.ui-v2 .ui2-micbtn:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 .ui2-micbtn:hover { background: var(--surface-2); color: var(--text); border-color: var(--line-2); }
+html.ui-v2 .ui2-micbtn-icon { display: flex; }
 html.ui-v2 .ui2-micbtn-dot {
   position: absolute; top: 5px; right: 5px;
   width: 7px; height: 7px; border-radius: 50%;
@@ -29,9 +32,9 @@ html.ui-v2 .ui2-micbtn[data-state="error"] .ui2-micbtn-dot { background: var(--r
 html.ui-v2 #ui2-voice-panel {
   position: fixed;
   top: calc(var(--ui2-ovs-h) + 8px);
-  right: 14px;
-  width: 320px;
-  z-index: 90;
+  right: 18px;                     /* shares the oversight bar's content edge */
+  width: min(320px, calc(100vw - 36px));
+  z-index: 90;                     /* above content + composer (70), below ⌘K (100) */
   background: var(--surface);
   border: 1px solid var(--line-2);
   border-radius: var(--r-panel);
@@ -40,62 +43,112 @@ html.ui-v2 #ui2-voice-panel {
   overflow: hidden;
 }
 html.ui-v2 .ui2-vp-head {
-  display: flex; align-items: center; gap: 9px;
-  padding: 13px 15px; border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 16px; border-bottom: 1px solid var(--line);
 }
 html.ui-v2 .ui2-vp-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--neutral-dot); }
 html.ui-v2 #ui2-voice-panel[data-state="live"] .ui2-vp-dot { background: var(--green); box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16); }
 html.ui-v2 #ui2-voice-panel[data-state="passive"] .ui2-vp-dot { background: var(--sky); box-shadow: 0 0 0 3px rgba(var(--sky-rgb), .16); }
 html.ui-v2 #ui2-voice-panel[data-state="error"] .ui2-vp-dot { background: var(--rose); box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .16); }
-html.ui-v2 .ui2-vp-title { font-size: 13px; font-weight: 800; flex: 1; }
-html.ui-v2 .ui2-vp-sub { font-family: var(--mono); font-size: 10px; color: var(--text-3); }
+html.ui-v2 .ui2-vp-title {
+  font-size: 13px; font-weight: 800; flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+html.ui-v2 .ui2-vp-sub {
+  font-family: var(--mono); font-size: 10.5px; color: var(--text-3);
+  max-width: 45%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 html.ui-v2 .ui2-vp-close {
   border: 0; background: transparent; color: var(--text-3); cursor: pointer;
-  display: flex; padding: 3px; border-radius: 6px;
+  display: flex; padding: 5px; margin-right: -5px; /* glyph optically flush with the 16px inset */
+  border-radius: var(--r-inset);
+  transition: background var(--t-fast), color var(--t-fast);
 }
 html.ui-v2 .ui2-vp-close:hover { color: var(--text); background: var(--surface-2); }
-html.ui-v2 .ui2-vp-body { padding: 14px 15px; display: flex; flex-direction: column; gap: 12px; }
+html.ui-v2 .ui2-vp-body { padding: 12px 16px 16px; display: flex; flex-direction: column; gap: 12px; }
 
-/* Re-parented v1 controls, restyled by id under the flag. */
-html.ui-v2 .ui2-vp-controls { display: flex; gap: 8px; }
+/* The slots are layout-transparent: their re-parented children keep the
+   v1 show/hide classes (.hidden !important / .visible), so a present-
+   but-hidden child must not leave a phantom flex gap behind. */
+html.ui-v2 .ui2-vp-status-slot, html.ui-v2 .ui2-vp-cam-slot { display: contents; }
+
+/* Re-parented v1 controls, restyled by id under the flag. The row wraps
+   so the passive-state CTA gets its own full-width line instead of
+   squeezing three labels into one (which wrapped "Make Active"). */
+html.ui-v2 .ui2-vp-controls { display: flex; flex-wrap: wrap; gap: 8px; }
 html.ui-v2 .ui2-vp-controls #micBtn,
 html.ui-v2 .ui2-vp-controls #videoBtn,
 html.ui-v2 .ui2-vp-controls #makeActiveBtn {
-  flex: 1; width: auto; height: auto; position: static;
+  flex: 1; width: auto; height: auto; position: static; min-width: 0;
+  white-space: nowrap;
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
-  padding: 9px 10px; border-radius: 10px;
+  padding: 9px 10px; border-radius: var(--r-ctl);
   font-family: var(--sans); font-size: 12.5px; font-weight: 700; cursor: pointer;
   border: 1px solid var(--line); background: var(--surface-2); color: var(--text);
   box-shadow: none;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
 }
-html.ui-v2 .ui2-vp-controls #micBtn.mic-on,
-html.ui-v2 .ui2-vp-controls #videoBtn.video-on {
-  border-color: rgba(var(--green-rgb), .4); color: var(--green); background: transparent;
+html.ui-v2 .ui2-vp-controls #micBtn:not(.is-disabled):not(.active):hover,
+html.ui-v2 .ui2-vp-controls #videoBtn:not(.is-disabled):not(.active):hover {
+  background: var(--surface-3); border-color: var(--line-2);
 }
+/* Capture-on truth class is v1's .active (36-voice-wasm-init toggles
+   .active — there is no .mic-on/.video-on vocabulary). */
+html.ui-v2 .ui2-vp-controls #micBtn.active,
+html.ui-v2 .ui2-vp-controls #videoBtn.active {
+  border-color: rgba(var(--green-rgb), .4); color: var(--green);
+  background: rgba(var(--green-rgb), .08);
+}
+html.ui-v2 .ui2-vp-controls #micBtn.active:hover,
+html.ui-v2 .ui2-vp-controls #videoBtn.active:hover { background: rgba(var(--green-rgb), .13); }
+html.ui-v2 .ui2-vp-controls #micBtn.is-disabled,
+html.ui-v2 .ui2-vp-controls #videoBtn.is-disabled { opacity: .55; cursor: default; }
 html.ui-v2 .ui2-vp-controls #makeActiveBtn {
+  flex: 1 1 100%;                  /* full-width CTA line under Mic/Camera */
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent); border: 0; font-weight: 800;
-  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  box-shadow: var(--shadow-primary);
 }
-/* The v1 controls are icon-only rounds; in panel context give them
-   text labels so the row reads like the approved mockup. */
-html.ui-v2 .ui2-vp-controls #micBtn::after { content: 'Mic'; }
-html.ui-v2 .ui2-vp-controls #videoBtn::after { content: 'Camera'; }
+html.ui-v2 .ui2-vp-controls #makeActiveBtn:hover {
+  filter: brightness(1.08);
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+}
+html.ui-v2 .ui2-vp-controls #makeActiveBtn:disabled { opacity: .6; cursor: default; filter: none; }
+html.ui-v2 .ui2-vp-btn-icon { display: flex; color: inherit; }
+
 html.ui-v2 #ui2-voice-panel[data-state="idle"] .ui2-vp-note::before {
   content: 'Start the mic to talk to this daemon live. ';
   color: var(--text-2);
 }
-html.ui-v2 .ui2-vp-status-slot:empty, html.ui-v2 .ui2-vp-cam-slot:empty { display: none; }
 html.ui-v2 .ui2-vp-status-slot #voiceStatus {
-  position: static; display: block; max-width: none;
+  position: static; display: block; width: fit-content; max-width: 100%;
   background: var(--surface-2); border: 1px solid var(--line);
-  border-radius: 999px; padding: 4px 11px;
+  border-radius: var(--r-pill); padding: 4px 12px;
   font-size: 11px; font-weight: 700; color: var(--text-2);
+  text-align: left;
+}
+html.ui-v2 .ui2-vp-status-slot #voiceStatus.connected {
+  color: var(--green); border-color: rgba(var(--green-rgb), .26);
+  background: rgba(var(--green-rgb), .1);
+}
+html.ui-v2 .ui2-vp-status-slot #voiceStatus.error {
+  color: var(--rose); border-color: rgba(var(--rose-rgb), .26);
+  background: rgba(var(--rose-rgb), .1);
 }
 html.ui-v2 .ui2-vp-cam-slot #videoPreviewWrap {
   position: static; width: 100%; height: auto;
-  border-radius: 10px; overflow: hidden;
+  border-radius: var(--r-inset); overflow: hidden;
   border: 1px solid var(--line); background: var(--code-bg);
 }
-html.ui-v2 .ui2-vp-cam-slot #videoPreviewEl { width: 100%; height: auto; display: block; }
+html.ui-v2 .ui2-vp-cam-slot #videoPreviewEl {
+  width: 100%; height: auto; display: block;
+  border: 0; border-radius: 0;     /* the wrap is the frame — no v1 double border */
+}
+html.ui-v2 .ui2-vp-cam-slot .video-preview-info {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 4px 8px 5px;
+  font-family: var(--mono); font-size: 10px; color: var(--text-3);
+}
+html.ui-v2 .ui2-vp-cam-slot .video-preview-info .frame-id { color: var(--sky); }
+html.ui-v2 .ui2-vp-cam-slot #videoFps { display: none; } /* dead readout (never updated) — hidden under v2 */
 html.ui-v2 .ui2-vp-note { font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
