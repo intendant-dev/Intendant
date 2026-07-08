@@ -104,6 +104,13 @@ REMOTE_READYZ_Q="$(remote_quote "$CONNECT_REMOTE_READYZ_URL")"
 info "preparing $SSH_DEST:$CONNECT_REMOTE_SOURCE"
 ssh "${SSH_OPTS[@]}" "$SSH_DEST" "sudo install -d -o \"$CONNECT_SSH_USER\" -g \"$CONNECT_SSH_USER\" $REMOTE_SOURCE_Q"
 
+# Clear the previous source tree (keeping target/ warm) before extracting:
+# tar layers over what's there, so a file the repo deleted or carved into a
+# directory would otherwise linger remotely forever — a stale module file
+# next to its carved directory fails the remote build with E0761.
+info "clearing stale remote source (preserving target/)"
+ssh "${SSH_OPTS[@]}" "$SSH_DEST" "find $REMOTE_SOURCE_Q -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} +"
+
 info "syncing source from $REPO_ROOT"
 export COPYFILE_DISABLE=1
 tar -C "$REPO_ROOT" \
