@@ -184,7 +184,10 @@ function ui2WireMirrors() {
     const el = document.getElementById('ui2-fact-model');
     if (!el) return;
     const real = (v) => v && v !== '--';
-    el.textContent = real(p) || real(m) ? `${real(p) ? p : '?'} · ${real(m) ? m : '?'}` : '—';
+    // Placeholder facts go quiet instead of reading as debug output ("—").
+    const live = real(p) || real(m);
+    el.textContent = live ? `${real(p) ? p : '?'} · ${real(m) ? m : '?'}` : '';
+    el.style.display = live ? '' : 'none';
   };
   ui2Mirror('sb-provider', factsModel);
   ui2Mirror('sb-model', factsModel);
@@ -196,7 +199,11 @@ function ui2WireMirrors() {
     const t = (document.getElementById('tk-tokens')?.textContent || '').trim();
     const c = (document.getElementById('tk-cost')?.textContent || '').trim();
     const el = document.getElementById('ui2-fact-tokens');
-    if (el) el.textContent = c ? `${t} · ${c}` : t;
+    if (!el) return;
+    // "-- tok · $0" at rest is noise; show the fact once tokens are real.
+    const live = t && !/^--/.test(t);
+    el.textContent = live ? (c ? `${t} · ${c}` : t) : '';
+    el.style.display = live ? '' : 'none';
   };
   ui2Mirror('tk-tokens', factsTokens);
   ui2Mirror('tk-cost', factsTokens);
@@ -362,8 +369,10 @@ function ui2PaletteRender(filter) {
   const q = (filter || '').trim().toLowerCase();
   const activePane = document.querySelector('.tab-pane.active');
   const activeTab = activePane ? activePane.id.replace(/^tab-/, '') : '';
+  // Label-only matching: users type what they SEE. Id matching surprised —
+  // "sta" surfaced Usage via its internal tab id `stats`.
   ui2Palette.entries = ui2PaletteEntries().filter((item) =>
-    !q || item.label.toLowerCase().includes(q) || (item.tab || '').includes(q));
+    !q || item.label.toLowerCase().includes(q));
   ui2Palette.selected = Math.min(ui2Palette.selected, Math.max(0, ui2Palette.entries.length - 1));
   list.innerHTML = '';
   if (!ui2Palette.entries.length) {
@@ -469,7 +478,12 @@ function ui2WirePalette() {
 
 ui2BuildNav();
 if (ui2Enabled()) {
+  // Single-boot: a module script executes at readyState 'interactive', so
+  // the old immediate call + DOMContentLoaded listener both fired and wired
+  // everything twice — the doubled capture-phase keydown made one ⌘K
+  // open-then-close the palette and arrows double-step. Same idiom as the
+  // ui2-activity boot.
   const wire = () => { ui2WireMirrors(); ui2WirePalette(); };
-  document.addEventListener('DOMContentLoaded', wire, { once: true });
-  if (document.readyState !== 'loading') wire();
+  if (document.readyState === 'complete') wire();
+  else document.addEventListener('DOMContentLoaded', wire, { once: true });
 }

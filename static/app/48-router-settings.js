@@ -62,7 +62,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'vault', 'debug', 'settings'];
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['shell'];
-const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug', 'autonomy', 'providers', 'presence', 'advanced'];
+const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug', 'autonomy', 'providers', 'presence', 'advanced', 'appearance'];
 // ui-v2 (design-overhaul) remaps the three legacy Settings sub-tabs onto
 // the four design sections — and back when the flag is off — so both
 // generations of deep link keep landing somewhere sensible. 'network'
