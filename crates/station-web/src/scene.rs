@@ -6,11 +6,13 @@ use std::f32::consts::PI;
 use web_sys::CanvasRenderingContext2d;
 
 use crate::gpu::GpuFrame;
+use crate::input::HitAction;
 use crate::model::{StationAgent, StationHost, StationSnapshot};
 use crate::util::phase_color;
 use crate::util::{
-    css_rgba, goal_status_color, relationship_color, role_color, stable_angle, stable_unit, Color,
-    C_BLUE, C_GREEN, C_PEACH, C_RED, C_SAPPHIRE, C_SUBTEXT0, C_SURFACE0, C_TEAL, C_TEXT, C_YELLOW,
+    css_color, css_rgba, epoch_seconds_now, goal_status_color, pressure_color, relationship_color,
+    role_color, stable_angle, stable_unit, Color, C_BLUE, C_GREEN, C_PEACH, C_RED, C_SAPPHIRE,
+    C_SUBTEXT0, C_SURFACE0, C_TEAL, C_TEXT, C_YELLOW,
 };
 use crate::StationInner;
 
@@ -126,81 +128,261 @@ impl StationInner {
             true
         });
 
-        // Phase C slices 2–3, behind ?station_panes=on: one card beside
-        // the selected node — the throwaway that proves the pane pipeline
-        // (billboarding, per-pixel depth against the wireframe) and the
-        // glyph-atlas text on it, before real panels migrate into the
-        // scene. Title is the selected id; rows reuse the cached
-        // control-center summaries (fresh: render() recomputes them
-        // before building the frame).
-        if self.panes_enabled {
-            if let Some(pos) = self
+        // Phase C slice 5, behind ?station_panes=on: the selected agent's
+        // focus panel as a world pane beside its node — the shared focus
+        // rows (focus_rows, the screen panel's exact content), a tokens
+        // meter, and action pills whose projected rects the HUD pass
+        // adopts as hit zones. Wide viewports only: under 820 CSS px the
+        // compact screen surface is the better presentation, so the
+        // scene stays out of its way and the HUD keeps its panel (it
+        // yields only to an actually registered pane target). Hosts and
+        // system nodes keep their screen panels until their panes
+        // migrate in a later slice.
+        if self.panes_enabled && self.css_width() >= 820.0 {
+            if let Some(agent) = self
                 .selected_id
                 .as_ref()
-                .and_then(|id| self.layout_cache.get(id))
-                .copied()
+                .and_then(|id| self.snapshot.agents.iter().find(|a| &a.id == id))
             {
-                let anchor = pos + cam_right * 0.66 + cam_up * 0.52;
-                let emitted = crate::panes::add_world_pane(
-                    &mut frame,
-                    &mut project,
-                    cam_right,
-                    cam_up,
-                    anchor,
-                    PANE_HALF_W,
-                    PANE_HALF_H,
-                    Color::rgb(16, 18, 32).with_alpha(0.86),
-                );
-                if emitted {
-                    // Register the card for raycast picking (slice 4,
-                    // input::pick_pane) — click-solid, matching its
-                    // per-pixel occlusion of the scene behind it.
-                    frame.pane_targets.push(crate::panes::PaneTarget {
-                        id: self.selected_id.clone().unwrap_or_default(),
-                        anchor,
-                        right: cam_right,
-                        up: cam_up,
-                        half_w: PANE_HALF_W,
-                        half_h: PANE_HALF_H,
-                    });
-                    if let Some(atlas) = self.text_atlas.as_ref() {
-                        let inner_w = (PANE_HALF_W - PANE_MARGIN) * 2.0;
-                        let top_left = anchor - cam_right * (PANE_HALF_W - PANE_MARGIN)
-                            + cam_up * (PANE_HALF_H - PANE_MARGIN);
-                        let title = self.selected_id.as_deref().unwrap_or_default();
-                        crate::text_atlas::add_text_world(
-                            &mut frame,
-                            atlas,
-                            &mut project,
-                            cam_right,
-                            cam_up,
-                            top_left,
-                            PANE_TITLE_H,
-                            &atlas.fit_to_width(title, PANE_TITLE_H, inner_w),
-                            C_TEXT,
-                        );
-                        let mut cursor = top_left - cam_up * (PANE_TITLE_H * 1.3);
-                        for target in self.system_targets.iter().take(3) {
-                            let row = format!("{}  {}", target.title, target.value);
-                            crate::text_atlas::add_text_world(
-                                &mut frame,
-                                atlas,
-                                &mut project,
-                                cam_right,
-                                cam_up,
-                                cursor,
-                                PANE_ROW_H,
-                                &atlas.fit_to_width(&row, PANE_ROW_H, inner_w),
-                                C_SUBTEXT0,
-                            );
-                            cursor = cursor - cam_up * (PANE_ROW_H * 1.25);
-                        }
-                    }
+                if let Some(pos) = self.layout_cache.get(&agent.id).copied() {
+                    self.add_agent_focus_pane(
+                        &mut frame,
+                        agent,
+                        pos,
+                        cam_right,
+                        cam_up,
+                        &mut project,
+                    );
                 }
             }
         }
 
         self.frame = frame;
+    }
+
+    /// The selected agent's focus panel as a world pane (Phase C slice
+    /// 5): card body, title + subtitle, the shared focus rows, and
+    /// action pills (steer + session ops + approve/deny) laid onto the
+    /// card, each pill's projected screen rect registered in
+    /// `frame.pane_zones`. Emits nothing without a baked text atlas — a
+    /// blank card must not replace the screen panel, and the HUD only
+    /// yields when this agent's pane target actually exists.
+    pub(crate) fn add_agent_focus_pane(
+        &self,
+        frame: &mut GpuFrame,
+        agent: &StationAgent,
+        pos: Vec3,
+        right: Vec3,
+        up: Vec3,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
+    ) {
+        let Some(atlas) = self.text_atlas.as_ref() else {
+            return;
+        };
+        let content = crate::focus_rows::agent_focus_content(
+            agent,
+            self.snapshot.hosts.first().map(|h| h.id.as_str()),
+            epoch_seconds_now(),
+        );
+        // Action pills: a steer composer opener unless the session ops
+        // already advertise a steer, then the shared content's pills.
+        // Colors come from the same CSS palette the screen pills use.
+        let mut pills: Vec<(&str, Color, HitAction)> = Vec::new();
+        if !content.pills.iter().any(|p| p.label == "steer") {
+            pills.push(("steer", C_BLUE, HitAction::Composer { op: "open-send" }));
+        }
+        for pill in &content.pills {
+            pills.push((pill.label, css_color(pill.color_css), pill.action.clone()));
+        }
+        let pill_rows = pill_row_count(atlas, pills.iter().map(|p| p.0));
+        let half_h =
+            agent_pane_half_h(content.rows.len(), pill_rows, content.approval.is_some());
+        // Clear of the node up-right, scaling with the card so a tall
+        // panel doesn't swallow its own anchor.
+        let anchor = pos + right * (PANE_HALF_W + 0.30) + up * (half_h * 0.55);
+        if !crate::panes::add_world_pane(
+            frame,
+            project,
+            right,
+            up,
+            anchor,
+            PANE_HALF_W,
+            half_h,
+            Color::rgb(16, 18, 32).with_alpha(0.86),
+            0.0,
+        ) {
+            return;
+        }
+        // Register the card for raycast picking (slice 4,
+        // input::pick_pane) — click-solid, matching its per-pixel
+        // occlusion of the scene behind it.
+        frame.pane_targets.push(crate::panes::PaneTarget {
+            id: agent.id.clone(),
+            anchor,
+            right,
+            up,
+            half_w: PANE_HALF_W,
+            half_h,
+        });
+
+        let inner_w = (PANE_HALF_W - PANE_MARGIN) * 2.0;
+        let top_left = anchor - right * (PANE_HALF_W - PANE_MARGIN) + up * (half_h - PANE_MARGIN);
+        crate::text_atlas::add_text_world(
+            frame,
+            atlas,
+            project,
+            right,
+            up,
+            top_left,
+            PANE_TITLE_H,
+            &atlas.fit_to_width(&agent.id, PANE_TITLE_H, inner_w),
+            C_TEXT,
+        );
+        let mut cursor = top_left - up * (PANE_TITLE_H * 1.3);
+        crate::text_atlas::add_text_world(
+            frame,
+            atlas,
+            project,
+            right,
+            up,
+            cursor,
+            PANE_ROW_H,
+            &atlas.fit_to_width(&content.subtitle, PANE_ROW_H, inner_w),
+            C_SUBTEXT0,
+        );
+        cursor = cursor - up * (PANE_ROW_H * 1.25);
+
+        for row in &content.rows {
+            pane_focus_row(frame, atlas, project, right, up, &mut cursor, row);
+        }
+
+        self.pane_pill_rows(frame, atlas, project, right, up, &mut cursor, &pills);
+
+        if let Some(appr) = &content.approval {
+            pane_focus_row(frame, atlas, project, right, up, &mut cursor, &appr.row);
+            let decide = |decision: &'static str| HitAction::Approval {
+                host_id: appr.host_id.clone(),
+                approval_id: appr.approval_id.clone(),
+                decision,
+            };
+            let pills = [
+                ("approve", C_GREEN, decide("approve")),
+                ("deny", C_RED, decide("deny")),
+            ];
+            self.pane_pill_rows(frame, atlas, project, right, up, &mut cursor, &pills);
+        }
+    }
+
+    /// Pills on a pane, wrapping to as many rows as the labels need (the
+    /// same pen walk `pill_row_count` sizes the card with): background
+    /// quad, label, and the projected hit rect per pill. Unlike the
+    /// screen panel, nothing is dropped — every advertised action stays
+    /// reachable in the scene.
+    #[allow(clippy::too_many_arguments)]
+    fn pane_pill_rows(
+        &self,
+        frame: &mut GpuFrame,
+        atlas: &crate::text_atlas::TextAtlas,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
+        right: Vec3,
+        up: Vec3,
+        cursor: &mut Vec3,
+        pills: &[(&str, Color, HitAction)],
+    ) {
+        if pills.is_empty() {
+            return;
+        }
+        let inner_w = (PANE_HALF_W - PANE_MARGIN) * 2.0;
+        let ph = PANE_ROW_H * 1.35;
+        let mut pen = 0.0f32;
+        for (label, color, action) in pills {
+            let text_w = atlas.measure_world(label, PANE_ROW_H);
+            let pw = text_w + PANE_ROW_H * 0.9;
+            if pen > 0.0 && pen + pw > inner_w {
+                *cursor = *cursor - up * (PANE_ROW_H * 1.6);
+                pen = 0.0;
+            }
+            let center = *cursor + right * (pen + pw * 0.5) - up * (ph * 0.5);
+            crate::panes::add_world_pane(
+                frame,
+                project,
+                right,
+                up,
+                center,
+                pw * 0.5,
+                ph * 0.5,
+                color.with_alpha(0.2),
+                crate::panes::PANE_LAYER1_BIAS,
+            );
+            crate::text_atlas::add_text_world(
+                frame,
+                atlas,
+                project,
+                right,
+                up,
+                *cursor + right * (pen + (pw - text_w) * 0.5) - up * ((ph - PANE_ROW_H) * 0.5),
+                PANE_ROW_H,
+                label,
+                *color,
+            );
+            self.push_pane_zone(
+                frame,
+                project,
+                right,
+                up,
+                center,
+                pw * 0.5,
+                ph * 0.5,
+                action.clone(),
+            );
+            pen += pw + PANE_ROW_H * 0.4;
+        }
+        *cursor = *cursor - up * (PANE_ROW_H * 1.6);
+    }
+
+    /// Project a pill's world rect to its CSS-px bounding box and
+    /// register it (with the click action) in `frame.pane_zones` for the
+    /// HUD pass to adopt. A pill straddling the frustum edge is skipped
+    /// — its card was emitted whole, so this only drops zones in
+    /// degenerate views.
+    #[allow(clippy::too_many_arguments)]
+    fn push_pane_zone(
+        &self,
+        frame: &mut GpuFrame,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
+        right: Vec3,
+        up: Vec3,
+        center: Vec3,
+        half_w: f32,
+        half_h: f32,
+        action: HitAction,
+    ) {
+        let corners = [
+            center - right * half_w - up * half_h,
+            center + right * half_w - up * half_h,
+            center + right * half_w + up * half_h,
+            center - right * half_w + up * half_h,
+        ];
+        let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+        let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+        for corner in corners {
+            let Some((ndc, _, _)) = project(corner) else {
+                return;
+            };
+            let px = ndc_to_screen([ndc.x, ndc.y], self.width, self.height);
+            min_x = min_x.min(px.x);
+            min_y = min_y.min(px.y);
+            max_x = max_x.max(px.x);
+            max_y = max_y.max(px.y);
+        }
+        let dpr = self.dpr as f32;
+        frame.pane_zones.push(crate::panes::PaneZone {
+            x: min_x / dpr,
+            y: min_y / dpr,
+            w: (max_x - min_x) / dpr,
+            h: (max_y - min_y) / dpr,
+            action,
+        });
     }
 
     pub(crate) fn add_grid(
@@ -344,7 +526,9 @@ impl StationInner {
             "orchestrator" => {
                 frame.add_wire_octa(project, pos, 0.34, spin, role.with_alpha(body_alpha + 0.01))
             }
-            "sub-agent" => frame.add_wire_tetra(project, pos, 0.31, spin, role.with_alpha(body_alpha)),
+            "sub-agent" => {
+                frame.add_wire_tetra(project, pos, 0.31, spin, role.with_alpha(body_alpha))
+            }
             _ => frame.add_wire_icosa(project, pos, 0.31, spin, role.with_alpha(body_alpha)),
         }
         if !agent.recent {
@@ -750,15 +934,132 @@ impl Camera {
 /// Half-width (in NDC) of the faint thick pass behind glowing lines.
 pub(crate) const GLOW_WIDTH: f32 = 0.007;
 
-/// Proof-card geometry (Phase C slices 2–3), world units: pane
-/// half-extents, inner text margin, and the title/row glyph-cell heights.
-/// Sized so the text draws near the atlas's baked glyph size at typical
-/// camera distances (see `text_atlas` on sampling quality).
-const PANE_HALF_W: f32 = 0.62;
-const PANE_HALF_H: f32 = 0.40;
+/// Focus-pane geometry (Phase C), world units: pane half-width, inner
+/// text margin, title/row glyph-cell heights, and the label column
+/// where row values start (mirroring the screen panel's 96px column;
+/// wide enough that the longest labels — "worktree", "approval", 8
+/// chars at ~0.047/glyph — fit un-ellipsized). The half-HEIGHT is
+/// content-driven — `agent_pane_half_h`. Glyph heights are sized so
+/// text draws near the atlas's baked size at typical camera distances
+/// (see `text_atlas` on sampling quality).
+const PANE_HALF_W: f32 = 0.95;
 const PANE_MARGIN: f32 = 0.07;
 const PANE_TITLE_H: f32 = 0.14;
 const PANE_ROW_H: f32 = 0.105;
+const PANE_LABEL_COL: f32 = 0.44;
+
+/// Content-driven pane half-height: title block, subtitle row, `rows`
+/// content rows, the tokens-meter band, `pill_rows` wrapped action-pill
+/// rows, and — when actionable — the approval row plus its own pill row
+/// (approve + deny always fit one row at the pane's inner width). Kept
+/// in lockstep with the layout walk in
+/// `add_agent_focus_pane`/`pane_focus_row`/`pane_pill_rows`.
+pub(crate) fn agent_pane_half_h(rows: usize, pill_rows: usize, approval: bool) -> f32 {
+    let pitch = PANE_ROW_H * 1.25;
+    let mut content_h = PANE_TITLE_H * 1.3            // title
+        + (rows as f32 + 1.0) * pitch                 // subtitle + rows
+        + PANE_ROW_H * 0.5                            // tokens meter band
+        + pill_rows as f32 * (PANE_ROW_H * 1.6); //      wrapped pill rows
+    if approval {
+        content_h += pitch + PANE_ROW_H * 1.6;
+    }
+    (content_h + PANE_MARGIN * 2.0) * 0.5
+}
+
+/// Number of wrapped rows the pill labels occupy at the pane's inner
+/// width — the same pen walk `pane_pill_rows` renders with, so sizing
+/// and layout cannot disagree.
+fn pill_row_count<'a>(
+    atlas: &crate::text_atlas::TextAtlas,
+    labels: impl Iterator<Item = &'a str>,
+) -> usize {
+    let inner_w = (PANE_HALF_W - PANE_MARGIN) * 2.0;
+    let mut rows = 0usize;
+    let mut pen = 0.0f32;
+    for label in labels {
+        let pw = atlas.measure_world(label, PANE_ROW_H) + PANE_ROW_H * 0.9;
+        if rows == 0 || (pen > 0.0 && pen + pw > inner_w) {
+            rows += 1;
+            if pen > 0.0 {
+                pen = 0.0;
+            }
+        }
+        pen += pw + PANE_ROW_H * 0.4;
+    }
+    rows
+}
+
+/// One shared focus row on a pane: colored label column, value text
+/// beside it (the world-space counterpart of `hud::focus_row`), plus
+/// the meter band under a row that carries one. Advances `cursor` past
+/// the row (and band).
+fn pane_focus_row(
+    frame: &mut GpuFrame,
+    atlas: &crate::text_atlas::TextAtlas,
+    project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32, f32)>,
+    right: Vec3,
+    up: Vec3,
+    cursor: &mut Vec3,
+    row: &crate::focus_rows::AgentFocusRow,
+) {
+    let inner_w = (PANE_HALF_W - PANE_MARGIN) * 2.0;
+    crate::text_atlas::add_text_world(
+        frame,
+        atlas,
+        project,
+        right,
+        up,
+        *cursor,
+        PANE_ROW_H,
+        &atlas.fit_to_width(row.label, PANE_ROW_H, PANE_LABEL_COL - 0.03),
+        css_color(row.color_css),
+    );
+    crate::text_atlas::add_text_world(
+        frame,
+        atlas,
+        project,
+        right,
+        up,
+        *cursor + right * PANE_LABEL_COL,
+        PANE_ROW_H,
+        &atlas.fit_to_width(&row.value, PANE_ROW_H, inner_w - PANE_LABEL_COL),
+        C_TEXT,
+    );
+    *cursor = *cursor - up * (PANE_ROW_H * 1.25);
+    if let Some(pct) = row.meter {
+        let track_w = inner_w - PANE_LABEL_COL;
+        let mh = PANE_ROW_H * 0.18;
+        let track_center = *cursor + right * (PANE_LABEL_COL + track_w * 0.5) - up * (mh * 0.5);
+        crate::panes::add_world_pane(
+            frame,
+            project,
+            right,
+            up,
+            track_center,
+            track_w * 0.5,
+            mh * 0.5,
+            C_SURFACE0.with_alpha(0.92),
+            crate::panes::PANE_LAYER1_BIAS,
+        );
+        let frac = pct.clamp(0.0, 1.0);
+        if frac > 0.001 {
+            let fill_w = track_w * frac;
+            let fill_center = *cursor + right * (PANE_LABEL_COL + fill_w * 0.5) - up * (mh * 0.5);
+            crate::panes::add_world_pane(
+                frame,
+                project,
+                right,
+                up,
+                fill_center,
+                fill_w * 0.5,
+                mh * 0.5,
+                css_color(pressure_color(pct)).with_alpha(0.95),
+                crate::panes::PANE_LAYER2_BIAS,
+            );
+        }
+        *cursor = *cursor - up * (PANE_ROW_H * 0.5);
+    }
+}
 
 /// Depth-cued brightness: geometry nearer than the orbit center draws a
 /// little brighter, farther a little dimmer. `z` is view-space depth and
@@ -892,6 +1193,41 @@ pub(crate) fn layout_positions(
 mod tests {
     use super::*;
     use crate::model::StationAgent;
+
+    #[test]
+    fn agent_pane_half_h_scales_with_rows_pills_and_approval() {
+        let pitch = PANE_ROW_H * 1.25;
+        let base = agent_pane_half_h(5, 1, false);
+        // Three more rows grow the half-height by half of three pitches.
+        let more = agent_pane_half_h(8, 1, false);
+        assert!((more - base - 3.0 * pitch * 0.5).abs() < 1e-6);
+        // A wrapped second pill row adds half a pill-row height.
+        let wrapped = agent_pane_half_h(5, 2, false);
+        assert!((wrapped - base - PANE_ROW_H * 1.6 * 0.5).abs() < 1e-6);
+        // An actionable approval adds its row and a pill row.
+        let approval = agent_pane_half_h(5, 1, true);
+        assert!((approval - base - (pitch + PANE_ROW_H * 1.6) * 0.5).abs() < 1e-6);
+        // Exact arithmetic for the base case, pinned against the layout
+        // walk's constants (title 1.3, pitch 1.25, meter 0.5, pills 1.6).
+        let content = PANE_TITLE_H * 1.3 + 6.0 * pitch + PANE_ROW_H * 0.5 + PANE_ROW_H * 1.6;
+        assert!((base - (content + PANE_MARGIN * 2.0) * 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pill_row_count_wraps_like_the_renderer_pen_walk() {
+        // Synthetic atlas ('a' advances 10px, 'b' 14px); at height h the
+        // world advance is px * (h / CELL_H).
+        let atlas = crate::text_atlas::test_atlas();
+        assert_eq!(pill_row_count(&atlas, [].into_iter()), 0);
+        assert_eq!(pill_row_count(&atlas, ["a"].into_iter()), 1);
+        // A couple of short labels share one row; a long run of wide
+        // labels must wrap. Monotonic rather than pen-exact: the sizing
+        // walk and the renderer share the same arithmetic.
+        let one = pill_row_count(&atlas, ["aa", "bb"].into_iter());
+        let many = pill_row_count(&atlas, ["bbbbbbbb"; 12].into_iter());
+        assert_eq!(one, 1);
+        assert!(many > 1, "twelve wide labels must wrap ({many} rows)");
+    }
 
     #[test]
     fn ndc_depth_is_monotonic_and_clip_safe() {

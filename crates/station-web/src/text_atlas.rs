@@ -276,9 +276,7 @@ pub(crate) fn add_text_world(
         let mut quad = [(Vec2::new(0.0, 0.0), 0.0f32, 0.0f32, 0.0f32); 4];
         for (slot, (world, u, v)) in quad.iter_mut().zip(corners) {
             match project(world) {
-                Some((ndc, _cue, depth)) => {
-                    *slot = (ndc, (depth - TEXT_DEPTH_BIAS).max(0.0), u, v)
-                }
+                Some((ndc, _cue, depth)) => *slot = (ndc, (depth - TEXT_DEPTH_BIAS).max(0.0), u, v),
                 None => {
                     frame.text_vertices.truncate(start);
                     return false;
@@ -299,27 +297,34 @@ pub(crate) fn add_text_world(
     frame.text_vertices.len() > start
 }
 
+/// Synthetic atlas for unit tests across modules (this one's layout
+/// math, scene's pill-wrap sizing walk): two visible glyphs, a space,
+/// and the `?` fallback on a 100×50 canvas, with distinct advances so
+/// layout math shows.
+#[cfg(test)]
+pub(crate) fn test_atlas() -> TextAtlas {
+    let glyph = |x: f32, advance: f32| Glyph {
+        u0: x / 100.0,
+        v0: 0.0,
+        u1: (x + advance + PAD * 2.0) / 100.0,
+        v1: CELL_H / 50.0,
+        advance,
+        slot_w: advance + PAD * 2.0,
+    };
+    let mut glyphs = HashMap::new();
+    glyphs.insert('a', glyph(0.0, 10.0));
+    glyphs.insert('b', glyph(20.0, 14.0));
+    glyphs.insert(' ', glyph(40.0, 8.0));
+    glyphs.insert('?', glyph(60.0, 12.0));
+    TextAtlas::from_parts(glyphs, 100, 50, vec![0; 100 * 50])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Synthetic atlas: two visible glyphs, a space, and the `?` fallback
-    /// on a 100×50 canvas, with distinct advances so layout math shows.
     fn atlas() -> TextAtlas {
-        let glyph = |x: f32, advance: f32| Glyph {
-            u0: x / 100.0,
-            v0: 0.0,
-            u1: (x + advance + PAD * 2.0) / 100.0,
-            v1: CELL_H / 50.0,
-            advance,
-            slot_w: advance + PAD * 2.0,
-        };
-        let mut glyphs = HashMap::new();
-        glyphs.insert('a', glyph(0.0, 10.0));
-        glyphs.insert('b', glyph(20.0, 14.0));
-        glyphs.insert(' ', glyph(40.0, 8.0));
-        glyphs.insert('?', glyph(60.0, 12.0));
-        TextAtlas::from_parts(glyphs, 100, 50, vec![0; 100 * 50])
+        test_atlas()
     }
 
     fn basis() -> (Vec3, Vec3) {

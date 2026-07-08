@@ -6,8 +6,30 @@
 //! panel surfaces.
 
 use crate::gpu::{GpuFrame, GpuVertex};
+use crate::input::HitAction;
 use crate::scene::{Vec2, Vec3};
 use crate::util::Color;
+
+/// Depth bias for the first layer of surfaces drawn ON a card (meter
+/// track, pill backgrounds): proud of the card body so LessEqual can't
+/// z-fight it, but behind the text bias (`text_atlas::TEXT_DEPTH_BIAS`,
+/// 0.0015) so labels still draw over them.
+pub(crate) const PANE_LAYER1_BIAS: f32 = 0.0006;
+/// Second on-card layer (a meter's fill quad over its track quad).
+pub(crate) const PANE_LAYER2_BIAS: f32 = 0.001;
+
+/// A pane pill's projected screen rect (CSS px) with the action a click
+/// dispatches. The scene computes these while laying pills onto a world
+/// pane; the HUD pass adopts them into `hit_zones` when the pane
+/// replaces the screen panel, so activate()-by-name, a11y hotspots, and
+/// rect picking keep working with zero new dispatch vocabulary.
+pub(crate) struct PaneZone {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) w: f32,
+    pub(crate) h: f32,
+    pub(crate) action: HitAction,
+}
 
 /// A pane's world geometry registered for raycast picking — the 3D
 /// counterpart of `ProjectedNode` (which carries screen-space pick
@@ -37,8 +59,7 @@ pub(crate) fn ray_hit(target: &PaneTarget, origin: Vec3, dir: Vec3) -> Option<f3
         return None;
     }
     let local = (origin + dir * t) - target.anchor;
-    (local.dot(target.right).abs() <= target.half_w
-        && local.dot(target.up).abs() <= target.half_h)
+    (local.dot(target.right).abs() <= target.half_w && local.dot(target.up).abs() <= target.half_h)
         .then_some(t)
 }
 
@@ -47,7 +68,10 @@ pub(crate) fn ray_hit(target: &PaneTarget, origin: Vec3, dir: Vec3) -> Option<f3
 /// their own clip depth, so a pane at an angle to the view still sorts
 /// per-pixel against the scene. A pane with any corner culled is skipped
 /// whole — a partially projected billboard warps unpredictably near the
-/// frustum edge. Returns whether the pane was emitted.
+/// frustum edge. `depth_bias` is subtracted per corner: 0.0 for a card
+/// body, a `PANE_LAYER*_BIAS` for quads layered on one (meter bars,
+/// pill backgrounds), mirroring the text pass's bias so coplanar layers
+/// stack deterministically. Returns whether the pane was emitted.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn add_world_pane(
     frame: &mut GpuFrame,
@@ -58,6 +82,7 @@ pub(crate) fn add_world_pane(
     half_w: f32,
     half_h: f32,
     color: Color,
+    depth_bias: f32,
 ) -> bool {
     let corners = [
         anchor - right * half_w - up * half_h,
@@ -77,7 +102,7 @@ pub(crate) fn add_world_pane(
     for (ndc, depth) in [bl, br, tr, bl, tr, tl] {
         frame.pane_vertices.push(GpuVertex {
             pos: [ndc.x, ndc.y],
-            depth,
+            depth: depth - depth_bias,
             color: rgba,
         });
     }
@@ -98,8 +123,7 @@ mod tests {
         let (right, up) = basis();
         // Projector: NDC from x/y, depth rises with x so the two right
         // corners carry a deeper value than the left ones.
-        let mut project =
-            |v: Vec3| Some((Vec2::new(v.x, v.y), 1.0, 0.5 + v.x * 0.1));
+        let mut project = |v: Vec3| Some((Vec2::new(v.x, v.y), 1.0, 0.5 + v.x * 0.1));
         let emitted = add_world_pane(
             &mut frame,
             &mut project,
@@ -109,6 +133,7 @@ mod tests {
             1.0,
             0.5,
             Color::rgb(16, 18, 32).with_alpha(0.86),
+            0.0,
         );
         assert!(emitted);
         assert_eq!(frame.pane_vertices.len(), 6);
@@ -118,6 +143,30 @@ mod tests {
         let depths: Vec<f32> = frame.pane_vertices.iter().map(|v| v.depth).collect();
         assert_eq!(depths, vec![0.4, 0.6, 0.6, 0.4, 0.6, 0.4]);
         assert!((frame.pane_vertices[0].color[3] - 0.86).abs() < 1e-6);
+    }
+
+    #[test]
+    fn depth_bias_lifts_every_corner_uniformly() {
+        let mut frame = GpuFrame::default();
+        let (right, up) = basis();
+        let mut project = |v: Vec3| Some((Vec2::new(v.x, v.y), 1.0, 0.5));
+        assert!(add_world_pane(
+            &mut frame,
+            &mut project,
+            right,
+            up,
+            Vec3::ZERO,
+            1.0,
+            0.5,
+            Color::rgb(255, 255, 255),
+            PANE_LAYER1_BIAS,
+        ));
+        for v in &frame.pane_vertices {
+            assert!((v.depth - (0.5 - PANE_LAYER1_BIAS)).abs() < 1e-6);
+        }
+        // Layer ordering invariant: card < layer1 < layer2 < text bias.
+        assert!(0.0 < PANE_LAYER1_BIAS && PANE_LAYER1_BIAS < PANE_LAYER2_BIAS);
+        assert!(PANE_LAYER2_BIAS < crate::text_atlas::TEXT_DEPTH_BIAS);
     }
 
     fn target(anchor: Vec3, half_w: f32, half_h: f32) -> PaneTarget {
@@ -163,9 +212,7 @@ mod tests {
         let mut frame = GpuFrame::default();
         let (right, up) = basis();
         // Cull anything left of x = 0 — the two left corners fail.
-        let mut project = |v: Vec3| {
-            (v.x >= 0.0).then(|| (Vec2::new(v.x, v.y), 1.0, 0.5))
-        };
+        let mut project = |v: Vec3| (v.x >= 0.0).then(|| (Vec2::new(v.x, v.y), 1.0, 0.5));
         let emitted = add_world_pane(
             &mut frame,
             &mut project,
@@ -175,6 +222,7 @@ mod tests {
             1.0,
             0.5,
             Color::rgb(255, 255, 255),
+            0.0,
         );
         assert!(!emitted);
         assert!(frame.pane_vertices.is_empty());
