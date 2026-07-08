@@ -1382,11 +1382,17 @@ async fn supervised_session_surfaces_approvals_on_the_dashboard() {
     let script = rig.write_script(&serde_json::json!({
         "profiles": [{
             "steps": [
+                // `rmdir`, not `rm`: it is in the classifier's destructive
+                // list AND exists on every platform this e2e runs on — a
+                // POSIX utility and a cmd.exe built-in (`rm` is neither on
+                // Windows, where the approved command then fails and the
+                // marker survives; that exact miss ejected this test's PR
+                // from the merge queue on the windows leg).
                 { "content": "Deleting the marker.",
                   "tool_calls": [{ "name": "exec_command",
-                                   "arguments": { "nonce": 1, "command": "rm approval-pin-marker.txt" } }] },
-                // No transcript expectation: a successful rm prints
-                // nothing — the test's proof is the marker file itself
+                                   "arguments": { "nonce": 1, "command": "rmdir approval-pin-marker" } }] },
+                // No transcript expectation: a successful rmdir prints
+                // nothing — the test's proof is the marker directory itself
                 // disappearing from the session project.
                 { "content": "Marker removed.",
                   "tool_calls": [{ "name": "signal_done",
@@ -1394,12 +1400,13 @@ async fn supervised_session_surfaces_approvals_on_the_dashboard() {
             ]
         }]
     }));
-    // The session's project: seeded with the marker the gated `rm` deletes.
+    // The session's project: seeded with the empty marker directory the
+    // gated `rmdir` deletes.
     let session_project = tempfile::tempdir().expect("session project dir");
-    let marker = session_project.path().join("approval-pin-marker.txt");
-    std::fs::write(&marker, "pin").expect("seed marker");
+    let marker = session_project.path().join("approval-pin-marker");
+    std::fs::create_dir(&marker).expect("seed marker dir");
 
-    // Default autonomy (Medium): `rm` classifies destructive → Ask.
+    // Default autonomy (Medium): `rmdir` classifies destructive → Ask.
     let mut cmd = rig.command();
     cmd.env("INTENDANT_MOCK_SCRIPT", &script)
         .args(["--no-tls", "--web", "18941"]);
@@ -1432,8 +1439,8 @@ async fn supervised_session_surfaces_approvals_on_the_dashboard() {
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
             serde_json::json!({
                 "action": "create_session",
-                "task": "delete the pinned marker file",
-                "project_root": session_project.path(),
+                "task": "delete the pinned marker directory",
+                "project_root": session_project.path().to_string_lossy(),
                 "direct": true,
             })
             .to_string()
@@ -1482,7 +1489,7 @@ async fn supervised_session_surfaces_approvals_on_the_dashboard() {
     while marker.exists() {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "approved rm never ran; daemon stderr:\n{}",
+            "approved rmdir never ran; daemon stderr:\n{}",
             stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
