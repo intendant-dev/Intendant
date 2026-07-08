@@ -253,7 +253,14 @@ impl StationInner {
     }
 
     /// Slim scrollbar: rounded track + position thumb.
-    pub(crate) fn draw_scrollbar(&self, x: f32, y: f32, viewport_h: f32, content_h: f32, offset: f32) {
+    pub(crate) fn draw_scrollbar(
+        &self,
+        x: f32,
+        y: f32,
+        viewport_h: f32,
+        content_h: f32,
+        offset: f32,
+    ) {
         self.hud.set_fill("rgba(49,50,68,0.65)");
         self.rounded_path(x, y + 2.0, 6.0, viewport_h - 4.0, 3.0);
         self.hud.ctx.fill();
@@ -692,7 +699,15 @@ impl StationInner {
 
     /// One labeled row inside a focus panel: colored label column, value
     /// text beside it. Returns the next row baseline.
-    pub(crate) fn focus_row(&self, x: f32, row_y: f32, w: f32, label: &str, value: &str, color: &str) -> f32 {
+    pub(crate) fn focus_row(
+        &self,
+        x: f32,
+        row_y: f32,
+        w: f32,
+        label: &str,
+        value: &str,
+        color: &str,
+    ) -> f32 {
         self.text(&truncate(label, 11), x + 16.0, row_y, 9.0, color, "bold");
         self.text(
             &truncate(value, ((w - 116.0) / 5.6).max(18.0) as usize),
@@ -707,7 +722,10 @@ impl StationInner {
 
     /// Real detail panel for a selected agent node: identity, model, phase,
     /// task, budget/usage, and — when an approval is pending — the approval
-    /// command plus actionable approve/deny pills.
+    /// command plus actionable approve/deny pills. Rows, pills, and the
+    /// approval come from `focus_rows::agent_focus_content`, shared with
+    /// the world pane (`scene::add_agent_focus_pane`) so the two surfaces
+    /// cannot drift.
     pub(crate) fn draw_agent_focus(
         &mut self,
         agent: &crate::model::StationAgent,
@@ -715,30 +733,14 @@ impl StationInner {
         panel_w: f32,
         activity_lane_y: f32,
     ) {
-        let approval = agent.needs_approval
-            && (agent.host_id == "local"
-                || self
-                    .snapshot
-                    .hosts
-                    .first()
-                    .is_some_and(|h| h.id == agent.host_id)
-                || agent
-                    .approval_id
-                    .as_deref()
-                    .is_some_and(|id| !id.is_empty()));
-        let is_session = !agent.session_id.trim().is_empty();
-        let has_goal =
-            !agent.goal_objective.trim().is_empty() || !agent.goal_status.trim().is_empty();
-        let has_cache_vitals = agent.cache_hit_pct >= 0.0
-            || (agent.cache_ttl_seconds > 0.0 && agent.cache_last_activity_epoch > 0.0);
-        let rows = 5
-            + usize::from(!agent.worktree.trim().is_empty())
-            + usize::from(has_goal)
-            + usize::from(!agent.relationship_kind.trim().is_empty())
-            + usize::from(!agent.vitals_git.trim().is_empty())
-            + usize::from(has_cache_vitals)
-            + usize::from(!agent.vitals_limits.trim().is_empty())
-            + if approval { 2 } else { 0 };
+        let content = crate::focus_rows::agent_focus_content(
+            agent,
+            self.snapshot.hosts.first().map(|h| h.id.as_str()),
+            epoch_seconds_now(),
+        );
+        let approval = content.approval.is_some();
+        let is_session = !content.pills.is_empty();
+        let rows = content.rows.len() + if approval { 2 } else { 0 };
         let panel_h = 74.0
             + rows as f32 * 17.0
             + if approval { 30.0 } else { 6.0 }
@@ -746,15 +748,8 @@ impl StationInner {
         let y = (activity_lane_y - panel_h - 12.0).max(58.0);
         let phase = phase_color_css(&agent.phase);
         self.focus_panel_frame(x, y, panel_w, panel_h, &agent.id, phase);
-        let subtitle = if is_session && agent.recent {
-            format!("recent {} session", nonempty(&agent.source, "intendant"))
-        } else if is_session {
-            format!("{} session", nonempty(&agent.source, "intendant"))
-        } else {
-            format!("{} agent", nonempty(&agent.role, "agent"))
-        };
         self.text(
-            &truncate(&subtitle, 30),
+            &truncate(&content.subtitle, 30),
             x + 96.0,
             y + 23.0,
             9.0,
@@ -781,245 +776,48 @@ impl StationInner {
         ));
 
         let mut row_y = y + 70.0;
-        row_y = self.focus_row(
-            x,
-            row_y,
-            panel_w,
-            "source",
-            &format!(
-                "{} / {}",
-                nonempty(&agent.provider, "provider"),
-                nonempty(&agent.model, "model")
-            ),
-            C_BLUE_CSS,
-        );
-        row_y = self.focus_row(
-            x,
-            row_y,
-            panel_w,
-            "phase",
-            &format!(
-                "{} / {}{}",
-                nonempty(&agent.phase, "idle"),
-                nonempty(&agent.status, "idle"),
-                if agent.autonomy.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" / {} autonomy", agent.autonomy.trim())
-                }
-            ),
-            phase,
-        );
-        row_y = self.focus_row(
-            x,
-            row_y,
-            panel_w,
-            "task",
-            &nonempty(&agent.task, "idle"),
-            C_TEAL_CSS,
-        );
-        if !agent.relationship_kind.trim().is_empty() {
-            let parent = agent
-                .parent_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .map(|p| p.strip_prefix("session-").unwrap_or(p))
-                .map(|p| truncate(p, 12))
-                .unwrap_or_default();
-            let lineage = if parent.is_empty() {
-                agent.relationship_kind.trim().to_string()
-            } else {
-                format!("{} of {}", agent.relationship_kind.trim(), parent)
-            };
-            row_y = self.focus_row(x, row_y, panel_w, "lineage", &lineage, C_MAUVE_CSS);
-        }
-        if has_goal {
-            let status = agent.goal_status.trim();
-            let goal_color = goal_status_color_css(status);
-            let mut goal_text = if status.is_empty() {
-                agent.goal_objective.trim().to_string()
-            } else if agent.goal_objective.trim().is_empty() {
-                status.to_string()
-            } else {
-                format!("{}: {}", status, agent.goal_objective.trim())
-            };
-            if !agent.goal_tokens.trim().is_empty() {
-                goal_text.push_str(&format!(" ({} tok)", agent.goal_tokens.trim()));
+        for row in &content.rows {
+            row_y = self.focus_row(x, row_y, panel_w, row.label, &row.value, row.color_css);
+            if let Some(pct) = row.meter {
+                self.meter(
+                    x + 96.0,
+                    row_y - 12.0,
+                    panel_w - 116.0,
+                    pct,
+                    pressure_color(pct),
+                );
+                row_y += 6.0;
             }
-            row_y = self.focus_row(x, row_y, panel_w, "goal", &goal_text, goal_color);
-        }
-        let budget_pct = percent(agent.tokens, agent.token_cap);
-        row_y = self.focus_row(
-            x,
-            row_y,
-            panel_w,
-            "tokens",
-            &format!(
-                "{} / {} ({})",
-                fmt_compact(agent.tokens),
-                fmt_compact(agent.token_cap),
-                pct_label(budget_pct)
-            ),
-            pressure_color(budget_pct),
-        );
-        self.meter(
-            x + 96.0,
-            row_y - 12.0,
-            panel_w - 116.0,
-            budget_pct,
-            pressure_color(budget_pct),
-        );
-        row_y += 6.0;
-        let mut usage = format!(
-            "p {} / c {} / cached {}",
-            fmt_compact(agent.prompt),
-            fmt_compact(agent.completion),
-            fmt_compact(agent.cached)
-        );
-        if agent.cost > 0.0 {
-            usage.push_str(&format!(" / ${:.2}", agent.cost));
-        }
-        if agent.turn_cap > 0 {
-            usage.push_str(&format!(" / turn {}/{}", agent.turns, agent.turn_cap));
-        } else if agent.turns > 0 {
-            usage.push_str(&format!(" / turn {}", agent.turns));
-        }
-        row_y = self.focus_row(x, row_y, panel_w, "usage", &usage, C_LAVENDER_CSS);
-        if !agent.vitals_git.trim().is_empty() {
-            let color = if agent.vitals_git_conflict {
-                C_RED_CSS
-            } else {
-                C_TEAL_CSS
-            };
-            row_y = self.focus_row(x, row_y, panel_w, "git", agent.vitals_git.trim(), color);
-        }
-        if agent.cache_hit_pct >= 0.0 || agent.cache_ttl_seconds > 0.0 {
-            // Same tiers as the dashboard chip (fragment 39): hit green
-            // ≥90 / yellow ≥50 / red, countdown red in its final minute,
-            // cold dimmed.
-            let mut text = String::new();
-            let mut color = C_SUBTEXT0_CSS;
-            if agent.cache_hit_pct >= 0.0 {
-                let hit = agent.cache_hit_pct.clamp(0.0, 100.0);
-                text.push_str(&format!("⚡{}%", hit.round() as u32));
-                color = if hit >= 90.0 {
-                    C_GREEN_CSS
-                } else if hit >= 50.0 {
-                    C_YELLOW_CSS
-                } else {
-                    C_PEACH_CSS
-                };
-            }
-            let now = epoch_seconds_now();
-            if agent.cache_ttl_seconds > 0.0 && agent.cache_last_activity_epoch > 0.0 && now > 0.0
-            {
-                let remaining =
-                    agent.cache_ttl_seconds - (now - agent.cache_last_activity_epoch);
-                if !text.is_empty() {
-                    text.push(' ');
-                }
-                if remaining > 0.0 {
-                    text.push_str(&format!("⏳{}", fmt_countdown(remaining)));
-                    if remaining <= 60.0 {
-                        color = C_RED_CSS;
-                    }
-                } else {
-                    text.push_str("✗ cold");
-                    color = C_SUBTEXT0_CSS;
-                }
-            }
-            if !text.is_empty() {
-                row_y = self.focus_row(x, row_y, panel_w, "cache", &text, color);
-            }
-        }
-        if !agent.vitals_limits.trim().is_empty() {
-            let color = match agent.vitals_limits_state.trim() {
-                "crit" => C_RED_CSS,
-                "warn" => C_YELLOW_CSS,
-                _ => C_SUBTEXT0_CSS,
-            };
-            row_y = self.focus_row(x, row_y, panel_w, "limits", agent.vitals_limits.trim(), color);
-        }
-        if !agent.worktree.trim().is_empty() {
-            row_y = self.focus_row(
-                x,
-                row_y,
-                panel_w,
-                "worktree",
-                agent.worktree.trim(),
-                C_MAUVE_CSS,
-            );
         }
 
         if is_session {
-            // Per-node action pills at session-window-kebab parity: the
-            // universal basics plus whatever thread-action ops the session
-            // advertises. Every pill dispatches through the dashboard's
-            // real session-action handler.
-            let sid = agent.session_id.trim().to_string();
-            let ops = &agent.thread_actions;
+            // Per-node action pills at session-window-kebab parity — the
+            // shared content builds the set; every pill dispatches through
+            // the dashboard's real session-action handler.
             let py = row_y - 2.0;
             let mut px = x + 96.0;
-            let mut pills: Vec<(&str, &str, &str)> =
-                vec![("log", C_BLUE_CSS, "station-log")];
-            if agent.recent {
-                // A closed session can be read or brought back — nothing
-                // else applies to it.
-                pills.push(("resume", C_GREEN_CSS, "resume"));
-            } else {
-                pills.push(("target", C_TEAL_CSS, "target"));
-                pills.push(("steer", C_LAVENDER_CSS, "steer"));
-                if agent.can_interrupt {
-                    pills.push(("stop", C_RED_CSS, "interrupt"));
-                }
-                if ops.iter().any(|op| op == "compact") {
-                    pills.push(("compact", C_MAUVE_CSS, "thread-compact"));
-                }
-                if ops.iter().any(|op| op == "fork") {
-                    pills.push(("fork", C_PEACH_CSS, "thread-fork"));
-                }
-            }
-            for (label, color, action) in pills {
-                let pw = label.chars().count() as f32 * 6.1 + 18.0;
+            for pill in &content.pills {
+                let pw = pill.label.chars().count() as f32 * 6.1 + 18.0;
                 if px + pw > x + panel_w - 16.0 {
                     break;
                 }
-                self.pill_at(px, py, pw, 23.0, label, color, false);
-                self.hit_zones.push(HitZone::new(
-                    px,
-                    py,
-                    pw,
-                    23.0,
-                    HitAction::SessionAction {
-                        action: action.to_string(),
-                        id: sid.clone(),
-                    },
-                ));
+                self.pill_at(px, py, pw, 23.0, pill.label, pill.color_css, false);
+                self.hit_zones
+                    .push(HitZone::new(px, py, pw, 23.0, pill.action.clone()));
                 px += pw + 8.0;
             }
             row_y += 32.0;
         }
 
-        if approval {
+        if let Some(appr) = &content.approval {
             row_y = self.focus_row(
                 x,
                 row_y,
                 panel_w,
-                "approval",
-                &format!(
-                    "{}{}",
-                    nonempty(&agent.approval_command, "approval required"),
-                    if agent.approval_category.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", agent.approval_category.trim())
-                    }
-                ),
-                C_YELLOW_CSS,
+                appr.row.label,
+                &appr.row.value,
+                appr.row.color_css,
             );
-            let host_id = agent.host_id.clone();
-            let approval_id = agent.approval_id.clone().unwrap_or_default();
             let py = row_y - 6.0;
             self.pill_at(x + 96.0, py, 78.0, 23.0, "approve", C_GREEN_CSS, false);
             self.hit_zones.push(HitZone::new(
@@ -1028,8 +826,8 @@ impl StationInner {
                 78.0,
                 23.0,
                 HitAction::Approval {
-                    host_id: host_id.clone(),
-                    approval_id: approval_id.clone(),
+                    host_id: appr.host_id.clone(),
+                    approval_id: appr.approval_id.clone(),
                     decision: "approve",
                 },
             ));
@@ -1040,8 +838,8 @@ impl StationInner {
                 58.0,
                 23.0,
                 HitAction::Approval {
-                    host_id,
-                    approval_id,
+                    host_id: appr.host_id.clone(),
+                    approval_id: appr.approval_id.clone(),
                     decision: "deny",
                 },
             ));

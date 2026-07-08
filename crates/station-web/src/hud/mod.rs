@@ -10,11 +10,11 @@ use crate::input::{HitAction, HitZone, ViewSliderKey};
 use crate::model::activity_retained_count;
 use crate::scene::{ndc_to_screen, LayoutName, Mood, NodeKind, ProjectedNode, Vec2};
 use crate::util::{
-    attention_level_color_css, css_rgba, epoch_seconds_now, fmt_compact, fmt_countdown,
-    goal_status_color_css, hex_color, level_color_css, nonempty, pct_label, percent,
-    phase_color_css, pressure_color, tone_color_css, truncate, Color, C_BLUE, C_BLUE_CSS,
-    C_GREEN_CSS, C_LAVENDER, C_LAVENDER_CSS, C_MAUVE_CSS, C_OVERLAY1, C_OVERLAY1_CSS, C_PEACH,
-    C_PEACH_CSS, C_RED_CSS, C_SUBTEXT0_CSS, C_TEAL, C_TEAL_CSS, C_TEXT_CSS, C_YELLOW_CSS,
+    attention_level_color_css, css_rgba, epoch_seconds_now, fmt_compact, goal_status_color_css,
+    hex_color, level_color_css, nonempty, pct_label, percent, phase_color_css, pressure_color,
+    tone_color_css, truncate, Color, C_BLUE, C_BLUE_CSS, C_GREEN_CSS, C_LAVENDER, C_LAVENDER_CSS,
+    C_MAUVE_CSS, C_OVERLAY1, C_OVERLAY1_CSS, C_PEACH, C_PEACH_CSS, C_RED_CSS, C_SUBTEXT0_CSS,
+    C_TEAL, C_TEAL_CSS, C_TEXT_CSS, C_YELLOW_CSS,
 };
 use crate::StationInner;
 
@@ -29,9 +29,9 @@ pub(crate) struct Hud {
     pub(crate) style: RefCell<HudStyle>,
 }
 
-mod stage;
-mod panels;
 mod focus;
+mod panels;
+mod stage;
 mod widgets;
 
 #[derive(Default)]

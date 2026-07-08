@@ -3,6 +3,7 @@
 //! `static/app.html`. Rendering is scheduled on demand: see
 //! `StationInner::schedule_frame` / `is_animating`.
 
+mod focus_rows;
 mod gpu;
 mod hud;
 mod input;
@@ -295,6 +296,10 @@ impl StationWeb {
             // frame, with their projected screen rects (CSS px).
             "paneTargets": inner.frame.pane_targets.len(),
             "paneRects": pane_rects,
+            // Slice 5: pill hit rects laid onto world panes this frame —
+            // adopted into hitZones when the pane replaces the screen
+            // panel, so the two counters move together.
+            "paneZones": inner.frame.pane_zones.len(),
             "mood": inner.mood.label(),
             "motion": inner.motion,
             "composer": {

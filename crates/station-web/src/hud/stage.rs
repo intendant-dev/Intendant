@@ -411,10 +411,7 @@ impl StationInner {
                 nonempty(&controls.session_goal_objective, "(no objective)")
             );
             if !controls.session_goal_tokens.trim().is_empty() {
-                goal_line.push_str(&format!(
-                    " ({} tok)",
-                    controls.session_goal_tokens.trim()
-                ));
+                goal_line.push_str(&format!(" ({} tok)", controls.session_goal_tokens.trim()));
             }
             self.text(
                 &truncate(&goal_line, ((w * 0.46) / 5.6).max(46.0) as usize),
@@ -965,6 +962,24 @@ impl StationInner {
         // Sit just above the activity lane, wherever density placed it.
         let activity_lane_y = (h - lane_metrics(self.density, h).2 - 24.0).max(282.0);
         if let Some(agent) = self.snapshot.agents.iter().find(|a| a.id == id).cloned() {
+            // Phase C slice 5: when the scene carried this agent's focus
+            // as a world pane this frame (flag on, wide viewport — the
+            // pane registered a pick target), and WebGPU actually renders
+            // it (the canvas fallback draws lines only, so the pane would
+            // be invisible there), the screen panel yields. The pane's
+            // projected pill rects become this frame's hit zones, so
+            // activate()-by-name, a11y hotspots, and rect picking keep
+            // working over the in-scene pills.
+            if self.gpu.is_some() && self.frame.pane_targets.iter().any(|t| t.id == id) {
+                let zones: Vec<HitZone> = self
+                    .frame
+                    .pane_zones
+                    .iter()
+                    .map(|z| HitZone::new(z.x, z.y, z.w, z.h, z.action.clone()))
+                    .collect();
+                self.hit_zones.extend(zones);
+                return;
+            }
             self.draw_agent_focus(&agent, x, panel_w, activity_lane_y);
             return;
         }
