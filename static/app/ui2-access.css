@@ -1410,10 +1410,26 @@ html.ui-v2 #tab-access .access-model-status.failed {
 }
 
 /* ── shared bits ── */
+/* Empty states: centered quiet copy in a dashed placeholder frame (the
+   fleet's "+ Link a daemon" affordance grammar, minus the affordance). */
 html.ui-v2 #tab-access .access-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 64px;
+  padding: 18px 16px;
+  border: 1px dashed var(--line-2);
+  border-radius: 12px;
+  text-align: center;
   font-size: 12.5px;
   color: var(--text-3);
-  padding: 10px 0;
+}
+/* …but inside an already-framed model section, quiet text only —
+   a dashed box nested in a bordered card reads twice. */
+html.ui-v2 #tab-access .access-model-table .access-empty {
+  border: 0;
+  min-height: 0;
+  padding: 14px 16px;
 }
 
 /* ── responsive ── */
@@ -1446,5 +1462,3 @@ html.ui-v2 #tab-access .access-empty {
   html.ui-v2 .access-target-actions { grid-column: 1 / -1; }
   html.ui-v2 .access-target-actions { justify-content: flex-start; min-width: 0; }
 }
-
-/* qa-access-marker r2 */
