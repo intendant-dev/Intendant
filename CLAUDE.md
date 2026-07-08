@@ -39,6 +39,7 @@ Read the relevant chapter before changing a subsystem:
 | WebRTC display (shared encoder pool, tile streaming) | `docs/src/display-pipeline.md` |
 | Peer federation, cross-machine display, LAN/mTLS | `docs/src/peer-federation.md` |
 | Trust model: anchor daemons, client identity keys, role ceilings, IAM | `docs/src/trust-architecture.md` |
+| Trust tiers: which client for which daemon, fleet zones, custody per tier | `docs/src/trust-tiers.md` |
 | Credential custody: leases, vault, egress relay, OAuth modes | `docs/src/credential-custody.md` |
 | Hosted rendezvous (intendant-connect), claims, self-hosting | `docs/src/self-hosted-rendezvous.md` |
 | Computer use, live audio, phone/voice-call skills | `docs/src/computer-use-and-audio.md` |
