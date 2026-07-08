@@ -17328,6 +17328,7 @@ html.ui-v2 #tab-sessions .session-detail .empty-state {
   }
 }
 /* ── static/app/ui2-activity.css ── */
+/* qa-activity-grid-marker-r5 */
 /* ── ui-v2 Activity slice 1: Focus timeline + approval hero ────────────
    All scoped html.ui-v2. Restyles the EXISTING log-entry scaffold
    (.log-ts gutter / .log-icon dot / data-level colors) into the design's
@@ -17387,12 +17388,18 @@ html.ui-v2 .log-entry .log-icon {
   width: 6px; height: 6px;    /* …become the role dot */
   border-radius: 50%;
   background: var(--text-3);
-  align-self: center;
+  /* Pin to the FIRST text line, not the entry's vertical middle —
+     align-self:center floated the dot between lines on wrapped entries.
+     13.5px × 1.55 line box = ~21px; a 6px dot centers at (21−6)/2 ≈ 7px. */
+  align-self: start;
+  margin-top: 7px;
   justify-self: center;
 }
+/* Meta chips join the row's shared baseline so they ride line 1 on
+   wrapped entries (center-alignment floated them mid-entry). */
 html.ui-v2 .log-entry .log-host,
-html.ui-v2 .log-entry .log-session { margin-right: 7px; align-self: center; }
-html.ui-v2 .log-entry .log-anchor-btn { margin-right: 6px; align-self: center; }
+html.ui-v2 .log-entry .log-session { margin-right: 7px; align-self: baseline; }
+html.ui-v2 .log-entry .log-anchor-btn { margin-right: 6px; align-self: baseline; }
 /* the source string becomes the role eyebrow (gap via padding — grid
    max-content tracks size it reliably even when the glyph is ::after) */
 html.ui-v2 .log-entry .log-level {
@@ -17407,6 +17414,12 @@ html.ui-v2 .log-entry .log-level {
   width: auto;    /* v1 fixes .log-level at width:52px — the longer v2
                      role labels (INTENDANT) would ink past it into the
                      content column */
+  /* Shared body edge: each entry is its own grid, so a max-content level
+     track makes body columns ragged across rows (ℹ vs INTENDANT). A
+     min-width sized to the longest eyebrow (INTENDANT at 9.5px mono +
+     .13em tracking ≈ 62px) lines every body up without reintroducing
+     v1's overflow. */
+  min-width: 63px;
 }
 /* named roles: label overrides (textContent stays untouched — session
    windows and Station read it — so the swap is ::after only) */
@@ -17439,6 +17452,16 @@ html.ui-v2 .log-entry.level-model { color: var(--text); }
 html.ui-v2 .log-entry.level-detail, html.ui-v2 .log-entry.level-debug { color: var(--text-3); }
 html.ui-v2 .log-entry.level-error { color: var(--rose); }
 html.ui-v2 .log-entry.level-warn { color: var(--amber); }
+/* v1 re-tints body prose per role at the child level
+   (.level-model .log-content { color: var(--log-model) } …) which outranks
+   the parent rules above — under v2 the EYEBROW + dot carry the role and
+   the body reads as text ink. Warn/error keep their semantic tint. */
+html.ui-v2 .log-entry.level-model .log-content,
+html.ui-v2 .log-entry.level-agent .log-content,
+html.ui-v2 .log-entry.level-subagent .log-content,
+html.ui-v2 .log-entry.level-presence .log-content { color: var(--text); }
+html.ui-v2 .log-entry.level-detail .log-content,
+html.ui-v2 .log-entry.level-debug .log-content { color: var(--text-3); }
 /* hover actions float over the entry instead of joining the grid flow */
 html.ui-v2 .log-entry .log-copy-entry,
 html.ui-v2 .log-entry .log-edit-message {
@@ -17475,7 +17498,9 @@ html.ui-v2 .log-entry.rollback-marker { color: var(--amber); }
 html.ui-v2 #approval-panel .approval-card {
   border: 1px solid rgba(var(--amber-rgb), .32);
   border-radius: 14px;
-  background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02));
+  /* tint over an OPAQUE base — a bare gradient let the stream ghost
+     through the card (pixel-QA 2026-07-08) */
+  background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02)), var(--surface);
   box-shadow: var(--shadow-card);
   padding: 15px 17px;
 }
@@ -17704,11 +17729,135 @@ html.ui-v2 .ui2-approval-session {
   background: var(--session-badge-bg, var(--surface-2));
   color: var(--session-badge-fg, var(--text-2));
 }
-/* the bottom panel gets a solid backdrop — stream text was bleeding
-   between the hero's buttons */
+/* the bottom panel gets a SOLID backdrop — at 92% the stream still
+   ghosted between the hero's buttons (product bar: no text bleed) */
 html.ui-v2 #activity-log-pane .bottom-panel.visible {
-  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  background: var(--bg);
   padding: 10px 14px 12px;
+}
+/* rail contents pair with the composer column: same 920px cap, centered
+   (the full-pane card dwarfed the dock it sits above) */
+html.ui-v2 #activity-log-pane .bottom-panel .panel-body,
+html.ui-v2 #activity-log-pane .bottom-panel .panel-header {
+  max-width: 920px;
+  margin-inline: auto;
+}
+
+/* — light theme: identity-chip legibility (pixel-QA 2026-07-08; widened
+   past this tab per the sessions agent's file request — the .log-entry
+   chip presentation lives here and the same chips render in
+   session-detail logs) ───────────────────────────────────────────────
+   applySessionBadgeStyle mints dark-theme pastels (fg ≈ 78% lightness) as
+   inline --session-badge-* vars; on light surfaces that is pale-on-pale
+   (~1.3:1). Re-derive the consumed colors toward ink while KEEPING each
+   session's hue — a flat token tint would sever the badge ↔ window-ring
+   ↔ switcher color identity. */
+html.ui-v2[data-theme="light"] .log-entry .log-session,
+html.ui-v2[data-theme="light"] .global-task-bar .task-target-session-badge,
+html.ui-v2[data-theme="light"] #ui2-approval-session {
+  color: color-mix(in srgb, var(--session-badge-fg, var(--text-2)) 34%, var(--text));
+  border-color: color-mix(in srgb, var(--session-badge-border, var(--line-2)) 55%, var(--line-2));
+}
+/* Host badge: hash bg is hsl(h, 32%, 58%) with v1 ink var(--base) — in
+   light that base flips to near-white (~2:1 on the midtone bg). Pin the
+   ink to light's text token (dark keeps --base = near-black, ~7:1). */
+html.ui-v2[data-theme="light"] .log-entry .log-host { color: var(--text); }
+
+/* — operator-question rail (ask_human parks a session here) — the v2
+   hero grammar, sky-tinted: a question asks for input, not permission. */
+html.ui-v2 #human-panel .panel-header {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--sky);
+  padding: 0 3px 6px;
+}
+html.ui-v2 #human-panel .panel-body {
+  border: 1px solid rgba(var(--sky-rgb), .3);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(var(--sky-rgb), .08), rgba(var(--sky-rgb), .02)), var(--surface);
+  box-shadow: var(--shadow-card);
+  padding: 13px 15px;
+}
+html.ui-v2 #human-panel .input-question {
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 650;
+  padding: 0 0 10px;
+}
+html.ui-v2 #human-panel .input-area { gap: 9px; }
+html.ui-v2 #human-panel .input-area textarea {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  padding: 8px 11px;
+  min-height: 38px;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+html.ui-v2 #human-panel .input-area textarea:focus {
+  border-color: rgba(var(--iris-rgb), .45);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+html.ui-v2 #human-panel .input-area button {
+  border: 0;
+  border-radius: 10px;
+  padding: 9px 16px;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-size: 13px;
+  font-weight: 800;
+  box-shadow: var(--shadow-primary);
+  transition: filter var(--t-fast);
+}
+html.ui-v2 #human-panel .input-area button:hover { filter: brightness(1.08); opacity: 1; }
+
+/* — structured user questions (#question-panel) share the sky grammar — */
+html.ui-v2 #question-panel .approval-card {
+  border: 1px solid rgba(var(--sky-rgb), .3);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(var(--sky-rgb), .08), rgba(var(--sky-rgb), .02)), var(--surface);
+  box-shadow: var(--shadow-card);
+  padding: 13px 15px;
+}
+html.ui-v2 #question-panel .approval-icon { display: none; }
+html.ui-v2 #question-panel .question-text { color: var(--text); font-size: 13.5px; }
+html.ui-v2 #question-panel .question-header-chip {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--sky);
+  background: rgba(var(--sky-rgb), .1);
+  border: 1px solid rgba(var(--sky-rgb), .24);
+}
+html.ui-v2 #question-panel .question-option {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 #question-panel .question-option:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2 #question-panel .question-option.selected {
+  border-color: rgba(var(--iris-rgb), .5);
+  background: rgba(var(--iris-rgb), .1);
+}
+html.ui-v2 #question-panel .question-free-text {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+}
+html.ui-v2 #question-panel .question-free-text:focus {
+  border-color: rgba(var(--iris-rgb), .45);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
 }
 /* ── static/app/ui2-grid.css ── */
 /* ── ui-v2 Activity Grid mode: session-window re-skin ──────────────────
@@ -17728,6 +17877,19 @@ html.ui-v2 .session-window-grid {
   padding: 12px 14px;
   border-bottom: 1px solid var(--line);
   background: var(--bg);
+}
+/* Resized grid: v1 pins a fixed height with overflow:visible, and a
+   definite height COMPRESSES the auto rows — at 5-6 windows row 1's
+   cards painted over row 2 (measured: 320px cards in 298px tracks;
+   ledger finding #4). Under v2 the dragged size is a CAP the area
+   scrolls within, so tracks keep content size and rows never overlap.
+   Cost: a ⋯ menu taller than the remaining grid area scrolls instead of
+   escaping — the lesser evil vs overlapping cards. */
+html.ui-v2 .session-window-grid.resized {
+  height: auto;
+  max-height: var(--session-window-grid-height);
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 html.ui-v2 .session-window-grid-resize-handle::before {
   width: 44px;
@@ -17942,6 +18104,14 @@ html.ui-v2 .concurrent-log-action[aria-pressed="true"] { color: var(--iris-2); }
 html.ui-v2 .session-window { background: var(--surface); }
 html.ui-v2 .session-window-header { background: var(--surface-2); }
 html.ui-v2 .concurrent-log-region { background: var(--bg); }
+
+/* Light theme: the session-badge vars are dark-theme pastels (see the
+   matching remap in ui2-activity.css) — re-derive the window id chip
+   toward ink so per-session identity stays legible on light surfaces. */
+html.ui-v2[data-theme="light"] .session-window-id {
+  color: color-mix(in srgb, var(--session-badge-fg, var(--text-2)) 34%, var(--text));
+  border-color: color-mix(in srgb, var(--session-badge-border, var(--line-2)) 55%, var(--line-2));
+}
 /* ── static/app/ui2-live.css ── */
 /* ── ui-v2 Live display (Video tab) re-skin (design-overhaul P2) ───────
    Everything here is scoped under `html.ui-v2` and restyles the EXISTING
@@ -23925,9 +24095,13 @@ function ui2RailForegroundSessionId() {
   return '';
 }
 
-function ui2RailTick() {
+function ui2RailTick(force) {
   const rail = document.getElementById('ui2-vitals-rail');
-  if (!rail || !rail.offsetParent) return; // hidden: other tab/subtab, grid layout, or <1180px
+  if (!rail) return;
+  // hidden: other tab/subtab, grid layout, or <1180px — skip the interval
+  // work, but let the build-time call fill values so the rail never shows
+  // placeholder dashes on its first paint.
+  if (!force && !rail.offsetParent) return;
 
   const sid = ui2RailForegroundSessionId();
   const sessionEl = document.getElementById('ui2-rail-session');
@@ -23982,8 +24156,8 @@ if (ui2Enabled()) {
     ui2WireLayoutToggle();
     ui2DressComposer();
     ui2BuildVitalsRail();
-    ui2RailTick();
-    setInterval(ui2RailTick, 1000);
+    ui2RailTick(true);
+    setInterval(() => ui2RailTick(), 1000);
     // Focus filter + raw-entry hygiene: follow stream appends, target
     // changes (the chip re-renders on every change), and layout flips.
     const stream = document.getElementById('log-stream');
