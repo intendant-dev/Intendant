@@ -28,7 +28,7 @@ use gpu::{GpuFrame, GpuState};
 use hud::{Hud, SystemTarget};
 use input::{HitZone, PinchZoom, PointerDrag, ScrollZone};
 use model::{StationEvent, StationSnapshot, StationTranscript};
-use scene::{layout_positions, ndc_to_screen, LayoutName, Mood, Particle, Vec2, Vec3};
+use scene::{layout_positions, LayoutName, Mood, Particle, Vec2, Vec3};
 use util::{lcg, level_color, now_ms, station_enable_webgpu, unit};
 
 #[wasm_bindgen]
@@ -238,35 +238,10 @@ impl StationWeb {
         // targets — deterministic click coordinates for the rig today,
         // the a11y hotspot feed when real panels move in-scene. A pane
         // with any corner culled reports no rect (matching the draw).
-        let camera = inner.camera();
-        let aspect = inner.width as f32 / inner.height.max(1) as f32;
         let pane_rects: Vec<serde_json::Value> = inner
-            .frame
-            .pane_targets
-            .iter()
-            .filter_map(|target| {
-                let mut min = (f32::MAX, f32::MAX);
-                let mut max = (f32::MIN, f32::MIN);
-                for corner in [
-                    target.anchor - target.right * target.half_w - target.up * target.half_h,
-                    target.anchor + target.right * target.half_w - target.up * target.half_h,
-                    target.anchor + target.right * target.half_w + target.up * target.half_h,
-                    target.anchor - target.right * target.half_w + target.up * target.half_h,
-                ] {
-                    let (ndc, _z) = camera.project_depth(corner, aspect, inner.fov_deg)?;
-                    let p = ndc_to_screen([ndc.x, ndc.y], inner.width, inner.height);
-                    min = (min.0.min(p.x), min.1.min(p.y));
-                    max = (max.0.max(p.x), max.1.max(p.y));
-                }
-                let dpr = inner.dpr as f32;
-                Some(serde_json::json!({
-                    "id": target.id,
-                    "x": min.0 / dpr,
-                    "y": min.1 / dpr,
-                    "w": (max.0 - min.0) / dpr,
-                    "h": (max.1 - min.1) / dpr,
-                }))
-            })
+            .pane_css_rects()
+            .into_iter()
+            .map(|(id, x, y, w, h)| serde_json::json!({ "id": id, "x": x, "y": y, "w": w, "h": h }))
             .collect();
         serde_json::json!({
             "fps": inner.present_fps(),

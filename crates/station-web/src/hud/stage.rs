@@ -665,6 +665,16 @@ impl StationInner {
                 cy + ring_scale * 0.7,
             ),
         ];
+        // World panes own their screen area: a summary card that would
+        // paint over an in-scene panel is skipped for the frame (the HUD
+        // canvas sits above the scene canvas, so it would otherwise cover
+        // the pane). Canvas-fallback frames draw no solid panes, so
+        // nothing is skipped there.
+        let pane_rects = if self.gpu.is_some() {
+            self.pane_css_rects()
+        } else {
+            Vec::new()
+        };
         for (id, nx, ny) in node_specs {
             if let Some(target) = targets.iter().find(|target| target.id == id) {
                 let node_w = if id == "system:peers" {
@@ -677,15 +687,17 @@ impl StationInner {
                 } else {
                     node_h
                 };
-                self.station_orbital_node(
-                    cx,
-                    cy,
-                    nx.clamp(x + 20.0, x + w - node_w - 20.0),
-                    ny.clamp(y + 58.0, y + core_h - node_h - 20.0),
-                    node_w,
-                    node_h,
-                    target,
-                );
+                let node_x = nx.clamp(x + 20.0, x + w - node_w - 20.0);
+                let node_y = ny.clamp(y + 58.0, y + core_h - node_h - 20.0);
+                if pane_rects.iter().any(|(_, px, py, pw, ph)| {
+                    node_x < px + pw
+                        && node_x + node_w > *px
+                        && node_y < py + ph
+                        && node_y + node_h > *py
+                }) {
+                    continue;
+                }
+                self.station_orbital_node(cx, cy, node_x, node_y, node_w, node_h, target);
             }
         }
 
