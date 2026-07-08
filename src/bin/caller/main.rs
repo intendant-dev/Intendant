@@ -371,7 +371,12 @@ fn print_help() {
 }
 
 fn parse_cli_flags() -> Result<CliFlags, CallerError> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    parse_cli_flags_from(env::args().skip(1).collect())
+}
+
+/// Testable core of [`parse_cli_flags`]: `args` is argv minus the binary
+/// name.
+fn parse_cli_flags_from(args: Vec<String>) -> Result<CliFlags, CallerError> {
     let mut flags = CliFlags {
         task: None,
         task_file: None,
@@ -482,6 +487,13 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                 i += 1;
             }
             "--resume" | "-r" => {
+                // Optional-value flag: `--resume` without an id acts like
+                // `--continue`, so a dash-leading next token is read as the
+                // next flag, not as an id. That is only safe because resume
+                // ids are UUIDs (SessionLog::resolve_path) or external-CLI
+                // session ids (also UUIDs) — both hex-leading. If a resume
+                // id mint ever moves to a dashable alphabet (base64url), the
+                // id must get a fixed alphanumeric prefix (see 8c9c0d96).
                 if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                     flags.resume_id = Some(args[i + 1].clone());
                     i += 2;
@@ -672,6 +684,13 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                 })?;
                 flags.record_displays.push(id);
                 i += 2;
+            }
+            "--" => {
+                // Standard end-of-flags separator: everything after is task
+                // text, however it starts — the escape hatch for prose (or a
+                // pasted token) that would otherwise read as a flag.
+                task_parts.extend(args[i + 1..].iter().cloned());
+                break;
             }
             other => {
                 if other.starts_with('-') {
@@ -1804,10 +1823,64 @@ Also: {"source": "bare"}"#;
         assert_eq!(resume_session.as_deref(), Some(backend_session_id));
     }
 
+    fn cli(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_cli_flags_double_dash_ends_flags() {
+        // `--` is the standard escape hatch: everything after it is task
+        // text even when it would otherwise parse as a flag.
+        let flags = parse_cli_flags_from(cli(&["--direct", "--", "--not-a-flag", "task"]))
+            .expect("everything after -- is task text");
+        assert!(flags.direct);
+        assert_eq!(flags.task.as_deref(), Some("--not-a-flag task"));
+    }
+
+    #[test]
+    fn parse_cli_flags_unknown_flag_still_errors() {
+        // (match instead of unwrap_err: CliFlags deliberately has no Debug.)
+        for argv in [cli(&["--nope"]), cli(&["-x", "task"])] {
+            match parse_cli_flags_from(argv) {
+                Err(err) => assert!(err.to_string().contains("Unknown CLI flag")),
+                Ok(_) => panic!("unknown flag must error"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_cli_flags_resume_takes_id_but_yields_to_flags() {
+        // A hex-leading id (UUIDs — the only resume-id mints) is captured…
+        let flags =
+            parse_cli_flags_from(cli(&["--resume", "0f9b2c1e-aaaa-bbbb-cccc-121212121212"]))
+                .unwrap();
+        assert_eq!(
+            flags.resume_id.as_deref(),
+            Some("0f9b2c1e-aaaa-bbbb-cccc-121212121212")
+        );
+        assert!(!flags.continue_last);
+        // …while a dash-leading next token keeps the documented
+        // optional-value fallback: --resume degrades to --continue.
+        let flags = parse_cli_flags_from(cli(&["--resume", "--direct"])).unwrap();
+        assert!(flags.continue_last);
+        assert!(flags.direct);
+        assert!(flags.resume_id.is_none());
+    }
+
+    #[test]
+    fn parse_cli_flags_value_flags_accept_dash_leading_values() {
+        // Value positions must never reject a token for its leading dash:
+        // --owner takes a base64url fingerprint, 1 in 64 of which starts
+        // with '-'.
+        let fingerprint = "-vyeJaE3hyqm4J45K5j_sVTXAAAABBBBCCCCDDDDEEE";
+        assert_eq!(fingerprint.len(), 43);
+        let flags = parse_cli_flags_from(cli(&["--owner", fingerprint])).unwrap();
+        assert_eq!(flags.owner.as_deref(), Some(fingerprint));
+    }
+
     #[test]
     fn parse_cli_flags_empty() {
-        // Can't easily test parse_cli_flags since it reads env::args(),
-        // but we can test the struct defaults
+        // Struct defaults (parser behavior is covered above).
         let flags = CliFlags {
             task: None,
             task_file: None,

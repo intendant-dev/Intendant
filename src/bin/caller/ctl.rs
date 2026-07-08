@@ -2116,6 +2116,45 @@ mod tests {
         values.iter().map(|value| value.to_string()).collect()
     }
 
+    // Minted ids (session, request, workspace, …) ride ctl argv as flag
+    // values and positionals; base64url mints can lead with '-'. These pin
+    // the parser invariants that keep such tokens from dying as flags (the
+    // 2026-07-08 `peer complete` merge-queue ejection class; see 8c9c0d96).
+
+    #[test]
+    fn parse_command_args_accepts_dash_leading_values_and_positionals() {
+        // A dash-leading token in a value position is the value…
+        let parsed =
+            parse_command_args(&args(&["--session", "-vyeJaE3hyqm4"]), &["--session"], &[])
+                .expect("flag value may lead with a dash");
+        assert_eq!(parsed.one("--session"), Some("-vyeJaE3hyqm4"));
+        // …and a single-dash token in positional position is a positional.
+        let parsed = parse_command_args(&args(&["-vyeJaE3hyqm4"]), &[], &[])
+            .expect("single-dash token is a positional, not a flag");
+        assert_eq!(parsed.positional, vec!["-vyeJaE3hyqm4".to_string()]);
+    }
+
+    #[test]
+    fn parse_command_args_double_dash_forces_positionals() {
+        let parsed = parse_command_args(&args(&["--", "--looks-like-a-flag"]), &[], &[])
+            .expect("everything after -- is positional");
+        assert_eq!(parsed.positional, vec!["--looks-like-a-flag".to_string()]);
+    }
+
+    #[test]
+    fn parse_command_args_unknown_double_dash_flag_still_errors() {
+        let err = parse_command_args(&args(&["--sesion", "x"]), &["--session"], &[]).unwrap_err();
+        assert!(err.contains("unknown flag --sesion"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_global_args_flag_values_accept_dash_leading_tokens() {
+        let (config, command) =
+            parse_global_args(args(&["--session", "-abc123", "status"])).expect("parses");
+        assert_eq!(config.session_id.as_deref(), Some("-abc123"));
+        assert_eq!(command, args(&["status"]));
+    }
+
     #[test]
     fn cu_actions_example_matches_cu_action_type() {
         // Guards the documented example (and by extension CU_ACTION_SHAPES)
