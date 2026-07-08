@@ -1258,27 +1258,36 @@ pub(crate) fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
     )
 }
 
+/// The "dashboard action" RPC lane's allowlist, by wire action name. Single
+/// declaration: `dashboard_action_msg_allowed` gates against it, and the
+/// parity test below pins the SPA's `DASHBOARD_ACTION_MSG_RPC_ACTIONS`
+/// mirror (static/app/31-init-identity-fleet.js) to this exact set — adding
+/// an action here without the frontend mirror (or vice versa) fails the
+/// suite instead of shipping as drift. Fail-closed: a new `ControlMsg`
+/// variant is not dispatchable over this lane until named here.
+pub(crate) const DASHBOARD_ACTION_MSG_ACTIONS: &[&str] = &[
+    "codex_thread_action",
+    "take_display",
+    "release_display",
+    "grant_user_display",
+    "revoke_user_display",
+    "create_virtual_display",
+    "create_browser_workspace",
+    "close_browser_workspace",
+    "acquire_browser_workspace",
+    "release_browser_workspace",
+    "setup_debug_screen",
+    "teardown_debug_screen",
+    "start_debug_recording",
+    "stop_debug_recording",
+    "start_recording",
+    "stop_recording",
+    "delete_recording",
+    "set_diagnostics_visual_marker",
+];
+
 pub(crate) fn dashboard_action_msg_allowed(ctrl: &ControlMsg) -> bool {
-    matches!(
-        ctrl,
-        ControlMsg::CodexThreadAction { .. }
-            | ControlMsg::TakeDisplay { .. }
-            | ControlMsg::ReleaseDisplay { .. }
-            | ControlMsg::GrantUserDisplay { .. }
-            | ControlMsg::RevokeUserDisplay { .. }
-            | ControlMsg::CreateBrowserWorkspace { .. }
-            | ControlMsg::CloseBrowserWorkspace { .. }
-            | ControlMsg::AcquireBrowserWorkspace { .. }
-            | ControlMsg::ReleaseBrowserWorkspace { .. }
-            | ControlMsg::SetupDebugScreen
-            | ControlMsg::TeardownDebugScreen
-            | ControlMsg::StartDebugRecording
-            | ControlMsg::StopDebugRecording
-            | ControlMsg::StartRecording { .. }
-            | ControlMsg::StopRecording { .. }
-            | ControlMsg::DeleteRecording { .. }
-            | ControlMsg::SetDiagnosticsVisualMarker { .. }
-    )
+    DASHBOARD_ACTION_MSG_ACTIONS.contains(&dashboard_control_msg_action(ctrl))
 }
 
 pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
@@ -1336,6 +1345,7 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::ReleaseDisplay { .. } => "release_display",
         ControlMsg::GrantUserDisplay { .. } => "grant_user_display",
         ControlMsg::RevokeUserDisplay { .. } => "revoke_user_display",
+        ControlMsg::CreateVirtualDisplay { .. } => "create_virtual_display",
         ControlMsg::CreateBrowserWorkspace { .. } => "create_browser_workspace",
         ControlMsg::CloseBrowserWorkspace { .. } => "close_browser_workspace",
         ControlMsg::AcquireBrowserWorkspace { .. } => "acquire_browser_workspace",

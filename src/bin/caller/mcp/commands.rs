@@ -1226,6 +1226,22 @@ pub(crate) async fn handle_control_command_mcp(
             );
             Some(RESOURCE_LOGS_URI)
         }
+        ControlMsg::CreateVirtualDisplay { .. } => {
+            // The user-display listener (spawned in every mode) owns the
+            // actual work — Xvfb launch, capture session, DisplayReady /
+            // DisplayCaptureLost — by consuming this same bus event. This
+            // arm only acknowledges receipt on the MCP control surface.
+            emit_control_result(
+                control_tx,
+                "create_virtual_display",
+                true,
+                "virtual display creation requested — outcome arrives as \
+                 display_ready or display_capture_lost"
+                    .to_string(),
+                None,
+            );
+            Some(RESOURCE_LOGS_URI)
+        }
         ControlMsg::ListDisplays => {
             let session_registry = state.read().await.session_registry.clone();
             let displays =

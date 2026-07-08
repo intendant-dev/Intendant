@@ -352,6 +352,7 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::ReleaseDisplay { .. }
         | ControlMsg::GrantUserDisplay { .. }
         | ControlMsg::RevokeUserDisplay { .. }
+        | ControlMsg::CreateVirtualDisplay { .. }
         | ControlMsg::SetDiagnosticsVisualMarker { .. } => PeerOperation::DisplayInput,
         ControlMsg::Input { .. }
         | ControlMsg::FollowUp { .. }
