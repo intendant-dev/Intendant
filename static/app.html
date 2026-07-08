@@ -19425,8 +19425,12 @@ html.ui-v2 #tab-stats .ui-stat-value {
 html.ui-v2 #tab-stats #stats-kpi-row .ui-stat:nth-child(4) .ui-stat-value {
   color: var(--iris-2);
 }
-html.ui-v2 #tab-stats .stats-kpi-skel-label { min-height: 11px; }
-html.ui-v2 #tab-stats .stats-kpi-skel-value { min-height: 24px; }
+/* Skeleton bars mirror the real label/value line boxes (11px text at the
+   inherited 1.5 line-height = 16.5px; 24px value at the ui-stat 1.15 =
+   27.6px) so the tiles keep their height when data lands — previously
+   the shimmer tiles were 11px shorter and the whole page shifted. */
+html.ui-v2 #tab-stats .stats-kpi-skel-label { min-height: 16.5px; }
+html.ui-v2 #tab-stats .stats-kpi-skel-value { min-height: 27.6px; }
 
 /* ── empty state ── */
 html.ui-v2 #tab-stats #usage-empty {
@@ -19663,6 +19667,9 @@ html.ui-v2 #tab-stats .token-breakdown .total-row {
 html.ui-v2 #tab-stats .cost-grid {
   font-size: 12.5px;
   gap: 7px 16px;
+  /* Wide grids (the 8-column by-agent table) clipped their trailing
+     columns inside the card below ~900px; scroll the grid instead. */
+  overflow-x: auto;
 }
 html.ui-v2 #tab-stats .cost-grid .label { color: var(--text-2); }
 html.ui-v2 #tab-stats .cost-grid .value {
@@ -19679,9 +19686,20 @@ html.ui-v2 #tab-stats .cost-grid .head {
   text-transform: uppercase;
   color: var(--text-3);
 }
+/* Never wrap headers, row labels, or the amber unpriced note: with the
+   grid scrollable, long content widens its track instead of stacking
+   word-per-line inside a squeezed column ("EST. / COST", four-line
+   unpriced notes at 820). */
+html.ui-v2 #tab-stats .cost-grid .head,
+html.ui-v2 #tab-stats .cost-grid .label,
+html.ui-v2 #tab-stats .cost-grid .unpriced { white-space: nowrap; }
 html.ui-v2 #tab-stats .cost-grid .label.strong { color: var(--text); font-weight: 700; }
 html.ui-v2 #tab-stats .cost-grid .err { color: var(--rose); }
-html.ui-v2 #tab-stats .cost-grid .unpriced { color: var(--amber); }
+html.ui-v2 #tab-stats .cost-grid .unpriced {
+  color: var(--amber);
+  line-height: 1.4;
+  margin-top: 2px;
+}
 html.ui-v2 #tab-stats .cost-grid .total-row {
   border-top: 1px solid var(--line);
   color: var(--text);
@@ -19746,9 +19764,32 @@ html.ui-v2 #tab-stats .token-activity-skyline-bar { border-radius: 2px 2px 0 0; 
 html.ui-v2 #tab-stats .token-activity-months {
   font-size: 10.5px;
   color: var(--text-3);
+  /* Month labels must sit exactly over their week columns. The heatmap's
+     column pitch is (100% + 3px)/53 — 53 cells with 52 interior 3px gaps
+     — while v1's gapless 1fr months tracks are 100%/53, drifting ~3px
+     left by the year's end (and real gaps here would miscount: the last
+     label's `span 4` mints implicit tracks whose extra gap slots shrink
+     every explicit track). Gapless pitch-sized tracks dodge both: only
+     the phantom 3px of the trailing "gap" overflows, clipped below, so
+     the grid's outer width stays equal to the heatmap's and the wrap
+     never gains a phantom scrollbar. */
+  grid-template-columns: repeat(53, calc((100% + 3px) / 53));
+  grid-auto-columns: 0;
+  overflow: hidden;
 }
 /* Design cell geometry: square cells, 2px radius, 3px gap; ramp colors
-   come from the --viz-* tokens the v1 rules already consume. */
+   come from the --viz-* tokens the v1 rules already consume. Design
+   scroll floor is 640px (v1 shipped 720) — both rows share it or the
+   months row would compress on a different curve than the cells. */
+html.ui-v2 #tab-stats .token-activity-months,
+html.ui-v2 #tab-stats .token-activity-heatmap {
+  min-width: 640px;
+}
+html.ui-v2 #tab-stats .token-activity-heatmap-wrap {
+  /* 1px more than v1's 2px so the bottom row's focus frame and the
+     selected-day ring aren't shaved by the scroll clip. */
+  padding-bottom: 3px;
+}
 html.ui-v2 #tab-stats .token-activity-heatmap {
   gap: 3px;
   grid-template-rows: repeat(7, auto);
@@ -19758,10 +19799,20 @@ html.ui-v2 #tab-stats .token-activity-day {
   aspect-ratio: 1 / 1;
   border-radius: 2px;
 }
+html.ui-v2 #tab-stats .token-activity-day:not(.future):hover {
+  border-color: var(--text-2);
+}
+/* Keyboard focus: an inner accent frame instead of the global outline —
+   an outline (or outer ring) on edge columns would be clipped by the
+   wrap's scroll box. Distinct from hover (text-2 border) and from the
+   selected ring below. */
 html.ui-v2 #tab-stats .token-activity-day:not(.future):hover,
 html.ui-v2 #tab-stats .token-activity-day:not(.future):focus-visible {
-  border-color: var(--text-2);
   outline: none;
+}
+html.ui-v2 #tab-stats .token-activity-day:not(.future):focus-visible {
+  border-color: var(--iris-2);
+  box-shadow: inset 0 0 0 1px var(--iris-2);
 }
 html.ui-v2 #tab-stats .token-activity-day.selected {
   border-color: var(--text);
@@ -19776,6 +19827,10 @@ html.ui-v2 #tab-stats .ui2-heat-legend {
   color: var(--text-3);
 }
 html.ui-v2 #tab-stats .ui2-heat-legend span { margin: 0 4px; }
+/* The row's first text node must sit on the card's content edge — the
+   side margins are only separators between the words and the swatches. */
+html.ui-v2 #tab-stats .ui2-heat-legend span:first-child { margin-left: 0; }
+html.ui-v2 #tab-stats .ui2-heat-legend span:last-child { margin-right: 0; }
 html.ui-v2 #tab-stats .ui2-heat-legend i {
   width: 11px;
   height: 11px;
