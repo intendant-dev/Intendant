@@ -1051,6 +1051,41 @@ mod tests {
     }
 
     #[test]
+    fn wire_requested_profiles_stay_lenient_and_degrade_fail_closed() {
+        // The CLI validates --profile loudly, but the doorbell wire path
+        // must keep accepting profile names this build does not know
+        // (older/newer requesters): the string is stored as-is and stays
+        // fail-closed — presence-only — at authorization time.
+        let certs = tempfile::TempDir::new().unwrap();
+        setup_certs(certs.path());
+        let key = access::certs::generate_client_key_material().unwrap();
+        let request = AccessRequestCreate {
+            version: 1,
+            requester_label: "primary".into(),
+            public_key_pem: key.public_key_pem,
+            nonce: "0123456789abcdef".into(),
+            requested_profile: Some("future-profile".into()),
+            requester_card_url: None,
+        };
+
+        let created = create_pending_request(
+            certs.path(),
+            request,
+            "https://target/.well-known/agent-card.json".into(),
+            Some("127.0.0.1".into()),
+            &PeerAccessRequestConfig::default(),
+        )
+        .unwrap();
+        let approved = approve_request(certs.path(), &created.code, None).unwrap();
+
+        assert_eq!(approved.approved_profile.as_deref(), Some("future-profile"));
+        assert!(!crate::peer::access_policy::profile_allows_operation(
+            "future-profile",
+            crate::peer::access_policy::PeerOperation::StatsRead,
+        ));
+    }
+
+    #[test]
     fn install_approved_identity_writes_peer_config_and_key() {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::write(root.path().join("intendant.toml"), "").unwrap();

@@ -308,7 +308,12 @@ On the receiving side this is the ordinary peer-principal path: the peer's
 this daemon, then classifies the inner tool per its own gate —
 `take_screenshot`/`list_displays` need **display view** (`read-only-display`
 or better), `execute_cu_actions` needs **display input** (`peer-operator` /
-`peer-root` only). A denial comes back as a structured `isError` tool result
+`peer-root` only). `read_screen` is display-view class too — an element tree
+reveals screen content just as a screenshot does — so `intendant ctl --peer
+<id> cu elements` reads the peer's frontmost UI element tree under the same
+display-view grant when the peer's platform accessibility stack is available
+(deliberately no `peer_read_screen` twin; the generic side-channel covers
+it). A denial comes back as a structured `isError` tool result
 with the peer's diagnostic text, which every caller surface passes through
 verbatim.
 
@@ -323,10 +328,17 @@ work — reach for direct CU when this agent needs to see or drive the peer's
 screen itself.
 
 The same side-channel is reachable from the CLI with **no daemon in the
-loop**: `intendant ctl --peer <id> …` resolves the `[[peer]]` entry from
-`intendant.toml` (label case-insensitive, card_url host, exact card_url, or
-the suffix of an `intendant:<label>` peer id), derives the `/mcp` endpoint
-from the card_url origin, and builds the same pinned mTLS client — explicit
+loop**: `intendant ctl --peer <id> …` resolves the `[[peer]]` entry from the
+project's `intendant.toml` first and, when the project yields no match (or
+has no config at all), from the user-level `~/.intendant/peers.toml`
+(`$INTENDANT_HOME/peers.toml` under an overridden state root) — peers are
+machine-scoped identities, so a pairing recorded there works from any
+working directory. Both layers use the same matching rules (label
+case-insensitive, card_url host, exact card_url, or the suffix of an
+`intendant:<label>` peer id); a project match always wins, and only
+`ctl --peer` reads the user-level file — daemon boot federates from the
+project config alone. Resolution then derives the `/mcp` endpoint from the
+card_url origin and builds the same pinned mTLS client — explicit
 `client_cert`/`client_key` first (the peer-boot pairing rule; half-set
 config errors out), else the installed access identity for TLS targets.
 Every existing ctl subcommand then drives the peer:
@@ -692,6 +704,28 @@ headless and should be approved from its own CLI/logs.
    access cert store, writes or updates the requester's outbound `[[peer]]`,
    pins the target server fingerprint, and starts the live peer registration
    when the dashboard daemon is running.
+
+A granted profile can be changed later without re-pairing:
+
+```bash
+intendant peer set-profile <fingerprint> --profile peer-operator
+```
+
+`set-profile` rewrites the stored identity record for an approved inbound peer
+— copy the fingerprint from `intendant peer identities` (an unambiguous prefix
+works; no match and ambiguous prefixes error with the candidates listed). Like
+approval, this is an offline state-file write: the gateway resolves a presented
+client certificate to its stored profile on every request, so the new profile
+takes effect on the peer's next request with no daemon restart. Revoked
+identities cannot be edited — approve a new pairing instead.
+
+`--profile` values typed at the CLI (`request`, `approve`, `set-profile`) are
+validated against the canonical profile vocabulary and fail loudly on unknown
+names, listing the known profiles and aliases — a typo no longer silently
+lands as a presence-only grant. Aliases (e.g. `peer-daemon` for `peer-root`)
+keep working and resolve to their canonical name. Unknown profile strings
+arriving *on the wire* are still accepted and stay fail-closed: they degrade
+to presence-only at authorization time.
 
 The unauthenticated public surface for this flow is intentionally tiny:
 `POST /api/peer-pairing/requests` creates a pending request and

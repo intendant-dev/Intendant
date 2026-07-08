@@ -1213,6 +1213,25 @@ mod tests {
     }
 
     #[test]
+    fn minted_session_ids_are_flag_safe() {
+        // Session ids ride argv (`intendant --resume <id>`), where a leading
+        // '-' reads as a flag — `--resume` in particular degrades to
+        // `--continue` on a dash-leading token. UUIDs are hex-leading, so
+        // this can't fire today; if this mint ever moves to a dashable
+        // alphabet (base64url), prefix the id with a fixed alphanumeric
+        // char instead (see 8c9c0d96).
+        for _ in 0..64 {
+            let path = SessionLog::resolve_path(None);
+            let id = path
+                .file_name()
+                .expect("session dir has a name")
+                .to_string_lossy()
+                .to_string();
+            assert!(!id.starts_with('-'), "session id not flag-safe: {id}");
+        }
+    }
+
+    #[test]
     fn open_reuses_existing_session_id() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
