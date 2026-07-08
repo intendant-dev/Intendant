@@ -201,8 +201,17 @@ fn parse_global_args(mut raw: Vec<String>) -> Result<(Config, Vec<String>), Stri
 
 fn parse_output_flags(mut config: Config, raw: Vec<String>) -> (Config, Vec<String>) {
     let mut command = Vec::with_capacity(raw.len());
+    let mut past_separator = false;
     for arg in raw {
+        // `--` ends flag parsing everywhere in the grammar; keep it (the
+        // subcommand parser consumes it) and stop stripping output flags so
+        // a positional literally equal to "--json"/"--raw" stays passable.
         match arg.as_str() {
+            _ if past_separator => command.push(arg),
+            "--" => {
+                past_separator = true;
+                command.push(arg);
+            }
             "--raw" => config.raw = true,
             "--json" => config.json = true,
             _ => command.push(arg),
@@ -471,6 +480,10 @@ fn parse_command_args(
                     .push(value.to_string());
             } else if flag.starts_with("--") && bool_flags.contains(flag) {
                 return Err(format!("{flag} does not take a value"));
+            } else if flag.starts_with("--") {
+                // `--typo=value` is a mistyped flag, same as `--typo value` —
+                // a positional that genuinely looks like that rides after `--`.
+                return Err(format!("unknown flag {flag}"));
             } else {
                 positional.push(arg.clone());
             }
@@ -2230,6 +2243,35 @@ mod tests {
     fn parse_command_args_unknown_double_dash_flag_still_errors() {
         let err = parse_command_args(&args(&["--sesion", "x"]), &["--session"], &[]).unwrap_err();
         assert!(err.contains("unknown flag --sesion"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_command_args_unknown_equals_flag_errors_like_its_spaced_twin() {
+        // `--sesion=x` must fail exactly like `--sesion x` instead of
+        // silently becoming a positional…
+        let err = parse_command_args(&args(&["--sesion=x"]), &["--session"], &[]).unwrap_err();
+        assert!(err.contains("unknown flag --sesion"), "got: {err}");
+        // …while `--` still escapes a positional that genuinely looks like one,
+        // and known `=` forms keep working.
+        let parsed = parse_command_args(&args(&["--", "--sesion=x"]), &["--session"], &[])
+            .expect("after -- everything is positional");
+        assert_eq!(parsed.positional, vec!["--sesion=x".to_string()]);
+        let parsed = parse_command_args(&args(&["--session=abc"]), &["--session"], &[])
+            .expect("known flag accepts =value");
+        assert_eq!(parsed.one("--session"), Some("abc"));
+    }
+
+    #[test]
+    fn parse_output_flags_stop_stripping_after_double_dash() {
+        let (config, command) = parse_output_flags(
+            test_config(),
+            args(&["peer", "message", "--json", "--", "--json", "--raw"]),
+        );
+        // Before the separator the output flag is consumed as usual…
+        assert!(config.json);
+        assert!(!config.raw);
+        // …after it, the tokens survive verbatim for the subcommand parser.
+        assert_eq!(command, args(&["peer", "message", "--", "--json", "--raw"]));
     }
 
     #[test]
