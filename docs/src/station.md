@@ -160,12 +160,18 @@ scene is no longer a backdrop behind the UI — the scene *is* the UI,
 spatially.
 
 *In flight behind `?station_panes=on`*: the depth attachment, a
-billboarded depth-tested pane pipeline (`panes.rs`), and glyph-atlas text
-on those panes (`text_atlas.rs` — the HUD font baked to a mip-chained R8
-coverage texture, sampled by a textured pipeline) are live, proven by one
-card beside the selected node. Raycast picking and the promotion of real
-panels into the scene are next; the flag flips to opt-out when the pane
-presentation graduates.
+billboarded depth-tested pane pipeline (`panes.rs`), glyph-atlas text on
+those panes (`text_atlas.rs` — the HUD font baked to a mip-chained R8
+coverage texture, sampled by a textured pipeline), raycast picking
+(`Camera::ray_through`; panes are click-solid), and the first real panel
+are live: selecting an agent on a wide viewport draws its focus panel as
+a world pane — rows and pills derived once for both surfaces
+(`focus_rows.rs`), a tokens meter, and wrapped action pills whose
+projected rects the HUD adopts as hit zones (activation-by-name and a11y
+hotspots keep working). The screen panel yields only when the pane
+actually rendered, and remains the presentation for hosts/system nodes,
+narrow viewports, and the canvas fallback. The flag flips to opt-out
+when the pane presentation graduates.
 
 ### Phase D — XR spatial computing
 

@@ -23,7 +23,7 @@ sessions, orchestration sessions, sub-agents, and external agents alike.
 |-------|-------------|-----------|--------------------|
 | **Direct** | `--direct`, a "simple" task heuristic, or any non-daemon CLI path | One supervised agent loop, no delegation | `run_direct_mode` (`main.rs`) |
 | **Orchestrate** | Default for non-trivial tasks under the daemon (no `--direct`); explicit `orchestrate` flag on task submission | The same loop with the orchestration prompt; delegates via `spawn_sub_agent` | `run_direct_mode` with `SubAgentRole::Orchestrator` |
-| **Sub-Agent** | Spawned by another session's `spawn_sub_agent` tool call | A supervised child session with a role prompt; reports back with `submit_result` | `SessionSupervisor::start_sub_agent_session` (`session_supervisor.rs`) |
+| **Sub-Agent** | Spawned by another session's `spawn_sub_agent` tool call | A supervised child session with a role prompt; reports back with `submit_result` | `SessionSupervisor::start_sub_agent_session` (`session_supervisor/sub_agents.rs`) |
 | **External-Agent** | `--agent <backend>` or `[agent] default_backend`, or `backend` on `spawn_sub_agent` | A supervised third-party coding CLI wired to Intendant's MCP server | `run_external_agent_mode` (`main.rs`) — see [External-Agent Orchestration](./external-agent-orchestration.md) |
 
 These are configurations of one thing, not modes of different things: every

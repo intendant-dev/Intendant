@@ -86,10 +86,15 @@ persistent agent, so it merely *re-broadcasts* these as
 
 ## Session Supervisor
 
-`session_supervisor.rs` is the long-lived owner of every session launched from
+`session_supervisor/` is the long-lived owner of every session launched from
 the control plane at runtime. Where the control plane owns *settings*, the
 supervisor owns *sessions* — their lifecycle, their per-session resources, and
-the graph of how they relate.
+the graph of how they relate. `mod.rs` holds the supervisor/state types and
+shared helpers; the behavior is sliced into `dispatch.rs` (ControlMsg intake),
+`launch.rs` (new/resume flows and the shared session spawner),
+`sub_agents.rs` (delegation), `routing.rs` (follow-up/steer/edit/stop),
+`agent_config.rs` (per-session agent config and identity), and `registry.rs`
+(lifecycle observation and registration).
 
 It subscribes to the bus and handles the session-lifecycle `ControlMsg`s:
 

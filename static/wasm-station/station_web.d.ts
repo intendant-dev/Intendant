@@ -98,12 +98,12 @@ export interface InitOutput {
     readonly stationweb_set_visuals: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly stationweb_unregister_display_source: (a: number, b: number, c: number) => void;
     readonly stationweb_update_snapshot: (a: number, b: any) => [number, number];
-    readonly wasm_bindgen__closure__destroy__h0b7c3dde0a11a997: (a: number, b: number) => void;
+    readonly wasm_bindgen__closure__destroy__h881eee7d209e2631: (a: number, b: number) => void;
     readonly wasm_bindgen__closure__destroy__hccf83c1ad0c1d3f3: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h3378a55d603b975f: (a: number, b: number, c: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h6044e1f38f492cc6: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__he37f37943cc9018e: (a: number, b: number, c: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__ha089cbe81a3c964c: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h63b5eb8c1813e0ac: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h9d0506930843bd3e: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h07d11b4718ab4b35: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

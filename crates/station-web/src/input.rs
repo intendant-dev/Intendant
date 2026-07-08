@@ -208,11 +208,9 @@ impl StationInner {
                         // occludes the scene behind it per-pixel, so a
                         // click on it keeps its node selected instead of
                         // falling through to empty-space deselection.
-                        // (A node floating between the camera and a card
-                        // is stolen by the card — acceptable while the
-                        // one card anchors to the selection; revisit with
-                        // a depth compare if panes multiply.)
-                        s.selected_id = s.pick_pane(x, y).or_else(|| s.pick_node(x, y));
+                        // Node-vs-pane overlaps settle by camera depth
+                        // (slice 6), matching what the depth buffer drew.
+                        s.selected_id = s.pick_scene(x, y);
                         s.hud_dirty = true;
                         None
                     } else {
@@ -407,9 +405,18 @@ impl StationInner {
     }
 
     pub(crate) fn pick_node(&self, x: f32, y: f32) -> Option<String> {
+        self.pick_node_depth(x, y).map(|(_, id)| id)
+    }
+
+    /// Screen-nearest node under the pointer with its camera distance
+    /// (world units from the eye), so node-vs-pane overlaps settle by
+    /// depth. A node missing from the layout cache reads as infinitely
+    /// far — a pane over it stays click-solid.
+    fn pick_node_depth(&self, x: f32, y: f32) -> Option<(f32, String)> {
         let px = x * self.dpr as f32;
         let py = y * self.dpr as f32;
-        self.frame
+        let hit = self
+            .frame
             .projected_nodes
             .iter()
             .filter_map(|n| {
@@ -418,7 +425,13 @@ impl StationInner {
                 (d <= n.radius * self.dpr as f32 + 10.0).then(|| (d, n.id.clone()))
             })
             .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(_, id)| id)
+            .map(|(_, id)| id)?;
+        let depth = self
+            .layout_cache
+            .get(&hit)
+            .map(|pos| (*pos - self.camera().eye).len())
+            .unwrap_or(f32::MAX);
+        Some((depth, hit))
     }
 
     /// Raycast pane picking (Phase C slice 4): the inverse of
@@ -426,6 +439,12 @@ impl StationInner {
     /// with the frame's world-space pane targets; the nearest hit wins.
     /// Coordinates are CSS px like `pick_node`'s.
     pub(crate) fn pick_pane(&self, x: f32, y: f32) -> Option<String> {
+        self.pick_pane_depth(x, y).map(|(_, id)| id)
+    }
+
+    /// `pick_pane` with the hit's ray distance (world units from the
+    /// eye), the pane side of the depth settle.
+    fn pick_pane_depth(&self, x: f32, y: f32) -> Option<(f32, String)> {
         if self.frame.pane_targets.is_empty() {
             return None;
         }
@@ -445,7 +464,14 @@ impl StationInner {
                 crate::panes::ray_hit(target, origin, dir).map(|t| (t, target.id.clone()))
             })
             .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(_, id)| id)
+    }
+
+    /// Combined scene pick (slice 6): the screen-nearest node and the
+    /// ray-nearest pane, settled by camera depth when both hit — a node
+    /// in front of a card wins its click, a node behind it stays
+    /// occluded, exactly matching what the depth buffer rendered.
+    pub(crate) fn pick_scene(&self, x: f32, y: f32) -> Option<String> {
+        settle_pick(self.pick_node_depth(x, y), self.pick_pane_depth(x, y))
     }
 
     pub(crate) fn dispatch_hit(&mut self, action: HitAction) -> Option<serde_json::Value> {
@@ -1057,6 +1083,21 @@ pub(crate) fn hotspot_rects_from_zones(zones: &[HitZone]) -> Vec<(String, f32, f
     out
 }
 
+/// Settle a node hit against a pane hit by camera depth: the nearer one
+/// takes the click; a lone hit of either kind wins outright. Ties go to
+/// the pane (it drew over the node at equal depth).
+pub(crate) fn settle_pick(
+    node: Option<(f32, String)>,
+    pane: Option<(f32, String)>,
+) -> Option<String> {
+    match (node, pane) {
+        (Some((nd, nid)), Some((pd, _))) if nd < pd => Some(nid),
+        (_, Some((_, pid))) => Some(pid),
+        (Some((_, nid)), None) => Some(nid),
+        (None, None) => None,
+    }
+}
+
 /// Resolve an `activate` name to the action a click on that zone would
 /// dispatch, honoring hit-test precedence (last-drawn zone wins).
 pub(crate) fn zone_action_by_name(zones: &[HitZone], name: &str) -> Option<HitAction> {
@@ -1149,6 +1190,21 @@ pub(crate) struct PinchZoom {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settle_pick_prefers_the_nearer_hit_and_pane_on_ties() {
+        let node = |d: f32| Some((d, "node".to_string()));
+        let pane = |d: f32| Some((d, "pane".to_string()));
+        // Node in front of the card wins; node behind it stays occluded.
+        assert_eq!(settle_pick(node(4.0), pane(6.0)).as_deref(), Some("node"));
+        assert_eq!(settle_pick(node(8.0), pane(6.0)).as_deref(), Some("pane"));
+        // Equal depth goes to the pane (it drew over the node).
+        assert_eq!(settle_pick(node(6.0), pane(6.0)).as_deref(), Some("pane"));
+        // Lone hits win outright; nothing hits nothing.
+        assert_eq!(settle_pick(node(4.0), None).as_deref(), Some("node"));
+        assert_eq!(settle_pick(None, pane(6.0)).as_deref(), Some("pane"));
+        assert_eq!(settle_pick(None, None), None);
+    }
 
     #[test]
     fn zone_names_cover_every_action_kind() {

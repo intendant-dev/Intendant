@@ -1083,6 +1083,35 @@ async fn tile_subscriber_peer_handles(
         .collect()
 }
 
+/// Core of the per-peer reaper (see [`DisplaySession::spawn_peer_reaper`]):
+/// remove `peer_id`'s registration — but only while the map still holds
+/// **this** peer (`Arc::ptr_eq`), so a reaper firing late for a replaced
+/// peer leaves its successor untouched, and a peer already removed by
+/// `remove_peer` is not double-decremented. Returns whether it removed.
+async fn reap_peer_registration(
+    peers: &Arc<RwLock<HashMap<PeerId, Arc<webrtc::WebRtcPeer>>>>,
+    tile_subscribers: &Arc<RwLock<HashSet<PeerId>>>,
+    counters: &Arc<DisplayMetricsCounters>,
+    peer_id: PeerId,
+    peer: &Arc<webrtc::WebRtcPeer>,
+) -> bool {
+    let removed = {
+        let mut guard = peers.write().await;
+        match guard.get(&peer_id) {
+            Some(current) if Arc::ptr_eq(current, peer) => {
+                guard.remove(&peer_id);
+                true
+            }
+            _ => false,
+        }
+    };
+    if removed {
+        tile_subscribers.write().await.remove(&peer_id);
+        counters.peer_count.fetch_sub(1, Ordering::Relaxed);
+    }
+    removed
+}
+
 impl DisplaySession {
     /// Create a new display session.  Does NOT start capture -- call `start()`.
     pub fn new(display_id: u32, backend: Arc<dyn DisplayBackend>) -> Self {
@@ -2051,6 +2080,7 @@ impl DisplaySession {
                 self.counters.peer_count.fetch_add(1, Ordering::Relaxed);
             }
         }
+        self.spawn_peer_reaper(peer_id, &peer);
 
         self.ensure_clipboard_forwarding().await;
 
@@ -2839,6 +2869,28 @@ impl DisplaySession {
         }
     }
 
+    /// Deregister the peer from the session maps when its driver tears
+    /// down. `remove_peer` only covers gateway-WS-signaled viewers (the
+    /// WS teardown path is its sole caller) — peers signaled over the
+    /// dashboard-control channel (hosted Connect) or torn down by ICE
+    /// failure had no deregistration path at all, leaving `peer_count`
+    /// and the presence policy's peer map stale, so the layer-pause idle
+    /// policy never engaged (observed live: `peers=1` forever on a cloud
+    /// box after its only viewer left). Identity-guarded (`Arc::ptr_eq`)
+    /// so a replaced peer's reaper cannot remove its successor under the
+    /// same id, and idempotent alongside `remove_peer`.
+    fn spawn_peer_reaper(&self, peer_id: PeerId, peer: &Arc<self::webrtc::WebRtcPeer>) {
+        let peers = Arc::clone(&self.peers);
+        let tile_subscribers = Arc::clone(&self.tile_subscribers);
+        let counters = Arc::clone(&self.counters);
+        let peer = Arc::clone(peer);
+        let closed = peer.closed();
+        tokio::spawn(async move {
+            closed.await;
+            reap_peer_registration(&peers, &tile_subscribers, &counters, peer_id, &peer).await;
+        });
+    }
+
     /// F-1.3b3: fetch a clone of the per-peer
     /// [`self::webrtc::WebRtcPeer`] handle for gateway-side wiring
     /// after [`Self::handle_offer`]. Returns `None` if the peer has
@@ -3000,6 +3052,55 @@ pub(crate) fn gated_input_handler(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    fn reaper_fixture(
+        peer_id: PeerId,
+    ) -> (
+        Arc<RwLock<HashMap<PeerId, Arc<webrtc::WebRtcPeer>>>>,
+        Arc<RwLock<HashSet<PeerId>>>,
+        Arc<DisplayMetricsCounters>,
+        Arc<webrtc::WebRtcPeer>,
+    ) {
+        let peer = Arc::new(webrtc::WebRtcPeer::new_for_test(peer_id, Vec::new()));
+        let peers = Arc::new(RwLock::new(HashMap::from([(peer_id, Arc::clone(&peer))])));
+        let tile_subscribers = Arc::new(RwLock::new(HashSet::from([peer_id])));
+        let counters = Arc::new(DisplayMetricsCounters::new());
+        counters.peer_count.store(1, Ordering::Relaxed);
+        (peers, tile_subscribers, counters, peer)
+    }
+
+    #[tokio::test]
+    async fn reap_removes_the_registered_peer_and_decrements_the_gauge() {
+        let (peers, subs, counters, peer) = reaper_fixture(7);
+        assert!(reap_peer_registration(&peers, &subs, &counters, 7, &peer).await);
+        assert!(peers.read().await.is_empty());
+        assert!(subs.read().await.is_empty());
+        assert_eq!(counters.peer_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn reap_leaves_a_replacement_peer_registered_under_the_same_id() {
+        let (peers, subs, counters, old_peer) = reaper_fixture(7);
+        let replacement = Arc::new(webrtc::WebRtcPeer::new_for_test(7, Vec::new()));
+        peers.write().await.insert(7, Arc::clone(&replacement));
+        assert!(!reap_peer_registration(&peers, &subs, &counters, 7, &old_peer).await);
+        assert!(Arc::ptr_eq(
+            peers.read().await.get(&7).expect("replacement stays"),
+            &replacement
+        ));
+        assert!(subs.read().await.contains(&7));
+        assert_eq!(counters.peer_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn reap_is_a_no_op_after_remove_peer_already_deregistered() {
+        let (peers, subs, counters, peer) = reaper_fixture(7);
+        peers.write().await.remove(&7);
+        subs.write().await.remove(&7);
+        counters.peer_count.store(0, Ordering::Relaxed);
+        assert!(!reap_peer_registration(&peers, &subs, &counters, 7, &peer).await);
+        assert_eq!(counters.peer_count.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn tile_damage_uses_xdamage_only_for_x11_backend() {

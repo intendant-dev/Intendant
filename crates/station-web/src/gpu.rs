@@ -6,7 +6,7 @@ use wasm_bindgen::JsValue;
 #[cfg(target_arch = "wasm32")]
 use web_sys::HtmlCanvasElement;
 
-use crate::panes::PaneTarget;
+use crate::panes::{PaneTarget, PaneZone};
 use crate::scene::{rotate_x, rotate_y, Plane, ProjectedNode, Vec2, Vec3};
 use crate::text_atlas::TextAtlas;
 use crate::util::Color;
@@ -249,12 +249,11 @@ impl GpuState {
                 },
             ],
         });
-        let text_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Station Text Pipeline Layout"),
-                bind_group_layouts: &[Some(&atlas_layout)],
-                immediate_size: 0,
-            });
+        let text_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Station Text Pipeline Layout"),
+            bind_group_layouts: &[Some(&atlas_layout)],
+            immediate_size: 0,
+        });
         let text_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Station Text Pipeline"),
             layout: Some(&text_pipeline_layout),
@@ -422,7 +421,8 @@ impl GpuState {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
-        self.depth_view = Self::create_depth_view(&self.device, self.config.width, self.config.height);
+        self.depth_view =
+            Self::create_depth_view(&self.device, self.config.width, self.config.height);
     }
 
     pub(crate) fn render(
@@ -689,6 +689,10 @@ pub(crate) struct GpuFrame {
     /// of `projected_nodes` (`input::pick_pane` intersects pointer rays
     /// with these).
     pub(crate) pane_targets: Vec<PaneTarget>,
+    /// Projected screen rects for pane pills (panes.rs) — adopted into
+    /// `hit_zones` by the HUD pass when a world pane replaces the
+    /// screen focus panel.
+    pub(crate) pane_zones: Vec<PaneZone>,
 }
 
 impl GpuFrame {
@@ -700,6 +704,7 @@ impl GpuFrame {
         self.text_vertices.clear();
         self.projected_nodes.clear();
         self.pane_targets.clear();
+        self.pane_zones.clear();
     }
 
     pub(crate) fn add_line_ndc(&mut self, a: Vec2, za: f32, b: Vec2, zb: f32, color: Color) {
@@ -1060,7 +1065,14 @@ mod tests {
         assert!((frame.line_vertices[0].depth - 0.1).abs() < 1e-6);
         assert!((frame.line_vertices[1].depth - 0.7).abs() < 1e-6);
         // The glow halo's quad corners inherit their own endpoint's depth.
-        frame.add_glow_line_ndc(Vec2::new(0.0, 0.0), 0.2, Vec2::new(1.0, 0.0), 0.8, Color::rgb(0, 0, 255), 0.01);
+        frame.add_glow_line_ndc(
+            Vec2::new(0.0, 0.0),
+            0.2,
+            Vec2::new(1.0, 0.0),
+            0.8,
+            Color::rgb(0, 0, 255),
+            0.01,
+        );
         let quad = &frame.tri_vertices[..6];
         assert_eq!(
             quad.iter().map(|v| v.depth).collect::<Vec<_>>(),
@@ -1087,12 +1099,26 @@ mod tests {
     fn glow_lines_add_quad_plus_bright_core() {
         let mut frame = GpuFrame::default();
         let color = Color::rgb(0, 0, 255);
-        frame.add_glow_line_ndc(Vec2::new(0.0, 0.0), 0.0, Vec2::new(1.0, 0.0), 0.0, color, 0.01);
+        frame.add_glow_line_ndc(
+            Vec2::new(0.0, 0.0),
+            0.0,
+            Vec2::new(1.0, 0.0),
+            0.0,
+            color,
+            0.01,
+        );
         assert_eq!(frame.tri_vertices.len(), 6, "thick halo quad");
         assert_eq!(frame.line_vertices.len(), 2, "thin bright core");
         assert!(frame.tri_vertices[0].color[3] < frame.line_vertices[0].color[3]);
         // Degenerate (zero-length) glow segments skip the quad, not crash.
-        frame.add_glow_line_ndc(Vec2::new(0.5, 0.5), 0.0, Vec2::new(0.5, 0.5), 0.0, color, 0.01);
+        frame.add_glow_line_ndc(
+            Vec2::new(0.5, 0.5),
+            0.0,
+            Vec2::new(0.5, 0.5),
+            0.0,
+            color,
+            0.01,
+        );
         assert_eq!(frame.tri_vertices.len(), 6);
         assert_eq!(frame.line_vertices.len(), 4);
 

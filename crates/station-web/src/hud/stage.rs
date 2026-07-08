@@ -411,10 +411,7 @@ impl StationInner {
                 nonempty(&controls.session_goal_objective, "(no objective)")
             );
             if !controls.session_goal_tokens.trim().is_empty() {
-                goal_line.push_str(&format!(
-                    " ({} tok)",
-                    controls.session_goal_tokens.trim()
-                ));
+                goal_line.push_str(&format!(" ({} tok)", controls.session_goal_tokens.trim()));
             }
             self.text(
                 &truncate(&goal_line, ((w * 0.46) / 5.6).max(46.0) as usize),
@@ -668,6 +665,16 @@ impl StationInner {
                 cy + ring_scale * 0.7,
             ),
         ];
+        // World panes own their screen area: a summary card that would
+        // paint over an in-scene panel is skipped for the frame (the HUD
+        // canvas sits above the scene canvas, so it would otherwise cover
+        // the pane). Canvas-fallback frames draw no solid panes, so
+        // nothing is skipped there.
+        let pane_rects = if self.gpu.is_some() {
+            self.pane_css_rects()
+        } else {
+            Vec::new()
+        };
         for (id, nx, ny) in node_specs {
             if let Some(target) = targets.iter().find(|target| target.id == id) {
                 let node_w = if id == "system:peers" {
@@ -680,15 +687,17 @@ impl StationInner {
                 } else {
                     node_h
                 };
-                self.station_orbital_node(
-                    cx,
-                    cy,
-                    nx.clamp(x + 20.0, x + w - node_w - 20.0),
-                    ny.clamp(y + 58.0, y + core_h - node_h - 20.0),
-                    node_w,
-                    node_h,
-                    target,
-                );
+                let node_x = nx.clamp(x + 20.0, x + w - node_w - 20.0);
+                let node_y = ny.clamp(y + 58.0, y + core_h - node_h - 20.0);
+                if pane_rects.iter().any(|(_, px, py, pw, ph)| {
+                    node_x < px + pw
+                        && node_x + node_w > *px
+                        && node_y < py + ph
+                        && node_y + node_h > *py
+                }) {
+                    continue;
+                }
+                self.station_orbital_node(cx, cy, node_x, node_y, node_w, node_h, target);
             }
         }
 
@@ -965,6 +974,24 @@ impl StationInner {
         // Sit just above the activity lane, wherever density placed it.
         let activity_lane_y = (h - lane_metrics(self.density, h).2 - 24.0).max(282.0);
         if let Some(agent) = self.snapshot.agents.iter().find(|a| a.id == id).cloned() {
+            // Phase C slice 5: when the scene carried this agent's focus
+            // as a world pane this frame (flag on, wide viewport — the
+            // pane registered a pick target), and WebGPU actually renders
+            // it (the canvas fallback draws lines only, so the pane would
+            // be invisible there), the screen panel yields. The pane's
+            // projected pill rects become this frame's hit zones, so
+            // activate()-by-name, a11y hotspots, and rect picking keep
+            // working over the in-scene pills.
+            if self.gpu.is_some() && self.frame.pane_targets.iter().any(|t| t.id == id) {
+                let zones: Vec<HitZone> = self
+                    .frame
+                    .pane_zones
+                    .iter()
+                    .map(|z| HitZone::new(z.x, z.y, z.w, z.h, z.action.clone()))
+                    .collect();
+                self.hit_zones.extend(zones);
+                return;
+            }
             self.draw_agent_focus(&agent, x, panel_w, activity_lane_y);
             return;
         }
