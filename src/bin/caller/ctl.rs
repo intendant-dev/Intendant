@@ -2,7 +2,7 @@ use base64::Engine;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use intendant_core::net::DEFAULT_GATEWAY_PORT as DEFAULT_PORT;
 
@@ -217,29 +217,21 @@ fn clean_opt(value: Option<String>) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Resolve `--peer <needle>` against the project's `[[peer]]` configuration
-/// and switch the invocation to peer routing: point `base_url` at the peer's
-/// stateless JSON-RPC `/mcp` endpoint, adopt the peer's outbound bearer, and
-/// build the mTLS-capable HTTP client whose client certificate binds the
-/// principal the peer's IAM profile authorizes.
+/// Resolve `--peer <needle>` against the `[[peer]]` configuration — project
+/// first, user-level fallback second — and switch the invocation to peer
+/// routing: point `base_url` at the peer's stateless JSON-RPC `/mcp`
+/// endpoint, adopt the peer's outbound bearer, and build the mTLS-capable
+/// HTTP client whose client certificate binds the principal the peer's IAM
+/// profile authorizes.
 fn configure_peer_mode(config: &mut Config, needle: &str) -> Result<reqwest::Client, String> {
     let project = crate::project::Project::detect()
         .map_err(|e| format!("--peer could not load the project configuration: {e}"))?;
-    let config_path = project.root.join("intendant.toml");
-    if !config_path.exists() {
-        return Err(format!(
-            "no intendant.toml found at {} (project root detected from the current directory); \
-             --peer needs the project's [[peer]] configuration",
-            config_path.display()
-        ));
-    }
-    if project.config.peers.is_empty() {
-        return Err(format!(
-            "{} has no [[peer]] entries; --peer needs the target peer configured there",
-            config_path.display()
-        ));
-    }
-    let peer = resolve_peer(&project.config.peers, needle)?;
+    let peer = resolve_peer_with_user_fallback(
+        &project.config.peers,
+        &project.root.join("intendant.toml"),
+        &user_peers_file(),
+        needle,
+    )?;
     config.base_url = peer_mcp_endpoint(&peer.card_url)?;
     config.bearer = peer.bearer_token.clone();
 
@@ -252,7 +244,7 @@ fn configure_peer_mode(config: &mut Config, needle: &str) -> Result<reqwest::Cli
     // Explicit [[peer]] client_cert/client_key wins (same pairing rule the
     // daemon applies at peer boot); otherwise fall back to the installed
     // access client identity for TLS peers.
-    let identity = crate::startup::peer_boot::peer_client_identity_from_config(peer)
+    let identity = crate::startup::peer_boot::peer_client_identity_from_config(&peer)
         .map_err(|e| format!("peer '{needle}': {e}"))?
         .or_else(|| {
             if crate::peer::transport::tls_client::url_uses_tls(&config.base_url) {
@@ -268,6 +260,75 @@ fn configure_peer_mode(config: &mut Config, needle: &str) -> Result<reqwest::Cli
         identity.as_ref(),
     )
     .map_err(|e| format!("peer '{needle}': failed to build TLS client: {e}"))
+}
+
+/// Two-layer `--peer` resolution: the project's `[[peer]]` entries first
+/// (unchanged behavior), then — only when the project yields ZERO matches,
+/// including when there is no project config at all — the user-level peers
+/// file. Both layers use the same matching rules ([`peer_matches`]). Because
+/// the project layer wins outright whenever it matches at all, an ambiguous
+/// match ACROSS the two layers cannot arise by construction; ambiguity
+/// within a single layer stays an error.
+///
+/// SCOPE GUARD: the user-level peers file is a `ctl --peer` RESOLUTION
+/// fallback ONLY. Daemon startup (`startup/peer_boot.rs`) must keep
+/// federating from the project config alone — a daemon that auto-federates
+/// with every peer in a machine-global file would be a semantic change
+/// nobody asked for.
+fn resolve_peer_with_user_fallback(
+    project_peers: &[crate::project::PeerConfig],
+    project_config_path: &Path,
+    user_peers_path: &Path,
+    needle: &str,
+) -> Result<crate::project::PeerConfig, String> {
+    if project_peers.iter().any(|peer| peer_matches(peer, needle)) {
+        return resolve_peer(project_peers, needle).cloned();
+    }
+    let user_peers = load_user_peers(user_peers_path)?;
+    if user_peers.iter().any(|peer| peer_matches(peer, needle)) {
+        return resolve_peer(&user_peers, needle).cloned();
+    }
+    Err(format!(
+        "no configured peer matches '{needle}'; searched {} and {}",
+        describe_peer_source(project_config_path, project_peers),
+        describe_peer_source(user_peers_path, &user_peers),
+    ))
+}
+
+/// The user-level peers file: `[[peer]]` entries in the same shape as the
+/// project config's, at `<state root>/peers.toml` — `~/.intendant/peers.toml`
+/// by default, relocated by `$INTENDANT_HOME` (which is also what keeps
+/// hermetic harnesses away from the real user's file). Peers are
+/// machine-scoped identities — their `client_cert`/`client_key` paths are
+/// absolute, like the access certs already under the state root — not
+/// project state, so a peer recorded here is reachable from any working
+/// directory.
+fn user_peers_file() -> PathBuf {
+    crate::platform::intendant_home().join("peers.toml")
+}
+
+/// Load `[[peer]]` entries from the user-level peers file. A missing file
+/// is simply "no user-level peers" (Ok, empty); an unreadable or
+/// unparseable file the user did write fails loud instead of being
+/// silently skipped.
+fn load_user_peers(path: &Path) -> Result<Vec<crate::project::PeerConfig>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read user-level peers file {}: {e}", path.display()))?;
+    #[derive(serde::Deserialize)]
+    struct UserPeersFile {
+        #[serde(default, rename = "peer")]
+        peers: Vec<crate::project::PeerConfig>,
+    }
+    let parsed: UserPeersFile = toml::from_str(&content).map_err(|e| {
+        format!(
+            "failed to parse user-level peers file {}: {e}",
+            path.display()
+        )
+    })?;
+    Ok(parsed.peers)
 }
 
 /// Pick the `[[peer]]` entry `--peer <needle>` refers to. A peer matches when
@@ -342,6 +403,30 @@ fn describe_peer(peer: &crate::project::PeerConfig) -> String {
         (Some(label), None) => label.to_string(),
         (None, Some(host)) => host,
         (None, None) => peer.card_url.clone(),
+    }
+}
+
+/// Render one resolution layer for the no-match error: its path plus either
+/// the peers it configures or why it contributed none — so the error names
+/// both locations `--peer` searched and where a fix belongs.
+fn describe_peer_source(path: &Path, peers: &[crate::project::PeerConfig]) -> String {
+    if peers.is_empty() {
+        let why = if path.exists() {
+            "no [[peer]] entries"
+        } else {
+            "not found"
+        };
+        format!("{} ({why})", path.display())
+    } else {
+        format!(
+            "{} (peers: {})",
+            path.display(),
+            peers
+                .iter()
+                .map(describe_peer)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 }
 
@@ -1861,7 +1946,7 @@ Usage: intendant ctl [global flags] <command> [args]\n\
 Global flags:\n\
   --url URL                 MCP URL (default http://localhost:8765/mcp)\n\
   --port PORT               Dashboard/MCP port when --url is omitted\n\
-  --peer ID                 Route commands to a federated peer's /mcp over mTLS ([[peer]] label or host); authorized by the profile the peer granted this daemon\n\
+  --peer ID                 Route commands to a federated peer's /mcp over mTLS ([[peer]] label or host, from the project intendant.toml or ~/.intendant/peers.toml); authorized by the profile the peer granted this daemon\n\
   --session ID              Session id to bind to the MCP request\n\
   --managed-context MODE    vanilla or managed\n\
   --json                    Print parsed JSON where possible\n\
@@ -2503,6 +2588,178 @@ mod tests {
         assert!(err.contains("no configured peer matches 'nope'"), "{err}");
         assert!(err.contains("nicks-mac (mac.example)"), "{err}");
         assert!(err.contains("dell.example"), "{err}");
+    }
+
+    #[test]
+    fn user_fallback_resolves_when_project_has_no_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("peers.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[[peer]]
+card_url = "https://dell.example/.well-known/agent-card.json"
+label = "dell"
+bearer_token = "tok"
+"#,
+        )
+        .expect("write user peers");
+        // No project config at all — and the same matching rules (here the
+        // `intendant:<label>` suffix form) apply to the user layer.
+        let peer = resolve_peer_with_user_fallback(
+            &[],
+            &dir.path().join("intendant.toml"),
+            &user_path,
+            "intendant:dell",
+        )
+        .expect("user-level fallback resolves");
+        assert_eq!(peer.label.as_deref(), Some("dell"));
+        assert_eq!(peer.bearer_token.as_deref(), Some("tok"));
+        assert_eq!(
+            peer.card_url,
+            "https://dell.example/.well-known/agent-card.json"
+        );
+    }
+
+    #[test]
+    fn project_match_wins_without_reading_the_user_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("peers.toml");
+        // Deliberately corrupt: a project match must short-circuit before
+        // the user layer is even read, so this must not error.
+        std::fs::write(&user_path, "not [ valid toml").expect("write corrupt user peers");
+        let project_peers = vec![peer_config(
+            "https://project.example/.well-known/agent-card.json",
+            Some("dell"),
+        )];
+        let peer = resolve_peer_with_user_fallback(
+            &project_peers,
+            &dir.path().join("intendant.toml"),
+            &user_path,
+            "dell",
+        )
+        .expect("project layer wins");
+        assert_eq!(
+            peer.card_url,
+            "https://project.example/.well-known/agent-card.json"
+        );
+    }
+
+    #[test]
+    fn user_fallback_no_match_error_names_both_locations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_config = dir.path().join("intendant.toml");
+        std::fs::write(&project_config, "").expect("write project config");
+        let user_path = dir.path().join("peers.toml");
+        std::fs::write(
+            &user_path,
+            "[[peer]]\ncard_url = \"https://dell.example/.well-known/agent-card.json\"\n",
+        )
+        .expect("write user peers");
+        let project_peers = vec![peer_config(
+            "https://mac.example:8766/.well-known/agent-card.json",
+            Some("nicks-mac"),
+        )];
+        let err =
+            resolve_peer_with_user_fallback(&project_peers, &project_config, &user_path, "nope")
+                .expect_err("no match is an error");
+        assert!(err.contains("no configured peer matches 'nope'"), "{err}");
+        assert!(
+            err.contains(&project_config.display().to_string()),
+            "names the project config: {err}"
+        );
+        assert!(
+            err.contains(&user_path.display().to_string()),
+            "names the user peers file: {err}"
+        );
+        assert!(
+            err.contains("nicks-mac (mac.example)"),
+            "lists project peers: {err}"
+        );
+        assert!(err.contains("dell.example"), "lists user peers: {err}");
+    }
+
+    #[test]
+    fn user_fallback_no_match_error_marks_absent_files_as_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_config = dir.path().join("intendant.toml");
+        let user_path = dir.path().join("peers.toml");
+        let err = resolve_peer_with_user_fallback(&[], &project_config, &user_path, "dell")
+            .expect_err("nothing configured anywhere is an error");
+        assert!(err.contains("no configured peer matches 'dell'"), "{err}");
+        assert!(
+            err.contains(&format!("{} (not found)", project_config.display())),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("{} (not found)", user_path.display())),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ambiguity_within_the_user_layer_stays_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("peers.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[[peer]]
+card_url = "https://one.example/.well-known/agent-card.json"
+label = "twin"
+
+[[peer]]
+card_url = "https://two.example/.well-known/agent-card.json"
+label = "twin"
+"#,
+        )
+        .expect("write user peers");
+        let err = resolve_peer_with_user_fallback(
+            &[],
+            &dir.path().join("intendant.toml"),
+            &user_path,
+            "twin",
+        )
+        .expect_err("ambiguous within one layer is an error");
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("twin (one.example)"), "{err}");
+        assert!(err.contains("twin (two.example)"), "{err}");
+    }
+
+    #[test]
+    fn load_user_peers_missing_file_is_empty_and_invalid_file_is_loud() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("peers.toml");
+        assert!(
+            load_user_peers(&path)
+                .expect("missing file means no user-level peers")
+                .is_empty()
+        );
+        std::fs::write(&path, "not [ valid toml").expect("write corrupt file");
+        let err = load_user_peers(&path).expect_err("corrupt file errors");
+        assert!(
+            err.contains(&path.display().to_string()),
+            "names the file: {err}"
+        );
+    }
+
+    /// The user-level fallback file must live under the state root
+    /// (`intendant_home()`): intendant-core's state_paths tests pin that
+    /// `$INTENDANT_HOME` relocates that root (and its default follows
+    /// `$HOME`), so this derivation is what isolates hermetic harnesses —
+    /// the e2e rigs point `HOME` at a temp dir and their spawned binaries
+    /// then derive the peers path under the rig home, never the developer's
+    /// real `~/.intendant/peers.toml`. Pure path computation: the test
+    /// itself reads nothing from the real home. (In this bin's test build
+    /// `intendant_home()` is process-cached and env mutation races the
+    /// parallel runner — per the state_paths convention, behavior tests
+    /// thread explicit paths instead, as the tests above do.)
+    #[test]
+    fn user_peers_file_is_under_the_state_root() {
+        assert_eq!(
+            user_peers_file(),
+            crate::platform::intendant_home().join("peers.toml")
+        );
     }
 
     #[test]

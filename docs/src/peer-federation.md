@@ -328,10 +328,17 @@ work — reach for direct CU when this agent needs to see or drive the peer's
 screen itself.
 
 The same side-channel is reachable from the CLI with **no daemon in the
-loop**: `intendant ctl --peer <id> …` resolves the `[[peer]]` entry from
-`intendant.toml` (label case-insensitive, card_url host, exact card_url, or
-the suffix of an `intendant:<label>` peer id), derives the `/mcp` endpoint
-from the card_url origin, and builds the same pinned mTLS client — explicit
+loop**: `intendant ctl --peer <id> …` resolves the `[[peer]]` entry from the
+project's `intendant.toml` first and, when the project yields no match (or
+has no config at all), from the user-level `~/.intendant/peers.toml`
+(`$INTENDANT_HOME/peers.toml` under an overridden state root) — peers are
+machine-scoped identities, so a pairing recorded there works from any
+working directory. Both layers use the same matching rules (label
+case-insensitive, card_url host, exact card_url, or the suffix of an
+`intendant:<label>` peer id); a project match always wins, and only
+`ctl --peer` reads the user-level file — daemon boot federates from the
+project config alone. Resolution then derives the `/mcp` endpoint from the
+card_url origin and builds the same pinned mTLS client — explicit
 `client_cert`/`client_key` first (the peer-boot pairing rule; half-set
 config errors out), else the installed access identity for TLS targets.
 Every existing ctl subcommand then drives the peer:
