@@ -7,24 +7,30 @@
 <link rel="icon" type="image/png" sizes="128x128" href="/icon-128.png" id="favicon">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="manifest" href="/manifest.webmanifest">
-<meta name="theme-color" content="#11111b">
+<meta name="theme-color" content="#0B0C10">
 <script>
   // ui-v2 flag (design-overhaul program): decide before first paint so
   // neither UI generation flashes. `?ui=v2` / `?ui=v1` overrides and
-  // persists; otherwise localStorage wins; default stays v1 until the
-  // program flips it. The class lives on <html> — all v2 styles are
-  // scoped under `html.ui-v2` and are inert without it.
+  // persists; otherwise localStorage wins. v2 is the DEFAULT since the
+  // P3 flip — `?ui=v1` (or a stored '0') is the soak-period escape
+  // hatch until the v1 chrome is deleted. The class lives on <html> —
+  // all v2 styles are scoped under `html.ui-v2` and inert without it.
   (function () {
-    var on = false;
+    var on = true;
     try {
       var q = new URLSearchParams(location.search).get('ui');
       if (q === 'v2' || q === 'v1') {
         on = q === 'v2';
         localStorage.setItem('intendant.ui2', on ? '1' : '0');
       } else {
-        on = localStorage.getItem('intendant.ui2') === '1';
+        on = localStorage.getItem('intendant.ui2') !== '0';
       }
-    } catch (e) { /* storage unavailable: stay v1 */ }
+    } catch (e) { /* storage unavailable: v2 default */ }
     if (on) document.documentElement.classList.add('ui-v2');
+    else {
+      // v1 keeps its Catppuccin crust tab tint during the soak.
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute('content', '#11111b');
+    }
   })();
 </script>

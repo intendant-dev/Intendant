@@ -175,7 +175,10 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   `crates/app-html-assembler`; CI enforces the match). Edit the fragments,
   never the artifact. Merge conflicts: resolve them in the fragments, run
   `cargo run -p app-html-assembler`, then `git add static/app.html` — never
-  hand-reconcile the generated file.
+  hand-reconcile the generated file. The dashboard ships the **ui-v2 chrome
+  by default** (design overhaul: `ui2-*` fragments + the `16-styles-v2-tokens`
+  palette, all scoped under `html.ui-v2`); `?ui=v1` is the soak-period escape
+  hatch until the v1 chrome/Catppuccin generation is deleted.
 - Pure-safe Rust by default. The Unix (macOS / Linux) code paths keep `unsafe`
   confined to documented islands: small platform probes/signals and display or
   identity queries in `platform.rs` (now `crates/intendant-platform`); macOS Accessibility bindings in `ax.rs`
