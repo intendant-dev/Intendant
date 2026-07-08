@@ -4,7 +4,9 @@
 > access system is shaped the way it is, what each piece of infrastructure is
 > allowed to do, and the order in which the remaining pieces land. The
 > operational reference for the UI lives in [Web Dashboard → Access](./web-dashboard.md#access);
-> the daemon-to-daemon layer is in [Peer Federation](./peer-federation.md).
+> the daemon-to-daemon layer is in [Peer Federation](./peer-federation.md);
+> the fleet-level operating model built on these mechanisms — which client
+> for which daemon, custody per tier — is [Trust Tiers](./trust-tiers.md).
 
 Intendant's goal is a **network of agentic networks**: daemons (agents) owned
 by people and organizations, where an owner can grant other people and other

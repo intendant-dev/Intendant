@@ -13,6 +13,7 @@
 - [Self-Hosted Rendezvous](./self-hosted-rendezvous.md)
 - [Credential Custody: the Vault and Leases](./credential-custody.md)
 - [Trust Architecture](./trust-architecture.md)
+- [Trust Tiers](./trust-tiers.md)
 - [Computer Use & Live Audio](./computer-use-and-audio.md)
 - [Presence Layer](./presence.md)
 - [Autonomy & Approvals](./autonomy.md)
