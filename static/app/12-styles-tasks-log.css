@@ -124,7 +124,7 @@
   align-items: center;
   gap: 8px;
   padding: 7px 12px;
-  background: #11111a;
+  background: var(--crust);
   border-bottom: 1px solid var(--surface0);
   flex-shrink: 0;
 }
@@ -154,7 +154,7 @@
   background:
     radial-gradient(circle at 18% 20%, color-mix(in srgb, var(--blue) 18%, transparent), transparent 30%),
     radial-gradient(circle at 84% 78%, color-mix(in srgb, var(--green) 12%, transparent), transparent 28%),
-    linear-gradient(145deg, #101018 0%, var(--mantle) 62%, #11111a 100%);
+    linear-gradient(145deg, var(--crust) 0%, var(--mantle) 62%, var(--crust) 100%);
 }
 #context-scene {
   display: block;
@@ -427,7 +427,7 @@ body.context-focus-active {
   font-weight: 600;
   cursor: pointer;
 }
-.stop-btn:hover { background: #e06c75; }
+.stop-btn:hover { background: var(--red); }
 .stop-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ── Global Task Bar ──

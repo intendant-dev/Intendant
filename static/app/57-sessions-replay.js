@@ -2560,7 +2560,7 @@ function sessionDetailVisibleLevels() {
 const sessionDetailLevelColors = {
   model: 'var(--blue)', agent: 'var(--teal)', error: 'var(--red)',
   warn: 'var(--yellow)', subagent: 'var(--mauve)', presence: 'var(--green)',
-  detail: '#a2a8be', debug: 'var(--overlay1)',
+  detail: 'var(--log-detail)', debug: 'var(--overlay1)',
 };
 const sessionDetailSourceLabels = {
   system: '\u2139', worker: 'Model', agent: 'Run',
