@@ -107,25 +107,28 @@ pub mod transport;
 pub mod upcast;
 
 pub use card::{
-    AgentCard, ApplicationAuth, AuthRequirements, Capability, McpTransportKind, OpenClawRole,
+    AgentCard, ApplicationAuth, AuthRequirements, Capability,
     TransportAuth, TransportSpec,
 };
-pub use coordinator::{Coordinator, CoordinatorError, RoutedTask, TaskRequest};
+pub use coordinator::{Coordinator, CoordinatorError, TaskRequest};
 pub use event::{
     ActivityId, ActivityKind, ActivityOutcome, ApprovalDecision, ApprovalRequest, LogLevel,
-    MessageContent, MessageId, MessagePart, MessageRole, ModelUsage, PeerDisplayInfo, PeerEvent,
-    PeerMessage, PeerStatus, SessionInfo, TaggedPeerEvent, TaskId, TaskUpdate, UsageSnapshot,
+    MessageContent, MessageId, MessageRole, ModelUsage, PeerDisplayInfo, PeerEvent,
+    PeerMessage, PeerStatus, SessionInfo, UsageSnapshot,
     WebRtcSessionId, WebRtcSignal,
 };
 pub use handle::{
-    spawn_peer, ConnectionState, PeerHandle, PeerSnapshot, BROADCAST_CAPACITY, COMMANDS_CAPACITY,
-    EVENTS_CAPACITY,
+    ConnectionState, PeerHandle, PeerSnapshot,
 };
 pub use id::PeerId;
-pub use log_writer::{spawn_peer_log_writer, LOG_CHANNEL_CAPACITY};
-pub use registry::{PeerRegistry, RegistryEvent, REGISTRY_BROADCAST_CAPACITY};
-pub use traits::{check_feature, PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures};
-pub use upcast::{AppEventUpcaster, WireEventUpcaster};
+// LOG_CHANNEL_CAPACITY has cfg(test) consumers only (the mcp_http and
+// mcp tools_peer rigs) — a plain build's unused-import lint can't see
+// them, so the allow keeps a cleanup pass from stripping it again.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub use log_writer::LOG_CHANNEL_CAPACITY;
+pub use log_writer::spawn_peer_log_writer;
+pub use registry::{PeerRegistry, RegistryEvent};
+pub use traits::PeerTask;
 
 // ---------------------------------------------------------------------------
 // Errors

@@ -50,6 +50,12 @@ pub fn sanitize_session_id(raw: &str) -> Option<String> {
 /// Path shape: `<intendant_state_dir>/diagnostics/visual-freshness/<session_id>.ndjson`.
 /// `intendant_state_dir` is `platform::intendant_home()` — `~/.intendant`
 /// unless `$INTENDANT_HOME` overrides it, matching the session-log writer.
+///
+/// Production-dormant but kept: the ambient twin of
+/// `append_visual_freshness_record` (which is production-used) for the
+/// read side, pinned by tests; the explicit `_in` variant is what live
+/// callers use today.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn visual_freshness_path(session_id: &str) -> Option<PathBuf> {
     visual_freshness_path_in(&intendant_state_dir(), session_id)
 }

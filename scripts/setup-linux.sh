@@ -261,30 +261,45 @@ install_rust() {
 
 # ── wasm-pack ─────────────────────────────────────────────────────────────
 
+# Pinned to the version the committed wasm blobs were built with —
+# single-sourced from .wasm-pack-version (build.rs enforces the same pin
+# and skips rebuilds under any other version). `cargo install` resolves
+# outside our Cargo.lock, so the exact version is the pin.
+wasm_pack_pin() {
+    tr -d '[:space:]' < "$REPO_ROOT/.wasm-pack-version"
+}
+
 check_wasm_pack() {
     echo ""
     info "WASM build tools:"
 
-    if has_cmd wasm-pack; then
-        ok "wasm-pack $(wasm-pack --version 2>/dev/null | cut -d' ' -f2)"
+    local pin installed
+    pin="$(wasm_pack_pin)"
+    installed="$(wasm-pack --version 2>/dev/null | cut -d' ' -f2 || true)"
+    if [ "$installed" = "$pin" ]; then
+        ok "wasm-pack $installed (pinned)"
         return 0
     fi
 
-    miss "wasm-pack" "cargo install wasm-pack --version 0.14.0 --locked"
+    if [ -n "$installed" ]; then
+        miss "wasm-pack $installed != pin $pin" "cargo install wasm-pack --version $pin --locked --force"
+    else
+        miss "wasm-pack" "cargo install wasm-pack --version $pin --locked"
+    fi
     return 1
 }
 
 install_wasm_pack() {
-    if has_cmd wasm-pack; then
-        info "wasm-pack already installed"
+    local pin installed
+    pin="$(wasm_pack_pin)"
+    installed="$(wasm-pack --version 2>/dev/null | cut -d' ' -f2 || true)"
+    if [ "$installed" = "$pin" ]; then
+        info "wasm-pack already at the pinned version"
         return
     fi
 
-    info "installing wasm-pack (this may take a minute)..."
-    # Pinned: `cargo install` resolves outside our Cargo.lock, so an exact
-    # version (the one the committed wasm blobs were built with) plus
-    # --locked is the only reproducibility we get for it.
-    cargo install wasm-pack --version 0.14.0 --locked
+    info "installing wasm-pack $pin (this may take a minute)..."
+    cargo install wasm-pack --version "$pin" --locked --force
     ok "wasm-pack installed"
 }
 
