@@ -15922,7 +15922,7 @@ html.ui-v2 #tab-sessions .sessions-title {
 }
 
 /* Toolbar fold: the full v1 control row, one reveal away. */
-html.ui-v2 #tab-sessions .ui2-tools-toggle { padding: 6px 11px; }
+html.ui-v2 #tab-sessions .ui2-tools-toggle { padding: 7px 11px; } /* equal height with Refresh */
 html.ui-v2 #tab-sessions .ui2-tools-badge {
   font-family: var(--mono);
   font-size: 10px;
@@ -15946,6 +15946,23 @@ html.ui-v2 #tab-sessions .sessions-header.ui2-tools-open .sessions-toolbar {
   border-radius: 12px;
   background: var(--surface);
 }
+/* v1's fixed track plans overflow once the fold adds 26px of card chrome
+   (padding + border): the sort column escaped the card and the fixed-min
+   filter buttons spilled across their gaps. Re-plan per pane with
+   flexible tracks and let every control fill its track. */
+html.ui-v2 #sessions-pane-recent .sessions-header.ui2-tools-open .sessions-toolbar {
+  grid-template-columns: minmax(150px, 1.6fr) minmax(128px, 1.1fr) minmax(112px, 1fr) minmax(112px, 1fr) auto minmax(150px, 1.2fr);
+}
+html.ui-v2 #sessions-pane-deep .sessions-header.ui2-tools-open .sessions-toolbar {
+  grid-template-columns: minmax(150px, 1.6fr) minmax(128px, 1.1fr) minmax(112px, 1fr) minmax(112px, 1fr) minmax(150px, 1.2fr);
+}
+html.ui-v2 #sessions-pane-worktrees .sessions-header.ui2-tools-open .sessions-toolbar {
+  grid-template-columns: minmax(190px, 1fr) auto auto auto auto auto minmax(160px, auto);
+}
+html.ui-v2 #tab-sessions .sessions-toolbar .sessions-control,
+html.ui-v2 #tab-sessions .sessions-toolbar .sessions-project-filter { min-width: 0; }
+html.ui-v2 #tab-sessions .sessions-multi-filter-btn { min-width: 0; width: 100%; }
+html.ui-v2 #tab-sessions .sessions-sort select { width: 100%; min-width: 0; }
 
 /* Toolbar field voice + input recipes. */
 html.ui-v2 #tab-sessions .sessions-toolbar .sessions-search > span,
@@ -15989,7 +16006,7 @@ html.ui-v2 #tab-sessions .sessions-multi-filter-menu {
   border: 1px solid var(--line-2);
   border-radius: 12px;
   background: var(--surface);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, .45);
+  box-shadow: var(--shadow-menu);
 }
 html.ui-v2 #tab-sessions .sessions-multi-filter-menu label {
   padding: 6px 8px;
@@ -16024,6 +16041,12 @@ html.ui-v2 #tab-sessions .sessions-toggle {
   transition: border-color var(--t-med), color var(--t-med), background var(--t-med);
 }
 html.ui-v2 #tab-sessions .sessions-toggle input[type="checkbox"] { accent-color: var(--iris); }
+/* Keyboard focus lands on the hidden-in-plain-sight checkbox — surface it
+   on the chip itself so tabbing through the fold stays visible. */
+html.ui-v2 #tab-sessions .sessions-toggle:focus-within {
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
 html.ui-v2 #tab-sessions .sessions-toggle:has(input:checked) {
   border-color: rgba(var(--iris-rgb), .3);
   background: rgba(var(--iris-rgb), .09);
@@ -16146,7 +16169,7 @@ html.ui-v2 #tab-sessions .sessions-host-chip.offline { opacity: .55; }
 
 html.ui-v2 #tab-sessions .sessions-list { gap: 10px; }
 html.ui-v2 #tab-sessions .session-card {
-  padding: 14px 250px 14px 17px;
+  padding: 14px 282px 14px 17px;
   border: 1px solid var(--line);
   border-radius: 13px;
   background: var(--surface);
@@ -16208,6 +16231,7 @@ html.ui-v2 #tab-sessions .session-card .ui-badge {
   font-size: 10px;
   font-weight: 700;
   letter-spacing: .01em;
+  line-height: 15px; /* pin: button chips (lineage) must match span pills */
   border: 1px solid transparent;
   background: var(--surface-3);
   color: var(--text-2);
@@ -16318,15 +16342,15 @@ html.ui-v2 #tab-sessions .session-card .sc-actions {
   top: 50%;
   right: 14px;
   transform: translateY(-50%);
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: flex-end;
-  max-width: 224px;
+  gap: 6px;
 }
 html.ui-v2 #tab-sessions .session-card .sc-actions .ui-btn {
   min-height: 0;
-  padding: 6px 12px;
+  padding: 6px 11px;
   border-radius: 9px;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 700;
   background: transparent;
   border-color: transparent;
@@ -16381,7 +16405,7 @@ html.ui-v2 #tab-sessions .sc-delete-menu {
   border: 1px solid var(--line-2);
   border-radius: 12px;
   background: var(--surface);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, .45);
+  box-shadow: var(--shadow-menu);
   padding: 5px;
 }
 html.ui-v2 #tab-sessions .sc-delete-menu-item {
@@ -17137,6 +17161,7 @@ html.ui-v2 #tab-sessions .session-detail-action-btn:hover:not(:disabled) {
 }
 html.ui-v2 #tab-sessions .session-resume-btn {
   border: 0;
+  padding: 7px 14px; /* +1px vs bordered siblings: keeps all three 30px tall */
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-weight: 800;
@@ -17343,6 +17368,15 @@ html.ui-v2 #tab-sessions .session-detail .empty-state {
 
 @media (max-width: 980px) {
   html.ui-v2 #tab-sessions .sessions-aggregate { grid-template-columns: repeat(2, 1fr); }
+  /* v1's fixed five-track deep-search row clips Run/Clear off the card at
+     narrow widths — let the controls wrap under the explainer instead. */
+  html.ui-v2 #tab-sessions .sessions-deep-search-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+  }
+  html.ui-v2 #tab-sessions .sessions-deep-search-title { flex: 1 1 100%; min-width: 0; }
+  html.ui-v2 #tab-sessions .sessions-deep-search-query { flex: 1 1 200px; min-width: 0; }
   html.ui-v2 #tab-sessions .sessions-header.ui2-tools-open .sessions-toolbar,
   html.ui-v2 #tab-sessions .worktrees-header .sessions-toolbar {
     grid-template-columns: 1fr 1fr;
