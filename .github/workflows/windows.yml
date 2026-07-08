@@ -63,6 +63,14 @@ concurrency:
 jobs:
   test:
     name: test (${{ matrix.os }})
+    # CI probe (task #45; the follow-up PR removes this guard): skip this
+    # required job on the probe branch's own pull_request runs, to verify
+    # the merge queue accepts a created-then-skipped required check
+    # (distinct from a never-created one, which wedges at "Expected").
+    # `head_ref` is only set on pull_request events, so every other run —
+    # pushes, other PRs, and this PR's own merge-group gate — executes
+    # normally.
+    if: github.head_ref != 'ci-skip-probe'
     # Trust-based routing: our own refs (pushes, merge-queue refs, same-repo
     # PRs — every agent landing) run on the self-hosted fleet for speed;
     # fork PRs run on GitHub-hosted runners so external code never executes
