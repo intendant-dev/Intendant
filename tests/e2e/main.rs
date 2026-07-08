@@ -1364,3 +1364,135 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
 
     let _ = daemon_b.child.kill().await;
 }
+
+/// A supervised session under the web gateway surfaces Ask-category
+/// approvals on the dashboard instead of failing closed. The launch used
+/// to hard-code `headless: true`, so a CreateSession'd session auto-denied
+/// gated commands with "Approval required in headless mode" even though
+/// the dispatch table routes Approve/Deny/Skip into the session's own
+/// approval registry — and the spawn_sub_agent contract documents children
+/// as having "their own approvals". Pin the whole loop: the approval event
+/// arrives tagged with the session id, an `approve` over /ws releases it,
+/// and the gated command really runs (the seeded marker file disappears).
+#[tokio::test]
+async fn supervised_session_surfaces_approvals_on_the_dashboard() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    let script = rig.write_script(&serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Deleting the marker.",
+                  "tool_calls": [{ "name": "exec_command",
+                                   "arguments": { "nonce": 1, "command": "rm approval-pin-marker.txt" } }] },
+                // No transcript expectation: a successful rm prints
+                // nothing — the test's proof is the marker file itself
+                // disappearing from the session project.
+                { "content": "Marker removed.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "approval pin complete" } }] }
+            ]
+        }]
+    }));
+    // The session's project: seeded with the marker the gated `rm` deletes.
+    let session_project = tempfile::tempdir().expect("session project dir");
+    let marker = session_project.path().join("approval-pin-marker.txt");
+    std::fs::write(&marker, "pin").expect("seed marker");
+
+    // Default autonomy (Medium): `rm` classifies destructive → Ask.
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script)
+        .args(["--no-tls", "--web", "18941"]);
+    let mut child = cmd.spawn().expect("spawn intendant daemon");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let _stderr_drain = drain_pipe_into(child.stderr.take().expect("stderr"), stderr_buf.clone());
+    let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
+
+    let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
+    let port: u16 = stderr_so_far
+        .lines()
+        .find_map(|line| {
+            let url = line.strip_prefix("Dashboard: http://")?;
+            url.rsplit(':').next()?.trim().parse().ok()
+        })
+        .expect("parse the dashboard port from the startup line");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // The very first control message can race daemon startup (the gateway
+    // accepts /ws a beat before the supervisor subscribes) — retry the
+    // send until the approval surfaces. A duplicate create is harmless
+    // here: we approve the first approval's session and stop it; the rig
+    // kills the daemon on drop.
+    let mut approval = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "delete the pinned marker file",
+                "project_root": session_project.path(),
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send create_session");
+        approval = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("approval_required")
+        })
+        .await;
+        if approval.is_some() {
+            break;
+        }
+    }
+    let approval = approval.unwrap_or_else(|| {
+        panic!(
+            "no approval_required from the supervised session (fail-closed regression?); daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let session_id = approval
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("approval event must carry its session id, got {approval}"))
+        .to_string();
+    let approval_id = approval
+        .get("id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| panic!("approval event must carry an id, got {approval}"));
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "approve",
+            "session_id": session_id,
+            "id": approval_id,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send approve");
+
+    // The released command really runs: the seeded marker disappears.
+    let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+    while marker.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "approved rm never ran; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let stderr_ctx = stderr_buf.clone();
+    complete_and_stop_session(&mut ws, &session_id, move || {
+        stderr_ctx.lock().map(|b| b.clone()).unwrap_or_default()
+    })
+    .await;
+
+    let _ = child.kill().await;
+}

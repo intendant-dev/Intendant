@@ -911,7 +911,14 @@ impl SessionSupervisor {
                     context_injection,
                     supervisor.config.session_registry.clone(),
                     supervisor.config.peer_registry.clone(),
-                    true,
+                    // Headless (auto-deny gated commands) only when there is
+                    // no dashboard to ask: with the gateway up, supervised
+                    // sessions surface approvals per session — the dispatch
+                    // table routes Approve/Deny/Skip into this session's
+                    // registry, and spawn_sub_agent documents children as
+                    // having "their own approvals". Mirrors the foreground's
+                    // `!use_web`.
+                    web_port.is_none(),
                     attachments,
                     native,
                 )
