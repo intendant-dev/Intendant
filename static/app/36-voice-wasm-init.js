@@ -649,9 +649,11 @@ async function main() {
       if (d.event === 'recording_started' && d.stream_name) {
         const slot = slotForRecordingStream(d.stream_name);
         if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = true; slot.recordBtn.innerHTML = '&#x23F9; Stop'; slot.recordBtn.classList.add('active'); slot.deleteRecBtn.style.display = 'none'; }
+        handleDebugRecordingEvent(d); // debug tab's Record button tracks its display's streams
       } else if (d.event === 'recording_stopped' && d.stream_name) {
         const slot = slotForRecordingStream(d.stream_name);
         if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = ''; }
+        handleDebugRecordingEvent(d);
       } else if (d.event === 'recording_deleted' && d.stream_name) {
         const slot = slotForRecordingStream(d.stream_name);
         if (slot) { if (slot.recordingStreamName === d.stream_name) slot.recordingStreamName = null; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = 'none'; }

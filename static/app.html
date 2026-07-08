@@ -35678,9 +35678,11 @@ async function main() {
       if (d.event === 'recording_started' && d.stream_name) {
         const slot = slotForRecordingStream(d.stream_name);
         if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = true; slot.recordBtn.innerHTML = '&#x23F9; Stop'; slot.recordBtn.classList.add('active'); slot.deleteRecBtn.style.display = 'none'; }
+        handleDebugRecordingEvent(d); // debug tab's Record button tracks its display's streams
       } else if (d.event === 'recording_stopped' && d.stream_name) {
         const slot = slotForRecordingStream(d.stream_name);
         if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = ''; }
+        handleDebugRecordingEvent(d);
       } else if (d.event === 'recording_deleted' && d.stream_name) {
         const slot = slotForRecordingStream(d.stream_name);
         if (slot) { if (slot.recordingStreamName === d.stream_name) slot.recordingStreamName = null; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = 'none'; }
@@ -80021,7 +80023,7 @@ function renderBrowserWorkspaces() {
   window.__stationBrowserWorkspaceCount = rows.length;
   // Zero-count wording lives in the list's empty state; repeating it here
   // stacked two "no workspaces" lines.
-  if (status) status.textContent = rows.length ? `${rows.length} active workspace${rows.length === 1 ? '' : 's'}` : '';
+  if (status && status.dataset.error !== '1') status.textContent = rows.length ? `${rows.length} active workspace${rows.length === 1 ? '' : 's'}` : '';
   if (!rows.length) {
     list.innerHTML = '<div class="ui-empty compact"><div class="ui-empty-title">No browser workspaces</div>' +
       '<div class="ui-empty-hint">Create one above, or the agent will spawn its own when it needs a browser.</div></div>';
@@ -80035,7 +80037,7 @@ function renderBrowserWorkspaces() {
     if (ui2Enabled()) card.dataset.status = String(w.status || '');
     const meta = document.createElement('div');
     meta.className = 'debug-workspace-row-main';
-    const lease = w.lease ? ` leased by ${w.lease.holder_id || 'unknown'}` : ' unleased';
+    const lease = w.lease ? `leased by ${w.lease.holder_id || 'unknown'}` : 'unleased';
     const url = w.url || 'about:blank';
     const executableSource = w.browser_executable_source ? ` · ${w.browser_executable_source}` : '';
     meta.innerHTML =
@@ -80068,6 +80070,8 @@ function handleBrowserWorkspaceMessage(d) {
   if (d.t === 'browser_workspace_snapshot' && Array.isArray(d.workspaces)) {
     browserWorkspaces.clear();
     for (const w of d.workspaces) if (w && w.id) browserWorkspaces.set(String(w.id), w);
+    const snapStatus = document.getElementById('browser-workspace-status');
+    if (snapStatus) delete snapStatus.dataset.error; // fresh truth supersedes a pinned error
     renderBrowserWorkspaces();
     return;
   }
@@ -80078,7 +80082,15 @@ function handleBrowserWorkspaceMessage(d) {
     browserWorkspaces.delete(String(d.workspace_id));
   }
   const status = document.getElementById('browser-workspace-status');
-  if (status && d.kind === 'error') status.textContent = d.message || 'Browser workspace error';
+  if (status && d.kind === 'error') {
+    // Paint the error AFTER the re-render and pin it — renderBrowserWorkspaces
+    // rewrites the status line and was clobbering the message same-tick.
+    renderBrowserWorkspaces();
+    status.dataset.error = '1';
+    status.textContent = d.message || 'Browser workspace error';
+    return;
+  }
+  if (status) delete status.dataset.error;
   renderBrowserWorkspaces();
 }
 
@@ -80133,6 +80145,32 @@ function onDebugScreenReady(displayId) {
   document.getElementById('debug-record-btn').disabled = false;
   document.getElementById('debug-info').classList.remove('hidden');
   document.getElementById('debug-display-id').textContent = displayId;
+}
+
+// The daemon emits recording_started/stopped with stream `display_<id>[_n]`
+// (recording.rs pick_next_display_stream_name); flip the debug Record button
+// when the stream belongs to the debug display. Called from the central WS
+// dispatch (36-voice-wasm-init) — declarations hoist module-wide, so the
+// later-fragment definition is live by event time.
+function debugRecordingStreamIsOurs(streamName) {
+  const idEl = document.getElementById('debug-display-id');
+  const id = ((idEl && idEl.textContent) || '').trim();
+  if (!id) return false;
+  const base = `display_${id}`;
+  return streamName === base || streamName.startsWith(`${base}_`);
+}
+
+function handleDebugRecordingEvent(d) {
+  if (!debugScreenActive || !d.stream_name) return;
+  if (!debugRecordingStreamIsOurs(String(d.stream_name))) return;
+  const btn = document.getElementById('debug-record-btn');
+  if (d.event === 'recording_started') {
+    debugRecording = true;
+    if (btn) btn.textContent = 'Stop recording';
+  } else if (d.event === 'recording_stopped') {
+    debugRecording = false;
+    if (btn) btn.textContent = 'Start recording';
+  }
 }
 
 function onDebugScreenTornDown() {
