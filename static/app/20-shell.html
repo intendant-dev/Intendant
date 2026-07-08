@@ -1376,6 +1376,13 @@
                     </select>
                   </label>
                 </div>
+                <!-- ui-v2 only: the design's green happy-path banner. Stays
+                     hidden in v1 forever — JS unhides it exclusively under
+                     the ui-v2 flag and only when fuel is positively known. -->
+                <div id="new-session-fueled-banner" class="sessions-fueled-banner hidden">
+                  <span class="sessions-fueled-dot" aria-hidden="true"></span>
+                  <span class="sessions-fueled-text" id="new-session-fueled-text">Fueled &mdash; model credentials active, ready to launch.</span>
+                </div>
                 <div id="new-session-unfueled-banner" class="sessions-unfueled-banner hidden">
                   <span class="sessions-unfueled-text">No model credentials on this daemon &mdash; the internal agent can&rsquo;t start. External agents (Codex, Claude Code) sign in with their own accounts and still work.</span>
                   <button type="button" class="ui-btn sessions-unfueled-add-keys" onclick="focusSettingsApiKeys()">Add API keys</button>

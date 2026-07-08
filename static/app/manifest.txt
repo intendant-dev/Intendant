@@ -22,6 +22,7 @@ ui2-terminal-files.css
 ui2-debug.css
 ui2-station.css
 ui2-vault.css
+ui2-sessions.css
 19-style-close.html
 
 20-shell.html
