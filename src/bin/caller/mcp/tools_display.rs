@@ -178,6 +178,24 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<GrantUserDisplayParams>,
     ) -> String {
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.grant_user_display_as_caller(params, ToolCallerTrust::OwnerSurface)
+            .await
+    }
+
+    pub(crate) async fn grant_user_display_as_caller(
+        &self,
+        params: GrantUserDisplayParams,
+        caller: ToolCallerTrust,
+    ) -> String {
+        // The grant IS the owner's opt-in: only owner surfaces may perform
+        // it. (Revoke stays open to everyone — de-escalation is fail-safe.)
+        if caller == ToolCallerTrust::Scoped {
+            return "Denied: grant_user_display performs the daemon owner's opt-in and is only \
+                    available on owner surfaces. Ask the owner to grant the display from the \
+                    dashboard or with `intendant ctl display grant-user`."
+                .to_string();
+        }
         let display_id = params.display_id.unwrap_or(0);
         let active_resolution = active_display_session_resolution(&self.state, display_id).await;
         let autonomy = {
@@ -309,54 +327,84 @@ impl IntendantServer {
         UserSessionDisplayActivationRequest::Requested
     }
 
+    /// Activate the display a shared-view show/focus/capture targets.
+    /// Display 0 is the user's real display on every platform (nonzero ids
+    /// are agent-owned virtual displays): reaching it is the owner's
+    /// opt-in, so a scoped caller (supervised agent, scoped grant, peer)
+    /// without the standing grant is refused rather than the opt-in being
+    /// performed on the owner's behalf — the native handler refuses exactly
+    /// this (`display_glue::handle_shared_view_calls`), and this is its MCP
+    /// twin. Only the user display ever touches the autonomy guard: an
+    /// agent-owned display activates via the bus event alone (the previous
+    /// code flipped the global user grant as a side effect of sharing a
+    /// virtual display, which silently opted the user in).
     pub(crate) async fn ensure_shared_view_display_active(
         &self,
         display_target: Option<&str>,
         display_id: Option<u32>,
-    ) {
+        caller: ToolCallerTrust,
+    ) -> Result<(), String> {
         let Some(display_id) = shared_view_user_display_id(display_target, display_id) else {
-            return;
+            return Ok(());
         };
-        if display_id == 0
-            && crate::computer_use::DisplayBackend::detect()
-                == crate::computer_use::DisplayBackend::Wayland
-        {
-            let _ = self
-                .ensure_wayland_user_session_display_activation(
-                    crate::computer_use::DisplayTarget::UserSession,
-                    crate::computer_use::DisplayBackend::Wayland,
-                )
-                .await;
-            return;
-        }
 
         let (autonomy, session_registry) = {
             let state = self.state.read().await;
             (state.autonomy.clone(), state.session_registry.clone())
         };
-        if let Some(registry) = session_registry {
-            if registry.read().await.get(display_id).is_some() {
-                return;
+
+        if display_id == 0 {
+            let granted = autonomy.read().await.user_display_granted;
+            if !caller.allows_user_session(granted) {
+                return Err(format!(
+                    "Cannot activate the user display for a shared view. {}",
+                    crate::computer_use::user_session_denied_message()
+                ));
+            }
+            if crate::computer_use::DisplayBackend::detect()
+                == crate::computer_use::DisplayBackend::Wayland
+            {
+                let _ = self
+                    .ensure_wayland_user_session_display_activation(
+                        crate::computer_use::DisplayTarget::UserSession,
+                        crate::computer_use::DisplayBackend::Wayland,
+                    )
+                    .await;
+                return Ok(());
             }
         }
 
-        {
+        if let Some(registry) = session_registry {
+            if registry.read().await.get(display_id).is_some() {
+                return Ok(());
+            }
+        }
+
+        if display_id == 0 {
+            // An owner surface opted in (or the grant was already held);
+            // record it on the guard like the explicit grant paths do.
             let mut guard = autonomy.write().await;
             guard.user_display_granted = true;
         }
         self.bus.send(AppEvent::UserDisplayGranted { display_id });
+        Ok(())
     }
 
     pub(crate) async fn show_shared_view_for_session(
         &self,
         params: ShowSharedViewParams,
         session_id: Option<&str>,
+        caller: ToolCallerTrust,
     ) -> String {
         let display_target = shared_view_display_target(params.display_target, params.display_id);
         let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
         let region = params.focus_region.map(normalize_shared_view_region);
-        self.ensure_shared_view_display_active(display_target.as_deref(), display_id)
-            .await;
+        if let Err(denied) = self
+            .ensure_shared_view_display_active(display_target.as_deref(), display_id, caller)
+            .await
+        {
+            return denied;
+        }
         self.emit_shared_view(
             session_id,
             "show",
@@ -376,7 +424,10 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<ShowSharedViewParams>,
     ) -> String {
-        self.show_shared_view_for_session(params, None).await
+        // The stdio MCP transport is wired up by the daemon owner's own
+        // client configuration: an owner surface.
+        self.show_shared_view_for_session(params, None, ToolCallerTrust::OwnerSurface)
+            .await
     }
 
     pub(crate) async fn hide_shared_view_for_session(
@@ -400,11 +451,16 @@ impl IntendantServer {
         &self,
         params: FocusSharedViewParams,
         session_id: Option<&str>,
+        caller: ToolCallerTrust,
     ) -> String {
         let display_target = shared_view_display_target(params.display_target, params.display_id);
         let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
-        self.ensure_shared_view_display_active(display_target.as_deref(), display_id)
-            .await;
+        if let Err(denied) = self
+            .ensure_shared_view_display_active(display_target.as_deref(), display_id, caller)
+            .await
+        {
+            return denied;
+        }
         self.emit_shared_view(
             session_id,
             "focus",
@@ -424,18 +480,25 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<FocusSharedViewParams>,
     ) -> String {
-        self.focus_shared_view_for_session(params, None).await
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.focus_shared_view_for_session(params, None, ToolCallerTrust::OwnerSurface)
+            .await
     }
 
     pub(crate) async fn request_shared_view_input_for_session(
         &self,
         params: RequestSharedViewInputParams,
         session_id: Option<&str>,
+        caller: ToolCallerTrust,
     ) -> String {
         let display_target = shared_view_display_target(params.display_target, params.display_id);
         let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
-        self.ensure_shared_view_display_active(display_target.as_deref(), display_id)
-            .await;
+        if let Err(denied) = self
+            .ensure_shared_view_display_active(display_target.as_deref(), display_id, caller)
+            .await
+        {
+            return denied;
+        }
         self.emit_shared_view(
             session_id,
             "input_request",
@@ -455,7 +518,8 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<RequestSharedViewInputParams>,
     ) -> String {
-        self.request_shared_view_input_for_session(params, None)
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.request_shared_view_input_for_session(params, None, ToolCallerTrust::OwnerSurface)
             .await
     }
 
@@ -464,11 +528,16 @@ impl IntendantServer {
         params: CaptureSharedViewFrameParams,
         session_id: Option<&str>,
         compact_output: bool,
+        caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
         let display_target = shared_view_display_target(params.display_target, params.display_id);
         let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
-        self.ensure_shared_view_display_active(display_target.as_deref(), display_id)
-            .await;
+        if let Err(denied) = self
+            .ensure_shared_view_display_active(display_target.as_deref(), display_id, caller)
+            .await
+        {
+            return Ok(text_tool_error(denied));
+        }
         self.emit_shared_view(
             session_id,
             "capture",
@@ -482,6 +551,7 @@ impl IntendantServer {
         self.take_screenshot_with_output(
             Parameters(TakeScreenshotParams { display_target }),
             compact_output,
+            caller,
         )
         .await
     }
@@ -493,7 +563,8 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<CaptureSharedViewFrameParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.capture_shared_view_frame_for_session(params, None, false)
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.capture_shared_view_frame_for_session(params, None, false, ToolCallerTrust::OwnerSurface)
             .await
     }
 
@@ -502,7 +573,8 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<TakeScreenshotParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.take_screenshot_with_output(Parameters(params), false)
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.take_screenshot_with_output(Parameters(params), false, ToolCallerTrust::OwnerSurface)
             .await
     }
 
@@ -510,6 +582,7 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<TakeScreenshotParams>,
         compact_output: bool,
+        caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
         use crate::computer_use::{execute_actions, CuAction, DisplayBackend};
 
@@ -552,7 +625,7 @@ impl IntendantServer {
             &mut counter,
             &session_registry,
             None,
-            user_display_granted,
+            caller.allows_user_session(user_display_granted),
         )
         .await;
 
@@ -597,6 +670,16 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<ReadScreenParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.read_screen_as_caller(Parameters(params), ToolCallerTrust::OwnerSurface)
+            .await
+    }
+
+    pub(crate) async fn read_screen_as_caller(
+        &self,
+        Parameters(params): Parameters<ReadScreenParams>,
+        caller: ToolCallerTrust,
+    ) -> Result<CallToolResult, McpError> {
         // Element trees only exist for the real session; default there
         // unconditionally rather than availability-probing like the pixel
         // tools do.
@@ -604,6 +687,19 @@ impl IntendantServer {
             None => crate::computer_use::DisplayTarget::UserSession,
             Some(spec) => resolve_display_target(spec),
         };
+        // The element tree reveals the real session's content (window
+        // titles, field values) just as pixels do — and unlike the pixel
+        // tools it bypasses the session pipeline on every platform, so this
+        // gate is the only fence.
+        if target.is_user_session() {
+            let autonomy = self.state.read().await.autonomy.clone();
+            let granted = autonomy.read().await.user_display_granted;
+            if !caller.allows_user_session(granted) {
+                return Ok(text_tool_error(
+                    crate::computer_use::user_session_denied_message().to_string(),
+                ));
+            }
+        }
         match crate::computer_use::read_screen_elements(target).await {
             Ok(snapshot) => {
                 let body = if params.format.as_deref() == Some("json") {
@@ -625,14 +721,20 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<ExecuteCuActionsParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.execute_cu_actions_with_output(Parameters(params), false)
-            .await
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.execute_cu_actions_with_output(
+            Parameters(params),
+            false,
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
     }
 
     pub(crate) async fn execute_cu_actions_with_output(
         &self,
         Parameters(params): Parameters<ExecuteCuActionsParams>,
         compact_output: bool,
+        caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
         use crate::computer_use::{execute_actions, DisplayBackend};
 
@@ -700,7 +802,7 @@ impl IntendantServer {
             &mut counter,
             &session_registry,
             denorm_ref,
-            user_display_granted,
+            caller.allows_user_session(user_display_granted),
         )
         .await;
 
@@ -1004,11 +1106,16 @@ mod tests {
                 }
                 other => panic!("expected SharedView event, got {other:?}"),
             }
+
+            // Sharing an agent-owned virtual display must never touch the
+            // user-display grant: activation rides the bus event alone.
+            let autonomy = { server.state.read().await.autonomy.clone() };
+            assert!(!autonomy.read().await.user_display_granted);
         });
     }
 
     #[test]
-    fn shared_view_user_session_requests_display_activation() {
+    fn shared_view_user_session_scoped_caller_is_refused_not_self_granted() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1019,6 +1126,8 @@ mod tests {
             let state = test_state();
             let server = IntendantServer::new(state.clone(), bus.clone());
 
+            // The generic by-name dispatch is the fail-closed Scoped path —
+            // the one supervised external agents and peers arrive on.
             let result = server
                 .call_tool_by_name_for_session(
                     "show_shared_view",
@@ -1028,6 +1137,50 @@ mod tests {
                     }),
                     Some("session-a"),
                     None,
+                )
+                .await
+                .expect("tool should dispatch");
+            let rendered = serde_json::to_string(&result).unwrap_or_default();
+            assert!(
+                rendered.contains("explicit opt-in"),
+                "scoped caller must get the opt-in refusal, got: {rendered}"
+            );
+
+            // No activation event, and the guard must be untouched: the
+            // refusal exists precisely so a scoped caller cannot perform
+            // the owner's opt-in (the old code flipped the grant here).
+            assert!(
+                timeout(Duration::from_millis(200), rx.recv()).await.is_err(),
+                "no event may fire for a refused user-session share"
+            );
+            let autonomy = { state.read().await.autonomy.clone() };
+            assert!(!autonomy.read().await.user_display_granted);
+        });
+    }
+
+    #[test]
+    fn shared_view_user_session_owner_surface_requests_display_activation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let state = test_state();
+            let server = IntendantServer::new(state.clone(), bus.clone());
+
+            // The owner's call IS the opt-in.
+            let result = server
+                .call_tool_by_name_as_caller(
+                    "show_shared_view",
+                    serde_json::json!({
+                        "display_target": "user_session",
+                        "reason": "show the user's screen"
+                    }),
+                    Some("session-a"),
+                    None,
+                    ToolCallerTrust::OwnerSurface,
                 )
                 .await
                 .expect("tool should dispatch");
@@ -1060,6 +1213,119 @@ mod tests {
             let autonomy = { state.read().await.autonomy.clone() };
             assert!(autonomy.read().await.user_display_granted);
         });
+    }
+
+    #[test]
+    fn read_screen_user_session_scoped_caller_needs_the_grant() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let bus = EventBus::new();
+            let state = test_state();
+            let server = IntendantServer::new(state.clone(), bus);
+
+            // Ungranted scoped caller: refused before any platform
+            // accessibility API runs (the element tree reveals screen
+            // content like pixels do, and bypasses the session pipeline on
+            // every platform).
+            let result = server
+                .call_tool_by_name_for_session(
+                    "read_screen",
+                    serde_json::json!({}),
+                    Some("session-a"),
+                    None,
+                )
+                .await
+                .expect("tool should dispatch");
+            let rendered = serde_json::to_string(&result).unwrap_or_default();
+            assert!(
+                rendered.contains("explicit opt-in"),
+                "scoped ungranted read_screen must be refused, got: {rendered}"
+            );
+
+            // With the grant held, the same scoped caller proceeds past the
+            // gate (whatever the headless platform stack then returns, it
+            // must not be the opt-in refusal).
+            let autonomy = { state.read().await.autonomy.clone() };
+            autonomy.write().await.user_display_granted = true;
+            let result = server
+                .call_tool_by_name_for_session(
+                    "read_screen",
+                    serde_json::json!({}),
+                    Some("session-a"),
+                    None,
+                )
+                .await
+                .expect("tool should dispatch");
+            let rendered = serde_json::to_string(&result).unwrap_or_default();
+            assert!(
+                !rendered.contains("explicit opt-in"),
+                "granted read_screen must clear the gate, got: {rendered}"
+            );
+        });
+    }
+
+    #[test]
+    fn grant_user_display_scoped_caller_is_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let state = test_state();
+            let server = IntendantServer::new(state.clone(), bus.clone());
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "grant_user_display",
+                    serde_json::json!({}),
+                    Some("session-a"),
+                    None,
+                )
+                .await
+                .expect("tool should dispatch");
+            let rendered = serde_json::to_string(&result).unwrap_or_default();
+            assert!(
+                rendered.contains("owner"),
+                "scoped grant_user_display must be refused, got: {rendered}"
+            );
+            assert!(
+                timeout(Duration::from_millis(200), rx.recv()).await.is_err(),
+                "no grant event may fire for a refused grant"
+            );
+            let autonomy = { state.read().await.autonomy.clone() };
+            assert!(!autonomy.read().await.user_display_granted);
+        });
+    }
+
+    #[test]
+    fn resolve_display_target_never_yields_a_virtual_user_display() {
+        use crate::computer_use::DisplayTarget;
+        // ":00" / "display_00" / "00" must not dodge the user-session gate
+        // that ":0" gets — a parsed id of 0 IS the user session.
+        for spec in [":00", "display_00", "00", ":0", "0", "user_session"] {
+            assert_eq!(
+                resolve_display_target(spec),
+                DisplayTarget::UserSession,
+                "spec {spec:?}"
+            );
+        }
+        assert_eq!(
+            resolve_display_target(":99"),
+            DisplayTarget::Virtual { id: 99 }
+        );
+    }
+
+    #[test]
+    fn caller_trust_gates_user_session_on_grant_or_owner() {
+        assert!(ToolCallerTrust::OwnerSurface.allows_user_session(false));
+        assert!(ToolCallerTrust::OwnerSurface.allows_user_session(true));
+        assert!(!ToolCallerTrust::Scoped.allows_user_session(false));
+        assert!(ToolCallerTrust::Scoped.allows_user_session(true));
     }
 
     #[test]
@@ -1134,12 +1400,15 @@ mod tests {
             let mut rx = bus.subscribe();
             let server = IntendantServer::new(state.clone(), bus);
 
+            // The grant is owner-surface-only; the routing under test is the
+            // owner path (scoped refusal is pinned separately).
             let result = server
-                .call_tool_by_name_for_session(
+                .call_tool_by_name_as_caller(
                     "grant_user_display",
                     serde_json::json!({ "display_id": 2 }),
                     Some("managed-session"),
                     Some(true),
+                    ToolCallerTrust::OwnerSurface,
                 )
                 .await
                 .expect("grant_user_display should route");
@@ -1362,12 +1631,16 @@ mod tests {
             let mut rx = bus.subscribe();
             let server = IntendantServer::new(state.clone(), bus);
 
+            // Owner path (the grant is owner-surface-only; scoped refusal is
+            // pinned separately) — under test here is the active-session
+            // DisplayReady behavior.
             let result = server
-                .call_tool_by_name_for_session(
+                .call_tool_by_name_as_caller(
                     "grant_user_display",
                     serde_json::json!({ "display_id": 0 }),
                     Some("managed-session"),
                     Some(true),
+                    ToolCallerTrust::OwnerSurface,
                 )
                 .await
                 .expect("grant_user_display should route");

@@ -325,7 +325,13 @@ pub(crate) async fn handle_mcp_http_request(
                 });
             }
             match server
-                .call_tool_by_name_for_session(name, args, session_id, codex_managed_context)
+                .call_tool_by_name_as_caller(
+                    name,
+                    args,
+                    session_id,
+                    codex_managed_context,
+                    crate::mcp::ToolCallerTrust::from_principal(&access.principal),
+                )
                 .await
             {
                 Ok(result) => Ok(serde_json::to_value(result).unwrap_or_else(|e| {

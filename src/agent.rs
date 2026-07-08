@@ -446,6 +446,17 @@ impl Agent {
         // macOS: use native screencapture (no display number needed)
         #[cfg(target_os = "macos")]
         let output = {
+            // Same gate as the Linux display<=0 branch below: `screencapture`
+            // always reads the user's primary display, which requires the
+            // explicit user-display grant (the env is set at spawn only when
+            // the controller-side guard grant is true).
+            if std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err() {
+                return Err(AgentError::Process(
+                    "Access to the user's session display (display :0) requires explicit grant. \
+                     Use a virtual display or request display access first."
+                        .to_string(),
+                ));
+            }
             Command::new("screencapture")
                 .args(["-x", &screenshot_path.to_string_lossy()])
                 .output()

@@ -447,9 +447,13 @@ pub fn normalized_to_pixels(
 /// the last non-Screenshot action (all providers expect a screenshot in the
 /// result).
 ///
-/// `user_display_granted` is the autonomy guard's grant state (the single
-/// source of truth for the user-display grant), read by the caller; it is
-/// only used to word the no-session recovery message.
+/// `user_session_allowed` is the single enforcement point for reaching the
+/// user's real desktop: callers pass the autonomy guard's user-display grant,
+/// OR-ed with their surface trust where an owner surface is exempt (the
+/// MCP layer's `ToolCallerTrust`). A `UserSession` target with
+/// `user_session_allowed == false` fails closed here for every action, on
+/// every backend — the Wayland/Windows session-existence requirement is a
+/// second fence, not the gate.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_actions(
     actions: &[CuAction],
@@ -459,8 +463,21 @@ pub async fn execute_actions(
     action_counter: &mut u64,
     session_registry: &Option<crate::display::SharedSessionRegistry>,
     denorm_ref: Option<(u32, u32)>,
-    user_display_granted: bool,
+    user_session_allowed: bool,
 ) -> Vec<CuActionResult> {
+    if target.is_user_session() && !user_session_allowed {
+        // One result per action, like every other outcome of this function
+        // (a screenshot-only batch still gets its one denial).
+        return actions
+            .iter()
+            .map(|_| CuActionResult {
+                success: false,
+                screenshot: None,
+                error: Some(user_session_denied_message().to_string()),
+            })
+            .collect();
+    }
+
     #[cfg(target_os = "linux")]
     crate::linux_display_env::ensure_gui_session_env("computer use actions");
 
@@ -492,7 +509,7 @@ pub async fn execute_actions(
                 error: Some(no_session_message(
                     effective_backend,
                     &target,
-                    user_display_granted,
+                    user_session_allowed,
                 )),
             }];
         }
@@ -1612,11 +1629,22 @@ fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 // ── Session-only backends: DisplaySession routing ───────────────────────────
 
 /// Build an actionable error for the "no capture session" failure path on the
+/// The fail-closed refusal for a `UserSession` target without the
+/// user-display grant (or an owner surface). One message for every surface
+/// — MCP tools, ctl, peers, the native loop's chokepoint — mirroring the
+/// native shared-view refusal so the opt-in is always worded the same way.
+pub(crate) fn user_session_denied_message() -> &'static str {
+    "Access to the user's real display (user_session) is an explicit opt-in — \
+     the user must grant their display first (dashboard grant, grant_user_display, \
+     or `intendant ctl display grant-user`). Target an agent-owned virtual display \
+     instead, e.g. display_target \":99\"."
+}
+
 /// session-only backends (Wayland, Windows). A bare "no session" message left
 /// callers with no hint about what's wrong or how to recover, which caused
 /// external agents to retry the same call indefinitely.
-/// `user_display_granted` is the autonomy guard's grant state, passed in by
-/// the caller; it only steers the recovery wording.
+/// `user_display_granted` is the caller's `user_session_allowed` (grant or
+/// owner surface); it only steers the recovery wording.
 fn no_session_message(
     backend: DisplayBackend,
     target: &DisplayTarget,
@@ -2822,6 +2850,68 @@ mod tests {
         assert_eq!(ScrollDirection::Down.x11_button(), 5);
         assert_eq!(ScrollDirection::Left.x11_button(), 6);
         assert_eq!(ScrollDirection::Right.x11_button(), 7);
+    }
+
+    #[tokio::test]
+    async fn execute_actions_refuses_user_session_without_allowance() {
+        // The chokepoint: a user_session target with user_session_allowed ==
+        // false fails closed for EVERY action on EVERY backend, before any
+        // capture/injection path runs (headless-safe: nothing touches a
+        // display).
+        let dir = std::env::temp_dir();
+        let mut counter = 0u64;
+        let actions = [CuAction::Screenshot, CuAction::Wait { ms: 1 }];
+        for backend in [
+            DisplayBackend::X11,
+            DisplayBackend::MacOS,
+            DisplayBackend::Wayland,
+            DisplayBackend::Windows,
+        ] {
+            let results = execute_actions(
+                &actions,
+                DisplayTarget::UserSession,
+                backend,
+                &dir,
+                &mut counter,
+                &None,
+                None,
+                false,
+            )
+            .await;
+            assert_eq!(results.len(), actions.len(), "one result per action");
+            for result in results {
+                assert!(!result.success);
+                assert_eq!(
+                    result.error.as_deref(),
+                    Some(user_session_denied_message()),
+                    "backend {backend:?} must fail closed with the opt-in message"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_actions_gate_leaves_virtual_targets_alone() {
+        // A virtual target is agent-owned: the gate must not fire for it even
+        // with user_session_allowed == false (Wayland backend: the virtual
+        // target routes to X11 tooling and then the session lookup, so this
+        // stays headless-safe and returns the no-session recovery text, not
+        // the opt-in refusal).
+        let dir = std::env::temp_dir();
+        let mut counter = 0u64;
+        let results = execute_actions(
+            &[CuAction::Screenshot],
+            DisplayTarget::Virtual { id: 4321 },
+            DisplayBackend::Windows,
+            &dir,
+            &mut counter,
+            &None,
+            None,
+            false,
+        )
+        .await;
+        let error = results[0].error.as_deref().unwrap_or_default();
+        assert_ne!(error, user_session_denied_message());
     }
 
     #[test]

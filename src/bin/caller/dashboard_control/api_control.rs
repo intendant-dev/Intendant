@@ -869,7 +869,13 @@ pub(crate) async fn api_mcp_tool_call_response(
         .unwrap_or_else(|| serde_json::json!({}));
     let managed_context = optional_managed_context_param(&params);
     match server
-        .call_tool_by_name_for_session(&name, arguments, session_id.as_deref(), managed_context)
+        .call_tool_by_name_as_caller(
+            &name,
+            arguments,
+            session_id.as_deref(),
+            managed_context,
+            crate::mcp::ToolCallerTrust::from_principal(&runtime.grant.access_principal()),
+        )
         .await
     {
         Ok(result) => {
