@@ -20,6 +20,8 @@ function ui2VoiceBuildPanel() {
   mic.className = 'ui2-micbtn';
   mic.title = 'Voice';
   mic.dataset.state = 'idle';
+  mic.setAttribute('aria-haspopup', 'dialog');
+  mic.setAttribute('aria-expanded', 'false');
   mic.innerHTML = `<span class="ui2-micbtn-icon">${ui2Icon('mic', 16)}</span><span class="ui2-micbtn-dot"></span>`;
   const search = document.getElementById('ui2-search-btn');
   bar.insertBefore(mic, search);
@@ -27,6 +29,8 @@ function ui2VoiceBuildPanel() {
   const panel = document.createElement('div');
   panel.id = 'ui2-voice-panel';
   panel.hidden = true;
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-label', 'Voice');
   panel.innerHTML = `
     <div class="ui2-vp-head">
       <span class="ui2-vp-dot"></span>
@@ -53,11 +57,40 @@ function ui2VoiceBuildPanel() {
   const cam = document.getElementById('videoPreviewWrap');
   if (cam) panel.querySelector('#ui2-vp-cam-slot').appendChild(cam);
 
-  const toggle = (open) => { panel.hidden = open === undefined ? !panel.hidden : !open ? true : false; };
+  // Swap the v1 emoji glyphs for line icons + labels (same grid/stroke as
+  // ui2Icon; safe: 36-voice-wasm-init only ever toggles these buttons'
+  // classList, never their content — #makeActiveBtn is text-rewritten by
+  // v1 ("Requesting active...") so it stays text-only).
+  const camSvg = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink:0;display:block"><rect x="3" y="6.5" width="13.5" height="11" rx="2.4"/><path d="M16.5 10.6 21 8v8l-4.5-2.6Z"/></svg>';
+  const decorate = (btn, iconHtml, label) => {
+    if (!btn) return;
+    btn.textContent = '';
+    const ic = document.createElement('span');
+    ic.className = 'ui2-vp-btn-icon';
+    ic.innerHTML = iconHtml;
+    const tx = document.createElement('span');
+    tx.className = 'ui2-vp-btn-label';
+    tx.textContent = label;
+    btn.append(ic, tx);
+  };
+  decorate(document.getElementById('micBtn'), ui2Icon('mic', 14), 'Mic');
+  decorate(document.getElementById('videoBtn'), camSvg, 'Camera');
+
+  const toggle = (open) => {
+    const show = open === undefined ? panel.hidden : !!open;
+    panel.hidden = !show;
+    mic.setAttribute('aria-expanded', String(show));
+  };
   mic.addEventListener('click', () => toggle());
   panel.querySelector('#ui2-vp-close').addEventListener('click', () => toggle(false));
+  // Layered-Escape contract: the ⌘K palette's capture handler runs first
+  // (earlier fragment) and marks its Escape consumed via preventDefault —
+  // honoring that keeps one keypress from closing both layers; we mark
+  // ours the same way so the v1 Escape cascade below us stays quiet.
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !panel.hidden) { e.stopPropagation(); toggle(false); }
+    if (e.key === 'Escape' && !panel.hidden && !e.defaultPrevented) {
+      e.preventDefault(); e.stopPropagation(); toggle(false);
+    }
   }, true);
   document.addEventListener('mousedown', (e) => {
     if (!panel.hidden && !panel.contains(e.target) && e.target !== mic && !mic.contains(e.target)) toggle(false);
@@ -92,6 +125,6 @@ function ui2VoiceBuildPanel() {
 }
 
 if (ui2Enabled()) {
-  document.addEventListener('DOMContentLoaded', ui2VoiceBuildPanel, { once: true });
-  if (document.readyState !== 'loading') ui2VoiceBuildPanel();
+  if (document.readyState === 'complete') ui2VoiceBuildPanel();
+  else document.addEventListener('DOMContentLoaded', ui2VoiceBuildPanel, { once: true });
 }
