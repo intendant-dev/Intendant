@@ -175,7 +175,14 @@ pub struct VoiceDebugState {
 /// future runtime config additions re-blur the boundary.
 #[derive(Clone, Debug, Serialize)]
 pub struct WebGatewayConfig {
+    /// Browser live-audio **voice** provider (Gemini Live by default) — NOT
+    /// the chat/agent provider. `PROVIDER=mock` and chat provider selection
+    /// deliberately do not affect this pair, and nothing should render it
+    /// as the daemon's chat provider (that once made keyless daemons claim
+    /// to run gemini). Kept as the bare `provider`/`model` wire keys for
+    /// compatibility with hosted pages older or newer than this daemon.
     pub provider: String,
+    /// Browser live-audio **voice** model. See `provider` above.
     pub model: String,
     /// Effective server-side presence state for this running daemon. This is
     /// intentionally runtime-scoped, because `--no-presence` can override the
