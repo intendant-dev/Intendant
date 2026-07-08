@@ -29,9 +29,13 @@
      [data-station-hotspot], #station-composer-input, the two canvas
      ids, #station-display-endpoints. #station-dock stays dead.
    - Station stays dark by design even after a light theme ships (the
-     canvas palette is not theme-aware); the pane gradient below reads
-     from --bg/--bg-1, so the P4 light-theme pass owns pinning it dark
-     if those tokens ever flip. */
+     canvas palette is not theme-aware). The light theme HAS shipped and
+     flips --bg/--bg-1/--glass/--text, so every surface that overlays or
+     abuts the canvas is pinned to the dark values below with literals
+     (deliberate token exceptions — a var() here would flip with the
+     theme and put light glass / dark ink on top of the dark scene).
+     The flow-row peer-chip band above the canvas is NOT pinned: it is
+     ordinary chrome and follows the active theme. */
 
 /* ── peer-display chip band (flow row above the canvas) ── */
 html.ui-v2 .station-peer-chips {
@@ -75,39 +79,53 @@ html.ui-v2 .station-peer-chip .chip-dot.ok {
 
 /* ── canvas container: the deeper-space backdrop (design §3.19) ──
    Background only — position/overflow/flex stay v1 so canvas pixels,
-   hotspot rects, and the composer slot share one coordinate space. */
+   hotspot rects, and the composer slot share one coordinate space.
+   Pinned to the DARK token values (literals, not var()): the WASM scene
+   is dark regardless of theme, and this backdrop shows pre-first-paint
+   and during resize — a light flash behind a dark scene reads broken. */
 html.ui-v2 .station-pane {
   background:
-    radial-gradient(ellipse 70% 70% at 50% 52%, rgba(var(--iris-rgb), .08), transparent 60%),
-    radial-gradient(circle at 50% 52%, var(--bg-1), var(--bg) 70%);
+    radial-gradient(ellipse 70% 70% at 50% 52%, rgba(126, 140, 250, .08), transparent 60%),
+    radial-gradient(circle at 50% 52%, #0E1015, #0B0C10 70%);
 }
 
-/* ── lower-left status/metrics chip (v2 glass, mono, blur-free) ── */
+/* ── lower-left status/metrics chip (mono, blur-free) ──
+   Sits ON the canvas, over whatever the scene painted there (in loaded
+   states that is the activity runway's bottom row — the WASM layout does
+   not reserve chip clearance yet). Two deliberate choices follow:
+   - OPAQUE background: the old .7-alpha glass double-exposed painted
+     runway text through the chip into unreadable mush.
+   - Dark literals, both themes: the scene below is always dark, so the
+     chip must stay dark glass with light ink even under data-theme=light
+     (theme vars would flip it to a milky pill on a dark canvas). */
 html.ui-v2 .station-status {
-  color: var(--text-3);
+  color: #6C7482;
   font-family: var(--mono);
   font-size: 10.5px;
   padding: 6px 10px;
-  border: 1px solid var(--line-2);
+  border: 1px solid rgba(230, 236, 247, .14);
   border-radius: 10px;
-  background: var(--glass);
+  background: #12141C;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .04), 0 4px 14px rgba(0, 0, 0, .35);
 }
 html.ui-v2 .station-status-metrics {
-  color: var(--text-2);
-  border-right: 1px solid var(--line-2);
+  color: #A7AEBE;
+  border-right: 1px solid rgba(230, 236, 247, .14);
 }
 
 /* ── composer textarea overlay: ink only ──
    The canvas paints the strip chrome and positions this textarea from
-   composer_state() geometry; font-size/line-height/padding stay v1. */
+   composer_state() geometry; font-size/line-height/padding stay v1.
+   Ink pinned to dark-theme literals: the strip below is canvas-painted
+   dark in both themes, and var(--text) would flip to near-black ink on
+   it under the light theme. */
 html.ui-v2 .station-composer-input {
-  color: var(--text);
-  caret-color: var(--iris);
+  color: #EAECF2;
+  caret-color: #7E8CFA;
   font-family: var(--mono);
 }
 html.ui-v2 .station-composer-input::placeholder {
-  color: var(--text-3);
+  color: #6C7482;
   opacity: 1;
 }
 

@@ -15151,9 +15151,13 @@ html.ui-v2 #tab-debug .ui-empty-hint {
      [data-station-hotspot], #station-composer-input, the two canvas
      ids, #station-display-endpoints. #station-dock stays dead.
    - Station stays dark by design even after a light theme ships (the
-     canvas palette is not theme-aware); the pane gradient below reads
-     from --bg/--bg-1, so the P4 light-theme pass owns pinning it dark
-     if those tokens ever flip. */
+     canvas palette is not theme-aware). The light theme HAS shipped and
+     flips --bg/--bg-1/--glass/--text, so every surface that overlays or
+     abuts the canvas is pinned to the dark values below with literals
+     (deliberate token exceptions — a var() here would flip with the
+     theme and put light glass / dark ink on top of the dark scene).
+     The flow-row peer-chip band above the canvas is NOT pinned: it is
+     ordinary chrome and follows the active theme. */
 
 /* ── peer-display chip band (flow row above the canvas) ── */
 html.ui-v2 .station-peer-chips {
@@ -15197,39 +15201,53 @@ html.ui-v2 .station-peer-chip .chip-dot.ok {
 
 /* ── canvas container: the deeper-space backdrop (design §3.19) ──
    Background only — position/overflow/flex stay v1 so canvas pixels,
-   hotspot rects, and the composer slot share one coordinate space. */
+   hotspot rects, and the composer slot share one coordinate space.
+   Pinned to the DARK token values (literals, not var()): the WASM scene
+   is dark regardless of theme, and this backdrop shows pre-first-paint
+   and during resize — a light flash behind a dark scene reads broken. */
 html.ui-v2 .station-pane {
   background:
-    radial-gradient(ellipse 70% 70% at 50% 52%, rgba(var(--iris-rgb), .08), transparent 60%),
-    radial-gradient(circle at 50% 52%, var(--bg-1), var(--bg) 70%);
+    radial-gradient(ellipse 70% 70% at 50% 52%, rgba(126, 140, 250, .08), transparent 60%),
+    radial-gradient(circle at 50% 52%, #0E1015, #0B0C10 70%);
 }
 
-/* ── lower-left status/metrics chip (v2 glass, mono, blur-free) ── */
+/* ── lower-left status/metrics chip (mono, blur-free) ──
+   Sits ON the canvas, over whatever the scene painted there (in loaded
+   states that is the activity runway's bottom row — the WASM layout does
+   not reserve chip clearance yet). Two deliberate choices follow:
+   - OPAQUE background: the old .7-alpha glass double-exposed painted
+     runway text through the chip into unreadable mush.
+   - Dark literals, both themes: the scene below is always dark, so the
+     chip must stay dark glass with light ink even under data-theme=light
+     (theme vars would flip it to a milky pill on a dark canvas). */
 html.ui-v2 .station-status {
-  color: var(--text-3);
+  color: #6C7482;
   font-family: var(--mono);
   font-size: 10.5px;
   padding: 6px 10px;
-  border: 1px solid var(--line-2);
+  border: 1px solid rgba(230, 236, 247, .14);
   border-radius: 10px;
-  background: var(--glass);
+  background: #12141C;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .04), 0 4px 14px rgba(0, 0, 0, .35);
 }
 html.ui-v2 .station-status-metrics {
-  color: var(--text-2);
-  border-right: 1px solid var(--line-2);
+  color: #A7AEBE;
+  border-right: 1px solid rgba(230, 236, 247, .14);
 }
 
 /* ── composer textarea overlay: ink only ──
    The canvas paints the strip chrome and positions this textarea from
-   composer_state() geometry; font-size/line-height/padding stay v1. */
+   composer_state() geometry; font-size/line-height/padding stay v1.
+   Ink pinned to dark-theme literals: the strip below is canvas-painted
+   dark in both themes, and var(--text) would flip to near-black ink on
+   it under the light theme. */
 html.ui-v2 .station-composer-input {
-  color: var(--text);
-  caret-color: var(--iris);
+  color: #EAECF2;
+  caret-color: #7E8CFA;
   font-family: var(--mono);
 }
 html.ui-v2 .station-composer-input::placeholder {
-  color: var(--text-3);
+  color: #6C7482;
   opacity: 1;
 }
 
@@ -18079,6 +18097,17 @@ html.ui-v2 #tab-displays .ui-empty-glyph {
   background: var(--surface-2);
   border: 1px solid var(--line-2);
   color: var(--text-3);
+  /* v1 leaves the block-level svg at the box's top-left; center it and
+     match the usage tab's 20px glyph so empty states read identically. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+html.ui-v2 #tab-displays .ui-empty-glyph svg {
+  width: 20px;
+  height: 20px;
+  stroke: currentColor;
+  stroke-width: 1.7;
 }
 html.ui-v2 #tab-displays .ui-empty-title {
   color: var(--text);
@@ -18090,6 +18119,26 @@ html.ui-v2 #tab-displays .ui-empty-hint {
   font-size: 11.5px;
   line-height: 1.5;
 }
+/* v1's .ui-empty-btn recipe hover-flips --blue→--sapphire, which under the
+   v2 bridge reads iris→sky — a hue change mid-hover. Re-pin the CTA to the
+   v2 primary recipe (iris gradient, brightness hover) used rail-wide. */
+html.ui-v2 #tab-displays .ui-empty-btn {
+  margin-top: 8px;
+  padding: 8px 18px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  transition: filter var(--t-med);
+}
+html.ui-v2 #tab-displays .ui-empty-btn:hover {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  filter: brightness(1.08);
+}
 
 /* ── per-slot toolbar → the design's live toolbar ── */
 html.ui-v2 .display-slot + .display-slot { margin-top: 8px; }
@@ -18098,6 +18147,9 @@ html.ui-v2 .display-toolbar {
   border-bottom: 0;
   padding: 10px 2px 10px;
   gap: 8px;
+  /* v1 never wraps; at narrow widths the trailing buttons (incl. Take
+     Control) clipped off the right edge with no scroll. Wrap instead. */
+  flex-wrap: wrap;
 }
 /* display name wears the design's picker-button look (static: every
    granted display renders simultaneously — no dropdown to fake) */
@@ -18110,6 +18162,9 @@ html.ui-v2 .display-label {
   border: 1px solid var(--line);
   border-radius: 9px;
   background: var(--surface);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 /* connection status: dotted text when healthy, rose pill when degraded
    (reconnect countdown / failed / disconnected / capture lost) */
@@ -18121,6 +18176,8 @@ html.ui-v2 .display-status {
   font-weight: 600;
   color: var(--text-2);
   font-variant-numeric: tabular-nums;
+  /* pill text must never wrap — a wrapped 999px pill renders as an egg */
+  white-space: nowrap;
 }
 html.ui-v2 .display-status::before {
   content: '';
@@ -18161,6 +18218,7 @@ html.ui-v2 .display-input-authority {
   background: var(--surface-3);
   color: var(--text-2);
   border: 1px solid var(--line-2);
+  white-space: nowrap;
 }
 html.ui-v2 .display-input-authority.you {
   background: rgba(var(--green-rgb), .12);
@@ -18290,7 +18348,7 @@ html.ui-v2 .display-toolbar .release-note {
   width: 150px;
 }
 html.ui-v2 .display-toolbar .release-note::placeholder { color: var(--text-3); }
-html.ui-v2 .display-toolbar .release-note:focus { border-color: var(--iris); outline: none; box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25); }
+html.ui-v2 .display-toolbar .release-note:focus { border-color: var(--iris); outline: none; box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22); }
 html.ui-v2 .stream-frame-id { font-family: var(--mono); }
 
 /* ── the stage: rounded dark viewport (WRAPPER does the clipping) ──
@@ -18367,6 +18425,21 @@ html.ui-v2 .shared-view-focus-box::after {
   border-color: rgba(var(--amber-rgb), .5);
   font-family: var(--sans);
 }
+/* light theme: the stage stays a dark viewport, but its .5-black drop
+   shadow is dark-tuned — soften toward the light elevation vocabulary. */
+html.ui-v2[data-theme="light"] .display-canvas {
+  box-shadow:
+    inset 0 0 0 1px var(--line-2),
+    inset 0 1px 0 rgba(255, 255, 255, .04),
+    0 24px 60px rgba(23, 28, 50, .22);
+}
+html.ui-v2[data-theme="light"] .display-slot.shared-view-active .display-canvas {
+  box-shadow:
+    inset 0 0 0 2px rgba(var(--sky-rgb), .74),
+    inset 0 1px 0 rgba(255, 255, 255, .04),
+    0 24px 60px rgba(23, 28, 50, .22);
+}
+
 /* contexts that must NOT wear the stage chrome: activity thumbnails and
    in-page fullscreen (the reparented canvas keeps its geometry honest) */
 html.ui-v2 .activity-display-thumb > .display-canvas {
@@ -18601,7 +18674,7 @@ html.ui-v2 .ann-note {
   width: 190px;
 }
 html.ui-v2 .ann-note::placeholder { color: var(--text-3); }
-html.ui-v2 .ann-note:focus { border-color: var(--iris); box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25); }
+html.ui-v2 .ann-note:focus { border-color: var(--iris); box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22); }
 /* triple action: Send = primary; Attach = secondary; Save = ghost */
 html.ui-v2 .ann-submit-btn,
 html.ui-v2 .clip-toolbar .clip-send-btn {
@@ -18808,7 +18881,7 @@ html.ui-v2 .display-picker {
   border: 1px solid var(--line-2);
   border-radius: 12px;
   padding: 5px;
-  box-shadow: 0 30px 80px rgba(0, 0, 0, .6);
+  box-shadow: var(--shadow-overlay);
 }
 html.ui-v2 .display-picker-item {
   border-radius: 8px;
