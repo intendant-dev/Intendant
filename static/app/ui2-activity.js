@@ -24,6 +24,12 @@ function ui2ApproveCategoryRule() {
   const category = ui2ApprovalCategory();
   if (category && typeof dispatchControlMsg === 'function') {
     dispatchControlMsg({ action: 'set_approval_rule', category, rule: 'auto' });
+    // Re-pull the shared control state so an already-open Control pane /
+    // Settings autonomy section shows the new rule (they otherwise
+    // refresh only on open — pull-based by design).
+    setTimeout(() => {
+      if (typeof refreshControlPane === 'function') refreshControlPane();
+    }, 400);
   }
   sendApproval('approve');
 }

@@ -3,7 +3,11 @@
 The web dashboard is Intendant's **default frontend**. It is a single-page app
 served by the controller's built-in HTTP/WebSocket gateway, running entirely in
 the browser with WASM-powered state management (the `presence-web` crate,
-Catppuccin Mocha theme, mobile-responsive). The SPA is served as one
+mobile-responsive). Since the design-overhaul flip the default look is the
+**v2 chrome** (dark, Iris accent: left navigation rail, oversight bar, ⌘K
+command palette, bottom composer); the previous Catppuccin Mocha generation
+remains reachable at `?ui=v1` as an escape hatch during the soak period, after
+which it will be deleted. The SPA is served as one
 self-contained file, `static/app.html` — a **generated artifact**: `build.rs`
 assembles it from the ordered fragments in `static/app/` (`manifest.txt` fixes
 the order) via `crates/app-html-assembler`, and CI rejects any drift between
@@ -81,10 +85,20 @@ the idle daemon loop.
 
 ## Tabs
 
-The top tab bar has ten tabs: **Activity**, **Stats**, **Terminal**,
-**Video**, **Station**, **Sessions**, **Files**, **Access**, **Debug**, and
-**Settings**. New events arriving while you are on another tab raise a
-notification badge.
+The v2 chrome groups eleven destinations in the left navigation rail —
+**Activity** and **Sessions** (Work), **Live display** and **Station** (Watch),
+**Terminal** and **Files** (Machine), **Usage** (Insight), **Access** and
+**Vault** (Trust), **Settings** and **Debug** (System). The oversight bar on
+top carries the phase pill, stop control, context meter, transport state, the
+Activity Focus/Grid layout toggle, and the ⌘K command palette; the composer —
+the global task input — docks at the bottom and reaches the daemon from any
+destination. New events arriving while you are elsewhere raise a badge on the
+rail item. (Under `?ui=v1` the same panes hang off the classic top tab bar;
+Vault lives inside Access there.)
+
+The section headings below keep the internal pane names (`Video` is the Live
+display destination, `Stats` is Usage) — ids, routes, and deep links are
+unchanged by the redesign.
 
 ### One design language, bounded DOM
 
@@ -172,9 +186,20 @@ Five subtabs:
   - **live** — voice transcripts, presence lifecycle, tool requests
   - **server** — presence model internals (thinking, tool calls)
 
-  The Log pane also carries the approval controls (Approve / Skip / Approve All
-  / Deny) and a follow-up text input for sending a message after a round
-  completes.
+  Under v2 the Log pane has two layouts, toggled from the oversight bar and
+  persisted per browser: **Focus** (the default) shows the combined stream as
+  one centered timeline with role eyebrows, and on wide viewports a vitals
+  rail for the foreground session (working tree, context budget, prompt
+  cache, rate limits, changes); **Grid** shows the classic per-session
+  window grid with relationship wires and the concurrent stream below.
+
+  The Log pane also carries the approval card. **Approve** clears the
+  pending command once; **Approve all like this** sets that approval
+  category's rule to `auto` (the shipped per-category machinery, scoped and
+  revocable in Settings) and then approves; **Switch to Full autonomy** is
+  the old approve-all — it lifts every gate, and is labeled for what it is.
+  Skip and Deny complete the set (`y` / `a` / `s` / `n`). A follow-up text
+  input sends a message after a round completes.
 - **Context** — the agent's current working context (what it is operating on).
 - **Managed** — operator console for managed-Codex context maintenance (see
   below).

@@ -852,9 +852,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         window.delegate = self
         window.makeKeyAndOrderFront(nil)
 
-        // Dark title bar to match Catppuccin Mocha theme
+        // Dark title bar matching the ui-v2 background (--bg #0B0C10);
+        // the dashboard defaults to v2 since the P3 flip.
         window.titlebarAppearsTransparent = true
-        window.backgroundColor = NSColor(red: 30/255, green: 30/255, blue: 46/255, alpha: 1.0)
+        window.backgroundColor = NSColor(red: 11/255, green: 12/255, blue: 16/255, alpha: 1.0)
         window.appearance = NSAppearance(named: .darkAqua)
     }
 
