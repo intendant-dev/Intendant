@@ -699,6 +699,13 @@ headless and should be approved from its own CLI/logs.
    intendant peer deny ABCD-1234
    ```
 
+   When neither the request nor the approval states a profile, the grant
+   defaults to **`read-only-display`** (`DEFAULT_PROFILE` in
+   `access_policy.rs`): the peer can view displays but holds no input.
+   Upgrading is an explicit owner act — `peer approve --profile
+   peer-operator` at approval time, or `peer set-profile` later. The
+   identity a `peer invite` pre-approves carries the same default.
+
 5. Approval signs the requester's public key with the target's access CA and
    exposes only the signed client certificate to the requester. The requester's
    private key never leaves the requester.

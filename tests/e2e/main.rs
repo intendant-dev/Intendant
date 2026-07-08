@@ -1162,8 +1162,10 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
     // Approve headlessly on B: a direct state-file write against B's
     // cert store (the running daemon rereads the file per status poll).
     // The profile is stated explicitly again — approval, not the
-    // request, is what grants — and canonically: unknown profile
-    // strings silently degrade to presence-only rather than erroring.
+    // request, is what grants — and canonically: the CLI validates
+    // profile names loudly, while unknown strings arriving on the wire
+    // are stored as-is and stay fail-closed (presence-only) at
+    // authorization time.
     let approve = {
         let mut cmd = daemon_b.rig.command();
         cmd.args([
