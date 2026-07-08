@@ -17515,6 +17515,228 @@ html.ui-v2 .ui2-rail-advanced {
   transition: background var(--t-fast), color var(--t-fast);
 }
 html.ui-v2 .ui2-rail-advanced:hover { background: var(--surface-2); color: var(--text); }
+/* ── static/app/ui2-grid.css ── */
+/* ── ui-v2 Activity Grid mode: session-window re-skin ──────────────────
+   All scoped html.ui-v2. The v1 window machinery (collapse states,
+   resize, maximize, menus, wires geometry, prompt-target ring driven by
+   the per-session badge vars) stays fully in charge — this fragment
+   re-tones surfaces, chips, controls, and type to the v2 language. The
+   Catppuccin bridge already re-points the state colors (blue→iris,
+   mauve→violet, …), so state semantics inherit v2 hues without
+   restating every rule. Geometry-critical rules (heights, container-
+   type, overflow incl. menu-open, flex orders) are deliberately not
+   touched. */
+
+/* — grid container + resize handle — */
+html.ui-v2 .session-window-grid {
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+html.ui-v2 .session-window-grid-resize-handle::before {
+  width: 44px;
+  height: 4px;
+  border-radius: 3px;
+  background: var(--line-2);
+}
+html.ui-v2 .session-window-grid-resize-handle:hover::before,
+html.ui-v2 .session-window-grid-resize-handle.dragging::before {
+  background: var(--iris);
+}
+
+/* — window card — */
+html.ui-v2 .session-window {
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-card);
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+html.ui-v2 .session-window:hover { border-color: var(--line-2); }
+html.ui-v2 .session-window.foreground {
+  border-color: rgba(var(--iris-rgb), .55);
+  box-shadow: inset 0 0 0 1px rgba(var(--iris-rgb), .22), var(--shadow-card);
+}
+/* prompt-target keeps the badge-var ring (correct per-session color);
+   only the outer glow is softened to the v2 shadow scale */
+html.ui-v2 .session-window.prompt-target {
+  box-shadow:
+    inset 0 0 0 2px color-mix(in srgb, var(--session-badge-border, rgba(var(--iris-rgb), .6)) 72%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--session-badge-border, rgba(var(--iris-rgb), .6)) 30%, transparent),
+    0 8px 22px rgba(var(--iris-rgb), .10);
+}
+
+/* — header + title stack — */
+html.ui-v2 .session-window-header {
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 .session-window-id {
+  border-radius: var(--r-ctl);
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 2px 6px;
+}
+html.ui-v2 .session-window-task { color: var(--text-2); font-size: 12px; }
+html.ui-v2 .session-window-project,
+html.ui-v2 .session-window-cwd { font-family: var(--mono); font-size: 10px; }
+/* the msg/proj/cwd eyebrow prefixes read as labels, not noise */
+html.ui-v2 .session-window-task::before,
+html.ui-v2 .session-window-project::before,
+html.ui-v2 .session-window-cwd::before {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+/* — relation chips (hues match the wires: bridge maps them together) — */
+html.ui-v2 .session-window-relation-chip {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  background: transparent;
+}
+html.ui-v2 .session-window-relation-chip.side { border-color: rgba(var(--violet-rgb), .4); }
+html.ui-v2 .session-window-relation-chip.fork { border-color: rgba(var(--iris-rgb), .4); }
+html.ui-v2 .session-window-relation-chip.subagent { border-color: rgba(var(--green-rgb), .38); }
+
+/* — status chip: dot + label, same grammar as the oversight phase pill — */
+html.ui-v2 .session-window-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  background: transparent;
+}
+html.ui-v2 .session-window-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--neutral-dot);
+}
+html.ui-v2 .session-window-status.active { color: var(--iris-2); border-color: rgba(var(--iris-rgb), .4); }
+html.ui-v2 .session-window-status.active::before { background: var(--iris); animation: ui2-pulse 2s infinite; }
+html.ui-v2 .session-window-status.waiting { color: var(--amber); border-color: rgba(var(--amber-rgb), .4); }
+html.ui-v2 .session-window-status.waiting::before { background: var(--amber); animation: ui2-pulse 2s infinite; }
+html.ui-v2 .session-window-status.done { color: var(--green); border-color: rgba(var(--green-rgb), .38); }
+html.ui-v2 .session-window-status.done::before { background: var(--green); }
+
+/* — goal / tier / vitals chips — */
+html.ui-v2 .session-window-goal,
+html.ui-v2 .session-window-tier,
+html.ui-v2 .session-window-vitals {
+  font-family: var(--mono);
+  font-size: 9.5px;
+}
+html.ui-v2 .session-window-vitals { gap: 7px; }
+
+/* — window controls (−, ⛶, ×, ⋯) — */
+html.ui-v2 .session-window-action {
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  background: transparent;
+  color: var(--text-3);
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 .session-window-action:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 .session-window-close:hover {
+  background: rgba(var(--rose-rgb), .12);
+  color: var(--rose);
+}
+
+/* — ⋯ action menu + submenus: v2 popover card — */
+html.ui-v2 .session-window-menu,
+html.ui-v2 .session-window-submenu-panel {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow-overlay);
+  padding: 4px;
+}
+html.ui-v2 .session-window-menu button,
+html.ui-v2 .session-window-submenu-trigger {
+  border-radius: 7px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+html.ui-v2 .session-window-menu button:hover,
+html.ui-v2 .session-window-submenu-trigger:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+html.ui-v2 .session-window-menu-separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--line);
+}
+
+/* — per-window log — */
+html.ui-v2 .session-window-log { padding: 4px 10px 8px; }
+/* narrower gutter inside windows than the main timeline */
+html.ui-v2 .session-window-log .log-entry { grid-template-columns: 44px 14px max-content max-content max-content max-content minmax(0, 1fr); }
+html.ui-v2 .session-window-empty {
+  color: var(--text-3);
+  font-size: 12px;
+  padding: 14px 4px;
+}
+html.ui-v2 .session-window-jump-bottom {
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--text-2);
+  box-shadow: var(--shadow-card);
+}
+html.ui-v2 .session-window-jump-bottom:hover { color: var(--text); background: var(--surface-2); }
+
+/* — relationship wires (SVG): quieter idle, iris when active — */
+html.ui-v2 .session-relationship-wire { stroke: color-mix(in srgb, var(--text-3) 45%, transparent); }
+html.ui-v2 .session-relationship-wire.fork { stroke: rgba(var(--iris-rgb), .62); }
+html.ui-v2 .session-relationship-wire.subagent { stroke: rgba(var(--green-rgb), .6); }
+html.ui-v2 .session-relationship-wire.active {
+  stroke: var(--iris);
+  filter: drop-shadow(0 0 4px rgba(var(--iris-rgb), .45));
+}
+html.ui-v2 .session-relationship-endpoint { fill: var(--bg); stroke: color-mix(in srgb, var(--text-3) 55%, transparent); }
+html.ui-v2 .session-relationship-endpoint.fork { stroke: rgba(var(--iris-rgb), .8); }
+html.ui-v2 .session-relationship-endpoint.subagent { stroke: rgba(var(--green-rgb), .78); }
+html.ui-v2 .session-relationship-endpoint.active { stroke: var(--iris); }
+
+/* — "Concurrent view" strip label + its window controls — */
+html.ui-v2 .concurrent-log-label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+html.ui-v2 .concurrent-log-action {
+  border-radius: var(--r-ctl);
+  color: var(--text-3);
+}
+html.ui-v2 .concurrent-log-action:hover,
+html.ui-v2 .concurrent-log-action:focus { background: var(--surface-2); color: var(--text); }
+html.ui-v2 .concurrent-log-action[aria-pressed="true"] { color: var(--iris-2); }
 /* ── static/app/ui2-live.css ── */
 /* ── ui-v2 Live display (Video tab) re-skin (design-overhaul P2) ───────
    Everything here is scoped under `html.ui-v2` and restyles the EXISTING
