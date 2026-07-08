@@ -502,6 +502,55 @@ pub(crate) async fn activate_user_display(
     #[cfg(target_os = "linux")]
     crate::linux_display_env::ensure_gui_session_env("user display activation");
 
+    // Virtual (Xvfb) display targets connect directly to their own X server.
+    // A display id in the agent virtual range with a live socket is an Xvfb
+    // — agent-launched or dashboard-created — and must never fall through to
+    // the user-session backends: the Wayland arm would raise a portal dialog
+    // for the wrong display, and the X11 arm's xrandr lookup only knows
+    // monitor ids of $DISPLAY, so it previously captured the right Xvfb only
+    // when the process-wide DISPLAY happened to point at it.
+    #[cfg(target_os = "linux")]
+    if target_display_id != 0 && vision::virtual_display_socket_exists(target_display_id) {
+        let display_str = format!(":{target_display_id}");
+        let backend = match display::x11::X11Backend::with_display(&display_str) {
+            Ok(backend) => backend,
+            Err(e) => {
+                report_user_display_capture_unavailable(
+                    bus,
+                    display_id,
+                    format!("virtual display {display_str} connect failed: {e}"),
+                );
+                return;
+            }
+        };
+        let session = display::DisplaySession::new(display_id, Arc::new(backend));
+        if let Err(e) = session
+            .start(
+                30,
+                frame_registry.clone(),
+                Some(display_event_forwarder(bus.clone())),
+            )
+            .await
+        {
+            report_user_display_capture_unavailable(
+                bus,
+                display_id,
+                format!("virtual display {display_str} session failed: {e}"),
+            );
+            return;
+        }
+        let (width, height) = session.resolution();
+        let session = Arc::new(session);
+        session.spawn_metrics_logger(Some(display_event_forwarder(bus.clone())));
+        session_registry.write().await.insert(display_id, session);
+        bus.send(AppEvent::DisplayReady {
+            display_id,
+            width,
+            height,
+        });
+        return;
+    }
+
     // On Wayland: create a DisplaySession with WaylandBackend.
     // Detect Wayland even when WAYLAND_DISPLAY isn't in our env (e.g. started
     // from a tty/ssh session while a graphical session is active).
