@@ -301,6 +301,133 @@ html.ui-v2 .ui2-palette-empty {
 @keyframes ui2-rise { from { opacity: 0; transform: translateY(8px) scale(.99); } to { opacity: 1; transform: none; } }
 @keyframes ui2-fade { from { opacity: 0; } to { opacity: 1; } }
 
+/* ── activity layout toggle (Focus / Grid) ─────────────────────────────
+   Visible only while the Activity tab is active (html[data-ui2-tab],
+   stamped by the pane observer). Active side follows html[data-ui2-layout]
+   (absent = focus, the default) so CSS has one source of truth. */
+html.ui-v2 .ui2-layout-toggle { display: none; }
+html.ui-v2[data-ui2-tab="activity"] .ui2-layout-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+}
+html.ui-v2 .ui2-layout-toggle button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 650;
+  padding: 4px 12px;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 .ui2-layout-toggle button:hover { color: var(--text); }
+html.ui-v2:not([data-ui2-layout="grid"]) #ui2-layout-focus-btn,
+html.ui-v2[data-ui2-layout="grid"] #ui2-layout-grid-btn {
+  background: var(--surface-2);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+/* ── composer dock (the global task bar, re-homed) ─────────────────────
+   The v1 .global-task-bar moves from the top strip to a floating card at
+   the bottom — the design's composer. Same element, same ids, all v1
+   listeners intact; phase + stop inside it are hidden because the
+   oversight bar already mirrors them. Solid surface, no backdrop-filter:
+   fixed chrome overlaps the Station canvases on the Station tab. */
+html.ui-v2 #app { padding-bottom: 92px; }
+html.ui-v2 .global-task-bar {
+  position: fixed;
+  left: var(--ui2-nav-w);
+  right: 0;
+  bottom: 16px;
+  width: min(920px, calc(100vw - var(--ui2-nav-w) - 36px));
+  margin-inline: auto;
+  z-index: 70;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: var(--shadow-card);
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+html.ui-v2 .global-task-bar:focus-within {
+  border-color: rgba(var(--iris-rgb), .45);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .14), var(--shadow-card);
+}
+/* phase + stop live in the oversight bar under v2 */
+html.ui-v2 .global-task-bar .phase-banner { display: none; }
+html.ui-v2 .global-task-bar .stop-btn { display: none; }
+html.ui-v2 .global-task-input {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  font-size: 13.5px;
+  padding: 7px 6px;
+}
+html.ui-v2 .global-task-input:focus { border: 0; box-shadow: none; outline: none; }
+html.ui-v2 .task-new-session-btn {
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-weight: 650;
+  padding: 5px 11px;
+}
+html.ui-v2 .task-new-session-btn:hover { color: var(--text); background: var(--surface-2); }
+html.ui-v2 .global-direct-toggle {
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  padding: 4px 11px;
+  font-size: 11px;
+  color: var(--text-3);
+  background: transparent;
+}
+html.ui-v2 .global-direct-toggle:has(input:checked) {
+  border-color: rgba(var(--iris-rgb), .4);
+  color: var(--iris-2);
+  background: rgba(var(--iris-rgb), .09);
+}
+html.ui-v2 .global-attach-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 50%;
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 13px;
+}
+html.ui-v2 .global-attach-btn:hover { color: var(--text); background: var(--surface-2); }
+/* Send keeps its v1 text — the label is live state ("Send" / "↗ Steer" /
+   "Save & rerun", rewritten by updateSubmitButtonLabel on phase change). */
+html.ui-v2 .global-send-btn {
+  border: 0;
+  border-radius: var(--r-pill);
+  padding: 8px 16px;
+  font-size: 12.5px;
+  font-weight: 750;
+  flex-shrink: 0;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .34);
+}
+html.ui-v2 .global-send-btn:hover { filter: brightness(1.08); background: linear-gradient(180deg, var(--iris), var(--iris-deep)); }
+
 /* ── responsive ── */
 @media (max-width: 1179px) {
   html.ui-v2 .ui2-ovs-compact-hide { display: none; }

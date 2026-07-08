@@ -13,24 +13,44 @@ html.ui-v2 #log-stream {
   padding: 18px 24px 24px;
 }
 
-/* — timeline entry grammar: [mono ts gutter][dot][body] — */
+/* — timeline entry grammar — the scaffold's real child order is
+   [icon][ts][host][session][level][anchor?][content…] (createLogScaffold,
+   41:1260). Explicit grid placement turns that into the design's line:
+   [ts gutter][role dot][host][session][ROLE eyebrow][anchor] [body],
+   with every unlisted child (output groups, notices) defaulting into the
+   body column on its own row — a hanging indent for free. */
 html.ui-v2 .log-entry {
   display: grid;
-  grid-template-columns: 56px 14px 1fr;
-  gap: 0 10px;
+  grid-template-columns: 56px 18px max-content max-content max-content max-content minmax(0, 1fr);
   align-items: baseline;
-  padding: 5px 0;
+  position: relative;
+  padding: 4px 0;
   border: 0;
   background: transparent;
   font-size: 13.5px;
   line-height: 1.55;
 }
+html.ui-v2 .log-entry > * { grid-column: 7; min-width: 0; }
+/* the grid display above outweighs v1's filter hide — restate it */
+html.ui-v2 .log-entry.hidden-by-filter { display: none; }
+html.ui-v2 .log-entry .log-ts { grid-column: 1; grid-row: 1; }
+html.ui-v2 .log-entry .log-icon { grid-column: 2; grid-row: 1; }
+html.ui-v2 .log-entry .log-host { grid-column: 3; grid-row: 1; }
+html.ui-v2 .log-entry .log-session { grid-column: 4; grid-row: 1; }
+html.ui-v2 .log-entry .log-level { grid-column: 5; grid-row: 1; }
+html.ui-v2 .log-entry .log-anchor-btn { grid-column: 6; grid-row: 1; }
+html.ui-v2 .log-entry .log-content { grid-column: 7; }
 html.ui-v2 .log-entry .log-ts {
   font-family: var(--mono);
   font-size: 10.5px;
   color: var(--text-3);
   text-align: right;
   white-space: nowrap;
+  padding-right: 4px;
+  width: auto;    /* v1 fixes .log-ts at width:88px — wider than the 56px
+                     gutter, it would overflow across the dot/badge
+                     columns and mash the row's left side */
+  min-width: 0;
 }
 html.ui-v2 .log-entry .log-icon {
   font-size: 0;               /* hide the glyph… */
@@ -40,6 +60,43 @@ html.ui-v2 .log-entry .log-icon {
   align-self: center;
   justify-self: center;
 }
+html.ui-v2 .log-entry .log-host,
+html.ui-v2 .log-entry .log-session { margin-right: 7px; align-self: center; }
+html.ui-v2 .log-entry .log-anchor-btn { margin-right: 6px; align-self: center; }
+/* the source string becomes the role eyebrow (gap via padding — grid
+   max-content tracks size it reliably even when the glyph is ::after) */
+html.ui-v2 .log-entry .log-level {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  padding-right: 10px;
+  white-space: nowrap;
+  width: auto;    /* v1 fixes .log-level at width:52px — the longer v2
+                     role labels (INTENDANT) would ink past it into the
+                     content column */
+}
+/* named roles: label overrides (textContent stays untouched — session
+   windows and Station read it — so the swap is ::after only) */
+html.ui-v2 .log-entry.source-user .log-level,
+html.ui-v2 .log-entry.source-model .log-level,
+html.ui-v2 .log-entry.source-prsnc .log-level,
+html.ui-v2 .log-entry.source-live .log-level { font-size: 0; letter-spacing: 0; }
+html.ui-v2 .log-entry .log-level::after {
+  font-size: 9.5px;
+  letter-spacing: .13em;
+}
+html.ui-v2 .log-entry.source-user .log-level { color: var(--amber); }
+html.ui-v2 .log-entry.source-user .log-level::after { content: 'YOU'; }
+html.ui-v2 .log-entry.source-model .log-level { color: var(--iris-2); }
+html.ui-v2 .log-entry.source-model .log-level::after { content: 'INTENDANT'; }
+html.ui-v2 .log-entry.source-prsnc .log-level { color: var(--green); }
+html.ui-v2 .log-entry.source-prsnc .log-level::after { content: 'PRESENCE'; }
+html.ui-v2 .log-entry.source-live .log-level { color: var(--sky); }
+html.ui-v2 .log-entry.source-live .log-level::after { content: 'VOICE'; }
+/* role dot tints */
 html.ui-v2 .log-entry.level-model .log-icon { background: var(--iris); }
 html.ui-v2 .log-entry.level-agent .log-icon { background: var(--green); }
 html.ui-v2 .log-entry.level-subagent .log-icon { background: var(--violet); }
@@ -47,10 +104,21 @@ html.ui-v2 .log-entry.level-presence .log-icon { background: var(--green); }
 html.ui-v2 .log-entry.level-error .log-icon { background: var(--rose); }
 html.ui-v2 .log-entry.level-warn .log-icon { background: var(--amber); }
 html.ui-v2 .log-entry.level-info .log-icon { background: var(--sky); }
+html.ui-v2 .log-entry.source-user .log-icon { background: var(--amber); }
 html.ui-v2 .log-entry.level-model { color: var(--text); }
 html.ui-v2 .log-entry.level-detail, html.ui-v2 .log-entry.level-debug { color: var(--text-3); }
 html.ui-v2 .log-entry.level-error { color: var(--rose); }
 html.ui-v2 .log-entry.level-warn { color: var(--amber); }
+/* hover actions float over the entry instead of joining the grid flow */
+html.ui-v2 .log-entry .log-copy-entry,
+html.ui-v2 .log-entry .log-edit-message {
+  position: absolute;
+  top: 2px;
+  background: var(--surface);
+  border-color: var(--line);
+}
+html.ui-v2 .log-entry .log-copy-entry { right: 4px; }
+html.ui-v2 .log-entry .log-edit-message { right: 32px; }
 
 /* code-ish payloads inside entries read as command blocks */
 html.ui-v2 .log-entry pre {
@@ -158,3 +226,127 @@ html.ui-v2 #approval-panel .ui2-approve-category {
 html.ui-v2 #approval-panel .ui2-approve-category:hover { background: rgba(var(--green-rgb), .08); }
 /* the relabeled autonomy escape reads as the power action it is */
 html.ui-v2 #approval-panel .ui2-full-escape { font-size: 12px; color: var(--text-3); }
+
+/* — Focus layout (default): one centered timeline ──────────────────────
+   The session-window grid, its resize handle, and the "Concurrent view"
+   label disappear; the combined stream is the surface. JS keeps the
+   stream mounted (shouldDetachConcurrentLogStream returns false under
+   Focus) — these rules are the visual half of that contract. Grid mode
+   (html[data-ui2-layout="grid"]) leaves v1's machinery fully in charge. */
+html.ui-v2:not([data-ui2-layout="grid"]) #session-window-grid,
+html.ui-v2:not([data-ui2-layout="grid"]) #session-window-grid-resize-handle,
+html.ui-v2:not([data-ui2-layout="grid"]) #concurrent-log-label { display: none; }
+/* Focus must also neutralize the v1 minimized/maximized pane states —
+   they collapse or hide the very stream Focus promotes (the CSS half of
+   the shouldDetachConcurrentLogStream guard). */
+html.ui-v2:not([data-ui2-layout="grid"]) .subtab-pane.concurrent-log-minimized .log-stream { display: block; }
+html.ui-v2:not([data-ui2-layout="grid"]) .subtab-pane.concurrent-log-minimized .concurrent-log-region,
+html.ui-v2:not([data-ui2-layout="grid"]) .subtab-pane.concurrent-log-maximized .concurrent-log-region {
+  flex: 1;
+  min-height: 0;
+  border-top: 0;
+}
+/* v1 hides these with !important while the grid is maximized; the grid
+   itself is gone under Focus, so counter at the same weight. */
+html.ui-v2:not([data-ui2-layout="grid"]) .session-window-grid.maximized ~ .concurrent-log-region { display: flex !important; }
+html.ui-v2:not([data-ui2-layout="grid"]) .session-window-grid.maximized ~ .scroll-bottom-btn.visible { display: flex !important; }
+
+/* turn separators read as quiet time breaks */
+html.ui-v2 .log-turn-sep {
+  max-width: 880px;
+  margin: 10px auto;
+  opacity: .75;
+}
+
+/* — vitals rail (Focus, Activity tab, ≥1180px) ─────────────────────────
+   The design's right rail: Working tree / Context budget / Prompt cache /
+   Rate limits / Changes for the FOREGROUND session (prompt target →
+   current → daemon), fed by the same session_vitals segments the session
+   windows render. Built by ui2-activity.js inside #activity-log-pane so
+   subtab/tab switching hides it for free. */
+html.ui-v2 #ui2-vitals-rail { display: none; }
+@media (min-width: 1180px) {
+  html.ui-v2:not([data-ui2-layout="grid"]) #ui2-vitals-rail {
+    display: flex;
+    flex-direction: column;
+    gap: 11px;
+    position: absolute;
+    top: 12px;
+    right: 14px;
+    width: 248px;
+    padding: 14px 15px 12px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--surface);
+    box-shadow: var(--shadow-card);
+    z-index: 5;
+  }
+  html.ui-v2:not([data-ui2-layout="grid"]) #activity-log-pane { padding-right: 288px; }
+}
+html.ui-v2 .ui2-rail-session {
+  font-size: 12px;
+  font-weight: 750;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-bottom: 9px;
+  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 .ui2-rail-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  text-align: left;
+  font-family: inherit;
+}
+html.ui-v2 .ui2-rail-label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 .ui2-rail-value {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .ui2-rail-row[data-state="ok"] .ui2-rail-value { color: var(--green); }
+html.ui-v2 .ui2-rail-row[data-state="warn"] .ui2-rail-value { color: var(--amber); }
+html.ui-v2 .ui2-rail-row[data-state="crit"] .ui2-rail-value { color: var(--rose); }
+html.ui-v2 .ui2-rail-meter {
+  height: 4px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+html.ui-v2 .ui2-rail-meter i {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--iris), var(--iris-deep));
+  transition: width .4s ease;
+}
+html.ui-v2 .ui2-rail-changes { cursor: pointer; }
+html.ui-v2 .ui2-rail-changes:hover .ui2-rail-value { color: var(--text); }
+html.ui-v2 .ui2-rail-advanced {
+  margin-top: 2px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 .ui2-rail-advanced:hover { background: var(--surface-2); color: var(--text); }

@@ -930,7 +930,11 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
             Some(PresenceEvent::ApprovalNeeded {
                 id: *id,
                 preview: command_preview.clone(),
-                category: format!("{:?}", category),
+                // Display, not Debug: the dashboard round-trips this string
+                // into set_approval_rule, whose ActionCategory::from_str
+                // only accepts the lowercase Display ids ("destructive" —
+                // "Destructive" silently fails to parse).
+                category: category.to_string(),
             })
         }
         AppEvent::ApprovalResolved { id, action, .. } => {
@@ -1249,7 +1253,9 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             s.pending_approval = Some(presence_core::PendingApprovalSnapshot {
                 id: *id,
                 command_preview: command_preview.clone(),
-                category: format!("{:?}", category),
+                // Display ids, same reason as the live ApprovalNeeded path:
+                // late-join re-injection feeds set_approval_rule's parser.
+                category: category.to_string(),
             });
         }
         AppEvent::ApprovalResolved { action, .. } => {

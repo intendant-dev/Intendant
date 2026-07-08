@@ -4046,7 +4046,7 @@ body.access-page #tab-access {
   align-items: center;
   gap: 8px;
   padding: 7px 12px;
-  background: #11111a;
+  background: var(--crust);
   border-bottom: 1px solid var(--surface0);
   flex-shrink: 0;
 }
@@ -4076,7 +4076,7 @@ body.access-page #tab-access {
   background:
     radial-gradient(circle at 18% 20%, color-mix(in srgb, var(--blue) 18%, transparent), transparent 30%),
     radial-gradient(circle at 84% 78%, color-mix(in srgb, var(--green) 12%, transparent), transparent 28%),
-    linear-gradient(145deg, #101018 0%, var(--mantle) 62%, #11111a 100%);
+    linear-gradient(145deg, var(--crust) 0%, var(--mantle) 62%, var(--crust) 100%);
 }
 #context-scene {
   display: block;
@@ -4349,7 +4349,7 @@ body.context-focus-active {
   font-weight: 600;
   cursor: pointer;
 }
-.stop-btn:hover { background: #e06c75; }
+.stop-btn:hover { background: var(--red); }
 .stop-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ── Global Task Bar ──
@@ -12369,6 +12369,133 @@ html.ui-v2 .ui2-palette-empty {
 @keyframes ui2-rise { from { opacity: 0; transform: translateY(8px) scale(.99); } to { opacity: 1; transform: none; } }
 @keyframes ui2-fade { from { opacity: 0; } to { opacity: 1; } }
 
+/* ── activity layout toggle (Focus / Grid) ─────────────────────────────
+   Visible only while the Activity tab is active (html[data-ui2-tab],
+   stamped by the pane observer). Active side follows html[data-ui2-layout]
+   (absent = focus, the default) so CSS has one source of truth. */
+html.ui-v2 .ui2-layout-toggle { display: none; }
+html.ui-v2[data-ui2-tab="activity"] .ui2-layout-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+}
+html.ui-v2 .ui2-layout-toggle button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 650;
+  padding: 4px 12px;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 .ui2-layout-toggle button:hover { color: var(--text); }
+html.ui-v2:not([data-ui2-layout="grid"]) #ui2-layout-focus-btn,
+html.ui-v2[data-ui2-layout="grid"] #ui2-layout-grid-btn {
+  background: var(--surface-2);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+/* ── composer dock (the global task bar, re-homed) ─────────────────────
+   The v1 .global-task-bar moves from the top strip to a floating card at
+   the bottom — the design's composer. Same element, same ids, all v1
+   listeners intact; phase + stop inside it are hidden because the
+   oversight bar already mirrors them. Solid surface, no backdrop-filter:
+   fixed chrome overlaps the Station canvases on the Station tab. */
+html.ui-v2 #app { padding-bottom: 92px; }
+html.ui-v2 .global-task-bar {
+  position: fixed;
+  left: var(--ui2-nav-w);
+  right: 0;
+  bottom: 16px;
+  width: min(920px, calc(100vw - var(--ui2-nav-w) - 36px));
+  margin-inline: auto;
+  z-index: 70;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: var(--shadow-card);
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+html.ui-v2 .global-task-bar:focus-within {
+  border-color: rgba(var(--iris-rgb), .45);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .14), var(--shadow-card);
+}
+/* phase + stop live in the oversight bar under v2 */
+html.ui-v2 .global-task-bar .phase-banner { display: none; }
+html.ui-v2 .global-task-bar .stop-btn { display: none; }
+html.ui-v2 .global-task-input {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  font-size: 13.5px;
+  padding: 7px 6px;
+}
+html.ui-v2 .global-task-input:focus { border: 0; box-shadow: none; outline: none; }
+html.ui-v2 .task-new-session-btn {
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-weight: 650;
+  padding: 5px 11px;
+}
+html.ui-v2 .task-new-session-btn:hover { color: var(--text); background: var(--surface-2); }
+html.ui-v2 .global-direct-toggle {
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  padding: 4px 11px;
+  font-size: 11px;
+  color: var(--text-3);
+  background: transparent;
+}
+html.ui-v2 .global-direct-toggle:has(input:checked) {
+  border-color: rgba(var(--iris-rgb), .4);
+  color: var(--iris-2);
+  background: rgba(var(--iris-rgb), .09);
+}
+html.ui-v2 .global-attach-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 50%;
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 13px;
+}
+html.ui-v2 .global-attach-btn:hover { color: var(--text); background: var(--surface-2); }
+/* Send keeps its v1 text — the label is live state ("Send" / "↗ Steer" /
+   "Save & rerun", rewritten by updateSubmitButtonLabel on phase change). */
+html.ui-v2 .global-send-btn {
+  border: 0;
+  border-radius: var(--r-pill);
+  padding: 8px 16px;
+  font-size: 12.5px;
+  font-weight: 750;
+  flex-shrink: 0;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .34);
+}
+html.ui-v2 .global-send-btn:hover { filter: brightness(1.08); background: linear-gradient(180deg, var(--iris), var(--iris-deep)); }
+
 /* ── responsive ── */
 @media (max-width: 1179px) {
   html.ui-v2 .ui2-ovs-compact-hide { display: none; }
@@ -17051,24 +17178,44 @@ html.ui-v2 #log-stream {
   padding: 18px 24px 24px;
 }
 
-/* — timeline entry grammar: [mono ts gutter][dot][body] — */
+/* — timeline entry grammar — the scaffold's real child order is
+   [icon][ts][host][session][level][anchor?][content…] (createLogScaffold,
+   41:1260). Explicit grid placement turns that into the design's line:
+   [ts gutter][role dot][host][session][ROLE eyebrow][anchor] [body],
+   with every unlisted child (output groups, notices) defaulting into the
+   body column on its own row — a hanging indent for free. */
 html.ui-v2 .log-entry {
   display: grid;
-  grid-template-columns: 56px 14px 1fr;
-  gap: 0 10px;
+  grid-template-columns: 56px 18px max-content max-content max-content max-content minmax(0, 1fr);
   align-items: baseline;
-  padding: 5px 0;
+  position: relative;
+  padding: 4px 0;
   border: 0;
   background: transparent;
   font-size: 13.5px;
   line-height: 1.55;
 }
+html.ui-v2 .log-entry > * { grid-column: 7; min-width: 0; }
+/* the grid display above outweighs v1's filter hide — restate it */
+html.ui-v2 .log-entry.hidden-by-filter { display: none; }
+html.ui-v2 .log-entry .log-ts { grid-column: 1; grid-row: 1; }
+html.ui-v2 .log-entry .log-icon { grid-column: 2; grid-row: 1; }
+html.ui-v2 .log-entry .log-host { grid-column: 3; grid-row: 1; }
+html.ui-v2 .log-entry .log-session { grid-column: 4; grid-row: 1; }
+html.ui-v2 .log-entry .log-level { grid-column: 5; grid-row: 1; }
+html.ui-v2 .log-entry .log-anchor-btn { grid-column: 6; grid-row: 1; }
+html.ui-v2 .log-entry .log-content { grid-column: 7; }
 html.ui-v2 .log-entry .log-ts {
   font-family: var(--mono);
   font-size: 10.5px;
   color: var(--text-3);
   text-align: right;
   white-space: nowrap;
+  padding-right: 4px;
+  width: auto;    /* v1 fixes .log-ts at width:88px — wider than the 56px
+                     gutter, it would overflow across the dot/badge
+                     columns and mash the row's left side */
+  min-width: 0;
 }
 html.ui-v2 .log-entry .log-icon {
   font-size: 0;               /* hide the glyph… */
@@ -17078,6 +17225,43 @@ html.ui-v2 .log-entry .log-icon {
   align-self: center;
   justify-self: center;
 }
+html.ui-v2 .log-entry .log-host,
+html.ui-v2 .log-entry .log-session { margin-right: 7px; align-self: center; }
+html.ui-v2 .log-entry .log-anchor-btn { margin-right: 6px; align-self: center; }
+/* the source string becomes the role eyebrow (gap via padding — grid
+   max-content tracks size it reliably even when the glyph is ::after) */
+html.ui-v2 .log-entry .log-level {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  padding-right: 10px;
+  white-space: nowrap;
+  width: auto;    /* v1 fixes .log-level at width:52px — the longer v2
+                     role labels (INTENDANT) would ink past it into the
+                     content column */
+}
+/* named roles: label overrides (textContent stays untouched — session
+   windows and Station read it — so the swap is ::after only) */
+html.ui-v2 .log-entry.source-user .log-level,
+html.ui-v2 .log-entry.source-model .log-level,
+html.ui-v2 .log-entry.source-prsnc .log-level,
+html.ui-v2 .log-entry.source-live .log-level { font-size: 0; letter-spacing: 0; }
+html.ui-v2 .log-entry .log-level::after {
+  font-size: 9.5px;
+  letter-spacing: .13em;
+}
+html.ui-v2 .log-entry.source-user .log-level { color: var(--amber); }
+html.ui-v2 .log-entry.source-user .log-level::after { content: 'YOU'; }
+html.ui-v2 .log-entry.source-model .log-level { color: var(--iris-2); }
+html.ui-v2 .log-entry.source-model .log-level::after { content: 'INTENDANT'; }
+html.ui-v2 .log-entry.source-prsnc .log-level { color: var(--green); }
+html.ui-v2 .log-entry.source-prsnc .log-level::after { content: 'PRESENCE'; }
+html.ui-v2 .log-entry.source-live .log-level { color: var(--sky); }
+html.ui-v2 .log-entry.source-live .log-level::after { content: 'VOICE'; }
+/* role dot tints */
 html.ui-v2 .log-entry.level-model .log-icon { background: var(--iris); }
 html.ui-v2 .log-entry.level-agent .log-icon { background: var(--green); }
 html.ui-v2 .log-entry.level-subagent .log-icon { background: var(--violet); }
@@ -17085,10 +17269,21 @@ html.ui-v2 .log-entry.level-presence .log-icon { background: var(--green); }
 html.ui-v2 .log-entry.level-error .log-icon { background: var(--rose); }
 html.ui-v2 .log-entry.level-warn .log-icon { background: var(--amber); }
 html.ui-v2 .log-entry.level-info .log-icon { background: var(--sky); }
+html.ui-v2 .log-entry.source-user .log-icon { background: var(--amber); }
 html.ui-v2 .log-entry.level-model { color: var(--text); }
 html.ui-v2 .log-entry.level-detail, html.ui-v2 .log-entry.level-debug { color: var(--text-3); }
 html.ui-v2 .log-entry.level-error { color: var(--rose); }
 html.ui-v2 .log-entry.level-warn { color: var(--amber); }
+/* hover actions float over the entry instead of joining the grid flow */
+html.ui-v2 .log-entry .log-copy-entry,
+html.ui-v2 .log-entry .log-edit-message {
+  position: absolute;
+  top: 2px;
+  background: var(--surface);
+  border-color: var(--line);
+}
+html.ui-v2 .log-entry .log-copy-entry { right: 4px; }
+html.ui-v2 .log-entry .log-edit-message { right: 32px; }
 
 /* code-ish payloads inside entries read as command blocks */
 html.ui-v2 .log-entry pre {
@@ -17196,6 +17391,130 @@ html.ui-v2 #approval-panel .ui2-approve-category {
 html.ui-v2 #approval-panel .ui2-approve-category:hover { background: rgba(var(--green-rgb), .08); }
 /* the relabeled autonomy escape reads as the power action it is */
 html.ui-v2 #approval-panel .ui2-full-escape { font-size: 12px; color: var(--text-3); }
+
+/* — Focus layout (default): one centered timeline ──────────────────────
+   The session-window grid, its resize handle, and the "Concurrent view"
+   label disappear; the combined stream is the surface. JS keeps the
+   stream mounted (shouldDetachConcurrentLogStream returns false under
+   Focus) — these rules are the visual half of that contract. Grid mode
+   (html[data-ui2-layout="grid"]) leaves v1's machinery fully in charge. */
+html.ui-v2:not([data-ui2-layout="grid"]) #session-window-grid,
+html.ui-v2:not([data-ui2-layout="grid"]) #session-window-grid-resize-handle,
+html.ui-v2:not([data-ui2-layout="grid"]) #concurrent-log-label { display: none; }
+/* Focus must also neutralize the v1 minimized/maximized pane states —
+   they collapse or hide the very stream Focus promotes (the CSS half of
+   the shouldDetachConcurrentLogStream guard). */
+html.ui-v2:not([data-ui2-layout="grid"]) .subtab-pane.concurrent-log-minimized .log-stream { display: block; }
+html.ui-v2:not([data-ui2-layout="grid"]) .subtab-pane.concurrent-log-minimized .concurrent-log-region,
+html.ui-v2:not([data-ui2-layout="grid"]) .subtab-pane.concurrent-log-maximized .concurrent-log-region {
+  flex: 1;
+  min-height: 0;
+  border-top: 0;
+}
+/* v1 hides these with !important while the grid is maximized; the grid
+   itself is gone under Focus, so counter at the same weight. */
+html.ui-v2:not([data-ui2-layout="grid"]) .session-window-grid.maximized ~ .concurrent-log-region { display: flex !important; }
+html.ui-v2:not([data-ui2-layout="grid"]) .session-window-grid.maximized ~ .scroll-bottom-btn.visible { display: flex !important; }
+
+/* turn separators read as quiet time breaks */
+html.ui-v2 .log-turn-sep {
+  max-width: 880px;
+  margin: 10px auto;
+  opacity: .75;
+}
+
+/* — vitals rail (Focus, Activity tab, ≥1180px) ─────────────────────────
+   The design's right rail: Working tree / Context budget / Prompt cache /
+   Rate limits / Changes for the FOREGROUND session (prompt target →
+   current → daemon), fed by the same session_vitals segments the session
+   windows render. Built by ui2-activity.js inside #activity-log-pane so
+   subtab/tab switching hides it for free. */
+html.ui-v2 #ui2-vitals-rail { display: none; }
+@media (min-width: 1180px) {
+  html.ui-v2:not([data-ui2-layout="grid"]) #ui2-vitals-rail {
+    display: flex;
+    flex-direction: column;
+    gap: 11px;
+    position: absolute;
+    top: 12px;
+    right: 14px;
+    width: 248px;
+    padding: 14px 15px 12px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--surface);
+    box-shadow: var(--shadow-card);
+    z-index: 5;
+  }
+  html.ui-v2:not([data-ui2-layout="grid"]) #activity-log-pane { padding-right: 288px; }
+}
+html.ui-v2 .ui2-rail-session {
+  font-size: 12px;
+  font-weight: 750;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-bottom: 9px;
+  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 .ui2-rail-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  text-align: left;
+  font-family: inherit;
+}
+html.ui-v2 .ui2-rail-label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 .ui2-rail-value {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .ui2-rail-row[data-state="ok"] .ui2-rail-value { color: var(--green); }
+html.ui-v2 .ui2-rail-row[data-state="warn"] .ui2-rail-value { color: var(--amber); }
+html.ui-v2 .ui2-rail-row[data-state="crit"] .ui2-rail-value { color: var(--rose); }
+html.ui-v2 .ui2-rail-meter {
+  height: 4px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+html.ui-v2 .ui2-rail-meter i {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--iris), var(--iris-deep));
+  transition: width .4s ease;
+}
+html.ui-v2 .ui2-rail-changes { cursor: pointer; }
+html.ui-v2 .ui2-rail-changes:hover .ui2-rail-value { color: var(--text); }
+html.ui-v2 .ui2-rail-advanced {
+  margin-top: 2px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 .ui2-rail-advanced:hover { background: var(--surface-2); color: var(--text); }
 /* ── static/app/ui2-live.css ── */
 /* ── ui-v2 Live display (Video tab) re-skin (design-overhaul P2) ───────
    Everything here is scoped under `html.ui-v2` and restyles the EXISTING
@@ -22151,6 +22470,16 @@ html.ui-v2 #tab-settings .settings-save-row {
     <span class="ui2-ovs-session" id="ui2-session-id"></span>
   </div>
   <div class="ui2-ovs-spacer"></div>
+  <!-- Activity layout toggle: Focus (one centered timeline) vs Grid (the
+       session-window grid + concurrent stream). CSS shows it only while
+       the Activity tab is active (html[data-ui2-tab="activity"]);
+       ui2-activity.js owns the state (html[data-ui2-layout] + localStorage). -->
+  <div class="ui2-layout-toggle" id="ui2-layout-toggle" role="group" aria-label="Activity layout">
+    <button type="button" id="ui2-layout-focus-btn" data-layout="focus"
+            title="Focus — one centered timeline (session windows hidden)">Focus</button>
+    <button type="button" id="ui2-layout-grid-btn" data-layout="grid"
+            title="Grid — session windows with the concurrent stream below">Grid</button>
+  </div>
   <div class="ui2-ctx ui2-ovs-compact-hide" id="ui2-ctx" title="Context budget used">
     <span class="ui2-ctx-label">Context</span>
     <div class="ui2-ctx-track"><div class="ui2-ctx-fill" id="ui2-ctx-fill"></div></div>
@@ -22392,10 +22721,13 @@ function ui2WireMirrors() {
 
   // Stop: visible exactly when the v1 button is; label follows
   // ("Interrupting…"); click proxies so all interrupt logic stays v1's.
+  // Read the INLINE display (what updateStopButtonVisibility writes), not
+  // the computed one — under v2 the composer CSS hides the v1 button
+  // unconditionally, so computed display is always none.
   ui2Mirror('stop-btn', (src) => {
     const stop = document.getElementById('ui2-stop-btn');
     if (!stop) return;
-    const shown = getComputedStyle(src).display !== 'none' && !src.hidden;
+    const shown = src.style.display !== 'none' && !src.hidden;
     stop.hidden = !shown;
     stop.disabled = src.disabled;
     const label = document.getElementById('ui2-stop-label');
@@ -22481,6 +22813,9 @@ function ui2WireMirrors() {
     const title = document.getElementById('ui2-page-title');
     if (!active || !title) return;
     const tab = active.id.replace(/^tab-/, '');
+    // Stamp the active tab on <html> so v2 CSS can key tab-scoped chrome
+    // (the Focus/Grid layout toggle shows only on Activity).
+    document.documentElement.dataset.ui2Tab = tab;
     title.textContent = UI2_TAB_TITLES[tab] || tab;
     document.querySelectorAll('#ui2-nav .ui2-nav-item[data-tab]').forEach((btn) => {
       // switchTab() owns .active on .tab-btn but early-returns when the
@@ -22738,13 +23073,15 @@ if (ui2Enabled()) {
 
 function ui2ApprovalCategory() {
   // stationCurrentApproval is the cross-module source of truth for the
-  // pending approval; the panel's category line is the fallback.
+  // pending approval; the panel's category line is the fallback. Normalize
+  // to the daemon's lowercase ActionCategory ids — set_approval_rule's
+  // parser is exact-match ("destructive", not "Destructive").
   const fromGlobal = (typeof stationCurrentApproval !== 'undefined' && stationCurrentApproval &&
     (stationCurrentApproval.category || stationCurrentApproval.action_category)) || '';
-  if (fromGlobal) return String(fromGlobal);
+  if (fromGlobal) return String(fromGlobal).trim().toLowerCase();
   const el = document.getElementById('approval-category');
   const m = /([a-z_]+)\s*$/i.exec((el && el.textContent) || '');
-  return m ? m[1] : '';
+  return m ? m[1].toLowerCase() : '';
 }
 
 function ui2ApproveCategoryRule() {
@@ -22792,10 +23129,165 @@ function ui2AugmentApprovalPanel() {
   }, true);
 }
 
+// ── slice 2: Focus/Grid layout, composer dressing, vitals rail ─────────
+
+// Layout state lives on <html> (data-ui2-layout; absent/focus = default)
+// so CSS is the single reader. Switching remounts the concurrent stream:
+// under grid+minimized v1 parks it in a detached fragment, and Focus must
+// always show it (shouldDetachConcurrentLogStream carries the guard).
+function ui2ApplyLayout(mode) {
+  const grid = mode === 'grid';
+  document.documentElement.dataset.ui2Layout = grid ? 'grid' : 'focus';
+  try { localStorage.setItem('intendant.ui2.layout', grid ? 'grid' : 'focus'); } catch (e) { /* private mode */ }
+  const fBtn = document.getElementById('ui2-layout-focus-btn');
+  const gBtn = document.getElementById('ui2-layout-grid-btn');
+  if (fBtn) fBtn.setAttribute('aria-pressed', String(!grid));
+  if (gBtn) gBtn.setAttribute('aria-pressed', String(grid));
+  if (typeof syncConcurrentLogStreamMount === 'function') syncConcurrentLogStreamMount();
+  if (grid && typeof fitSessionWindowGridHeight === 'function') fitSessionWindowGridHeight();
+}
+
+function ui2WireLayoutToggle() {
+  let mode = 'focus';
+  try { if (localStorage.getItem('intendant.ui2.layout') === 'grid') mode = 'grid'; } catch (e) { /* private mode */ }
+  ui2ApplyLayout(mode);
+  for (const id of ['ui2-layout-focus-btn', 'ui2-layout-grid-btn']) {
+    const btn = document.getElementById(id);
+    if (btn) btn.addEventListener('click', () => ui2ApplyLayout(btn.dataset.layout));
+  }
+}
+
+// Composer dressing: placeholder copy + the attach glyph. The send
+// button's TEXT is state (Send / ↗ Steer / Save & rerun) — left alone.
+function ui2DressComposer() {
+  const input = document.getElementById('activity-task-input');
+  if (input) input.placeholder = 'Reply, steer, or describe a new task…';
+  const attach = document.getElementById('upload-attach-btn');
+  if (attach && typeof ui2Icon === 'function') attach.innerHTML = ui2Icon('attach', 15);
+}
+
+// ── vitals rail ────────────────────────────────────────────────────────
+
+function ui2RailSetRow(id, text, titleLines, state) {
+  const row = document.getElementById(id);
+  if (!row) return;
+  const value = row.querySelector('.ui2-rail-value');
+  if (value) value.textContent = text || '—';
+  row.title = Array.isArray(titleLines) ? titleLines.join('\n') : '';
+  if (state) row.dataset.state = state;
+  else delete row.dataset.state;
+}
+
+function ui2BuildVitalsRail() {
+  const pane = document.getElementById('activity-log-pane');
+  if (!pane || document.getElementById('ui2-vitals-rail')) return;
+  const rail = document.createElement('aside');
+  rail.id = 'ui2-vitals-rail';
+  rail.setAttribute('aria-label', 'Session vitals');
+  rail.innerHTML = `
+    <div class="ui2-rail-session" id="ui2-rail-session">No session yet</div>
+    <div class="ui2-rail-row" id="ui2-rail-git"><span class="ui2-rail-label">Working tree</span><span class="ui2-rail-value">—</span></div>
+    <div class="ui2-rail-row" id="ui2-rail-ctx"><span class="ui2-rail-label">Context budget</span><span class="ui2-rail-value">—</span><div class="ui2-rail-meter"><i id="ui2-rail-ctx-fill"></i></div></div>
+    <div class="ui2-rail-row" id="ui2-rail-cache"><span class="ui2-rail-label">Prompt cache</span><span class="ui2-rail-value">—</span></div>
+    <div class="ui2-rail-row" id="ui2-rail-limits"><span class="ui2-rail-label">Rate limits</span><span class="ui2-rail-value">—</span></div>
+    <button type="button" class="ui2-rail-row ui2-rail-changes" id="ui2-rail-changes" title="Open the Changes sub-tab"><span class="ui2-rail-label">Changes</span><span class="ui2-rail-value">—</span></button>
+    <button type="button" class="ui2-rail-advanced" id="ui2-rail-advanced" title="Raw state and observers live on the Debug tab">Advanced &amp; raw state</button>`;
+  pane.appendChild(rail);
+  const changes = document.getElementById('ui2-rail-changes');
+  if (changes) changes.addEventListener('click', () => {
+    const btn = document.querySelector('#activity-subtabs [data-activity-tab="changes"]');
+    if (btn) btn.click();
+  });
+  const advanced = document.getElementById('ui2-rail-advanced');
+  if (advanced) advanced.addEventListener('click', () => {
+    if (typeof routeTo === 'function') routeTo('debug');
+    else if (typeof switchTab === 'function') switchTab('debug');
+  });
+}
+
+// The rail describes the FOREGROUND session — prompt target, then the
+// current session, then the daemon's own. Same fallback chain the v1
+// composer targeting uses.
+function ui2RailForegroundSessionId() {
+  if (typeof resolvePromptTargetSessionId === 'function') {
+    const sid = resolvePromptTargetSessionId();
+    if (sid) return sid;
+  }
+  if (typeof currentSessionFullId !== 'undefined' && currentSessionFullId) return currentSessionFullId;
+  if (typeof daemonSessionFullId !== 'undefined' && daemonSessionFullId) return daemonSessionFullId;
+  return '';
+}
+
+function ui2RailTick() {
+  const rail = document.getElementById('ui2-vitals-rail');
+  if (!rail || !rail.offsetParent) return; // hidden: other tab/subtab, grid layout, or <1180px
+
+  const sid = ui2RailForegroundSessionId();
+  const sessionEl = document.getElementById('ui2-rail-session');
+  if (sessionEl) {
+    let label = 'No session yet';
+    if (sid) {
+      label = sid.slice(0, 10);
+      if (typeof sessionIdentityParts === 'function') {
+        const parts = sessionIdentityParts(sid) || {};
+        label = parts.name || parts.shortId || label;
+      }
+    }
+    sessionEl.textContent = label;
+    sessionEl.title = sid;
+  }
+
+  const meta = (sid && typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(sid)) || {};
+  const vitals = meta.vitals || null;
+
+  const git = (vitals && typeof sessionVitalsGitSegment === 'function')
+    ? sessionVitalsGitSegment(vitals.git) : null;
+  ui2RailSetRow('ui2-rail-git', git ? git.text : '', git ? git.titleLines : null,
+    git && git.conflict ? 'crit' : null);
+
+  const cache = (vitals && typeof sessionVitalsCacheSegment === 'function')
+    ? sessionVitalsCacheSegment(vitals.cache) : null;
+  ui2RailSetRow('ui2-rail-cache', cache ? cache.text : '', cache ? cache.titleLines : null,
+    cache ? (/cache-crit|cache-cold/.test(cache.cls) ? 'crit' : /cache-warn|cache-expiring/.test(cache.cls) ? 'warn' : 'ok') : null);
+
+  const limits = (vitals && typeof sessionVitalsLimitsSegment === 'function')
+    ? sessionVitalsLimitsSegment(vitals.limits) : null;
+  ui2RailSetRow('ui2-rail-limits', limits ? limits.text : '', limits ? limits.titleLines : null,
+    limits ? (limits.severity || null) : null);
+
+  // Context budget mirrors the status-bar meter (same source the
+  // oversight-bar chip reads).
+  const pctSrc = document.getElementById('sb-budget-pct');
+  const pctText = pctSrc ? (pctSrc.textContent || '').trim() : '';
+  ui2RailSetRow('ui2-rail-ctx', pctText || '—', null, null);
+  const fill = document.getElementById('ui2-rail-ctx-fill');
+  if (fill) fill.style.width = Math.max(0, Math.min(100, parseFloat(pctText) || 0)) + '%';
+
+  // Changes count mirrors the sub-tab badge.
+  const badge = document.getElementById('badge-changes');
+  const badgeShown = badge && badge.style.display !== 'none' && (badge.textContent || '').trim();
+  ui2RailSetRow('ui2-rail-changes', badgeShown ? `${badgeShown.trim()} — view diff` : 'none yet', null, null);
+}
+
 if (ui2Enabled()) {
-  const wire = () => ui2AugmentApprovalPanel();
-  document.addEventListener('DOMContentLoaded', wire, { once: true });
-  if (document.readyState !== 'loading') wire();
+  const wire = () => {
+    ui2AugmentApprovalPanel();
+    ui2WireLayoutToggle();
+    ui2DressComposer();
+    ui2BuildVitalsRail();
+    ui2RailTick();
+    setInterval(ui2RailTick, 1000);
+  };
+  // Every fragment shares ONE <script type="module"> scope (30-module-open),
+  // which executes with readyState already 'interactive' — an immediate
+  // wire() here would run mid-module and reach let-bindings later fragments
+  // haven't initialized yet (ui2ApplyLayout → syncConcurrentLogStreamMount →
+  // concurrentLogDetachedFragment, still in its TDZ), and the throw would
+  // kill every fragment after this one. For a static module script,
+  // DOMContentLoaded always fires after the whole module completes — wire
+  // there, never inline.
+  if (document.readyState === 'complete') wire();
+  else document.addEventListener('DOMContentLoaded', wire, { once: true });
 }
 /* ── static/app/31-init-identity-fleet.js ── */
 'use strict';
@@ -41616,6 +42108,11 @@ function pruneMainLogContainer(container = currentMainLogContainer()) {
 }
 
 function shouldDetachConcurrentLogStream() {
+  // ui-v2 Focus layout: the combined stream IS the visible surface (the
+  // grid is CSS-hidden without touching its .hidden class) — never park
+  // the stream in the detached fragment there, or Focus shows nothing.
+  const root = document.documentElement;
+  if (root.classList.contains('ui-v2') && root.dataset.ui2Layout !== 'grid') return false;
   const grid = document.getElementById('session-window-grid');
   return !!grid
     && !grid.classList.contains('hidden')
@@ -83155,7 +83652,7 @@ function sessionDetailVisibleLevels() {
 const sessionDetailLevelColors = {
   model: 'var(--blue)', agent: 'var(--teal)', error: 'var(--red)',
   warn: 'var(--yellow)', subagent: 'var(--mauve)', presence: 'var(--green)',
-  detail: '#a2a8be', debug: 'var(--overlay1)',
+  detail: 'var(--log-detail)', debug: 'var(--overlay1)',
 };
 const sessionDetailSourceLabels = {
   system: '\u2139', worker: 'Model', agent: 'Run',
