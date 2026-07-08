@@ -516,6 +516,7 @@ pub fn grant(
     material: &str,
     mode: Option<&str>,
     granted_by: &str,
+    granted_via: &str,
     ttl_ms: Option<u64>,
     offline_ms: Option<u64>,
 ) -> Result<GrantOutcome, String> {
@@ -567,11 +568,12 @@ pub fn grant(
         .write()
         .expect("lease tombstones poisoned")
         .remove(kind);
-    crate::credential_audit::record(
+    crate::credential_audit::record_with_origin(
         crate::credential_audit::EVENT_LEASE_GRANTED,
         kind,
         label.trim(),
         granted_by.trim(),
+        granted_via,
         format!(
             "ttl {}m · offline {}h · mode {}{}",
             ttl_ms / 60_000,
@@ -620,7 +622,7 @@ impl LeaseShutdownGuard {
 
 impl Drop for LeaseShutdownGuard {
     fn drop(&mut self) {
-        let dropped = revoke(None, "process exit");
+        let dropped = revoke(None, "process exit", "local");
         if dropped > 0 {
             eprintln!("Revoked {dropped} credential lease(s) at process exit");
         }
@@ -632,7 +634,7 @@ impl Drop for LeaseShutdownGuard {
 /// deliberate forgetting — it leaves no "expired" tombstone. `actor` is
 /// who asked (a principal label, or "daemon shutdown"), recorded in the
 /// custody trail.
-pub fn revoke(selector: Option<&str>, actor: &str) -> usize {
+pub fn revoke(selector: Option<&str>, actor: &str, via: &str) -> usize {
     let mut leases = store().write().expect("lease store poisoned");
     let before = leases.len();
     let mut dropped: Vec<(String, String)> = Vec::new();
@@ -660,11 +662,12 @@ pub fn revoke(selector: Option<&str>, actor: &str) -> usize {
             eprintln!("[credential-leases] revoked lease cleanup for {kind} failed: {err}");
             queue_materialization_cleanup(&kind);
         }
-        crate::credential_audit::record(
+        crate::credential_audit::record_with_origin(
             crate::credential_audit::EVENT_LEASE_REVOKED,
             &kind,
             &label,
             actor,
+            via,
             "material dropped and zeroized".to_string(),
         );
     }
@@ -785,6 +788,7 @@ mod tests {
             "sk-ant-lease-material",
             None,
             "connect:alice",
+            "hosted",
             None,
             None,
         )
@@ -805,7 +809,7 @@ mod tests {
         let renewed_expiry = renew(&outcome.lease_id).unwrap();
         assert!(renewed_expiry >= outcome.expires_at_unix_ms);
 
-        assert_eq!(revoke(Some(&outcome.lease_id), "test"), 1);
+        assert_eq!(revoke(Some(&outcome.lease_id), "test", "local"), 1);
         assert!(leased_secret("api_key:anthropic").is_none());
         // Revocation is deliberate — it must not read as "went dry".
         assert!(expired_lease_note().is_none());
@@ -816,13 +820,13 @@ mod tests {
     fn regrant_replaces_and_unknown_kinds_are_refused() {
         let _guard = lock();
         reset();
-        grant("api_key:openai", "a", "first", None, "root", None, None).unwrap();
-        let outcome = grant("api_key:openai", "b", "second", None, "root", None, None).unwrap();
+        grant("api_key:openai", "a", "first", None, "root", "local", None, None).unwrap();
+        let outcome = grant("api_key:openai", "b", "second", None, "root", "local", None, None).unwrap();
         assert!(outcome.replaced);
         assert_eq!(leased_secret("api_key:openai").as_deref(), Some("second"));
 
-        assert!(grant("api_key:mystery", "x", "y", None, "root", None, None).is_err());
-        assert!(grant("api_key:gemini", "x", "", None, "root", None, None).is_err());
+        assert!(grant("api_key:mystery", "x", "y", None, "root", "local", None, None).is_err());
+        assert!(grant("api_key:gemini", "x", "", None, "root", "local", None, None).is_err());
         reset();
     }
 
@@ -836,6 +840,7 @@ mod tests {
             "gm-key",
             None,
             "root",
+            "local",
             Some(0), // clamps to MIN_TTL_MS
             Some(0), // offline 0: dies one TTL after the last renewal
         )
@@ -858,6 +863,7 @@ mod tests {
             "gm-key-2",
             None,
             "root",
+            "local",
             None,
             None,
         )
@@ -919,6 +925,7 @@ mod tests {
             r#"{"tokens":{"access_token":"at","refresh_token":"rt"}}"#,
             Some("access_token"),
             "root",
+            "local",
             None,
             None,
         )
@@ -930,6 +937,7 @@ mod tests {
             r#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt"}}"#,
             Some("access_token"),
             "root",
+            "local",
             None,
             None,
         )
@@ -942,6 +950,7 @@ mod tests {
             r#"{"OPENAI_API_KEY":"sk-live","tokens":{"access_token":"at"}}"#,
             Some("access_token"),
             "root",
+            "local",
             None,
             None,
         )
@@ -954,6 +963,7 @@ mod tests {
             "not json",
             Some("access_token"),
             "root",
+            "local",
             None,
             None
         )
@@ -964,6 +974,7 @@ mod tests {
             r#"{"tokens":{}}"#,
             Some("sideways"),
             "root",
+            "local",
             None,
             None
         )
@@ -1007,6 +1018,7 @@ mod tests {
             "gm",
             Some("access_token"),
             "root",
+            "local",
             None,
             None,
         )
@@ -1020,7 +1032,7 @@ mod tests {
                 .as_str(),
             "api_key"
         );
-        revoke(None, "test");
+        revoke(None, "test", "local");
         reset();
     }
 
@@ -1034,6 +1046,7 @@ mod tests {
             "sk-ant-from-lease",
             None,
             "root",
+            "local",
             None,
             None,
         )

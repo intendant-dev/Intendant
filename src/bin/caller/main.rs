@@ -3437,7 +3437,7 @@ async fn main() -> Result<(), CallerError> {
                 }
                 // Drop every credential lease (zeroizes memory, deletes
                 // materialized oauth auth files) before the process dies.
-                let _ = credential_leases::revoke(None, "daemon shutdown");
+                let _ = credential_leases::revoke(None, "daemon shutdown", "local");
                 // Clean up control socket
                 control::cleanup();
                 std::process::exit(130);

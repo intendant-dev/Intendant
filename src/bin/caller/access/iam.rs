@@ -51,7 +51,20 @@ pub struct LocalIamState {
     /// `max_role` caps what its documents may grant here.
     #[serde(default)]
     pub trusted_orgs: Vec<TrustedOrg>,
+    /// Trust tier of this daemon (docs/src/trust-tiers.md): what a
+    /// compromise of this box would cost its owner. `integrated` = holds
+    /// the owner's personal world; `disposable` = scratch box, nothing
+    /// durable; `None` = the owner has not chosen. The tier is doctrine
+    /// carried to grant flows and the Access UI — it grants and denies
+    /// nothing by itself; ceilings and grants do the enforcing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
 }
+
+/// The daemon tier vocabulary, in UI presentation order. Single source for
+/// the wire values and the dashboard's static mirror (pinned by the
+/// `dashboard_tier_vocabulary_mirrors_daemon_tiers` parity test).
+pub const DAEMON_TIERS: [&str; 2] = ["integrated", "disposable"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrustedOrg {
@@ -91,7 +104,7 @@ fn default_role_ceilings() -> std::collections::BTreeMap<String, String> {
     ceilings
 }
 
-fn default_hosted_origins() -> Vec<String> {
+pub fn default_hosted_origins() -> Vec<String> {
     vec!["https://connect.intendant.dev".to_string()]
 }
 
@@ -613,6 +626,7 @@ impl Default for LocalIamState {
             role_ceilings: default_role_ceilings(),
             hosted_origins: default_hosted_origins(),
             trusted_orgs: Vec::new(),
+            tier: None,
         }
     }
 }
@@ -1088,6 +1102,114 @@ pub fn update_user_client_grant(
     Ok(IamGrantUpdateResult { principal, grant })
 }
 
+/// Set (or clear, with `None`) this daemon's trust tier
+/// (docs/src/trust-tiers.md). Pure state mutation + audit event; the
+/// caller persists. Returns the normalized stored value.
+pub fn set_daemon_tier(
+    state: &mut LocalIamState,
+    tier: Option<&str>,
+    actor: &AccessPrincipal,
+) -> AccessResult<Option<String>> {
+    let normalized = match tier.map(str::trim) {
+        None | Some("") => None,
+        Some(value) => {
+            let value = value.to_ascii_lowercase();
+            if !DAEMON_TIERS.contains(&value.as_str()) {
+                return Err(AccessError(format!(
+                    "unknown tier {value:?} (expected one of: {})",
+                    DAEMON_TIERS.join(", ")
+                )));
+            }
+            Some(value)
+        }
+    };
+    if state.tier == normalized {
+        return Ok(normalized);
+    }
+    let now = now_unix_ms();
+    state.audit_events.push(IamAuditEvent {
+        id: format!("audit:{}:{}", now, state.audit_events.len() + 1),
+        at_unix_ms: Some(now),
+        actor_principal_id: actor.id.clone(),
+        action: "set_daemon_tier".to_string(),
+        target_id: "local".to_string(),
+        summary: format!(
+            "Trust tier {} -> {}",
+            state.tier.as_deref().unwrap_or("unset"),
+            normalized.as_deref().unwrap_or("unset")
+        ),
+    });
+    state.tier = normalized.clone();
+    Ok(normalized)
+}
+
+/// The binding kinds the hosted-control ceiling governs: Connect-account
+/// sessions and browser identity keys enrolled from a hosted origin.
+pub const HOSTED_CEILING_BINDINGS: [&str; 2] = ["connect_account", "client_key"];
+
+/// Set the hosted-control ceiling — the `role_ceilings` entries for both
+/// hosted-provenance binding kinds — to `role_id`, which must name a
+/// defined, enforced role (`role:none` refuses hosted control entirely).
+/// Pure state mutation + audit event; the caller persists. Divergent
+/// per-binding ceilings remain possible by editing `iam.json`; this
+/// function is the one-knob path the dashboard exposes.
+pub fn set_hosted_control_ceiling(
+    state: &mut LocalIamState,
+    role_id: &str,
+    actor: &AccessPrincipal,
+) -> AccessResult<()> {
+    for role in builtin_role_templates() {
+        if !state.roles.iter().any(|existing| existing.id == role.id) {
+            state.roles.push(role);
+        }
+    }
+    let role_id = role_id.trim();
+    let Some(role) = state.roles.iter().find(|role| role.id == role_id) else {
+        return Err(AccessError(format!("unknown IAM role {role_id}")));
+    };
+    if role.status == "planned" {
+        return Err(AccessError(format!(
+            "IAM role {role_id} is planned but not enforced"
+        )));
+    }
+    let role_id = role.id.clone();
+    let previous: Vec<String> = HOSTED_CEILING_BINDINGS
+        .iter()
+        .map(|binding| {
+            state
+                .role_ceilings
+                .get(*binding)
+                .cloned()
+                .unwrap_or_else(|| "uncapped".to_string())
+        })
+        .collect();
+    if previous.iter().all(|existing| *existing == role_id) {
+        return Ok(());
+    }
+    for binding in HOSTED_CEILING_BINDINGS {
+        state
+            .role_ceilings
+            .insert(binding.to_string(), role_id.clone());
+    }
+    let now = now_unix_ms();
+    state.audit_events.push(IamAuditEvent {
+        id: format!("audit:{}:{}", now, state.audit_events.len() + 1),
+        at_unix_ms: Some(now),
+        actor_principal_id: actor.id.clone(),
+        action: "set_hosted_control_ceiling".to_string(),
+        target_id: "role_ceilings".to_string(),
+        summary: format!(
+            "Hosted control ceiling {} -> {role_id}",
+            if previous[0] == previous[1] {
+                previous[0].clone()
+            } else {
+                previous.join(" / ")
+            }
+        ),
+    });
+    Ok(())
+}
+
 fn validate_user_client_role(state: &LocalIamState, role_id: &str) -> AccessResult<()> {
     let Some(role) = state.roles.iter().find(|role| role.id == role_id) else {
         return Err(AccessError(format!("unknown IAM role {role_id}")));
@@ -1095,6 +1217,12 @@ fn validate_user_client_role(state: &LocalIamState, role_id: &str) -> AccessResu
     if role.id == "role:peer-profile" {
         return Err(AccessError(
             "peer-profile is a daemon-to-daemon role and cannot be assigned to a user/client"
+                .to_string(),
+        ));
+    }
+    if role.id == "role:none" {
+        return Err(AccessError(
+            "role:none is a ceiling-only sentinel and cannot be granted to a user/client"
                 .to_string(),
         ));
     }
@@ -1680,6 +1808,7 @@ pub fn overview_metadata(load: &LoadedIamState) -> Value {
         },
         "role_ceilings": load.state.role_ceilings.clone(),
         "hosted_origins": load.state.hosted_origins.clone(),
+        "tier": load.state.tier.clone(),
         "trusted_orgs": load.state.trusted_orgs.clone(),
         "org_issuers": load
             .path
@@ -2011,6 +2140,41 @@ pub fn role_ceiling_for_session(
     Some(ceiling.clone())
 }
 
+/// Origin class of a session for the custody trail
+/// (docs/src/trust-tiers.md): `hosted` (Connect account or a browser key
+/// enrolled from one of `hosted_origins`), `direct` (anchor-grade key,
+/// mTLS certificate, or any other explicit binding), `local` (the
+/// owner's own dashboard / loopback), or `peer` (a federated daemon).
+/// Classification mirrors [`role_ceiling_for_session`]'s hosted test.
+pub fn session_origin_class(hosted_origins: &[String], principal: &AccessPrincipal) -> &'static str {
+    if principal.kind == "peer_daemon" {
+        return "peer";
+    }
+    match principal.authn_kind.as_deref() {
+        Some("connect_account") => "hosted",
+        Some("client_key") => {
+            let origin = principal.authn_origin.as_deref().unwrap_or("");
+            let hosted = !origin.is_empty()
+                && hosted_origins
+                    .iter()
+                    .any(|candidate| candidate.trim_end_matches('/') == origin.trim_end_matches('/'));
+            if hosted {
+                "hosted"
+            } else {
+                "direct"
+            }
+        }
+        Some(_) => "direct",
+        None => {
+            if principal.kind == "root_session" {
+                "local"
+            } else {
+                "direct"
+            }
+        }
+    }
+}
+
 /// True when a permission list grants `permission`. The legacy aggregate id
 /// `terminal.use` implies the three split terminal permissions, so custom
 /// roles and org grant caps written before the split keep their meaning
@@ -2178,6 +2342,17 @@ fn builtin_role_templates() -> Vec<IamRole> {
                 "filesystem.read".to_string(),
                 "filesystem.write".to_string(),
             ],
+            source: "builtin".to_string(),
+        },
+        IamRole {
+            id: "role:none".to_string(),
+            label: "No access".to_string(),
+            status: "enforced".to_string(),
+            summary: "Ceiling-only sentinel with no permissions: used in role_ceilings to \
+                      refuse a binding kind (e.g. hosted-origin control) entirely. Never \
+                      assigned to a principal."
+                .to_string(),
+            permissions: vec![],
             source: "builtin".to_string(),
         },
         IamRole {
@@ -2726,10 +2901,54 @@ mod tests {
         let mut pickable = builtin.clone();
         // The peer-profile role is daemon-peer-only; humans never pick it.
         assert!(pickable.remove("role:peer-profile"));
+        // role:none is the ceiling-only sentinel; it is never granted.
+        assert!(pickable.remove("role:none"));
         assert_eq!(
             quoted_role_ids(picker),
             pickable,
             "ACCESS_ROLE_PICKER_ORDER (static/app.html) drifted from builtin_role_templates"
+        );
+    }
+
+    #[test]
+    fn dashboard_tier_vocabulary_mirrors_daemon_tiers() {
+        let app = app_html();
+        let meta = slice_between(app, "const ACCESS_TIER_META = {", "\n};");
+        let pattern = regex::Regex::new(r"'([a-z]+)':\s*\{").unwrap();
+        let mirrored: Vec<String> = pattern
+            .captures_iter(meta)
+            .map(|caps| caps[1].to_string())
+            .collect();
+        let expected: Vec<String> = DAEMON_TIERS.iter().map(|tier| tier.to_string()).collect();
+        assert_eq!(
+            mirrored, expected,
+            "ACCESS_TIER_META (static/app.html) drifted from DAEMON_TIERS — \
+             ids and presentation order are both pinned"
+        );
+    }
+
+    #[test]
+    fn dashboard_hosted_ceiling_choices_name_builtin_roles() {
+        let app = app_html();
+        let builtin: std::collections::BTreeSet<String> = builtin_role_templates()
+            .into_iter()
+            .map(|role| role.id)
+            .collect();
+        let choices = slice_between(app, "const ACCESS_HOSTED_CEILING_CHOICES = [", "\n];");
+        let mirrored = quoted_role_ids(choices);
+        assert!(
+            !mirrored.is_empty(),
+            "ACCESS_HOSTED_CEILING_CHOICES (static/app.html) lists no role ids"
+        );
+        for role_id in &mirrored {
+            assert!(
+                builtin.contains(role_id),
+                "ACCESS_HOSTED_CEILING_CHOICES entry {role_id} is not a builtin role"
+            );
+        }
+        assert!(
+            mirrored.contains("role:none"),
+            "the hosted-ceiling knob must offer the refuse-entirely position (role:none)"
         );
     }
 
@@ -3779,6 +3998,138 @@ mod tests {
             )
             .allowed
         );
+    }
+
+    #[test]
+    fn set_daemon_tier_validates_normalizes_and_audits() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        assert_eq!(state.tier, None);
+
+        let stored = set_daemon_tier(&mut state, Some("  Integrated "), &actor).unwrap();
+        assert_eq!(stored.as_deref(), Some("integrated"));
+        assert_eq!(state.tier.as_deref(), Some("integrated"));
+        assert_eq!(state.audit_events.len(), 1);
+        assert_eq!(state.audit_events[0].action, "set_daemon_tier");
+
+        // Idempotent set: no state change, no audit noise.
+        set_daemon_tier(&mut state, Some("integrated"), &actor).unwrap();
+        assert_eq!(state.audit_events.len(), 1);
+
+        let err = set_daemon_tier(&mut state, Some("fortress"), &actor).unwrap_err();
+        assert!(err.to_string().contains("unknown tier"));
+        assert_eq!(state.tier.as_deref(), Some("integrated"));
+
+        let cleared = set_daemon_tier(&mut state, None, &actor).unwrap();
+        assert_eq!(cleared, None);
+        assert_eq!(state.tier, None);
+        assert_eq!(state.audit_events.len(), 2);
+    }
+
+    #[test]
+    fn hosted_control_ceiling_role_none_refuses_hosted_sessions_entirely() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("hosted-key".to_string()),
+                client_key_origin: Some("https://connect.intendant.dev".to_string()),
+                role_id: Some("role:root".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("anchor-key".to_string()),
+                client_key_origin: Some("https://anchor.local:8765".to_string()),
+                role_id: Some("role:root".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        set_hosted_control_ceiling(&mut state, "role:none", &actor).unwrap();
+        for binding in HOSTED_CEILING_BINDINGS {
+            assert_eq!(
+                state.role_ceilings.get(binding).map(String::as_str),
+                Some("role:none")
+            );
+        }
+        assert!(state
+            .audit_events
+            .iter()
+            .any(|event| event.action == "set_hosted_control_ceiling"));
+
+        // A hosted-origin key with a root grant can no longer do anything —
+        // not even the observer-grade operations operator allowed.
+        let hosted = principal_for_client_key(&state, "hosted-key", "connect").unwrap();
+        for op in [
+            crate::access::access_policy::PeerOperation::ShellSpawn,
+            crate::access::access_policy::PeerOperation::DisplayView,
+            crate::access::access_policy::PeerOperation::SessionInspect,
+        ] {
+            let denied = evaluate_principal_operation_with_state(&state, &hosted, op);
+            assert!(!denied.allowed, "expected {op:?} denied under role:none");
+            assert!(denied.reason.contains("role ceiling"));
+        }
+
+        // Anchor-origin keys are untouched by the hosted ceiling.
+        let anchor = principal_for_client_key(&state, "anchor-key", "connect").unwrap();
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &anchor,
+                crate::access::access_policy::PeerOperation::AccessManage,
+            )
+            .allowed
+        );
+
+        // Idempotent set: no extra audit event.
+        let audit_count = state.audit_events.len();
+        set_hosted_control_ceiling(&mut state, "role:none", &actor).unwrap();
+        assert_eq!(state.audit_events.len(), audit_count);
+
+        // And the knob moves back up.
+        set_hosted_control_ceiling(&mut state, "role:operator", &actor).unwrap();
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &hosted,
+                crate::access::access_policy::PeerOperation::ShellSpawn,
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn set_hosted_control_ceiling_requires_a_defined_role() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let err = set_hosted_control_ceiling(&mut state, "role:fortress", &actor).unwrap_err();
+        assert!(err.to_string().contains("unknown IAM role"));
+        assert_eq!(state.role_ceilings, default_role_ceilings());
+    }
+
+    #[test]
+    fn role_none_cannot_be_granted_to_a_user_client() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let err = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("some-key".to_string()),
+                role_id: Some("role:none".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ceiling-only"));
     }
 
     #[test]

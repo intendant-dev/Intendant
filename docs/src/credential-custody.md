@@ -64,6 +64,17 @@ subscription OAuth credential sets for the external agents (Codex,
 Claude Code). Each entry carries a kind, a label, provider metadata, and
 optional per-daemon scoping rules (below).
 
+Entries may also carry an **unseal policy** (`unseal_policy:
+"trusted"`; absent = anywhere): a trusted-only entry refuses use from
+hosted tabs — no reveal, no lease fueling, no egress relay, no voice
+mirror — while still syncing inside the encrypted body. This is
+client-side self-enforcement (a guard against mistakes and casual
+exfiltration, not against a malicious bundle — see
+[Trust Tiers](./trust-tiers.md)); and since today's vault only opens
+through a Connect service, a trusted-only entry stays stored-but-sealed
+until the direct/app vault path exists. The policy field is invisible
+to the service like every other entry field.
+
 **Keying.** A random 256-bit vault master key `K` encrypts the vault
 body (AES-GCM). `K` itself is never stored — it is wrapped into one
 **envelope per enrolled unlocker**:
@@ -132,7 +143,7 @@ raw frame names are reserved for the `egress_*` relay path):
 | `api_credential_lease_renew` | browser → daemon request with `lease_id` (or legacy `leaseId`) | `lease_id`, new `expires_at_unix_ms` |
 | `api_credential_lease_revoke` | browser → daemon request with optional `lease_id` / `leaseId` / `kind`; omitted revokes every lease on the daemon | `revoked` count |
 | `api_credential_lease_status` | browser → daemon request with no params | active `leases` (`lease_id`, `kind`, `label`, `mode`, grant/renew/expiry timestamps, `ttl_ms`, `offline_ms`, `use_count`), active `egress` relays, and `expired_note` |
-| `api_credential_custody_trail` | browser → daemon request with no params | recent custody events (`at_unix_ms`, `event`, `kind`, `label`, `actor`, `detail`) from the daemon's own record — lease grants/expiries/revocations, relay changes, restart resets; metadata only, never material. Kept at `~/.intendant/custody-audit.jsonl` (0600, bounded), rendered in Access → Advanced → Custody trail |
+| `api_credential_custody_trail` | browser → daemon request with no params | recent custody events (`at_unix_ms`, `event`, `kind`, `label`, `actor`, `origin`, `detail`) from the daemon's own record — lease grants/expiries/revocations, relay changes, restart resets; metadata only, never material. `origin` stamps the session's origin class on ceremonies (`hosted` / `direct` / `local` / `peer`; empty on sessionless events and pre-field records). Kept at `~/.intendant/custody-audit.jsonl` (0600, bounded), rendered in Access → Advanced → Custody trail |
 
 Leases ride the same per-frame IAM checks as every other tunnel
 operation; granting requires a session whose principal holds a new

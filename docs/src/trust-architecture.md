@@ -498,8 +498,12 @@ The pieces that implement the model, mapped to the codebase:
   Connect-account principals and client keys enrolled from a hosted origin
   cannot exceed `role:operator` (no `access.manage`, no `settings.manage`,
   no `runtime.control`). Ceilings are enforced as a permission intersection
-  at decision time and surfaced in the Access UI, and are configurable in
-  `iam.json` for owners who explicitly accept hosted-root risk.
+  at decision time and surfaced in the Access UI. Hardening is one knob —
+  the hosted-control cap on the Trust tier card (Access → Overview) moves
+  both hosted bindings to operator / observer / `role:none` (refuse
+  entirely), per [Trust Tiers](./trust-tiers.md); raising a ceiling or
+  clearing them stays an explicit `iam.json` edit for owners who accept
+  hosted-root risk.
 - **Device enrollment**: when a browser's *verified* key is refused, the
   daemon queues a pending enrollment (in-memory, capped, TTL'd — the queue
   grants nothing by itself); the owner approves it with a role, or denies it,

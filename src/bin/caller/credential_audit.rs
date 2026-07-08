@@ -40,6 +40,14 @@ pub struct CustodyEvent {
     pub kind: String,
     pub label: String,
     pub actor: String,
+    /// Origin class of the session that performed the ceremony —
+    /// `hosted` (Connect account / hosted-origin browser key), `direct`
+    /// (anchor-grade key or mTLS cert), `local` (the owner's own
+    /// dashboard), or `peer`. Empty for events with no session behind
+    /// them (expiry sweeps, restart resets) and for records written
+    /// before the field existed. See docs/src/trust-tiers.md.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
     pub detail: String,
 }
 
@@ -125,6 +133,7 @@ impl Trail {
             kind: String::new(),
             label: String::new(),
             actor: "daemon".to_string(),
+            origin: String::new(),
             detail: "restart: in-memory leases and relays cleared".to_string(),
         });
     }
@@ -191,12 +200,27 @@ fn global() -> &'static Mutex<Trail> {
 /// Record one custody event. `detail` is free-form human text; material
 /// must never be passed here.
 pub fn record(event: &str, kind: &str, label: &str, actor: &str, detail: String) {
+    record_with_origin(event, kind, label, actor, "", detail);
+}
+
+/// Like [`record`], stamping the origin class of the session behind the
+/// ceremony (`hosted` / `direct` / `local` / `peer`; empty = unknown or
+/// no session).
+pub fn record_with_origin(
+    event: &str,
+    kind: &str,
+    label: &str,
+    actor: &str,
+    origin: &str,
+    detail: String,
+) {
     let entry = CustodyEvent {
         at_unix_ms: now_unix_ms(),
         event: event.to_string(),
         kind: kind.to_string(),
         label: label.to_string(),
         actor: actor.to_string(),
+        origin: origin.to_string(),
         detail,
     };
     global()
@@ -237,6 +261,7 @@ mod tests {
 
     fn event(n: u64, event: &str) -> CustodyEvent {
         CustodyEvent {
+            origin: String::new(),
             at_unix_ms: n,
             event: event.to_string(),
             kind: "api_key:anthropic".to_string(),

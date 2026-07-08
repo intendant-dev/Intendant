@@ -2008,6 +2008,12 @@ function renderPeerAccessRequests(requests) {
     return;
   }
 
+  // Upward-grant guard (docs/src/trust-tiers.md): approving a peer here
+  // grants that daemon authority ON this machine. On an integrated-tier
+  // machine that is the alarm condition — advisory, never a refusal.
+  const integratedTier = (typeof accessIamModel === 'function' && typeof accessOverviewModel === 'function')
+    && String(accessIamModel(accessOverviewModel())?.tier || '') === 'integrated';
+
   list.innerHTML = requests.map(req => {
     const requestId = String(req.request_id || '');
     const label = escapeHtml(req.requester_label || 'Unnamed daemon');
@@ -2030,6 +2036,7 @@ function renderPeerAccessRequests(requests) {
         </div>
         <div class="daemon-access-request-meta">Status ${escapeHtml(status)} - ${roleLabel} ${escapeHtml(role.label)}</div>
         <div class="daemon-access-request-meta daemon-role-summary">${escapeHtml(role.summary)}</div>
+        ${pending && integratedTier ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="Grants flow toward disposable machines, never up. If that daemon is lower-trust than this one, approving bridges your tiers — see the Trust tier card in Access.">⚠ Integrated-tier machine: approving grants a peer daemon authority here. Make sure trust flows downward.</div>' : ''}
         ${timing ? `<div class="daemon-access-request-meta">${timing}</div>` : ''}
         ${pending ? `<div class="daemon-pairing-row"><select data-access-request-profile="${escapeHtml(requestId)}">${renderPeerProfileOptions(requestedProfile)}</select></div>` : ''}
         <div class="daemon-access-request-actions">

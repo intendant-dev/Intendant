@@ -148,6 +148,10 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     method("api_access_connect_claim_code", PeerOperation::AccessManage),
     method("api_access_connect_config", PeerOperation::AccessManage),
     method("api_access_connect_unclaim", PeerOperation::AccessManage),
+    // Trust-tier settings (docs/src/trust-tiers.md): the tier label and
+    // the hosted-control ceiling knob (mirrors the HTTP route rows).
+    method("api_access_set_tier", PeerOperation::AccessManage),
+    method("api_access_set_hosted_ceiling", PeerOperation::AccessManage),
     // Credential custody (vault leases + client egress): granting, renewing,
     // revoking, and even reading lease status all sit behind the dedicated
     // gate — a scoped guest session can neither fuel nor drain a daemon, nor
@@ -484,6 +488,26 @@ impl DashboardControlGrant {
                 profile.clone(),
                 "peer-dashboard-control",
             ),
+        }
+    }
+
+    /// Origin class of this session for the custody trail —
+    /// `hosted` / `direct` / `local` / `peer`
+    /// (`access::iam::session_origin_class`). `UserClient` grants carry
+    /// their IAM snapshot's `hosted_origins`; the root-equivalent
+    /// variants classify against the compiled default list.
+    pub(crate) fn custody_origin_class(&self) -> &'static str {
+        match self {
+            Self::TrustedLocal => "local",
+            Self::UserClientRoot { principal } => crate::access::iam::session_origin_class(
+                &crate::access::iam::default_hosted_origins(),
+                principal,
+            ),
+            Self::UserClient {
+                principal,
+                iam_state,
+            } => crate::access::iam::session_origin_class(&iam_state.hosted_origins, principal),
+            Self::Peer { .. } => "peer",
         }
     }
 
