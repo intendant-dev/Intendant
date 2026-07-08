@@ -83,8 +83,14 @@ function ui2VoiceBuildPanel() {
   };
   mic.addEventListener('click', () => toggle());
   panel.querySelector('#ui2-vp-close').addEventListener('click', () => toggle(false));
+  // Layered-Escape contract: the ⌘K palette's capture handler runs first
+  // (earlier fragment) and marks its Escape consumed via preventDefault —
+  // honoring that keeps one keypress from closing both layers; we mark
+  // ours the same way so the v1 Escape cascade below us stays quiet.
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !panel.hidden) { e.stopPropagation(); toggle(false); }
+    if (e.key === 'Escape' && !panel.hidden && !e.defaultPrevented) {
+      e.preventDefault(); e.stopPropagation(); toggle(false);
+    }
   }, true);
   document.addEventListener('mousedown', (e) => {
     if (!panel.hidden && !panel.contains(e.target) && e.target !== mic && !mic.contains(e.target)) toggle(false);
