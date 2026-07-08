@@ -3,7 +3,7 @@
 //! actions, subagent state emits, and the thread-action dispatcher.
 
 use crate::project::{self, Project};
-use crate::{context_rewind, fission_ledger, fission_lifecycle, frontend, platform, provider, worktree};
+use crate::{context_rewind, fission_ledger, fission_lifecycle, platform, provider, worktree};
 use crate::{
     drain_external_agent_events, emit_child_turn_complete, emit_child_turn_complete_for_session,
     emit_context_rewind_failure, emit_external_session_identity, external_agent_log_source,
