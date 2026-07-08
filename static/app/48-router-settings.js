@@ -59,7 +59,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 // We still use localStorage for preferences that aren't navigation
 // (verbosity, direct-mode, host filter, sessions filters).
 
-const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'debug', 'settings'];
+const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'vault', 'debug', 'settings'];
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
@@ -285,6 +285,16 @@ function switchTab(tabId) {
   }
   if (tabId === 'settings' && !apiKeyStatusLoaded) {
     loadApiKeyStatus();
+  }
+  if (tabId === 'vault') {
+    // ui-v2 destination (the vault sections are re-parented here at boot;
+    // under v1 this pane is only reachable by a hand-typed #vault and the
+    // render below is a harmless repaint of the sections in Access →
+    // Advanced). Vault state changes render eagerly on their own; entering
+    // the pane repaints once so lease countdowns are fresh — the renderer
+    // itself kicks the lease + custody refreshes.
+    paneDeferredRenders.delete('vault');
+    renderAccessVaultSection();
   }
   if (tabId === 'access') {
     paneDeferredRenders.delete('access');

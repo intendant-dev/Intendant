@@ -1582,3 +1582,269 @@ function applyDisplayStripState() {
   });
 }
 
+
+// ── ui-v2 Live-display right rail (design-overhaul P2) ─────────────────
+// Display-only mirror chrome, active only under the ?ui=v2 flag: renders
+// rail rows FROM existing state (displaySlots + slot DOM, the Station
+// peer-display chips, the sb-display-access grant chip) via
+// MutationObservers, and proxies every click to the existing controls.
+// It owns no state, sends no messages, and never touches the WebRTC
+// slots, the single-reparented <video> elements, or v1 markup. Honest
+// authority copy: taking control is last-take-wins displacement between
+// viewers (no request/approve ceremony), and "another viewer has input"
+// is a first-class rendered state.
+if (typeof ui2Enabled === 'function' && ui2Enabled()) (() => {
+  const tab = document.getElementById('tab-displays');
+  if (!tab) return;
+  const rail = document.createElement('aside');
+  rail.className = 'ui2-live-rail';
+  rail.id = 'ui2-live-rail';
+  rail.innerHTML = `
+    <section>
+      <div class="ui2-live-rail-eyebrow">Displays</div>
+      <div class="ui2-live-rail-list" id="ui2-live-displays-list"></div>
+    </section>
+    <section>
+      <div class="ui2-live-rail-eyebrow">Input authority</div>
+      <div id="ui2-live-authority-card"></div>
+    </section>
+    <section>
+      <div class="ui2-live-rail-eyebrow">Peer displays</div>
+      <div class="ui2-live-rail-list" id="ui2-live-peer-list"></div>
+    </section>
+    <section>
+      <div class="ui2-live-rail-eyebrow">Your screen</div>
+      <div id="ui2-live-yourscreen"></div>
+    </section>`;
+  tab.appendChild(rail);
+  const displaysList = rail.querySelector('#ui2-live-displays-list');
+  const authorityCard = rail.querySelector('#ui2-live-authority-card');
+  const peerList = rail.querySelector('#ui2-live-peer-list');
+  const yourScreen = rail.querySelector('#ui2-live-yourscreen');
+
+  const emptyHint = (text) => {
+    const div = document.createElement('div');
+    div.className = 'ui2-live-rail-empty';
+    div.textContent = text;
+    return div;
+  };
+
+  function renderDisplayRows() {
+    displaysList.textContent = '';
+    const slots = Array.from(displaySlots.values());
+    if (!slots.length) {
+      displaysList.appendChild(emptyHint('No displays active. They appear here when the agent launches a GUI or you share your screen.'));
+      return;
+    }
+    for (const slot of slots) {
+      const row = document.createElement('button');
+      row.type = 'button';
+      const err = slot.statusEl && slot.statusEl.classList.contains('error');
+      row.className = 'ui2-live-row' + (slot.connected ? ' ok viewing' : (err ? ' err' : ''));
+      const dot = document.createElement('span');
+      dot.className = 'ui2-live-row-dot';
+      const main = document.createElement('span');
+      main.className = 'ui2-live-row-main';
+      const title = document.createElement('span');
+      title.className = 'ui2-live-row-title';
+      const labelEl = slot.el && slot.el.querySelector('.display-label');
+      title.textContent = (labelEl && labelEl.textContent) || `Display ${slot.displayId}`;
+      const meta = document.createElement('span');
+      meta.className = 'ui2-live-row-meta';
+      meta.textContent = (slot.statusEl && slot.statusEl.textContent) || '';
+      main.appendChild(title);
+      main.appendChild(meta);
+      row.appendChild(dot);
+      row.appendChild(main);
+      if (slot.connected) {
+        const tag = document.createElement('span');
+        tag.className = 'ui2-live-row-tag';
+        tag.textContent = 'VIEWING';
+        row.appendChild(tag);
+      }
+      row.title = 'Scroll this display into view';
+      row.addEventListener('click', () => {
+        if (slot.el && slot.el.isConnected) slot.el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      });
+      displaysList.appendChild(row);
+    }
+  }
+
+  const AUTH_LABEL = {
+    you: 'you',
+    other: 'another viewer',
+    unclaimed: 'shared',
+    unknown: 'view-only',
+  };
+  function renderAuthorityCard() {
+    authorityCard.textContent = '';
+    const card = document.createElement('div');
+    card.className = 'ui2-live-card';
+    const title = document.createElement('div');
+    title.className = 'ui2-live-card-title';
+    const sub = document.createElement('div');
+    sub.className = 'ui2-live-card-sub';
+    const slots = Array.from(displaySlots.values());
+    if (!slots.length) {
+      title.textContent = 'No live display';
+      sub.textContent = 'Input authority appears here once a display is streaming.';
+      card.appendChild(title);
+      card.appendChild(sub);
+      authorityCard.appendChild(card);
+      return;
+    }
+    const anyYou = slots.some(s => s.authorityState === 'you');
+    const anyOther = slots.some(s => s.authorityState === 'other');
+    title.textContent = anyYou
+      ? 'You have input control'
+      : anyOther
+        ? 'Another viewer has input'
+        : 'You have view-only';
+    sub.textContent = 'Take control forwards your mouse and keyboard to the display. It displaces whoever holds input — last take wins, there is no approval step. Release hands the display back.';
+    card.appendChild(title);
+    card.appendChild(sub);
+    for (const slot of slots) {
+      const row = document.createElement('div');
+      row.className = 'ui2-live-auth-row';
+      const name = document.createElement('span');
+      name.className = 'ui2-live-auth-name';
+      const labelEl = slot.el && slot.el.querySelector('.display-label');
+      name.textContent = (labelEl && labelEl.textContent) || `Display ${slot.displayId}`;
+      const pill = document.createElement('span');
+      const st = slot.authorityState || 'unknown';
+      pill.className = 'ui2-live-state-pill' + (st === 'you' ? ' you' : st === 'other' ? ' other' : '');
+      pill.textContent = AUTH_LABEL[st] || AUTH_LABEL.unknown;
+      row.appendChild(name);
+      row.appendChild(pill);
+      card.appendChild(row);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      if (st === 'you') {
+        btn.className = 'ui2-live-card-btn release';
+        btn.textContent = 'Release control';
+        btn.title = 'Release input and return this display to view-only';
+        btn.addEventListener('click', () => {
+          const b = document.getElementById(`ds-release-${slot.displayId}`);
+          if (b) b.click();
+        });
+      } else {
+        btn.className = 'ui2-live-card-btn';
+        btn.textContent = st === 'other' ? 'Take control anyway' : 'Take control';
+        btn.title = st === 'other'
+          ? 'Takes input immediately and displaces the current viewer'
+          : 'Take interactive control of this display (keyboard and mouse)';
+        btn.addEventListener('click', () => {
+          const b = document.getElementById(`ds-take-${slot.displayId}`);
+          if (b) b.click();
+        });
+      }
+      card.appendChild(btn);
+    }
+    authorityCard.appendChild(card);
+  }
+
+  function renderPeerRows() {
+    peerList.textContent = '';
+    const chips = document.querySelectorAll('#station-peer-chips .station-peer-chip');
+    if (!chips.length) {
+      peerList.appendChild(emptyHint('No peer displays advertised. Paired daemons that share a display appear here.'));
+      return;
+    }
+    chips.forEach((chip) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'ui2-live-row' + (chip.disabled ? '' : ' ok');
+      row.disabled = chip.disabled;
+      row.title = chip.title || '';
+      const dot = document.createElement('span');
+      dot.className = 'ui2-live-row-dot';
+      const main = document.createElement('span');
+      main.className = 'ui2-live-row-main';
+      const title = document.createElement('span');
+      title.className = 'ui2-live-row-title';
+      title.textContent = chip.textContent || '';
+      const meta = document.createElement('span');
+      meta.className = 'ui2-live-row-meta';
+      meta.textContent = chip.disabled ? 'peer offline' : 'peer · view display';
+      main.appendChild(title);
+      main.appendChild(meta);
+      const chev = document.createElement('span');
+      chev.className = 'ui2-live-row-chev';
+      chev.textContent = '›';
+      row.appendChild(dot);
+      row.appendChild(main);
+      row.appendChild(chev);
+      row.addEventListener('click', () => chip.click());
+      peerList.appendChild(row);
+    });
+  }
+
+  function renderYourScreen() {
+    yourScreen.textContent = '';
+    const chip = document.getElementById('sb-display-access');
+    const card = document.createElement('div');
+    card.className = 'ui2-live-card';
+    const head = document.createElement('div');
+    head.style.display = 'flex';
+    head.style.alignItems = 'center';
+    head.style.gap = '8px';
+    const title = document.createElement('div');
+    title.className = 'ui2-live-card-title';
+    title.style.flex = '1';
+    title.textContent = 'Your screen';
+    const granted = !!(chip && chip.classList.contains('granted'));
+    const pill = document.createElement('span');
+    pill.className = 'ui2-live-state-pill' + (granted ? ' you' : '');
+    pill.textContent = granted ? 'shared' : 'off';
+    head.appendChild(title);
+    head.appendChild(pill);
+    const sub = document.createElement('div');
+    sub.className = 'ui2-live-card-sub';
+    sub.textContent = granted
+      ? 'The agent can see and drive this screen for computer-use tasks until you revoke access.'
+      : 'Share your own screen with the agent for computer-use tasks. You choose the display and can revoke at any time.';
+    card.appendChild(head);
+    card.appendChild(sub);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ui2-live-card-btn ' + (granted ? 'danger' : 'secondary');
+    btn.textContent = granted ? 'Revoke access' : 'Share your screen…';
+    btn.title = chip ? chip.title : '';
+    btn.disabled = !chip;
+    btn.addEventListener('click', (e) => {
+      // Same flow as the status-bar chip (single display → instant
+      // grant; multiple → picker popover anchored at the chip).
+      e.stopPropagation();
+      if (chip) chip.click();
+    });
+    card.appendChild(btn);
+    yourScreen.appendChild(card);
+  }
+
+  let railRaf = 0;
+  function renderRail() {
+    railRaf = 0;
+    renderDisplayRows();
+    renderAuthorityCard();
+    renderPeerRows();
+    renderYourScreen();
+  }
+  function scheduleRail() {
+    if (railRaf) return;
+    railRaf = requestAnimationFrame(renderRail);
+  }
+  const observe = (el, opts) => {
+    if (!el) return;
+    new MutationObserver(scheduleRail).observe(el, opts);
+  };
+  // Slots come and go / status text + authority chips restyle in place.
+  observe(document.getElementById('displays-container'),
+    { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'style'], characterData: true });
+  // Station peer chips re-render on peer_display_ready/removed.
+  observe(document.getElementById('station-peer-chips'),
+    { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'disabled', 'title'] });
+  // user_session grant chip flips text + .granted.
+  observe(document.getElementById('sb-display-access'),
+    { childList: true, attributes: true, attributeFilter: ['class'], characterData: true, subtree: true });
+  renderRail();
+})();

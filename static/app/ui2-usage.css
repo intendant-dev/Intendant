@@ -1,0 +1,589 @@
+/* ── ui-v2 Usage (Stats) tab re-skin (design-overhaul P2) ──────────────
+   Everything here is scoped under html.ui-v2 #tab-stats (plus the
+   v2-only elements 53-stats-settings.js injects under the flag) — inert
+   for v1 and for every other surface. The existing DOM, ids, renderer
+   contracts, and delegated listeners are untouched: the KPI row, live
+   usage cards, token-activity heatmap (month labels, tooltips, keyboard
+   day-select, agent/view segments, day drill-down), the four power
+   tables, disk usage, and display metrics all keep their v1 markup.
+
+   v2-only additions (all built by flag-gated JS in 53-stats-settings.js):
+   the in-page header, the by-model cost cards (fed by the `model` field
+   the usage view now keeps), the heatmap Less→More legend, and the two
+   disclosure folds that keep every v1 power section reachable.
+
+   The heatmap ramp needs no per-cell work here: v1 cells already paint
+   from --viz-empty / --viz-ramp-1..5, and 16-styles-v2-tokens.css
+   re-points those at the design's iris ramp under the flag. */
+
+/* ── page scaffold ── */
+html.ui-v2 #tab-stats .usage-container {
+  padding: 26px 28px 48px;
+}
+html.ui-v2 #tab-stats .usage-container > * {
+  width: 100%;
+  max-width: 935px;
+  margin-left: auto;
+  margin-right: auto;
+}
+html.ui-v2 #tab-stats .ui2-page-head { margin-bottom: 18px; }
+html.ui-v2 #tab-stats .ui2-page-title {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -.02em;
+  color: var(--text);
+}
+html.ui-v2 #tab-stats .ui2-page-sub {
+  margin: 7px 0 0;
+  font-size: 14px;
+  color: var(--text-2);
+}
+
+/* ── host picker (fleet stats scope) ── */
+html.ui-v2 #tab-stats .stats-host-bar {
+  background: transparent;
+  border-bottom: 1px solid var(--line);
+  padding: 12px 28px;
+  gap: 9px;
+}
+html.ui-v2 #tab-stats .stats-host-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-stats .stats-host-select {
+  appearance: none;
+  -webkit-appearance: none;
+  min-height: 30px;
+  padding: 5px 28px 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background-color: var(--surface);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23A7AEBE' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 14px;
+  color: var(--text);
+  font: 700 12.5px var(--sans);
+  transition: background-color var(--t-med), border-color var(--t-med);
+}
+html.ui-v2 #tab-stats .stats-host-select:hover {
+  background-color: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2 #tab-stats .stats-host-select:focus {
+  outline: none;
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+
+/* ── KPI row (5 tiles, all real) ── */
+html.ui-v2 #tab-stats .ui-stat-row {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin: 0 auto 22px;
+}
+html.ui-v2 #tab-stats .ui-stat {
+  gap: 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: linear-gradient(160deg, var(--surface-2), var(--surface));
+  padding: 15px 16px;
+}
+html.ui-v2 #tab-stats .ui-stat-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-stats .ui-stat-value {
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: -.02em;
+  color: var(--text);
+}
+/* The Lifetime-tokens tile wears the brand tint (design: iris-2 value).
+   Positional by design: renderStatsKpiRow emits exactly five tiles in a
+   fixed order — a reorder there shows up in shots immediately. */
+html.ui-v2 #tab-stats #stats-kpi-row .ui-stat:nth-child(4) .ui-stat-value {
+  color: var(--iris-2);
+}
+html.ui-v2 #tab-stats .stats-kpi-skel-label { min-height: 11px; }
+html.ui-v2 #tab-stats .stats-kpi-skel-value { min-height: 24px; }
+
+/* ── empty state ── */
+html.ui-v2 #tab-stats #usage-empty {
+  min-height: 0;
+  align-content: start;
+  gap: 4px;
+  padding: 42px 16px;
+}
+html.ui-v2 #tab-stats .ui-empty-glyph {
+  width: 40px;
+  height: 40px;
+  border-radius: 11px;
+  border: 1px solid var(--line-2);
+  background: var(--surface-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  margin-bottom: 8px;
+}
+html.ui-v2 #tab-stats .ui-empty-glyph svg {
+  width: 20px;
+  height: 20px;
+  stroke: currentColor;
+  stroke-width: 1.7;
+}
+html.ui-v2 #tab-stats .ui-empty-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+html.ui-v2 #tab-stats .ui-empty-hint {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+
+/* ── by-model cards (v2-only section) ── */
+html.ui-v2 #tab-stats .ui2-eyebrow {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  margin: 4px 0 12px;
+}
+html.ui-v2 #tab-stats .ui2-model-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+html.ui-v2 #tab-stats #ui2-by-model { margin-bottom: 22px; }
+html.ui-v2 #tab-stats .ui2-model-card {
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  padding: 14px 16px 13px;
+}
+html.ui-v2 #tab-stats .ui2-model-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 11px;
+}
+html.ui-v2 #tab-stats .ui2-model-name {
+  font: 700 13.5px var(--mono);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Source chips follow the design's session-source tint map:
+   native = iris, Codex = neutral, Claude Code = amber. */
+html.ui-v2 #tab-stats .ui2-model-chip {
+  flex-shrink: 0;
+  font: 400 10.5px var(--mono);
+  padding: 1px 7px;
+  border-radius: 6px;
+  background: var(--surface-3);
+  color: var(--text-2);
+}
+html.ui-v2 #tab-stats .ui2-model-chip.is-intendant {
+  background: rgba(var(--iris-rgb), .12);
+  color: var(--iris-2);
+}
+html.ui-v2 #tab-stats .ui2-model-chip.is-claude {
+  background: rgba(var(--amber-rgb), .12);
+  color: var(--amber);
+}
+html.ui-v2 #tab-stats .ui2-model-cost {
+  margin-left: auto;
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: -.01em;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+html.ui-v2 #tab-stats .ui2-model-stats {
+  display: flex;
+  gap: 26px;
+  margin-bottom: 11px;
+}
+html.ui-v2 #tab-stats .ui2-model-stat .label {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-bottom: 2px;
+}
+html.ui-v2 #tab-stats .ui2-model-stat .value {
+  font: 600 13px var(--mono);
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+html.ui-v2 #tab-stats .ui2-model-stat.is-cached .value { color: var(--green); }
+html.ui-v2 #tab-stats .ui2-model-meter {
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  overflow: hidden;
+}
+html.ui-v2 #tab-stats .ui2-model-meter > i {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, var(--iris), var(--violet));
+}
+html.ui-v2 #tab-stats .ui2-model-sub {
+  margin-top: 7px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-stats .ui2-model-unpriced {
+  margin-left: 8px;
+  font-size: 10.5px;
+  color: var(--amber);
+}
+html.ui-v2 #tab-stats .ui2-model-more {
+  font-size: 11.5px;
+  color: var(--text-3);
+  padding: 2px 2px 0;
+}
+
+/* ── shared card + section-head chrome for the v1 sections ── */
+html.ui-v2 #tab-stats .usage-container > .ui-card,
+html.ui-v2 #tab-stats .ui2-fold-body .ui-card {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  box-shadow: none;
+  padding: 16px 18px 17px;
+}
+html.ui-v2 #tab-stats .ui-section-head { margin-bottom: 13px; }
+html.ui-v2 #tab-stats .ui-section-title {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text);
+}
+html.ui-v2 #tab-stats .ui-section-sub {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+/* ── live / fallback usage cards ── */
+html.ui-v2 #tab-stats .usage-cards { gap: 12px; }
+html.ui-v2 #tab-stats .usage-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: none;
+  padding: 14px 16px;
+}
+html.ui-v2 #tab-stats .usage-card .card-title {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  color: var(--text-3);
+  margin-bottom: 5px;
+}
+html.ui-v2 #tab-stats .usage-card .card-model {
+  font: 600 13px var(--mono);
+  color: var(--text);
+  margin-bottom: 12px;
+}
+html.ui-v2 #tab-stats .usage-card .card-model .provider { color: var(--iris-2); }
+html.ui-v2 #tab-stats .usage-card .card-model .model-name,
+html.ui-v2 #tab-stats .usage-card .card-model .model { color: var(--text-2); }
+html.ui-v2 #tab-stats .token-bar .bar-label {
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+html.ui-v2 #tab-stats .token-bar .bar-label .tokens {
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+html.ui-v2 #tab-stats .token-bar .bar-label .pct {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+/* Context-pressure meter: design fill (iris→violet); warn/danger keep
+   their semantic hues via the tone classes the renderer already sets. */
+html.ui-v2 #tab-stats .ui-meter {
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+}
+html.ui-v2 #tab-stats .ui-meter > i {
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, var(--iris), var(--violet));
+}
+html.ui-v2 #tab-stats .ui-meter.warn { background: rgba(var(--amber-rgb), .16); }
+html.ui-v2 #tab-stats .ui-meter.warn > i { background: var(--amber); }
+html.ui-v2 #tab-stats .ui-meter.danger { background: rgba(var(--rose-rgb), .16); }
+html.ui-v2 #tab-stats .ui-meter.danger > i { background: var(--rose); }
+html.ui-v2 #tab-stats .token-breakdown {
+  font-size: 12px;
+}
+html.ui-v2 #tab-stats .token-breakdown .label { color: var(--text-3); }
+html.ui-v2 #tab-stats .token-breakdown .value {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text);
+}
+html.ui-v2 #tab-stats .token-breakdown .total-row {
+  border-top: 1px solid var(--line);
+}
+
+/* ── cost / table grids (shared .cost-grid recipe) ── */
+html.ui-v2 #tab-stats .cost-grid {
+  font-size: 12.5px;
+  gap: 7px 16px;
+}
+html.ui-v2 #tab-stats .cost-grid .label { color: var(--text-2); }
+html.ui-v2 #tab-stats .cost-grid .value {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+}
+html.ui-v2 #tab-stats .cost-grid .head {
+  font-family: var(--sans);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-stats .cost-grid .label.strong { color: var(--text); font-weight: 700; }
+html.ui-v2 #tab-stats .cost-grid .err { color: var(--rose); }
+html.ui-v2 #tab-stats .cost-grid .unpriced { color: var(--amber); }
+html.ui-v2 #tab-stats .cost-grid .total-row {
+  border-top: 1px solid var(--line);
+  color: var(--text);
+}
+html.ui-v2 #tab-stats .cost-grid .value.total { font-weight: 700; }
+html.ui-v2 #tab-stats #daily-usage-grid .label.today { color: var(--iris-2); font-weight: 700; }
+html.ui-v2 #tab-stats #agent-usage-grid .period { color: var(--text-3); font-weight: 500; }
+
+/* ── token activity (existing renderer, re-skinned) ── */
+html.ui-v2 #tab-stats .token-activity-segment {
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-2);
+}
+html.ui-v2 #tab-stats .token-activity-segment button {
+  min-height: 0;
+  padding: 6px 12px;
+  border-radius: 8px;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 700;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #tab-stats .token-activity-segment button:hover {
+  color: var(--text);
+  background: transparent;
+}
+html.ui-v2 #tab-stats .token-activity-segment button.active {
+  background: var(--surface-3);
+  color: var(--text);
+  font-weight: 700;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, .2);
+}
+html.ui-v2 #tab-stats .token-activity-segment button:disabled {
+  color: var(--text-3);
+  opacity: .45;
+}
+html.ui-v2 #tab-stats .token-activity-stats {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+html.ui-v2 #tab-stats .token-activity-stat { border-right: 1px solid var(--line); }
+html.ui-v2 #tab-stats .token-activity-stat:last-child { border-right: 0; }
+html.ui-v2 #tab-stats .token-activity-stat .value {
+  font-size: 19px;
+  font-weight: 800;
+  letter-spacing: -.01em;
+  color: var(--text);
+}
+html.ui-v2 #tab-stats .token-activity-stat .label {
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-stats .token-activity-skyline {
+  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 #tab-stats .token-activity-skyline-bar { border-radius: 2px 2px 0 0; }
+html.ui-v2 #tab-stats .token-activity-months {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+/* Design cell geometry: square cells, 2px radius, 3px gap; ramp colors
+   come from the --viz-* tokens the v1 rules already consume. */
+html.ui-v2 #tab-stats .token-activity-heatmap {
+  gap: 3px;
+  grid-template-rows: repeat(7, auto);
+}
+html.ui-v2 #tab-stats .token-activity-day {
+  height: auto;
+  aspect-ratio: 1 / 1;
+  border-radius: 2px;
+}
+html.ui-v2 #tab-stats .token-activity-day:not(.future):hover,
+html.ui-v2 #tab-stats .token-activity-day:not(.future):focus-visible {
+  border-color: var(--text-2);
+  outline: none;
+}
+html.ui-v2 #tab-stats .token-activity-day.selected {
+  border-color: var(--text);
+  box-shadow: 0 0 0 2px rgba(var(--iris-rgb), .45);
+}
+html.ui-v2 #tab-stats .ui2-heat-legend {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 9px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-stats .ui2-heat-legend span { margin: 0 4px; }
+html.ui-v2 #tab-stats .ui2-heat-legend i {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+}
+html.ui-v2 #tab-stats .ui2-heat-legend .l0 { background: var(--viz-empty); }
+html.ui-v2 #tab-stats .ui2-heat-legend .l1 { background: var(--viz-ramp-1); }
+html.ui-v2 #tab-stats .ui2-heat-legend .l2 { background: var(--viz-ramp-2); }
+html.ui-v2 #tab-stats .ui2-heat-legend .l3 { background: var(--viz-ramp-3); }
+html.ui-v2 #tab-stats .ui2-heat-legend .l4 { background: var(--viz-ramp-4); }
+html.ui-v2 #tab-stats .ui2-heat-legend .l5 { background: var(--viz-ramp-5); }
+html.ui-v2 #tab-stats .token-activity-detail {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-2);
+}
+html.ui-v2 #tab-stats .token-activity-detail-day {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+html.ui-v2 #tab-stats .token-activity-detail-agent {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-stats .token-activity-detail-metric .label {
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-stats .token-activity-detail-metric .value {
+  font: 600 13px var(--mono);
+  color: var(--text);
+}
+
+/* ── tokens-per-turn chart ── */
+html.ui-v2 #tab-stats .history-bar {
+  background: var(--viz-ramp-4);
+  border-radius: 2px 2px 0 0;
+}
+
+/* ── loading pill ── */
+html.ui-v2 #tab-stats .stats-loading {
+  margin: 12px auto 12px 0;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface);
+  color: var(--text-2);
+}
+html.ui-v2 #tab-stats .stats-loading-spinner {
+  border-color: var(--surface-3);
+  border-top-color: var(--iris);
+}
+html.ui-v2 #tab-stats .stats-loading-title { color: var(--text); }
+html.ui-v2 #tab-stats .stats-loading-detail { color: var(--text-3); }
+
+/* ── display transport metrics ── */
+html.ui-v2 #tab-stats .display-metrics-table { font-size: 12.5px; }
+html.ui-v2 #tab-stats .display-metrics-table th {
+  color: var(--text-3);
+  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 #tab-stats .display-metrics-table td { color: var(--text-2); }
+html.ui-v2 #tab-stats .display-metrics-table td.dm-value {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+}
+html.ui-v2 #tab-stats .display-metrics-table td.dm-unit { color: var(--text-3); }
+
+/* ── disclosure folds (v2-only wrappers around the v1 power sections) ── */
+html.ui-v2 #tab-stats .ui2-fold { margin-top: 14px; }
+html.ui-v2 #tab-stats .ui2-fold-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--sans);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 #tab-stats .ui2-fold-head:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2 #tab-stats .ui2-fold-chev {
+  display: flex;
+  color: var(--text-3);
+  transition: transform var(--t-med);
+}
+html.ui-v2 #tab-stats .ui2-fold.open .ui2-fold-chev { transform: rotate(90deg); }
+html.ui-v2 #tab-stats .ui2-fold-title {
+  font-size: 13.5px;
+  font-weight: 700;
+}
+html.ui-v2 #tab-stats .ui2-fold-hint {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+html.ui-v2 #tab-stats .ui2-fold-body { display: none; }
+html.ui-v2 #tab-stats .ui2-fold.open .ui2-fold-body { display: block; }
+/* The fold owns the gap under its header; the sections inside keep the
+   12px card rhythm from the shared rule above. */
+html.ui-v2 #tab-stats .ui2-fold-body > :first-child { margin-top: 12px; }
+html.ui-v2 #tab-stats .ui2-fold-body .usage-cards { margin-top: 12px; }
+
+/* ── narrow widths ── */
+@media (max-width: 820px) {
+  html.ui-v2 #tab-stats .usage-container { padding: 20px 16px 40px; }
+  html.ui-v2 #tab-stats .ui2-model-stats { gap: 18px; }
+  html.ui-v2 #tab-stats .ui2-fold-hint { display: none; }
+}

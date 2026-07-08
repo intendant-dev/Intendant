@@ -2439,6 +2439,10 @@ function setNewSessionStartButtonPending(pending) {
 // bindings). Unknown never blocks.
 let daemonUnfueledCached = null;
 let daemonFuelProbeInFlight = false;
+// ui-v2 fueled-banner detail: which providers the key-status probe saw.
+// null = never probed; [] = probed and none (or probe failed — generic
+// copy, no re-hammering).
+let daemonFuelProviders = null;
 
 function daemonInternalUnfueled() {
   const status = dashboardControlTransport?.lastStatus;
@@ -2448,15 +2452,28 @@ function daemonInternalUnfueled() {
 
 function refreshFuelStateForBanner() {
   const status = dashboardControlTransport?.lastStatus;
-  if (status && typeof status.fueled === 'boolean') return;
-  if (daemonUnfueledCached !== null || daemonFuelProbeInFlight) return;
+  // ui-v2's green Fueled banner names the fueled providers, so under the
+  // flag the one-shot probe also runs when the status frame already
+  // answered the boolean; v1 keeps the original short-circuits.
+  const wantProviders = typeof ui2Enabled === 'function' && ui2Enabled() && daemonFuelProviders === null;
+  if (status && typeof status.fueled === 'boolean' && !wantProviders) return;
+  if ((daemonUnfueledCached !== null && !wantProviders) || daemonFuelProbeInFlight) return;
   if (typeof fetchApiKeyStatus !== 'function') return;
   daemonFuelProbeInFlight = true;
   fetchApiKeyStatus()
     .then(d => {
-      if (d && !d.error) daemonUnfueledCached = !(d.openai || d.anthropic || d.gemini);
+      if (d && !d.error) {
+        if (daemonUnfueledCached === null) daemonUnfueledCached = !(d.openai || d.anthropic || d.gemini);
+        daemonFuelProviders = [
+          d.anthropic ? 'Anthropic' : '',
+          d.openai ? 'OpenAI' : '',
+          d.gemini ? 'Gemini' : '',
+        ].filter(Boolean);
+      } else if (daemonFuelProviders === null) {
+        daemonFuelProviders = [];
+      }
     })
-    .catch(() => {})
+    .catch(() => { if (daemonFuelProviders === null) daemonFuelProviders = []; })
     .finally(() => {
       daemonFuelProbeInFlight = false;
       updateNewSessionFuelBanner();
@@ -2534,6 +2551,80 @@ window.qa = Object.assign(window.qa || {}, {
 
 });
 
+// ── ui-v2 execution segmented control (design overhaul) ──
+// The reference's Auto / Orchestrate / Direct segmented choice with a
+// per-choice note (execInfo copy, verbatim — it matches the current
+// semantics). The v1 <select id="new-session-execution"> stays the source
+// of truth (startNewSession reads it; updateNewSessionAgentFields drives
+// its disabled state) — the segments only proxy value + disabled, and the
+// select is hidden by ui2-sessions.css under the flag. v1 DOM untouched.
+const UI2_EXEC_CHOICES = [
+  { value: '', label: 'Auto', note: 'The task-size heuristic decides between a single agent and supervised sub-agents.' },
+  { value: 'orchestrate', label: 'Orchestrate', note: 'Delegates the task to supervised sub-agents working in isolated git worktrees.' },
+  { value: 'direct', label: 'Direct', note: 'A single agent handles the whole task — no delegation.' },
+];
+let ui2ExecSegEl = null;
+let ui2ExecNoteEl = null;
+
+function ui2SyncExecSeg() {
+  if (!ui2ExecSegEl) return;
+  const sel = document.getElementById('new-session-execution');
+  if (!sel) return;
+  const value = sel.value || '';
+  const disabled = !!sel.disabled;
+  ui2ExecSegEl.classList.toggle('disabled', disabled);
+  for (const btn of ui2ExecSegEl.querySelectorAll('button[data-exec]')) {
+    const active = (btn.dataset.exec || '') === value;
+    btn.classList.toggle('is-accent', active && !disabled);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    btn.disabled = disabled;
+  }
+  if (ui2ExecNoteEl) {
+    const choice = UI2_EXEC_CHOICES.find(c => c.value === value) || UI2_EXEC_CHOICES[0];
+    ui2ExecNoteEl.textContent = disabled
+      ? 'Execution shape applies to the internal agent — external CLIs run their own loops.'
+      : choice.note;
+  }
+}
+
+if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+  const wrap = document.getElementById('new-session-execution-wrap');
+  if (wrap && wrap.parentElement) {
+    const field = document.createElement('div');
+    field.className = 'sessions-new-session-field ui2-exec-field';
+    const label = document.createElement('span');
+    label.className = 'ui2-exec-label';
+    label.textContent = 'Execution';
+    const seg = document.createElement('div');
+    seg.className = 'ui2-seg ui2-exec-seg';
+    seg.setAttribute('role', 'group');
+    seg.setAttribute('aria-label', 'Execution shape');
+    for (const choice of UI2_EXEC_CHOICES) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.dataset.exec = choice.value;
+      btn.textContent = choice.label;
+      btn.title = choice.note;
+      btn.addEventListener('click', () => {
+        const sel = document.getElementById('new-session-execution');
+        if (!sel || sel.disabled) return;
+        sel.value = choice.value;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        ui2SyncExecSeg();
+      });
+      seg.appendChild(btn);
+    }
+    const note = document.createElement('div');
+    note.className = 'sessions-agent-note ui2-exec-note';
+    field.append(label, seg, note);
+    ui2ExecSegEl = seg;
+    ui2ExecNoteEl = note;
+    wrap.after(field);
+    document.getElementById('new-session-execution')?.addEventListener('change', ui2SyncExecSeg);
+    ui2SyncExecSeg();
+  }
+}
+
 function updateNewSessionFuelBanner() {
   const banner = document.getElementById('new-session-unfueled-banner');
   if (!banner) return;
@@ -2547,6 +2638,31 @@ function updateNewSessionFuelBanner() {
     btn.disabled = show;
     btn.title = show ? 'Internal sessions need an API key or a vault credential lease' : '';
   }
+
+  // ui-v2 only: the design's green happy-path banner. Shown exclusively
+  // when fuel is positively known (status frame `fueled === true` or the
+  // key probe found a provider) — an unknown state shows neither banner,
+  // never a claimed one. v1 never unhides this element.
+  const fueledBanner = document.getElementById('new-session-fueled-banner');
+  if (fueledBanner) {
+    const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
+    const status = dashboardControlTransport?.lastStatus;
+    const knownFueled = (status && status.fueled === true) || daemonUnfueledCached === false;
+    const showFueled = ui2 && internalSelected && !show && knownFueled;
+    fueledBanner.classList.toggle('hidden', !showFueled);
+    if (showFueled) {
+      const textEl = document.getElementById('new-session-fueled-text');
+      const names = Array.isArray(daemonFuelProviders) && daemonFuelProviders.length > 0
+        ? daemonFuelProviders.join(' + ')
+        : '';
+      if (textEl) {
+        textEl.textContent = names
+          ? `Fueled — ${names} credentials active, ready to launch.`
+          : 'Fueled — model credentials active, ready to launch.';
+      }
+    }
+  }
+  ui2SyncExecSeg();
 }
 
 function setNewSessionSpawnNotice(kind, text, action) {

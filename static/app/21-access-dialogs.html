@@ -283,6 +283,26 @@
       </div>
     </div>
 
+    <!-- Vault Tab (design-overhaul P2): the ui-v2 top-level destination.
+         Under html.ui-v2, boot re-parents the vault + custody sections
+         (with their section heads) out of Access → Advanced into
+         #vault-tab-sections — every id, listener, and the
+         window.intendantVault contract survives the move
+         (ui2VaultAdoptSections in 32-vault-custody.js). Under v1 nothing
+         moves: no v1 control routes here, and a hand-typed #vault shows
+         only the pointer note below. -->
+    <div id="tab-vault" class="tab-pane">
+      <div class="vault-pane-body" id="vault-pane-body">
+        <div class="ui2-vault-pagehead" id="ui2-vault-pagehead" hidden>
+          <h1 class="ui2-acc-title">Vault</h1>
+        </div>
+        <div class="vault-note" id="vault-v1-note">
+          The credential vault lives in <a href="#access/advanced">Access &rarr; Advanced</a>.
+        </div>
+        <div id="vault-tab-sections"></div>
+      </div>
+    </div>
+
     <!-- Settings Tab -->
     <div id="tab-settings" class="tab-pane">
       <div class="subtabs">

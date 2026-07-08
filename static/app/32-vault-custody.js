@@ -1624,7 +1624,7 @@ async function vaultEgressExecute(id) {
   }
 }
 
-/* ── Vault UI (Access → Advanced) ── */
+/* ── Vault UI (v1: Access → Advanced · ui-v2: the #vault destination) ── */
 
 function vaultProviderLabel(provider) {
   if (provider === 'anthropic') return 'Anthropic';
@@ -2258,6 +2258,56 @@ function renderAccessVaultSection() {
   mount.innerHTML = '';
   mount.appendChild(card);
 }
+
+/* ── ui-v2: Vault as its own top-level destination ──
+   Under the ui-v2 flag, boot moves the vault + custody sections (and the
+   two acc-section-heads introducing them) out of Access → Advanced into
+   the #tab-vault pane. The nodes are RE-PARENTED, never rebuilt: every id,
+   attached listener, and the window.intendantVault contract survives, and
+   all renderers keep finding their mounts by id (the same relocation
+   pattern the display canvases use). Under v1 (no flag) nothing runs, so
+   the vault validators' #access/advanced contract stays byte-intact.
+   Skipped on the standalone /access admin page, which is locked to the
+   Access tab — there the vault stays reachable inside Advanced. A small
+   link card is left behind so #access/advanced deep links (unfueled
+   empty-state, older bookmarks) still lead somewhere honest. */
+function ui2VaultAdoptSections() {
+  if (typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
+  if (DASHBOARD_ACCESS_PAGE_MODE) return;
+  const host = document.getElementById('vault-tab-sections');
+  const vaultMount = document.getElementById('access-vault-section');
+  const custodyMount = document.getElementById('access-custody-section');
+  if (!host || !vaultMount || !custodyMount) return;
+  const advancedBody = vaultMount.parentElement;
+  const vaultHead = vaultMount.previousElementSibling;
+  const custodyHead = custodyMount.previousElementSibling;
+  if (vaultHead?.classList.contains('acc-section-head')) host.appendChild(vaultHead);
+  host.appendChild(vaultMount);
+  if (custodyHead?.classList.contains('acc-section-head')) host.appendChild(custodyHead);
+  host.appendChild(custodyMount);
+  const pagehead = document.getElementById('ui2-vault-pagehead');
+  if (pagehead) pagehead.hidden = false;
+  const v1Note = document.getElementById('vault-v1-note');
+  if (v1Note) v1Note.hidden = true;
+  if (advancedBody) {
+    const moved = document.createElement('div');
+    moved.className = 'ui2-vault-moved-card';
+    const title = document.createElement('div');
+    title.className = 'ui2-vault-moved-title';
+    title.textContent = 'The vault has its own home now';
+    const sub = document.createElement('div');
+    sub.className = 'ui2-vault-moved-sub';
+    sub.textContent = 'Credential vault, fueling, and the custody trail moved to Vault in the navigation rail.';
+    const go = document.createElement('button');
+    go.type = 'button';
+    go.className = 'ui2-vault-moved-go';
+    go.textContent = 'Open Vault';
+    go.addEventListener('click', () => routeTo('vault'));
+    moved.append(title, sub, go);
+    advancedBody.prepend(moved);
+  }
+}
+ui2VaultAdoptSections();
 
 /* Debug/validator handle (the module scope hides the vault globals; the
    validators observe state through this, like intendantDashboardControl). */

@@ -30,9 +30,7 @@ const UI2_NAV_GROUPS = [
   ] },
   { label: 'Trust', items: [
     { tab: 'access', label: 'Access', icon: 'access' },
-    // Vault's own destination arrives with its program phase; until then
-    // this is an honest shortcut to today's vault home.
-    { route: ['access', 'advanced'], label: 'Vault', icon: 'vault' },
+    { tab: 'vault', label: 'Vault', icon: 'vault' },
   ] },
   { label: 'System', items: [
     { tab: 'settings', label: 'Settings', icon: 'settings' },

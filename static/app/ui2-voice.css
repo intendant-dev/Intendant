@@ -1,0 +1,101 @@
+/* ── ui-v2 voice: mic button + in-call panel (user-approved design) ────
+   All scoped html.ui-v2. The v1 floating overlay stays in the DOM
+   (bootstrap asserts it) but hidden; its live controls are re-parented
+   into the panel by ui2-voice.js. */
+
+html.ui-v2 #voiceOverlay { display: none !important; }
+
+html.ui-v2 .ui2-micbtn {
+  position: relative;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; flex-shrink: 0;
+  border: 1px solid var(--line); border-radius: var(--r-ctl);
+  background: transparent; color: var(--text-2); cursor: pointer;
+  transition: background var(--t-med), color var(--t-med);
+}
+html.ui-v2 .ui2-micbtn:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 .ui2-micbtn-dot {
+  position: absolute; top: 5px; right: 5px;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: transparent;
+}
+html.ui-v2 .ui2-micbtn[data-state="live"] { color: var(--green); border-color: rgba(var(--green-rgb), .4); }
+html.ui-v2 .ui2-micbtn[data-state="live"] .ui2-micbtn-dot { background: var(--green); animation: ui2-pulse 1.3s infinite; }
+html.ui-v2 .ui2-micbtn[data-state="passive"] { color: var(--sky); }
+html.ui-v2 .ui2-micbtn[data-state="passive"] .ui2-micbtn-dot { background: var(--sky); }
+html.ui-v2 .ui2-micbtn[data-state="error"] { color: var(--rose); border-color: rgba(var(--rose-rgb), .4); }
+html.ui-v2 .ui2-micbtn[data-state="error"] .ui2-micbtn-dot { background: var(--rose); }
+
+html.ui-v2 #ui2-voice-panel {
+  position: fixed;
+  top: calc(var(--ui2-ovs-h) + 8px);
+  right: 14px;
+  width: 320px;
+  z-index: 90;
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-panel);
+  box-shadow: var(--shadow-overlay);
+  animation: ui2-rise .2s ease;
+  overflow: hidden;
+}
+html.ui-v2 .ui2-vp-head {
+  display: flex; align-items: center; gap: 9px;
+  padding: 13px 15px; border-bottom: 1px solid var(--line);
+}
+html.ui-v2 .ui2-vp-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--neutral-dot); }
+html.ui-v2 #ui2-voice-panel[data-state="live"] .ui2-vp-dot { background: var(--green); box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16); }
+html.ui-v2 #ui2-voice-panel[data-state="passive"] .ui2-vp-dot { background: var(--sky); box-shadow: 0 0 0 3px rgba(var(--sky-rgb), .16); }
+html.ui-v2 #ui2-voice-panel[data-state="error"] .ui2-vp-dot { background: var(--rose); box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .16); }
+html.ui-v2 .ui2-vp-title { font-size: 13px; font-weight: 800; flex: 1; }
+html.ui-v2 .ui2-vp-sub { font-family: var(--mono); font-size: 10px; color: var(--text-3); }
+html.ui-v2 .ui2-vp-close {
+  border: 0; background: transparent; color: var(--text-3); cursor: pointer;
+  display: flex; padding: 3px; border-radius: 6px;
+}
+html.ui-v2 .ui2-vp-close:hover { color: var(--text); background: var(--surface-2); }
+html.ui-v2 .ui2-vp-body { padding: 14px 15px; display: flex; flex-direction: column; gap: 12px; }
+
+/* Re-parented v1 controls, restyled by id under the flag. */
+html.ui-v2 .ui2-vp-controls { display: flex; gap: 8px; }
+html.ui-v2 .ui2-vp-controls #micBtn,
+html.ui-v2 .ui2-vp-controls #videoBtn,
+html.ui-v2 .ui2-vp-controls #makeActiveBtn {
+  flex: 1; width: auto; height: auto; position: static;
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  padding: 9px 10px; border-radius: 10px;
+  font-family: var(--sans); font-size: 12.5px; font-weight: 700; cursor: pointer;
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--text);
+  box-shadow: none;
+}
+html.ui-v2 .ui2-vp-controls #micBtn.mic-on,
+html.ui-v2 .ui2-vp-controls #videoBtn.video-on {
+  border-color: rgba(var(--green-rgb), .4); color: var(--green); background: transparent;
+}
+html.ui-v2 .ui2-vp-controls #makeActiveBtn {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent); border: 0; font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+}
+/* The v1 controls are icon-only rounds; in panel context give them
+   text labels so the row reads like the approved mockup. */
+html.ui-v2 .ui2-vp-controls #micBtn::after { content: 'Mic'; }
+html.ui-v2 .ui2-vp-controls #videoBtn::after { content: 'Camera'; }
+html.ui-v2 #ui2-voice-panel[data-state="idle"] .ui2-vp-note::before {
+  content: 'Start the mic to talk to this daemon live. ';
+  color: var(--text-2);
+}
+html.ui-v2 .ui2-vp-status-slot:empty, html.ui-v2 .ui2-vp-cam-slot:empty { display: none; }
+html.ui-v2 .ui2-vp-status-slot #voiceStatus {
+  position: static; display: block; max-width: none;
+  background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: 999px; padding: 4px 11px;
+  font-size: 11px; font-weight: 700; color: var(--text-2);
+}
+html.ui-v2 .ui2-vp-cam-slot #videoPreviewWrap {
+  position: static; width: 100%; height: auto;
+  border-radius: 10px; overflow: hidden;
+  border: 1px solid var(--line); background: var(--code-bg);
+}
+html.ui-v2 .ui2-vp-cam-slot #videoPreviewEl { width: 100%; height: auto; display: block; }
+html.ui-v2 .ui2-vp-note { font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
