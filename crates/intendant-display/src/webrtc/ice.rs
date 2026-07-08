@@ -4,7 +4,10 @@
 
 use super::*;
 
-pub(crate) fn host_candidate_init(addr: SocketAddr, protocol: RTCIceProtocol) -> RTCIceCandidateInit {
+pub(crate) fn host_candidate_init(
+    addr: SocketAddr,
+    protocol: RTCIceProtocol,
+) -> RTCIceCandidateInit {
     let (foundation, proto, priority, tcp_suffix) = match protocol {
         RTCIceProtocol::Udp => ("1", "udp", 2_130_706_431u32, ""),
         RTCIceProtocol::Tcp => ("9001", "tcp", 1_677_721_855u32, " tcptype passive"),
@@ -74,7 +77,8 @@ pub(crate) const STUN_BINDING_TIMEOUT: Duration = Duration::from_millis(1500);
 /// meta-crate — no new dep): `Message::build` writes the 20-byte header
 /// with the magic cookie and a random transaction ID, sets the message
 /// type to `BINDING_REQUEST`, and `marshal_binary` yields the wire bytes.
-pub(crate) fn build_stun_binding_request() -> Result<(Vec<u8>, rtc::stun::message::TransactionId), String> {
+pub(crate) fn build_stun_binding_request(
+) -> Result<(Vec<u8>, rtc::stun::message::TransactionId), String> {
     use rtc::stun::message::{Message, BINDING_REQUEST};
 
     let mut request = Message::new();

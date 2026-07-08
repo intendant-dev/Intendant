@@ -38,7 +38,7 @@ impl PeerId {
     #[allow(dead_code)]
     pub fn kind(&self) -> Option<PeerKind> {
         let prefix = self.0.split(':').next()?;
-        PeerKind::from_str(prefix)
+        prefix.parse().ok()
     }
 
     /// Return the label portion (everything after the first `:`).
@@ -100,27 +100,43 @@ impl PeerKind {
         }
     }
 
-    /// Strict parse — returns `Some` only for known kinds. Use when
-    /// you want to distinguish "unrecognized" from "explicit Other"
-    /// (which [`from_wire`](Self::from_wire) collapses).
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "intendant" => Some(Self::Intendant),
-            "openclaw" => Some(Self::OpenClaw),
-            "hermes" => Some(Self::Hermes),
-            "letta" => Some(Self::Letta),
-            "a2a" => Some(Self::A2A),
-            "mcp" => Some(Self::Mcp),
-            "other" => Some(Self::Other),
-            _ => None,
-        }
-    }
-
     /// Parse with forward-compat fallback: unrecognized wire strings
     /// collapse to [`PeerKind::Other`] rather than returning `None`.
     /// This is what the custom `Deserialize` impl calls.
     pub fn from_wire(s: &str) -> Self {
-        Self::from_str(s).unwrap_or(Self::Other)
+        s.parse().unwrap_or(Self::Other)
+    }
+}
+
+/// Parse error for an unrecognized [`PeerKind`] name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownPeerKind;
+
+impl std::fmt::Display for UnknownPeerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unknown peer kind")
+    }
+}
+
+impl std::error::Error for UnknownPeerKind {}
+
+/// Strict parse — `Ok` only for known kinds (`s.parse().ok()` for
+/// Option ergonomics). Use when you want to distinguish "unrecognized"
+/// from "explicit Other" (which [`PeerKind::from_wire`] collapses).
+impl std::str::FromStr for PeerKind {
+    type Err = UnknownPeerKind;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "intendant" => Ok(Self::Intendant),
+            "openclaw" => Ok(Self::OpenClaw),
+            "hermes" => Ok(Self::Hermes),
+            "letta" => Ok(Self::Letta),
+            "a2a" => Ok(Self::A2A),
+            "mcp" => Ok(Self::Mcp),
+            "other" => Ok(Self::Other),
+            _ => Err(UnknownPeerKind),
+        }
     }
 }
 

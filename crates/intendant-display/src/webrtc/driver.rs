@@ -1786,7 +1786,10 @@ pub(crate) const TILE_DELTAS_CHANNEL_LABEL: &str = "tile-deltas";
 /// `display_input_authority` data channel. Wire format matches the
 /// local 5c WS message exactly (same `t` discriminator, same `state`
 /// vocabulary) so browser handlers can stay symmetric.
-pub(crate) fn serialize_authority_state(display_id: u32, state: DisplayInputAuthorityState) -> String {
+pub(crate) fn serialize_authority_state(
+    display_id: u32,
+    state: DisplayInputAuthorityState,
+) -> String {
     serde_json::json!({
         "t": "display_input_authority_state",
         "display_id": display_id,

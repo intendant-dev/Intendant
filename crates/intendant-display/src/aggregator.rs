@@ -824,6 +824,11 @@ pub fn compose_effective_wanted(
     effective
 }
 
+/// Probe for a simulcast layer's paused state (`None` = the pool does
+/// not know the layer). Shared by the coordinator signature and its
+/// callers, which would otherwise each spell the boxed-closure type.
+pub type LayerPauseProbe = Box<dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sync>;
+
 /// Spawn the single layer-policy coordinator for one display.
 ///
 /// One task, three policies, one writer. Subscribes to each peer's
@@ -863,7 +868,7 @@ pub fn compose_effective_wanted(
 pub fn spawn_layer_policy_coordinator(
     peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>>,
     get_current_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync>,
-    is_layer_paused: Box<dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sync>,
+    is_layer_paused: LayerPauseProbe,
     on_action: Box<dyn Fn(CapacityAction) + Send + Sync>,
     config: CapacityPolicyConfig,
     shutdown: CancellationToken,
@@ -2608,8 +2613,7 @@ mod tests {
         // Pool reports every layer ACTIVE — the diff after the
         // presence policy fires Idle must produce a PauseLayer
         // for each.
-        let is_layer_paused: Box<dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sync> =
-            Box::new(|_| Some(false));
+        let is_layer_paused: LayerPauseProbe = Box::new(|_| Some(false));
 
         let shutdown = CancellationToken::new();
         let handle = spawn_layer_policy_coordinator(

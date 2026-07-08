@@ -415,6 +415,12 @@ pub struct DisplayMetricsCounters {
     pub epoch_us: AtomicU64,
 }
 
+impl Default for DisplayMetricsCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DisplayMetricsCounters {
     pub fn new() -> Self {
         let now_us = Instant::now().elapsed().as_micros() as u64;
@@ -1035,6 +1041,7 @@ async fn send_tile_control_to_peers(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_latest_tile_snapshot_to_peer_id(
     peers: Arc<RwLock<HashMap<PeerId, Arc<webrtc::WebRtcPeer>>>>,
     latest_frame: Arc<RwLock<Option<Arc<Frame>>>>,
@@ -1179,7 +1186,9 @@ impl DisplaySession {
     pub async fn start(
         &self,
         fps: u32,
-        frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<intendant_core::frames::FrameRegistry>>>,
+        frame_registry: Option<
+            std::sync::Arc<tokio::sync::RwLock<intendant_core::frames::FrameRegistry>>,
+        >,
         events: Option<DisplayEventSender>,
     ) -> Result<(), CallerError> {
         let mut capture_rx = self.backend.start_capture(fps).await?;
@@ -1400,9 +1409,7 @@ impl DisplaySession {
                     .collect()
             });
         let pool_for_query = Arc::clone(&pool_arc);
-        let is_layer_paused: Box<
-            dyn Fn(&encode::pool::SimulcastRid) -> Option<bool> + Send + Sync,
-        > = Box::new(move |rid| {
+        let is_layer_paused: aggregator::LayerPauseProbe = Box::new(move |rid| {
             pool_for_query.is_layer_paused(encode::pool::CodecKind::Vp8, rid.clone())
         });
         let pool_for_action = Arc::clone(&pool_arc);
@@ -1957,6 +1964,7 @@ impl DisplaySession {
     ///     task drops the lease via `drop(current_lease.take())`
     ///     (RAII releases on-demand refcounts under the existing
     ///     generation gate).
+    #[allow(clippy::too_many_arguments)]
     async fn handle_offer_pool_mode(
         &self,
         peer_id: PeerId,
@@ -2941,6 +2949,12 @@ pub struct SessionRegistry {
 }
 
 pub type SharedSessionRegistry = Arc<RwLock<SessionRegistry>>;
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SessionRegistry {
     pub fn new() -> Self {

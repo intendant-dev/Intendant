@@ -63,7 +63,8 @@ pub(crate) fn try_spawn_encoder_thread(
     // (Windows COM/MF) is initialized on the thread that will use it.
     let mime = id.codec.mime();
     let (cw, ch, cbr) = (layer.width, layer.height, layer.target_bitrate_kbps);
-    let construct = move || crate::encode::select_codec_for_mime(mime, cw, ch, cbr).map(|(enc, _)| enc);
+    let construct =
+        move || crate::encode::select_codec_for_mime(mime, cw, ch, cbr).map(|(enc, _)| enc);
     spawn_encoder_thread_with(
         id,
         layer,
@@ -214,6 +215,7 @@ pub(crate) fn try_h264_fallback_for_layer(
 /// is built. Constructing on the thread that will use and drop the
 /// encoder is what makes the Windows MF backend's per-thread COM
 /// init/teardown correct; see [`try_spawn_encoder_thread`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_encoder_thread_with(
     id: EncoderId,
     layer: LayerSpec,

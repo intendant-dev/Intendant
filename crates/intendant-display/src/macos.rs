@@ -13,7 +13,6 @@
 use super::{
     capture::damage::Rect, DisplayBackend, DisplayInfoKind, Frame, FrameFormat, InputEvent,
 };
-use intendant_core::error::CallerError;
 use async_trait::async_trait;
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
@@ -21,6 +20,7 @@ use core_graphics::event::{
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::{CGPoint, CGRect as CgRect, CGSize};
+use intendant_core::error::CallerError;
 use screencapturekit::cg::CGRect as ScRect;
 use screencapturekit::cm::{CMTime, SCFrameStatus};
 use screencapturekit::cv::CVPixelBufferLockFlags;
@@ -90,6 +90,12 @@ pub struct MacOSBackend {
     shutdown: Arc<AtomicBool>,
     input_geometry: Arc<RwLock<InputGeometry>>,
     target: CaptureTarget,
+}
+
+impl Default for MacOSBackend {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MacOSBackend {

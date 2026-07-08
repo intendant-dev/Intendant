@@ -499,6 +499,7 @@ impl WebRtcPeer {
     /// encoded frame channel — the caller (`Self::new`) hands it
     /// directly to `pool_frame_intake` rather than parking it on
     /// the struct.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn build_with_codec_set(
         peer_id: PeerId,
         offer_sdp: &str,
@@ -697,9 +698,8 @@ impl WebRtcPeer {
                 .with_size(2048)
                 .build(),
         );
-        let registry = registry.with(|inner| {
-            crate::twcc_tap::TwccTapInterceptor::new(inner, twcc_tap_tx.clone())
-        });
+        let registry = registry
+            .with(|inner| crate::twcc_tap::TwccTapInterceptor::new(inner, twcc_tap_tx.clone()));
 
         let mut rtc = RTCPeerConnectionBuilder::new()
             .with_configuration(RTCConfigurationBuilder::new().build())

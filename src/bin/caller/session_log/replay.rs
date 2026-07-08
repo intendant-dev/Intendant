@@ -748,7 +748,8 @@ pub fn session_log_entry_to_app_event(
             let id = turn.unwrap_or(0) as u64;
             match decision {
                 "waiting" => {
-                    let category = crate::autonomy::ActionCategory::from_str(category_str)
+                    let category = category_str
+                        .parse()
                         .unwrap_or(crate::autonomy::ActionCategory::CommandExec);
                     Some(AppEvent::ApprovalRequired {
                         session_id: None,

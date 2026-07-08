@@ -32,6 +32,12 @@ pub struct ClipboardMonitor {
     shutdown: Arc<AtomicBool>,
 }
 
+impl Default for ClipboardMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClipboardMonitor {
     pub fn new() -> Self {
         Self {

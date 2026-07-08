@@ -6,13 +6,13 @@
 //! frames and an `AtomicBool` for shutdown signaling.
 
 use super::{DisplayBackend, Frame, FrameFormat, InputEvent};
-use intendant_core::error::CallerError;
 use ashpd::desktop::clipboard::Clipboard;
 use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::{PersistMode, Session};
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use intendant_core::error::CallerError;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;

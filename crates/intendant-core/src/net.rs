@@ -165,9 +165,7 @@ pub fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
 /// `bind_dual_stack_or_v4`: dual-stack for the IPv6 wildcard,
 /// `SO_REUSEADDR` so lingering TIME_WAIT sockets don't block the port.
 /// Shared by the dashboard gateway and the enrollment cert server.
-pub fn rebind_dead_tcp_listener(
-    addr: std::net::SocketAddr,
-) -> std::io::Result<TcpListener> {
+pub fn rebind_dead_tcp_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if addr.is_ipv6() {
         Domain::IPV6
@@ -212,9 +210,7 @@ mod tests {
     /// SO_REUSEADDR, so the only systematic `AddrInUse` source is a socket
     /// that is genuinely still bound — which keeps failing past the
     /// deadline and still fails the test.
-    async fn rebind_with_patience(
-        addr: std::net::SocketAddr,
-    ) -> std::io::Result<TcpListener> {
+    async fn rebind_with_patience(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
         loop {
             match rebind_dead_tcp_listener(addr) {
@@ -243,10 +239,9 @@ mod tests {
             .expect("rebind on the freed address");
         assert_eq!(rebound.local_addr().unwrap(), addr);
 
-        let (client, (server, _peer)) = tokio::join!(
-            tokio::net::TcpStream::connect(addr),
-            async { rebound.accept().await.unwrap() },
-        );
+        let (client, (server, _peer)) = tokio::join!(tokio::net::TcpStream::connect(addr), async {
+            rebound.accept().await.unwrap()
+        },);
         client.expect("client connects to rebound listener");
         drop(server);
     }

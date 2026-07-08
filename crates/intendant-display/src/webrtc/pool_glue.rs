@@ -17,7 +17,9 @@ use super::*;
 /// dedup avoids counting the same codec twice in a multi-layer
 /// simulcast set.
 #[cfg(test)]
-pub(crate) fn codec_set_from_subscriptions(subscriptions: &[EncoderSubscription]) -> Vec<CodecKind> {
+pub(crate) fn codec_set_from_subscriptions(
+    subscriptions: &[EncoderSubscription],
+) -> Vec<CodecKind> {
     let mut seen: std::collections::HashSet<CodecKind> = std::collections::HashSet::new();
     let mut codecs: Vec<CodecKind> = Vec::new();
     for sub in subscriptions {
