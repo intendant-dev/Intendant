@@ -42,6 +42,24 @@ HTTPS. A systemd unit is just the command above with
 default instance uses (`scripts/deploy-connect-prod-alpha.sh`) is a
 worked example.
 
+A worked Caddy site block (the shape the default instance runs — the
+forwarding headers are load-bearing, see
+[Reachability](#reachability-for-natd-daemons)):
+
+```caddy
+connect.example.com {
+	encode gzip zstd
+
+	reverse_proxy 127.0.0.1:9876 {
+		header_up Host {host}
+		header_up -X-Forwarded-Host
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}
+```
+
 ## Pointing daemons at it
 
 In `intendant.toml`:
@@ -148,6 +166,9 @@ curl -s -X POST https://connect.example.com/api/daemon/register \
   -d '{"protocol":"intendant-connect-rendezvous-v1","daemon_id":"probe","daemon_public_key":"probe"}' \
   | grep observed_ip   # must echo YOUR public IP, not null
 ```
+
+(`scripts/deploy-connect-prod-alpha.sh` runs this probe automatically
+after every deploy and fails loudly when the echo is missing.)
 
 Caddy gotcha (this bit the default instance): within a `reverse_proxy`
 block, `header_up -X-Forwarded-For` deletions are applied **after**
