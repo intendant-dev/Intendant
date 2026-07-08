@@ -324,8 +324,10 @@ per-display WebRTC session.
   gets a working display; agents can then target it for computer use. The
   created display is daemon-owned: it never touches the "Your display"
   opt-in, and it is destroyed (Xvfb killed) when any dashboard closes its
-  tile or the daemon exits. Xvfb is Linux-only; on macOS/Windows the button
-  reports a clear error and "Your display" streams the real desktop instead.
+  tile; after a hard daemon kill it is reclaimed like any orphaned agent
+  Xvfb on the next allocation. Xvfb is Linux-only; on macOS/Windows the
+  button reports a clear error and "Your display" streams the real desktop
+  instead.
 
 ### Station
 

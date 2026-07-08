@@ -113,8 +113,9 @@ CU actions operate on a `DisplayTarget` (`#[serde(tag = "kind")]`):
   (`create_virtual_display`) — the path that gives a claimed headless box a
   display with no API key configured. Dashboard-created displays register a
   capture session immediately (streaming tile, CU-routable), are daemon-owned,
-  and are destroyed when their tile is closed or the daemon exits. Xvfb is
-  Linux-only; other platforms answer the action with a clear error.
+  and are destroyed when their tile is closed (a hard daemon kill leaves the
+  usual orphan for the next allocation to reclaim). Xvfb is Linux-only; other
+  platforms answer the action with a clear error.
 - **`UserSession`** — the user's real desktop. On Linux X11 it resolves the
   login session's `DISPLAY` (falling back to `:0`); on macOS the primary display
   doesn't use `DISPLAY`. Requires an explicit `DisplayControl` grant via the

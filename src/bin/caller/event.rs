@@ -1575,9 +1575,12 @@ pub enum ControlMsg {
     /// Xvfb through the same machinery agent sessions use, registers a
     /// capture session, and announces it with `DisplayReady`; failures
     /// surface as `DisplayCaptureLost` with an actionable reason. The
-    /// created display is daemon-owned: it dies with the daemon, or when
-    /// any dashboard closes its tile (`RevokeUserDisplay` on its id).
-    /// Linux-only mechanism — other platforms report a clear error.
+    /// created display is daemon-owned: closing its tile
+    /// (`RevokeUserDisplay` on its id) destroys it, a graceful daemon exit
+    /// drops its guard, and a hard kill leaves it to the standard Xvfb
+    /// orphan-reclaim on the next allocation (signal shutdown is
+    /// `process::exit` — no `Drop`). Linux-only mechanism — other
+    /// platforms report a clear error.
     CreateVirtualDisplay {
         /// Optional resolution; defaults to 1920x1080. Values are clamped
         /// to sane bounds and rounded down to even (VP8 requirement).
