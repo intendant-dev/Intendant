@@ -71,6 +71,15 @@ ctl --peer <peer-label> cu actions --target user_session \
 #    (principal principal:peer-daemon:<fingerprint>, ...)"
 # — that denial IS the pass for the deny leg; run whichever
 # matches the standing grant, or both against two peers.
+#
+# THIRD outcome class on user_session legs: peers are never owner
+# surfaces, so if the TARGET daemon's user-display grant is not held
+# (`ctl display grant-user` on the box), screenshots/actions/elements
+# against user_session return the explicit opt-in refusal ("Access to
+# the user's real display (user_session) is an explicit opt-in ...").
+# That is the grant gate passing, not a transport or profile failure —
+# distinct from the IAM "Permission denied" above. The fleet boxes with
+# a persistent grant never show it; report it if one does.
 
 ctl --peer <peer-label> cu elements
 # OPTIONAL leg — the peer's frontmost UI element tree (read_screen:

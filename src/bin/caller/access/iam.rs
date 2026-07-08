@@ -340,6 +340,20 @@ pub struct AccessDecision {
 }
 
 impl AccessPrincipal {
+    /// True for the owner's own control surfaces: the trusted-local
+    /// dashboard and enrolled root user clients (both keep the root
+    /// dashboard grant id, minted nowhere else) plus the documented
+    /// anything-with-a-shell local loopback principal. The derived
+    /// transport defaults — supervised agent sessions and MCP token
+    /// holders — share the `root_session` *kind* but drop the grant id,
+    /// so this predicate must never be widened to the kind alone: those
+    /// callers are root-compatible for IAM yet are exactly who the
+    /// user-display grant exists to hold.
+    pub fn is_owner_surface(&self) -> bool {
+        self.grant_id.as_deref() == Some("grant:root:dashboard")
+            || self.id == "principal:local-process:loopback"
+    }
+
     pub fn root_dashboard_session(source: impl Into<String>, transport: impl Into<String>) -> Self {
         Self {
             id: "principal:root:dashboard".to_string(),
@@ -3515,6 +3529,43 @@ mod tests {
         assert_eq!(local.id, "principal:local-process:loopback");
         assert_eq!(local.source, "mcp-loopback-cleartext");
         assert!(evaluate_principal_operation(&local, PeerOperation::AccessManage).allowed);
+    }
+
+    #[test]
+    fn owner_surface_excludes_the_root_compatible_transport_defaults() {
+        // Owner surfaces: the trusted dashboard / enrolled root user
+        // clients, and the documented local-shell loopback principal.
+        assert!(AccessPrincipal::root_dashboard_session("test", "dashboard").is_owner_surface());
+        assert!(AccessPrincipal::root_user_client(
+            "test",
+            "dashboard",
+            "Alice",
+            None,
+            None,
+            Vec::new()
+        )
+        .is_owner_surface());
+        assert!(AccessPrincipal::root_dashboard_session_with_client_key(
+            "test", "dashboard", "fp", "pk"
+        )
+        .is_owner_surface());
+        assert!(AccessPrincipal::local_loopback_mcp_default("http").is_owner_surface());
+
+        // Root-COMPATIBLE is not owner: supervised external agents and MCP
+        // token holders share kind "root_session" but are exactly who the
+        // user-display grant must hold; peers are gated by their profile.
+        assert!(
+            !AccessPrincipal::supervised_agent_session_default("kid-1", "http", true)
+                .is_owner_surface()
+        );
+        assert!(
+            !AccessPrincipal::supervised_agent_session_default("kid-1", "http", false)
+                .is_owner_surface()
+        );
+        assert!(!AccessPrincipal::mcp_token_holder("http").is_owner_surface());
+        assert!(
+            !AccessPrincipal::peer_daemon("fp", "dell", "peer-root", "mtls").is_owner_surface()
+        );
     }
 
     #[test]

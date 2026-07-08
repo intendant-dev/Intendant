@@ -227,6 +227,28 @@ impl IntendantServer {
         session_id: Option<&str>,
         managed_context_override: Option<bool>,
     ) -> Result<CallToolResult, String> {
+        // Fail-closed default: a dispatch path that doesn't state its surface
+        // is scoped (internal self-calls, tests). The HTTP gate and the
+        // dashboard tunnel pass their bound principal's surface explicitly
+        // via `call_tool_by_name_as_caller`.
+        self.call_tool_by_name_as_caller(
+            name,
+            args,
+            session_id,
+            managed_context_override,
+            ToolCallerTrust::Scoped,
+        )
+        .await
+    }
+
+    pub async fn call_tool_by_name_as_caller(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+        caller: ToolCallerTrust,
+    ) -> Result<CallToolResult, String> {
         fn parse_params<T: serde::de::DeserializeOwned>(
             args: serde_json::Value,
         ) -> Result<Parameters<T>, String> {
@@ -417,8 +439,10 @@ impl IntendantServer {
                 Ok(text_tool_result(self.release_display(params).await))
             }
             "grant_user_display" => {
-                let params = parse_params::<GrantUserDisplayParams>(args)?;
-                Ok(text_tool_result(self.grant_user_display(params).await))
+                let Parameters(params) = parse_params::<GrantUserDisplayParams>(args)?;
+                Ok(text_tool_result(
+                    self.grant_user_display_as_caller(params, caller).await,
+                ))
             }
             "revoke_user_display" => {
                 let params = parse_params::<RevokeUserDisplayParams>(args)?;
@@ -427,7 +451,8 @@ impl IntendantServer {
             "show_shared_view" => {
                 let Parameters(params) = parse_params::<ShowSharedViewParams>(args)?;
                 Ok(text_tool_result(
-                    self.show_shared_view_for_session(params, session_id).await,
+                    self.show_shared_view_for_session(params, session_id, caller)
+                        .await,
                 ))
             }
             "hide_shared_view" => {
@@ -439,13 +464,14 @@ impl IntendantServer {
             "focus_shared_view" => {
                 let Parameters(params) = parse_params::<FocusSharedViewParams>(args)?;
                 Ok(text_tool_result(
-                    self.focus_shared_view_for_session(params, session_id).await,
+                    self.focus_shared_view_for_session(params, session_id, caller)
+                        .await,
                 ))
             }
             "request_shared_view_input" => {
                 let Parameters(params) = parse_params::<RequestSharedViewInputParams>(args)?;
                 Ok(text_tool_result(
-                    self.request_shared_view_input_for_session(params, session_id)
+                    self.request_shared_view_input_for_session(params, session_id, caller)
                         .await,
                 ))
             }
@@ -455,25 +481,36 @@ impl IntendantServer {
                     params,
                     session_id,
                     managed_context_override == Some(true),
+                    caller,
                 )
                 .await
                 .map_err(|e| e.to_string())
             }
             "take_screenshot" => {
                 let params = parse_params::<TakeScreenshotParams>(args)?;
-                self.take_screenshot_with_output(params, managed_context_override == Some(true))
-                    .await
-                    .map_err(|e| e.to_string())
+                self.take_screenshot_with_output(
+                    params,
+                    managed_context_override == Some(true),
+                    caller,
+                )
+                .await
+                .map_err(|e| e.to_string())
             }
             "read_screen" => {
                 let params = parse_params::<ReadScreenParams>(args)?;
-                self.read_screen(params).await.map_err(|e| e.to_string())
+                self.read_screen_as_caller(params, caller)
+                    .await
+                    .map_err(|e| e.to_string())
             }
             "execute_cu_actions" => {
                 let params = parse_params::<ExecuteCuActionsParams>(args)?;
-                self.execute_cu_actions_with_output(params, managed_context_override == Some(true))
-                    .await
-                    .map_err(|e| e.to_string())
+                self.execute_cu_actions_with_output(
+                    params,
+                    managed_context_override == Some(true),
+                    caller,
+                )
+                .await
+                .map_err(|e| e.to_string())
             }
             "list_frames" => {
                 let params = parse_params::<ListFramesParams>(args)?;
@@ -1492,26 +1529,64 @@ const FISSION_WAIT_MAX_TIMEOUT_S: u64 = 300;
 /// group on the operator's behalf.
 const FISSION_CONTROL_DETACH_REASON: &str = "operator detach via fission_control";
 
+/// Which surface a tool call arrived from, for user-session display gating.
+/// Owner surfaces — the trusted dashboard / enrolled root user clients, local
+/// loopback, and the stdio MCP transport the owner wired up — may opt in to
+/// the user's real display without the standing grant; every other caller
+/// (supervised external agents, scoped grants, federated peers) needs
+/// `user_display_granted`. Fail-closed: paths that don't state a surface are
+/// `Scoped`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallerTrust {
+    OwnerSurface,
+    Scoped,
+}
+
+impl ToolCallerTrust {
+    pub fn from_principal(principal: &crate::access::iam::AccessPrincipal) -> Self {
+        if principal.is_owner_surface() {
+            ToolCallerTrust::OwnerSurface
+        } else {
+            ToolCallerTrust::Scoped
+        }
+    }
+
+    /// Whether this caller may reach the user's real display given the
+    /// autonomy guard's grant state.
+    pub fn allows_user_session(self, user_display_granted: bool) -> bool {
+        user_display_granted || self == ToolCallerTrust::OwnerSurface
+    }
+}
+
 /// Parse an explicit display-target spec. Callers resolve an *omitted*
 /// spec with [`crate::computer_use::default_display_target`], which is
 /// availability-aware, instead of assuming a virtual display exists.
+/// A parsed id of 0 is the user's session, never `Virtual { id: 0 }` —
+/// ":00" must not dodge the user-session gate that ":0" gets.
 fn resolve_display_target(target: &str) -> crate::computer_use::DisplayTarget {
     use crate::computer_use::DisplayTarget;
+    fn virtual_or_user_session(id: u32) -> crate::computer_use::DisplayTarget {
+        if id == 0 {
+            DisplayTarget::UserSession
+        } else {
+            DisplayTarget::Virtual { id }
+        }
+    }
     match target {
         "user_session" | "user" | "primary" | ":0" | "0" | "display_0" => {
             DisplayTarget::UserSession
         }
         s if s.starts_with(':') => {
             let id: u32 = s[1..].parse().unwrap_or(99);
-            DisplayTarget::Virtual { id }
+            virtual_or_user_session(id)
         }
         s if s.starts_with("display_") => {
             let id: u32 = s["display_".len()..].parse().unwrap_or(99);
-            DisplayTarget::Virtual { id }
+            virtual_or_user_session(id)
         }
         s => {
             let id: u32 = s.parse().unwrap_or(99);
-            DisplayTarget::Virtual { id }
+            virtual_or_user_session(id)
         }
     }
 }

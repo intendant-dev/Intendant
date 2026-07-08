@@ -317,6 +317,14 @@ it). A denial comes back as a structured `isError` tool result
 with the peer's diagnostic text, which every caller surface passes through
 verbatim.
 
+A peer is never an *owner surface* on the target daemon: targeting the
+peer's real desktop (`user_session`) additionally requires the target
+daemon's own standing user-display grant, enforced at the CU executor
+([Computer Use](./computer-use-and-audio.md#display-targets)). The peer
+profile authorizes the operation class; the grant is the target owner's
+opt-in to their desktop specifically — a `peer-operator` profile alone
+reaches agent virtual displays, not an ungranted user session.
+
 Screenshot and CU replies carry real MCP image content blocks; the native
 tool folds them into the conversation as image attachments
 (`add_tool_result_with_images`), and the MCP twins re-emit them as image

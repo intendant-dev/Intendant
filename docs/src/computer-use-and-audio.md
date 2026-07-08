@@ -111,7 +111,15 @@ CU actions operate on a `DisplayTarget` (`#[serde(tag = "kind")]`):
 - **`UserSession`** — the user's real desktop. On Linux X11 it resolves the
   login session's `DISPLAY` (falling back to `:0`); on macOS the primary display
   doesn't use `DISPLAY`. Requires an explicit `DisplayControl` grant via the
-  autonomy system.
+  autonomy system — enforced fail-closed at the `execute_actions` chokepoint
+  on **every** backend (the raw X11/macOS capture/injection paths included,
+  not just by session existence on Wayland/Windows), with one exemption: an
+  **owner surface** (the trusted dashboard, an enrolled root user client,
+  local loopback `ctl`, or the stdio MCP transport the owner wired up —
+  `ToolCallerTrust` in `mcp/mod.rs`, derived from the bound
+  `AccessPrincipal`) may target its own desktop ungranted, because the
+  owner's call *is* the opt-in. Every other caller — supervised external
+  agents, scoped grants, federated peers — needs the standing grant.
 
 When a pixel-CU call (`take_screenshot`, `execute_cu_actions`) omits
 `display_target`, the default is availability-aware
@@ -124,7 +132,9 @@ same resolution when a session has no CU display configured, except its
 user-session fallback additionally requires the user-display grant — the
 model-driven path never auto-targets the user's desktop ungranted.
 (`read_screen` defaults to the user session unconditionally — element trees
-only exist there.)
+only exist there — and sits behind the same grant/owner gate on all
+platforms: the element tree reveals window titles and field values just as
+pixels do, and it bypasses the session pipeline entirely.)
 
 User-session access uses a **session-grant** model: approve once (the `d` hotkey
 the dashboard control, MCP `grant_user_display`, or
@@ -134,6 +144,14 @@ Computer Use, the operator must enable **Allow Remote Interaction** in the
 physical portal dialog before clicking **Share**; approving screen sharing alone
 can produce screenshots while leaving keyboard/mouse injection unavailable. See
 [Autonomy & Approvals](./autonomy.md) for the approval surface.
+
+Granting is itself owner-surface-only: `grant_user_display` from a scoped
+caller is refused (revoke stays open — de-escalation is fail-safe), and the
+shared-view tools (`show_shared_view`, `focus_shared_view`,
+`request_shared_view_input`, `capture_shared_view_frame`) activate a
+user-session target only for a granted or owner caller instead of flipping
+the grant themselves. Sharing an agent-owned virtual display never touches
+the user-display grant.
 
 ### CU-First Routing
 

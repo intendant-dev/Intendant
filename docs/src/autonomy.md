@@ -86,4 +86,9 @@ external-agent approval routing through `external_approval_decision`.
 user-display toggle or `intendant ctl display grant-user` — and the agent keeps
 access to the user's display for the rest of the session (used by both
 [computer use](./computer-use-and-audio.md) and WebRTC streaming). Revoke from
-the same places to drop it.
+the same places to drop it. The grant is enforced fail-closed at the CU
+executor on every platform; only the owner's own surfaces (dashboard, local
+`ctl`, the owner-wired stdio MCP transport) may reach the user display
+without it, because their call is the opt-in. Note the grant is a single
+per-daemon flag: once granted, it holds for every principal the IAM layer
+lets at the display tools until revoked.

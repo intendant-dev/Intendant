@@ -72,7 +72,13 @@ evaluated at call time** against that principal's permissions via a per-tool
 operation map (`mcp_tool_operation` in `mcp/tool_gate.rs`; e.g. `execute_cu_actions`
 and `grant_user_display` require `display.input`, `start_task` requires
 `task.run`, unclassified tools require `runtime.control`). `tools/list` is
-filtered to what the principal may actually call. Binding order:
+filtered to what the principal may actually call. The display tools carry a
+second, separate gate: a `user_session` target needs the standing
+user-display grant unless the bound principal is an owner surface (the
+trusted dashboard / enrolled root user client or bare local loopback —
+`AccessPrincipal::is_owner_surface`); the stdio transport, being wired up by
+the owner's own client config, always counts as an owner surface. See
+[Computer Use](./computer-use-and-audio.md#display-targets). Binding order:
 
 1. **Peer daemons** (mTLS peer identity) use their peer-profile principal.
 2. **Supervised backends** present the token in their injected
