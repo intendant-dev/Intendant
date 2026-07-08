@@ -15292,7 +15292,7 @@ html.ui-v2 #vault-tab-sections .acc-section-title {
 html.ui-v2 #vault-tab-sections .acc-section-sub {
   font-size: 12px;
   line-height: 1.55;
-  color: var(--text-3);
+  color: var(--text-2); /* running explainer copy — light text-3 is ~3.5:1, under AA */
   max-width: 860px;
 }
 
@@ -15381,9 +15381,18 @@ html.ui-v2 #access-vault-section .vault-entry-row:not(:has(.vault-chip.ok))::bef
   height: 34px;
   flex-shrink: 0;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: 10px;
   background:
     url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23a7aebe" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.5" cy="12" r="3.6"/><path d="M12.1 12H21"/><path d="M18 12v3.4"/><path d="M15 12v2.4"/></svg>')
+    center / 18px 18px no-repeat,
+    var(--surface-2);
+}
+/* Light theme: the glyph stroke is baked into the data URI (no var()
+   inside url()), so restate it in light ink (--text-2 light = #4B5265 —
+   the dark-theme gray reads washed out on light surfaces). */
+html.ui-v2[data-theme="light"] #access-vault-section .vault-entry-row:not(:has(.vault-chip.ok))::before {
+  background:
+    url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%234B5265" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.5" cy="12" r="3.6"/><path d="M12.1 12H21"/><path d="M18 12v3.4"/><path d="M15 12v2.4"/></svg>')
     center / 18px 18px no-repeat,
     var(--surface-2);
 }
@@ -15396,12 +15405,19 @@ html.ui-v2 #access-vault-section .vault-entry-row .lbl {
   font-size: 13.5px;
   font-weight: 700;
   color: var(--text);
+  min-width: 0;
+  overflow-wrap: anywhere; /* an unbroken 80-char label must wrap, not blow the row */
 }
+/* Grow-to-fill + right-align instead of margin-left:auto: when the secret
+   and the actions wrap together onto a second line, two auto margins
+   would split the leftover space and float the secret mid-row. */
 html.ui-v2 #access-vault-section .vault-entry-row .secret {
-  margin-left: auto;
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: right;
   font-family: var(--mono);
   font-size: 11px;
-  color: var(--text-3);
+  color: var(--text-2); /* lease expiry / key tails are real data — text-3 fails AA on light */
 }
 html.ui-v2 #access-vault-section .vault-entry-row .vault-entry-actions { gap: 8px; }
 
@@ -15414,7 +15430,7 @@ html.ui-v2 #access-custody-section .ui-btn {
   gap: 7px;
   padding: 7px 13px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: 10px; /* fleet control radius (Access .acc-btn, Settings controls) */
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -15456,10 +15472,13 @@ html.ui-v2 #access-custody-section .ui-btn:focus-visible {
 }
 
 /* ── notes, warnings, errors ── */
+/* Notes carry real state copy (empty states, lease lifecycle, consent) —
+   text-2 at 12px: light-theme text-3 lands ~3.5:1 on these surfaces,
+   under AA for running copy. */
 html.ui-v2 #access-vault-section .vault-note {
-  font-size: 11.5px;
+  font-size: 12px;
   line-height: 1.55;
-  color: var(--text-3);
+  color: var(--text-2);
 }
 html.ui-v2 #access-vault-section .vault-warning {
   border: 1px solid rgba(var(--amber-rgb), .32);
@@ -15503,26 +15522,34 @@ html.ui-v2 #access-vault-section .vault-words .n {
   color: var(--text-3);
 }
 
-/* ── inputs / selects / textareas ── */
+/* ── inputs / selects / textareas ──
+   36px control height = the Access field-grid recipe, so the two Trust
+   tabs' forms match. Selects are deliberately NOT in this rule: its
+   plain background would bury the chevron artwork the shared select
+   recipe below paints (higher specificity) — they take min-height there. */
 html.ui-v2 #access-vault-section .vault-phrase-input,
-html.ui-v2 #access-vault-section .vault-form-grid input,
-html.ui-v2 #access-vault-section .vault-form-grid select {
+html.ui-v2 #access-vault-section .vault-form-grid input {
+  min-height: 36px;
   border: 1px solid var(--line-2);
   border-radius: 10px;
   background: var(--surface-2);
   color: var(--text);
   font-size: 13px;
-  padding: 10px 12px;
+  padding: 8px 12px;
   outline: none;
 }
 html.ui-v2 #access-vault-section .vault-phrase-input { font-family: var(--mono); font-size: 12.5px; }
+/* The unlock row pairs the phrase input with its button — same 36px
+   control height, or the pair reads misaligned. */
+html.ui-v2 #access-vault-section .vault-actions:has(> .vault-phrase-input) > .ui-btn {
+  min-height: 36px;
+}
 html.ui-v2 #access-vault-section .vault-phrase-input::placeholder,
 html.ui-v2 #access-vault-section .vault-form-grid input::placeholder { color: var(--text-3); }
 html.ui-v2 #access-vault-section .vault-phrase-input:focus-visible,
-html.ui-v2 #access-vault-section .vault-form-grid input:focus-visible,
-html.ui-v2 #access-vault-section .vault-form-grid select:focus-visible {
+html.ui-v2 #access-vault-section .vault-form-grid input:focus-visible {
   border-color: var(--iris);
-  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
 }
 html.ui-v2 #access-vault-section .vault-form-grid {
   grid-template-columns: minmax(120px, 170px) 1fr;
@@ -15538,6 +15565,7 @@ html.ui-v2 #access-vault-section .vault-form-grid label {
 html.ui-v2 #access-vault-section select {
   appearance: none;
   -webkit-appearance: none;
+  min-height: 36px;
   border: 1px solid var(--line-2);
   border-radius: 10px;
   background:
@@ -15552,13 +15580,30 @@ html.ui-v2 #access-vault-section select {
   cursor: pointer;
   outline: none;
 }
+/* Light theme: chevron stroke restated in light ink (see the key tile). */
+html.ui-v2[data-theme="light"] #access-vault-section select {
+  background:
+    url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%234B5265" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>')
+    right 10px center / 15px 15px no-repeat,
+    var(--surface-2);
+}
 html.ui-v2 #access-vault-section select:focus-visible {
   border-color: var(--iris);
-  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
 }
 
-/* The offline-window knob row reads as the security dial it is. */
+/* Form selects drop the dial-grade bold and match the sibling inputs'
+   type size — in a labeled form the value reads like a field, not a
+   control. (Chevron clearance rides on the shared recipe above.) */
+html.ui-v2 #access-vault-section .vault-form-grid select {
+  font-size: 13px;
+  font-weight: 400;
+}
+
+/* The offline-window knob row reads as the security dial it is —
+   label left, control right, the Settings preference-row grammar. */
 html.ui-v2 #access-vault-section .vault-actions:has(> select) {
+  justify-content: space-between;
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--surface);
@@ -15570,7 +15615,11 @@ html.ui-v2 #access-vault-section .vault-actions:has(> select) > .vault-note {
   color: var(--text);
 }
 
-/* ── checkbox toggles (client egress + full-credential OAuth opt-in) ── */
+/* ── checkbox toggles (client egress + full-credential OAuth opt-in) ──
+   Geometry matches the Settings toggle recipe exactly (42×24, 20px #fff
+   knob); the inset hairline + the light-theme track/knob treatment are
+   the delta — an unchecked borderless surface-3 track is near-invisible
+   on light surfaces (~1.2:1). Worth porting back into Settings. */
 html.ui-v2 #access-vault-section input[type="checkbox"] {
   appearance: none;
   -webkit-appearance: none;
@@ -15582,9 +15631,13 @@ html.ui-v2 #access-vault-section input[type="checkbox"] {
   border: 0;
   border-radius: 999px;
   background: var(--surface-3);
+  box-shadow: inset 0 0 0 1px var(--line-2);
   cursor: pointer;
   transition: background var(--t-slow);
   vertical-align: middle;
+}
+html.ui-v2[data-theme="light"] #access-vault-section input[type="checkbox"] {
+  background: var(--line-2); /* over white ≈ a real track, not a ghost */
 }
 html.ui-v2 #access-vault-section input[type="checkbox"]::after {
   content: '';
@@ -15598,14 +15651,25 @@ html.ui-v2 #access-vault-section input[type="checkbox"]::after {
   box-shadow: 0 2px 5px rgba(0, 0, 0, .4);
   transition: left var(--t-slow);
 }
-html.ui-v2 #access-vault-section input[type="checkbox"]:checked { background: var(--iris); }
+html.ui-v2[data-theme="light"] #access-vault-section input[type="checkbox"]::after {
+  box-shadow: 0 1px 3px rgba(23, 28, 50, .3), 0 0 0 1px rgba(18, 23, 42, .08);
+}
+html.ui-v2 #access-vault-section input[type="checkbox"]:checked {
+  background: var(--iris);
+  box-shadow: none;
+}
 html.ui-v2 #access-vault-section input[type="checkbox"]:checked::after { left: 20px; }
 html.ui-v2 #access-vault-section input[type="checkbox"]:focus-visible {
   outline: 2px solid var(--iris);
   outline-offset: 2px;
 }
 
-/* Per-provider relay toggles: the wrap is a .vault-note span. */
+/* Per-provider relay toggles: the wrap is a .vault-note span. The row's
+   column-gap outgrows the 10px toggle↔label gap so the groups separate
+   more than their internals (proximity grouping). */
+html.ui-v2 #access-vault-section .vault-actions:has(> .vault-note > input[type="checkbox"]) {
+  gap: 8px 20px;
+}
 html.ui-v2 #access-vault-section .vault-actions > .vault-note:has(> input[type="checkbox"]) {
   display: inline-flex;
   align-items: center;
@@ -15615,16 +15679,20 @@ html.ui-v2 #access-vault-section .vault-actions > .vault-note:has(> input[type="
   color: var(--text);
 }
 html.ui-v2 #access-vault-section .vault-actions > .vault-note > label { cursor: pointer; }
-/* Full-credential OAuth opt-in: dashed consent card, long-copy label. */
+/* Full-credential OAuth opt-in: dashed consent card, long-copy label.
+   The copy is a first-class security decision, not a footnote — it gets
+   body ink (the note default below is already text-2, this pins it). */
 html.ui-v2 #access-vault-section .vault-actions:has(> #vault-oauth-lease-toggle) {
   flex-wrap: nowrap;
   align-items: flex-start;
+  gap: 12px;
   border: 1px dashed var(--line-2);
   border-radius: 12px;
   padding: 12px 14px;
 }
 html.ui-v2 #access-vault-section .vault-actions:has(> #vault-oauth-lease-toggle) > .vault-note {
   cursor: pointer;
+  color: var(--text-2);
 }
 
 /* ── folds: "Add a credential" reads as a dashed add button; the
@@ -15640,10 +15708,21 @@ html.ui-v2 #access-vault-section .acc-fold > summary {
   font-size: 12.5px;
   font-weight: 700;
   color: var(--text-2);
+  border-radius: 12px; /* the keyboard focus ring follows this — square ring on a rounded card otherwise */
 }
 html.ui-v2 #access-vault-section .acc-fold > summary:hover { color: var(--text); }
 html.ui-v2 #access-vault-section .acc-fold > summary::before { color: var(--text-3); }
 html.ui-v2 #access-vault-section .acc-fold-body { padding: 4px 15px 15px; }
+/* The OAuth textarea and the submit row live OUTSIDE the label/control
+   grid in the DOM; indent them to the control column (170px label col +
+   12px gap) so the form keeps one left edge. */
+html.ui-v2 #access-vault-section .acc-fold:has(.vault-form-grid) > .acc-fold-body > .vault-phrase-input {
+  width: calc(100% - 182px);
+  margin-left: 182px;
+}
+html.ui-v2 #access-vault-section .acc-fold:has(.vault-form-grid) > .acc-fold-body > .vault-actions {
+  margin-left: 182px;
+}
 html.ui-v2 #access-vault-section .acc-fold:has(.vault-form-grid):not([open]) {
   width: max-content;
   max-width: 100%;
@@ -15681,12 +15760,18 @@ html.ui-v2 #access-custody-section .custody-row {
   font-size: 12px;
 }
 html.ui-v2 #access-custody-section .custody-row:last-child { border-bottom: 0; }
+/* Fixed-width timestamp + event-chip columns so every row's main text
+   starts on the same edge — the trail reads as a table, not a ragged
+   list ("Jul 8, 09:41:22" ≈ 102px mono; "relay off" is the widest chip). */
 html.ui-v2 #access-custody-section .custody-ts {
+  min-width: 110px;
   font-family: var(--mono);
   font-size: 10.5px;
   color: var(--text-3);
 }
 html.ui-v2 #access-custody-section .custody-chip {
+  min-width: 66px;
+  text-align: center;
   padding: 2px 8px;
   border-radius: 999px;
   font-size: 10.5px;
@@ -15700,11 +15785,16 @@ html.ui-v2 #access-custody-section .custody-chip.expire { background: var(--surf
 html.ui-v2 #access-custody-section .custody-chip.egress { background: rgba(var(--sky-rgb), .14); color: var(--sky); }
 html.ui-v2 #access-custody-section .custody-chip.reset { background: rgba(var(--rose-rgb), .14); color: var(--rose); }
 html.ui-v2 #access-custody-section .custody-main { color: var(--text); font-weight: 600; font-size: 12.5px; }
-html.ui-v2 #access-custody-section .custody-meta { color: var(--text-3); font-size: 11.5px; }
+html.ui-v2 #access-custody-section .custody-meta { color: var(--text-2); font-size: 12px; }
+/* Narrow panes: the meta fragment takes its own full line instead of
+   splitting mid-row differently on every row. */
+@media (max-width: 900px) {
+  html.ui-v2 #access-custody-section .custody-meta { flex: 1 1 100%; }
+}
 html.ui-v2 #access-custody-section .vault-note {
-  font-size: 11.5px;
+  font-size: 12px;
   line-height: 1.55;
-  color: var(--text-3);
+  color: var(--text-2);
 }
 
 /* ── "Vault moved" pointer card left in Access → Advanced ── */
@@ -15733,7 +15823,7 @@ html.ui-v2 .ui2-vault-moved-sub {
 }
 html.ui-v2 .ui2-vault-moved-go {
   border: 1px solid var(--line-2);
-  border-radius: 9px;
+  border-radius: 10px;
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
