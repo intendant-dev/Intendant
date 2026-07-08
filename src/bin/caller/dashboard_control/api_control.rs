@@ -1660,6 +1660,99 @@ mod tests {
     use crate::*;
     use crate::dashboard_control::tests::{runtime};
 
+    /// The SPA mirrors the action-message allowlist as
+    /// `DASHBOARD_ACTION_MSG_RPC_ACTIONS` (static/app/31-init-identity-fleet.js)
+    /// to pick the RPC lane before dispatching. That copy can't derive from
+    /// this file, so pin its set to `DASHBOARD_ACTION_MSG_ACTIONS` — same
+    /// pattern as the IAM catalog parity tests in `access::iam`.
+    #[test]
+    fn spa_action_msg_rpc_set_mirrors_dashboard_action_allowlist() {
+        let app = include_str!("../../../../static/app.html");
+        let start = "const DASHBOARD_ACTION_MSG_RPC_ACTIONS = new Set([";
+        let from = app
+            .find(start)
+            .expect("DASHBOARD_ACTION_MSG_RPC_ACTIONS set not found in app.html")
+            + start.len();
+        let rest = &app[from..];
+        let to = rest
+            .find("]);")
+            .expect("DASHBOARD_ACTION_MSG_RPC_ACTIONS set is unterminated");
+        let js_set: std::collections::BTreeSet<&str> = rest[..to]
+            .split('\'')
+            .skip(1)
+            .step_by(2)
+            .collect();
+        let rust_set: std::collections::BTreeSet<&str> =
+            DASHBOARD_ACTION_MSG_ACTIONS.iter().copied().collect();
+        assert_eq!(
+            js_set, rust_set,
+            "DASHBOARD_ACTION_MSG_RPC_ACTIONS (static/app/31-init-identity-fleet.js) \
+             drifted from DASHBOARD_ACTION_MSG_ACTIONS"
+        );
+    }
+
+    /// Every allowlisted action name must be a real `ControlMsg` wire name —
+    /// a typo in the const would silently close the lane for that action.
+    #[test]
+    fn dashboard_action_allowlist_names_are_reachable() {
+        for name in DASHBOARD_ACTION_MSG_ACTIONS {
+            let probe = serde_json::json!({ "action": name });
+            let parses = serde_json::from_value::<ControlMsg>(probe).is_ok();
+            // Actions with required fields don't parse from the bare probe;
+            // check those against the canonical name map via a sample.
+            let known = parses
+                || SAMPLE_ACTION_MSGS
+                    .iter()
+                    .any(|(sample_name, _)| sample_name == name);
+            assert!(known, "allowlisted action {name:?} matches no ControlMsg");
+        }
+        for (name, sample) in SAMPLE_ACTION_MSGS {
+            let msg: ControlMsg = serde_json::from_value(sample()).unwrap();
+            assert_eq!(dashboard_control_msg_action(&msg), *name);
+            assert!(
+                dashboard_action_msg_allowed(&msg),
+                "sample for {name:?} not admitted by the allowlist"
+            );
+        }
+    }
+
+    /// Samples for allowlisted actions whose variants have required fields.
+    const SAMPLE_ACTION_MSGS: &[(&str, fn() -> serde_json::Value)] = &[
+        ("codex_thread_action", || {
+            serde_json::json!({"action": "codex_thread_action", "session_id": "s", "op": "new", "params": {}})
+        }),
+        ("take_display", || {
+            serde_json::json!({"action": "take_display", "display_id": 1})
+        }),
+        ("release_display", || {
+            serde_json::json!({"action": "release_display", "display_id": 1})
+        }),
+        ("create_virtual_display", || {
+            serde_json::json!({"action": "create_virtual_display", "width": 1280, "height": 800})
+        }),
+        ("close_browser_workspace", || {
+            serde_json::json!({"action": "close_browser_workspace", "workspace_id": "w"})
+        }),
+        ("acquire_browser_workspace", || {
+            serde_json::json!({"action": "acquire_browser_workspace", "workspace_id": "w", "holder_id": "h"})
+        }),
+        ("release_browser_workspace", || {
+            serde_json::json!({"action": "release_browser_workspace", "workspace_id": "w", "holder_id": "h"})
+        }),
+        ("start_recording", || {
+            serde_json::json!({"action": "start_recording", "stream_name": "s"})
+        }),
+        ("stop_recording", || {
+            serde_json::json!({"action": "stop_recording", "stream_name": "s"})
+        }),
+        ("delete_recording", || {
+            serde_json::json!({"action": "delete_recording", "stream_name": "s"})
+        }),
+        ("set_diagnostics_visual_marker", || {
+            serde_json::json!({"action": "set_diagnostics_visual_marker", "enabled": true})
+        }),
+    ];
+
     struct DashboardControlStubDisplayBackend;
 
     #[async_trait::async_trait]

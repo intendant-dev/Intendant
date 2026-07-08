@@ -309,6 +309,8 @@ html {
 }
 .display-picker-item:hover { background: var(--surface1); }
 .display-picker-item .dp-primary { color: var(--green); font-size: 10px; margin-left: 4px; }
+/* Action rows (e.g. "New virtual display") sit under the capture targets. */
+.display-picker-item.dp-action { border-top: 1px solid var(--surface1); margin-top: 4px; padding-top: 8px; color: var(--blue); }
 .budget-bar {
   display: inline-flex;
   align-items: center;
@@ -19719,7 +19721,8 @@ html.ui-v2 #tab-stats .ui2-fold-body .usage-cards { margin-top: 12px; }
             </svg>
           </div>
           <div class="ui-empty-title">No displays active</div>
-          <div class="ui-empty-hint">Displays will appear when the agent launches a GUI</div>
+          <div class="ui-empty-hint">Displays appear when the agent launches a GUI or you share your screen — or create one right here</div>
+          <button class="ui-empty-btn" id="displays-create-virtual" onclick="createVirtualDisplay(event)" title="Launch a virtual display (Xvfb) on the daemon host — no agent or API key needed. Linux hosts only.">New virtual display</button>
         </div>
       </div>
       <div class="displays-collapse-bar hidden" id="displays-collapse-bar">
@@ -22850,6 +22853,7 @@ const DASHBOARD_ACTION_MSG_RPC_ACTIONS = new Set([
   'release_display',
   'grant_user_display',
   'revoke_user_display',
+  'create_virtual_display',
   'create_browser_workspace',
   'close_browser_workspace',
   'acquire_browser_workspace',
@@ -82604,9 +82608,38 @@ function showDisplayPicker(displays) {
     });
     picker.appendChild(item);
   }
+  const createItem = document.createElement('div');
+  createItem.className = 'display-picker-item dp-action';
+  createItem.textContent = 'New virtual display';
+  createItem.title = 'Launch a virtual display (Xvfb) on the daemon host — no agent or API key needed. Linux hosts only.';
+  createItem.addEventListener('click', (e) => {
+    e.stopPropagation();
+    hideDisplayPicker();
+    createVirtualDisplay();
+  });
+  picker.appendChild(createItem);
   picker.classList.add('visible');
   displayPickerVisible = true;
 }
+
+// Keyless "new virtual display": the daemon launches an Xvfb and registers
+// a capture session — the tile arrives via the normal display_ready
+// broadcast, and failures come back as display_capture_lost (toasted by
+// the slot-less branch of that handler). Works with zero API keys, which
+// is what makes a freshly claimed headless box show a display at all.
+window.createVirtualDisplay = function(event) {
+  if (event?.stopPropagation) event.stopPropagation();
+  const sent = dispatchDashboardActionMsg({ action: 'create_virtual_display' }, {
+    onError: (err) => {
+      if (typeof showControlToast === 'function') {
+        showControlToast('error', err?.message || 'Virtual display create failed');
+      }
+    },
+  });
+  if (sent && typeof showControlToast === 'function') {
+    showControlToast('info', 'Creating virtual display… the tile appears when its stream is ready');
+  }
+};
 
 function grantUserDisplayTarget(display) {
   const displayId = Number(display?.id);
