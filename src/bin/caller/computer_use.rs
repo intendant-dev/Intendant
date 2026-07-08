@@ -2,7 +2,7 @@
 //!
 //! Defines common CU action types and an executor that dispatches them via
 //! platform-specific backends (X11, Wayland, macOS). Provider-specific parsing
-//! and result formatting live in `provider.rs`.
+//! and result formatting live in the per-provider modules under `provider/`.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

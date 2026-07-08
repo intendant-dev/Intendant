@@ -1754,8 +1754,8 @@ pub(crate) async fn handle_federated_webrtc_signal(
             });
             // Loopback TCP candidates (127.0.0.1 / ::1) are silently
             // dropped by browsers as anti-rebinding mitigation (same
-            // filter documented for the local path at
-            // display/webrtc.rs:38-43; the federated path hits the
+            // filter documented for the local path in the
+            // display/webrtc/mod.rs module docs; the federated path hits the
             // same trap when an operator configures a `localhost:NNNN`
             // tunnel on the primary side but the browser doesn't have
             // a matching loopback tunnel). No observable signaling
