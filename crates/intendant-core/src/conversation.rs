@@ -639,8 +639,7 @@ impl Conversation {
         let file = std::fs::File::create(path)?;
         let mut writer = std::io::BufWriter::new(file);
         for msg in &self.messages {
-            let json = serde_json::to_string(msg)
-                .map_err(std::io::Error::other)?;
+            let json = serde_json::to_string(msg).map_err(std::io::Error::other)?;
             writeln!(writer, "{}", json)?;
         }
         writer.flush()?;

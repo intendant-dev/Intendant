@@ -401,8 +401,7 @@ impl EncoderPool {
         // reflects the pool's total throughput. Tests that don't
         // care about metrics pass `None`; production passes
         // `Some(Arc::clone(&self.counters))` from DisplaySession::start.
-        let counters =
-            counters.unwrap_or_else(|| Arc::new(crate::DisplayMetricsCounters::new()));
+        let counters = counters.unwrap_or_else(|| Arc::new(crate::DisplayMetricsCounters::new()));
         let duration_ms = if framerate > 0 {
             1000 / framerate as u64
         } else {

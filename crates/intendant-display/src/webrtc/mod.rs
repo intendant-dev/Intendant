@@ -49,8 +49,8 @@ use super::encode::pool::{
 use super::tile::backpressure::{TileDeltaBackpressure, TileDeltaSendDecision};
 use super::tile::transport as tile_transport;
 use super::{EncodedFrame, IceConfig, InputEvent, PeerId};
-use intendant_core::error::CallerError;
 use bytes::{Bytes, BytesMut};
+use intendant_core::error::CallerError;
 use rtc::data_channel::{RTCDataChannelId, RTCDataChannelMessage};
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::media_engine::{
@@ -396,9 +396,7 @@ impl WebRtcPeer {
     /// Receivers are independent — multiple subscribers (capacity
     /// aggregator + a metrics dashboard, say) can each
     /// `subscribe_twcc_health` and read independently.
-    pub fn subscribe_twcc_health(
-        &self,
-    ) -> watch::Receiver<Option<crate::twcc_tap::TwccHealth>> {
+    pub fn subscribe_twcc_health(&self) -> watch::Receiver<Option<crate::twcc_tap::TwccHealth>> {
         self.twcc_health_rx.clone()
     }
 

@@ -61,6 +61,11 @@ impl TileUpdateReplayBuffer {
     }
 
     #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[allow(dead_code)]
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
     }
