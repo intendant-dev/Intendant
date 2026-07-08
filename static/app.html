@@ -14723,6 +14723,1578 @@ html.ui-v2 #tab-debug .ui-empty-hint {
   line-height: 1.55;
   color: var(--text-3);
 }
+/* ── static/app/ui2-sessions.css ── */
+/* ── ui-v2 Sessions surface re-skin (design-overhaul P2) ───────────────
+   Everything here is scoped under `html.ui-v2` and restyles the EXISTING
+   Sessions DOM — v1 stays pixel-identical. The perf architecture landed
+   by the sessions-perf program (viewport windowing, append-only renders,
+   node-stable cards, memoized haystacks) is untouched: this file styles
+   the same builders' output; the only gated markup additions are the
+   page header, the toolbar-fold toggles, the two extra KPI tiles, the
+   source-badge data attribute, the fueled banner, and the execution
+   segmented proxy (see 55/56/57 ui2Enabled() blocks).
+
+   Recipes come from the design-system reference: tint formula (fill
+   8–16%, border ~26%, text full color), radius ladder (8 inset · 9–10
+   control · 12–14 card · 16–18 panel · 999 pill), segmented grammar
+   (nav = neutral, value choice = accent), eyebrow labels, mono mandate
+   (ids, paths, metrics, timestamps — never body UI). */
+
+/* ══ page scaffold ══════════════════════════════════════════════════ */
+
+html.ui-v2 #tab-sessions .sessions-container {
+  padding: 26px max(28px, calc((100% - 1000px) / 2)) 60px;
+}
+html.ui-v2 #tab-sessions .ui2-page-head { margin: 0 0 16px; }
+html.ui-v2 #tab-sessions .ui2-page-title {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -.02em;
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .ui2-page-sub {
+  margin: 6px 0 0;
+  font-size: 13.5px;
+  color: var(--text-2);
+}
+
+/* Sub-tabs → neutral segmented control (design: navigation = neutral). */
+html.ui-v2 #tab-sessions .sessions-container > .subtabs {
+  display: inline-flex;
+  width: max-content;
+  max-width: 100%;
+  margin: 0 0 22px;
+  padding: 3px;
+  gap: 3px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  border-radius: 11px;
+}
+html.ui-v2 #sessions-subtabs .subtab-btn {
+  border: 0;
+  border-radius: 8px;
+  min-height: 0;
+  padding: 7px 14px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 700;
+  transition: background var(--t-fast), color var(--t-fast);
+  white-space: nowrap;
+}
+html.ui-v2 #sessions-subtabs .subtab-btn:hover { color: var(--text); }
+html.ui-v2 #sessions-subtabs .subtab-btn.active {
+  background: var(--surface-3);
+  color: var(--text);
+  border: 0;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, .2);
+}
+
+/* ══ shared controls inside the tab ═════════════════════════════════ */
+
+/* Buttons on the shared .ui-btn contract (Refresh / Scan / Cached /
+   card actions / Show more). */
+html.ui-v2 #tab-sessions .ui-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 0;
+  padding: 7px 13px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: background var(--t-med), border-color var(--t-med),
+    color var(--t-med), filter var(--t-med);
+}
+html.ui-v2 #tab-sessions .ui-btn:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: var(--line-2);
+}
+html.ui-v2 #tab-sessions .ui-btn.danger {
+  border-color: rgba(var(--rose-rgb), .4);
+  background: transparent;
+  color: var(--rose);
+  font-weight: 700;
+}
+html.ui-v2 #tab-sessions .ui-btn.danger:hover:not(:disabled) {
+  background: rgba(var(--rose-rgb), .1);
+  border-color: rgba(var(--rose-rgb), .55);
+  color: var(--rose);
+}
+html.ui-v2 #tab-sessions .ui-btn:disabled { opacity: .5; }
+html.ui-v2 #tab-sessions .sessions-refresh {
+  height: auto;
+  font-size: 12px;
+}
+
+/* Pane title line: the section voice under the page header. */
+html.ui-v2 #tab-sessions .sessions-header { gap: 12px; margin-bottom: 12px; }
+html.ui-v2 #tab-sessions .sessions-title-line {
+  justify-content: flex-start;
+  gap: 9px;
+}
+html.ui-v2 #tab-sessions .sessions-title {
+  flex: 1 1 auto;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+/* Toolbar fold: the full v1 control row, one reveal away. */
+html.ui-v2 #tab-sessions .ui2-tools-toggle { padding: 6px 11px; }
+html.ui-v2 #tab-sessions .ui2-tools-badge {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  background: rgba(var(--iris-rgb), .16);
+  color: var(--iris-2);
+}
+html.ui-v2 #tab-sessions .ui2-tools-badge.hidden { display: none; }
+html.ui-v2 #tab-sessions .ui2-tools-chev { display: flex; color: var(--text-3); }
+html.ui-v2 #tab-sessions .ui2-tools-chev svg { transition: transform var(--t-med); }
+html.ui-v2 #tab-sessions .sessions-header.ui2-tools-open .ui2-tools-chev svg {
+  transform: rotate(180deg);
+}
+html.ui-v2 #tab-sessions .sessions-toolbar { display: none; }
+html.ui-v2 #tab-sessions .sessions-header.ui2-tools-open .sessions-toolbar {
+  display: grid;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+/* Toolbar field voice + input recipes. */
+html.ui-v2 #tab-sessions .sessions-toolbar .sessions-search > span,
+html.ui-v2 #tab-sessions .sessions-toolbar .sessions-control > span,
+html.ui-v2 #tab-sessions .sessions-toolbar .sessions-sort > span {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .sessions-search input,
+html.ui-v2 #tab-sessions .sessions-sort select,
+html.ui-v2 #tab-sessions .sessions-control select,
+html.ui-v2 #tab-sessions .sessions-multi-filter-btn {
+  height: 32px;
+  padding: 5px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 9px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  transition: border-color var(--t-med), box-shadow var(--t-med);
+}
+html.ui-v2 #tab-sessions .sessions-search input::placeholder { color: var(--text-3); }
+html.ui-v2 #tab-sessions .sessions-search input:focus,
+html.ui-v2 #tab-sessions .sessions-sort select:focus,
+html.ui-v2 #tab-sessions .sessions-multi-filter-btn:focus-visible {
+  outline: none;
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+html.ui-v2 #tab-sessions .sessions-multi-filter-btn { padding-right: 26px; }
+html.ui-v2 #tab-sessions .sessions-multi-filter-btn::after { color: var(--text-3); }
+html.ui-v2 #tab-sessions .sessions-multi-filter-btn:hover,
+html.ui-v2 #tab-sessions .sessions-multi-filter-btn[aria-expanded="true"] {
+  border-color: var(--iris);
+}
+html.ui-v2 #tab-sessions .sessions-multi-filter-menu {
+  padding: 6px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .45);
+}
+html.ui-v2 #tab-sessions .sessions-multi-filter-menu label {
+  padding: 6px 8px;
+  border-radius: 8px;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+html.ui-v2 #tab-sessions .sessions-multi-filter-menu label:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .sessions-multi-filter-menu input { accent-color: var(--iris); }
+html.ui-v2 #tab-sessions .sessions-multi-filter-search { background: var(--surface); }
+html.ui-v2 #tab-sessions .sessions-multi-filter-search input {
+  padding: 6px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .sessions-multi-filter-empty,
+html.ui-v2 #tab-sessions .sessions-multi-filter-more { color: var(--text-3); }
+html.ui-v2 #tab-sessions .sessions-toggle {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+  transition: border-color var(--t-med), color var(--t-med), background var(--t-med);
+}
+html.ui-v2 #tab-sessions .sessions-toggle input[type="checkbox"] { accent-color: var(--iris); }
+html.ui-v2 #tab-sessions .sessions-toggle:has(input:checked) {
+  border-color: rgba(var(--iris-rgb), .3);
+  background: rgba(var(--iris-rgb), .09);
+  color: var(--iris-2);
+}
+
+/* Status lines under toolbars (deep-search status, worktrees status). */
+html.ui-v2 #tab-sessions .sessions-search-status {
+  margin: -2px 0 8px;
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+html.ui-v2 #tab-sessions .sessions-search-status.error { color: var(--rose); }
+
+/* ══ KPI strip (Recent + Worktrees aggregates) ══════════════════════ */
+
+html.ui-v2 #tab-sessions .sessions-aggregate {
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin: 0 0 18px;
+}
+html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat {
+  margin: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: none;
+}
+html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-value {
+  margin-top: 4px;
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: -.01em;
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-sub {
+  margin-top: 3px;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .sessions-aggregate .agg-card.loading {
+  border-color: rgba(var(--iris-rgb), .22);
+}
+html.ui-v2 #tab-sessions .sessions-aggregate .agg-card.loading .agg-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-3);
+}
+/* Worktrees keeps its six operational tiles on one row where they fit. */
+html.ui-v2 #tab-sessions #worktrees-aggregate {
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+
+/* ══ hydration status banner ════════════════════════════════════════ */
+
+html.ui-v2 #tab-sessions .sessions-hydration-status {
+  margin: -6px 0 12px;
+  padding: 8px 12px;
+  border: 1px solid rgba(var(--iris-rgb), .26);
+  border-left: 3px solid var(--iris);
+  border-radius: 11px;
+  background: rgba(var(--iris-rgb), .08);
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .sessions-hydration-status.done {
+  border-color: rgba(var(--green-rgb), .26);
+  border-left-color: var(--green);
+  background: rgba(var(--green-rgb), .08);
+}
+html.ui-v2 #tab-sessions .sessions-hydration-status.error {
+  border-color: rgba(var(--rose-rgb), .32);
+  border-left-color: var(--rose);
+  background: rgba(var(--rose-rgb), .07);
+}
+html.ui-v2 #tab-sessions .sessions-hydration-spinner {
+  border: 2px solid var(--surface-3);
+  border-top-color: var(--iris);
+}
+html.ui-v2 #tab-sessions .sessions-hydration-status.done .sessions-hydration-spinner { border-color: var(--green); }
+html.ui-v2 #tab-sessions .sessions-hydration-status.error .sessions-hydration-spinner { border-color: var(--rose); }
+html.ui-v2 #tab-sessions .sessions-hydration-title { font-size: 12.5px; font-weight: 700; }
+html.ui-v2 #tab-sessions .sessions-hydration-detail { color: var(--text-2); font-size: 11.5px; }
+html.ui-v2 #tab-sessions .sessions-hydration-meter { background: var(--surface-3); }
+html.ui-v2 #tab-sessions .sessions-hydration-meter span {
+  background: linear-gradient(90deg, var(--iris), var(--violet));
+}
+
+/* ══ host strip (browse a peer's sessions in place) ═════════════════ */
+
+html.ui-v2 #tab-sessions .sessions-host-chip {
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 #tab-sessions .sessions-host-chip:hover {
+  border-color: var(--line-2);
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .sessions-host-chip.active {
+  background: rgba(var(--iris-rgb), .14);
+  border-color: rgba(var(--iris-rgb), .3);
+  color: var(--iris-2);
+}
+html.ui-v2 #tab-sessions .sessions-host-chip.offline { opacity: .55; }
+
+/* ══ session cards ══════════════════════════════════════════════════ */
+
+html.ui-v2 #tab-sessions .sessions-list { gap: 10px; }
+html.ui-v2 #tab-sessions .session-card {
+  padding: 14px 250px 14px 17px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--surface);
+  box-shadow: none;
+  cursor: pointer;
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 #tab-sessions .session-card:hover {
+  border-color: var(--line-2);
+  background: var(--surface-2);
+}
+html.ui-v2 #tab-sessions .session-card.current {
+  border-color: rgba(var(--iris-rgb), .4);
+  background: rgba(var(--iris-rgb), .07);
+}
+html.ui-v2 #tab-sessions .session-card.partial {
+  border-color: rgba(var(--iris-rgb), .2);
+  background:
+    linear-gradient(90deg, rgba(var(--iris-rgb), .05), transparent 36%),
+    var(--surface);
+}
+html.ui-v2 #tab-sessions .session-card.dimmed { opacity: .5; }
+html.ui-v2 #tab-sessions .session-card.dimmed:hover { opacity: .75; }
+html.ui-v2 #tab-sessions .session-card .sc-top { gap: 10px; margin-bottom: 4px; }
+html.ui-v2 #tab-sessions .session-card .sc-name {
+  font-size: 14.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+/* Title-kind marker (name/initial/untitled) — quiet mono microtext. */
+html.ui-v2 #tab-sessions .session-card .sc-title-kind,
+html.ui-v2 #tab-sessions .session-detail-title .sd-title-kind {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: .06em;
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0 4px;
+  background: transparent;
+}
+html.ui-v2 #tab-sessions .session-card .sc-title-kind.name,
+html.ui-v2 #tab-sessions .session-detail-title .sd-title-kind.name {
+  color: var(--iris-2);
+  border-color: rgba(var(--iris-rgb), .3);
+  background: rgba(var(--iris-rgb), .1);
+}
+
+/* Status pills: the design's tint map on the existing tone classes —
+   active/in-progress = iris, done = green, failed = rose,
+   interrupted = amber, idle/abandoned = neutral. Dots removed (the
+   reference status pills are text-only). */
+html.ui-v2 #tab-sessions .session-card .ui-chip,
+html.ui-v2 #tab-sessions .session-card .ui-badge {
+  border-radius: var(--r-pill);
+  padding: 2px 9px;
+  font-family: var(--sans);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .01em;
+  border: 1px solid transparent;
+  background: var(--surface-3);
+  color: var(--text-2);
+}
+html.ui-v2 #tab-sessions .session-card .ui-chip::before { display: none; }
+html.ui-v2 #tab-sessions .session-card .ui-chip.info {
+  background: rgba(var(--iris-rgb), .16);
+  border-color: transparent;
+  color: var(--iris-2);
+}
+html.ui-v2 #tab-sessions .session-card .ui-chip.ok {
+  background: rgba(var(--green-rgb), .14);
+  border-color: transparent;
+  color: var(--green);
+}
+html.ui-v2 #tab-sessions .session-card .ui-chip.err {
+  background: rgba(var(--rose-rgb), .14);
+  border-color: transparent;
+  color: var(--rose);
+}
+html.ui-v2 #tab-sessions .session-card .ui-chip.warn {
+  background: rgba(var(--amber-rgb), .14);
+  border-color: transparent;
+  color: var(--amber);
+}
+html.ui-v2 #tab-sessions .session-card .ui-chip.muted {
+  background: var(--surface-3);
+  border-color: transparent;
+  color: var(--text-2);
+}
+
+/* Source badges: native = iris, Codex = neutral, Claude Code = amber
+   (radius-6 chips in the reference; keyed off the gated data-src). */
+html.ui-v2 #tab-sessions .session-card .sc-source {
+  border-radius: 6px;
+  letter-spacing: .02em;
+}
+html.ui-v2 #tab-sessions .session-card .sc-source.local,
+html.ui-v2 #tab-sessions .session-card .sc-source[data-src="intendant"] {
+  background: rgba(var(--iris-rgb), .12);
+  color: var(--iris-2);
+}
+html.ui-v2 #tab-sessions .session-card .sc-source[data-src="claude-code"] {
+  background: rgba(var(--amber-rgb), .12);
+  color: var(--amber);
+}
+html.ui-v2 #tab-sessions .session-card .sc-source[data-src="codex"] {
+  background: var(--surface-3);
+  color: var(--text-2);
+}
+
+/* Lineage chips are clickable — give them the interactive voice. */
+html.ui-v2 #tab-sessions .session-card button.sc-role { cursor: pointer; }
+html.ui-v2 #tab-sessions .session-card button.sc-role:hover {
+  border-color: rgba(var(--iris-rgb), .3);
+  background: rgba(var(--iris-rgb), .1);
+  color: var(--iris-2);
+}
+
+/* Second line + hit snippets. */
+html.ui-v2 #tab-sessions .session-card .sc-task {
+  font-size: 12.5px;
+  color: var(--text-2);
+  margin: 0 0 5px;
+}
+html.ui-v2 #tab-sessions .session-card .sc-search-hit {
+  border-left: 2px solid var(--iris);
+  border-radius: 0 8px 8px 0;
+  background: rgba(var(--iris-rgb), .08);
+  color: var(--text-2);
+  font-size: 12px;
+}
+html.ui-v2 #tab-sessions .session-card .sc-search-hit-count { color: var(--iris-2); }
+html.ui-v2 #tab-sessions .session-card .sc-preview-hit {
+  border-left: 2px solid var(--violet);
+  border-radius: 0 8px 8px 0;
+  background: rgba(var(--violet-rgb), .08);
+  color: var(--text-2);
+  font-size: 12px;
+}
+html.ui-v2 #tab-sessions .session-card .sc-preview-hit-role { color: var(--violet); }
+
+/* Meta row — mono microtext per the reference card's third line. */
+html.ui-v2 #tab-sessions .session-card .sc-meta {
+  gap: 3px 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .session-card .sc-meta .label { color: var(--text-3); }
+html.ui-v2 #tab-sessions .session-card .sc-meta .value { color: var(--text-2); }
+html.ui-v2 #tab-sessions .session-card .sc-id { color: var(--text-2); }
+html.ui-v2 #tab-sessions .session-card .sc-id:hover { color: var(--iris-2); }
+html.ui-v2 #tab-sessions .session-card .sc-meta .model-val { color: var(--sky); }
+html.ui-v2 #tab-sessions .session-card .sc-meta .provider-val { color: var(--sky); }
+html.ui-v2 #tab-sessions .session-card .sc-meta .v-green { color: var(--green); }
+html.ui-v2 #tab-sessions .session-card .sc-meta .v-blue { color: var(--sky); }
+html.ui-v2 #tab-sessions .session-card .sc-meta .v-peach { color: var(--amber); }
+html.ui-v2 #tab-sessions .session-card .sc-meta .v-red { color: var(--rose); }
+html.ui-v2 #tab-sessions .session-card .sc-meta .v-yellow { color: var(--amber); }
+html.ui-v2 #tab-sessions .session-card .sc-meta .v-dim { color: var(--text-3); }
+html.ui-v2 #tab-sessions .session-card .sc-meta .sc-loading-meta .value { color: var(--iris-2); }
+
+/* Right-aligned action column (the reference's Resume/Open/Retry slot).
+   The primary action stays visible; the rest keep v1's quiet-until-
+   engaged behavior, re-voiced in v2 colors. */
+html.ui-v2 #tab-sessions .session-card .sc-actions {
+  top: 50%;
+  right: 14px;
+  transform: translateY(-50%);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: 224px;
+}
+html.ui-v2 #tab-sessions .session-card .sc-actions .ui-btn {
+  min-height: 0;
+  padding: 6px 12px;
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 700;
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .session-card .sc-actions .sc-resume-btn {
+  background: var(--surface-3);
+  border-color: transparent;
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .session-card:hover .sc-actions .ui-btn,
+html.ui-v2 #tab-sessions .session-card:focus-within .sc-actions .ui-btn {
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .session-card:hover .sc-actions .sc-resume-btn,
+html.ui-v2 #tab-sessions .session-card:focus-within .sc-actions .sc-resume-btn {
+  background: var(--surface-3);
+  border-color: var(--line-2);
+}
+html.ui-v2 #tab-sessions .session-card:hover .sc-actions .ui-btn:hover {
+  border-color: rgba(var(--iris-rgb), .4);
+  color: var(--iris-2);
+}
+html.ui-v2 #tab-sessions .session-card:hover .sc-actions .ui-btn.danger,
+html.ui-v2 #tab-sessions .session-card:focus-within .sc-actions .ui-btn.danger {
+  background: transparent;
+  border-color: rgba(var(--rose-rgb), .4);
+  color: var(--rose);
+}
+html.ui-v2 #tab-sessions .session-card:hover .sc-actions .ui-btn.danger:hover {
+  border-color: rgba(var(--rose-rgb), .55);
+  background: rgba(var(--rose-rgb), .1);
+  color: var(--rose);
+}
+@media (hover: none) {
+  html.ui-v2 #tab-sessions .session-card .sc-actions .ui-btn {
+    background: var(--surface-2);
+    border-color: var(--line);
+    color: var(--text);
+  }
+  html.ui-v2 #tab-sessions .session-card .sc-actions .ui-btn.danger {
+    background: transparent;
+    border-color: rgba(var(--rose-rgb), .4);
+    color: var(--rose);
+  }
+}
+
+/* Delete target menu. */
+html.ui-v2 #tab-sessions .sc-delete-menu {
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .45);
+  padding: 5px;
+}
+html.ui-v2 #tab-sessions .sc-delete-menu-item {
+  border-radius: 8px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+html.ui-v2 #tab-sessions .sc-delete-menu-item:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .sc-delete-menu-item.danger { color: var(--rose); }
+html.ui-v2 #tab-sessions .sc-delete-menu-item .size-hint {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .sc-delete-btn.pending {
+  border-color: rgba(var(--iris-rgb), .3);
+  background: rgba(var(--iris-rgb), .1);
+  color: var(--iris-2);
+}
+
+/* Show more + scroll sentinel row. */
+html.ui-v2 #tab-sessions .sessions-show-more { padding: 14px 0 4px; }
+html.ui-v2 #tab-sessions .sessions-show-more-btn {
+  padding: 9px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+html.ui-v2 #tab-sessions .sessions-show-more-btn:hover {
+  border-color: var(--line-2);
+  background: transparent;
+  color: var(--text);
+}
+
+/* Empty states (States recipe: glyph box + quiet copy) + skeletons. */
+html.ui-v2 #tab-sessions .sessions-list > .empty-state,
+html.ui-v2 #tab-sessions .worktrees-list > .empty-state {
+  flex-direction: column;
+  gap: 11px;
+  height: auto;
+  padding: 44px 16px;
+  color: var(--text-2);
+  font-size: 13.5px;
+  font-weight: 600;
+  text-align: center;
+}
+html.ui-v2 #tab-sessions .sessions-list > .empty-state::before,
+html.ui-v2 #tab-sessions .worktrees-list > .empty-state::before {
+  content: '\25CD';
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--line-2);
+  border-radius: 11px;
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: 15px;
+}
+html.ui-v2 #tab-sessions .sessions-skel-card {
+  height: 76px;
+  border-radius: 13px;
+  background: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
+  background-size: 420px 100%;
+}
+
+/* ══ deep search pane ═══════════════════════════════════════════════ */
+
+html.ui-v2 #tab-sessions .sessions-deep-search {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--surface);
+}
+html.ui-v2 #tab-sessions .sessions-deep-search-title { font-size: 13px; font-weight: 800; color: var(--text); }
+html.ui-v2 #tab-sessions .sessions-deep-search-title span:last-child {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-3);
+  line-height: 1.5;
+}
+html.ui-v2 #tab-sessions .sessions-deep-search-query {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .sessions-deep-search-query input,
+html.ui-v2 #tab-sessions .sessions-deep-search-query select {
+  height: 34px;
+  padding: 6px 11px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+}
+html.ui-v2 #tab-sessions .sessions-deep-search-query input::placeholder { color: var(--text-3); }
+html.ui-v2 #tab-sessions .sessions-deep-search-query input:focus,
+html.ui-v2 #tab-sessions .sessions-deep-search-query select:focus {
+  outline: none;
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+/* Run = primary; Cancel/Clear = secondary. Busy states keep v1 logic
+   (disabled Run, revealed Cancel) and only re-dress it. */
+html.ui-v2 #tab-sessions .sessions-deep-search-btn {
+  height: 34px;
+  padding: 6px 15px;
+  border: 0;
+  border-radius: 10px;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-size: 12.5px;
+  font-weight: 800;
+  box-shadow: var(--shadow-primary);
+  transition: filter var(--t-med), background var(--t-med), color var(--t-med);
+}
+html.ui-v2 #tab-sessions .sessions-deep-search-btn:hover:not(:disabled) {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  filter: brightness(1.08);
+}
+html.ui-v2 #tab-sessions .sessions-deep-search-btn:disabled { opacity: .55; box-shadow: none; }
+html.ui-v2 #tab-sessions .sessions-deep-search-btn.secondary {
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-weight: 600;
+  box-shadow: none;
+}
+html.ui-v2 #tab-sessions .sessions-deep-search-btn.secondary:hover:not(:disabled) {
+  border-color: var(--line-2);
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+/* ══ worktrees pane ═════════════════════════════════════════════════ */
+
+/* Safety classification carries the row: left accent + tinted safety
+   sentence; the reference's branch icon leads the title row. */
+html.ui-v2 #tab-sessions .session-card.worktree-card {
+  cursor: default;
+  padding: 13px 17px;
+  border-left: 3px solid var(--neutral-dot);
+}
+html.ui-v2 #tab-sessions .worktree-card.safe { border-color: var(--line); border-left-color: var(--green); }
+html.ui-v2 #tab-sessions .worktree-card.warning { border-color: var(--line); border-left-color: var(--amber); }
+html.ui-v2 #tab-sessions .worktree-card.danger { border-color: var(--line); border-left-color: var(--rose); }
+html.ui-v2 #tab-sessions .worktree-card.queued {
+  border-color: rgba(var(--iris-rgb), .3);
+  background: rgba(var(--iris-rgb), .05);
+}
+html.ui-v2 #tab-sessions .worktree-card.removing {
+  border-color: rgba(var(--iris-rgb), .4);
+  background: rgba(var(--iris-rgb), .08);
+}
+html.ui-v2 #tab-sessions .worktree-card > .sc-top::before {
+  content: '';
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  background: var(--iris-2);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='6' cy='6' r='2.4'/%3E%3Ccircle cx='6' cy='18' r='2.4'/%3E%3Ccircle cx='18' cy='8' r='2.4'/%3E%3Cpath d='M6 8.4v7.2'/%3E%3Cpath d='M18 10.4c0 4.2-6 1.8-6 5.6'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='6' cy='6' r='2.4'/%3E%3Ccircle cx='6' cy='18' r='2.4'/%3E%3Ccircle cx='18' cy='8' r='2.4'/%3E%3Cpath d='M6 8.4v7.2'/%3E%3Cpath d='M18 10.4c0 4.2-6 1.8-6 5.6'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-branch {
+  font-family: var(--mono);
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-path {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-labels { gap: 5px; margin: 7px 0 0; }
+html.ui-v2 #tab-sessions .worktree-card .wt-label {
+  padding: 1px 7px;
+  border-radius: 6px;
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .05em;
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-label.cleanup-candidate,
+html.ui-v2 #tab-sessions .worktree-card .wt-label.merged {
+  background: rgba(var(--green-rgb), .14);
+  color: var(--green);
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-label.dirty,
+html.ui-v2 #tab-sessions .worktree-card .wt-label.unmerged,
+html.ui-v2 #tab-sessions .worktree-card .wt-label.conflicts {
+  background: rgba(var(--rose-rgb), .14);
+  color: var(--rose);
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-label.active,
+html.ui-v2 #tab-sessions .worktree-card .wt-label.locked,
+html.ui-v2 #tab-sessions .worktree-card .wt-label.main {
+  background: rgba(var(--amber-rgb), .14);
+  color: var(--amber);
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-label.stale,
+html.ui-v2 #tab-sessions .worktree-card .wt-label.untracked,
+html.ui-v2 #tab-sessions .worktree-card .wt-label.unknown-merge {
+  background: rgba(var(--amber-rgb), .1);
+  color: var(--amber);
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-safety {
+  margin: 8px 0;
+  padding: 7px 10px;
+  border-left: 2px solid var(--neutral-dot);
+  border-radius: 0 8px 8px 0;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12px;
+}
+html.ui-v2 #tab-sessions .worktree-card.safe .wt-safety { border-left-color: var(--green); }
+html.ui-v2 #tab-sessions .worktree-card.warning .wt-safety { border-left-color: var(--amber); }
+html.ui-v2 #tab-sessions .worktree-card.danger .wt-safety { border-left-color: var(--rose); }
+/* Worktree actions are an operational footer row, not the floating
+   action column — re-assert v1's static layout over the session-card
+   absolute rule above (equal specificity; later wins). */
+html.ui-v2 #tab-sessions .worktree-card .sc-actions {
+  position: static;
+  transform: none;
+  max-width: none;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-command {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+/* The serialized remove queue's whole-list busy dim. */
+html.ui-v2 #tab-sessions .worktrees-list.is-busy { opacity: .82; }
+
+/* Scan/removal activity notice shares the spawn-notice recipe below. */
+
+/* ══ worktree inspect modal ═════════════════════════════════════════ */
+
+html.ui-v2 #worktree-inspect-modal {
+  background: rgba(6, 7, 10, .62);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+}
+html.ui-v2 #worktree-inspect-modal .modal-dialog {
+  border: 1px solid var(--line-2);
+  border-radius: 18px;
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  box-shadow: var(--shadow-overlay);
+  animation: ui2-rise .2s ease;
+}
+html.ui-v2 #worktree-inspect-modal h3 {
+  font-size: 17px;
+  font-weight: 800;
+  color: var(--text);
+}
+html.ui-v2 #worktree-inspect-modal .modal-close {
+  border-radius: 8px;
+  color: var(--text-2);
+}
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-path {
+  font-family: var(--mono);
+  color: var(--text);
+}
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-summary { color: var(--text-2); }
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-metric,
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-section {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-metric .label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+}
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-metric .value {
+  font-family: var(--mono);
+  font-weight: 700;
+  color: var(--text);
+}
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-section h4 {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-reason,
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-file,
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-command {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-reason.ok {
+  border-color: rgba(var(--green-rgb), .26);
+  background: rgba(var(--green-rgb), .07);
+}
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-reason.warning {
+  border-color: rgba(var(--amber-rgb), .26);
+  background: rgba(var(--amber-rgb), .07);
+}
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-reason.danger,
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-reason.keep {
+  border-color: rgba(var(--rose-rgb), .32);
+  background: rgba(var(--rose-rgb), .06);
+}
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-reason-title,
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-command-title { color: var(--text); }
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-file-title,
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-command code {
+  font-family: var(--mono);
+  color: var(--text-2);
+}
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-reason-detail,
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-file-detail { color: var(--text-3); }
+html.ui-v2 #worktree-inspect-modal .modal-confirm,
+html.ui-v2 #worktree-inspect-modal .modal-cancel,
+html.ui-v2 #worktree-inspect-modal .ui-btn {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 7px 13px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  min-height: 0;
+}
+html.ui-v2 #worktree-inspect-modal .modal-confirm:hover,
+html.ui-v2 #worktree-inspect-modal .modal-cancel:hover,
+html.ui-v2 #worktree-inspect-modal .ui-btn:hover {
+  background: var(--surface-3);
+  border-color: var(--line-2);
+}
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-status.ok { color: var(--green); }
+html.ui-v2 #worktree-inspect-modal .worktree-inspect-status.error { color: var(--rose); }
+
+/* ══ new session pane ═══════════════════════════════════════════════ */
+
+html.ui-v2 #tab-sessions .sessions-new-pane { padding: 0; }
+html.ui-v2 #tab-sessions .sessions-new-panel {
+  max-width: 720px;
+  margin: 0;
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--surface);
+  box-shadow: none;
+  gap: 0;
+}
+html.ui-v2 #tab-sessions .sessions-new-panel .ui-section-head { margin-bottom: 16px; }
+html.ui-v2 #tab-sessions .sessions-new-panel .ui-section-title {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: normal;
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .sessions-new-panel .ui-section-sub {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .sessions-new-task { gap: 14px; }
+
+/* Fuel banners lead the card (flex order; DOM order stays v1's). */
+html.ui-v2 #tab-sessions .sessions-fueled-banner { order: -3; }
+html.ui-v2 #tab-sessions #new-session-unfueled-banner { order: -2; }
+html.ui-v2 #tab-sessions .sessions-fueled-banner {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 12px;
+  border: 1px solid rgba(var(--green-rgb), .24);
+  border-radius: 9px;
+  background: rgba(var(--green-rgb), .1);
+}
+html.ui-v2 #tab-sessions .sessions-fueled-banner.hidden { display: none; }
+html.ui-v2 #tab-sessions .sessions-fueled-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--green);
+}
+html.ui-v2 #tab-sessions .sessions-fueled-text {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--green);
+}
+html.ui-v2 #tab-sessions .sessions-unfueled-banner {
+  padding: 9px 12px;
+  border: 1px solid rgba(var(--amber-rgb), .32);
+  border-left: 1px solid rgba(var(--amber-rgb), .32);
+  border-radius: 9px;
+  background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02));
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+html.ui-v2 #tab-sessions .sessions-unfueled-banner::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .14);
+  animation: ui2-pulse 2s infinite;
+}
+html.ui-v2 #tab-sessions .sessions-unfueled-add-keys {
+  border: 0;
+  border-radius: 8px;
+  padding: 7px 14px;
+  background: var(--amber);
+  color: var(--on-accent);
+  font-weight: 800;
+}
+html.ui-v2 #tab-sessions .sessions-unfueled-add-keys:hover:not(:disabled) {
+  background: var(--amber);
+  border-color: transparent;
+  filter: brightness(1.08);
+}
+
+/* Field voice + inputs. */
+html.ui-v2 #tab-sessions .sessions-new-session-field,
+html.ui-v2 #tab-sessions .sessions-project-label,
+html.ui-v2 #tab-sessions .ui2-exec-label {
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .sessions-new-task .sessions-project-input,
+html.ui-v2 #tab-sessions .sessions-new-task-input,
+html.ui-v2 #tab-sessions .sessions-agent-select,
+html.ui-v2 #tab-sessions .sessions-agent-managed-context-select,
+html.ui-v2 #tab-sessions .sessions-agent-command-input,
+html.ui-v2 #tab-sessions .sessions-new-session-field > select,
+html.ui-v2 #tab-sessions .sessions-new-external-grid input,
+html.ui-v2 #tab-sessions .sessions-new-external-grid select {
+  height: auto;
+  min-height: 36px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: normal;
+  transition: border-color var(--t-med), box-shadow var(--t-med);
+}
+html.ui-v2 #tab-sessions .sessions-new-task input::placeholder,
+html.ui-v2 #tab-sessions .sessions-new-task textarea::placeholder { color: var(--text-3); }
+html.ui-v2 #tab-sessions .sessions-new-task input:focus,
+html.ui-v2 #tab-sessions .sessions-new-task textarea:focus,
+html.ui-v2 #tab-sessions .sessions-new-task select:focus {
+  outline: none;
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+html.ui-v2 #tab-sessions .sessions-new-task-input {
+  min-height: 88px;
+  font-size: 14px;
+  line-height: 1.5;
+  resize: vertical;
+}
+html.ui-v2 #tab-sessions .sessions-new-task select:disabled,
+html.ui-v2 #tab-sessions .sessions-new-task input:disabled {
+  opacity: .55;
+  color: var(--text-3);
+}
+
+/* Attach row: dashed affordance + quiet pending bar. */
+html.ui-v2 #tab-sessions .sessions-attach-btn {
+  padding: 7px 13px;
+  border: 1px dashed var(--line-2);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+  transition: border-color var(--t-med), color var(--t-med);
+}
+html.ui-v2 #tab-sessions .sessions-attach-btn:hover {
+  border-color: var(--iris);
+  color: var(--iris-2);
+}
+html.ui-v2 #tab-sessions .sessions-attach-row .pending-attachments-bar {
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+
+/* Project row. */
+html.ui-v2 #tab-sessions .sessions-project-browse,
+html.ui-v2 #tab-sessions .sessions-project-create-label {
+  height: auto;
+  min-height: 36px;
+  padding: 8px 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 600;
+  transition: background var(--t-med), border-color var(--t-med), color var(--t-med);
+}
+html.ui-v2 #tab-sessions .sessions-project-browse:hover:not(:disabled),
+html.ui-v2 #tab-sessions .sessions-project-create-label:hover {
+  background: var(--surface-3);
+  border-color: var(--line-2);
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .sessions-project-create-label input { accent-color: var(--iris); }
+html.ui-v2 #tab-sessions .sessions-project-status { font-size: 11.5px; color: var(--text-3); }
+html.ui-v2 #tab-sessions .sessions-project-status.ok { color: var(--green); }
+html.ui-v2 #tab-sessions .sessions-project-status.warn { color: var(--amber); }
+html.ui-v2 #tab-sessions .sessions-project-status.error { color: var(--rose); }
+
+/* Execution segmented (accent choice variant); the v1 select hides under
+   the flag — it stays the wire-format source of truth. */
+html.ui-v2 #tab-sessions #new-session-execution-wrap { display: none; }
+html.ui-v2 #tab-sessions .ui2-exec-field { display: flex; flex-direction: column; }
+html.ui-v2 #tab-sessions .ui2-seg {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 11px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+html.ui-v2 #tab-sessions .ui2-seg > button {
+  flex: 1;
+  padding: 8px 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: normal;
+  text-transform: none;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #tab-sessions .ui2-seg > button:hover:not(:disabled) { color: var(--text); }
+html.ui-v2 #tab-sessions .ui2-seg > button.is-accent {
+  background: linear-gradient(180deg, rgba(var(--iris-rgb), .24), rgba(var(--iris-rgb), .1));
+  color: var(--iris-2);
+  box-shadow: inset 0 0 0 1px rgba(var(--iris-rgb), .3);
+}
+html.ui-v2 #tab-sessions .ui2-seg.disabled { opacity: .55; }
+html.ui-v2 #tab-sessions .ui2-seg > button:disabled { cursor: not-allowed; }
+html.ui-v2 #tab-sessions .ui2-exec-note {
+  min-height: 14px;
+  margin-top: 2px;
+  font-size: 11.5px;
+  font-weight: 400;
+  letter-spacing: normal;
+  line-height: 1.5;
+  color: var(--text-3);
+  text-transform: none;
+}
+
+/* External agent options fold. */
+html.ui-v2 #tab-sessions .sessions-new-external-fold {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-2);
+}
+html.ui-v2 #tab-sessions .sessions-new-external-fold > summary {
+  padding: 11px 14px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-2);
+}
+html.ui-v2 #tab-sessions .sessions-new-external-fold > summary::before { color: var(--text-3); }
+html.ui-v2 #tab-sessions .sessions-new-external-fold > summary:hover { color: var(--text); }
+html.ui-v2 #tab-sessions .sessions-new-external-fold .ui-fold-hint { color: var(--text-3); }
+html.ui-v2 #tab-sessions .sessions-new-external-grid input,
+html.ui-v2 #tab-sessions .sessions-new-external-grid select { background: var(--surface); }
+/* Technical option vocabularies read as values → mono. */
+html.ui-v2 #tab-sessions .sessions-new-external-grid select,
+html.ui-v2 #tab-sessions .sessions-agent-command-input {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+html.ui-v2 #tab-sessions .sessions-new-fast-toggle {
+  height: auto;
+  min-height: 36px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+html.ui-v2 #tab-sessions .sessions-new-fast-toggle input { accent-color: var(--green); }
+html.ui-v2 #tab-sessions .sessions-new-fast-toggle.active {
+  border-color: rgba(var(--green-rgb), .26);
+  background: rgba(var(--green-rgb), .1);
+  color: var(--green);
+}
+html.ui-v2 #tab-sessions .sessions-agent-note {
+  font-size: 11.5px;
+  color: var(--text-3);
+  text-transform: none;
+}
+html.ui-v2 #tab-sessions .sessions-agent-note.warn { color: var(--amber); }
+
+/* Launch button: the reference's full-width primary hero. */
+html.ui-v2 #tab-sessions .sessions-start-btn {
+  align-self: stretch;
+  width: 100%;
+  padding: 12px;
+  border: 0;
+  border-radius: 11px;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-size: 14px;
+  font-weight: 800;
+  box-shadow: 0 8px 22px rgba(var(--iris-rgb), .34);
+  transition: filter var(--t-med), transform var(--t-med), opacity var(--t-med);
+}
+html.ui-v2 #tab-sessions .sessions-start-btn:hover:not(:disabled) {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+html.ui-v2 #tab-sessions .sessions-start-btn:disabled {
+  opacity: .5;
+  box-shadow: none;
+}
+html.ui-v2 #tab-sessions .sessions-start-btn.pending {
+  border: 0;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  opacity: .8;
+}
+
+/* Spawn / activity notices (New Session state machine + worktree scans).
+   Kind classes carry the tone: pending=iris, ok=green, warn=amber,
+   error=rose. */
+html.ui-v2 #tab-sessions .sessions-spawn-notice {
+  padding: 8px 12px;
+  border: 1px solid rgba(var(--iris-rgb), .26);
+  border-left: 3px solid var(--iris);
+  border-radius: 11px;
+  background: rgba(var(--iris-rgb), .08);
+  color: var(--text);
+  font-size: 12.5px;
+}
+html.ui-v2 #tab-sessions .sessions-spawn-notice.ok {
+  border-color: rgba(var(--green-rgb), .26);
+  border-left-color: var(--green);
+  background: rgba(var(--green-rgb), .08);
+}
+html.ui-v2 #tab-sessions .sessions-spawn-notice.warn {
+  border-color: rgba(var(--amber-rgb), .26);
+  border-left-color: var(--amber);
+  background: rgba(var(--amber-rgb), .09);
+}
+html.ui-v2 #tab-sessions .sessions-spawn-notice.error {
+  border-color: rgba(var(--rose-rgb), .32);
+  border-left-color: var(--rose);
+  background: rgba(var(--rose-rgb), .07);
+}
+html.ui-v2 #tab-sessions .sessions-spawn-spinner {
+  border: 2px solid var(--surface-3);
+  border-top-color: var(--iris);
+}
+html.ui-v2 #tab-sessions .sessions-spawn-notice.ok .sessions-spawn-spinner { border-color: var(--green); }
+html.ui-v2 #tab-sessions .sessions-spawn-notice.warn .sessions-spawn-spinner { border-color: var(--amber); }
+html.ui-v2 #tab-sessions .sessions-spawn-notice.error .sessions-spawn-spinner { border-color: var(--rose); }
+html.ui-v2 #tab-sessions .sessions-spawn-action {
+  padding: 5px 12px;
+  border: 1px solid rgba(var(--iris-rgb), .3);
+  border-radius: 8px;
+  background: rgba(var(--iris-rgb), .14);
+  color: var(--iris-2);
+  font-size: 11.5px;
+  font-weight: 700;
+}
+html.ui-v2 #tab-sessions .sessions-spawn-action:hover {
+  background: rgba(var(--iris-rgb), .22);
+}
+
+/* ══ session detail overlay ═════════════════════════════════════════ */
+
+html.ui-v2 #tab-sessions .session-detail-header {
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  padding: 10px 0;
+}
+html.ui-v2 #tab-sessions .session-back-btn {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+html.ui-v2 #tab-sessions .session-back-btn:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .session-detail-title { font-size: 13.5px; }
+html.ui-v2 #tab-sessions .session-detail-title .sd-title-text { font-weight: 700; color: var(--text); }
+html.ui-v2 #tab-sessions .session-detail-title .sd-title-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .session-detail-title .sd-title-subline { color: var(--text-3); }
+html.ui-v2 #tab-sessions .sd-meta-strip {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+html.ui-v2 #tab-sessions .sd-meta-strip .label { color: var(--text-3); }
+html.ui-v2 #tab-sessions .sd-meta-strip .value { color: var(--text-2); }
+
+/* Detail actions: Resume leads (accent), Configure/Rename quiet. */
+html.ui-v2 #tab-sessions .session-detail-action-btn {
+  padding: 6px 13px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+}
+html.ui-v2 #tab-sessions .session-detail-action-btn:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: var(--line-2);
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .session-resume-btn {
+  border: 0;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 800;
+  box-shadow: var(--shadow-primary);
+}
+html.ui-v2 #tab-sessions .session-resume-btn:hover:not(:disabled) {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  border-color: transparent;
+  color: var(--on-accent);
+  filter: brightness(1.08);
+}
+html.ui-v2 #tab-sessions .session-rename-btn,
+html.ui-v2 #tab-sessions .session-config-btn {
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--text-2);
+}
+
+/* Lineage strip. */
+html.ui-v2 #tab-sessions .session-detail-title .sd-lineage-kind {
+  border-color: rgba(var(--violet-rgb), .3);
+  background: rgba(var(--violet-rgb), .1);
+  color: var(--violet);
+  border-radius: 5px;
+}
+html.ui-v2 #tab-sessions .session-detail-title .sd-lineage-chip {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+html.ui-v2 #tab-sessions .session-detail-title button.sd-lineage-chip:hover {
+  border-color: rgba(var(--iris-rgb), .4);
+  color: var(--iris-2);
+}
+html.ui-v2 #tab-sessions .session-detail-title .sd-lineage-current {
+  border-color: rgba(var(--iris-rgb), .3);
+  background: rgba(var(--iris-rgb), .09);
+  color: var(--text);
+}
+
+/* Collapsible sections. */
+html.ui-v2 #tab-sessions .sd-section { border-bottom: 1px solid var(--line); }
+html.ui-v2 #tab-sessions .sd-section-header { padding: 10px 4px; }
+html.ui-v2 #tab-sessions .sd-section-header:hover { background: var(--hover-wash); }
+html.ui-v2 #tab-sessions .sd-section-title {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .sd-section-badge {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .sd-section-chevron { color: var(--text-3); }
+
+/* Log replay toolbar (pager / jump / filter / verbosity). */
+html.ui-v2 #tab-sessions .session-detail-log-status {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .session-detail-log-actions button,
+html.ui-v2 #tab-sessions .session-detail-log-actions select,
+html.ui-v2 #tab-sessions .session-detail-log-jump {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 11.5px;
+  padding: 5px 9px;
+}
+html.ui-v2 #tab-sessions .session-detail-log-actions button:hover:not(:disabled) {
+  border-color: var(--line-2);
+  background: var(--surface-3);
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions .session-detail-log-jump {
+  font-family: var(--mono);
+}
+html.ui-v2 #tab-sessions .session-detail-log-jump:focus,
+html.ui-v2 #tab-sessions .session-detail-log-actions select:focus {
+  outline: none;
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+html.ui-v2 #tab-sessions .session-detail-logs .log-entry:hover { background: var(--hover-wash); }
+html.ui-v2 #tab-sessions .session-detail-logs .log-ts {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .session-detail-logs .log-turn-sep {
+  border-top: 1px solid var(--line);
+  color: var(--text-3);
+  font-size: 10.5px;
+}
+
+/* Recordings player (session-detail instance only — fragment 46's live
+   recording chrome is another phase's surface). */
+html.ui-v2 #tab-sessions #session-detail-recordings {
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--code-bg);
+  margin: 6px 0 10px;
+}
+html.ui-v2 #tab-sessions #session-detail-recordings .session-rec-header {
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  color: var(--text-2);
+  font-size: 12px;
+}
+html.ui-v2 #tab-sessions #session-detail-recordings .session-rec-header select {
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 4px 8px;
+}
+html.ui-v2 #tab-sessions #session-detail-recordings .recording-timeline {
+  background: var(--bg-1);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 #tab-sessions #session-detail-recordings .timeline-bar { background: var(--surface-3); }
+html.ui-v2 #tab-sessions #session-detail-recordings .timeline-progress {
+  background: linear-gradient(90deg, var(--iris), var(--violet));
+  opacity: .35;
+}
+html.ui-v2 #tab-sessions #session-detail-recordings .timeline-cursor {
+  width: 2px;
+  background: var(--iris);
+  box-shadow: 0 0 0 1px rgba(var(--iris-rgb), .4);
+}
+html.ui-v2 #tab-sessions #session-detail-recordings .recording-controls {
+  background: var(--bg-1);
+  padding: 6px 12px;
+}
+html.ui-v2 #tab-sessions #session-detail-recordings .recording-controls button {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+}
+html.ui-v2 #tab-sessions #session-detail-recordings .recording-controls button:hover {
+  background: var(--surface-3);
+  border-color: var(--line-2);
+  color: var(--text);
+}
+html.ui-v2 #tab-sessions #session-detail-recordings .recording-controls select {
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+html.ui-v2 #tab-sessions #session-detail-recordings .rec-time {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+/* Frames gallery. */
+html.ui-v2 #tab-sessions .sd-frame-group-header { color: var(--text-2); font-size: 12px; font-weight: 600; }
+html.ui-v2 #tab-sessions .sd-frame-group-header:hover { color: var(--text); }
+html.ui-v2 #tab-sessions .sd-frame-group-badge {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .sd-frame-thumb {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--code-bg);
+  transition: border-color var(--t-fast), transform var(--t-fast);
+}
+html.ui-v2 #tab-sessions .sd-frame-thumb:hover {
+  border-color: rgba(var(--iris-rgb), .5);
+}
+html.ui-v2 #tab-sessions .sd-frame-thumb .frame-label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  background: rgba(6, 7, 10, .72);
+  color: var(--text-2);
+}
+html.ui-v2 .sd-frame-lightbox { background: rgba(6, 7, 10, .85); }
+
+/* Generic empty voice inside the detail body ("Loading...", errors). */
+html.ui-v2 #tab-sessions .session-detail .empty-state {
+  padding: 26px 12px;
+  color: var(--text-3);
+  font-size: 13px;
+}
+
+/* ══ responsive ═════════════════════════════════════════════════════ */
+
+@media (max-width: 980px) {
+  html.ui-v2 #tab-sessions .sessions-aggregate { grid-template-columns: repeat(2, 1fr); }
+  html.ui-v2 #tab-sessions .sessions-header.ui2-tools-open .sessions-toolbar,
+  html.ui-v2 #tab-sessions .worktrees-header .sessions-toolbar {
+    grid-template-columns: 1fr 1fr;
+  }
+  html.ui-v2 #tab-sessions .session-card { padding-right: 17px; }
+  html.ui-v2 #tab-sessions .session-card .sc-actions {
+    position: static;
+    transform: none;
+    max-width: none;
+    justify-content: flex-start;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+  }
+}
+@media (max-width: 640px) {
+  html.ui-v2 #tab-sessions .sessions-header.ui2-tools-open .sessions-toolbar,
+  html.ui-v2 #tab-sessions .worktrees-header .sessions-toolbar {
+    grid-template-columns: 1fr;
+  }
+}
 </style>
 <!-- ── static/app/20-shell.html ── -->
 </head>
@@ -16102,6 +17674,13 @@ html.ui-v2 #tab-debug .ui-empty-hint {
                       <option value="direct">Direct &mdash; single agent</option>
                     </select>
                   </label>
+                </div>
+                <!-- ui-v2 only: the design's green happy-path banner. Stays
+                     hidden in v1 forever — JS unhides it exclusively under
+                     the ui-v2 flag and only when fuel is positively known. -->
+                <div id="new-session-fueled-banner" class="sessions-fueled-banner hidden">
+                  <span class="sessions-fueled-dot" aria-hidden="true"></span>
+                  <span class="sessions-fueled-text" id="new-session-fueled-text">Fueled &mdash; model credentials active, ready to launch.</span>
                 </div>
                 <div id="new-session-unfueled-banner" class="sessions-unfueled-banner hidden">
                   <span class="sessions-unfueled-text">No model credentials on this daemon &mdash; the internal agent can&rsquo;t start. External agents (Codex, Claude Code) sign in with their own accounts and still work.</span>
@@ -71965,6 +73544,10 @@ function setNewSessionStartButtonPending(pending) {
 // bindings). Unknown never blocks.
 let daemonUnfueledCached = null;
 let daemonFuelProbeInFlight = false;
+// ui-v2 fueled-banner detail: which providers the key-status probe saw.
+// null = never probed; [] = probed and none (or probe failed — generic
+// copy, no re-hammering).
+let daemonFuelProviders = null;
 
 function daemonInternalUnfueled() {
   const status = dashboardControlTransport?.lastStatus;
@@ -71974,15 +73557,28 @@ function daemonInternalUnfueled() {
 
 function refreshFuelStateForBanner() {
   const status = dashboardControlTransport?.lastStatus;
-  if (status && typeof status.fueled === 'boolean') return;
-  if (daemonUnfueledCached !== null || daemonFuelProbeInFlight) return;
+  // ui-v2's green Fueled banner names the fueled providers, so under the
+  // flag the one-shot probe also runs when the status frame already
+  // answered the boolean; v1 keeps the original short-circuits.
+  const wantProviders = typeof ui2Enabled === 'function' && ui2Enabled() && daemonFuelProviders === null;
+  if (status && typeof status.fueled === 'boolean' && !wantProviders) return;
+  if ((daemonUnfueledCached !== null && !wantProviders) || daemonFuelProbeInFlight) return;
   if (typeof fetchApiKeyStatus !== 'function') return;
   daemonFuelProbeInFlight = true;
   fetchApiKeyStatus()
     .then(d => {
-      if (d && !d.error) daemonUnfueledCached = !(d.openai || d.anthropic || d.gemini);
+      if (d && !d.error) {
+        if (daemonUnfueledCached === null) daemonUnfueledCached = !(d.openai || d.anthropic || d.gemini);
+        daemonFuelProviders = [
+          d.anthropic ? 'Anthropic' : '',
+          d.openai ? 'OpenAI' : '',
+          d.gemini ? 'Gemini' : '',
+        ].filter(Boolean);
+      } else if (daemonFuelProviders === null) {
+        daemonFuelProviders = [];
+      }
     })
-    .catch(() => {})
+    .catch(() => { if (daemonFuelProviders === null) daemonFuelProviders = []; })
     .finally(() => {
       daemonFuelProbeInFlight = false;
       updateNewSessionFuelBanner();
@@ -72060,6 +73656,80 @@ window.qa = Object.assign(window.qa || {}, {
 
 });
 
+// ── ui-v2 execution segmented control (design overhaul) ──
+// The reference's Auto / Orchestrate / Direct segmented choice with a
+// per-choice note (execInfo copy, verbatim — it matches the current
+// semantics). The v1 <select id="new-session-execution"> stays the source
+// of truth (startNewSession reads it; updateNewSessionAgentFields drives
+// its disabled state) — the segments only proxy value + disabled, and the
+// select is hidden by ui2-sessions.css under the flag. v1 DOM untouched.
+const UI2_EXEC_CHOICES = [
+  { value: '', label: 'Auto', note: 'The task-size heuristic decides between a single agent and supervised sub-agents.' },
+  { value: 'orchestrate', label: 'Orchestrate', note: 'Delegates the task to supervised sub-agents working in isolated git worktrees.' },
+  { value: 'direct', label: 'Direct', note: 'A single agent handles the whole task — no delegation.' },
+];
+let ui2ExecSegEl = null;
+let ui2ExecNoteEl = null;
+
+function ui2SyncExecSeg() {
+  if (!ui2ExecSegEl) return;
+  const sel = document.getElementById('new-session-execution');
+  if (!sel) return;
+  const value = sel.value || '';
+  const disabled = !!sel.disabled;
+  ui2ExecSegEl.classList.toggle('disabled', disabled);
+  for (const btn of ui2ExecSegEl.querySelectorAll('button[data-exec]')) {
+    const active = (btn.dataset.exec || '') === value;
+    btn.classList.toggle('is-accent', active && !disabled);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    btn.disabled = disabled;
+  }
+  if (ui2ExecNoteEl) {
+    const choice = UI2_EXEC_CHOICES.find(c => c.value === value) || UI2_EXEC_CHOICES[0];
+    ui2ExecNoteEl.textContent = disabled
+      ? 'Execution shape applies to the internal agent — external CLIs run their own loops.'
+      : choice.note;
+  }
+}
+
+if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+  const wrap = document.getElementById('new-session-execution-wrap');
+  if (wrap && wrap.parentElement) {
+    const field = document.createElement('div');
+    field.className = 'sessions-new-session-field ui2-exec-field';
+    const label = document.createElement('span');
+    label.className = 'ui2-exec-label';
+    label.textContent = 'Execution';
+    const seg = document.createElement('div');
+    seg.className = 'ui2-seg ui2-exec-seg';
+    seg.setAttribute('role', 'group');
+    seg.setAttribute('aria-label', 'Execution shape');
+    for (const choice of UI2_EXEC_CHOICES) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.dataset.exec = choice.value;
+      btn.textContent = choice.label;
+      btn.title = choice.note;
+      btn.addEventListener('click', () => {
+        const sel = document.getElementById('new-session-execution');
+        if (!sel || sel.disabled) return;
+        sel.value = choice.value;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        ui2SyncExecSeg();
+      });
+      seg.appendChild(btn);
+    }
+    const note = document.createElement('div');
+    note.className = 'sessions-agent-note ui2-exec-note';
+    field.append(label, seg, note);
+    ui2ExecSegEl = seg;
+    ui2ExecNoteEl = note;
+    wrap.after(field);
+    document.getElementById('new-session-execution')?.addEventListener('change', ui2SyncExecSeg);
+    ui2SyncExecSeg();
+  }
+}
+
 function updateNewSessionFuelBanner() {
   const banner = document.getElementById('new-session-unfueled-banner');
   if (!banner) return;
@@ -72073,6 +73743,31 @@ function updateNewSessionFuelBanner() {
     btn.disabled = show;
     btn.title = show ? 'Internal sessions need an API key or a vault credential lease' : '';
   }
+
+  // ui-v2 only: the design's green happy-path banner. Shown exclusively
+  // when fuel is positively known (status frame `fueled === true` or the
+  // key probe found a provider) — an unknown state shows neither banner,
+  // never a claimed one. v1 never unhides this element.
+  const fueledBanner = document.getElementById('new-session-fueled-banner');
+  if (fueledBanner) {
+    const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
+    const status = dashboardControlTransport?.lastStatus;
+    const knownFueled = (status && status.fueled === true) || daemonUnfueledCached === false;
+    const showFueled = ui2 && internalSelected && !show && knownFueled;
+    fueledBanner.classList.toggle('hidden', !showFueled);
+    if (showFueled) {
+      const textEl = document.getElementById('new-session-fueled-text');
+      const names = Array.isArray(daemonFuelProviders) && daemonFuelProviders.length > 0
+        ? daemonFuelProviders.join(' + ')
+        : '';
+      if (textEl) {
+        textEl.textContent = names
+          ? `Fueled — ${names} credentials active, ready to launch.`
+          : 'Fueled — model credentials active, ready to launch.';
+      }
+    }
+  }
+  ui2SyncExecSeg();
 }
 
 function setNewSessionSpawnNotice(kind, text, action) {
@@ -72409,6 +74104,89 @@ if (ui2Enabled()) {
     sub.textContent = 'Diagnostics, the headless observer display, and managed browser workspaces.';
     head.append(title, sub);
     debugPane.prepend(head);
+  }
+
+  // Sessions page header (same reference pattern): the design's in-page
+  // title above the sub-tabs. v1 markup never had one — flag-gated only.
+  const sessionsContainer = document.querySelector('#tab-sessions .sessions-container');
+  if (sessionsContainer) {
+    const head = document.createElement('header');
+    head.className = 'ui2-page-head';
+    const title = document.createElement('h2');
+    title.className = 'ui2-page-title';
+    title.textContent = 'Sessions';
+    const sub = document.createElement('p');
+    sub.className = 'ui2-page-sub';
+    sub.textContent = 'Every run across all backends — browse, search, resume, or fork.';
+    head.append(title, sub);
+    sessionsContainer.prepend(head);
+  }
+
+  // Toolbar folds (design "power one reveal away"): the reference Recent
+  // pane has no filter row, but every current control survives — behind a
+  // per-pane "Filters & sort" toggle. DOM is only ever hidden/shown by a
+  // header class; the toolbar's controls, ids, and menu logic are shared
+  // with v1 untouched. Open state persists per pane; the count bubble
+  // reads active refinements straight from the DOM (checked filter boxes,
+  // non-empty quick search, non-default sort, subagent toggle).
+  for (const fold of [
+    { pane: 'sessions-pane-recent', key: 'intendant.ui2.sessionsTools.recent' },
+    { pane: 'sessions-pane-deep', key: 'intendant.ui2.sessionsTools.deep' },
+    { pane: 'sessions-pane-worktrees', key: 'intendant.ui2.sessionsTools.worktrees' },
+  ]) {
+    const pane = document.getElementById(fold.pane);
+    const header = pane ? pane.querySelector('.sessions-header') : null;
+    const titleLine = header ? header.querySelector('.sessions-title-line') : null;
+    const toolbar = header ? header.querySelector('.sessions-toolbar') : null;
+    if (!header || !titleLine || !toolbar) continue;
+    let open = false;
+    try { open = localStorage.getItem(fold.key) === '1'; } catch (e) { /* private mode */ }
+    header.classList.toggle('ui2-tools-open', open);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ui-btn ui2-tools-toggle';
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    const label = document.createElement('span');
+    label.textContent = 'Filters & sort';
+    const badge = document.createElement('span');
+    badge.className = 'ui2-tools-badge';
+    const chev = document.createElement('span');
+    chev.className = 'ui2-tools-chev';
+    chev.innerHTML = ui2Icon('chev', 14);
+    btn.append(label, badge, chev);
+    const refreshBadge = () => {
+      let n = toolbar.querySelectorAll('.sessions-multi-filter-menu input:checked').length;
+      for (const input of toolbar.querySelectorAll('input[type="search"]')) {
+        if (input.value.trim()) n += 1;
+      }
+      const subagents = toolbar.querySelector('#sessions-show-subagents');
+      if (subagents && subagents.checked) n += 1;
+      for (const sel of toolbar.querySelectorAll('.sessions-sort select')) {
+        if (sel.selectedIndex > 0) n += 1;
+      }
+      // Worktree kind toggles count only when off their defaults.
+      for (const id of ['filter-worktrees-active', 'filter-worktrees-dirty', 'filter-worktrees-unmerged']) {
+        const t = toolbar.querySelector(`#${id}`);
+        if (t && !t.checked) n += 1;
+      }
+      const main = toolbar.querySelector('#filter-worktrees-main');
+      if (main && main.checked) n += 1;
+      badge.textContent = n > 0 ? String(n) : '';
+      badge.classList.toggle('hidden', n === 0);
+    };
+    btn.addEventListener('click', () => {
+      const next = !header.classList.contains('ui2-tools-open');
+      header.classList.toggle('ui2-tools-open', next);
+      btn.setAttribute('aria-expanded', next ? 'true' : 'false');
+      try { localStorage.setItem(fold.key, next ? '1' : '0'); } catch (e) { /* private mode */ }
+      refreshBadge(); // restored-from-localStorage filters set no events
+    });
+    toolbar.addEventListener('change', refreshBadge);
+    toolbar.addEventListener('input', refreshBadge);
+    refreshBadge();
+    const refreshBtn = titleLine.querySelector('.sessions-refresh');
+    if (refreshBtn) titleLine.insertBefore(btn, refreshBtn);
+    else titleLine.appendChild(btn);
   }
 }
 
@@ -74282,14 +76060,51 @@ function renderSessionsAggregate(sessions, el) {
   if (detailsLoading) sessionsSubParts.push('visible so far');
   if (externalSessions > 0) sessionsSubParts.push(`${externalSessions.toLocaleString()} external`);
   if (activeSessions > 0) sessionsSubParts.push(`${activeSessions.toLocaleString()} active`);
-  const cards = [
-    { label: 'Sessions', value: totalSessions.toLocaleString(), sub: sessionsSubParts.join(' · ') },
-    { label: 'Total Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
-    { label: 'Input', value: detailsLoading ? loadingValue : totalInput.toLocaleString(), loading: detailsLoading },
-    { label: 'Cached', value: detailsLoading ? loadingValue : totalCached.toLocaleString(), loading: detailsLoading },
-    { label: 'Output', value: detailsLoading ? loadingValue : totalOutput.toLocaleString(), loading: detailsLoading },
-    { label: 'Disk', value: detailsLoading ? loadingValue : _fmtBytes(totalDiskBytes), loading: detailsLoading },
-  ];
+  const sessionsTile = { label: 'Sessions', value: totalSessions.toLocaleString(), sub: sessionsSubParts.join(' · ') };
+  const inputTile = { label: 'Input', value: detailsLoading ? loadingValue : totalInput.toLocaleString(), loading: detailsLoading };
+  const cachedTile = { label: 'Cached', value: detailsLoading ? loadingValue : totalCached.toLocaleString(), loading: detailsLoading };
+  const outputTile = { label: 'Output', value: detailsLoading ? loadingValue : totalOutput.toLocaleString(), loading: detailsLoading };
+  const diskTile = { label: 'Disk', value: detailsLoading ? loadingValue : _fmtBytes(totalDiskBytes), loading: detailsLoading };
+
+  let cards;
+  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+    // ui-v2 (design overhaul): the reference KPI set — Sessions · Tokens ·
+    // Cost · Active days — leads, with the v1 breakdown tiles kept as a
+    // second row (re-homed, not deleted). All values are real: cost sums
+    // per-row estimates; active days counts distinct calendar days that
+    // saw session activity (created or last changed — the honest
+    // client-side read; no per-day server metric exists).
+    const totalCost = sessions.reduce((sum, s) => sum + (s.estimated_cost || 0), 0);
+    const activeDayKeys = new Set();
+    for (const s of sessions) {
+      for (const value of [s.created_at, s.updated_at || s.changed_at]) {
+        if (!value) continue;
+        const t = Date.parse(value);
+        if (Number.isNaN(t)) continue;
+        const d = new Date(t);
+        activeDayKeys.add(`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`);
+      }
+    }
+    cards = [
+      sessionsTile,
+      { label: 'Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
+      {
+        label: 'Cost',
+        value: detailsLoading
+          ? loadingValue
+          : '$' + totalCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+        loading: detailsLoading,
+      },
+      { label: 'Active days', value: activeDayKeys.size.toLocaleString(), sub: detailsLoading ? 'visible so far' : '' },
+      inputTile, cachedTile, outputTile, diskTile,
+    ];
+  } else {
+    cards = [
+      sessionsTile,
+      { label: 'Total Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
+      inputTile, cachedTile, outputTile, diskTile,
+    ];
+  }
 
   renderAggregateStatTiles(el, cards);
 }
@@ -74819,6 +76634,9 @@ function buildSessionCard(m, derived, ctx) {
   if (!isExternal && hasExternalBackend && backendSource && backendSource !== 'intendant') {
     sourceEl.title = `${prettyAgentName(backendSource) || backendSource} backend`;
   }
+  // ui-v2 badge tint is CSS-keyed off the normalized source id (native=iris,
+  // codex=neutral, claude-code=amber); v1 renders no attribute.
+  if (typeof ui2Enabled === 'function' && ui2Enabled()) sourceEl.dataset.src = source;
   top.appendChild(sourceEl);
 
   if (rowIsPartial) {

@@ -20,6 +20,89 @@ if (ui2Enabled()) {
     head.append(title, sub);
     debugPane.prepend(head);
   }
+
+  // Sessions page header (same reference pattern): the design's in-page
+  // title above the sub-tabs. v1 markup never had one — flag-gated only.
+  const sessionsContainer = document.querySelector('#tab-sessions .sessions-container');
+  if (sessionsContainer) {
+    const head = document.createElement('header');
+    head.className = 'ui2-page-head';
+    const title = document.createElement('h2');
+    title.className = 'ui2-page-title';
+    title.textContent = 'Sessions';
+    const sub = document.createElement('p');
+    sub.className = 'ui2-page-sub';
+    sub.textContent = 'Every run across all backends — browse, search, resume, or fork.';
+    head.append(title, sub);
+    sessionsContainer.prepend(head);
+  }
+
+  // Toolbar folds (design "power one reveal away"): the reference Recent
+  // pane has no filter row, but every current control survives — behind a
+  // per-pane "Filters & sort" toggle. DOM is only ever hidden/shown by a
+  // header class; the toolbar's controls, ids, and menu logic are shared
+  // with v1 untouched. Open state persists per pane; the count bubble
+  // reads active refinements straight from the DOM (checked filter boxes,
+  // non-empty quick search, non-default sort, subagent toggle).
+  for (const fold of [
+    { pane: 'sessions-pane-recent', key: 'intendant.ui2.sessionsTools.recent' },
+    { pane: 'sessions-pane-deep', key: 'intendant.ui2.sessionsTools.deep' },
+    { pane: 'sessions-pane-worktrees', key: 'intendant.ui2.sessionsTools.worktrees' },
+  ]) {
+    const pane = document.getElementById(fold.pane);
+    const header = pane ? pane.querySelector('.sessions-header') : null;
+    const titleLine = header ? header.querySelector('.sessions-title-line') : null;
+    const toolbar = header ? header.querySelector('.sessions-toolbar') : null;
+    if (!header || !titleLine || !toolbar) continue;
+    let open = false;
+    try { open = localStorage.getItem(fold.key) === '1'; } catch (e) { /* private mode */ }
+    header.classList.toggle('ui2-tools-open', open);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ui-btn ui2-tools-toggle';
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    const label = document.createElement('span');
+    label.textContent = 'Filters & sort';
+    const badge = document.createElement('span');
+    badge.className = 'ui2-tools-badge';
+    const chev = document.createElement('span');
+    chev.className = 'ui2-tools-chev';
+    chev.innerHTML = ui2Icon('chev', 14);
+    btn.append(label, badge, chev);
+    const refreshBadge = () => {
+      let n = toolbar.querySelectorAll('.sessions-multi-filter-menu input:checked').length;
+      for (const input of toolbar.querySelectorAll('input[type="search"]')) {
+        if (input.value.trim()) n += 1;
+      }
+      const subagents = toolbar.querySelector('#sessions-show-subagents');
+      if (subagents && subagents.checked) n += 1;
+      for (const sel of toolbar.querySelectorAll('.sessions-sort select')) {
+        if (sel.selectedIndex > 0) n += 1;
+      }
+      // Worktree kind toggles count only when off their defaults.
+      for (const id of ['filter-worktrees-active', 'filter-worktrees-dirty', 'filter-worktrees-unmerged']) {
+        const t = toolbar.querySelector(`#${id}`);
+        if (t && !t.checked) n += 1;
+      }
+      const main = toolbar.querySelector('#filter-worktrees-main');
+      if (main && main.checked) n += 1;
+      badge.textContent = n > 0 ? String(n) : '';
+      badge.classList.toggle('hidden', n === 0);
+    };
+    btn.addEventListener('click', () => {
+      const next = !header.classList.contains('ui2-tools-open');
+      header.classList.toggle('ui2-tools-open', next);
+      btn.setAttribute('aria-expanded', next ? 'true' : 'false');
+      try { localStorage.setItem(fold.key, next ? '1' : '0'); } catch (e) { /* private mode */ }
+      refreshBadge(); // restored-from-localStorage filters set no events
+    });
+    toolbar.addEventListener('change', refreshBadge);
+    toolbar.addEventListener('input', refreshBadge);
+    refreshBadge();
+    const refreshBtn = titleLine.querySelector('.sessions-refresh');
+    if (refreshBtn) titleLine.insertBefore(btn, refreshBtn);
+    else titleLine.appendChild(btn);
+  }
 }
 
 function toggleDebugScreen() {
@@ -1892,14 +1975,51 @@ function renderSessionsAggregate(sessions, el) {
   if (detailsLoading) sessionsSubParts.push('visible so far');
   if (externalSessions > 0) sessionsSubParts.push(`${externalSessions.toLocaleString()} external`);
   if (activeSessions > 0) sessionsSubParts.push(`${activeSessions.toLocaleString()} active`);
-  const cards = [
-    { label: 'Sessions', value: totalSessions.toLocaleString(), sub: sessionsSubParts.join(' · ') },
-    { label: 'Total Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
-    { label: 'Input', value: detailsLoading ? loadingValue : totalInput.toLocaleString(), loading: detailsLoading },
-    { label: 'Cached', value: detailsLoading ? loadingValue : totalCached.toLocaleString(), loading: detailsLoading },
-    { label: 'Output', value: detailsLoading ? loadingValue : totalOutput.toLocaleString(), loading: detailsLoading },
-    { label: 'Disk', value: detailsLoading ? loadingValue : _fmtBytes(totalDiskBytes), loading: detailsLoading },
-  ];
+  const sessionsTile = { label: 'Sessions', value: totalSessions.toLocaleString(), sub: sessionsSubParts.join(' · ') };
+  const inputTile = { label: 'Input', value: detailsLoading ? loadingValue : totalInput.toLocaleString(), loading: detailsLoading };
+  const cachedTile = { label: 'Cached', value: detailsLoading ? loadingValue : totalCached.toLocaleString(), loading: detailsLoading };
+  const outputTile = { label: 'Output', value: detailsLoading ? loadingValue : totalOutput.toLocaleString(), loading: detailsLoading };
+  const diskTile = { label: 'Disk', value: detailsLoading ? loadingValue : _fmtBytes(totalDiskBytes), loading: detailsLoading };
+
+  let cards;
+  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+    // ui-v2 (design overhaul): the reference KPI set — Sessions · Tokens ·
+    // Cost · Active days — leads, with the v1 breakdown tiles kept as a
+    // second row (re-homed, not deleted). All values are real: cost sums
+    // per-row estimates; active days counts distinct calendar days that
+    // saw session activity (created or last changed — the honest
+    // client-side read; no per-day server metric exists).
+    const totalCost = sessions.reduce((sum, s) => sum + (s.estimated_cost || 0), 0);
+    const activeDayKeys = new Set();
+    for (const s of sessions) {
+      for (const value of [s.created_at, s.updated_at || s.changed_at]) {
+        if (!value) continue;
+        const t = Date.parse(value);
+        if (Number.isNaN(t)) continue;
+        const d = new Date(t);
+        activeDayKeys.add(`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`);
+      }
+    }
+    cards = [
+      sessionsTile,
+      { label: 'Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
+      {
+        label: 'Cost',
+        value: detailsLoading
+          ? loadingValue
+          : '$' + totalCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+        loading: detailsLoading,
+      },
+      { label: 'Active days', value: activeDayKeys.size.toLocaleString(), sub: detailsLoading ? 'visible so far' : '' },
+      inputTile, cachedTile, outputTile, diskTile,
+    ];
+  } else {
+    cards = [
+      sessionsTile,
+      { label: 'Total Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
+      inputTile, cachedTile, outputTile, diskTile,
+    ];
+  }
 
   renderAggregateStatTiles(el, cards);
 }
