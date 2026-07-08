@@ -21,7 +21,14 @@ pub(crate) fn unix_timestamp() -> i64 {
         .unwrap_or_default()
 }
 
-pub const DEFAULT_PROFILE: &str = "peer-operator";
+/// The profile a pairing yields when nobody states one — on `peer approve`
+/// without `--profile` (and no requested profile on the doorbell), and on
+/// the identity a `peer invite` pre-approves. Least-privilege by decision
+/// (2026-07-08): displays are viewable, input is not — an owner upgrades a
+/// specific peer explicitly (`peer approve --profile …` or
+/// `peer set-profile <fingerprint> --profile …`), rather than every unlabeled
+/// pairing arriving input-capable.
+pub const DEFAULT_PROFILE: &str = "read-only-display";
 const POLICY_DIR: &str = "peer-access-identities";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -858,6 +865,24 @@ pub fn normalize_fingerprint(raw: &str) -> Result<String, CallerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the least-privilege pairing default (owner decision,
+    /// 2026-07-08): an unlabeled pairing views displays and never holds
+    /// input. Widening this default back to an input-capable profile is a
+    /// security-posture change that must be made here, deliberately, not
+    /// inherited from a refactor.
+    #[test]
+    fn default_profile_is_least_privilege_display_view() {
+        assert_eq!(DEFAULT_PROFILE, "read-only-display");
+        assert!(profile_allows_operation(
+            DEFAULT_PROFILE,
+            PeerOperation::DisplayView
+        ));
+        assert!(!profile_allows_operation(
+            DEFAULT_PROFILE,
+            PeerOperation::DisplayInput
+        ));
+    }
 
     /// The dashboard's profile picker (`PEER_PROFILE_OPTIONS`) and alias
     /// map (`peerProfileMeta`) are static mirrors of [`PROFILES`] /

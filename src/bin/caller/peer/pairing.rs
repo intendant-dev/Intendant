@@ -326,7 +326,7 @@ fn print_help() {
     println!("    --port <N>           Port for the default Agent Card URL (default 8765)");
     println!("    --label <NAME>       Display label for this peer in the joining daemon");
     println!("    --client-name <NAME> Common name hint for the issued client certificate");
-    println!("    --profile <NAME>     Peer profile to request, approve, or set (default peer-operator; use peer-root for full peer access)");
+    println!("    --profile <NAME>     Peer profile to request, approve, or set (default read-only-display; peer-operator adds display input + tasks, peer-root is full peer access)");
     println!("    --requester-card-url <URL>  Optional Agent Card URL for the requesting daemon");
     println!();
     println!("NOTES:");

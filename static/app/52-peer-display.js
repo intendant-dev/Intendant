@@ -1664,14 +1664,14 @@ function setDaemonPairingStatus(id, msg, kind) {
 
 const PEER_PROFILE_OPTIONS = [
   {
+    profile: 'read-only-display',
+    label: 'Read-only display',
+    summary: 'Presence, stats, and display viewing. No input control. The default when no profile is stated.',
+  },
+  {
     profile: 'peer-operator',
     label: 'Peer operator',
     summary: 'Daemon-to-daemon display input, messages, tasks, and approvals. No settings or runtime control.',
-  },
-  {
-    profile: 'read-only-display',
-    label: 'Read-only display',
-    summary: 'Presence, stats, and display viewing. No input control.',
   },
   {
     profile: 'shared-session-spectator',
@@ -1751,7 +1751,9 @@ function peerProfileMeta(profile) {
 }
 
 function renderPeerProfileOptions(selected) {
-  const value = String(selected || 'peer-operator').toLowerCase();
+  // Mirrors the daemon's DEFAULT_PROFILE (access_policy.rs): an approval
+  // with no stated profile yields read-only-display.
+  const value = String(selected || 'read-only-display').toLowerCase();
   const selectedMeta = peerProfileMeta(value);
   return PEER_PROFILE_OPTIONS.map(({ profile, label, summary }) => (
     `<option value="${escapeHtml(profile)}" ${profile === selectedMeta.profile ? 'selected' : ''} title="${escapeHtml(summary)}">${escapeHtml(label)}</option>`
@@ -2011,12 +2013,14 @@ function renderPeerAccessRequests(requests) {
     const label = escapeHtml(req.requester_label || 'Unnamed daemon');
     const code = escapeHtml(req.code || '');
     const status = String(req.status || 'unknown').toLowerCase();
-    const role = peerProfileMeta(req.approved_profile || req.requested_profile || 'peer-operator');
+    // The || fallback mirrors the daemon's DEFAULT_PROFILE: a request with
+    // no stated profile is what an unadorned approval will grant.
+    const role = peerProfileMeta(req.approved_profile || req.requested_profile || 'read-only-display');
     const source = req.source_hint ? `Source ${escapeHtml(req.source_hint)}` : '';
     const expires = req.expires_at_unix ? `Expires ${escapeHtml(accessRequestTimeLabel(req.expires_at_unix))}` : '';
     const timing = [source, expires].filter(Boolean).join(' - ');
     const pending = status === 'pending';
-    const requestedProfile = req.approved_profile || req.requested_profile || 'peer-operator';
+    const requestedProfile = req.approved_profile || req.requested_profile || 'read-only-display';
     const roleLabel = req.approved_profile ? 'Approved peer profile' : 'Requested peer profile';
     return `
       <div class="daemon-access-request-card">
