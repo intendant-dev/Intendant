@@ -12911,7 +12911,7 @@ html.ui-v2 .acc-btn {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  min-height: 0;
+  min-height: 36px; /* one control height across form action rows */
   padding: 8px 14px;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -12933,7 +12933,7 @@ html.ui-v2 .acc-btn.primary {
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-weight: 800;
-  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  box-shadow: var(--shadow-primary);
 }
 html.ui-v2 .acc-btn.primary:hover {
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
@@ -13135,7 +13135,7 @@ html.ui-v2 .acc-hero-card {
 html.ui-v2 #access-identity-hero .acc-hero-card:first-child {
   background: linear-gradient(145deg, var(--surface-2), var(--surface));
   border-color: var(--line-2);
-  box-shadow: 0 12px 34px rgba(0, 0, 0, .28);
+  box-shadow: var(--shadow-card); /* token, not literal: light theme softens it */
 }
 html.ui-v2 .acc-hero-glyph {
   width: 44px;
@@ -13387,9 +13387,21 @@ html.ui-v2 .acc-choice-card:has(input:checked)::after {
   font-size: 10px;
   font-weight: 800;
 }
-html.ui-v2 .acc-choice-card .t { font-size: 13.5px; font-weight: 700; padding-right: 20px; }
+html.ui-v2 .acc-choice-card .t { font-size: 13.5px; font-weight: 700; padding-right: 32px; } /* clear the 17px ✓ badge + its 12px inset */
 html.ui-v2 .acc-choice-card .d { font-size: 11.5px; color: var(--text-2); }
 html.ui-v2 .acc-choice-card:has(input:disabled) { opacity: .55; cursor: not-allowed; }
+/* Keyboard focus: the selection inputs are visually hidden (opacity 0,
+   zero-size), so the browser ring lands on nothing. Draw it on the card
+   the keyboard user is actually looking at. */
+html.ui-v2 .acc-choice-card:has(input:focus-visible),
+html.ui-v2 .acc-role-card:has(input:focus-visible) {
+  outline: 2px solid var(--iris);
+  outline-offset: 2px;
+}
+html.ui-v2 .acc-status-toggle label:has(input:focus-visible) span {
+  outline: 2px solid var(--iris);
+  outline-offset: 2px;
+}
 html.ui-v2 .acc-detected {
   border: 1px solid rgba(var(--green-rgb), .26);
   border-radius: 10px;
@@ -13417,6 +13429,26 @@ html.ui-v2 .acc-field-grid select {
 html.ui-v2 .acc-field-grid input::placeholder { color: var(--text-3); }
 html.ui-v2 .acc-field-grid input:focus,
 html.ui-v2 .acc-field-grid select:focus {
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25);
+}
+/* Fields that carry their own border+ring focus treatment suppress the
+   global outline (double-ring otherwise; same convention as the chrome
+   search field). Keyboard visibility is preserved by the ring itself. */
+html.ui-v2 .acc-field-grid input:focus-visible,
+html.ui-v2 .acc-field-grid select:focus-visible,
+html.ui-v2 .acc-grant-fs-roots textarea:focus-visible,
+html.ui-v2 .daemon-pairing-row input:focus-visible,
+html.ui-v2 .daemon-pairing-row select:focus-visible,
+html.ui-v2 .daemon-add-row input:focus-visible,
+html.ui-v2 .daemon-pairing-textarea:focus-visible,
+html.ui-v2 #tab-access .coord-row input:focus-visible,
+html.ui-v2 #tab-access .coord-textarea:focus-visible {
+  outline: none;
+}
+html.ui-v2 .acc-grant-fs-roots textarea:focus,
+html.ui-v2 #tab-access .coord-row input:focus,
+html.ui-v2 #tab-access .coord-textarea:focus {
   border-color: var(--iris);
   box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25);
 }
@@ -13450,7 +13482,35 @@ html.ui-v2 .acc-grant-fs-scope {
   background: var(--bg-1);
   padding: 10px 12px;
 }
-html.ui-v2 .acc-grant-fs-scope summary { font-size: 12.5px; font-weight: 600; color: var(--text-2); }
+/* The fold grammar (custom ▸ caret), not the browser's default
+   disclosure triangle — every sibling fold on the pane speaks it. */
+html.ui-v2 .acc-grant-fs-scope > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-2);
+  user-select: none;
+}
+html.ui-v2 .acc-grant-fs-scope > summary::-webkit-details-marker { display: none; }
+html.ui-v2 .acc-grant-fs-scope > summary::before {
+  content: '\25B8';
+  color: var(--text-3);
+  font-size: 11px;
+  transition: transform var(--t-fast);
+}
+html.ui-v2 .acc-grant-fs-scope[open] > summary::before { transform: rotate(90deg); }
+html.ui-v2 .acc-grant-fs-scope > summary:hover { color: var(--text); }
+/* Read/write-roots captions wear the same eyebrow as sibling field labels. */
+html.ui-v2 .acc-grant-fs-roots > span {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
 html.ui-v2 .acc-grant-fs-roots textarea {
   border: 1px solid var(--line-2);
   border-radius: 10px;
@@ -13468,10 +13528,12 @@ html.ui-v2 .acc-status-toggle {
   overflow: visible;
 }
 html.ui-v2 .acc-status-toggle span {
+  display: inline-block;
   border-radius: 7px;
-  padding: 6px 14px;
+  padding: 5px 13px;
   font-size: 12.5px;
   font-weight: 700;
+  line-height: 18px; /* 3+3 wrapper + 5+5 pad + 18 line + 2 borders = 36, level with the row's buttons */
   color: var(--text-2);
   transition: background var(--t-fast), color var(--t-fast);
 }
@@ -13633,7 +13695,7 @@ html.ui-v2 .access-target-actions button.primary {
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-weight: 800;
-  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  box-shadow: var(--shadow-primary);
 }
 html.ui-v2 .access-target-actions button.primary:hover { filter: brightness(1.08); background: linear-gradient(180deg, var(--iris), var(--iris-deep)); }
 html.ui-v2 .access-target-actions button.danger {
@@ -13842,7 +13904,7 @@ html.ui-v2 .daemon-access-request-actions button.approve {
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-weight: 800;
-  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  box-shadow: var(--shadow-primary);
 }
 html.ui-v2 .daemon-access-request-actions button.approve:hover { filter: brightness(1.08); }
 html.ui-v2 .daemon-access-request-actions button.deny,
@@ -14046,6 +14108,27 @@ html.ui-v2 #tab-access .access-matrix-table td {
   color: var(--text-3);
   font-size: 11px;
 }
+/* Sticky policy column: with ~23 permission columns the row identity
+   scrolled out with the table; pin it (opaque background so pills pass
+   underneath, hairline seam marks the edge). The width floor stops the
+   policy blurbs collapsing into ten-line towers that inflate every row. */
+html.ui-v2 #tab-access .access-matrix-table th:first-child,
+html.ui-v2 #tab-access .access-matrix-table td:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  min-width: 200px;
+  max-width: 260px;
+  background: var(--surface);
+  box-shadow: inset -1px 0 0 var(--line);
+}
+html.ui-v2 #tab-access .access-matrix-table th:first-child { z-index: 2; background: var(--bg-1); }
+/* Scanning aid on a two-screen-wide table (deliberate on a read-only
+   grid): the wash keeps the row legible while the eye travels. */
+html.ui-v2 #tab-access .access-matrix-table tbody tr:hover td { background: var(--hover-wash); }
+html.ui-v2 #tab-access .access-matrix-table tbody tr:hover td:first-child {
+  background: color-mix(in srgb, var(--text) 4%, var(--surface));
+}
 html.ui-v2 #tab-access .access-matrix-policy {
   font-family: var(--mono);
   font-size: 12.5px;
@@ -14144,16 +14227,57 @@ html.ui-v2 #tab-access .access-model-status.failed {
 }
 
 /* ── shared bits ── */
+/* Empty states: centered quiet copy in a dashed placeholder frame (the
+   fleet's "+ Link a daemon" affordance grammar, minus the affordance). */
 html.ui-v2 #tab-access .access-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 64px;
+  padding: 18px 16px;
+  border: 1px dashed var(--line-2);
+  border-radius: 12px;
+  text-align: center;
   font-size: 12.5px;
   color: var(--text-3);
-  padding: 10px 0;
+}
+/* …but inside an already-framed model section, quiet text only —
+   a dashed box nested in a bordered card reads twice. */
+html.ui-v2 #tab-access .access-model-table .access-empty {
+  border: 0;
+  min-height: 0;
+  padding: 14px 16px;
 }
 
 /* ── responsive ── */
 @media (max-width: 940px) {
   html.ui-v2 #access-identity-hero { grid-template-columns: 1fr; }
   html.ui-v2 #tab-access .acc-explainer { grid-template-columns: 1fr; }
+  /* Model-inspector rows: the 4-track grid needs ~630px of floor — at
+     phone-ish widths it forced the whole pane to pan sideways. Stack:
+     name + status pill on the first line, meta and detail below. */
+  html.ui-v2 #tab-access .access-model-row { grid-template-columns: minmax(0, 1fr) auto; }
+  html.ui-v2 #tab-access .access-model-main { grid-column: 1; grid-row: 1; }
+  html.ui-v2 #tab-access .access-model-row .access-model-status { grid-column: 2; grid-row: 1; }
+  html.ui-v2 #tab-access .access-model-meta { grid-column: 1 / -1; grid-row: 2; }
+  html.ui-v2 #tab-access .access-model-detail {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
+/* Daemon target rows: five min-width tracks add up to ~930px — below
+   that the actions column vanished off the pane edge. Collapse to a
+   card: title row full-width, role/route side by side, chips and
+   actions on their own lines. */
+@media (max-width: 1000px) {
+  html.ui-v2 .access-target-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  html.ui-v2 .access-target-main,
+  html.ui-v2 .access-target-chips,
+  html.ui-v2 .access-target-actions { grid-column: 1 / -1; }
+  html.ui-v2 .access-target-actions { justify-content: flex-start; min-width: 0; }
 }
 /* ── static/app/ui2-terminal-files.css ── */
 /* ── ui-v2: Terminal + Files surfaces (design-overhaul P2) ─────────────
