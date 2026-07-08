@@ -19647,7 +19647,7 @@ html.ui-v2 #tab-stats .ui2-fold-body .usage-cards { margin-top: 12px; }
   html.ui-v2 #tab-stats .ui2-fold-hint { display: none; }
 }
 /* ── static/app/ui2-settings.css ── */
-/* ── ui-v2 Settings surface (design-overhaul P2) ─ qa-settings-2026-07-08 ─
+/* ── ui-v2 Settings surface (design-overhaul P2) ───────────────────────
    Everything here is scoped under `html.ui-v2` — v1 stays
    pixel-identical. ui2-settings.js re-parents the EXISTING Settings
    cards (ids + save path intact) into the design's four sections with a
@@ -20048,6 +20048,10 @@ html.ui-v2 .ui2-ro-value {
   border-radius: 6px;
   background: var(--surface-3);
   color: var(--iris-2);
+  max-width: 100%;
+  white-space: nowrap;   /* long model ids trail off; the pill never wraps */
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 html.ui-v2 .ui2-ro-note { border-top: 1px solid var(--line); padding-top: 12px; }
 
