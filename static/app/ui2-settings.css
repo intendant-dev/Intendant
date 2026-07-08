@@ -1,4 +1,4 @@
-/* ── ui-v2 Settings surface (design-overhaul P2) ───────────────────────
+/* ── ui-v2 Settings surface (design-overhaul P2) ─ qa-settings-2026-07-08 ─
    Everything here is scoped under `html.ui-v2` — v1 stays
    pixel-identical. ui2-settings.js re-parents the EXISTING Settings
    cards (ids + save path intact) into the design's four sections with a
@@ -76,7 +76,7 @@ html.ui-v2 .ui2-set-pane.active { display: flex; flex-direction: column; gap: 18
 /* ══ cards ══════════════════════════════════════════════════════════ */
 html.ui-v2 #tab-settings .ui-card {
   border: 1px solid var(--line);
-  border-radius: 15px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 20px 22px;
   margin: 0;
@@ -102,6 +102,10 @@ html.ui-v2 #tab-settings .ui-section-title {
 }
 html.ui-v2 #tab-settings .ui-section-sub {
   flex: 1 1 100%;
+  /* measure cap: full card width ran ~122ch. A max-width would clamp the
+     flex hypothetical size and let the sub slide up NEXT to the title
+     (basis 100% is the wrap forcer) — pad the right instead. */
+  padding-right: max(0px, calc(100% - 72ch));
   font-size: 12.5px;
   line-height: 1.55;
   color: var(--text-3);
@@ -129,6 +133,7 @@ html.ui-v2 #tab-settings .settings-row input[type="text"],
 html.ui-v2 #tab-settings .settings-row input[type="number"],
 html.ui-v2 #tab-settings .settings-row input[type="password"],
 html.ui-v2 #tab-settings .settings-row select {
+  flex: none;   /* v1 sets flex:1 — un-flexed so the widths below are real */
   width: 280px;
   max-width: 52%;
   border: 1px solid var(--line-2);
@@ -139,9 +144,24 @@ html.ui-v2 #tab-settings .settings-row select {
   font-size: 12.5px;
   padding: 8px 12px;
   outline: none;
+  text-overflow: ellipsis;   /* long values + placeholders trail off, not clip */
   transition: border-color var(--t-med), box-shadow var(--t-med);
 }
 html.ui-v2 #tab-settings .settings-row input[type="number"] { width: 110px; }
+/* Selects drop the native widget chrome for the input box + the
+   session-switcher chevron (same fixed mid-gray — data URIs can't
+   consume tokens; #6C7482 reads on both themes). */
+html.ui-v2 #tab-settings .settings-row select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 30px;
+  background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="%236C7482" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>');
+  background-repeat: no-repeat;
+  background-position: right 11px center;
+}
+/* Empty key-status ticks reserve a 16px column and push the API-key
+   inputs off the shared control right edge — show them only once set. */
+html.ui-v2 #tab-settings .key-status:empty { display: none; }
 html.ui-v2 #tab-settings .settings-row input:focus-visible,
 html.ui-v2 #tab-settings .settings-row select:focus-visible {
   border-color: var(--iris);
@@ -182,6 +202,11 @@ html.ui-v2 #tab-settings .settings-row input[type="checkbox"]::after {
 }
 html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:checked { background: var(--iris); }
 html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:checked::after { left: 20px; }
+/* Light theme: the off track (surface-3) sits on a white card — a
+   hairline keeps the pill legible without moving the knob geometry. */
+html.ui-v2[data-theme="light"] #tab-settings .settings-row input[type="checkbox"]:not(:checked) {
+  box-shadow: inset 0 0 0 1px var(--line-2);
+}
 html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:focus-visible {
   outline: 2px solid var(--iris);
   outline-offset: 2px;
@@ -284,6 +309,7 @@ html.ui-v2 .ui2-auto-dial .ui2-seg-btn { flex: 1; padding: 10px 13px; font-size:
 html.ui-v2 .ui2-auto-desc {
   margin: 14px 2px 0;
   min-height: 40px;
+  max-width: 72ch;
   font-size: 13.5px;
   line-height: 1.55;
   color: var(--text-2);
@@ -316,6 +342,7 @@ html.ui-v2 .ui2-rule-label {
 }
 html.ui-v2 .ui2-rule-sub {
   margin-top: 2px;
+  max-width: 72ch;
   font-size: 11.5px;
   line-height: 1.45;
   color: var(--text-3);
@@ -384,6 +411,15 @@ html.ui-v2 #tab-settings .settings-note {
   line-height: 1.55;
   color: var(--text-3);
 }
+/* Long-form footnotes: cap the measure at ~72ch WITHOUT shortening the
+   full-width divider some of them carry (border wraps the padding box,
+   so a right pad confines the text and the hairline still spans). */
+html.ui-v2 #tab-settings .settings-note,
+html.ui-v2 .ui2-auto-gates,
+html.ui-v2 .ui2-rules-note,
+html.ui-v2 .ui2-appearance-note {
+  padding-right: max(2px, calc(100% - 72ch));
+}
 html.ui-v2 #tab-settings .settings-note code {
   font-family: var(--mono);
   font-size: 11px;
@@ -410,7 +446,13 @@ html.ui-v2 #tab-settings .settings-keys-actions {
   padding-top: 14px;
   border-top: 1px solid var(--line);
 }
-html.ui-v2 #tab-settings .settings-env-overrides { margin-top: 4px; }
+html.ui-v2 #tab-settings .settings-env-overrides {
+  margin-top: 4px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;   /* v1 ships 6px + bare bg — off the v2 ladder */
+  background: var(--surface);
+}
 html.ui-v2 #tab-settings .settings-env-overrides h4 {
   margin: 0 0 8px;
   font-family: var(--sans);
@@ -456,7 +498,7 @@ html.ui-v2 #tab-settings .settings-save-row {
   align-items: center;
   gap: 10px;
   margin: 2px 0 0;
-  padding: 14px 2px 0;
+  padding: 14px 0 0;   /* flush: Save's left edge shares the card edge */
   border-top: 0;
   background: transparent;
   position: static;
