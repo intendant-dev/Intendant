@@ -255,6 +255,10 @@ pub(crate) enum RouteHandlerId {
     AccessConnectClaimCode,
     AccessConnectConfig,
     AccessConnectUnclaim,
+    /// Trust-tier settings pair (docs/src/trust-tiers.md): the daemon
+    /// tier label and the hosted-control ceiling knob. One handler, two
+    /// paths, switched on `req_path`.
+    AccessTierSettings,
     DashboardTargets,
     /// The whole /api/peers registry + pairing sub-router, moved
     /// verbatim (its internal shapes stay as they were; leaf-shape
@@ -962,6 +966,22 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::AccessConnectUnclaim,
         "Release this daemon's claim binding at the rendezvous (daemon-signed)",
     ),
+    fleet_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/access/tier"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessTierSettings,
+        "Set this daemon's trust tier label (integrated/disposable; null clears)",
+    ),
+    fleet_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/access/hosted-ceiling"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessTierSettings,
+        "Set the hosted-control ceiling role for hosted-provenance sessions",
+    ),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/dashboard/targets"),
@@ -1417,6 +1437,7 @@ mod tests {
             RouteHandlerId::AccessIamGrants,
             RouteHandlerId::AccessOrgApplyRenew,
             RouteHandlerId::AccessOrgManage,
+            RouteHandlerId::AccessTierSettings,
             RouteHandlerId::McpStream,
         ];
         let mut seen: HashSet<RouteHandlerId> = HashSet::new();

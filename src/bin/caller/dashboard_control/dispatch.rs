@@ -125,6 +125,7 @@ pub(crate) fn control_frame_response(
                             &material,
                             mode.as_deref(),
                             runtime.grant.label(),
+                            runtime.grant.custody_origin_class(),
                             ttl_ms,
                             offline_ms,
                         ) {
@@ -176,6 +177,7 @@ pub(crate) fn control_frame_response(
                     let revoked = crate::credential_leases::revoke(
                         selector.as_deref(),
                         runtime.grant.label(),
+                        runtime.grant.custody_origin_class(),
                     );
                     Some(serde_json::json!({
                         "t": "response",
@@ -270,6 +272,7 @@ pub(crate) fn control_frame_response(
                         Some(frames_tx) => match crate::credential_egress::register(
                             &runtime.session_id,
                             runtime.grant.label(),
+                            runtime.grant.custody_origin_class(),
                             &kinds,
                             frames_tx,
                         ) {
@@ -398,6 +401,29 @@ pub(crate) fn control_frame_response(
                         params,
                         runtime.project_root.as_deref(),
                     ) {
+                        Ok(result) => Some(serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": true,
+                            "result": result,
+                        })),
+                        Err(error) => Some(serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": false,
+                            "error": error,
+                        })),
+                    }
+                }
+                "api_access_set_tier" | "api_access_set_hosted_ceiling" => {
+                    let params = params.unwrap_or_else(|| serde_json::json!({}));
+                    let actor = runtime.grant.access_principal();
+                    let result = if method == "api_access_set_hosted_ceiling" {
+                        crate::web_gateway::access_set_hosted_ceiling_response_value(params, &actor)
+                    } else {
+                        crate::web_gateway::access_set_tier_response_value(params, &actor)
+                    };
+                    match result {
                         Ok(result) => Some(serde_json::json!({
                             "t": "response",
                             "id": id,

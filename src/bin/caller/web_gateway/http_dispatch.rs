@@ -696,6 +696,17 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::AccessTierSettings => {
+                return handle_access_tier_settings(
+                    stream,
+                    route_body,
+                    req_method,
+                    req_path,
+                    http_access_context,
+                    fleet_cors_origin,
+                )
+                .await;
+            }
             RouteHandlerId::AccessOverview => {
                 return handle_access_overview(
                     stream,

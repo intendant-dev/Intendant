@@ -14,7 +14,33 @@ const ACCESS_ROLE_META = {
   'role:observer': { cls: 'role-observer', short: 'Watch read-only, including live displays.' },
   'role:scoped-human': { cls: 'role-scoped', short: 'Inspect the access model only. A safe first grant.' },
   'role:peer-profile': { cls: 'role-peer', short: 'Daemon-to-daemon authority bounded by the peer profile.' },
+  'role:none': { cls: 'role-scoped', short: 'No permissions at all. Ceiling-only: used to refuse hosted-origin control entirely, never granted to anyone.' },
 };
+
+/* Trust tiers (docs/src/trust-tiers.md). The id vocabulary mirrors the
+   daemon's DAEMON_TIERS constant and is pinned by the
+   dashboard_tier_vocabulary_mirrors_daemon_tiers parity test — change
+   both together. */
+const ACCESS_TIER_META = {
+  'integrated': {
+    label: 'Integrated',
+    glyph: '⌂',
+    short: 'Holds your personal world — accounts, files, mail. Protect it: control it directly or through the app, and grant conservatively.',
+  },
+  'disposable': {
+    label: 'Disposable',
+    glyph: '♻',
+    short: 'Scratch box holding nothing durable. Worst case: rotate a key and destroy it. Hosted tabs are fine here.',
+  },
+};
+
+/* The curated hosted-ceiling positions, strongest last. Every id must
+   name a builtin role (pinned by the role-catalog parity test). */
+const ACCESS_HOSTED_CEILING_CHOICES = [
+  { id: 'role:operator', label: 'Operate (default)', short: 'Hosted tabs can drive sessions, terminal, files, and fuel credentials — the right setting for disposable boxes.' },
+  { id: 'role:observer', label: 'View only', short: 'Hosted tabs can watch displays and sessions but change nothing. Vault fueling from hosted tabs stops working on this daemon.' },
+  { id: 'role:none', label: 'Nothing', short: 'This daemon refuses hosted-origin control entirely — reach it directly, through the app, or from an enrolled peer.' },
+];
 
 function accessRoleMeta(roleId) {
   const id = accessModelLabel(roleId);
@@ -731,6 +757,151 @@ function renderAccessPeopleCurrent() {
   }));
 }
 
+/* Overview: Trust tier — what this machine holds, and how tightly hosted
+   tabs are capped on it (docs/src/trust-tiers.md). The tier is a doctrine
+   label (it grants and denies nothing); the ceiling row below it is the
+   enforcement, kept visually coupled so choosing "Integrated" naturally
+   leads to hardening hosted control. */
+function accessHostedCeilingCurrent(iam) {
+  const ceilings = iam.role_ceilings && typeof iam.role_ceilings === 'object' ? iam.role_ceilings : {};
+  const account = accessModelLabel(ceilings['connect_account']);
+  const key = accessModelLabel(ceilings['client_key']);
+  if (!account && !key) return { value: '', state: 'uncapped' };
+  if (account !== key) return { value: '', state: 'mixed' };
+  return { value: account, state: ACCESS_HOSTED_CEILING_CHOICES.some(c => c.id === account) ? 'choice' : 'custom' };
+}
+
+function renderAccessTierCard() {
+  const mount = document.getElementById('access-tier-card');
+  if (!mount) return;
+  const iam = accessIamModel(accessOverviewModel());
+  const tier = accessModelLabel(iam.tier);
+  const canSetTier = dashboardControlTransport?.lastStatus?.api_access_set_tier_available !== false;
+  const canSetCeiling = dashboardControlTransport?.lastStatus?.api_access_set_hosted_ceiling_available !== false;
+
+  mount.textContent = '';
+  const head = document.createElement('div');
+  head.className = 'acc-section-head';
+  const title = document.createElement('div');
+  title.className = 'acc-section-title';
+  title.textContent = 'Trust tier';
+  const sub = document.createElement('div');
+  sub.className = 'acc-section-sub';
+  sub.textContent = 'What would a compromise of this machine cost you? The tier is a label that guides grants and clients — the enforcement lives in the hosted-control cap below it.';
+  head.append(title, sub);
+  mount.appendChild(head);
+
+  const card = document.createElement('div');
+  card.className = 'acc-principal-card';
+
+  const headRow = document.createElement('div');
+  headRow.className = 'acc-principal-head';
+  const glyphEl = document.createElement('div');
+  glyphEl.className = 'acc-principal-glyph kind-local';
+  glyphEl.textContent = tier ? (ACCESS_TIER_META[tier]?.glyph || 'T') : '?';
+  const nameWrap = document.createElement('div');
+  const name = document.createElement('div');
+  name.className = 'acc-principal-name';
+  name.textContent = tier
+    ? `${ACCESS_TIER_META[tier]?.label || tier} machine`
+    : 'What does this machine hold?';
+  const kindLine = document.createElement('div');
+  kindLine.className = 'acc-principal-kind';
+  kindLine.textContent = tier
+    ? (ACCESS_TIER_META[tier]?.short || '')
+    : 'Pick a tier so grant flows and clients can hold you to it.';
+  nameWrap.append(name, kindLine);
+  headRow.append(glyphEl, nameWrap);
+  if (!tier) {
+    headRow.appendChild(accessRouteChip('remembered', 'not set',
+      'No tier chosen yet. The tier changes no permissions by itself — it drives warnings, recommendations, and (via the cap below) hosted-control policy.'));
+  }
+  card.appendChild(headRow);
+
+  // The two tier options, side by side, current one highlighted.
+  const options = document.createElement('div');
+  options.className = 'acc-grant-flow-actions acc-tier-options';
+  for (const [id, meta] of Object.entries(ACCESS_TIER_META)) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'acc-btn' + (tier === id ? ' primary' : '');
+    btn.textContent = `${meta.glyph} ${meta.label}`;
+    btn.title = meta.short + (tier === id ? ' (current — click again to clear)' : '');
+    btn.disabled = !canSetTier;
+    btn.addEventListener('click', () => accessSetTier(tier === id ? null : id));
+    options.appendChild(btn);
+  }
+  card.appendChild(options);
+
+  // Hosted-control cap: the enforcement row.
+  const ceiling = accessHostedCeilingCurrent(iam);
+  const capRow = document.createElement('div');
+  capRow.className = 'acc-grant-flow-actions acc-tier-cap-row';
+  const capLabel = document.createElement('span');
+  capLabel.className = 'acc-principal-kind';
+  capLabel.textContent = 'Hosted tabs may:';
+  capLabel.title = 'Applies to sessions arriving with hosted provenance — Connect accounts and browser keys enrolled from a hosted origin. Direct, app, and anchor-served sessions are never capped by this.';
+  capRow.appendChild(capLabel);
+  const select = document.createElement('select');
+  select.className = 'acc-btn';
+  select.disabled = !canSetCeiling;
+  for (const choice of ACCESS_HOSTED_CEILING_CHOICES) {
+    const opt = document.createElement('option');
+    opt.value = choice.id;
+    opt.textContent = choice.label;
+    opt.title = choice.short;
+    select.appendChild(opt);
+  }
+  if (ceiling.state === 'choice') {
+    select.value = ceiling.value;
+  } else {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.disabled = true;
+    opt.selected = true;
+    opt.textContent = ceiling.state === 'mixed'
+      ? 'custom (per-binding, via iam.json)'
+      : ceiling.state === 'custom'
+        ? `custom (${ceiling.value.replace(/^role:/, '')})`
+        : 'uncapped (via iam.json)';
+    select.appendChild(opt);
+  }
+  select.addEventListener('change', () => {
+    if (select.value) accessSetHostedCeiling(select.value);
+  });
+  capRow.appendChild(select);
+  card.appendChild(capRow);
+
+  const hint = document.createElement('div');
+  hint.className = 'acc-principal-kind';
+  const currentChoice = ACCESS_HOSTED_CEILING_CHOICES.find(c => c.id === ceiling.value);
+  hint.textContent = ceiling.state === 'choice'
+    ? (currentChoice?.short || '')
+    : ceiling.state === 'uncapped'
+      ? 'Ceilings are disabled in iam.json — hosted sessions can hold whatever their grant says, including root. Choose a cap here to restore them.'
+      : 'This daemon carries a hand-tuned ceiling in iam.json; picking an option here overwrites it for both hosted bindings.';
+  card.appendChild(hint);
+
+  // The doctrine nudge: an integrated machine still operable from any
+  // hosted tab is the mismatch the tiers chapter warns about.
+  if (tier === 'integrated' && ceiling.value === 'role:operator') {
+    const nudge = document.createElement('div');
+    nudge.className = 'acc-connect-warn';
+    const text = document.createElement('span');
+    text.textContent = 'Integrated machine, yet hosted tabs can still operate it. Recommended: cap them to View only (or Nothing) and drive this daemon directly or through the app. ';
+    const harden = document.createElement('button');
+    harden.type = 'button';
+    harden.className = 'acc-btn';
+    harden.textContent = 'Cap to View only';
+    harden.disabled = !canSetCeiling;
+    harden.addEventListener('click', () => accessSetHostedCeiling('role:observer'));
+    nudge.append(text, harden);
+    card.appendChild(nudge);
+  }
+
+  mount.appendChild(card);
+}
+
 /* Overview: Intendant Connect — this daemon's hosted reachability and
    claim binding. States: off → one-click enable; registering; unclaimed
    → reveal the twelve words (manage-gated, fetched only on click);
@@ -994,6 +1165,10 @@ function renderAccessEnrollmentRequests() {
     headRow.append(glyphEl, nameWrap);
     if (request.origin) {
       headRow.appendChild(accessRouteChip('connect', 'via hosted route', `The offer arrived through ${request.origin}; the key will be recorded with that origin, so the role ceiling applies until it is re-enrolled from an anchor origin.`));
+      if (accessModelLabel(accessIamModel(accessOverviewModel()).tier) === 'integrated') {
+        headRow.appendChild(accessRouteChip('danger', 'integrated tier',
+          'This is an integrated-tier machine and the key arrived through a hosted route. Approving is an upward grant (docs: trust-tiers) — the hosted-control cap still bounds the session, but prefer enrolling this device from a direct or app origin.'));
+      }
     }
     if (request.account_hint) {
       headRow.appendChild(request.account_attested
@@ -2050,6 +2225,7 @@ function renderAccessAdminSummaries() {
   }
   renderAccessAttention();
   renderAccessIdentityHero();
+  renderAccessTierCard();
   renderAccessConnectCard();
   renderAccessFleetStrip();
   renderAccessExplainer();

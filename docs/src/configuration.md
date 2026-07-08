@@ -724,6 +724,14 @@ sessions can operate but cannot administer. Owners who accept hosted-root
 risk can raise a ceiling or disable them all with an explicit empty map
 (`"role_ceilings": {}`).
 
+The common moves have a one-knob UI: the **hosted-control cap** on
+Access → Overview's Trust tier card writes both hosted bindings at once
+(`role:operator` / `role:observer` / `role:none` — the last refuses
+hosted-origin control entirely; `POST /api/access/hosted-ceiling`).
+Per-binding divergence, raising above operator, and clearing the map
+remain deliberate `iam.json` edits. `role:none` is a zero-permission,
+ceiling-only builtin — it can never be granted to a principal.
+
 The enforced built-in user/client roles are `role:scoped-human`,
 `role:observer`, `role:session-reader`, `role:terminal`, `role:files-read`,
 `role:files-write`, `role:operator`, and `role:root`. `role:peer-profile` is

@@ -2436,6 +2436,22 @@
 .daemon-role-summary {
   color: var(--subtext1);
 }
+.daemon-access-request-warn {
+  color: var(--peach);
+  font-weight: 600;
+}
+/* Trust tier card (Access → Overview) */
+.acc-tier-options .acc-btn {
+  flex: 1 1 0;
+  text-align: left;
+}
+.acc-tier-cap-row {
+  align-items: center;
+  gap: 10px;
+}
+.acc-tier-cap-row select.acc-btn {
+  min-width: 180px;
+}
 .daemon-access-request-actions {
   display: flex;
   gap: 6px;

@@ -131,20 +131,38 @@ which client they open for which box.
 
 ## Product hooks
 
-Three pieces of mechanism would let the product carry this doctrine instead
-of the owner's memory. All three are tracked work:
+Three pieces of mechanism let the product carry this doctrine instead of
+the owner's memory. All three are **shipped**:
 
-1. **Tier labels + upward-grant guard.** Daemons carry a tier label
-   (integrated/disposable) — in the fleet record, mirrored into local IAM —
-   and the grant flows (human and peer lanes) warn on, or refuse, any grant
-   that would give a lower-tier subject authority on a higher-tier daemon.
-2. **Per-daemon hosted-ceiling knob.** The `role_ceilings` map already
-   supports hardening below `role:operator` by editing `iam.json`; the hook
-   is surfacing it in Access as a first-class per-daemon control with an
-   honest top position — "refuse hosted-origin control entirely" — plus
-   copy that names the tier it implements.
-3. **Per-entry vault unseal policy.** Vault entries gain an origin policy
-   (`any` vs `app/direct-only`); the vault UI enforces it at unseal and the
-   custody trail records the origin class of every ceremony, so an
-   integrated-tier credential physically cannot be unsealed into a hosted
-   tab.
+1. **Tier labels + upward-grant guard.** Each daemon carries its tier in
+   local IAM (`tier` in `iam.json`; `POST /api/access/tier`,
+   audit-logged, manage-gated), chosen on the **Trust tier card** at the
+   top of Access → Overview. The guard is advisory and local-tier-driven:
+   on an integrated machine, the peer pairing-approval card warns that
+   approving grants a peer authority *here* (the upward-grant alarm), and
+   hosted-route device enrollments get an integrated-tier warning chip
+   beside the existing hosted-route one. *Deliberately deferred:*
+   cross-daemon tier visibility (a tier field on fleet records or agent
+   cards, so the granting side can compare both ends' tiers) — that needs
+   a metadata-carrier decision (browser-signed fleet payload v4 vs. the
+   public agent card) and is not required for the local alarm.
+2. **Per-daemon hosted-ceiling knob.** The same card carries "Hosted tabs
+   may: Operate / View only / Nothing" — one control writing both
+   hosted-provenance `role_ceilings` bindings
+   (`POST /api/access/hosted-ceiling`), with `role:none` (a
+   zero-permission, ceiling-only builtin) as the honest refuse-entirely
+   position. Choosing Integrated while hosted tabs can still operate
+   surfaces a one-click "Cap to View only" nudge. Raising ceilings,
+   per-binding divergence, and disabling remain deliberate `iam.json`
+   edits.
+3. **Per-entry vault unseal policy.** Vault entries accept
+   `unseal_policy: "trusted"` (add form + per-entry toggle): trusted-only
+   entries refuse reveal, lease fueling, egress relay, and the voice
+   mirror from hosted tabs, and the custody trail stamps every
+   lease/relay ceremony with the session's origin class
+   (`hosted`/`direct`/`local`/`peer`). Honest limits, stated in the UI
+   too: this is client-side self-enforcement — protection against
+   mistakes and casual exfiltration, not against a malicious bundle —
+   and until the direct/app vault path exists (the local-vault work),
+   a trusted-only entry is stored-but-sealed everywhere the vault
+   currently opens.

@@ -1189,6 +1189,131 @@ pub(crate) fn access_iam_upsert_user_client_grant_response_value_with_cert_dir(
     }))
 }
 
+/// Set (or clear) this daemon's trust tier (docs/src/trust-tiers.md):
+/// `{"tier": "integrated" | "disposable" | null}`. Shared by the HTTP
+/// route and the dashboard-control method.
+pub(crate) fn access_set_tier_response_value(
+    params: serde_json::Value,
+    actor: &crate::access::iam::AccessPrincipal,
+) -> Result<serde_json::Value, String> {
+    let tier = match params.get("tier") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => Some(value.as_str()),
+        Some(_) => return Err("tier must be a string or null".to_string()),
+    };
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let mut state = crate::access::iam::load_state(&cert_dir)
+        .map_err(|e| format!("load local IAM state: {e}"))?;
+    let stored =
+        crate::access::iam::set_daemon_tier(&mut state, tier, actor).map_err(|e| e.to_string())?;
+    crate::access::iam::save_state(&cert_dir, &state)
+        .map_err(|e| format!("save local IAM state: {e}"))?;
+    let loaded = crate::access::iam::load_state_for_overview(&cert_dir);
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "tier": stored,
+        "iam": crate::access::iam::overview_metadata(&loaded),
+    }))
+}
+
+/// Set the hosted-control ceiling (docs/src/trust-tiers.md):
+/// `{"role_id": "role:operator" | "role:observer" | "role:none" | …}` —
+/// any defined, enforced role. Writes both hosted-provenance binding
+/// ceilings; per-binding divergence stays an `iam.json` edit.
+pub(crate) fn access_set_hosted_ceiling_response_value(
+    params: serde_json::Value,
+    actor: &crate::access::iam::AccessPrincipal,
+) -> Result<serde_json::Value, String> {
+    let role_id = params
+        .get("role_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "role_id is required".to_string())?;
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let mut state = crate::access::iam::load_state(&cert_dir)
+        .map_err(|e| format!("load local IAM state: {e}"))?;
+    crate::access::iam::set_hosted_control_ceiling(&mut state, role_id, actor)
+        .map_err(|e| e.to_string())?;
+    crate::access::iam::save_state(&cert_dir, &state)
+        .map_err(|e| format!("save local IAM state: {e}"))?;
+    let loaded = crate::access::iam::load_state_for_overview(&cert_dir);
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "role_ceilings": loaded.state.role_ceilings,
+        "iam": crate::access::iam::overview_metadata(&loaded),
+    }))
+}
+
+/// One handler for the trust-tier settings pair; `req_path` picks the
+/// mutation. Both are manage-gated POSTs mirroring the IAM grant writes.
+pub(crate) async fn handle_access_tier_settings(
+    mut stream: DemuxStream,
+    body_text: String,
+    req_method: &str,
+    req_path: &str,
+    http_access_context: HttpAccessContext,
+    fleet_cors_origin: Option<String>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if req_method != "POST" {
+        let response = json_response(
+            "405 Method Not Allowed",
+            serde_json::json!({"error": "method not allowed"}).to_string(),
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    } else {
+        let decision =
+            http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+        if !decision.allowed {
+            let response = json_response(
+                "403 Forbidden",
+                serde_json::json!({
+                    "error": "principal does not allow this operation",
+                    "principal": http_access_context.principal.as_value(),
+                    "permission": decision.permission,
+                    "reason": decision.reason,
+                })
+                .to_string(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        } else {
+            let params: serde_json::Value = if body_text.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                match serde_json::from_str(&body_text) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        let response = json_response(
+                            "400 Bad Request",
+                            serde_json::json!({"error": format!("invalid request body: {e}")})
+                                .to_string(),
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
+                        return;
+                    }
+                }
+            };
+            let result = if req_path == "/api/access/hosted-ceiling" {
+                access_set_hosted_ceiling_response_value(params, &http_access_context.principal)
+            } else {
+                access_set_tier_response_value(params, &http_access_context.principal)
+            };
+            let (status, body) = match result {
+                Ok(value) => (200, value.to_string()),
+                Err(error) => (400, serde_json::json!({"error": error}).to_string()),
+            };
+            let response = with_fleet_cors(
+                json_response(status_reason(status), body),
+                fleet_cors_origin.as_deref(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    }
+    finalize_http_stream(&mut stream).await;
+}
+
 /// The Access API paths that participate in fleet cross-origin access: the
 /// anchor-served Access page manages sibling daemons by calling these
 /// directly, so they get an origin allowlist instead of the wildcard CORS
@@ -1210,6 +1335,8 @@ pub(crate) fn is_fleet_cors_access_path(req_path: &str) -> bool {
             | "/api/access/connect/claim-code"
             | "/api/access/connect/config"
             | "/api/access/connect/unclaim"
+            | "/api/access/tier"
+            | "/api/access/hosted-ceiling"
     )
 }
 

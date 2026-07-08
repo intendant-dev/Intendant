@@ -86,6 +86,7 @@ fn b64(data: &[u8]) -> String {
 pub fn register(
     session_id: &str,
     label: &str,
+    via: &str,
     kinds: &[String],
     frames_tx: mpsc::UnboundedSender<serde_json::Value>,
 ) -> Result<Vec<String>, String> {
@@ -118,11 +119,12 @@ pub fn register(
         }
     }
     for kind in &accepted {
-        crate::credential_audit::record(
+        crate::credential_audit::record_with_origin(
             crate::credential_audit::EVENT_EGRESS_REGISTERED,
             kind,
             label.trim(),
             label.trim(),
+            via,
             format!("provider calls relay through browser session {session_id}"),
         );
     }
@@ -523,6 +525,7 @@ mod tests {
         let accepted = register(
             "s1",
             "Tab A",
+            "local",
             &kinds(&[KIND_ANTHROPIC, "oauth:codex", "junk"]),
             tx,
         )
@@ -530,7 +533,7 @@ mod tests {
         assert_eq!(accepted, vec![KIND_ANTHROPIC.to_string()]);
         assert!(available(KIND_ANTHROPIC));
         assert!(!available(KIND_GEMINI));
-        assert!(register("s1", "Tab A", &kinds(&["junk"]), {
+        assert!(register("s1", "Tab A", "local", &kinds(&["junk"]), {
             let (tx, _rx) = mpsc::unbounded_channel();
             tx
         })
@@ -538,7 +541,7 @@ mod tests {
 
         // A later session takes the kind over.
         let (tx2, _rx2) = mpsc::unbounded_channel();
-        register("s2", "Tab B", &kinds(&[KIND_ANTHROPIC]), tx2).unwrap();
+        register("s2", "Tab B", "local", &kinds(&[KIND_ANTHROPIC]), tx2).unwrap();
         let status = relay_status();
         assert_eq!(status.len(), 1);
         assert_eq!(status[0].session_id, "s2");
@@ -553,7 +556,7 @@ mod tests {
         let _guard = lock();
         reset();
         let (tx, mut relay_rx) = mpsc::unbounded_channel();
-        register("s1", "Tab A", &kinds(&[KIND_GEMINI]), tx).unwrap();
+        register("s1", "Tab A", "local", &kinds(&[KIND_GEMINI]), tx).unwrap();
 
         let fetch_task = tokio::spawn(fetch(
             KIND_GEMINI,
@@ -616,7 +619,7 @@ mod tests {
         let _guard = lock();
         reset();
         let (tx, mut relay_rx) = mpsc::unbounded_channel();
-        register("s1", "Tab A", &kinds(&[KIND_ANTHROPIC]), tx).unwrap();
+        register("s1", "Tab A", "local", &kinds(&[KIND_ANTHROPIC]), tx).unwrap();
 
         let fetch_task = tokio::spawn(fetch(
             KIND_ANTHROPIC,
@@ -662,7 +665,7 @@ mod tests {
         let _guard = lock();
         reset();
         let (tx, mut relay_rx) = mpsc::unbounded_channel();
-        register("s1", "Tab A", &kinds(&[KIND_ANTHROPIC]), tx).unwrap();
+        register("s1", "Tab A", "local", &kinds(&[KIND_ANTHROPIC]), tx).unwrap();
         let fetch_task = tokio::spawn(fetch(
             KIND_ANTHROPIC,
             "POST",

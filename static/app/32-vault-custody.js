@@ -789,6 +789,22 @@ function vaultQueuePersist() {
   return result;
 }
 
+/* Per-entry unseal policy (docs/src/trust-tiers.md, hook 3). 'any' (or
+   absent — every pre-policy entry) uses the entry everywhere the vault
+   opens; 'trusted' refuses use from hosted tabs. Client-side self-
+   enforcement: it defends against mistakes and casual exfiltration, not
+   against a malicious page — and since today the vault only opens
+   through a Connect service, a trusted-only entry stays sealed until
+   the direct/app vault path lands. It still syncs, and the policy
+   rides inside the encrypted body like every other entry field. */
+function vaultEntryUnsealPolicy(entry) {
+  return entry?.unseal_policy === 'trusted' ? 'trusted' : 'any';
+}
+
+function vaultEntryUsableHere(entry) {
+  return vaultEntryUnsealPolicy(entry) !== 'trusted' || !DASHBOARD_CONNECT_MODE;
+}
+
 function vaultUpsertEntry(entry) {
   const now = Date.now();
   const existing = entry.id ? vaultState.entries.find(e => e.id === entry.id) : null;
@@ -860,10 +876,11 @@ let vaultVoiceMirror = {};
 function vaultSyncVoiceMirror() {
   const mirror = {};
   if (vaultState.status === 'unlocked' || vaultState.kBytes) {
+    const usable = vaultState.entries.filter(vaultEntryUsableHere);
     for (const [storageKey, provider] of Object.entries(VAULT_VOICE_STORAGE_PROVIDERS)) {
       const entry =
-        vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.voice && e.secret) ||
-        vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.secret);
+        usable.find(e => e.kind === 'api_key' && e.provider === provider && e.voice && e.secret) ||
+        usable.find(e => e.kind === 'api_key' && e.provider === provider && e.secret);
       if (entry) mirror[storageKey] = String(entry.secret);
     }
   }
@@ -1153,9 +1170,12 @@ function vaultLeaseRpc(method, params = {}) {
   return window.intendantDashboardControl.request(method, params, { timeoutMs: 15000 });
 }
 
-/* The lease kind a vault entry fuels, or null when it cannot fuel. */
+/* The lease kind a vault entry fuels, or null when it cannot fuel.
+   A trusted-only entry cannot fuel from this context at all — this is
+   the single choke point for fueling, re-fueling, and renew re-grants. */
 function vaultEntryLeaseKind(entry) {
   if (!entry || !entry.secret) return null;
+  if (!vaultEntryUsableHere(entry)) return null;
   if (entry.kind === 'api_key' && ['anthropic', 'openai', 'gemini'].includes(entry.provider)) {
     return `api_key:${entry.provider}`;
   }
@@ -1257,7 +1277,11 @@ function renderAccessCustodySection() {
     main.textContent = [event.label, event.kind].filter(Boolean).join(' · ');
     const meta = document.createElement('span');
     meta.className = 'custody-meta';
-    meta.textContent = [event.actor ? `by ${event.actor}` : '', event.detail]
+    meta.textContent = [
+      event.actor ? `by ${event.actor}` : '',
+      event.origin ? `via ${event.origin}` : '',
+      event.detail,
+    ]
       .filter(Boolean)
       .join(' — ');
     row.append(ts, chip, main, meta);
@@ -1419,9 +1443,10 @@ function vaultEgressEntryFor(kind) {
   if (vaultState.status !== 'unlocked') return null;
   const provider = String(kind || '').startsWith('api_key:') ? String(kind).slice(8) : '';
   if (!provider) return null;
+  const usable = vaultState.entries.filter(vaultEntryUsableHere);
   return (
-    vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.secret && !e.voice) ||
-    vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.secret) ||
+    usable.find(e => e.kind === 'api_key' && e.provider === provider && e.secret && !e.voice) ||
+    usable.find(e => e.kind === 'api_key' && e.provider === provider && e.secret) ||
     null
   );
 }
@@ -1758,10 +1783,21 @@ function vaultRenderEntries(card) {
     const kindChip = document.createElement('span');
     kindChip.className = 'vault-chip';
     kindChip.textContent = entry.kind === 'oauth' ? 'OAuth' : 'API key';
+    const trustedOnly = vaultEntryUnsealPolicy(entry) === 'trusted';
+    const usableHere = vaultEntryUsableHere(entry);
+    let policyChip = null;
+    if (trustedOnly) {
+      policyChip = document.createElement('span');
+      policyChip.className = usableHere ? 'vault-chip' : 'vault-chip warn';
+      policyChip.textContent = usableHere ? 'trusted origins' : 'sealed here';
+      policyChip.title = usableHere
+        ? 'This credential only works from trusted origins (direct or app) — hosted tabs cannot reveal, fuel, or relay it.'
+        : 'This credential is marked trusted-origins-only and this dashboard arrived through a hosted tab: it stays sealed here — no reveal, fueling, or relay. It still syncs with the vault.';
+    }
     const secret = document.createElement('span');
     secret.className = 'secret';
     const secretValue = String(entry.secret || '');
-    secret.textContent = vaultRevealedEntries.has(entry.id)
+    secret.textContent = usableHere && vaultRevealedEntries.has(entry.id)
       ? secretValue || '(token set)'
       : secretValue
         ? `••••${secretValue.slice(-4)}`
@@ -1769,26 +1805,37 @@ function vaultRenderEntries(card) {
     const actions = document.createElement('span');
     actions.className = 'vault-entry-actions';
     if (secretValue) {
-      actions.appendChild(
-        vaultButton(vaultRevealedEntries.has(entry.id) ? 'Hide' : 'Reveal', () => {
-          if (vaultRevealedEntries.has(entry.id)) vaultRevealedEntries.delete(entry.id);
-          else vaultRevealedEntries.add(entry.id);
-          renderAccessVaultSection();
-        })
-      );
-      actions.appendChild(
-        vaultButton('Copy', () => {
-          navigator.clipboard?.writeText(secretValue).catch(() => {});
-        })
-      );
+      const reveal = vaultButton(usableHere && vaultRevealedEntries.has(entry.id) ? 'Hide' : 'Reveal', () => {
+        if (vaultRevealedEntries.has(entry.id)) vaultRevealedEntries.delete(entry.id);
+        else vaultRevealedEntries.add(entry.id);
+        renderAccessVaultSection();
+      });
+      const copy = vaultButton('Copy', () => {
+        navigator.clipboard?.writeText(secretValue).catch(() => {});
+      });
+      if (!usableHere) {
+        reveal.disabled = true;
+        copy.disabled = true;
+        reveal.title = copy.title = 'Sealed in hosted tabs — this entry is marked trusted-origins-only.';
+      }
+      actions.append(reveal, copy);
     }
+    const policyBtn = vaultButton(trustedOnly ? 'Allow anywhere' : 'Trusted only', () => {
+      vaultUpsertEntry({ id: entry.id, unseal_policy: trustedOnly ? 'any' : 'trusted' });
+      renderAccessVaultSection();
+    });
+    policyBtn.title = trustedOnly
+      ? 'Let every dashboard this vault opens in use this credential again.'
+      : 'Seal this credential against hosted tabs: only direct or app origins may reveal, fuel, or relay it. (Client-side policy — it guards against mistakes, not a malicious page.)';
+    actions.appendChild(policyBtn);
     actions.appendChild(
       vaultButton('Remove', () => {
         vaultRemoveEntry(entry.id);
         renderAccessVaultSection();
       }, { danger: true })
     );
-    row.append(lbl, chip, kindChip, secret, actions);
+    if (policyChip) row.append(lbl, chip, kindChip, policyChip, secret, actions);
+    else row.append(lbl, chip, kindChip, secret, actions);
     list.appendChild(row);
   }
   card.appendChild(list);
@@ -1853,7 +1900,20 @@ function vaultRenderAddForm(card) {
     secretInput.style.display = oauth ? 'none' : '';
     secretArea.style.display = oauth ? '' : 'none';
   });
-  grid.append(kindLabel, kindSelect, providerLabel, providerSelect, labelLabel, labelInput, secretLabel, secretInput);
+  const policyLabel = document.createElement('label');
+  policyLabel.textContent = 'Unseal where?';
+  const policySelect = document.createElement('select');
+  for (const [value, label, title] of [
+    ['any', 'Anywhere this vault opens', 'The default: usable from every dashboard that can open your vault.'],
+    ['trusted', 'Trusted origins only (direct / app)', 'Sealed against hosted tabs: no reveal, fueling, or relay from them. Client-side policy — a guard against mistakes, not a malicious page. Today the vault itself opens through Connect, so a trusted-only entry stays stored-but-sealed until the direct/app vault path lands.'],
+  ]) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    option.title = title;
+    policySelect.appendChild(option);
+  }
+  grid.append(kindLabel, kindSelect, providerLabel, providerSelect, labelLabel, labelInput, policyLabel, policySelect, secretLabel, secretInput);
   body.appendChild(grid);
   body.appendChild(secretArea);
 
@@ -1880,6 +1940,7 @@ function vaultRenderAddForm(card) {
         label: labelInput.value.trim() ||
           (oauth ? vaultProviderLabel(providerSelect.value) : `${vaultProviderLabel(providerSelect.value)} key`),
         secret: secretValue,
+        ...(policySelect.value === 'trusted' ? { unseal_policy: 'trusted' } : {}),
       });
       secretInput.value = '';
       secretArea.value = '';
@@ -2001,6 +2062,15 @@ function vaultRenderFueling(card) {
   const fuelable = vaultState.entries
     .map(entry => ({ entry, kind: vaultEntryLeaseKind(entry) }))
     .filter(item => item.kind);
+  // No silent caps: say when entries exist but are sealed against this
+  // context, instead of quietly rendering fewer fuel buttons.
+  const sealed = vaultState.entries.filter(e => e.secret && !vaultEntryUsableHere(e)).length;
+  if (sealed > 0) {
+    const note = document.createElement('div');
+    note.className = 'vault-note';
+    note.textContent = `${sealed === 1 ? '1 credential is' : `${sealed} credentials are`} marked trusted-origins-only and stay${sealed === 1 ? 's' : ''} sealed in hosted tabs — no fueling from here.`;
+    card.appendChild(note);
+  }
   const fuelRow = document.createElement('div');
   fuelRow.className = 'vault-actions';
   for (const { entry, kind } of fuelable) {

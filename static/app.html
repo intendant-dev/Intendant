@@ -3616,6 +3616,22 @@ body.access-page #tab-access {
 .daemon-role-summary {
   color: var(--subtext1);
 }
+.daemon-access-request-warn {
+  color: var(--peach);
+  font-weight: 600;
+}
+/* Trust tier card (Access → Overview) */
+.acc-tier-options .acc-btn {
+  flex: 1 1 0;
+  text-align: left;
+}
+.acc-tier-cap-row {
+  align-items: center;
+  gap: 10px;
+}
+.acc-tier-cap-row select.acc-btn {
+  min-width: 180px;
+}
 .daemon-access-request-actions {
   display: flex;
   gap: 6px;
@@ -21825,6 +21841,7 @@ html.ui-v2 .ui2-appearance-note {
           <div class="access-pane-body">
             <div id="access-attention" class="acc-attention"></div>
             <div id="access-identity-hero" class="acc-hero-grid"></div>
+            <div id="access-tier-card"></div>
             <div id="access-connect-card"></div>
             <div class="acc-section-head">
               <div class="acc-section-title">Fleet</div>
@@ -25927,6 +25944,22 @@ function vaultQueuePersist() {
   return result;
 }
 
+/* Per-entry unseal policy (docs/src/trust-tiers.md, hook 3). 'any' (or
+   absent — every pre-policy entry) uses the entry everywhere the vault
+   opens; 'trusted' refuses use from hosted tabs. Client-side self-
+   enforcement: it defends against mistakes and casual exfiltration, not
+   against a malicious page — and since today the vault only opens
+   through a Connect service, a trusted-only entry stays sealed until
+   the direct/app vault path lands. It still syncs, and the policy
+   rides inside the encrypted body like every other entry field. */
+function vaultEntryUnsealPolicy(entry) {
+  return entry?.unseal_policy === 'trusted' ? 'trusted' : 'any';
+}
+
+function vaultEntryUsableHere(entry) {
+  return vaultEntryUnsealPolicy(entry) !== 'trusted' || !DASHBOARD_CONNECT_MODE;
+}
+
 function vaultUpsertEntry(entry) {
   const now = Date.now();
   const existing = entry.id ? vaultState.entries.find(e => e.id === entry.id) : null;
@@ -25998,10 +26031,11 @@ let vaultVoiceMirror = {};
 function vaultSyncVoiceMirror() {
   const mirror = {};
   if (vaultState.status === 'unlocked' || vaultState.kBytes) {
+    const usable = vaultState.entries.filter(vaultEntryUsableHere);
     for (const [storageKey, provider] of Object.entries(VAULT_VOICE_STORAGE_PROVIDERS)) {
       const entry =
-        vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.voice && e.secret) ||
-        vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.secret);
+        usable.find(e => e.kind === 'api_key' && e.provider === provider && e.voice && e.secret) ||
+        usable.find(e => e.kind === 'api_key' && e.provider === provider && e.secret);
       if (entry) mirror[storageKey] = String(entry.secret);
     }
   }
@@ -26291,9 +26325,12 @@ function vaultLeaseRpc(method, params = {}) {
   return window.intendantDashboardControl.request(method, params, { timeoutMs: 15000 });
 }
 
-/* The lease kind a vault entry fuels, or null when it cannot fuel. */
+/* The lease kind a vault entry fuels, or null when it cannot fuel.
+   A trusted-only entry cannot fuel from this context at all — this is
+   the single choke point for fueling, re-fueling, and renew re-grants. */
 function vaultEntryLeaseKind(entry) {
   if (!entry || !entry.secret) return null;
+  if (!vaultEntryUsableHere(entry)) return null;
   if (entry.kind === 'api_key' && ['anthropic', 'openai', 'gemini'].includes(entry.provider)) {
     return `api_key:${entry.provider}`;
   }
@@ -26395,7 +26432,11 @@ function renderAccessCustodySection() {
     main.textContent = [event.label, event.kind].filter(Boolean).join(' · ');
     const meta = document.createElement('span');
     meta.className = 'custody-meta';
-    meta.textContent = [event.actor ? `by ${event.actor}` : '', event.detail]
+    meta.textContent = [
+      event.actor ? `by ${event.actor}` : '',
+      event.origin ? `via ${event.origin}` : '',
+      event.detail,
+    ]
       .filter(Boolean)
       .join(' — ');
     row.append(ts, chip, main, meta);
@@ -26557,9 +26598,10 @@ function vaultEgressEntryFor(kind) {
   if (vaultState.status !== 'unlocked') return null;
   const provider = String(kind || '').startsWith('api_key:') ? String(kind).slice(8) : '';
   if (!provider) return null;
+  const usable = vaultState.entries.filter(vaultEntryUsableHere);
   return (
-    vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.secret && !e.voice) ||
-    vaultState.entries.find(e => e.kind === 'api_key' && e.provider === provider && e.secret) ||
+    usable.find(e => e.kind === 'api_key' && e.provider === provider && e.secret && !e.voice) ||
+    usable.find(e => e.kind === 'api_key' && e.provider === provider && e.secret) ||
     null
   );
 }
@@ -26896,10 +26938,21 @@ function vaultRenderEntries(card) {
     const kindChip = document.createElement('span');
     kindChip.className = 'vault-chip';
     kindChip.textContent = entry.kind === 'oauth' ? 'OAuth' : 'API key';
+    const trustedOnly = vaultEntryUnsealPolicy(entry) === 'trusted';
+    const usableHere = vaultEntryUsableHere(entry);
+    let policyChip = null;
+    if (trustedOnly) {
+      policyChip = document.createElement('span');
+      policyChip.className = usableHere ? 'vault-chip' : 'vault-chip warn';
+      policyChip.textContent = usableHere ? 'trusted origins' : 'sealed here';
+      policyChip.title = usableHere
+        ? 'This credential only works from trusted origins (direct or app) — hosted tabs cannot reveal, fuel, or relay it.'
+        : 'This credential is marked trusted-origins-only and this dashboard arrived through a hosted tab: it stays sealed here — no reveal, fueling, or relay. It still syncs with the vault.';
+    }
     const secret = document.createElement('span');
     secret.className = 'secret';
     const secretValue = String(entry.secret || '');
-    secret.textContent = vaultRevealedEntries.has(entry.id)
+    secret.textContent = usableHere && vaultRevealedEntries.has(entry.id)
       ? secretValue || '(token set)'
       : secretValue
         ? `••••${secretValue.slice(-4)}`
@@ -26907,26 +26960,37 @@ function vaultRenderEntries(card) {
     const actions = document.createElement('span');
     actions.className = 'vault-entry-actions';
     if (secretValue) {
-      actions.appendChild(
-        vaultButton(vaultRevealedEntries.has(entry.id) ? 'Hide' : 'Reveal', () => {
-          if (vaultRevealedEntries.has(entry.id)) vaultRevealedEntries.delete(entry.id);
-          else vaultRevealedEntries.add(entry.id);
-          renderAccessVaultSection();
-        })
-      );
-      actions.appendChild(
-        vaultButton('Copy', () => {
-          navigator.clipboard?.writeText(secretValue).catch(() => {});
-        })
-      );
+      const reveal = vaultButton(usableHere && vaultRevealedEntries.has(entry.id) ? 'Hide' : 'Reveal', () => {
+        if (vaultRevealedEntries.has(entry.id)) vaultRevealedEntries.delete(entry.id);
+        else vaultRevealedEntries.add(entry.id);
+        renderAccessVaultSection();
+      });
+      const copy = vaultButton('Copy', () => {
+        navigator.clipboard?.writeText(secretValue).catch(() => {});
+      });
+      if (!usableHere) {
+        reveal.disabled = true;
+        copy.disabled = true;
+        reveal.title = copy.title = 'Sealed in hosted tabs — this entry is marked trusted-origins-only.';
+      }
+      actions.append(reveal, copy);
     }
+    const policyBtn = vaultButton(trustedOnly ? 'Allow anywhere' : 'Trusted only', () => {
+      vaultUpsertEntry({ id: entry.id, unseal_policy: trustedOnly ? 'any' : 'trusted' });
+      renderAccessVaultSection();
+    });
+    policyBtn.title = trustedOnly
+      ? 'Let every dashboard this vault opens in use this credential again.'
+      : 'Seal this credential against hosted tabs: only direct or app origins may reveal, fuel, or relay it. (Client-side policy — it guards against mistakes, not a malicious page.)';
+    actions.appendChild(policyBtn);
     actions.appendChild(
       vaultButton('Remove', () => {
         vaultRemoveEntry(entry.id);
         renderAccessVaultSection();
       }, { danger: true })
     );
-    row.append(lbl, chip, kindChip, secret, actions);
+    if (policyChip) row.append(lbl, chip, kindChip, policyChip, secret, actions);
+    else row.append(lbl, chip, kindChip, secret, actions);
     list.appendChild(row);
   }
   card.appendChild(list);
@@ -26991,7 +27055,20 @@ function vaultRenderAddForm(card) {
     secretInput.style.display = oauth ? 'none' : '';
     secretArea.style.display = oauth ? '' : 'none';
   });
-  grid.append(kindLabel, kindSelect, providerLabel, providerSelect, labelLabel, labelInput, secretLabel, secretInput);
+  const policyLabel = document.createElement('label');
+  policyLabel.textContent = 'Unseal where?';
+  const policySelect = document.createElement('select');
+  for (const [value, label, title] of [
+    ['any', 'Anywhere this vault opens', 'The default: usable from every dashboard that can open your vault.'],
+    ['trusted', 'Trusted origins only (direct / app)', 'Sealed against hosted tabs: no reveal, fueling, or relay from them. Client-side policy — a guard against mistakes, not a malicious page. Today the vault itself opens through Connect, so a trusted-only entry stays stored-but-sealed until the direct/app vault path lands.'],
+  ]) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    option.title = title;
+    policySelect.appendChild(option);
+  }
+  grid.append(kindLabel, kindSelect, providerLabel, providerSelect, labelLabel, labelInput, policyLabel, policySelect, secretLabel, secretInput);
   body.appendChild(grid);
   body.appendChild(secretArea);
 
@@ -27018,6 +27095,7 @@ function vaultRenderAddForm(card) {
         label: labelInput.value.trim() ||
           (oauth ? vaultProviderLabel(providerSelect.value) : `${vaultProviderLabel(providerSelect.value)} key`),
         secret: secretValue,
+        ...(policySelect.value === 'trusted' ? { unseal_policy: 'trusted' } : {}),
       });
       secretInput.value = '';
       secretArea.value = '';
@@ -27139,6 +27217,15 @@ function vaultRenderFueling(card) {
   const fuelable = vaultState.entries
     .map(entry => ({ entry, kind: vaultEntryLeaseKind(entry) }))
     .filter(item => item.kind);
+  // No silent caps: say when entries exist but are sealed against this
+  // context, instead of quietly rendering fewer fuel buttons.
+  const sealed = vaultState.entries.filter(e => e.secret && !vaultEntryUsableHere(e)).length;
+  if (sealed > 0) {
+    const note = document.createElement('div');
+    note.className = 'vault-note';
+    note.textContent = `${sealed === 1 ? '1 credential is' : `${sealed} credentials are`} marked trusted-origins-only and stay${sealed === 1 ? 's' : ''} sealed in hosted tabs — no fueling from here.`;
+    card.appendChild(note);
+  }
   const fuelRow = document.createElement('div');
   fuelRow.className = 'vault-actions';
   for (const { entry, kind } of fuelable) {
@@ -49385,6 +49472,46 @@ async function accessConnectSetEnabled(enabled, rendezvousUrl) {
   renderAccessAdminSummaries();
 }
 
+async function accessSetTier(tier) {
+  const payload = { tier: tier || null };
+  try {
+    const resp = await dashboardJsonFetch('api_access_set_tier', payload, () => authedFetch('/api/access/tier', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }), 'api_access_set_tier', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    showControlToast?.('success', tier
+      ? `Trust tier set: ${tier}`
+      : 'Trust tier cleared');
+  } catch (err) {
+    showControlToast?.('error', err?.message || 'Trust tier change failed');
+  }
+  await refreshAccessOverviewFromApi().catch(() => null);
+  renderAccessAdminSummaries();
+}
+
+async function accessSetHostedCeiling(roleId) {
+  const payload = { role_id: roleId };
+  try {
+    const resp = await dashboardJsonFetch('api_access_set_hosted_ceiling', payload, () => authedFetch('/api/access/hosted-ceiling', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }), 'api_access_set_hosted_ceiling', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    showControlToast?.('success', roleId === 'role:none'
+      ? 'Hosted-origin control refused. Reach this daemon directly, through the app, or from an enrolled peer — a hosted tab can no longer change this back.'
+      : `Hosted control ceiling set to ${roleId.replace(/^role:/, '')}`);
+  } catch (err) {
+    showControlToast?.('error', err?.message || 'Hosted ceiling change failed');
+  }
+  await refreshAccessOverviewFromApi().catch(() => null);
+  renderAccessAdminSummaries();
+}
+
 async function accessConnectUnclaim() {
   try {
     const resp = await dashboardJsonFetch('api_access_connect_unclaim', {}, () => authedFetch('/api/access/connect/unclaim', {
@@ -50123,6 +50250,13 @@ function accessFallbackIamRoles() {
     status: 'enforced',
     summary: 'Daemon-to-daemon grants enforced by the approved peer identity profile.',
     permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'],
+    source: 'builtin',
+  }, {
+    id: 'role:none',
+    label: 'No access',
+    status: 'enforced',
+    summary: 'Ceiling-only sentinel with no permissions: used in role_ceilings to refuse a binding kind (e.g. hosted-origin control) entirely. Never assigned to a principal.',
+    permissions: [],
     source: 'builtin',
   }, {
     id: 'role:scoped-human',
@@ -50955,7 +51089,7 @@ function accessSyncUserClientGrantFields(form) {
       && selectedRoleObj.permissions.some(perm => !ceilingRole.permissions.includes(perm)));
     note.style.display = exceeds ? '' : 'none';
     if (exceeds) {
-      note.textContent = `Hosted-route sessions for this account are capped at ${ceiling.replace(/^role:/, '')} by this daemon's role ceiling — the grant saves as ${selectedRole.replace(/^role:/, '')}, but Connect sessions won't exceed the ceiling. Raise or clear role_ceilings in iam.json to change this.`;
+      note.textContent = `Hosted-route sessions for this account are capped at ${ceiling.replace(/^role:/, '')} by this daemon's role ceiling — the grant saves as ${selectedRole.replace(/^role:/, '')}, but Connect sessions won't exceed the ceiling. The "Hosted tabs may" control on the Overview tab moves it.`;
     }
   }
 }
@@ -50968,6 +51102,8 @@ function accessAssignableIamRoles(overview = accessOverviewModel()) {
     const status = accessModelLabel(role?.status, 'enforced');
     if (!id || status === 'planned') return false;
     if (id === 'role:peer-profile') return false;
+    // role:none is the ceiling-only sentinel; it is never granted.
+    if (id === 'role:none') return false;
     return true;
   });
   if (filtered.length) return filtered;
@@ -51758,7 +51894,33 @@ const ACCESS_ROLE_META = {
   'role:observer': { cls: 'role-observer', short: 'Watch read-only, including live displays.' },
   'role:scoped-human': { cls: 'role-scoped', short: 'Inspect the access model only. A safe first grant.' },
   'role:peer-profile': { cls: 'role-peer', short: 'Daemon-to-daemon authority bounded by the peer profile.' },
+  'role:none': { cls: 'role-scoped', short: 'No permissions at all. Ceiling-only: used to refuse hosted-origin control entirely, never granted to anyone.' },
 };
+
+/* Trust tiers (docs/src/trust-tiers.md). The id vocabulary mirrors the
+   daemon's DAEMON_TIERS constant and is pinned by the
+   dashboard_tier_vocabulary_mirrors_daemon_tiers parity test — change
+   both together. */
+const ACCESS_TIER_META = {
+  'integrated': {
+    label: 'Integrated',
+    glyph: '⌂',
+    short: 'Holds your personal world — accounts, files, mail. Protect it: control it directly or through the app, and grant conservatively.',
+  },
+  'disposable': {
+    label: 'Disposable',
+    glyph: '♻',
+    short: 'Scratch box holding nothing durable. Worst case: rotate a key and destroy it. Hosted tabs are fine here.',
+  },
+};
+
+/* The curated hosted-ceiling positions, strongest last. Every id must
+   name a builtin role (pinned by the role-catalog parity test). */
+const ACCESS_HOSTED_CEILING_CHOICES = [
+  { id: 'role:operator', label: 'Operate (default)', short: 'Hosted tabs can drive sessions, terminal, files, and fuel credentials — the right setting for disposable boxes.' },
+  { id: 'role:observer', label: 'View only', short: 'Hosted tabs can watch displays and sessions but change nothing. Vault fueling from hosted tabs stops working on this daemon.' },
+  { id: 'role:none', label: 'Nothing', short: 'This daemon refuses hosted-origin control entirely — reach it directly, through the app, or from an enrolled peer.' },
+];
 
 function accessRoleMeta(roleId) {
   const id = accessModelLabel(roleId);
@@ -52475,6 +52637,151 @@ function renderAccessPeopleCurrent() {
   }));
 }
 
+/* Overview: Trust tier — what this machine holds, and how tightly hosted
+   tabs are capped on it (docs/src/trust-tiers.md). The tier is a doctrine
+   label (it grants and denies nothing); the ceiling row below it is the
+   enforcement, kept visually coupled so choosing "Integrated" naturally
+   leads to hardening hosted control. */
+function accessHostedCeilingCurrent(iam) {
+  const ceilings = iam.role_ceilings && typeof iam.role_ceilings === 'object' ? iam.role_ceilings : {};
+  const account = accessModelLabel(ceilings['connect_account']);
+  const key = accessModelLabel(ceilings['client_key']);
+  if (!account && !key) return { value: '', state: 'uncapped' };
+  if (account !== key) return { value: '', state: 'mixed' };
+  return { value: account, state: ACCESS_HOSTED_CEILING_CHOICES.some(c => c.id === account) ? 'choice' : 'custom' };
+}
+
+function renderAccessTierCard() {
+  const mount = document.getElementById('access-tier-card');
+  if (!mount) return;
+  const iam = accessIamModel(accessOverviewModel());
+  const tier = accessModelLabel(iam.tier);
+  const canSetTier = dashboardControlTransport?.lastStatus?.api_access_set_tier_available !== false;
+  const canSetCeiling = dashboardControlTransport?.lastStatus?.api_access_set_hosted_ceiling_available !== false;
+
+  mount.textContent = '';
+  const head = document.createElement('div');
+  head.className = 'acc-section-head';
+  const title = document.createElement('div');
+  title.className = 'acc-section-title';
+  title.textContent = 'Trust tier';
+  const sub = document.createElement('div');
+  sub.className = 'acc-section-sub';
+  sub.textContent = 'What would a compromise of this machine cost you? The tier is a label that guides grants and clients — the enforcement lives in the hosted-control cap below it.';
+  head.append(title, sub);
+  mount.appendChild(head);
+
+  const card = document.createElement('div');
+  card.className = 'acc-principal-card';
+
+  const headRow = document.createElement('div');
+  headRow.className = 'acc-principal-head';
+  const glyphEl = document.createElement('div');
+  glyphEl.className = 'acc-principal-glyph kind-local';
+  glyphEl.textContent = tier ? (ACCESS_TIER_META[tier]?.glyph || 'T') : '?';
+  const nameWrap = document.createElement('div');
+  const name = document.createElement('div');
+  name.className = 'acc-principal-name';
+  name.textContent = tier
+    ? `${ACCESS_TIER_META[tier]?.label || tier} machine`
+    : 'What does this machine hold?';
+  const kindLine = document.createElement('div');
+  kindLine.className = 'acc-principal-kind';
+  kindLine.textContent = tier
+    ? (ACCESS_TIER_META[tier]?.short || '')
+    : 'Pick a tier so grant flows and clients can hold you to it.';
+  nameWrap.append(name, kindLine);
+  headRow.append(glyphEl, nameWrap);
+  if (!tier) {
+    headRow.appendChild(accessRouteChip('remembered', 'not set',
+      'No tier chosen yet. The tier changes no permissions by itself — it drives warnings, recommendations, and (via the cap below) hosted-control policy.'));
+  }
+  card.appendChild(headRow);
+
+  // The two tier options, side by side, current one highlighted.
+  const options = document.createElement('div');
+  options.className = 'acc-grant-flow-actions acc-tier-options';
+  for (const [id, meta] of Object.entries(ACCESS_TIER_META)) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'acc-btn' + (tier === id ? ' primary' : '');
+    btn.textContent = `${meta.glyph} ${meta.label}`;
+    btn.title = meta.short + (tier === id ? ' (current — click again to clear)' : '');
+    btn.disabled = !canSetTier;
+    btn.addEventListener('click', () => accessSetTier(tier === id ? null : id));
+    options.appendChild(btn);
+  }
+  card.appendChild(options);
+
+  // Hosted-control cap: the enforcement row.
+  const ceiling = accessHostedCeilingCurrent(iam);
+  const capRow = document.createElement('div');
+  capRow.className = 'acc-grant-flow-actions acc-tier-cap-row';
+  const capLabel = document.createElement('span');
+  capLabel.className = 'acc-principal-kind';
+  capLabel.textContent = 'Hosted tabs may:';
+  capLabel.title = 'Applies to sessions arriving with hosted provenance — Connect accounts and browser keys enrolled from a hosted origin. Direct, app, and anchor-served sessions are never capped by this.';
+  capRow.appendChild(capLabel);
+  const select = document.createElement('select');
+  select.className = 'acc-btn';
+  select.disabled = !canSetCeiling;
+  for (const choice of ACCESS_HOSTED_CEILING_CHOICES) {
+    const opt = document.createElement('option');
+    opt.value = choice.id;
+    opt.textContent = choice.label;
+    opt.title = choice.short;
+    select.appendChild(opt);
+  }
+  if (ceiling.state === 'choice') {
+    select.value = ceiling.value;
+  } else {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.disabled = true;
+    opt.selected = true;
+    opt.textContent = ceiling.state === 'mixed'
+      ? 'custom (per-binding, via iam.json)'
+      : ceiling.state === 'custom'
+        ? `custom (${ceiling.value.replace(/^role:/, '')})`
+        : 'uncapped (via iam.json)';
+    select.appendChild(opt);
+  }
+  select.addEventListener('change', () => {
+    if (select.value) accessSetHostedCeiling(select.value);
+  });
+  capRow.appendChild(select);
+  card.appendChild(capRow);
+
+  const hint = document.createElement('div');
+  hint.className = 'acc-principal-kind';
+  const currentChoice = ACCESS_HOSTED_CEILING_CHOICES.find(c => c.id === ceiling.value);
+  hint.textContent = ceiling.state === 'choice'
+    ? (currentChoice?.short || '')
+    : ceiling.state === 'uncapped'
+      ? 'Ceilings are disabled in iam.json — hosted sessions can hold whatever their grant says, including root. Choose a cap here to restore them.'
+      : 'This daemon carries a hand-tuned ceiling in iam.json; picking an option here overwrites it for both hosted bindings.';
+  card.appendChild(hint);
+
+  // The doctrine nudge: an integrated machine still operable from any
+  // hosted tab is the mismatch the tiers chapter warns about.
+  if (tier === 'integrated' && ceiling.value === 'role:operator') {
+    const nudge = document.createElement('div');
+    nudge.className = 'acc-connect-warn';
+    const text = document.createElement('span');
+    text.textContent = 'Integrated machine, yet hosted tabs can still operate it. Recommended: cap them to View only (or Nothing) and drive this daemon directly or through the app. ';
+    const harden = document.createElement('button');
+    harden.type = 'button';
+    harden.className = 'acc-btn';
+    harden.textContent = 'Cap to View only';
+    harden.disabled = !canSetCeiling;
+    harden.addEventListener('click', () => accessSetHostedCeiling('role:observer'));
+    nudge.append(text, harden);
+    card.appendChild(nudge);
+  }
+
+  mount.appendChild(card);
+}
+
 /* Overview: Intendant Connect — this daemon's hosted reachability and
    claim binding. States: off → one-click enable; registering; unclaimed
    → reveal the twelve words (manage-gated, fetched only on click);
@@ -52738,6 +53045,10 @@ function renderAccessEnrollmentRequests() {
     headRow.append(glyphEl, nameWrap);
     if (request.origin) {
       headRow.appendChild(accessRouteChip('connect', 'via hosted route', `The offer arrived through ${request.origin}; the key will be recorded with that origin, so the role ceiling applies until it is re-enrolled from an anchor origin.`));
+      if (accessModelLabel(accessIamModel(accessOverviewModel()).tier) === 'integrated') {
+        headRow.appendChild(accessRouteChip('danger', 'integrated tier',
+          'This is an integrated-tier machine and the key arrived through a hosted route. Approving is an upward grant (docs: trust-tiers) — the hosted-control cap still bounds the session, but prefer enrolling this device from a direct or app origin.'));
+      }
     }
     if (request.account_hint) {
       headRow.appendChild(request.account_attested
@@ -53794,6 +54105,7 @@ function renderAccessAdminSummaries() {
   }
   renderAccessAttention();
   renderAccessIdentityHero();
+  renderAccessTierCard();
   renderAccessConnectCard();
   renderAccessFleetStrip();
   renderAccessExplainer();
@@ -70867,6 +71179,12 @@ function renderPeerAccessRequests(requests) {
     return;
   }
 
+  // Upward-grant guard (docs/src/trust-tiers.md): approving a peer here
+  // grants that daemon authority ON this machine. On an integrated-tier
+  // machine that is the alarm condition — advisory, never a refusal.
+  const integratedTier = (typeof accessIamModel === 'function' && typeof accessOverviewModel === 'function')
+    && String(accessIamModel(accessOverviewModel())?.tier || '') === 'integrated';
+
   list.innerHTML = requests.map(req => {
     const requestId = String(req.request_id || '');
     const label = escapeHtml(req.requester_label || 'Unnamed daemon');
@@ -70889,6 +71207,7 @@ function renderPeerAccessRequests(requests) {
         </div>
         <div class="daemon-access-request-meta">Status ${escapeHtml(status)} - ${roleLabel} ${escapeHtml(role.label)}</div>
         <div class="daemon-access-request-meta daemon-role-summary">${escapeHtml(role.summary)}</div>
+        ${pending && integratedTier ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="Grants flow toward disposable machines, never up. If that daemon is lower-trust than this one, approving bridges your tiers — see the Trust tier card in Access.">⚠ Integrated-tier machine: approving grants a peer daemon authority here. Make sure trust flows downward.</div>' : ''}
         ${timing ? `<div class="daemon-access-request-meta">${timing}</div>` : ''}
         ${pending ? `<div class="daemon-pairing-row"><select data-access-request-profile="${escapeHtml(requestId)}">${renderPeerProfileOptions(requestedProfile)}</select></div>` : ''}
         <div class="daemon-access-request-actions">

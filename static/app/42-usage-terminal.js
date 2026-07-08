@@ -763,6 +763,46 @@ async function accessConnectSetEnabled(enabled, rendezvousUrl) {
   renderAccessAdminSummaries();
 }
 
+async function accessSetTier(tier) {
+  const payload = { tier: tier || null };
+  try {
+    const resp = await dashboardJsonFetch('api_access_set_tier', payload, () => authedFetch('/api/access/tier', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }), 'api_access_set_tier', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    showControlToast?.('success', tier
+      ? `Trust tier set: ${tier}`
+      : 'Trust tier cleared');
+  } catch (err) {
+    showControlToast?.('error', err?.message || 'Trust tier change failed');
+  }
+  await refreshAccessOverviewFromApi().catch(() => null);
+  renderAccessAdminSummaries();
+}
+
+async function accessSetHostedCeiling(roleId) {
+  const payload = { role_id: roleId };
+  try {
+    const resp = await dashboardJsonFetch('api_access_set_hosted_ceiling', payload, () => authedFetch('/api/access/hosted-ceiling', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }), 'api_access_set_hosted_ceiling', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    showControlToast?.('success', roleId === 'role:none'
+      ? 'Hosted-origin control refused. Reach this daemon directly, through the app, or from an enrolled peer — a hosted tab can no longer change this back.'
+      : `Hosted control ceiling set to ${roleId.replace(/^role:/, '')}`);
+  } catch (err) {
+    showControlToast?.('error', err?.message || 'Hosted ceiling change failed');
+  }
+  await refreshAccessOverviewFromApi().catch(() => null);
+  renderAccessAdminSummaries();
+}
+
 async function accessConnectUnclaim() {
   try {
     const resp = await dashboardJsonFetch('api_access_connect_unclaim', {}, () => authedFetch('/api/access/connect/unclaim', {
@@ -1501,6 +1541,13 @@ function accessFallbackIamRoles() {
     status: 'enforced',
     summary: 'Daemon-to-daemon grants enforced by the approved peer identity profile.',
     permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'],
+    source: 'builtin',
+  }, {
+    id: 'role:none',
+    label: 'No access',
+    status: 'enforced',
+    summary: 'Ceiling-only sentinel with no permissions: used in role_ceilings to refuse a binding kind (e.g. hosted-origin control) entirely. Never assigned to a principal.',
+    permissions: [],
     source: 'builtin',
   }, {
     id: 'role:scoped-human',
@@ -2333,7 +2380,7 @@ function accessSyncUserClientGrantFields(form) {
       && selectedRoleObj.permissions.some(perm => !ceilingRole.permissions.includes(perm)));
     note.style.display = exceeds ? '' : 'none';
     if (exceeds) {
-      note.textContent = `Hosted-route sessions for this account are capped at ${ceiling.replace(/^role:/, '')} by this daemon's role ceiling — the grant saves as ${selectedRole.replace(/^role:/, '')}, but Connect sessions won't exceed the ceiling. Raise or clear role_ceilings in iam.json to change this.`;
+      note.textContent = `Hosted-route sessions for this account are capped at ${ceiling.replace(/^role:/, '')} by this daemon's role ceiling — the grant saves as ${selectedRole.replace(/^role:/, '')}, but Connect sessions won't exceed the ceiling. The "Hosted tabs may" control on the Overview tab moves it.`;
     }
   }
 }
@@ -2346,6 +2393,8 @@ function accessAssignableIamRoles(overview = accessOverviewModel()) {
     const status = accessModelLabel(role?.status, 'enforced');
     if (!id || status === 'planned') return false;
     if (id === 'role:peer-profile') return false;
+    // role:none is the ceiling-only sentinel; it is never granted.
+    if (id === 'role:none') return false;
     return true;
   });
   if (filtered.length) return filtered;
