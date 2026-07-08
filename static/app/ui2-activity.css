@@ -1,0 +1,160 @@
+/* ── ui-v2 Activity slice 1: Focus timeline + approval hero ────────────
+   All scoped html.ui-v2. Restyles the EXISTING log-entry scaffold
+   (.log-ts gutter / .log-icon dot / data-level colors) into the design's
+   timeline grammar and the approval panel into the hero card; no DOM
+   builders are rewritten (clone+rewire into session windows keeps
+   working — the same classes style both contexts). Session-window grid
+   and the four sub-tabs keep bridge paint this slice. */
+
+/* — centered focus column — */
+html.ui-v2 #log-stream {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 18px 24px 24px;
+}
+
+/* — timeline entry grammar: [mono ts gutter][dot][body] — */
+html.ui-v2 .log-entry {
+  display: grid;
+  grid-template-columns: 56px 14px 1fr;
+  gap: 0 10px;
+  align-items: baseline;
+  padding: 5px 0;
+  border: 0;
+  background: transparent;
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+html.ui-v2 .log-entry .log-ts {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  text-align: right;
+  white-space: nowrap;
+}
+html.ui-v2 .log-entry .log-icon {
+  font-size: 0;               /* hide the glyph… */
+  width: 6px; height: 6px;    /* …become the role dot */
+  border-radius: 50%;
+  background: var(--text-3);
+  align-self: center;
+  justify-self: center;
+}
+html.ui-v2 .log-entry.level-model .log-icon { background: var(--iris); }
+html.ui-v2 .log-entry.level-agent .log-icon { background: var(--green); }
+html.ui-v2 .log-entry.level-subagent .log-icon { background: var(--violet); }
+html.ui-v2 .log-entry.level-presence .log-icon { background: var(--green); }
+html.ui-v2 .log-entry.level-error .log-icon { background: var(--rose); }
+html.ui-v2 .log-entry.level-warn .log-icon { background: var(--amber); }
+html.ui-v2 .log-entry.level-info .log-icon { background: var(--sky); }
+html.ui-v2 .log-entry.level-model { color: var(--text); }
+html.ui-v2 .log-entry.level-detail, html.ui-v2 .log-entry.level-debug { color: var(--text-3); }
+html.ui-v2 .log-entry.level-error { color: var(--rose); }
+html.ui-v2 .log-entry.level-warn { color: var(--amber); }
+
+/* code-ish payloads inside entries read as command blocks */
+html.ui-v2 .log-entry pre {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--code-bg);
+  padding: 10px 13px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+html.ui-v2 .diff-log-entry .diff-log-body {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+/* rewind strike-through + superseded keep their meaning, v2 tones */
+html.ui-v2 .log-entry.superseded { opacity: .48; }
+html.ui-v2 .log-entry.rollback-marker { color: var(--amber); }
+
+/* — approval hero card (design's flagship moment) — */
+html.ui-v2 #approval-panel .approval-card {
+  border: 1px solid rgba(var(--amber-rgb), .32);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02));
+  box-shadow: var(--shadow-card);
+  padding: 15px 17px;
+}
+html.ui-v2 #approval-panel .approval-icon { display: none; }
+html.ui-v2 #approval-panel .approval-title {
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--amber);
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+html.ui-v2 #approval-panel .approval-title::before {
+  content: '';
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 0 4px rgba(var(--amber-rgb), .14);
+  animation: ui2-pulse 2s infinite;
+}
+html.ui-v2 #approval-panel .approval-command {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--code-bg);
+  padding: 10px 14px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  margin: 10px 0 6px;
+}
+html.ui-v2 #approval-panel .approval-category {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: rgba(var(--amber-rgb), .14);
+  border: 1px solid rgba(var(--amber-rgb), .26);
+  color: var(--amber);
+  margin-bottom: 11px;
+}
+html.ui-v2 #approval-panel .approval-actions { display: flex; gap: 9px; flex-wrap: wrap; align-items: center; }
+html.ui-v2 #approval-panel .approval-actions button {
+  padding: 9px 15px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-2);
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #approval-panel .approval-actions button:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 #approval-panel .approval-actions button.approve {
+  border: 0;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 800;
+  box-shadow: 0 8px 22px rgba(var(--iris-rgb), .36);
+}
+html.ui-v2 #approval-panel .approval-actions button.approve:hover { filter: brightness(1.08); }
+html.ui-v2 #approval-panel .approval-actions button.deny {
+  border-color: rgba(var(--rose-rgb), .4);
+  color: var(--rose);
+  font-weight: 700;
+}
+html.ui-v2 #approval-panel .approval-actions button.deny:hover { background: rgba(var(--rose-rgb), .1); }
+html.ui-v2 #approval-panel .approval-actions kbd {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: rgba(11, 12, 16, .25);
+}
+/* the category-rule action (inserted by ui2-activity.js) */
+html.ui-v2 #approval-panel .ui2-approve-category {
+  border-color: rgba(var(--green-rgb), .34);
+  color: var(--green);
+}
+html.ui-v2 #approval-panel .ui2-approve-category:hover { background: rgba(var(--green-rgb), .08); }
+/* the relabeled autonomy escape reads as the power action it is */
+html.ui-v2 #approval-panel .ui2-full-escape { font-size: 12px; color: var(--text-3); }
