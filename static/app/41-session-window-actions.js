@@ -2158,8 +2158,13 @@ function applyMainBackendStatus() {
     return;
   }
 
-  providerEl.textContent = (gatewayConfig && gatewayConfig.provider) || '--';
-  modelEl.textContent = (gatewayConfig && gatewayConfig.model) || '--';
+  // No fallback to gatewayConfig here: its provider/model fields are the
+  // browser live-audio VOICE pair (Gemini Live by default), not the chat
+  // provider — using them made an idle or keyless daemon's status bar
+  // claim a chat provider it does not run. Real values arrive with the
+  // first session status event; until then the chips stay honest.
+  providerEl.textContent = '--';
+  modelEl.textContent = '--';
 }
 
 function updateStatusBar(d) {

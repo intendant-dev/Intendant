@@ -131,4 +131,25 @@ fi
 info "checking public readiness at $CONNECT_PUBLIC_READYZ_URL"
 curl -fsS "$CONNECT_PUBLIC_READYZ_URL" >/dev/null
 
+# Regression probe for the whole reverse-proxy chain: register a throwaway
+# daemon through the public origin and require the response to echo the
+# caller's address. observed_ip is what lets hosted dashboards reach NAT'd
+# daemons (they advertise ICE-TCP at that address) — a proxy that stops
+# forwarding X-Forwarded-For/X-Real-IP breaks every hosted dashboard, and
+# the failure only surfaces later as an ICE timeout on some daemon. The
+# throwaway registration is unclaimed and expires on its own.
+info "checking observed_ip echo at $CONNECT_PUBLIC_ORIGIN"
+PROBE_ARGS=(
+    -fsS -X POST "$CONNECT_PUBLIC_ORIGIN/api/daemon/register"
+    -H 'content-type: application/json'
+    -d '{"protocol":"intendant-connect-rendezvous-v1","daemon_id":"deploy-observed-ip-probe","daemon_public_key":"deploy-observed-ip-probe"}'
+)
+if [[ -n "${INTENDANT_CONNECT_TOKEN:-}" ]]; then
+    PROBE_ARGS+=(-H "Authorization: Bearer $INTENDANT_CONNECT_TOKEN")
+fi
+PROBE_RESPONSE="$(curl "${PROBE_ARGS[@]}")"
+if ! grep -qE '"observed_ip":"[0-9a-fA-F:.]+"' <<<"$PROBE_RESPONSE"; then
+    die "register response did not echo the caller address (observed_ip) — the reverse proxy in front of the service is not forwarding X-Forwarded-For/X-Real-IP, so hosted dashboards cannot reach NAT'd daemons. See the Reachability section of docs/src/self-hosted-rendezvous.md (Caddy applies header_up deletions after sets — do not strip-then-set). Response: $PROBE_RESPONSE"
+fi
+
 info "deploy complete"

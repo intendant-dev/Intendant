@@ -86,8 +86,6 @@ struct Nal {
 /// frame starts whenever `first_mb_in_slice == 0`.
 pub struct FfmpegH264Encoder {
     child: Child,
-    width: u32,
-    height: u32,
     frame_count: u64,
     pts_offset: u64,
     frame_size: usize,
@@ -304,8 +302,6 @@ impl FfmpegH264Encoder {
 
         Ok(Self {
             child,
-            width,
-            height,
             frame_count: 0,
             pts_offset: 0,
             frame_size,
