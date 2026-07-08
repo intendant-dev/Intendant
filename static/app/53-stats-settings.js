@@ -662,6 +662,8 @@ function renderStatsSessionSections(sessions) {
   }
   setStatsSessionLoading(currentStatsHostKey(), false);
   renderStatsKpiRow(sessions);
+  // ui-v2 only: per-model cost cards (the section exists only under the flag).
+  if (typeof ui2Enabled === 'function' && ui2Enabled()) renderUi2UsageByModel(sessions);
   renderTokenActivity(sessions);
   renderAllSessionsUsage(sessions);
   renderDailyUsage(sessions);
@@ -714,12 +716,15 @@ function clearStatsSessionSections() {
     'daily-usage-section',
     'agent-usage-section',
     'disk-usage-section',
+    // v2-only section (53's flag-gated boot block); null under v1.
+    'ui2-by-model',
   ]) {
     const el = document.getElementById(id);
     if (el) el.style.display = 'none';
   }
   for (const id of [
     'stats-kpi-row',
+    'ui2-by-model-cards',
     'token-activity-stats',
     'token-activity-skyline',
     'token-activity-months',
@@ -1537,6 +1542,9 @@ function renderAllSessionsUsageError(message) {
   if (dailyEl) dailyEl.style.display = 'none';
   if (agentEl) agentEl.style.display = 'none';
   if (diskEl) diskEl.style.display = 'none';
+  // v2-only by-model section (null under v1).
+  const byModelEl = document.getElementById('ui2-by-model');
+  if (byModelEl) byModelEl.style.display = 'none';
 }
 
 function renderAllSessionsUsage(sessions) {
@@ -1784,6 +1792,248 @@ document.getElementById('token-activity-heatmap')?.addEventListener('keydown', (
   event.preventDefault();
   selectTokenActivityDayFromCell(cell);
 });
+
+// ── ui-v2 Usage additions (design-overhaul P2) ──
+//
+// Everything from here to the boot block below is inert under v1: the
+// by-model section, heatmap legend, and disclosure folds exist only when
+// the flag builds them, and the one shared call site
+// (renderStatsSessionSections) is flag-gated. DOM nodes moved into the
+// folds keep their ids, so every v1 renderer and delegated listener
+// works unchanged.
+
+// Corpus cost per model. Sessions carry `model` in the usage view (the
+// session_catalog KEEP list serves it for exactly this fold); peers on
+// older builds still strip it, in which case everything lands in the
+// '' bucket and the section hides itself instead of showing one big
+// unattributed card.
+function summarizeUsageByModel(sessions) {
+  const buckets = new Map();
+  for (const s of sessions) {
+    const entries = sessionUsageEntries(s);
+    const hasUsage = entries.some(e => e.total > 0 || e.input > 0 || e.output > 0 || e.cached > 0 || e.cost > 0);
+    if (!hasUsage) continue;
+    const model = typeof (s && s.model) === 'string' ? s.model.trim() : '';
+    if (!buckets.has(model)) {
+      buckets.set(model, {
+        model,
+        sessions: 0,
+        input: 0,
+        cached: 0,
+        output: 0,
+        total: 0,
+        cost: 0,
+        unpricedTokens: 0,
+        sources: new Set(),
+      });
+    }
+    const bucket = buckets.get(model);
+    bucket.sessions += 1;
+    bucket.sources.add(agentUsageKey(s));
+    for (const entry of entries) {
+      bucket.input += entry.input;
+      bucket.cached += entry.cached;
+      bucket.output += entry.output;
+      bucket.total += entry.total;
+      bucket.cost += entry.cost;
+      if (entry.total > 0 && entry.cost === 0 && entry.pricingKnown !== true) {
+        bucket.unpricedTokens += entry.total;
+      }
+    }
+  }
+  return buckets;
+}
+
+const UI2_BY_MODEL_CARD_LIMIT = 8;
+
+// Session-source chip for a model card. Honest labels only: the corpus
+// knows which backend ran a session (source), not which live role
+// (main/presence) a model played — so the chip says native/codex/claude,
+// never a role the data can't prove.
+function ui2ModelSourceChipHtml(bucket) {
+  const sources = Array.from(bucket.sources);
+  const key = sources.length === 1 ? sources[0] : 'mixed';
+  const label = {
+    intendant: 'native',
+    codex: 'codex',
+    claude: 'claude code',
+    other: 'other',
+    mixed: 'mixed',
+  }[key] || key;
+  return `<span class="ui2-model-chip is-${escapeHtml(key)}">${escapeHtml(label)}</span>`;
+}
+
+function ui2ModelStatHtml(label, value, extraClass = '') {
+  return `
+    <div class="ui2-model-stat${extraClass}">
+      <div class="label">${escapeHtml(label)}</div>
+      <div class="value">${escapeHtml(value)}</div>
+    </div>`;
+}
+
+function renderUi2UsageByModel(sessions) {
+  const section = document.getElementById('ui2-by-model');
+  const cardsEl = document.getElementById('ui2-by-model-cards');
+  if (!section || !cardsEl) return;
+  const buckets = Array.from(summarizeUsageByModel(Array.isArray(sessions) ? sessions : []).values());
+  const named = buckets.filter(b => b.model);
+  if (named.length === 0) {
+    section.style.display = 'none';
+    cardsEl.innerHTML = '';
+    return;
+  }
+  const totalCost = buckets.reduce((sum, b) => sum + b.cost, 0);
+  named.sort((a, b) => (b.cost - a.cost) || (b.total - a.total));
+  const shown = named.slice(0, UI2_BY_MODEL_CARD_LIMIT);
+  const rest = named.slice(UI2_BY_MODEL_CARD_LIMIT);
+  const unattributed = buckets.find(b => !b.model);
+
+  const cards = shown.map(b => {
+    const share = totalCost > 0 ? (b.cost / totalCost) * 100 : 0;
+    const hit = b.input > 0 ? (b.cached / b.input) * 100 : null;
+    // Cost honesty: a model whose tokens carry no known pricing shows
+    // "—", not a fake $0.00 (same contract as the by-agent table).
+    const costText = b.cost > 0
+      ? formatUsdCompact(b.cost)
+      : (b.unpricedTokens > 0 ? '—' : formatUsd(0, 2));
+    const subBits = [];
+    if (b.cost > 0 && totalCost > 0) {
+      subBits.push(`${share.toFixed(share >= 10 ? 0 : 1)}% of all-time cost`);
+    }
+    if (hit != null) subBits.push(`${hit.toFixed(0)}% cache hit`);
+    subBits.push(`${b.sessions.toLocaleString()} session${b.sessions === 1 ? '' : 's'}`);
+    const unpriced = b.unpricedTokens > 0
+      ? `<span class="ui2-model-unpriced">+ ${b.unpricedTokens.toLocaleString()} tokens not priced</span>`
+      : '';
+    // Bar = share of all-time cost (real, unlike the reference's
+    // context-pressure fiction — daily buckets record no pressure).
+    const barPct = Math.min(100, b.cost > 0 ? Math.max(2, share) : 0);
+    return `
+      <div class="ui2-model-card">
+        <div class="ui2-model-head">
+          <span class="ui2-model-name" title="${escapeHtml(b.model)}">${escapeHtml(b.model)}</span>
+          ${ui2ModelSourceChipHtml(b)}
+          <span class="ui2-model-cost">${escapeHtml(costText)}</span>
+        </div>
+        <div class="ui2-model-stats">
+          ${ui2ModelStatHtml('Prompt', formatCompactNumber(b.input))}
+          ${ui2ModelStatHtml('Completion', formatCompactNumber(b.output))}
+          ${ui2ModelStatHtml('Cached', b.cached > 0 ? formatCompactNumber(b.cached) : '—', b.cached > 0 ? ' is-cached' : '')}
+        </div>
+        <div class="ui2-model-meter"><i style="width:${barPct.toFixed(2)}%"></i></div>
+        <div class="ui2-model-sub">${escapeHtml(subBits.join(' · '))}${unpriced}</div>
+      </div>`;
+  });
+
+  const footerBits = [];
+  if (rest.length > 0) {
+    const restCost = rest.reduce((sum, b) => sum + b.cost, 0);
+    footerBits.push(`+ ${rest.length} more model${rest.length === 1 ? '' : 's'} · ${formatUsdCompact(restCost)}`);
+  }
+  if (unattributed) {
+    footerBits.push(`${formatCompactNumber(unattributed.total)} tokens on sessions without a recorded model`);
+  }
+  const footer = footerBits.length > 0
+    ? `<div class="ui2-model-more">${escapeHtml(footerBits.join(' · '))}</div>`
+    : '';
+
+  cardsEl.innerHTML = cards.join('') + footer;
+  section.style.display = 'block';
+}
+
+// Boot-time page chrome for the v2 Usage screen: in-page header, the
+// by-model section, the heatmap Less→More legend, and the two disclosure
+// folds that keep every v1 power section reachable (live/fallback cards
+// incl. cache economics, estimated cost, tokens per turn; the four
+// tables, disk usage, and display transport). Nodes are MOVED with
+// appendChild — ids, renderer contracts, and delegated listeners are
+// untouched — and none of this runs under v1.
+if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+  const usageContainer = document.getElementById('usage-container');
+  if (usageContainer) {
+    const head = document.createElement('div');
+    head.className = 'ui2-page-head';
+    const pageTitle = document.createElement('h1');
+    pageTitle.className = 'ui2-page-title';
+    pageTitle.textContent = 'Usage';
+    const pageSub = document.createElement('p');
+    pageSub.className = 'ui2-page-sub';
+    pageSub.textContent = 'Token consumption, cost, and activity across every model and session.';
+    head.append(pageTitle, pageSub);
+    usageContainer.prepend(head);
+
+    const byModel = document.createElement('div');
+    byModel.id = 'ui2-by-model';
+    byModel.style.display = 'none';
+    byModel.innerHTML =
+      '<div class="ui2-eyebrow">By model</div>' +
+      '<div id="ui2-by-model-cards" class="ui2-model-cards"></div>';
+    document.getElementById('usage-empty')?.after(byModel);
+
+    // Legend inside the token-activity card so it shows/hides with it.
+    const heatWrap = usageContainer.querySelector('.token-activity-heatmap-wrap');
+    if (heatWrap) {
+      const legend = document.createElement('div');
+      legend.className = 'ui2-heat-legend';
+      legend.setAttribute('aria-hidden', 'true');
+      legend.innerHTML = '<span>Less</span>'
+        + [0, 1, 2, 3, 4, 5].map(l => `<i class="l${l}"></i>`).join('')
+        + '<span>More</span>';
+      heatWrap.after(legend);
+    }
+
+    const makeFold = (id, titleText, hintText, sectionIds) => {
+      const fold = document.createElement('section');
+      fold.className = 'ui2-fold';
+      fold.id = id;
+      const storeKey = 'intendant.ui2.' + id;
+      let open = false;
+      try { open = localStorage.getItem(storeKey) === '1'; } catch (e) { /* private mode */ }
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ui2-fold-head';
+      btn.innerHTML =
+        `<span class="ui2-fold-chev">${ui2Icon('right', 14)}</span>` +
+        `<span class="ui2-fold-title">${escapeHtml(titleText)}</span>` +
+        `<span class="ui2-fold-hint">${escapeHtml(hintText)}</span>`;
+      const body = document.createElement('div');
+      body.className = 'ui2-fold-body';
+      body.id = id + '-body';
+      btn.setAttribute('aria-controls', body.id);
+      for (const sid of sectionIds) {
+        const el = document.getElementById(sid);
+        if (el) body.appendChild(el);
+      }
+      const apply = () => {
+        fold.classList.toggle('open', open);
+        btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      };
+      btn.addEventListener('click', () => {
+        open = !open;
+        try { localStorage.setItem(storeKey, open ? '1' : '0'); } catch (e) { /* private mode */ }
+        apply();
+      });
+      apply();
+      fold.append(btn, body);
+      return fold;
+    };
+
+    usageContainer.append(
+      makeFold(
+        'ui2-usage-fold-session',
+        'Session & cost detail',
+        'Live model cards · cache economics · estimated cost · tokens per turn',
+        ['usage-cards', 'cost-section', 'token-history'],
+      ),
+      makeFold(
+        'ui2-usage-fold-tables',
+        'Detailed tables',
+        'All sessions · daily · by agent · disk · display transport',
+        ['all-sessions-usage', 'daily-usage-section', 'agent-usage-section', 'disk-usage-section', 'display-metrics-container'],
+      ),
+    );
+  }
+}
 
 function focusActivityForSessionEvent(options = {}) {
   const force = !!options.force;

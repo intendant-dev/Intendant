@@ -19,6 +19,7 @@ ui2-chrome.css
 ui2-access.css
 ui2-terminal-files.css
 ui2-debug.css
+ui2-usage.css
 19-style-close.html
 
 20-shell.html
