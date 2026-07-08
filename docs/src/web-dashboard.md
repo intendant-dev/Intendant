@@ -315,6 +315,18 @@ connected, local display input authority requests and keyboard/mouse input can
 use that daemon-scoped control tunnel; video media still flows through the
 per-display WebRTC session.
 
+- **New virtual display** (empty state + display picker) — create a virtual
+  display keylessly: the daemon launches an Xvfb through the same machinery
+  agent sessions use, registers a capture session, and every connected
+  dashboard gets a streaming tile (`create_virtual_display`, gated as
+  `display.input`, on both the `/ws` and dashboard-control transports). This
+  is how a freshly claimed headless box — no display server, no API key —
+  gets a working display; agents can then target it for computer use. The
+  created display is daemon-owned: it never touches the "Your display"
+  opt-in, and it is destroyed (Xvfb killed) when any dashboard closes its
+  tile or the daemon exits. Xvfb is Linux-only; on macOS/Windows the button
+  reports a clear error and "Your display" streams the real desktop instead.
+
 ### Station
 
 An immersive WASM-rendered control center for the same operational surfaces as
