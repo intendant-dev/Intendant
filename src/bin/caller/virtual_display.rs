@@ -114,12 +114,10 @@ pub(crate) async fn create_virtual_display(
             activate_user_display(bus, session_registry, frame_registry, display_id).await;
             // Activation failure already reported its reason; don't leave a
             // guarded Xvfb running with no tile and no way to destroy it.
-            if session_registry.read().await.get(display_id).is_none() {
-                if guards.remove(&display_id).is_some() {
-                    eprintln!(
-                        "[virtual_display] :{display_id} activation failed — Xvfb reaped"
-                    );
-                }
+            if session_registry.read().await.get(display_id).is_none()
+                && guards.remove(&display_id).is_some()
+            {
+                eprintln!("[virtual_display] :{display_id} activation failed — Xvfb reaped");
             }
         }
         Err(e) => {

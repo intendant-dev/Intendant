@@ -1677,11 +1677,8 @@ mod tests {
         let to = rest
             .find("]);")
             .expect("DASHBOARD_ACTION_MSG_RPC_ACTIONS set is unterminated");
-        let js_set: std::collections::BTreeSet<&str> = rest[..to]
-            .split('\'')
-            .skip(1)
-            .step_by(2)
-            .collect();
+        let js_set: std::collections::BTreeSet<&str> =
+            rest[..to].split('\'').skip(1).step_by(2).collect();
         let rust_set: std::collections::BTreeSet<&str> =
             DASHBOARD_ACTION_MSG_ACTIONS.iter().copied().collect();
         assert_eq!(
@@ -1718,39 +1715,50 @@ mod tests {
 
     /// Samples for allowlisted actions whose variants have required fields.
     const SAMPLE_ACTION_MSGS: &[(&str, fn() -> serde_json::Value)] = &[
-        ("codex_thread_action", || {
-            serde_json::json!({"action": "codex_thread_action", "session_id": "s", "op": "new", "params": {}})
-        }),
-        ("take_display", || {
-            serde_json::json!({"action": "take_display", "display_id": 1})
-        }),
-        ("release_display", || {
-            serde_json::json!({"action": "release_display", "display_id": 1})
-        }),
-        ("create_virtual_display", || {
-            serde_json::json!({"action": "create_virtual_display", "width": 1280, "height": 800})
-        }),
-        ("close_browser_workspace", || {
-            serde_json::json!({"action": "close_browser_workspace", "workspace_id": "w"})
-        }),
-        ("acquire_browser_workspace", || {
-            serde_json::json!({"action": "acquire_browser_workspace", "workspace_id": "w", "holder_id": "h"})
-        }),
-        ("release_browser_workspace", || {
-            serde_json::json!({"action": "release_browser_workspace", "workspace_id": "w", "holder_id": "h"})
-        }),
-        ("start_recording", || {
-            serde_json::json!({"action": "start_recording", "stream_name": "s"})
-        }),
-        ("stop_recording", || {
-            serde_json::json!({"action": "stop_recording", "stream_name": "s"})
-        }),
-        ("delete_recording", || {
-            serde_json::json!({"action": "delete_recording", "stream_name": "s"})
-        }),
-        ("set_diagnostics_visual_marker", || {
-            serde_json::json!({"action": "set_diagnostics_visual_marker", "enabled": true})
-        }),
+        (
+            "codex_thread_action",
+            || serde_json::json!({"action": "codex_thread_action", "session_id": "s", "op": "new", "params": {}}),
+        ),
+        (
+            "take_display",
+            || serde_json::json!({"action": "take_display", "display_id": 1}),
+        ),
+        (
+            "release_display",
+            || serde_json::json!({"action": "release_display", "display_id": 1}),
+        ),
+        (
+            "create_virtual_display",
+            || serde_json::json!({"action": "create_virtual_display", "width": 1280, "height": 800}),
+        ),
+        (
+            "close_browser_workspace",
+            || serde_json::json!({"action": "close_browser_workspace", "workspace_id": "w"}),
+        ),
+        (
+            "acquire_browser_workspace",
+            || serde_json::json!({"action": "acquire_browser_workspace", "workspace_id": "w", "holder_id": "h"}),
+        ),
+        (
+            "release_browser_workspace",
+            || serde_json::json!({"action": "release_browser_workspace", "workspace_id": "w", "holder_id": "h"}),
+        ),
+        (
+            "start_recording",
+            || serde_json::json!({"action": "start_recording", "stream_name": "s"}),
+        ),
+        (
+            "stop_recording",
+            || serde_json::json!({"action": "stop_recording", "stream_name": "s"}),
+        ),
+        (
+            "delete_recording",
+            || serde_json::json!({"action": "delete_recording", "stream_name": "s"}),
+        ),
+        (
+            "set_diagnostics_visual_marker",
+            || serde_json::json!({"action": "set_diagnostics_visual_marker", "enabled": true}),
+        ),
     ];
 
     struct DashboardControlStubDisplayBackend;
