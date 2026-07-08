@@ -61,6 +61,16 @@
     <span class="ui2-ovs-session" id="ui2-session-id"></span>
   </div>
   <div class="ui2-ovs-spacer"></div>
+  <!-- Activity layout toggle: Focus (one centered timeline) vs Grid (the
+       session-window grid + concurrent stream). CSS shows it only while
+       the Activity tab is active (html[data-ui2-tab="activity"]);
+       ui2-activity.js owns the state (html[data-ui2-layout] + localStorage). -->
+  <div class="ui2-layout-toggle" id="ui2-layout-toggle" role="group" aria-label="Activity layout">
+    <button type="button" id="ui2-layout-focus-btn" data-layout="focus"
+            title="Focus — one centered timeline (session windows hidden)">Focus</button>
+    <button type="button" id="ui2-layout-grid-btn" data-layout="grid"
+            title="Grid — session windows with the concurrent stream below">Grid</button>
+  </div>
   <div class="ui2-ctx ui2-ovs-compact-hide" id="ui2-ctx" title="Context budget used">
     <span class="ui2-ctx-label">Context</span>
     <div class="ui2-ctx-track"><div class="ui2-ctx-fill" id="ui2-ctx-fill"></div></div>

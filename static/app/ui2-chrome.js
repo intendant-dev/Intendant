@@ -113,10 +113,13 @@ function ui2WireMirrors() {
 
   // Stop: visible exactly when the v1 button is; label follows
   // ("Interrupting…"); click proxies so all interrupt logic stays v1's.
+  // Read the INLINE display (what updateStopButtonVisibility writes), not
+  // the computed one — under v2 the composer CSS hides the v1 button
+  // unconditionally, so computed display is always none.
   ui2Mirror('stop-btn', (src) => {
     const stop = document.getElementById('ui2-stop-btn');
     if (!stop) return;
-    const shown = getComputedStyle(src).display !== 'none' && !src.hidden;
+    const shown = src.style.display !== 'none' && !src.hidden;
     stop.hidden = !shown;
     stop.disabled = src.disabled;
     const label = document.getElementById('ui2-stop-label');
@@ -202,6 +205,9 @@ function ui2WireMirrors() {
     const title = document.getElementById('ui2-page-title');
     if (!active || !title) return;
     const tab = active.id.replace(/^tab-/, '');
+    // Stamp the active tab on <html> so v2 CSS can key tab-scoped chrome
+    // (the Focus/Grid layout toggle shows only on Activity).
+    document.documentElement.dataset.ui2Tab = tab;
     title.textContent = UI2_TAB_TITLES[tab] || tab;
     document.querySelectorAll('#ui2-nav .ui2-nav-item[data-tab]').forEach((btn) => {
       // switchTab() owns .active on .tab-btn but early-returns when the

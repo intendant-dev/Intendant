@@ -2064,6 +2064,11 @@ function pruneMainLogContainer(container = currentMainLogContainer()) {
 }
 
 function shouldDetachConcurrentLogStream() {
+  // ui-v2 Focus layout: the combined stream IS the visible surface (the
+  // grid is CSS-hidden without touching its .hidden class) — never park
+  // the stream in the detached fragment there, or Focus shows nothing.
+  const root = document.documentElement;
+  if (root.classList.contains('ui-v2') && root.dataset.ui2Layout !== 'grid') return false;
   const grid = document.getElementById('session-window-grid');
   return !!grid
     && !grid.classList.contains('hidden')
