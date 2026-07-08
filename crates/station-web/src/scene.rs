@@ -195,18 +195,30 @@ impl StationInner {
             pills.push((pill.label, css_color(pill.color_css), pill.action.clone()));
         }
         let pill_rows = pill_row_count(atlas, pills.iter().map(|p| p.0));
-        let half_h =
-            agent_pane_half_h(content.rows.len(), pill_rows, content.approval.is_some());
+        let half_h = agent_pane_half_h(content.rows.len(), pill_rows, content.approval.is_some());
+        // Readability floor (slice 6): the card keeps its intrinsic world
+        // size up close but grows with camera distance so its projection
+        // never drops below a legible width. The wrap/row arithmetic is
+        // scale-invariant (all dims scale together), so only the emitted
+        // geometry carries `s`.
+        let Some((_, _, clip_depth)) = project(pos) else {
+            return;
+        };
+        let px_per_world = (self.height as f32 * 0.5)
+            / ((self.fov_deg.to_radians() * 0.5).tan() * view_z_from_clip_depth(clip_depth))
+            / self.dpr as f32;
+        let s = (PANE_MIN_CSS_W / (PANE_HALF_W * 2.0 * px_per_world)).clamp(1.0, 2.6);
+        let (half_w, half_h) = (PANE_HALF_W * s, half_h * s);
         // Clear of the node up-right, scaling with the card so a tall
         // panel doesn't swallow its own anchor.
-        let anchor = pos + right * (PANE_HALF_W + 0.30) + up * (half_h * 0.55);
+        let anchor = pos + right * (half_w + 0.30) + up * (half_h * 0.55);
         if !crate::panes::add_world_pane(
             frame,
             project,
             right,
             up,
             anchor,
-            PANE_HALF_W,
+            half_w,
             half_h,
             Color::rgb(16, 18, 32).with_alpha(0.86),
             0.0,
@@ -221,12 +233,21 @@ impl StationInner {
             anchor,
             right,
             up,
-            half_w: PANE_HALF_W,
+            half_w,
             half_h,
         });
+        // Leader line: ties the card to its node (the 2D HUD's
+        // thumbnail-anchor precedent), colored by the agent's phase.
+        frame.add_line_projected(
+            project,
+            pos,
+            anchor - right * half_w - up * (half_h * 0.35),
+            phase_color(&agent.phase).with_alpha(0.38),
+        );
 
-        let inner_w = (PANE_HALF_W - PANE_MARGIN) * 2.0;
-        let top_left = anchor - right * (PANE_HALF_W - PANE_MARGIN) + up * (half_h - PANE_MARGIN);
+        let inner_w = (PANE_HALF_W - PANE_MARGIN) * 2.0 * s;
+        let top_left =
+            anchor - right * (half_w - PANE_MARGIN * s) + up * (half_h - PANE_MARGIN * s);
         crate::text_atlas::add_text_world(
             frame,
             atlas,
@@ -234,11 +255,11 @@ impl StationInner {
             right,
             up,
             top_left,
-            PANE_TITLE_H,
-            &atlas.fit_to_width(&agent.id, PANE_TITLE_H, inner_w),
+            PANE_TITLE_H * s,
+            &atlas.fit_to_width(&agent.id, PANE_TITLE_H * s, inner_w),
             C_TEXT,
         );
-        let mut cursor = top_left - up * (PANE_TITLE_H * 1.3);
+        let mut cursor = top_left - up * (PANE_TITLE_H * 1.3 * s);
         crate::text_atlas::add_text_world(
             frame,
             atlas,
@@ -246,20 +267,20 @@ impl StationInner {
             right,
             up,
             cursor,
-            PANE_ROW_H,
-            &atlas.fit_to_width(&content.subtitle, PANE_ROW_H, inner_w),
+            PANE_ROW_H * s,
+            &atlas.fit_to_width(&content.subtitle, PANE_ROW_H * s, inner_w),
             C_SUBTEXT0,
         );
-        cursor = cursor - up * (PANE_ROW_H * 1.25);
+        cursor = cursor - up * (PANE_ROW_H * 1.25 * s);
 
         for row in &content.rows {
-            pane_focus_row(frame, atlas, project, right, up, &mut cursor, row);
+            pane_focus_row(frame, atlas, project, right, up, &mut cursor, row, s);
         }
 
-        self.pane_pill_rows(frame, atlas, project, right, up, &mut cursor, &pills);
+        self.pane_pill_rows(frame, atlas, project, right, up, &mut cursor, &pills, s);
 
         if let Some(appr) = &content.approval {
-            pane_focus_row(frame, atlas, project, right, up, &mut cursor, &appr.row);
+            pane_focus_row(frame, atlas, project, right, up, &mut cursor, &appr.row, s);
             let decide = |decision: &'static str| HitAction::Approval {
                 host_id: appr.host_id.clone(),
                 approval_id: appr.approval_id.clone(),
@@ -269,7 +290,7 @@ impl StationInner {
                 ("approve", C_GREEN, decide("approve")),
                 ("deny", C_RED, decide("deny")),
             ];
-            self.pane_pill_rows(frame, atlas, project, right, up, &mut cursor, &pills);
+            self.pane_pill_rows(frame, atlas, project, right, up, &mut cursor, &pills, s);
         }
     }
 
@@ -288,18 +309,20 @@ impl StationInner {
         up: Vec3,
         cursor: &mut Vec3,
         pills: &[(&str, Color, HitAction)],
+        s: f32,
     ) {
         if pills.is_empty() {
             return;
         }
-        let inner_w = (PANE_HALF_W - PANE_MARGIN) * 2.0;
-        let ph = PANE_ROW_H * 1.35;
+        let row_h = PANE_ROW_H * s;
+        let inner_w = (PANE_HALF_W - PANE_MARGIN) * 2.0 * s;
+        let ph = row_h * 1.35;
         let mut pen = 0.0f32;
         for (label, color, action) in pills {
-            let text_w = atlas.measure_world(label, PANE_ROW_H);
-            let pw = text_w + PANE_ROW_H * 0.9;
+            let text_w = atlas.measure_world(label, row_h);
+            let pw = text_w + row_h * 0.9;
             if pen > 0.0 && pen + pw > inner_w {
-                *cursor = *cursor - up * (PANE_ROW_H * 1.6);
+                *cursor = *cursor - up * (row_h * 1.6);
                 pen = 0.0;
             }
             let center = *cursor + right * (pen + pw * 0.5) - up * (ph * 0.5);
@@ -320,8 +343,8 @@ impl StationInner {
                 project,
                 right,
                 up,
-                *cursor + right * (pen + (pw - text_w) * 0.5) - up * ((ph - PANE_ROW_H) * 0.5),
-                PANE_ROW_H,
+                *cursor + right * (pen + (pw - text_w) * 0.5) - up * ((ph - row_h) * 0.5),
+                row_h,
                 label,
                 *color,
             );
@@ -335,9 +358,9 @@ impl StationInner {
                 ph * 0.5,
                 action.clone(),
             );
-            pen += pw + PANE_ROW_H * 0.4;
+            pen += pw + row_h * 0.4;
         }
-        *cursor = *cursor - up * (PANE_ROW_H * 1.6);
+        *cursor = *cursor - up * (row_h * 1.6);
     }
 
     /// Project a pill's world rect to its CSS-px bounding box and
@@ -383,6 +406,46 @@ impl StationInner {
             h: (max_y - min_y) / dpr,
             action,
         });
+    }
+
+    /// CSS-px bounding rects of this frame's world panes (empty when
+    /// none): the HUD uses them to keep 2D chrome from painting over an
+    /// in-scene panel (the HUD canvas sits above the scene canvas), and
+    /// `debug_json` exports them as `paneRects`. A pane with any corner
+    /// culled reports no rect, matching the draw.
+    pub(crate) fn pane_css_rects(&self) -> Vec<(String, f32, f32, f32, f32)> {
+        if self.frame.pane_targets.is_empty() {
+            return Vec::new();
+        }
+        let camera = self.camera();
+        let aspect = self.width as f32 / self.height.max(1) as f32;
+        let dpr = self.dpr as f32;
+        self.frame
+            .pane_targets
+            .iter()
+            .filter_map(|target| {
+                let mut min = (f32::MAX, f32::MAX);
+                let mut max = (f32::MIN, f32::MIN);
+                for corner in [
+                    target.anchor - target.right * target.half_w - target.up * target.half_h,
+                    target.anchor + target.right * target.half_w - target.up * target.half_h,
+                    target.anchor + target.right * target.half_w + target.up * target.half_h,
+                    target.anchor - target.right * target.half_w + target.up * target.half_h,
+                ] {
+                    let (ndc, _z) = camera.project_depth(corner, aspect, self.fov_deg)?;
+                    let p = ndc_to_screen([ndc.x, ndc.y], self.width, self.height);
+                    min = (min.0.min(p.x), min.1.min(p.y));
+                    max = (max.0.max(p.x), max.1.max(p.y));
+                }
+                Some((
+                    target.id.clone(),
+                    min.0 / dpr,
+                    min.1 / dpr,
+                    (max.0 - min.0) / dpr,
+                    (max.1 - min.1) / dpr,
+                ))
+            })
+            .collect()
     }
 
     pub(crate) fn add_grid(
@@ -947,6 +1010,16 @@ const PANE_MARGIN: f32 = 0.07;
 const PANE_TITLE_H: f32 = 0.14;
 const PANE_ROW_H: f32 = 0.105;
 const PANE_LABEL_COL: f32 = 0.44;
+/// Readability floor (slice 6): minimum projected card width in CSS px —
+/// the pane scales up with camera distance until it holds this width
+/// (clamped, so a pathological distance can't blow it up unbounded).
+const PANE_MIN_CSS_W: f32 = 280.0;
+
+/// Inverse of `ndc_depth`: recover view-space z from the clip depth the
+/// projector returned (clamped away from the 1.0 asymptote).
+pub(crate) fn view_z_from_clip_depth(d: f32) -> f32 {
+    (1.0 / (1.0 - d.clamp(0.0, 0.999)) - 1.0).max(0.001)
+}
 
 /// Content-driven pane half-height: title block, subtitle row, `rows`
 /// content rows, the tokens-meter band, `pill_rows` wrapped action-pill
@@ -993,6 +1066,7 @@ fn pill_row_count<'a>(
 /// beside it (the world-space counterpart of `hud::focus_row`), plus
 /// the meter band under a row that carries one. Advances `cursor` past
 /// the row (and band).
+#[allow(clippy::too_many_arguments)]
 fn pane_focus_row(
     frame: &mut GpuFrame,
     atlas: &crate::text_atlas::TextAtlas,
@@ -1001,8 +1075,11 @@ fn pane_focus_row(
     up: Vec3,
     cursor: &mut Vec3,
     row: &crate::focus_rows::AgentFocusRow,
+    s: f32,
 ) {
-    let inner_w = (PANE_HALF_W - PANE_MARGIN) * 2.0;
+    let row_h = PANE_ROW_H * s;
+    let label_col = PANE_LABEL_COL * s;
+    let inner_w = (PANE_HALF_W - PANE_MARGIN) * 2.0 * s;
     crate::text_atlas::add_text_world(
         frame,
         atlas,
@@ -1010,8 +1087,8 @@ fn pane_focus_row(
         right,
         up,
         *cursor,
-        PANE_ROW_H,
-        &atlas.fit_to_width(row.label, PANE_ROW_H, PANE_LABEL_COL - 0.03),
+        row_h,
+        &atlas.fit_to_width(row.label, row_h, label_col - 0.03 * s),
         css_color(row.color_css),
     );
     crate::text_atlas::add_text_world(
@@ -1020,16 +1097,16 @@ fn pane_focus_row(
         project,
         right,
         up,
-        *cursor + right * PANE_LABEL_COL,
-        PANE_ROW_H,
-        &atlas.fit_to_width(&row.value, PANE_ROW_H, inner_w - PANE_LABEL_COL),
+        *cursor + right * label_col,
+        row_h,
+        &atlas.fit_to_width(&row.value, row_h, inner_w - label_col),
         C_TEXT,
     );
-    *cursor = *cursor - up * (PANE_ROW_H * 1.25);
+    *cursor = *cursor - up * (row_h * 1.25);
     if let Some(pct) = row.meter {
-        let track_w = inner_w - PANE_LABEL_COL;
-        let mh = PANE_ROW_H * 0.18;
-        let track_center = *cursor + right * (PANE_LABEL_COL + track_w * 0.5) - up * (mh * 0.5);
+        let track_w = inner_w - label_col;
+        let mh = row_h * 0.18;
+        let track_center = *cursor + right * (label_col + track_w * 0.5) - up * (mh * 0.5);
         crate::panes::add_world_pane(
             frame,
             project,
@@ -1044,7 +1121,7 @@ fn pane_focus_row(
         let frac = pct.clamp(0.0, 1.0);
         if frac > 0.001 {
             let fill_w = track_w * frac;
-            let fill_center = *cursor + right * (PANE_LABEL_COL + fill_w * 0.5) - up * (mh * 0.5);
+            let fill_center = *cursor + right * (label_col + fill_w * 0.5) - up * (mh * 0.5);
             crate::panes::add_world_pane(
                 frame,
                 project,
@@ -1057,7 +1134,7 @@ fn pane_focus_row(
                 crate::panes::PANE_LAYER2_BIAS,
             );
         }
-        *cursor = *cursor - up * (PANE_ROW_H * 0.5);
+        *cursor = *cursor - up * (row_h * 0.5);
     }
 }
 
@@ -1211,6 +1288,20 @@ mod tests {
         // walk's constants (title 1.3, pitch 1.25, meter 0.5, pills 1.6).
         let content = PANE_TITLE_H * 1.3 + 6.0 * pitch + PANE_ROW_H * 0.5 + PANE_ROW_H * 1.6;
         assert!((base - (content + PANE_MARGIN * 2.0) * 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn view_z_round_trips_ndc_depth() {
+        for z in [0.2f32, 1.0, 4.0, 11.0, 40.0] {
+            let recovered = view_z_from_clip_depth(ndc_depth(z));
+            assert!(
+                (recovered - z).abs() / z < 1e-3,
+                "z {z} recovered as {recovered}"
+            );
+        }
+        // The clamp keeps the asymptote and negatives finite and sane.
+        assert!(view_z_from_clip_depth(1.0).is_finite());
+        assert!(view_z_from_clip_depth(-0.5) > 0.0);
     }
 
     #[test]
