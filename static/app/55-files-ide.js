@@ -356,7 +356,13 @@ function filesIdeTreeRows(state, dir, depth, rows) {
     if (entry.hidden && !state.showHidden) continue;
     rows.push({ entry, depth });
     if (entry.is_dir && state.expanded.has(entry.path)) {
+      const before = rows.length;
       filesIdeTreeRows(state, entry.path, depth + 1, rows);
+      // A loaded-but-childless expansion renders nothing — say so (the
+      // root-empty case already has this notice at the container level).
+      if (rows.length === before && state.listings.get(entry.path)) {
+        rows.push({ notice: 'Empty directory', depth: depth + 1 });
+      }
     }
   }
   if (listing.truncated) {
