@@ -1603,3 +1603,7 @@ html.ui-v2 #tab-sessions .session-detail .empty-state {
     grid-template-columns: 1fr;
   }
 }
+
+/* Session ids ride the design mono, not the UA's ui-monospace stack
+   (chrome-audit cross-surface sweep). */
+html.ui-v2 #tab-sessions .session-card .sc-id { font-family: var(--mono); }

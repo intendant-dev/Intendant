@@ -12954,7 +12954,7 @@ html.ui-v2 #tab-access .acc-section-title {
 html.ui-v2 #tab-access .acc-section-sub {
   font-size: 12px;
   line-height: 1.55;
-  color: var(--text-3);
+  color: var(--text-2); /* running copy at text-3 fell under AA on light; vault parity */
   max-width: 860px;
 }
 html.ui-v2 #tab-access .acc-section-actions { margin-left: auto; }
@@ -13483,7 +13483,7 @@ html.ui-v2 .acc-field-grid input::placeholder { color: var(--text-3); }
 html.ui-v2 .acc-field-grid input:focus,
 html.ui-v2 .acc-field-grid select:focus {
   border-color: var(--iris);
-  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
 }
 /* Fields that carry their own border+ring focus treatment suppress the
    global outline (double-ring otherwise; same convention as the chrome
@@ -14024,6 +14024,16 @@ html.ui-v2 #tab-access .access-card-kind {
   font-size: 10.5px;
   font-weight: 700;
   letter-spacing: .02em;
+}
+/* Semantic tint when the emitter stamps a state (42-usage-terminal.js
+   diagnostics cards); stateless count pills stay neutral. */
+html.ui-v2 #tab-access .access-card-kind.ok {
+  background: rgba(var(--green-rgb), .12);
+  color: var(--green);
+}
+html.ui-v2 #tab-access .access-card-kind.warn {
+  background: rgba(var(--amber-rgb), .12);
+  color: var(--amber);
 }
 html.ui-v2 #tab-access .access-card-detail { font-size: 12px; color: var(--text-3); }
 html.ui-v2 #tab-access .access-card-actions button {
@@ -17804,6 +17814,10 @@ html.ui-v2 #tab-sessions .session-detail .empty-state {
     grid-template-columns: 1fr;
   }
 }
+
+/* Session ids ride the design mono, not the UA's ui-monospace stack
+   (chrome-audit cross-surface sweep). */
+html.ui-v2 #tab-sessions .session-card .sc-id { font-family: var(--mono); }
 /* ── static/app/ui2-activity.css ── */
 /* ── ui-v2 Activity slice 1: Focus timeline + approval hero ────────────
    All scoped html.ui-v2. Restyles the EXISTING log-entry scaffold
@@ -18346,6 +18360,10 @@ html.ui-v2 #question-panel .question-free-text:focus {
   border-color: rgba(var(--iris-rgb), .45);
   box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
 }
+
+/* Inline command code rides the design mono, not the UA's generic
+   monospace (chrome-audit cross-surface sweep). */
+html.ui-v2 code.log-command-code { font-family: var(--mono); }
 /* ── static/app/ui2-grid.css ── */
 /* ── ui-v2 Activity Grid mode: session-window re-skin ──────────────────
    All scoped html.ui-v2. The v1 window machinery (collapse states,
@@ -20603,6 +20621,9 @@ html.ui-v2 #tab-settings .settings-row input[type="checkbox"] {
   border: 0;
   border-radius: 999px;
   background: var(--surface-3);
+  /* vault-unified toggle recipe: hairline keeps the off track legible on
+     any card surface (checked state drops it — iris carries the shape) */
+  box-shadow: inset 0 0 0 1px var(--line-2);
   cursor: pointer;
   transition: background var(--t-slow);
   flex-shrink: 0;
@@ -20619,12 +20640,16 @@ html.ui-v2 #tab-settings .settings-row input[type="checkbox"]::after {
   box-shadow: 0 2px 5px rgba(0, 0, 0, .4);
   transition: left var(--t-slow);
 }
-html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:checked { background: var(--iris); }
+html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:checked { background: var(--iris); box-shadow: none; }
 html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:checked::after { left: 20px; }
-/* Light theme: the off track (surface-3) sits on a white card — a
-   hairline keeps the pill legible without moving the knob geometry. */
+/* Light theme: surface-3 on a white card is ~1.2:1 — fill the off track
+   with line-2 and crispen the knob (mirrors the vault toggle recipe;
+   geometry untouched). */
 html.ui-v2[data-theme="light"] #tab-settings .settings-row input[type="checkbox"]:not(:checked) {
-  box-shadow: inset 0 0 0 1px var(--line-2);
+  background: var(--line-2);
+}
+html.ui-v2[data-theme="light"] #tab-settings .settings-row input[type="checkbox"]::after {
+  box-shadow: 0 1px 3px rgba(23, 28, 50, .3), 0 0 0 1px rgba(18, 23, 42, .08);
 }
 html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:focus-visible {
   outline: 2px solid var(--iris);
@@ -20959,6 +20984,10 @@ html.ui-v2 .ui2-appearance-note {
   line-height: 1.5;
   color: var(--text-3);
 }
+
+/* Inline code in section subtitles rides the design mono (chrome-audit
+   cross-surface sweep). */
+html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
 </style>
 <!-- ── static/app/20-shell.html ── -->
 </head>

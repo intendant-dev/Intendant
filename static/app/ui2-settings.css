@@ -184,6 +184,9 @@ html.ui-v2 #tab-settings .settings-row input[type="checkbox"] {
   border: 0;
   border-radius: 999px;
   background: var(--surface-3);
+  /* vault-unified toggle recipe: hairline keeps the off track legible on
+     any card surface (checked state drops it — iris carries the shape) */
+  box-shadow: inset 0 0 0 1px var(--line-2);
   cursor: pointer;
   transition: background var(--t-slow);
   flex-shrink: 0;
@@ -200,12 +203,16 @@ html.ui-v2 #tab-settings .settings-row input[type="checkbox"]::after {
   box-shadow: 0 2px 5px rgba(0, 0, 0, .4);
   transition: left var(--t-slow);
 }
-html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:checked { background: var(--iris); }
+html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:checked { background: var(--iris); box-shadow: none; }
 html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:checked::after { left: 20px; }
-/* Light theme: the off track (surface-3) sits on a white card — a
-   hairline keeps the pill legible without moving the knob geometry. */
+/* Light theme: surface-3 on a white card is ~1.2:1 — fill the off track
+   with line-2 and crispen the knob (mirrors the vault toggle recipe;
+   geometry untouched). */
 html.ui-v2[data-theme="light"] #tab-settings .settings-row input[type="checkbox"]:not(:checked) {
-  box-shadow: inset 0 0 0 1px var(--line-2);
+  background: var(--line-2);
+}
+html.ui-v2[data-theme="light"] #tab-settings .settings-row input[type="checkbox"]::after {
+  box-shadow: 0 1px 3px rgba(23, 28, 50, .3), 0 0 0 1px rgba(18, 23, 42, .08);
 }
 html.ui-v2 #tab-settings .settings-row input[type="checkbox"]:focus-visible {
   outline: 2px solid var(--iris);
@@ -540,3 +547,7 @@ html.ui-v2 .ui2-appearance-note {
   line-height: 1.5;
   color: var(--text-3);
 }
+
+/* Inline code in section subtitles rides the design mono (chrome-audit
+   cross-surface sweep). */
+html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }

@@ -539,3 +539,7 @@ html.ui-v2 #question-panel .question-free-text:focus {
   border-color: rgba(var(--iris-rgb), .45);
   box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
 }
+
+/* Inline command code rides the design mono, not the UA's generic
+   monospace (chrome-audit cross-surface sweep). */
+html.ui-v2 code.log-command-code { font-family: var(--mono); }
