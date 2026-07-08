@@ -71,6 +71,15 @@ ctl --peer <peer-label> cu actions --target user_session \
 #    (principal principal:peer-daemon:<fingerprint>, ...)"
 # — that denial IS the pass for the deny leg; run whichever
 # matches the standing grant, or both against two peers.
+
+ctl --peer <peer-label> cu elements
+# OPTIONAL leg — the peer's frontmost UI element tree (read_screen:
+# display-view class, same grant as screenshots; the cheap textual
+# first look before pulling pixels). Accessibility availability
+# varies by box (Linux AT-SPI, macOS AX trust, Windows UIA), so a
+# "read_screen error: ..." from a missing/disabled stack — or a
+# denial under a sub-display-view grant — is a finding to report,
+# not a smoke failure.
 ```
 
 ## What it proves

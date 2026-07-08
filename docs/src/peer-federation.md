@@ -308,7 +308,12 @@ On the receiving side this is the ordinary peer-principal path: the peer's
 this daemon, then classifies the inner tool per its own gate —
 `take_screenshot`/`list_displays` need **display view** (`read-only-display`
 or better), `execute_cu_actions` needs **display input** (`peer-operator` /
-`peer-root` only). A denial comes back as a structured `isError` tool result
+`peer-root` only). `read_screen` is display-view class too — an element tree
+reveals screen content just as a screenshot does — so `intendant ctl --peer
+<id> cu elements` reads the peer's frontmost UI element tree under the same
+display-view grant when the peer's platform accessibility stack is available
+(deliberately no `peer_read_screen` twin; the generic side-channel covers
+it). A denial comes back as a structured `isError` tool result
 with the peer's diagnostic text, which every caller surface passes through
 verbatim.
 

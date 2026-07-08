@@ -620,6 +620,17 @@ mod tests {
             mcp_tool_operation("take_screenshot"),
             PeerOperation::DisplayView
         );
+        // read_screen is display-view class like take_screenshot — an
+        // element tree reveals screen content just as pixels do — so a
+        // read-only-display peer keeps its cheap textual grounding
+        // (`ctl --peer <id> cu elements`; deliberately no
+        // peer_read_screen twin — the generic side-channel covers it).
+        // Pinned so a refactor can't silently drop it to the
+        // RuntimeControl default and lock peers out.
+        assert_eq!(
+            mcp_tool_operation("read_screen"),
+            PeerOperation::DisplayView
+        );
         assert_eq!(
             mcp_tool_operation("show_shared_view"),
             PeerOperation::DisplayView
