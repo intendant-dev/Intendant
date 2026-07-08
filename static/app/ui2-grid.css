@@ -188,8 +188,11 @@ html.ui-v2 .session-window-menu-separator {
 
 /* — per-window log — */
 html.ui-v2 .session-window-log { padding: 4px 10px 8px; }
-/* narrower gutter inside windows than the main timeline */
-html.ui-v2 .session-window-log .log-entry { grid-template-columns: 44px 14px max-content max-content max-content max-content minmax(0, 1fr); }
+/* narrower gutter inside windows than the main timeline — but wide
+   enough for a full 8-char mono timestamp (44px ellipsized "18:31…");
+   col 2 shrinks to 10px because the role dot is hidden in windows */
+html.ui-v2 .session-window-log .log-entry { grid-template-columns: 54px 10px max-content max-content max-content max-content minmax(0, 1fr); }
+html.ui-v2 .session-window-log .log-entry .log-ts { font-size: 10px; }
 html.ui-v2 .session-window-empty {
   color: var(--text-3);
   font-size: 12px;

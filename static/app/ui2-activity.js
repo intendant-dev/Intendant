@@ -263,8 +263,10 @@ function ui2RailTick(force) {
 
   const cache = (vitals && typeof sessionVitalsCacheSegment === 'function')
     ? sessionVitalsCacheSegment(vitals.cache) : null;
+  // cold = no cache yet — neutral, not an alarm (rose on a fresh session
+  // read as a fault); expiring joins crit like v1's red.
   ui2RailSetRow('ui2-rail-cache', cache ? cache.text : '', cache ? cache.titleLines : null,
-    cache ? (/cache-crit|cache-cold/.test(cache.cls) ? 'crit' : /cache-warn|cache-expiring/.test(cache.cls) ? 'warn' : 'ok') : null);
+    cache ? (/cache-crit|cache-expiring/.test(cache.cls) ? 'crit' : /cache-warn/.test(cache.cls) ? 'warn' : /cache-cold/.test(cache.cls) ? null : 'ok') : null);
 
   const limits = (vitals && typeof sessionVitalsLimitsSegment === 'function')
     ? sessionVitalsLimitsSegment(vitals.limits) : null;

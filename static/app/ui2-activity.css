@@ -1,4 +1,3 @@
-/* qa-activity-grid-marker-r5 */
 /* ── ui-v2 Activity slice 1: Focus timeline + approval hero ────────────
    All scoped html.ui-v2. Restyles the EXISTING log-entry scaffold
    (.log-ts gutter / .log-icon dot / data-level colors) into the design's
@@ -210,6 +209,9 @@ html.ui-v2 #approval-panel .approval-category {
   color: var(--amber);
   margin-bottom: 11px;
 }
+/* keep v1's empty-hide winning — the display above outranked it and an
+   empty category rendered as a bare amber crumb */
+html.ui-v2 #approval-panel .approval-category:empty { display: none; }
 html.ui-v2 #approval-panel .approval-actions { display: flex; gap: 9px; flex-wrap: wrap; align-items: center; }
 html.ui-v2 #approval-panel .approval-actions button {
   padding: 9px 15px;
@@ -223,7 +225,9 @@ html.ui-v2 #approval-panel .approval-actions button {
 }
 html.ui-v2 #approval-panel .approval-actions button:hover { background: var(--surface-2); color: var(--text); }
 html.ui-v2 #approval-panel .approval-actions button.approve {
-  border: 0;
+  /* transparent border (not 0): keeps this box the same 37px height as
+     its bordered siblings — the row read 35px vs 37px */
+  border: 1px solid transparent;
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-weight: 800;
@@ -241,7 +245,13 @@ html.ui-v2 #approval-panel .approval-actions kbd {
   font-size: 10px;
   padding: 1px 5px;
   border-radius: 5px;
-  background: rgba(11, 12, 16, .25);
+  /* text-toned wash: lightens on dark, darkens on light, so the hint
+     stays legible on the iris-filled Approve in BOTH themes (the old
+     fixed dark wash made dark-theme "y" black-on-black) */
+  background: rgba(var(--text-rgb), .16);
+  /* ride the button's own ink (v1 pins kbd to overlay1/text-3, which
+     washes out on the filled Approve) */
+  color: inherit;
 }
 /* the category-rule action (inserted by ui2-activity.js) */
 html.ui-v2 #approval-panel .ui2-approve-category {
