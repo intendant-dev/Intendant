@@ -37,7 +37,15 @@ pub(crate) async fn find_available_port(
     for offset in 0..20u16 {
         let port = preferred.checked_add(offset).unwrap_or(preferred);
         match bind_web_listener(port, bind_ip).await {
-            Ok(listener) => return Ok((port, listener)),
+            Ok(listener) => {
+                // Report the port actually bound, not the one requested:
+                // `--web 0` asks the kernel for an ephemeral port (the
+                // race-free way to run parallel daemons — smoke rigs and
+                // CI runner instances sharing a box), and `local_addr` is
+                // the only truthful source for what it picked.
+                let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+                return Ok((bound, listener));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
             Err(e) => {
                 return Err(CallerError::Config(format!(
@@ -570,6 +578,22 @@ pub(crate) fn should_start_idle_web_daemon(use_web: bool, flags: &CliFlags) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn find_available_port_reports_the_kernel_assigned_port_for_web_zero() {
+        // `--web 0` = ephemeral bind: the returned port must be what the
+        // kernel actually assigned (smoke rigs parse it from the
+        // Dashboard log line), never the literal 0 that was requested.
+        let loopback = Some("127.0.0.1".parse().unwrap());
+        let (port, listener) = find_available_port(0, loopback).await.unwrap();
+        assert_ne!(port, 0);
+        assert_eq!(port, listener.local_addr().unwrap().port());
+        // A second ephemeral bind coexists — the parallel-daemon case.
+        let (port2, listener2) = find_available_port(0, loopback).await.unwrap();
+        assert_ne!(port2, 0);
+        assert_ne!(port2, port);
+        drop((listener, listener2));
+    }
 
     #[test]
     fn public_ip_classification_excludes_private_and_documentation_ranges() {

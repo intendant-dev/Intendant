@@ -12,7 +12,6 @@ const path = require('path');
 const BINARY = process.argv[2];
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'vitals-home-'));
 const PROJ = fs.mkdtempSync(path.join(os.tmpdir(), 'vitals-proj-'));
-const PORT = 18997;
 
 // The project is a real git repo: one commit, a feature branch one ahead
 // of main, plus a dirty file.
@@ -34,7 +33,11 @@ fs.writeFileSync(scriptPath, JSON.stringify(script));
 const env = { ...process.env, HOME, USERPROFILE: HOME, PROVIDER: 'mock', INTENDANT_MOCK_SCRIPT: scriptPath };
 for (const k of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'MODEL_NAME']) delete env[k];
 
-const child = spawn(BINARY, ['--no-tui', '--web', String(PORT), '--bind', '127.0.0.1', '--no-tls',
+// `--web 0` = kernel-assigned port: this driver only talks over the
+// pid-keyed control socket, so any free port works, and concurrent
+// smoke runs on one box (two CI runner instances) can't collide or
+// cross-talk.
+const child = spawn(BINARY, ['--no-tui', '--web', '0', '--bind', '127.0.0.1', '--no-tls',
   '--control-socket', '--autonomy', 'full', 'trivial task'], { cwd: PROJ, env, stdio: ['ignore', 'pipe', 'pipe'] });
 let exited = false;
 child.on('exit', () => { exited = true; });
