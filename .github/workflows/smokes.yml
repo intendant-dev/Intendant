@@ -70,15 +70,19 @@ jobs:
       fail-fast: false
       matrix:
         # `os` is the pinned check-name key and the fork-PR hosted label;
-        # `runner` is the self-hosted fleet placement. The smokes pin to the
-        # dedicated intendant-smokes-* labels (one runner instance per box
-        # carries them): the drivers bind fixed ports, so two smokes jobs
-        # must never run concurrently on one machine, while the test jobs
-        # are free to land on any instance. Provisioning steps gate on
-        # runner.environment. See windows.yml for the full rationale.
+        # `runner` is the self-hosted fleet placement. The smokes land on
+        # any Linux instance (same label as the test jobs): the drivers
+        # use kernel-assigned ports (`--web 0`, parsed from the daemon's
+        # output) and pid-keyed control sockets, so concurrent smoke jobs
+        # on one machine can't collide or cross-talk. (They previously
+        # bound fixed ports and pinned to a dedicated one-instance-per-box
+        # intendant-smokes-linux label — that serialization is gone; the
+        # label can be retired from the runner config.) Provisioning steps
+        # gate on runner.environment. See windows.yml for the full
+        # rationale.
         include:
           - os: ubuntu-latest
-            runner: [self-hosted, intendant-smokes-linux]
+            runner: [self-hosted, intendant-linux]
             target: x86_64-unknown-linux-gnu
 
     steps:

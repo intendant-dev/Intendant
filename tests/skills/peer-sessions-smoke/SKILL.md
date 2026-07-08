@@ -6,8 +6,12 @@ federate, a task is delegated through the primary, and the primary's
 folded per-session state.
 
 Keyless — both daemons run the scripted mock provider (`PROVIDER=mock`).
-Not in CI because it binds fixed local ports (18777/18778), spawns real
-daemons, and the `--browser` leg drives a real headless Chrome.
+The API leg gates landings in CI (smokes.yml). Daemon ports are
+kernel-assigned (`--web 0`, parsed from each daemon's log), so
+concurrent runs on one box — two CI runner instances, or a rig beside a
+dev daemon — can't collide. The `--browser` leg stays a local/canary
+check: it drives a real headless Chrome (CDP port 9333; override with
+`PEER_RIG_CDP_PORT`).
 
 ## Run
 

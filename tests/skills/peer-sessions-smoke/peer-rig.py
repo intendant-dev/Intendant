@@ -18,6 +18,7 @@ Native daemon-lane children emit no per-session usage/limits (the known
 """
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -33,7 +34,12 @@ WORKTREE = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__
 # battery keeps exercising the release artifact by default.
 BIN = os.environ.get("INTENDANT_BIN") or os.path.join(WORKTREE, "target/release/intendant")
 SCRATCH = os.environ.get("PEER_RIG_SCRATCH") or tempfile.mkdtemp(prefix="peer-rig-")
-A_PORT, B_PORT, CDP_PORT = 18777, 18778, 9333
+# Daemon ports are kernel-assigned (`--web 0`, parsed from the Dashboard
+# log line) so concurrent rig runs on one box — two CI runner instances,
+# or a rig beside a dev daemon — can't collide or cross-talk. The CDP
+# port only exists on the local --browser leg; override it if 9333 is
+# taken.
+CDP_PORT = int(os.environ.get("PEER_RIG_CDP_PORT", "9333"))
 BROWSER = "--browser" in sys.argv
 SLEEP_STEP = 30 if BROWSER else 6
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -90,7 +96,7 @@ def wait_for(desc, fn, timeout=45, interval=0.25):
     raise SystemExit(f"TIMEOUT waiting for {desc} (last error: {last})")
 
 
-def spawn_daemon(name, home, port, script, cwd):
+def spawn_daemon(name, home, script, cwd):
     os.makedirs(home, exist_ok=True)
     os.makedirs(cwd, exist_ok=True)
     script_path = os.path.join(home, "mock_script.json")
@@ -101,16 +107,31 @@ def spawn_daemon(name, home, port, script, cwd):
                         "MODEL_NAME", "PRESENCE_PROVIDER", "PRESENCE_MODEL",
                         "CU_PROVIDER", "CU_MODEL")}
     env.update(HOME=home, PROVIDER="mock", INTENDANT_MOCK_SCRIPT=script_path)
-    out = open(os.path.join(home, "daemon.log"), "w")
+    log_path = os.path.join(home, "daemon.log")
+    out = open(log_path, "w")
+    # `--web 0` asks the kernel for a free port (race-free — the daemon
+    # binds it directly, no probe-then-reuse window) and the daemon
+    # prints the port it actually bound. A 127.0.0.1 bind self-advertises
+    # ws://127.0.0.1:<actual>/ws on the agent card, so no --advertise-url
+    # is needed.
     p = subprocess.Popen(
-        [BIN, "--web", str(port), "--bind", "127.0.0.1", "--no-tls", "--no-tui",
-         "--autonomy", "full", "--advertise-url", f"ws://127.0.0.1:{port}/ws"],
+        [BIN, "--web", "0", "--bind", "127.0.0.1", "--no-tls", "--no-tui",
+         "--autonomy", "full"],
         cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=out)
     procs.append((name, p))
+
+    def parse_port():
+        if p.poll() is not None:
+            raise SystemExit(f"{name} exited early (code {p.poll()}) — see {log_path}")
+        with open(log_path) as f:
+            m = re.search(r"Dashboard: https?://127\.0\.0\.1:(\d+)", f.read())
+        return int(m.group(1)) if m else None
+
+    port = wait_for(f"{name} bound port", parse_port, timeout=30)
     log(f"daemon {name} pid {p.pid} port {port} home {home}")
     wait_for(f"{name} agent card",
              lambda: http("GET", f"http://127.0.0.1:{port}/.well-known/agent-card.json"))
-    return p
+    return p, port
 
 
 PEER_TASK_MARK = "PEER RIG TASK"
@@ -162,17 +183,17 @@ try:
     with open(os.path.join(proj_a, "dirty.txt"), "w") as f:
         f.write("uncommitted\n")
 
-    spawn_daemon("A(peer)", os.path.join(SCRATCH, "home-a"), A_PORT, script_a, proj_a)
-    spawn_daemon("B(primary)", os.path.join(SCRATCH, "home-b"), B_PORT, script_b,
-                 os.path.join(SCRATCH, "proj-b"))
+    _, a_port = spawn_daemon("A(peer)", os.path.join(SCRATCH, "home-a"), script_a, proj_a)
+    _, b_port = spawn_daemon("B(primary)", os.path.join(SCRATCH, "home-b"), script_b,
+                             os.path.join(SCRATCH, "proj-b"))
 
-    add = http("POST", f"http://127.0.0.1:{B_PORT}/api/peers",
-               {"card_url": f"http://127.0.0.1:{A_PORT}/.well-known/agent-card.json",
+    add = http("POST", f"http://127.0.0.1:{b_port}/api/peers",
+               {"card_url": f"http://127.0.0.1:{a_port}/.well-known/agent-card.json",
                 "label": "rig-peer"})
     log(f"peer add -> {add}")
 
     def connected():
-        for p in http("GET", f"http://127.0.0.1:{B_PORT}/api/peers")["peers"]:
+        for p in http("GET", f"http://127.0.0.1:{b_port}/api/peers")["peers"]:
             if p.get("connection_state", {}).get("state") == "connected":
                 return p
         return None
@@ -182,12 +203,12 @@ try:
     log(f"connected: {peer_id}")
 
     def peer_sessions():
-        for p in http("GET", f"http://127.0.0.1:{B_PORT}/api/peers")["peers"]:
+        for p in http("GET", f"http://127.0.0.1:{b_port}/api/peers")["peers"]:
             if p["id"] == peer_id:
                 return p.get("sessions", [])
         return []
 
-    task = http("POST", f"http://127.0.0.1:{B_PORT}/api/peers/{peer_id}/task",
+    task = http("POST", f"http://127.0.0.1:{b_port}/api/peers/{peer_id}/task",
                 {"instructions": f"{PEER_TASK_MARK} - run the scripted steps"})
     log(f"delegated -> {task}")
 
@@ -226,7 +247,7 @@ try:
             return r.stdout.strip()
 
         wait_for("chrome CDP", lambda: cdp("eval", "1+1"))
-        cdp("nav", f"http://127.0.0.1:{B_PORT}/")
+        cdp("nav", f"http://127.0.0.1:{b_port}/")
         wait_for("dashboard booted", lambda: True if cdp(
             "eval", "!!document.querySelector('.tab-btn')") == "true" else None)
         cdp("eval", "(() => { const b = [...document.querySelectorAll('button.tab-btn')]"
@@ -273,7 +294,7 @@ try:
           f"git vitals rode the peer rail (dirtyFiles={git.get('dirtyFiles')})")
 
     log(f"stopping child {child_sid} on A via /ws stop_session")
-    ws_action(A_PORT, {"action": "stop_session", "session_id": child_sid})
+    ws_action(a_port, {"action": "stop_session", "session_id": child_sid})
     wait_for("child retirement after stop",
              lambda: True if child_of(peer_sessions()) is None else None, timeout=30)
     check(True, "SessionEnded retired the folded child")

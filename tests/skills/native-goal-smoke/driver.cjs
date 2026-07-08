@@ -13,7 +13,6 @@ const path = require('path');
 const BINARY = process.argv[2] || path.resolve(__dirname, '../../../..', 'target/release/intendant');
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'native-goal-home-'));
 const PROJ = fs.mkdtempSync(path.join(os.tmpdir(), 'native-goal-proj-'));
-const PORT = 18994;
 
 const script = {
   profiles: [{
@@ -51,7 +50,11 @@ for (const k of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'MODEL
 // which does not spawn the control socket — with a task the run lands in
 // the foreground web branch whose worker loop is run_with_presence (the native
 // goal engine's home).
-const child = spawn(BINARY, ['--no-tui', '--web', String(PORT), '--bind', '127.0.0.1', '--no-tls',
+// `--web 0` = kernel-assigned port: this driver only talks over the
+// pid-keyed control socket, so any free port works, and concurrent
+// smoke runs on one box (two CI runner instances) can't collide or
+// cross-talk.
+const child = spawn(BINARY, ['--no-tui', '--web', '0', '--bind', '127.0.0.1', '--no-tls',
   '--control-socket', '--autonomy', 'full', 'do the initial smoke task'], {
   cwd: PROJ, env, stdio: ['ignore', 'pipe', 'pipe'],
 });
