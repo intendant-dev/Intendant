@@ -15124,7 +15124,9 @@ html.ui-v2 #tab-debug .debug-pane {
   max-width: 980px;
   padding: 26px 28px 44px;
 }
-html.ui-v2 #tab-debug .ui2-page-head { grid-column: 1 / -1; margin: 0 0 10px; }
+/* margin 2px + the 16px grid gap = 18px to the cards row (sibling page
+   heads: Usage 18px, Sessions 16px — 10px here read as 26px and drifted). */
+html.ui-v2 #tab-debug .ui2-page-head { grid-column: 1 / -1; margin: 0 0 2px; }
 html.ui-v2 #tab-debug .ui2-page-title {
   margin: 0;
   font-size: 26px;
@@ -15134,7 +15136,7 @@ html.ui-v2 #tab-debug .ui2-page-title {
 }
 html.ui-v2 #tab-debug .ui2-page-sub {
   margin: 7px 0 0;
-  font-size: 13px;
+  font-size: 13.5px; /* sibling page subs: Sessions 13.5 / Usage 14 — 13 was a third value */
   color: var(--text-2);
 }
 
@@ -15172,7 +15174,7 @@ html.ui-v2 #tab-debug .debug-status {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 0 0 13px;
+  margin: 0 0 12px;
   font-size: 12.5px;
   font-weight: 600;
   color: var(--text-2);
@@ -15277,7 +15279,10 @@ html.ui-v2 #tab-debug .debug-workspace-form label {
 }
 html.ui-v2 #tab-debug .debug-workspace-form input,
 html.ui-v2 #tab-debug .debug-workspace-form select {
-  padding: 8px 11px;
+  height: 35px; /* one control height for the row: text input, native select,
+                   and the Create button measured 35/36/34 and their top edges
+                   staggered by 1px each in the shared grid row */
+  padding: 8px 12px;
   border: 1px solid var(--line-2);
   border-radius: 10px;
   background: var(--surface-2);
@@ -15286,10 +15291,12 @@ html.ui-v2 #tab-debug .debug-workspace-form select {
   transition: border-color var(--t-med), box-shadow var(--t-med);
 }
 html.ui-v2 #tab-debug .debug-workspace-form input::placeholder { color: var(--text-3); }
-/* Provider tokens are technical vocabulary → mono (type-system mandate). */
-html.ui-v2 #tab-debug .debug-workspace-form select {
+/* Provider tokens and URLs are technical vocabulary → mono at the Settings
+   tab's 12.5px field size (type-system mandate; endpoints are mono there). */
+html.ui-v2 #tab-debug .debug-workspace-form select,
+html.ui-v2 #tab-debug #browser-workspace-url {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 12.5px;
 }
 html.ui-v2 #tab-debug .debug-workspace-form input:focus-visible,
 html.ui-v2 #tab-debug .debug-workspace-form select:focus-visible {
@@ -15297,7 +15304,7 @@ html.ui-v2 #tab-debug .debug-workspace-form select:focus-visible {
   border-color: var(--iris);
   box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
 }
-html.ui-v2 #tab-debug .debug-workspace-form .ui-btn { min-height: 34px; }
+html.ui-v2 #tab-debug .debug-workspace-form .ui-btn { min-height: 35px; }
 
 /* ── workspace status line + rows ── */
 html.ui-v2 #tab-debug .debug-workspace-status {
@@ -15367,6 +15374,16 @@ html.ui-v2 #tab-debug .debug-workspace-row-actions .ui-btn {
   padding: 5px 11px;
   font-size: 11.5px;
   border-radius: 8px;
+}
+/* Neutral actions sit on a surface-2 row — the generic surface-2 button fill
+   vanishes there (border-only affordance). Card tone restores the raised
+   read on both themes; hover's surface-3 still gives a visible delta.
+   Danger (Close) keeps its own transparent + rose recipe. */
+html.ui-v2 #tab-debug .debug-workspace-row-actions .ui-btn:not(.danger) {
+  background: var(--surface);
+}
+html.ui-v2 #tab-debug .debug-workspace-row-actions .ui-btn:not(.danger):hover {
+  background: var(--surface-3);
 }
 
 /* ── empty state (design States recipe) ── */
