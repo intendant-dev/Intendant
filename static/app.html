@@ -85296,6 +85296,31 @@ function showDisplayPicker(displays) {
     createVirtualDisplay();
   });
   picker.appendChild(createItem);
+  // ui-v2 hides #status-bar (the picker's v1 anchor subtree), so an
+  // in-place open can never render — portal to <body> and pin the popover
+  // to the live rail's "Your screen" card (the control that proxies the
+  // grant under v2). Single-display hosts grant instantly and never open
+  // the picker, which is why this only bit multi-display setups.
+  if (typeof ui2Enabled === 'function' && ui2Enabled() && picker.closest('#status-bar')) {
+    document.body.appendChild(picker);
+  }
+  if (typeof ui2Enabled === 'function' && ui2Enabled() && picker.parentElement === document.body) {
+    const anchor = document.getElementById('ui2-live-yourscreen');
+    const rect = anchor ? anchor.getBoundingClientRect() : null;
+    picker.style.position = 'fixed';
+    picker.style.zIndex = '95';
+    if (rect && rect.width) {
+      picker.style.left = `${Math.round(rect.left)}px`;
+      picker.style.top = `${Math.round(rect.bottom + 8)}px`;
+      picker.style.right = 'auto';
+      picker.style.transform = 'none';
+    } else {
+      picker.style.left = '50%';
+      picker.style.top = '96px';
+      picker.style.right = 'auto';
+      picker.style.transform = 'translateX(-50%)';
+    }
+  }
   picker.classList.add('visible');
   displayPickerVisible = true;
 }
