@@ -26,6 +26,7 @@ ui2-sessions.css
 ui2-activity.css
 ui2-live.css
 ui2-usage.css
+ui2-settings.css
 19-style-close.html
 
 20-shell.html
@@ -64,6 +65,7 @@ ui2-activity.js
 51-peer-approvals.js
 52-peer-display.js
 53-stats-settings.js
+ui2-settings.js
 54-session-lifecycle.js
 55-files-ide.js
 56-debug-sessions.js

@@ -52,6 +52,19 @@ const UI2_ICON_PATHS = {
   'folder-open': '<path d="M4 8V6.5A1.5 1.5 0 0 1 5.5 5H9l2 2h7.5A1.5 1.5 0 0 1 20 8.5V9"/><path d="M2.8 19h14.9a1 1 0 0 0 .95-.7L21 12H6.2a1 1 0 0 0-.95.7Z"/>',
 };
 
+// Truthful short tags per autonomy level (shared by the nav chip and the
+// Settings dial). Sourced from intendant-core autonomy.rs::needs_approval:
+// Low runs only file reads; Medium gates Ask-ruled writes/deletes/
+// destructive/network; High auto-approves every Ask rule (only Deny and
+// the hard gates stop it — NOT "gate network", the prototype's tag was
+// wrong); Full bypasses the rules entirely.
+const UI2_AUTONOMY_TAGS = {
+  Low: 'reads only',
+  Medium: 'gate writes',
+  High: 'auto unless denied',
+  Full: 'ungated',
+};
+
 function ui2Enabled() {
   return document.documentElement.classList.contains('ui-v2');
 }
