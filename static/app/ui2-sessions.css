@@ -1,4 +1,3 @@
-/* qa-sessions-marker-r2 */
 /* ── ui-v2 Sessions surface re-skin (design-overhaul P2) ───────────────
    Everything here is scoped under `html.ui-v2` and restyles the EXISTING
    Sessions DOM — v1 stays pixel-identical. The perf architecture landed
