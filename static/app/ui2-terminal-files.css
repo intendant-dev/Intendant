@@ -6,10 +6,13 @@
    element ids) are untouched — this file plus small ui2-gated JS in
    44-shell-frames.js / 55-files-ide.js is the whole change.
 
-   The xterm and CodeMirror content areas keep the design rule that code
-   surfaces stay dark: xterm's palette is a JS theme object built from
-   these tokens at init (ui2ShellTheme in 44-shell-frames.js); CodeMirror
-   is pure CSS via the .cm-s-intendant overrides below. */
+   Code-surface palettes follow the app theme (the light-theme token
+   import remaps --code-bg and the ANSI/CM semantics to darkened light
+   values): xterm's palette is a JS theme object built from these tokens
+   at init (ui2ShellTheme in 44-shell-frames.js — resolved once per page
+   load); CodeMirror is pure CSS via the .cm-s-intendant overrides below,
+   so it re-tints on a live theme flip while xterm keeps its init-time
+   palette until reload (known gap, tracked in 44-shell-frames.js). */
 
 /* v1 guards: elements that exist only for the v2 design (the ^C/^D/⏎ key
    chips and the Ln/Col statusbar span) stay invisible — and layout-inert —
@@ -23,12 +26,12 @@
    the shell toolbar by wireShellKeybar() under the flag. */
 html.ui-v2 #tab-terminal .subtabs { display: none; }
 
-html.ui-v2 #term-pane-shell { padding: 0 20px 14px; }
+html.ui-v2 #term-pane-shell { padding: 0 20px 16px; }
 
 html.ui-v2 #tab-terminal .shell-toolbar {
   background: transparent;
   border-bottom: 0;
-  padding: 13px 0 11px;
+  padding: 12px 0;
   gap: 10px;
 }
 html.ui-v2 #tab-terminal .shell-toolbar label {
@@ -64,6 +67,12 @@ html.ui-v2 #tab-files select:hover {
 html.ui-v2 #tab-files select:focus {
   border-color: var(--files-accent);
 }
+/* Light theme: the chevron's stroke is baked into the data URI (no var()
+   in url()), so it gets its own remap — text-2 light ink. */
+html.ui-v2[data-theme="light"] #tab-terminal .shell-toolbar select,
+html.ui-v2[data-theme="light"] #tab-files select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234B5265' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+}
 
 html.ui-v2 .shell-host-status {
   font-family: var(--mono);
@@ -75,6 +84,7 @@ html.ui-v2 .shell-host-status.warn { color: var(--amber); }
 html.ui-v2 .shell-host-status.ok { color: var(--green); }
 
 html.ui-v2 .shell-share-btn {
+  min-height: 32px; /* match the 32px Target select — one control height per row */
   padding: 6px 12px;
   border: 1px solid var(--line);
   border-radius: var(--r-ctl);
@@ -97,24 +107,38 @@ html.ui-v2 .shell-share-btn.is-shared {
 html.ui-v2 #tab-terminal .shell-toolbar .target-summary {
   border-left: 1px solid var(--line);
 }
+/* The machine name never word-wraps in the toolbar (the v1 base only
+   ellipsizes; without nowrap a squeezed column breaks "vortex-macos-…"
+   across three lines). */
+html.ui-v2 #tab-terminal .shell-toolbar .target-summary-name {
+  white-space: nowrap;
+}
 
 /* The stage: --code-bg mono surface with the design's terminal elevation.
    The inner padding lives on .xterm so the FitAddon subtracts it when
    computing cols/rows (parent padding would skew the fit math). */
 html.ui-v2 .terminal-container {
   border: 1px solid var(--line-2);
-  border-radius: 14px;
+  border-radius: var(--r-card);
   background: var(--code-bg);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03), 0 20px 50px rgba(0, 0, 0, .4);
   overflow: hidden;
 }
+/* Light theme: the dark elevation recipe reads as a dirty smudge on a
+   light page — swap to the light token shadows. */
+html.ui-v2[data-theme="light"] .terminal-container {
+  box-shadow: var(--glass-highlight), var(--shadow-card);
+}
 html.ui-v2 #shell-container .xterm { padding: 12px 14px; }
 
-/* Key bar: design chips — mono 11.5/600, radius 8, line border on surface. */
+/* Key bar: design chips — mono 11.5/600, radius 8, line border on surface.
+   4px side/bottom padding keeps the 2px focus ring (offset 2) inside the
+   bar's own scroll box — overflow-x:auto + overflow-y:hidden clip
+   anything closer to the edge. */
 html.ui-v2 .shell-keybar {
   background: transparent;
   border-top: 0;
-  padding: 11px 2px 1px;
+  padding: 12px 4px 4px;
   gap: 8px;
 }
 html.ui-v2 .shell-key {
@@ -139,6 +163,7 @@ html.ui-v2 .shell-key.sticky.armed {
 html.ui-v2 .shell-key.ui2-key { display: inline-block; }
 
 html.ui-v2 .keybar-toggle {
+  min-height: 32px; /* one control height per toolbar row (select is 32) */
   padding: 6px 12px;
   border: 1px solid var(--line);
   border-radius: var(--r-ctl);
@@ -278,6 +303,27 @@ html.ui-v2 #tab-files .ui-btn.danger:hover {
 }
 html.ui-v2 #tab-files .ui-btn:disabled { opacity: .45; }
 
+/* One control height per toolbar row: the Target select renders 32px, so
+   the buttons sharing its row match it (the tree/banner/find minis keep
+   their own compact sizes below). */
+html.ui-v2 #tab-files .files-ide-toolbar .ui-btn,
+html.ui-v2 #tab-files .files-tool .ui-btn {
+  min-height: 32px;
+}
+/* Transfer/staged in-row actions stay compact — list scale, not toolbar
+   scale. */
+html.ui-v2 #tab-files .files-transfer-row .ui-btn,
+html.ui-v2 #tab-files .files-staged-row .ui-btn {
+  min-height: 26px;
+  padding: 4px 10px;
+}
+/* Downloads path input: v1's 8px padding made it 34px tall next to its
+   own 32px row-mates; 6px lands the whole row on 32. */
+html.ui-v2 #tab-files .files-download-row input {
+  min-height: 32px;
+  padding: 6px 10px;
+}
+
 /* Text inputs across the Files surfaces: v2 input recipe, mono for paths. */
 html.ui-v2 #tab-files input[type="text"],
 html.ui-v2 #tab-files .files-ide-create-row input {
@@ -294,12 +340,18 @@ html.ui-v2 #tab-files .files-ide-create-row input:focus {
   border-color: var(--files-accent);
 }
 html.ui-v2 #tab-files input[type="text"]::placeholder { color: var(--text-3); }
+/* Single-hue focus: these inputs already signal focus with the machine
+   accent border; the global iris ring on top made a two-color halo. */
+html.ui-v2 #tab-files input[type="text"]:focus-visible,
+html.ui-v2 #tab-files .files-ide-create-row input:focus-visible {
+  outline-color: var(--files-accent);
+}
 
 /* — Editor sub-tab — */
 
 html.ui-v2 .files-ide-toolbar {
   min-height: 0;
-  padding: 11px 20px;
+  padding: 12px 20px;
   background: transparent;
   border-bottom: 0;
 }
@@ -374,6 +426,7 @@ html.ui-v2 #tab-files .files-ide-create-row input:focus {
 }
 
 html.ui-v2 .files-ide-row-act {
+  padding: 3px 6px; /* v1's 2px 5px left a 15px hit target */
   border-radius: 6px;
   color: var(--text-3);
 }
@@ -407,9 +460,15 @@ html.ui-v2 .files-ide-tab:hover { color: var(--text-2); }
 html.ui-v2 .files-ide-tab.active {
   background: var(--code-bg);
   color: var(--text);
-  box-shadow: inset 0 2px 0 var(--files-accent);
+  /* The 1px drop below paints over the strip's border-bottom so the
+     active tab fuses with the editor surface (no seam). */
+  box-shadow: inset 0 2px 0 var(--files-accent), 0 1px 0 var(--code-bg);
 }
 html.ui-v2 .files-ide-tab .files-ide-tab-dirty { color: var(--iris); }
+/* The dirty dot sits LEFT of the name in this DOM; v1's hover rule hides
+   it (it assumed the dot shared the close slot), which reflowed the tab
+   13px on hover. Keep it visible — dot and ✕ never collide here. */
+html.ui-v2 .files-ide-tab.dirty:hover .files-ide-tab-dirty { display: inline; }
 html.ui-v2 .files-ide-tab .files-ide-tab-close {
   border-radius: 6px;
   color: var(--text-3);
@@ -685,16 +744,34 @@ html.ui-v2 .fs-picker-path-row button {
   font: 600 12px var(--sans);
 }
 html.ui-v2 .fs-picker-path-row button:hover { background: var(--surface-2); border-color: var(--line-2); }
+/* Quiet list rows (the v1 base boxes every entry in a bordered button —
+   under v2 the list reads as rows: transparent until hover/selection). */
+html.ui-v2 .fs-picker-list {
+  border-color: var(--line);
+  border-radius: 11px;
+  background: var(--bg-1);
+}
 html.ui-v2 .fs-picker-entry {
+  border-color: transparent;
   border-radius: 7px;
+  background: transparent;
   font-family: var(--mono);
   font-size: 12.5px;
   color: var(--text-2);
 }
-html.ui-v2 .fs-picker-entry:hover { background: var(--hover-wash); color: var(--text); }
-html.ui-v2 .fs-picker-entry.selected {
-  background: rgba(var(--iris-rgb), .14);
+html.ui-v2 .fs-picker-entry:hover {
+  background: var(--hover-wash);
+  border-color: transparent;
   color: var(--text);
+}
+html.ui-v2 .fs-picker-entry.selected,
+html.ui-v2 .fs-picker-entry.selected:hover {
+  background: rgba(var(--iris-rgb), .14);
+  border-color: transparent;
+  color: var(--text);
+}
+html.ui-v2 .fs-picker-dialog.file-mode .fs-picker-entry.file.selected {
+  border-color: rgba(var(--iris-rgb), .4);
 }
 html.ui-v2 .fs-picker-status { font-size: 12px; color: var(--text-2); }
 html.ui-v2 .fs-picker-status.error { color: var(--rose); }
@@ -717,4 +794,31 @@ html.ui-v2 .fs-picker-close:hover { background: var(--surface-2); color: var(--t
     border-bottom: 1px solid var(--line);
   }
   html.ui-v2 .files-pane { padding: 12px; }
+
+  /* Files toolbar: v1's wrap rule targets `.files-ide-target-summary`,
+     but the element carries that string as its ID (class is
+     `target-summary`) — the rule never matched, so "New folder" wrapped
+     alone as a widow. Send the summary to its own full-width row. */
+  html.ui-v2 #files-ide-target-summary {
+    order: 5;
+    flex-basis: 100%;
+    max-width: 100%;
+  }
+
+  /* Terminal toolbar: the summary's v1 min-width (260px) + inline chips
+     overflowed the viewport at 820 (clipped capability chips, Keys
+     pushed off-screen). Wrap the toolbar; the summary takes a clean
+     full-width second row without the column divider. */
+  html.ui-v2 #tab-terminal .shell-toolbar { flex-wrap: wrap; }
+  html.ui-v2 #tab-terminal .shell-toolbar .target-summary {
+    order: 9;
+    flex-basis: 100%;
+    min-width: 0;
+    margin: 0;
+    padding: 2px 0 0;
+    border-left: 0;
+  }
+  html.ui-v2 #tab-terminal .shell-toolbar .target-summary-detail {
+    max-width: 100%;
+  }
 }
