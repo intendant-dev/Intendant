@@ -231,9 +231,38 @@ function showDisplayPicker(displays) {
     });
     picker.appendChild(item);
   }
+  const createItem = document.createElement('div');
+  createItem.className = 'display-picker-item dp-action';
+  createItem.textContent = 'New virtual display';
+  createItem.title = 'Launch a virtual display (Xvfb) on the daemon host — no agent or API key needed. Linux hosts only.';
+  createItem.addEventListener('click', (e) => {
+    e.stopPropagation();
+    hideDisplayPicker();
+    createVirtualDisplay();
+  });
+  picker.appendChild(createItem);
   picker.classList.add('visible');
   displayPickerVisible = true;
 }
+
+// Keyless "new virtual display": the daemon launches an Xvfb and registers
+// a capture session — the tile arrives via the normal display_ready
+// broadcast, and failures come back as display_capture_lost (toasted by
+// the slot-less branch of that handler). Works with zero API keys, which
+// is what makes a freshly claimed headless box show a display at all.
+window.createVirtualDisplay = function(event) {
+  if (event?.stopPropagation) event.stopPropagation();
+  const sent = dispatchDashboardActionMsg({ action: 'create_virtual_display' }, {
+    onError: (err) => {
+      if (typeof showControlToast === 'function') {
+        showControlToast('error', err?.message || 'Virtual display create failed');
+      }
+    },
+  });
+  if (sent && typeof showControlToast === 'function') {
+    showControlToast('info', 'Creating virtual display… the tile appears when its stream is ready');
+  }
+};
 
 function grantUserDisplayTarget(display) {
   const displayId = Number(display?.id);

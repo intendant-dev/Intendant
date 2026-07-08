@@ -1569,6 +1569,26 @@ pub enum ControlMsg {
         #[serde(default)]
         note: Option<String>,
     },
+    /// Create a virtual (Xvfb) display from a frontend — the keyless path
+    /// that gives a claimed headless box a working display without any
+    /// agent tool call. The daemon allocates the display number, launches
+    /// Xvfb through the same machinery agent sessions use, registers a
+    /// capture session, and announces it with `DisplayReady`; failures
+    /// surface as `DisplayCaptureLost` with an actionable reason. The
+    /// created display is daemon-owned: closing its tile
+    /// (`RevokeUserDisplay` on its id) destroys it, a graceful daemon exit
+    /// drops its guard, and a hard kill leaves it to the standard Xvfb
+    /// orphan-reclaim on the next allocation (signal shutdown is
+    /// `process::exit` — no `Drop`). Linux-only mechanism — other
+    /// platforms report a clear error.
+    CreateVirtualDisplay {
+        /// Optional resolution; defaults to 1920x1080. Values are clamped
+        /// to sane bounds and rounded down to even (VP8 requirement).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+    },
     /// **Phase 0 visual-freshness diagnostic** (task #83). Toggle the
     /// per-display marker overlay that the pool-feed bridge stamps into
     /// the I420 Y plane. Off by default; operator flips it on for a
@@ -4313,6 +4333,29 @@ mod tests {
             }
             _ => panic!("expected RevokeUserDisplay"),
         }
+    }
+
+    #[test]
+    fn control_msg_create_virtual_display_deserialize() {
+        let json = r#"{"action":"create_virtual_display"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ControlMsg::CreateVirtualDisplay {
+                width: None,
+                height: None
+            }
+        ));
+
+        let json = r#"{"action":"create_virtual_display","width":1280,"height":800}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ControlMsg::CreateVirtualDisplay {
+                width: Some(1280),
+                height: Some(800)
+            }
+        ));
     }
 
     #[test]

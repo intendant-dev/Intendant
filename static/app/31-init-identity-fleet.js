@@ -781,6 +781,7 @@ const DASHBOARD_ACTION_MSG_RPC_ACTIONS = new Set([
   'release_display',
   'grant_user_display',
   'revoke_user_display',
+  'create_virtual_display',
   'create_browser_workspace',
   'close_browser_workspace',
   'acquire_browser_workspace',

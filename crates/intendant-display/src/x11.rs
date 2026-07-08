@@ -64,8 +64,8 @@ impl X11Backend {
     }
 
     /// Create a backend targeting a specific X11 display string (e.g. ":0", ":99").
-    /// Currently unused but available for virtual display sessions and multi-server setups.
-    #[allow(dead_code)]
+    /// Virtual display sessions use this to connect to their own Xvfb server
+    /// regardless of where the process-wide `DISPLAY` points.
     pub fn with_display(display_str: &str) -> Result<Self, CallerError> {
         let (conn, screen_num) = x11rb::connect(Some(display_str))
             .map_err(|e| CallerError::Display(format!("X11 connect to {display_str}: {e}")))?;

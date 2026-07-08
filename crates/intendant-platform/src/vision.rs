@@ -146,6 +146,12 @@ pub fn display_config_for_provider(provider_name: &str) -> DisplayConfig {
 #[cfg(target_os = "linux")]
 const PREFERRED_DISPLAY: u32 = 99;
 
+/// One past the last display number [`find_free_display`] will allocate.
+/// `:99..:199` is the agent virtual-display range; sockets outside it are
+/// treated as user/session X servers, never as reclaimable Xvfb instances.
+#[cfg(target_os = "linux")]
+const VIRTUAL_DISPLAY_END: u32 = 200;
+
 /// Find a free X display number, preferring :99.
 ///
 /// Strategy for each candidate display:
@@ -156,16 +162,25 @@ const PREFERRED_DISPLAY: u32 = 99;
 /// 4. Lock file with some other live process → skip to next display
 #[cfg(target_os = "linux")]
 fn find_free_display() -> u32 {
-    find_free_display_in(std::path::Path::new("/tmp"))
+    find_free_display_in(std::path::Path::new("/tmp"), &[])
 }
 
 /// Lock-dir-injectable core of [`find_free_display`]. Tests pin a temp dir
 /// so the scan never probes the real X11 locks — a live :99 on a shared box
 /// (or a CI runner that also hosts a daemon) must never be examined, let
 /// alone reclaimed, by a unit test.
+///
+/// `exclude` lists display numbers this process knows are live and its own
+/// (held `XvfbGuard`s, registered capture sessions). Step 3's orphan
+/// reclaim would otherwise kill them: a guard-held `:99` looks exactly like
+/// an orphaned Xvfb to the lock-file scan, so allocating a *second* display
+/// must skip it rather than reclaim it.
 #[cfg(target_os = "linux")]
-fn find_free_display_in(lock_dir: &std::path::Path) -> u32 {
-    for id in PREFERRED_DISPLAY..200 {
+fn find_free_display_in(lock_dir: &std::path::Path, exclude: &[u32]) -> u32 {
+    for id in PREFERRED_DISPLAY..VIRTUAL_DISPLAY_END {
+        if exclude.contains(&id) {
+            continue;
+        }
         let lock = lock_dir.join(format!(".X{}-lock", id));
         if !lock.exists() {
             return id;
@@ -189,6 +204,57 @@ fn find_free_display_in(lock_dir: &std::path::Path) -> u32 {
 #[cfg(not(target_os = "linux"))]
 fn find_free_display() -> u32 {
     0
+}
+
+/// Allocate a virtual-display config at an explicit resolution, for callers
+/// that create displays for people rather than for a model's screenshot
+/// pipeline (the dashboard's keyless "new virtual display" path). Same
+/// allocator as [`display_config_for_provider`], provider-independent size.
+///
+/// `exclude` must list virtual-display numbers the caller already holds
+/// alive (guards, registered capture sessions) so the allocator never
+/// reclaims them as orphans — see [`find_free_display_in`].
+pub fn virtual_display_config(width: u32, height: u32, exclude: &[u32]) -> DisplayConfig {
+    #[cfg(target_os = "linux")]
+    let id = find_free_display_in(std::path::Path::new("/tmp"), exclude);
+    #[cfg(not(target_os = "linux"))]
+    let id = {
+        let _ = exclude;
+        find_free_display()
+    };
+    DisplayConfig {
+        target: DisplayTarget::Virtual { id },
+        width,
+        height,
+    }
+}
+
+/// Whether a live X server socket exists for virtual display `:id`.
+///
+/// True only inside the agent virtual-display number range (`:99..:199`) —
+/// callers use it to decide "this display target is an Xvfb we can connect
+/// to directly", and low-numbered sockets (`:0`, `:1`) are user session
+/// servers that must keep flowing through the user-display backends.
+/// Always false off Linux — virtual displays are Xvfb.
+pub fn virtual_display_socket_exists(id: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        virtual_display_socket_exists_in(std::path::Path::new("/tmp/.X11-unix"), id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = id;
+        false
+    }
+}
+
+/// Socket-dir-injectable core of [`virtual_display_socket_exists`].
+#[cfg(target_os = "linux")]
+fn virtual_display_socket_exists_in(socket_dir: &std::path::Path, id: u32) -> bool {
+    if !(PREFERRED_DISPLAY..VIRTUAL_DISPLAY_END).contains(&id) {
+        return false;
+    }
+    socket_dir.join(format!("X{}", id)).exists()
 }
 
 /// The conventional agent virtual display (`:99`) when an X server is
@@ -422,7 +488,56 @@ mod tests {
             format!("{}\n", std::process::id()),
         )
         .unwrap();
-        assert_eq!(find_free_display_in(tmp.path()), 100);
+        assert_eq!(find_free_display_in(tmp.path(), &[]), 100);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn find_free_display_skips_excluded_ids_without_reclaiming() {
+        let tmp = tempfile::tempdir().unwrap();
+        // :99 has a stale lock (dead pid). Without the exclusion the scan
+        // would clean it up and hand out 99; a caller that still holds :99
+        // alive (guard, capture session) must get the next number and the
+        // lock file must survive untouched.
+        let lock = tmp.path().join(".X99-lock");
+        std::fs::write(&lock, " 1999999999\n").unwrap();
+        assert_eq!(find_free_display_in(tmp.path(), &[99]), 100);
+        assert!(lock.exists(), "excluded display's lock must not be touched");
+        assert_eq!(find_free_display_in(tmp.path(), &[99, 100, 101]), 102);
+    }
+
+    #[test]
+    fn virtual_display_config_carries_requested_resolution() {
+        let config = virtual_display_config(1920, 1080, &[]);
+        assert_eq!((config.width, config.height), (1920, 1080));
+        let DisplayTarget::Virtual { id } = config.target else {
+            panic!("virtual_display_config must target a virtual display");
+        };
+        #[cfg(target_os = "linux")]
+        assert!((99..200).contains(&id));
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(id, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn virtual_display_socket_probe_is_range_scoped() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("X0"), b"").unwrap();
+        std::fs::write(tmp.path().join("X99"), b"").unwrap();
+        std::fs::write(tmp.path().join("X250"), b"").unwrap();
+        // User-session servers (:0) and out-of-range numbers never count.
+        assert!(!virtual_display_socket_exists_in(tmp.path(), 0));
+        assert!(virtual_display_socket_exists_in(tmp.path(), 99));
+        assert!(!virtual_display_socket_exists_in(tmp.path(), 250));
+        // In-range but no socket.
+        assert!(!virtual_display_socket_exists_in(tmp.path(), 150));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn virtual_display_socket_probe_is_linux_only() {
+        assert!(!virtual_display_socket_exists(99));
     }
 
     #[cfg(target_os = "linux")]

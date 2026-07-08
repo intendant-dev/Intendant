@@ -238,6 +238,8 @@ html {
 }
 .display-picker-item:hover { background: var(--surface1); }
 .display-picker-item .dp-primary { color: var(--green); font-size: 10px; margin-left: 4px; }
+/* Action rows (e.g. "New virtual display") sit under the capture targets. */
+.display-picker-item.dp-action { border-top: 1px solid var(--surface1); margin-top: 4px; padding-top: 8px; color: var(--blue); }
 .budget-bar {
   display: inline-flex;
   align-items: center;
