@@ -16005,6 +16005,12 @@ html.ui-v2 #tab-sessions .sessions-toggle {
   transition: border-color var(--t-med), color var(--t-med), background var(--t-med);
 }
 html.ui-v2 #tab-sessions .sessions-toggle input[type="checkbox"] { accent-color: var(--iris); }
+/* Keyboard focus lands on the hidden-in-plain-sight checkbox — surface it
+   on the chip itself so tabbing through the fold stays visible. */
+html.ui-v2 #tab-sessions .sessions-toggle:focus-within {
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
 html.ui-v2 #tab-sessions .sessions-toggle:has(input:checked) {
   border-color: rgba(var(--iris-rgb), .3);
   background: rgba(var(--iris-rgb), .09);
@@ -17326,6 +17332,15 @@ html.ui-v2 #tab-sessions .session-detail .empty-state {
 
 @media (max-width: 980px) {
   html.ui-v2 #tab-sessions .sessions-aggregate { grid-template-columns: repeat(2, 1fr); }
+  /* v1's fixed five-track deep-search row clips Run/Clear off the card at
+     narrow widths — let the controls wrap under the explainer instead. */
+  html.ui-v2 #tab-sessions .sessions-deep-search-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+  }
+  html.ui-v2 #tab-sessions .sessions-deep-search-title { flex: 1 1 100%; min-width: 0; }
+  html.ui-v2 #tab-sessions .sessions-deep-search-query { flex: 1 1 200px; min-width: 0; }
   html.ui-v2 #tab-sessions .sessions-header.ui2-tools-open .sessions-toolbar,
   html.ui-v2 #tab-sessions .worktrees-header .sessions-toolbar {
     grid-template-columns: 1fr 1fr;
