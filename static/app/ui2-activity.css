@@ -349,3 +349,34 @@ html.ui-v2 .ui2-rail-advanced {
   transition: background var(--t-fast), color var(--t-fast);
 }
 html.ui-v2 .ui2-rail-advanced:hover { background: var(--surface-2); color: var(--text); }
+
+/* — Focus filter + raw-entry hygiene + hero identity (corrective batch,
+     2026-07-08 product-owner review) — */
+html.ui-v2 .log-entry.hidden-by-focus { display: none; }
+html.ui-v2 .log-entry.ui2-stderr .log-content {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-3);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+html.ui-v2 .log-entry.ui2-stderr { padding: 2px 0; }
+html.ui-v2 .ui2-approval-session {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 5px;
+  border: 1px solid var(--session-badge-border, var(--line));
+  background: var(--session-badge-bg, var(--surface-2));
+  color: var(--session-badge-fg, var(--text-2));
+}
+/* the bottom panel gets a solid backdrop — stream text was bleeding
+   between the hero's buttons */
+html.ui-v2 #activity-log-pane .bottom-panel.visible {
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  padding: 10px 14px 12px;
+}

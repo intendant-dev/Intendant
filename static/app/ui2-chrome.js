@@ -175,6 +175,111 @@ function ui2WireMirrors() {
   const autonomyBtn = document.getElementById('ui2-autonomy-btn');
   if (autonomyBtn) autonomyBtn.addEventListener('click', () => routeTo('settings', 'autonomy'));
 
+  // Backend facts absorbed from the hidden v1 strips (provider·model,
+  // turn, tokens·cost). The pinned #sb-*/#tk-* elements stay in the DOM
+  // as the data source; these are pure mirrors.
+  const factsModel = () => {
+    const p = (document.getElementById('sb-provider')?.textContent || '').trim();
+    const m = (document.getElementById('sb-model')?.textContent || '').trim();
+    const el = document.getElementById('ui2-fact-model');
+    if (!el) return;
+    const real = (v) => v && v !== '--';
+    el.textContent = real(p) || real(m) ? `${real(p) ? p : '?'} · ${real(m) ? m : '?'}` : '—';
+  };
+  ui2Mirror('sb-provider', factsModel);
+  ui2Mirror('sb-model', factsModel);
+  ui2Mirror('sb-turn', (src) => {
+    const el = document.getElementById('ui2-fact-turn');
+    if (el) el.textContent = (src.textContent || 'T0').trim();
+  });
+  const factsTokens = () => {
+    const t = (document.getElementById('tk-tokens')?.textContent || '').trim();
+    const c = (document.getElementById('tk-cost')?.textContent || '').trim();
+    const el = document.getElementById('ui2-fact-tokens');
+    if (el) el.textContent = c ? `${t} · ${c}` : t;
+  };
+  ui2Mirror('tk-tokens', factsTokens);
+  ui2Mirror('tk-cost', factsTokens);
+
+  // Session switcher: the Focus session / composer target, as a control.
+  // Options rebuild from the live window set; selection drives the same
+  // focusSessionWindow() path as clicking a window. "All sessions" clears
+  // the Focus filter back to the combined stream.
+  //
+  // Wired strictly on DOMContentLoaded: this block reads `sessionWindows`,
+  // a `let` a later fragment declares in the shared module scope — at
+  // chrome-boot time it is in its TDZ, and even `typeof` on a TDZ binding
+  // THROWS (the module-boot rule's sharpest edge; a throw here kills
+  // every fragment after this one).
+  const ui2WireSwitcher = () => {
+  const switcher = document.getElementById('ui2-session-switcher');
+  const rebuildSwitcher = () => {
+    if (!switcher || typeof sessionWindows === 'undefined') return;
+    const target = typeof resolvePromptTargetSessionId === 'function'
+      ? (resolvePromptTargetSessionId() || '') : '';
+    const options = [['', 'all sessions']];
+    for (const [sid] of sessionWindows) {
+      let label = sid.slice(0, 8);
+      if (typeof sessionIdentityParts === 'function') {
+        const parts = sessionIdentityParts(sid) || {};
+        label = parts.name || parts.shortId || label;
+      }
+      options.push([sid, label]);
+    }
+    const sig = options.map((o) => o[0]).join(',') + '|' + target;
+    if (switcher.dataset.sig === sig) return;
+    switcher.dataset.sig = sig;
+    switcher.replaceChildren(...options.map(([value, label]) => {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = label;
+      return opt;
+    }));
+    switcher.value = target;
+    if (switcher.value !== target) switcher.value = '';
+  };
+  if (switcher) {
+    switcher.addEventListener('change', () => {
+      const sid = switcher.value;
+      if (sid && typeof focusSessionWindow === 'function') focusSessionWindow(sid);
+      else if (!sid && typeof discardPromptTargetReference === 'function') {
+        const current = typeof resolvePromptTargetSessionId === 'function'
+          ? resolvePromptTargetSessionId() : '';
+        if (current) discardPromptTargetReference(current);
+        if (typeof updatePromptTargetSessionHighlight === 'function') updatePromptTargetSessionHighlight();
+      }
+      if (typeof ui2ApplyFocusFilter === 'function') ui2ApplyFocusFilter();
+    });
+    ui2Mirror('task-target-chip', rebuildSwitcher);
+    const grid = document.getElementById('session-window-grid');
+    if (grid) new MutationObserver(rebuildSwitcher).observe(grid, { childList: true });
+    rebuildSwitcher();
+  }
+  };
+  if (document.readyState === 'complete') ui2WireSwitcher();
+  else document.addEventListener('DOMContentLoaded', ui2WireSwitcher, { once: true });
+
+  // Prominent theme toggle: icon shows the current theme; click flips.
+  const themeBtn = document.getElementById('ui2-theme-btn');
+  const themeIconSync = () => {
+    const icon = document.getElementById('ui2-theme-icon');
+    if (!icon || typeof ui2Theme !== 'function') return;
+    const light = ui2Theme() === 'light';
+    icon.innerHTML = ui2Icon(light ? 'sun' : 'moon', 16);
+    if (themeBtn) themeBtn.title = light ? 'Switch to dark theme' : 'Switch to light theme';
+  };
+  if (themeBtn) {
+    themeBtn.addEventListener('click', () => {
+      ui2SetTheme(ui2Theme() === 'light' ? 'dark' : 'light');
+      themeIconSync();
+      if (typeof ui2SettingsRenderAppearance === 'function') ui2SettingsRenderAppearance();
+    });
+    new MutationObserver(themeIconSync).observe(document.documentElement, {
+      attributes: true, attributeFilter: ['data-theme'],
+    });
+    themeIconSync();
+  }
+
   // Host identity: nav host button + avatar initials.
   ui2Mirror('sb-host-label', (src) => {
     const name = (src.textContent || '').trim() || 'local';

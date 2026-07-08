@@ -12512,6 +12512,63 @@ html.ui-v2[data-ui2-layout="grid"] #ui2-layout-grid-btn {
   box-shadow: inset 0 0 0 1px var(--line);
 }
 
+/* ── v1 strips absorbed (post-flip): the status bar and token ticker
+   duplicated the oversight bar; their unique facts (provider·model,
+   turn, tok/cost) now live in #ui2-ovs-facts as mirrors. The elements
+   stay in the DOM — pinned ids, v1 JS keeps writing them. ── */
+html.ui-v2 #status-bar { display: none; }
+html.ui-v2 #ticker-bar { display: none; }
+
+html.ui-v2 .ui2-ovs-facts {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+html.ui-v2 .ui2-fact { overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
+html.ui-v2 #ui2-fact-model { color: var(--sky); }
+
+html.ui-v2 .ui2-session-switcher {
+  display: none;
+  appearance: none;
+  -webkit-appearance: none;
+  max-width: 190px;
+  padding: 5px 26px 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface)
+    url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="%236C7482" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>')
+    no-repeat right 9px center;
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+html.ui-v2[data-ui2-tab="activity"] .ui2-session-switcher { display: inline-block; }
+html.ui-v2 .ui2-session-switcher:hover { border-color: var(--line-2); color: var(--text); }
+
+html.ui-v2 .ui2-theme-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .ui2-theme-btn:hover { background: var(--surface-2); color: var(--text); border-color: var(--line-2); }
+
 /* ── composer dock (the global task bar, re-homed) ─────────────────────
    The v1 .global-task-bar moves from the top strip to a floating card at
    the bottom — the design's composer. Same element, same ids, all v1
@@ -17622,6 +17679,37 @@ html.ui-v2 .ui2-rail-advanced {
   transition: background var(--t-fast), color var(--t-fast);
 }
 html.ui-v2 .ui2-rail-advanced:hover { background: var(--surface-2); color: var(--text); }
+
+/* — Focus filter + raw-entry hygiene + hero identity (corrective batch,
+     2026-07-08 product-owner review) — */
+html.ui-v2 .log-entry.hidden-by-focus { display: none; }
+html.ui-v2 .log-entry.ui2-stderr .log-content {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-3);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+html.ui-v2 .log-entry.ui2-stderr { padding: 2px 0; }
+html.ui-v2 .ui2-approval-session {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 5px;
+  border: 1px solid var(--session-badge-border, var(--line));
+  background: var(--session-badge-bg, var(--surface-2));
+  color: var(--session-badge-fg, var(--text-2));
+}
+/* the bottom panel gets a solid backdrop — stream text was bleeding
+   between the hero's buttons */
+html.ui-v2 #activity-log-pane .bottom-panel.visible {
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  padding: 10px 14px 12px;
+}
 /* ── static/app/ui2-grid.css ── */
 /* ── ui-v2 Activity Grid mode: session-window re-skin ──────────────────
    All scoped html.ui-v2. The v1 window machinery (collapse states,
@@ -17848,6 +17936,12 @@ html.ui-v2 .concurrent-log-action {
 html.ui-v2 .concurrent-log-action:hover,
 html.ui-v2 .concurrent-log-action:focus { background: var(--surface-2); color: var(--text); }
 html.ui-v2 .concurrent-log-action[aria-pressed="true"] { color: var(--iris-2); }
+
+/* Opaque cards (corrective batch): the translucent v1 window surfaces let
+   the concurrent stream show through — the design's cards are solid. */
+html.ui-v2 .session-window { background: var(--surface); }
+html.ui-v2 .session-window-header { background: var(--surface-2); }
+html.ui-v2 .concurrent-log-region { background: var(--bg); }
 /* ── static/app/ui2-live.css ── */
 /* ── ui-v2 Live display (Video tab) re-skin (design-overhaul P2) ───────
    Everything here is scoped under `html.ui-v2` and restyles the EXISTING
@@ -22843,9 +22937,23 @@ html.ui-v2 .ui2-appearance-note {
        ui2-activity.js owns the state (html[data-ui2-layout] + localStorage). -->
   <div class="ui2-layout-toggle" id="ui2-layout-toggle" role="group" aria-label="Activity layout">
     <button type="button" id="ui2-layout-focus-btn" data-layout="focus"
-            title="Focus — one centered timeline (session windows hidden)">Focus</button>
+            title="Focus — the targeted session's timeline (session windows hidden)">Focus</button>
     <button type="button" id="ui2-layout-grid-btn" data-layout="grid"
             title="Grid — session windows with the concurrent stream below">Grid</button>
+  </div>
+  <!-- Session switcher (the decision's missing half): picks the Focus
+       session / composer target. Populated from the live session set by
+       ui2-chrome.js; drives the same focus/target mechanism as clicking a
+       session window. Activity-only, like the layout toggle. -->
+  <select class="ui2-session-switcher" id="ui2-session-switcher"
+          aria-label="Focused session" title="Focused session — Focus shows this session's timeline; the composer targets it"></select>
+  <!-- Backend truth absorbed from the v1 status bar (hidden under v2):
+       provider·model, turn counter, live token/cost readout. Values are
+       mirrors of the pinned #sb-*/#tk-* elements. -->
+  <div class="ui2-ovs-facts ui2-ovs-compact-hide" id="ui2-ovs-facts">
+    <span class="ui2-fact" id="ui2-fact-model" title="Provider · model driving the main loop">—</span>
+    <span class="ui2-fact" id="ui2-fact-turn" title="Turn counter">T0</span>
+    <span class="ui2-fact" id="ui2-fact-tokens" title="Session tokens · cached · cost">— tok</span>
   </div>
   <div class="ui2-ctx ui2-ovs-compact-hide" id="ui2-ctx" title="Context budget used">
     <span class="ui2-ctx-label">Context</span>
@@ -22856,6 +22964,13 @@ html.ui-v2 .ui2-appearance-note {
   <button type="button" class="ui2-conn" id="ui2-conn" title="Dashboard transport — opens Access → Diagnostics">
     <span class="ui2-conn-dot" id="ui2-conn-dot"></span>
     <span class="ui2-conn-label ui2-ovs-compact-hide" id="ui2-conn-label">connecting…</span>
+  </button>
+  <!-- Prominent theme toggle (product-owner directive): one click from
+       anywhere; Settings → Appearance and the ⌘K action stay as the
+       long-form paths. Icon reflects the CURRENT theme; click flips. -->
+  <button type="button" class="ui2-theme-btn" id="ui2-theme-btn"
+          title="Switch to light theme" aria-label="Switch theme">
+    <span id="ui2-theme-icon"></span>
   </button>
   <button type="button" class="ui2-search" id="ui2-search-btn" title="Command palette">
     <span class="ui2-search-icon" id="ui2-search-icon"></span>
@@ -22917,6 +23032,8 @@ const UI2_ICON_PATHS = {
   phone: '<path d="M7 3.8c.9 0 2.8 3.2 2.3 4.1-.4.8-1.6 1.2-1.6 1.2s.5 2 2.1 3.6c1.6 1.6 3.6 2.1 3.6 2.1s.4-1.2 1.2-1.6c.9-.5 4.1 1.4 4.1 2.3 0 1.6-2 3.2-3.5 3.2-2.5 0-5.5-1.4-7.8-3.7C5.1 12.7 3.7 9.7 3.7 7.2c0-1.5 1.7-3.4 3.3-3.4z"/>',
 
   // — actions & affordances —
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2.5v2.2"/><path d="M12 19.3v2.2"/><path d="M2.5 12h2.2"/><path d="M19.3 12h2.2"/><path d="M5.3 5.3l1.6 1.6"/><path d="M17.1 17.1l1.6 1.6"/><path d="M18.7 5.3l-1.6 1.6"/><path d="M6.9 17.1l-1.6 1.6"/>',
+  moon: '<path d="M20.2 13.2A8.2 8.2 0 0 1 10.8 3.8a8.2 8.2 0 1 0 9.4 9.4Z"/>',
   search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/>',
   send: '<path d="M12 20V5"/><path d="M6 11l6-6 6 6"/>',
   plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
@@ -23178,6 +23295,111 @@ function ui2WireMirrors() {
   });
   const autonomyBtn = document.getElementById('ui2-autonomy-btn');
   if (autonomyBtn) autonomyBtn.addEventListener('click', () => routeTo('settings', 'autonomy'));
+
+  // Backend facts absorbed from the hidden v1 strips (provider·model,
+  // turn, tokens·cost). The pinned #sb-*/#tk-* elements stay in the DOM
+  // as the data source; these are pure mirrors.
+  const factsModel = () => {
+    const p = (document.getElementById('sb-provider')?.textContent || '').trim();
+    const m = (document.getElementById('sb-model')?.textContent || '').trim();
+    const el = document.getElementById('ui2-fact-model');
+    if (!el) return;
+    const real = (v) => v && v !== '--';
+    el.textContent = real(p) || real(m) ? `${real(p) ? p : '?'} · ${real(m) ? m : '?'}` : '—';
+  };
+  ui2Mirror('sb-provider', factsModel);
+  ui2Mirror('sb-model', factsModel);
+  ui2Mirror('sb-turn', (src) => {
+    const el = document.getElementById('ui2-fact-turn');
+    if (el) el.textContent = (src.textContent || 'T0').trim();
+  });
+  const factsTokens = () => {
+    const t = (document.getElementById('tk-tokens')?.textContent || '').trim();
+    const c = (document.getElementById('tk-cost')?.textContent || '').trim();
+    const el = document.getElementById('ui2-fact-tokens');
+    if (el) el.textContent = c ? `${t} · ${c}` : t;
+  };
+  ui2Mirror('tk-tokens', factsTokens);
+  ui2Mirror('tk-cost', factsTokens);
+
+  // Session switcher: the Focus session / composer target, as a control.
+  // Options rebuild from the live window set; selection drives the same
+  // focusSessionWindow() path as clicking a window. "All sessions" clears
+  // the Focus filter back to the combined stream.
+  //
+  // Wired strictly on DOMContentLoaded: this block reads `sessionWindows`,
+  // a `let` a later fragment declares in the shared module scope — at
+  // chrome-boot time it is in its TDZ, and even `typeof` on a TDZ binding
+  // THROWS (the module-boot rule's sharpest edge; a throw here kills
+  // every fragment after this one).
+  const ui2WireSwitcher = () => {
+  const switcher = document.getElementById('ui2-session-switcher');
+  const rebuildSwitcher = () => {
+    if (!switcher || typeof sessionWindows === 'undefined') return;
+    const target = typeof resolvePromptTargetSessionId === 'function'
+      ? (resolvePromptTargetSessionId() || '') : '';
+    const options = [['', 'all sessions']];
+    for (const [sid] of sessionWindows) {
+      let label = sid.slice(0, 8);
+      if (typeof sessionIdentityParts === 'function') {
+        const parts = sessionIdentityParts(sid) || {};
+        label = parts.name || parts.shortId || label;
+      }
+      options.push([sid, label]);
+    }
+    const sig = options.map((o) => o[0]).join(',') + '|' + target;
+    if (switcher.dataset.sig === sig) return;
+    switcher.dataset.sig = sig;
+    switcher.replaceChildren(...options.map(([value, label]) => {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = label;
+      return opt;
+    }));
+    switcher.value = target;
+    if (switcher.value !== target) switcher.value = '';
+  };
+  if (switcher) {
+    switcher.addEventListener('change', () => {
+      const sid = switcher.value;
+      if (sid && typeof focusSessionWindow === 'function') focusSessionWindow(sid);
+      else if (!sid && typeof discardPromptTargetReference === 'function') {
+        const current = typeof resolvePromptTargetSessionId === 'function'
+          ? resolvePromptTargetSessionId() : '';
+        if (current) discardPromptTargetReference(current);
+        if (typeof updatePromptTargetSessionHighlight === 'function') updatePromptTargetSessionHighlight();
+      }
+      if (typeof ui2ApplyFocusFilter === 'function') ui2ApplyFocusFilter();
+    });
+    ui2Mirror('task-target-chip', rebuildSwitcher);
+    const grid = document.getElementById('session-window-grid');
+    if (grid) new MutationObserver(rebuildSwitcher).observe(grid, { childList: true });
+    rebuildSwitcher();
+  }
+  };
+  if (document.readyState === 'complete') ui2WireSwitcher();
+  else document.addEventListener('DOMContentLoaded', ui2WireSwitcher, { once: true });
+
+  // Prominent theme toggle: icon shows the current theme; click flips.
+  const themeBtn = document.getElementById('ui2-theme-btn');
+  const themeIconSync = () => {
+    const icon = document.getElementById('ui2-theme-icon');
+    if (!icon || typeof ui2Theme !== 'function') return;
+    const light = ui2Theme() === 'light';
+    icon.innerHTML = ui2Icon(light ? 'sun' : 'moon', 16);
+    if (themeBtn) themeBtn.title = light ? 'Switch to dark theme' : 'Switch to light theme';
+  };
+  if (themeBtn) {
+    themeBtn.addEventListener('click', () => {
+      ui2SetTheme(ui2Theme() === 'light' ? 'dark' : 'light');
+      themeIconSync();
+      if (typeof ui2SettingsRenderAppearance === 'function') ui2SettingsRenderAppearance();
+    });
+    new MutationObserver(themeIconSync).observe(document.documentElement, {
+      attributes: true, attributeFilter: ['data-theme'],
+    });
+    themeIconSync();
+  }
 
   // Host identity: nav host button + avatar initials.
   ui2Mirror('sb-host-label', (src) => {
@@ -23560,6 +23782,7 @@ function ui2ApplyLayout(mode) {
   if (gBtn) gBtn.setAttribute('aria-pressed', String(grid));
   if (typeof syncConcurrentLogStreamMount === 'function') syncConcurrentLogStreamMount();
   if (grid && typeof fitSessionWindowGridHeight === 'function') fitSessionWindowGridHeight();
+  if (typeof ui2ApplyFocusFilter === 'function') ui2ApplyFocusFilter();
 }
 
 function ui2WireLayoutToggle() {
@@ -23579,6 +23802,75 @@ function ui2DressComposer() {
   if (input) input.placeholder = 'Reply, steer, or describe a new task…';
   const attach = document.getElementById('upload-attach-btn');
   if (attach && typeof ui2Icon === 'function') attach.innerHTML = ui2Icon('attach', 15);
+}
+
+// ── Focus filter: Focus shows the FOREGROUND session's timeline ────────
+// The original product decision: "Focus timeline + session switcher".
+// Entries from other sessions hide; daemon-level entries (no session id)
+// always show. No target selected ("all sessions") = the combined
+// stream. Grid mode never filters — the concurrent view is combined by
+// definition.
+function ui2ApplyFocusFilter() {
+  const stream = document.getElementById('log-stream');
+  if (!stream) return;
+  const focusMode = document.documentElement.dataset.ui2Layout !== 'grid';
+  const sid = (focusMode && typeof resolvePromptTargetSessionId === 'function'
+    && resolvePromptTargetSessionId()) || '';
+  stream.querySelectorAll('.log-entry').forEach((e) => {
+    const esid = e.dataset.sessionId || '';
+    e.classList.toggle('hidden-by-focus', !!sid && !!esid && esid !== sid);
+  });
+}
+
+let ui2FocusFilterQueued = false;
+function ui2QueueFocusFilter() {
+  if (ui2FocusFilterQueued) return;
+  ui2FocusFilterQueued = true;
+  requestAnimationFrame(() => {
+    ui2FocusFilterQueued = false;
+    ui2ApplyFocusFilter();
+    ui2TagRawEntries();
+  });
+}
+
+// Raw-payload hygiene: backend stderr lines render as compact, dimmed
+// mono rows instead of full-voice paragraphs.
+function ui2TagRawEntries() {
+  const stream = document.getElementById('log-stream');
+  if (!stream) return;
+  stream.querySelectorAll('.log-entry:not(.ui2-raw-checked)').forEach((e) => {
+    e.classList.add('ui2-raw-checked');
+    const text = e.querySelector('.log-content')?.textContent || '';
+    if (/^\s*\[(codex|claude(-code)?|backend) stderr\]/i.test(text)) {
+      e.classList.add('ui2-stderr');
+    }
+  });
+}
+
+// The approval hero names its session — with several agents running,
+// "Approval needed" alone is ambiguous.
+function ui2StampApprovalSession() {
+  const panel = document.getElementById('approval-panel');
+  if (!panel || !panel.classList.contains('visible')) return;
+  const title = panel.querySelector('.approval-title');
+  if (!title) return;
+  let chip = document.getElementById('ui2-approval-session');
+  if (!chip) {
+    chip = document.createElement('span');
+    chip.id = 'ui2-approval-session';
+    chip.className = 'ui2-approval-session';
+    title.appendChild(chip);
+  }
+  const sid = (typeof pendingApprovalSessionId !== 'undefined' && pendingApprovalSessionId) || '';
+  if (!sid) { chip.hidden = true; return; }
+  chip.hidden = false;
+  let label = sid.slice(0, 8);
+  if (typeof sessionIdentityParts === 'function') {
+    const parts = sessionIdentityParts(sid) || {};
+    label = parts.name || parts.shortId || label;
+  }
+  chip.textContent = label;
+  if (typeof applySessionBadgeStyle === 'function') applySessionBadgeStyle(chip, sid);
 }
 
 // ── vitals rail ────────────────────────────────────────────────────────
@@ -23692,6 +23984,21 @@ if (ui2Enabled()) {
     ui2BuildVitalsRail();
     ui2RailTick();
     setInterval(ui2RailTick, 1000);
+    // Focus filter + raw-entry hygiene: follow stream appends, target
+    // changes (the chip re-renders on every change), and layout flips.
+    const stream = document.getElementById('log-stream');
+    if (stream) new MutationObserver(ui2QueueFocusFilter).observe(stream, { childList: true });
+    const chip = document.getElementById('task-target-chip');
+    if (chip) new MutationObserver(ui2QueueFocusFilter).observe(chip, {
+      childList: true, characterData: true, subtree: true, attributes: true,
+    });
+    ui2ApplyFocusFilter();
+    ui2TagRawEntries();
+    // Approval hero session identity.
+    const panel = document.getElementById('approval-panel');
+    if (panel) new MutationObserver(ui2StampApprovalSession).observe(panel, {
+      attributes: true, attributeFilter: ['class'],
+    });
   };
   // Every fragment shares ONE <script type="module"> scope (30-module-open),
   // which executes with readyState already 'interactive' — an immediate

@@ -87,6 +87,7 @@ function ui2ApplyLayout(mode) {
   if (gBtn) gBtn.setAttribute('aria-pressed', String(grid));
   if (typeof syncConcurrentLogStreamMount === 'function') syncConcurrentLogStreamMount();
   if (grid && typeof fitSessionWindowGridHeight === 'function') fitSessionWindowGridHeight();
+  if (typeof ui2ApplyFocusFilter === 'function') ui2ApplyFocusFilter();
 }
 
 function ui2WireLayoutToggle() {
@@ -106,6 +107,75 @@ function ui2DressComposer() {
   if (input) input.placeholder = 'Reply, steer, or describe a new task…';
   const attach = document.getElementById('upload-attach-btn');
   if (attach && typeof ui2Icon === 'function') attach.innerHTML = ui2Icon('attach', 15);
+}
+
+// ── Focus filter: Focus shows the FOREGROUND session's timeline ────────
+// The original product decision: "Focus timeline + session switcher".
+// Entries from other sessions hide; daemon-level entries (no session id)
+// always show. No target selected ("all sessions") = the combined
+// stream. Grid mode never filters — the concurrent view is combined by
+// definition.
+function ui2ApplyFocusFilter() {
+  const stream = document.getElementById('log-stream');
+  if (!stream) return;
+  const focusMode = document.documentElement.dataset.ui2Layout !== 'grid';
+  const sid = (focusMode && typeof resolvePromptTargetSessionId === 'function'
+    && resolvePromptTargetSessionId()) || '';
+  stream.querySelectorAll('.log-entry').forEach((e) => {
+    const esid = e.dataset.sessionId || '';
+    e.classList.toggle('hidden-by-focus', !!sid && !!esid && esid !== sid);
+  });
+}
+
+let ui2FocusFilterQueued = false;
+function ui2QueueFocusFilter() {
+  if (ui2FocusFilterQueued) return;
+  ui2FocusFilterQueued = true;
+  requestAnimationFrame(() => {
+    ui2FocusFilterQueued = false;
+    ui2ApplyFocusFilter();
+    ui2TagRawEntries();
+  });
+}
+
+// Raw-payload hygiene: backend stderr lines render as compact, dimmed
+// mono rows instead of full-voice paragraphs.
+function ui2TagRawEntries() {
+  const stream = document.getElementById('log-stream');
+  if (!stream) return;
+  stream.querySelectorAll('.log-entry:not(.ui2-raw-checked)').forEach((e) => {
+    e.classList.add('ui2-raw-checked');
+    const text = e.querySelector('.log-content')?.textContent || '';
+    if (/^\s*\[(codex|claude(-code)?|backend) stderr\]/i.test(text)) {
+      e.classList.add('ui2-stderr');
+    }
+  });
+}
+
+// The approval hero names its session — with several agents running,
+// "Approval needed" alone is ambiguous.
+function ui2StampApprovalSession() {
+  const panel = document.getElementById('approval-panel');
+  if (!panel || !panel.classList.contains('visible')) return;
+  const title = panel.querySelector('.approval-title');
+  if (!title) return;
+  let chip = document.getElementById('ui2-approval-session');
+  if (!chip) {
+    chip = document.createElement('span');
+    chip.id = 'ui2-approval-session';
+    chip.className = 'ui2-approval-session';
+    title.appendChild(chip);
+  }
+  const sid = (typeof pendingApprovalSessionId !== 'undefined' && pendingApprovalSessionId) || '';
+  if (!sid) { chip.hidden = true; return; }
+  chip.hidden = false;
+  let label = sid.slice(0, 8);
+  if (typeof sessionIdentityParts === 'function') {
+    const parts = sessionIdentityParts(sid) || {};
+    label = parts.name || parts.shortId || label;
+  }
+  chip.textContent = label;
+  if (typeof applySessionBadgeStyle === 'function') applySessionBadgeStyle(chip, sid);
 }
 
 // ── vitals rail ────────────────────────────────────────────────────────
@@ -219,6 +289,21 @@ if (ui2Enabled()) {
     ui2BuildVitalsRail();
     ui2RailTick();
     setInterval(ui2RailTick, 1000);
+    // Focus filter + raw-entry hygiene: follow stream appends, target
+    // changes (the chip re-renders on every change), and layout flips.
+    const stream = document.getElementById('log-stream');
+    if (stream) new MutationObserver(ui2QueueFocusFilter).observe(stream, { childList: true });
+    const chip = document.getElementById('task-target-chip');
+    if (chip) new MutationObserver(ui2QueueFocusFilter).observe(chip, {
+      childList: true, characterData: true, subtree: true, attributes: true,
+    });
+    ui2ApplyFocusFilter();
+    ui2TagRawEntries();
+    // Approval hero session identity.
+    const panel = document.getElementById('approval-panel');
+    if (panel) new MutationObserver(ui2StampApprovalSession).observe(panel, {
+      attributes: true, attributeFilter: ['class'],
+    });
   };
   // Every fragment shares ONE <script type="module"> scope (30-module-open),
   // which executes with readyState already 'interactive' — an immediate
