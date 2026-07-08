@@ -917,7 +917,9 @@ pub(crate) async fn drain_outputs<I: rtc::interceptor::Interceptor>(
         // matter" — rtc/src/peer_connection/transport/dtls/mod.rs), so a
         // peer that reached us over ICE-TCP must be matched by its tuple,
         // not by the stamp, or every post-ICE packet misses the stream and
-        // DTLS times out. (The relay check above stays first: relay
+        // DTLS times out. Reported upstream as
+        // webrtc-rs/rtc#109 (fix PR #110); revisit this routing only
+        // after a release past 0.9.0 lands the fix and we upgrade. (The relay check above stays first: relay
         // transmits key on our relayed *local* address, which is never a
         // TCP peer tuple.)
         if let Some(sender) = tcp_senders.get(&t.transport.peer_addr) {
