@@ -14825,6 +14825,123 @@ html.ui-v2 #tab-debug .ui-empty-hint {
   line-height: 1.55;
   color: var(--text-3);
 }
+/* ── static/app/ui2-station.css ── */
+/* ── ui-v2 Station chrome: the thin HTML shell around the canvas ───────
+   (design-overhaul P2, wave 2)
+
+   Boundary rule (station.md contract): the WebGPU/HUD canvases and every
+   pixel they paint — header band, command deck, node cards, activity
+   runway, focus panels, transcript/diff panel, composer strip chrome —
+   are station-web (Rust→WASM) scope and are UNTOUCHED here. This file
+   re-skins only the HTML-side chrome inside #tab-station: the
+   peer-display chip band, the .station-pane space backdrop, the
+   lower-left status/metrics chip, and the transparent composer textarea
+   ink. The design prototype's DOM header band and footer runway are
+   deliberately NOT built: the canvas already paints both regions, so
+   DOM copies would double-render (they are canvas-theme inspiration for
+   the separate station-web palette pass, not DOM to build).
+
+   Invariants preserved verbatim:
+   - No backdrop-filter anywhere in this file. The status chip and the
+     composer overlay sit on top of the canvases (blur there forces the
+     WebGPU scene into constant recomposite — see the v1 token note in
+     10-styles-shell.css and the palette's .ui2-no-blur toggle); the
+     flow-row chip band simply goes opaque under v2, so Station carries
+     zero blur at all.
+   - Zero box-model changes to .station-pane, .station-canvas,
+     .station-hotspots, #station-composer-input: hotspot rects and the
+     composer slot are positioned from WASM truth (hotspot_rects(),
+     composer_state()) in canvas coordinates — this file is
+     background/ink only on those surfaces.
+   - Pinned ids/classes untouched: #station-status / -metrics / -text,
+     [data-station-hotspot], #station-composer-input, the two canvas
+     ids, #station-display-endpoints. #station-dock stays dead.
+   - Station stays dark by design even after a light theme ships (the
+     canvas palette is not theme-aware); the pane gradient below reads
+     from --bg/--bg-1, so the P4 light-theme pass owns pinning it dark
+     if those tokens ever flip. */
+
+/* ── peer-display chip band (flow row above the canvas) ── */
+html.ui-v2 .station-peer-chips {
+  gap: 7px;
+  padding: 6px 18px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+html.ui-v2 .station-peer-chips-label {
+  color: var(--text-3);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .09em;
+}
+html.ui-v2 .station-peer-chip {
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  box-shadow: none;
+  transition: border-color var(--t-fast), background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 .station-peer-chip:hover:not(:disabled) {
+  border-color: rgba(var(--iris-rgb), .3);
+  background: rgba(var(--iris-rgb), .1);
+  color: var(--iris-2);
+}
+html.ui-v2 .station-peer-chip .chip-dot {
+  background: var(--neutral-dot);
+}
+html.ui-v2 .station-peer-chip .chip-dot.ok {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16);
+}
+
+/* ── canvas container: the deeper-space backdrop (design §3.19) ──
+   Background only — position/overflow/flex stay v1 so canvas pixels,
+   hotspot rects, and the composer slot share one coordinate space. */
+html.ui-v2 .station-pane {
+  background:
+    radial-gradient(ellipse 70% 70% at 50% 52%, rgba(var(--iris-rgb), .08), transparent 60%),
+    radial-gradient(circle at 50% 52%, var(--bg-1), var(--bg) 70%);
+}
+
+/* ── lower-left status/metrics chip (v2 glass, mono, blur-free) ── */
+html.ui-v2 .station-status {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 6px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--glass);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .04), 0 4px 14px rgba(0, 0, 0, .35);
+}
+html.ui-v2 .station-status-metrics {
+  color: var(--text-2);
+  border-right: 1px solid var(--line-2);
+}
+
+/* ── composer textarea overlay: ink only ──
+   The canvas paints the strip chrome and positions this textarea from
+   composer_state() geometry; font-size/line-height/padding stay v1. */
+html.ui-v2 .station-composer-input {
+  color: var(--text);
+  caret-color: var(--iris);
+  font-family: var(--mono);
+}
+html.ui-v2 .station-composer-input::placeholder {
+  color: var(--text-3);
+  opacity: 1;
+}
+
+/* .station-hotspot: deliberately no rules. The a11y hotspot layer stays
+   invisible with untouched WASM-driven geometry; the global
+   html.ui-v2 :focus-visible iris ring is the keyboard affordance. */
 </style>
 <!-- ── static/app/20-shell.html ── -->
 </head>
@@ -23444,7 +23561,11 @@ function stationOperateBrowserWorkspace(op) {
       url: draft.url || undefined,
       provider: draft.provider || 'auto',
       label: draft.label || undefined,
-      owner_session_id: currentSessionId || undefined,
+      // The old `currentSessionId` global died in the AppWeb→PresenceWeb
+      // merge (9285c7b6); the bare read threw ReferenceError and silently
+      // broke Station's workspace create. Same fallback chain as the
+      // Debug pane's debugPaneSessionId() (PR #70 fix).
+      owner_session_id: currentSessionFullId || daemonSessionFullId || undefined,
     });
     stationSetPeerStatus('Browser workspace create requested', 'ok');
     stationScheduleUpdate();
