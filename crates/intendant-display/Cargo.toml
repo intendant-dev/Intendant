@@ -23,7 +23,7 @@ async-trait = "0.1"
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-rtc = { version = "=0.9.0" }
+rtc = { version = "=0.9.1" }
 bytes = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]

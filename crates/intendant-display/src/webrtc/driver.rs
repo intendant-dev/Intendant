@@ -911,15 +911,14 @@ pub(crate) async fn drain_outputs<I: rtc::interceptor::Interceptor>(
             }
             continue;
         }
-        // Route by connection before trusting the engine's protocol stamp:
-        // rtc 0.9 marks DTLS and SCTP transmits `TransportProtocol::UDP`
-        // even when the selected pair is TCP ("TransportProtocol doesn't
-        // matter" — rtc/src/peer_connection/transport/dtls/mod.rs), so a
-        // peer that reached us over ICE-TCP must be matched by its tuple,
-        // not by the stamp, or every post-ICE packet misses the stream and
-        // DTLS times out. Reported upstream as
-        // webrtc-rs/rtc#109 (fix PR #110); revisit this routing only
-        // after a release past 0.9.0 lands the fix and we upgrade. (The relay check above stays first: relay
+        // Route by connection first, engine stamp second: rtc < 0.9.1
+        // stamped DTLS/SCTP transmits `TransportProtocol::UDP` even on a
+        // TCP pair, misrouting every post-ICE packet (webrtc-rs/rtc#109,
+        // fixed by our upstream PR #110, released as 0.9.1 — which we
+        // run). Tuple-first routing stays regardless: the tuple is the
+        // engine's own connection key (rtc-shared `FiveTuple`), and it
+        // keeps any future stamping regression from presenting as a
+        // silent DTLS timeout again. (The relay check above stays first: relay
         // transmits key on our relayed *local* address, which is never a
         // TCP peer tuple.)
         if let Some(sender) = tcp_senders.get(&t.transport.peer_addr) {
