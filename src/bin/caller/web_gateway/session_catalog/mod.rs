@@ -677,14 +677,16 @@ pub(crate) fn sessions_list_response_body(limit: Option<usize>, ids: &[String]) 
 }
 
 /// Strip session rows down to what the Stats tab folds: usage, costs,
-/// per-day buckets, and disk sizes. Full rows carry tasks, paths, goals,
-/// and lineage that make a whole-corpus fetch megabytes; the usage view
-/// is the same cached data at ~a tenth of the payload.
+/// per-day buckets, disk sizes, and the model name (the ui-v2 Usage
+/// screen aggregates cost by model client-side). Full rows carry tasks,
+/// paths, goals, and lineage that make a whole-corpus fetch megabytes;
+/// the usage view is the same cached data at ~a tenth of the payload.
 pub(crate) fn session_list_body_usage_view(body: &str) -> String {
-    const KEEP: [&str; 19] = [
+    const KEEP: [&str; 20] = [
         "id",
         "session_id",
         "source",
+        "model",
         "turns",
         "total_tokens",
         "prompt_tokens",
@@ -2961,6 +2963,7 @@ mod tests {
         let body = serde_json::json!([{
             "session_id": "s-1",
             "source": "codex",
+            "model": "gpt-5.5",
             "task": "a very long task description",
             "cwd": "/somewhere/deep",
             "goal": {"objective": "x"},
@@ -2977,6 +2980,8 @@ mod tests {
         assert!(row.contains_key("session_id"));
         assert!(row.contains_key("daily_usage"));
         assert!(row.contains_key("total_bytes"));
+        // The by-model Usage cards need the model name kept in the slim view.
+        assert!(row.contains_key("model"));
         assert!(!row.contains_key("task"));
         assert!(!row.contains_key("cwd"));
         assert!(!row.contains_key("goal"));
