@@ -26,11 +26,20 @@
         on = localStorage.getItem('intendant.ui2') !== '0';
       }
     } catch (e) { /* storage unavailable: v2 default */ }
-    if (on) document.documentElement.classList.add('ui-v2');
-    else {
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if (on) {
+      document.documentElement.classList.add('ui-v2');
+      // Light theme (design-system import): browser-scoped preference,
+      // stamped pre-paint so neither theme flashes.
+      try {
+        if (localStorage.getItem('intendant.ui2.theme') === 'light') {
+          document.documentElement.setAttribute('data-theme', 'light');
+          if (meta) meta.setAttribute('content', '#F5F6FB');
+        }
+      } catch (e) { /* private mode: dark */ }
+    } else if (meta) {
       // v1 keeps its Catppuccin crust tab tint during the soak.
-      var meta = document.querySelector('meta[name="theme-color"]');
-      if (meta) meta.setAttribute('content', '#11111b');
+      meta.setAttribute('content', '#11111b');
     }
   })();
 </script>

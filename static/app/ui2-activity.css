@@ -278,7 +278,6 @@ html.ui-v2 #ui2-vitals-rail { display: none; }
     border: 1px solid var(--line);
     border-radius: 14px;
     background: var(--surface);
-    box-shadow: var(--shadow-card);
     z-index: 5;
   }
   html.ui-v2:not([data-ui2-layout="grid"]) #activity-log-pane { padding-right: 288px; }
@@ -331,7 +330,7 @@ html.ui-v2 .ui2-rail-meter i {
   height: 100%;
   width: 0;
   border-radius: 3px;
-  background: linear-gradient(90deg, var(--iris), var(--iris-deep));
+  background: linear-gradient(90deg, var(--iris), var(--violet));
   transition: width .4s ease;
 }
 html.ui-v2 .ui2-rail-changes { cursor: pointer; }

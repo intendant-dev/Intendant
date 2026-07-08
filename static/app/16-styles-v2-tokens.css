@@ -74,6 +74,7 @@ html.ui-v2 {
   --shadow-card: 0 12px 40px rgba(0, 0, 0, .34);
   --shadow-overlay: 0 30px 80px rgba(0, 0, 0, .6);
   --shadow-primary: 0 6px 16px rgba(var(--iris-rgb), .32);
+  --shadow-menu: 0 18px 48px rgba(0, 0, 0, .45);
 
   /* — motion — */
   --t-fast: .13s;
@@ -121,6 +122,95 @@ html.ui-v2 {
   --viz-ramp-5: var(--iris-2);
 }
 
+/* ── light theme (design-system import, 2026-07-08) ────────────────────
+   Same token names, remapped — activate with data-theme="light" on
+   <html> (00-head stamps it pre-paint from intendant.ui2.theme; the
+   Settings → Appearance segmented flips it). Values verbatim from the
+   design system's tokens/colors-light.css: iris DEEPENS for contrast
+   (--iris-2 becomes deeper ink, not brighter), semantics darken,
+   on-accent flips to white, shadows soften. The v1-bridge names follow
+   automatically; the handful of legacy rgba surfaces the v2 panes still
+   consume are remapped to the light surface vocabulary below. */
+html.ui-v2[data-theme="light"] {
+  /* — surfaces — */
+  --bg: #F5F6FB;
+  --bg-1: #EFF1F8;
+  --surface: #FFFFFF;
+  --surface-2: #F1F3F9;
+  --surface-3: #E5E8F1;
+  --code-bg: #EEF0F7;
+  --line: rgba(18, 23, 42, .1);
+  --line-2: rgba(18, 23, 42, .16);
+  --glass: rgba(250, 251, 254, .72);
+
+  /* — ink — */
+  --text: #171A23;
+  --text-2: #4B5265;
+  --text-3: #7B8296;
+
+  /* — brand + semantics — */
+  --iris: #5A69EE;
+  --iris-2: #4250D8;      /* on light, "brighter" iris means deeper ink */
+  --iris-deep: #4C5BE4;
+  --violet: #7D5BE0;
+  --on-accent: #FFFFFF;
+  --green: #1F8A56;
+  --amber: #A9691B;
+  --rose: #CC3D58;
+  --sky: #1F6FB2;
+  --neutral-dot: #8A90A3;
+
+  /* — alpha math — */
+  --iris-rgb: 90, 105, 238;
+  --violet-rgb: 125, 91, 224;
+  --green-rgb: 31, 138, 86;
+  --amber-rgb: 169, 105, 27;
+  --rose-rgb: 204, 61, 88;
+  --sky-rgb: 31, 111, 178;
+  --text-rgb: 23, 26, 35;
+
+  /* — interaction washes — */
+  --hover-wash: rgba(18, 23, 42, .05);
+
+  /* — data-viz ramp — */
+  --viz-empty: #E7EAF3;
+  --viz-ramp-1: #C9CFF4;
+  --viz-ramp-2: #A2ACEE;
+  --viz-ramp-3: #7B87E9;
+  --viz-ramp-4: var(--iris);
+  --viz-ramp-5: #3D4BD0;
+
+  /* — elevation — */
+  --shadow-card: 0 12px 40px rgba(23, 28, 50, .1);
+  --shadow-overlay: 0 30px 80px rgba(23, 28, 50, .22);
+  --shadow-primary: 0 6px 16px rgba(var(--iris-rgb), .3);
+  --shadow-menu: 0 18px 48px rgba(23, 28, 50, .16);
+
+  /* — legacy rgba surfaces still consumed via the bridge: remapped to
+       the light surface vocabulary (the design system carries no bridge) — */
+  --concurrent-view-bg: rgba(245, 246, 251, .68);
+  --concurrent-view-hover-bg: rgba(239, 241, 248, .8);
+  --session-window-bg: rgba(255, 255, 255, .86);
+  --session-window-header-bg: rgba(245, 246, 251, .7);
+  --session-window-hover-bg: rgba(255, 255, 255, .95);
+  --session-window-chip-bg: rgba(229, 232, 241, .64);
+  --glass-bg: rgba(250, 251, 254, .6);
+  --glass-bg-deep: linear-gradient(180deg, rgba(255, 255, 255, .82), rgba(241, 243, 249, .72));
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, .8);
+}
+
+/* Light scrollbar thumb: the dark thumb's fixed gray, softened. */
+html.ui-v2[data-theme="light"] ::-webkit-scrollbar-thumb {
+  background: rgba(96, 104, 128, .3);
+  border: 3px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+}
+html.ui-v2[data-theme="light"] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(96, 104, 128, .5);
+  background-clip: padding-box;
+}
+
 /* ── base surface treatments (v2 only) ──────────────────────────────── */
 html.ui-v2 body {
   background:
@@ -135,6 +225,10 @@ html.ui-v2 body {
 }
 
 html.ui-v2 ::selection { background: rgba(var(--iris-rgb), .28); }
+
+/* Links (rare in-product; iris-2, underline on hover). */
+html.ui-v2 a { color: var(--iris-2); text-decoration: none; }
+html.ui-v2 a:hover { text-decoration: underline; }
 
 html.ui-v2 ::-webkit-scrollbar { width: 10px; height: 10px; }
 html.ui-v2 ::-webkit-scrollbar-thumb {

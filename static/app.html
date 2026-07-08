@@ -27,11 +27,20 @@
         on = localStorage.getItem('intendant.ui2') !== '0';
       }
     } catch (e) { /* storage unavailable: v2 default */ }
-    if (on) document.documentElement.classList.add('ui-v2');
-    else {
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if (on) {
+      document.documentElement.classList.add('ui-v2');
+      // Light theme (design-system import): browser-scoped preference,
+      // stamped pre-paint so neither theme flashes.
+      try {
+        if (localStorage.getItem('intendant.ui2.theme') === 'light') {
+          document.documentElement.setAttribute('data-theme', 'light');
+          if (meta) meta.setAttribute('content', '#F5F6FB');
+        }
+      } catch (e) { /* private mode: dark */ }
+    } else if (meta) {
       // v1 keeps its Catppuccin crust tab tint during the soak.
-      var meta = document.querySelector('meta[name="theme-color"]');
-      if (meta) meta.setAttribute('content', '#11111b');
+      meta.setAttribute('content', '#11111b');
     }
   })();
 </script>
@@ -11979,6 +11988,7 @@ html.ui-v2 {
   --shadow-card: 0 12px 40px rgba(0, 0, 0, .34);
   --shadow-overlay: 0 30px 80px rgba(0, 0, 0, .6);
   --shadow-primary: 0 6px 16px rgba(var(--iris-rgb), .32);
+  --shadow-menu: 0 18px 48px rgba(0, 0, 0, .45);
 
   /* — motion — */
   --t-fast: .13s;
@@ -12026,6 +12036,95 @@ html.ui-v2 {
   --viz-ramp-5: var(--iris-2);
 }
 
+/* ── light theme (design-system import, 2026-07-08) ────────────────────
+   Same token names, remapped — activate with data-theme="light" on
+   <html> (00-head stamps it pre-paint from intendant.ui2.theme; the
+   Settings → Appearance segmented flips it). Values verbatim from the
+   design system's tokens/colors-light.css: iris DEEPENS for contrast
+   (--iris-2 becomes deeper ink, not brighter), semantics darken,
+   on-accent flips to white, shadows soften. The v1-bridge names follow
+   automatically; the handful of legacy rgba surfaces the v2 panes still
+   consume are remapped to the light surface vocabulary below. */
+html.ui-v2[data-theme="light"] {
+  /* — surfaces — */
+  --bg: #F5F6FB;
+  --bg-1: #EFF1F8;
+  --surface: #FFFFFF;
+  --surface-2: #F1F3F9;
+  --surface-3: #E5E8F1;
+  --code-bg: #EEF0F7;
+  --line: rgba(18, 23, 42, .1);
+  --line-2: rgba(18, 23, 42, .16);
+  --glass: rgba(250, 251, 254, .72);
+
+  /* — ink — */
+  --text: #171A23;
+  --text-2: #4B5265;
+  --text-3: #7B8296;
+
+  /* — brand + semantics — */
+  --iris: #5A69EE;
+  --iris-2: #4250D8;      /* on light, "brighter" iris means deeper ink */
+  --iris-deep: #4C5BE4;
+  --violet: #7D5BE0;
+  --on-accent: #FFFFFF;
+  --green: #1F8A56;
+  --amber: #A9691B;
+  --rose: #CC3D58;
+  --sky: #1F6FB2;
+  --neutral-dot: #8A90A3;
+
+  /* — alpha math — */
+  --iris-rgb: 90, 105, 238;
+  --violet-rgb: 125, 91, 224;
+  --green-rgb: 31, 138, 86;
+  --amber-rgb: 169, 105, 27;
+  --rose-rgb: 204, 61, 88;
+  --sky-rgb: 31, 111, 178;
+  --text-rgb: 23, 26, 35;
+
+  /* — interaction washes — */
+  --hover-wash: rgba(18, 23, 42, .05);
+
+  /* — data-viz ramp — */
+  --viz-empty: #E7EAF3;
+  --viz-ramp-1: #C9CFF4;
+  --viz-ramp-2: #A2ACEE;
+  --viz-ramp-3: #7B87E9;
+  --viz-ramp-4: var(--iris);
+  --viz-ramp-5: #3D4BD0;
+
+  /* — elevation — */
+  --shadow-card: 0 12px 40px rgba(23, 28, 50, .1);
+  --shadow-overlay: 0 30px 80px rgba(23, 28, 50, .22);
+  --shadow-primary: 0 6px 16px rgba(var(--iris-rgb), .3);
+  --shadow-menu: 0 18px 48px rgba(23, 28, 50, .16);
+
+  /* — legacy rgba surfaces still consumed via the bridge: remapped to
+       the light surface vocabulary (the design system carries no bridge) — */
+  --concurrent-view-bg: rgba(245, 246, 251, .68);
+  --concurrent-view-hover-bg: rgba(239, 241, 248, .8);
+  --session-window-bg: rgba(255, 255, 255, .86);
+  --session-window-header-bg: rgba(245, 246, 251, .7);
+  --session-window-hover-bg: rgba(255, 255, 255, .95);
+  --session-window-chip-bg: rgba(229, 232, 241, .64);
+  --glass-bg: rgba(250, 251, 254, .6);
+  --glass-bg-deep: linear-gradient(180deg, rgba(255, 255, 255, .82), rgba(241, 243, 249, .72));
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, .8);
+}
+
+/* Light scrollbar thumb: the dark thumb's fixed gray, softened. */
+html.ui-v2[data-theme="light"] ::-webkit-scrollbar-thumb {
+  background: rgba(96, 104, 128, .3);
+  border: 3px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+}
+html.ui-v2[data-theme="light"] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(96, 104, 128, .5);
+  background-clip: padding-box;
+}
+
 /* ── base surface treatments (v2 only) ──────────────────────────────── */
 html.ui-v2 body {
   background:
@@ -12040,6 +12139,10 @@ html.ui-v2 body {
 }
 
 html.ui-v2 ::selection { background: rgba(var(--iris-rgb), .28); }
+
+/* Links (rare in-product; iris-2, underline on hover). */
+html.ui-v2 a { color: var(--iris-2); text-decoration: none; }
+html.ui-v2 a:hover { text-decoration: underline; }
 
 html.ui-v2 ::-webkit-scrollbar { width: 10px; height: 10px; }
 html.ui-v2 ::-webkit-scrollbar-thumb {
@@ -12106,16 +12209,15 @@ html.ui-v2 #ui2-nav {
 
 html.ui-v2 .ui2-nav-top { padding: 18px 16px 14px; display: flex; flex-direction: column; gap: 14px; }
 html.ui-v2 .ui2-brand { display: flex; align-items: center; gap: 11px; }
+/* The brand row renders the real product mark (inline SVG, self-colored)
+   in a quiet tile — the old iris-gradient placeholder is gone. */
 html.ui-v2 .ui2-brand-glyph {
   width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0;
-  background: linear-gradient(145deg, var(--iris), var(--violet));
+  background: var(--surface-2);
+  border: 1px solid var(--line);
   display: flex; align-items: center; justify-content: center;
-  box-shadow: 0 6px 18px rgba(var(--iris-rgb), .4), inset 0 1px 0 rgba(255, 255, 255, .35);
 }
-html.ui-v2 .ui2-brand-inner {
-  width: 12px; height: 12px; border: 2px solid rgba(11, 12, 16, .92);
-  border-radius: 4px; transform: rotate(45deg);
-}
+html.ui-v2 .ui2-brand-glyph svg { display: block; }
 html.ui-v2 .ui2-brand-word { font-weight: 800; font-size: 16px; letter-spacing: -.01em; color: var(--text); }
 
 html.ui-v2 .ui2-host-btn {
@@ -12436,7 +12538,7 @@ html.ui-v2 .global-task-bar {
 }
 html.ui-v2 .global-task-bar:focus-within {
   border-color: rgba(var(--iris-rgb), .45);
-  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .14), var(--shadow-card);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22), var(--shadow-card);
 }
 /* phase + stop live in the oversight bar under v2 */
 html.ui-v2 .global-task-bar .phase-banner { display: none; }
@@ -17449,7 +17551,6 @@ html.ui-v2 #ui2-vitals-rail { display: none; }
     border: 1px solid var(--line);
     border-radius: 14px;
     background: var(--surface);
-    box-shadow: var(--shadow-card);
     z-index: 5;
   }
   html.ui-v2:not([data-ui2-layout="grid"]) #activity-log-pane { padding-right: 288px; }
@@ -17502,7 +17603,7 @@ html.ui-v2 .ui2-rail-meter i {
   height: 100%;
   width: 0;
   border-radius: 3px;
-  background: linear-gradient(90deg, var(--iris), var(--iris-deep));
+  background: linear-gradient(90deg, var(--iris), var(--violet));
   transition: width .4s ease;
 }
 html.ui-v2 .ui2-rail-changes { cursor: pointer; }
@@ -17551,17 +17652,18 @@ html.ui-v2 .session-window-grid-resize-handle.dragging::before {
   background: var(--iris);
 }
 
-/* — window card — */
+/* — window card (design-system polish: no shadow at rest — shadows are
+     reserved for overlays, primary buttons, and the approval hero) — */
 html.ui-v2 .session-window {
   border: 1px solid var(--line);
   border-radius: var(--r-card);
-  box-shadow: var(--shadow-card);
+  box-shadow: none;
   transition: border-color var(--t-fast), box-shadow var(--t-fast);
 }
 html.ui-v2 .session-window:hover { border-color: var(--line-2); }
 html.ui-v2 .session-window.foreground {
   border-color: rgba(var(--iris-rgb), .55);
-  box-shadow: inset 0 0 0 1px rgba(var(--iris-rgb), .22), var(--shadow-card);
+  box-shadow: inset 0 0 0 1px rgba(var(--iris-rgb), .22);
 }
 /* prompt-target keeps the badge-var ring (correct per-session color);
    only the outer glow is softened to the v2 shadow scale */
@@ -17613,11 +17715,12 @@ html.ui-v2 .session-window-relation-chip.side { border-color: rgba(var(--violet-
 html.ui-v2 .session-window-relation-chip.fork { border-color: rgba(var(--iris-rgb), .4); }
 html.ui-v2 .session-window-relation-chip.subagent { border-color: rgba(var(--green-rgb), .38); }
 
-/* — status chip: dot + label, same grammar as the oversight phase pill — */
+/* — status pill: TEXT-ONLY (design-system polish — dots and pulses
+     belong to the live phase pill and the approval hero, not session
+     state chips) — */
 html.ui-v2 .session-window-status {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
   font-family: var(--mono);
   font-size: 9.5px;
   font-weight: 700;
@@ -17625,21 +17728,24 @@ html.ui-v2 .session-window-status {
   text-transform: uppercase;
   padding: 3px 9px;
   border: 1px solid var(--line);
-  background: transparent;
+  background: var(--surface-3);
+  color: var(--text-2);
 }
-html.ui-v2 .session-window-status::before {
-  content: '';
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--neutral-dot);
+html.ui-v2 .session-window-status.active {
+  color: var(--iris-2);
+  border-color: rgba(var(--iris-rgb), .26);
+  background: rgba(var(--iris-rgb), .12);
 }
-html.ui-v2 .session-window-status.active { color: var(--iris-2); border-color: rgba(var(--iris-rgb), .4); }
-html.ui-v2 .session-window-status.active::before { background: var(--iris); animation: ui2-pulse 2s infinite; }
-html.ui-v2 .session-window-status.waiting { color: var(--amber); border-color: rgba(var(--amber-rgb), .4); }
-html.ui-v2 .session-window-status.waiting::before { background: var(--amber); animation: ui2-pulse 2s infinite; }
-html.ui-v2 .session-window-status.done { color: var(--green); border-color: rgba(var(--green-rgb), .38); }
-html.ui-v2 .session-window-status.done::before { background: var(--green); }
+html.ui-v2 .session-window-status.waiting {
+  color: var(--amber);
+  border-color: rgba(var(--amber-rgb), .26);
+  background: rgba(var(--amber-rgb), .12);
+}
+html.ui-v2 .session-window-status.done {
+  color: var(--green);
+  border-color: rgba(var(--green-rgb), .26);
+  background: rgba(var(--green-rgb), .12);
+}
 
 /* — goal / tier / vitals chips — */
 html.ui-v2 .session-window-goal,
@@ -17672,7 +17778,7 @@ html.ui-v2 .session-window-submenu-panel {
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--surface);
-  box-shadow: var(--shadow-overlay);
+  box-shadow: var(--shadow-menu);
   padding: 4px;
 }
 html.ui-v2 .session-window-menu button,
@@ -17734,7 +17840,6 @@ html.ui-v2 .concurrent-log-label {
   border: 1px solid var(--line);
   border-radius: var(--r-pill);
   background: var(--surface);
-  box-shadow: var(--shadow-card);
 }
 html.ui-v2 .concurrent-log-action {
   border-radius: var(--r-ctl);
@@ -19927,6 +20032,22 @@ html.ui-v2 #tab-settings .settings-save-row {
 
 @media (prefers-reduced-motion: reduce) {
   html.ui-v2 #tab-settings * { transition: none !important; }
+}
+
+/* — Appearance (design-system import) — */
+html.ui-v2 .ui2-appearance-label {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 12px 0 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+html.ui-v2 .ui2-appearance-note {
+  margin: 10px 2px 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-3);
 }
 </style>
 <!-- ── static/app/20-shell.html ── -->
@@ -22647,7 +22768,25 @@ html.ui-v2 #tab-settings .settings-save-row {
 <nav id="ui2-nav" aria-label="Primary">
   <div class="ui2-nav-top">
     <div class="ui2-brand">
-      <div class="ui2-brand-glyph"><div class="ui2-brand-inner"></div></div>
+      <!-- The real product mark (design-system pass): proscenium arch over
+           the serif I, golden conductor's baton, three sub-agent nodes.
+           Self-colored — theme-agnostic on both dark and light. -->
+      <div class="ui2-brand-glyph"><svg viewBox="70 80 372 372" width="26" height="26" aria-hidden="true">
+        <defs>
+          <linearGradient id="ui2bg-accent" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#89b4fa"/><stop offset="100%" stop-color="#74c7ec"/></linearGradient>
+          <linearGradient id="ui2bg-gold" x1="0" y1="1" x2="1" y2="0"><stop offset="0%" stop-color="#a68a5b"/><stop offset="50%" stop-color="#f9e2af"/><stop offset="100%" stop-color="#fff8e7"/></linearGradient>
+          <linearGradient id="ui2bg-arch" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#585b70"/><stop offset="100%" stop-color="#313244"/></linearGradient>
+        </defs>
+        <path d="M 105 405 L 105 185 Q 105 95, 195 95 L 317 95 Q 407 95, 407 185 L 407 405" fill="none" stroke="url(#ui2bg-arch)" stroke-width="14" stroke-linecap="round"/>
+        <rect x="206" y="150" width="100" height="14" rx="4" fill="url(#ui2bg-accent)"/>
+        <rect x="239" y="150" width="34" height="230" rx="5" fill="url(#ui2bg-accent)"/>
+        <rect x="206" y="368" width="100" height="14" rx="4" fill="url(#ui2bg-accent)"/>
+        <line x1="185" y1="330" x2="335" y2="175" stroke="url(#ui2bg-gold)" stroke-width="12" stroke-linecap="round"/>
+        <circle cx="335" cy="175" r="10" fill="#f9e2af"/>
+        <circle cx="206" cy="432" r="11" fill="#a6e3a1" opacity=".6"/>
+        <circle cx="256" cy="437" r="11" fill="#a6e3a1" opacity=".6"/>
+        <circle cx="306" cy="432" r="11" fill="#a6e3a1" opacity=".6"/>
+      </svg></div>
       <div class="ui2-brand-word ui2-nav-label">Intendant</div>
     </div>
     <button type="button" class="ui2-host-btn ui2-nav-label" id="ui2-host-btn"
@@ -22753,18 +22892,29 @@ html.ui-v2 #tab-settings .settings-save-row {
 // (filled play triangle, record dot). No emoji anywhere.
 
 const UI2_ICON_PATHS = {
-  // — destinations —
-  activity: '<path d="M3 12h3l2.4 7 5-16 3 9h4.6"/>',
-  sessions: '<path d="M12 3 3 8l9 5 9-5-9-5Z"/><path d="M3 13l9 5 9-5"/>',
-  live: '<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M9 21h6"/><path d="M11 8.6l4.2 2.9-4.2 2.9Z" fill="currentColor" stroke="none"/>',
-  station: '<circle cx="12" cy="12" r="2.4"/><ellipse cx="12" cy="12" rx="9" ry="3.6"/><ellipse cx="12" cy="12" rx="9" ry="3.6" transform="rotate(62 12 12)"/><ellipse cx="12" cy="12" rx="9" ry="3.6" transform="rotate(-62 12 12)"/>',
-  terminal: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9.5l3 2.5-3 2.5"/><path d="M13 15h4"/>',
-  files: '<path d="M4 7a2 2 0 0 1 2-2h3l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/>',
-  stats: '<path d="M5 20V11"/><path d="M12 20V4"/><path d="M19 20v-6"/>',
-  access: '<path d="M12 3l7 3v5c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/>',
-  vault: '<circle cx="8.5" cy="12" r="3.6"/><path d="M12.1 12H21"/><path d="M18 12v3.4"/><path d="M15 12v2.4"/>',
+  // — destinations (redesigned in the design-system pass, 2026-07-08:
+  //   drawn from the product's own motifs — timeline grammar, lineage
+  //   fan, broadcast, radar, prompt+cursor, tree, heatmap, keyhole,
+  //   safe wheel; settings/debug kept) —
+  activity: '<circle cx="5" cy="6.2" r="1.3" fill="currentColor" stroke="none"/><circle cx="5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="5" cy="17.8" r="1.3" fill="currentColor" stroke="none"/><path d="M9 6.2h7.5"/><path d="M9 12h11"/><path d="M9 17.8h5.5"/>',
+  sessions: '<circle cx="12" cy="5.4" r="2.1"/><path d="M10.9 7.2 6.6 14.6"/><path d="M12 7.5v7.9"/><path d="M13.1 7.2l4.3 7.4"/><circle cx="5.8" cy="16.9" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="17.6" r="1.5" fill="currentColor" stroke="none"/><circle cx="18.2" cy="16.9" r="1.5" fill="currentColor" stroke="none"/>',
+  live: '<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M9 21h6"/><circle cx="12" cy="10.5" r="1.4" fill="currentColor" stroke="none"/><path d="M9.2 13.3a4.4 4.4 0 0 1 0-5.6"/><path d="M14.8 7.7a4.4 4.4 0 0 1 0 5.6"/>',
+  station: '<circle cx="12" cy="12" r="8.4"/><path d="M12 12l5.4-6.2"/><circle cx="12" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="8.3" cy="14.9" r="1.3" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.2" r="1.3" fill="currentColor" stroke="none"/>',
+  terminal: '<path d="M4.5 6.5 10 12l-5.5 5.5"/><rect x="13" y="15.7" width="6.5" height="2.6" rx="1.1" fill="currentColor" stroke="none"/>',
+  files: '<rect x="3.5" y="3.5" width="8" height="4.8" rx="1.4"/><path d="M6.5 8.3v10h6"/><path d="M6.5 12.4h6"/><rect x="14" y="10" width="6.5" height="4.8" rx="1.4"/><rect x="14" y="16" width="6.5" height="4.8" rx="1.4"/>',
+  stats: '<rect x="3.5" y="3.5" width="4.6" height="4.6" rx="1"/><rect x="9.7" y="3.5" width="4.6" height="4.6" rx="1"/><rect x="15.9" y="3.5" width="4.6" height="4.6" rx="1"/><rect x="3.5" y="9.7" width="4.6" height="4.6" rx="1"/><rect x="9.7" y="9.7" width="4.6" height="4.6" rx="1" fill="currentColor" stroke="none"/><rect x="15.9" y="9.7" width="4.6" height="4.6" rx="1" fill="currentColor" stroke="none"/><rect x="3.5" y="15.9" width="4.6" height="4.6" rx="1"/><rect x="9.7" y="15.9" width="4.6" height="4.6" rx="1" fill="currentColor" stroke="none"/><rect x="15.9" y="15.9" width="4.6" height="4.6" rx="1" fill="currentColor" stroke="none"/>',
+  access: '<path d="M12 3l7 3v5c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6z"/><circle cx="12" cy="10.2" r="1.9"/><path d="M12 12.1v3"/>',
+  vault: '<rect x="3.5" y="3.5" width="17" height="17" rx="4.2"/><circle cx="12" cy="12" r="3.9"/><path d="M12 5.9v2.2"/><path d="M12 15.9v2.2"/><path d="M5.9 12h2.2"/><path d="M15.9 12h2.2"/>',
   settings: '<path d="M4 8h8"/><path d="M16 8h4"/><path d="M4 16h4"/><path d="M12 16h8"/><circle cx="14" cy="8" r="2"/><circle cx="8" cy="16" r="2"/>',
   debug: '<rect x="8" y="9" width="8" height="10" rx="4"/><path d="M12 5v4"/><path d="M8 12.5H4"/><path d="M8 16H4.5"/><path d="M20 12.5h-4"/><path d="M20 16h-3.5"/><path d="M9 9 6.8 6.4"/><path d="M15 9l2.2-2.6"/>',
+
+  // — product concepts (logo motifs + fleet vocabulary; same pass) —
+  daemon: '<rect x="4" y="5" width="16" height="6.2" rx="1.8"/><rect x="4" y="12.8" width="16" height="6.2" rx="1.8"/><circle cx="7.4" cy="8.1" r="1" fill="currentColor" stroke="none"/><circle cx="7.4" cy="15.9" r="1" fill="currentColor" stroke="none"/><path d="M13 8.1h4"/><path d="M13 15.9h4"/>',
+  peers: '<circle cx="6.7" cy="6.7" r="2.7"/><circle cx="17.3" cy="17.3" r="2.7"/><path d="M8.7 8.7l6.6 6.6"/>',
+  lease: '<circle cx="7.2" cy="16.8" r="3.4"/><path d="M9.7 14.3 19.5 4.5"/><path d="M14.8 9.2l2.8 2.8"/><path d="M17.7 6.3l2.3 2.3"/>',
+  baton: '<path d="M5 19 17.8 6.2"/><circle cx="18.6" cy="5.4" r="1.8" fill="currentColor" stroke="none"/><circle cx="4.6" cy="19.4" r="1.1" fill="currentColor" stroke="none"/>',
+  org: '<path d="M4.5 20.5v-9Q4.5 4 12 4t7.5 7.5v9"/><path d="M2.5 20.5h19"/>',
+  phone: '<path d="M7 3.8c.9 0 2.8 3.2 2.3 4.1-.4.8-1.6 1.2-1.6 1.2s.5 2 2.1 3.6c1.6 1.6 3.6 2.1 3.6 2.1s.4-1.2 1.2-1.6c.9-.5 4.1 1.4 4.1 2.3 0 1.6-2 3.2-3.5 3.2-2.5 0-5.5-1.4-7.8-3.7C5.1 12.7 3.7 9.7 3.7 7.2c0-1.5 1.7-3.4 3.3-3.4z"/>',
 
   // — actions & affordances —
   search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/>',
@@ -22822,6 +22972,21 @@ function ui2SetEnabled(on) {
   location.replace(url.toString());
 }
 
+// Theme (design-system import): dark is the default; light remaps the
+// same token names under data-theme="light". Live flip — pure CSS vars,
+// no reload; browser-scoped ("daemons don't care what you wear").
+function ui2Theme() {
+  return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+}
+function ui2SetTheme(theme) {
+  const light = theme === 'light';
+  if (light) document.documentElement.setAttribute('data-theme', 'light');
+  else document.documentElement.removeAttribute('data-theme');
+  try { localStorage.setItem('intendant.ui2.theme', light ? 'light' : 'dark'); } catch (e) { /* private mode */ }
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', light ? '#F5F6FB' : '#0B0C10');
+}
+
 function ui2Icon(name, size = 18) {
   const inner = UI2_ICON_PATHS[name];
   if (!inner) {
@@ -22832,7 +22997,10 @@ function ui2Icon(name, size = 18) {
 }
 
 // QA/debug facade (mirrors the window.qa / stationProbe convention).
-window.__ui2 = { enabled: ui2Enabled, setEnabled: ui2SetEnabled, icon: ui2Icon };
+window.__ui2 = {
+  enabled: ui2Enabled, setEnabled: ui2SetEnabled, icon: ui2Icon,
+  theme: ui2Theme, setTheme: ui2SetTheme,
+};
 /* ── static/app/ui2-chrome.js ── */
 // ── ui-v2 chrome wiring (design-overhaul P1a) ──────────────────────────
 // Builds the nav rail's destination buttons and mirrors live state out of
@@ -23074,6 +23242,14 @@ function ui2PaletteEntries() {
       entries.push(item);
     }
   }
+  // Actions (design-system import): the theme toggle rides the palette
+  // so light/dark is one ⌘K away from anywhere.
+  const light = typeof ui2Theme === 'function' && ui2Theme() === 'light';
+  entries.push({
+    action: 'theme',
+    icon: 'dial',
+    label: light ? 'Switch to dark theme' : 'Switch to light theme',
+  });
   return entries;
 }
 
@@ -23118,6 +23294,11 @@ function ui2PaletteInput() { return document.getElementById('ui2-palette-input')
 
 function ui2PaletteGo(item) {
   ui2PaletteClose();
+  if (item.action === 'theme') {
+    ui2SetTheme(ui2Theme() === 'light' ? 'dark' : 'light');
+    if (typeof ui2SettingsRenderAppearance === 'function') ui2SettingsRenderAppearance();
+    return;
+  }
   if (item.tab) routeTo(item.tab);
   else if (item.route) routeTo(item.route[0], item.route[1]);
 }
@@ -73029,6 +73210,7 @@ const UI2_SET_SECTIONS = [
   { id: 'autonomy', label: 'Autonomy & approvals' },
   { id: 'providers', label: 'Providers & models' },
   { id: 'presence', label: 'Presence & voice' },
+  { id: 'appearance', label: 'Appearance' },
   { id: 'advanced', label: 'Account & advanced' },
 ];
 
@@ -73215,6 +73397,17 @@ function ui2SettingsRenderAutonomy() {
       ? spec.desc
       : 'Autonomy level unknown — waiting for the daemon.';
   }
+}
+
+// Sync the Appearance theme segmented from the live document state
+// (boot stamp, this card, or the palette toggle — one source of truth).
+function ui2SettingsRenderAppearance() {
+  const current = typeof ui2Theme === 'function' ? ui2Theme() : 'dark';
+  document.querySelectorAll('#ui2-set-theme-seg .ui2-seg-btn').forEach((b) => {
+    const on = b.dataset.value === current;
+    b.classList.toggle('is-accent', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
 }
 
 function ui2SettingsRenderRules() {
@@ -73486,6 +73679,43 @@ function ui2SettingsBuild() {
     }
   }
 
+  // ── Appearance (design-system import: theme lives client-side) ──
+  {
+    const card = ui2SettingsEl('section', 'ui-card ui2-appearance-card');
+    const head = ui2SettingsEl('div', 'ui-section-head');
+    head.appendChild(ui2SettingsEl('h3', 'ui-section-title', 'Appearance'));
+    head.appendChild(ui2SettingsEl(
+      'div', 'ui-section-sub',
+      "Theme applies to this browser only; daemons don't care what you wear.",
+    ));
+    card.appendChild(head);
+    const label = ui2SettingsEl('div', 'ui2-appearance-label', 'Theme');
+    card.appendChild(label);
+    const seg = ui2SettingsEl('div', 'ui2-seg ui2-seg-wide');
+    seg.id = 'ui2-set-theme-seg';
+    seg.setAttribute('role', 'group');
+    seg.setAttribute('aria-label', 'Theme');
+    for (const t of [
+      { value: 'dark', label: 'Dark' },
+      { value: 'light', label: 'Light' },
+    ]) {
+      const btn = ui2SettingsEl('button', 'ui2-seg-btn', t.label);
+      btn.type = 'button';
+      btn.dataset.value = t.value;
+      btn.addEventListener('click', () => {
+        ui2SetTheme(t.value);
+        ui2SettingsRenderAppearance();
+      });
+      seg.appendChild(btn);
+    }
+    card.appendChild(seg);
+    card.appendChild(ui2SettingsEl(
+      'p', 'ui2-appearance-note',
+      'Same token names, remapped — iris deepens, semantics darken, shadows soften.',
+    ));
+    panes.appearance.appendChild(card);
+  }
+
   // ── Account & advanced (the old Debug pane, re-homed) ──
   {
     const debugBody = document.querySelector('#settings-pane-debug .settings-pane-body');
@@ -73516,6 +73746,7 @@ function ui2SettingsBuild() {
   });
 
   ui2SettingsRenderRules();
+  ui2SettingsRenderAppearance();
   ui2SettingsSyncMirrors();
   ui2SettingsApplyActive();
   // Populate approval rules early so the Autonomy section is live on

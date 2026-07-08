@@ -238,6 +238,14 @@ function ui2PaletteEntries() {
       entries.push(item);
     }
   }
+  // Actions (design-system import): the theme toggle rides the palette
+  // so light/dark is one ⌘K away from anywhere.
+  const light = typeof ui2Theme === 'function' && ui2Theme() === 'light';
+  entries.push({
+    action: 'theme',
+    icon: 'dial',
+    label: light ? 'Switch to dark theme' : 'Switch to light theme',
+  });
   return entries;
 }
 
@@ -282,6 +290,11 @@ function ui2PaletteInput() { return document.getElementById('ui2-palette-input')
 
 function ui2PaletteGo(item) {
   ui2PaletteClose();
+  if (item.action === 'theme') {
+    ui2SetTheme(ui2Theme() === 'light' ? 'dark' : 'light');
+    if (typeof ui2SettingsRenderAppearance === 'function') ui2SettingsRenderAppearance();
+    return;
+  }
   if (item.tab) routeTo(item.tab);
   else if (item.route) routeTo(item.route[0], item.route[1]);
 }
