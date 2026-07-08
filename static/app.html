@@ -14942,6 +14942,525 @@ html.ui-v2 .station-composer-input::placeholder {
 /* .station-hotspot: deliberately no rules. The a11y hotspot layer stays
    invisible with untouched WASM-driven geometry; the global
    html.ui-v2 :focus-visible iris ring is the keyboard affordance. */
+/* ── static/app/ui2-vault.css ── */
+/* ── ui-v2 Vault surface re-skin (design-overhaul P2) ──────────────────
+   Vault becomes a top-level destination under the flag: boot re-parents
+   #access-vault-section / #access-custody-section (plus their section
+   heads) into #tab-vault (ui2VaultAdoptSections, 32-vault-custody.js).
+   Everything here restyles the EXISTING vault DOM — the imperative
+   builders in 32-vault-custody.js are untouched, so the validator
+   contracts (visible button text, .vault-words .w, form-grid ordering,
+   window.intendantVault) hold in both generations.
+
+   Selectors are scoped to the section ids, not the pane: on the
+   standalone /access admin page (adoption skipped) and in any degraded
+   boot the sections keep the v2 look wherever they live. Recipes from
+   the design-system reference: tint formula (fill 8–16%, border ~26%,
+   text full color), radius ladder (10 control / 12 card / 999 pill),
+   mono mandate for ids+secrets+value chips, eyebrow section labels.
+
+   The two rules on the NEW #tab-vault fallback elements at the end of
+   the file are the only unflagged ones — that pane does not exist on any
+   v1 surface (reachable only by a hand-typed #vault), so existing v1
+   screens stay pixel-identical. */
+
+/* ── pane + page chrome ── */
+html.ui-v2 .vault-pane-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 26px 20px 64px;
+}
+html.ui-v2 .ui2-vault-pagehead,
+html.ui-v2 #vault-tab-sections {
+  width: 100%;
+  max-width: 880px;
+  margin: 0 auto;
+}
+/* No display rule on .ui2-vault-pagehead: it boots [hidden] and the adopt
+   pass unhides it — a class display rule would defeat the attribute. */
+html.ui-v2 .ui2-vault-pagehead { margin-bottom: 2px; }
+
+/* Section heads travel with the sections: eyebrow + explainer, matching
+   the Access pane treatment they had before the move. */
+html.ui-v2 #vault-tab-sections .acc-section-head {
+  margin: 30px 0 12px;
+  gap: 4px 12px;
+}
+html.ui-v2 #vault-tab-sections .acc-section-head:first-child { margin-top: 10px; }
+html.ui-v2 #vault-tab-sections .acc-section-title {
+  flex: 1 1 100%;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 #vault-tab-sections .acc-section-sub {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-3);
+  max-width: 860px;
+}
+
+/* ── the vault card unwraps into a page column ── */
+html.ui-v2 #access-vault-section .vault-card {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  gap: 14px;
+  margin-bottom: 8px;
+}
+
+/* Status line: the first one is the page's status row; the "Fueling —
+   this daemon" / "Client egress" heads inside reuse the same class and
+   read as section eyebrows (their .lbl carries an inline font-weight
+   from the builder — the size/case/color below do the differentiation). */
+html.ui-v2 #access-vault-section .vault-status-line {
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+html.ui-v2 #access-vault-section .vault-status-line .lbl {
+  font-size: 10.5px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 #access-vault-section .vault-status-line:not(:first-child) { margin-top: 16px; }
+
+/* Chips: status pill in the status line; mono value chips in rows. */
+html.ui-v2 #access-vault-section .vault-status-line > .vault-chip {
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line-2);
+  background: var(--surface-3);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-2);
+}
+html.ui-v2 #access-vault-section .vault-status-line > .vault-chip.ok {
+  background: rgba(var(--green-rgb), .12);
+  border-color: rgba(var(--green-rgb), .26);
+  color: var(--green);
+}
+html.ui-v2 #access-vault-section .vault-status-line > .vault-chip.warn {
+  background: rgba(var(--amber-rgb), .14);
+  border-color: rgba(var(--amber-rgb), .26);
+  color: var(--amber);
+}
+html.ui-v2 #access-vault-section .vault-entry-row .vault-chip {
+  padding: 1px 7px;
+  border-radius: 6px;
+  border: 0;
+  background: var(--surface-3);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--text-2);
+}
+html.ui-v2 #access-vault-section .vault-entry-row .vault-chip.ok {
+  background: rgba(var(--green-rgb), .12);
+  color: var(--green);
+}
+html.ui-v2 #access-vault-section .vault-entry-row .vault-chip.warn {
+  background: rgba(var(--amber-rgb), .14);
+  color: var(--amber);
+}
+
+/* ── credential / lease / relay rows as cards ── */
+html.ui-v2 #access-vault-section .vault-entry-list { gap: 10px; }
+html.ui-v2 #access-vault-section .vault-entry-row {
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 13px 16px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+/* Credential rows (no active-state chip) get the key tile. */
+html.ui-v2 #access-vault-section .vault-entry-row:not(:has(.vault-chip.ok))::before {
+  content: '';
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background:
+    url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23a7aebe" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.5" cy="12" r="3.6"/><path d="M12.1 12H21"/><path d="M18 12v3.4"/><path d="M15 12v2.4"/></svg>')
+    center / 18px 18px no-repeat,
+    var(--surface-2);
+}
+/* Active rows (leases, live relays) carry the green accent edge. */
+html.ui-v2 #access-vault-section .vault-entry-row:has(.vault-chip.ok) {
+  border-left: 3px solid var(--green);
+  padding-left: 14px;
+}
+html.ui-v2 #access-vault-section .vault-entry-row .lbl {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+html.ui-v2 #access-vault-section .vault-entry-row .secret {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 #access-vault-section .vault-entry-row .vault-entry-actions { gap: 8px; }
+
+/* ── buttons (vaultButton emits .ui-btn [primary|danger]) ── */
+html.ui-v2 #access-vault-section .ui-btn,
+html.ui-v2 #access-custody-section .ui-btn {
+  min-height: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 13px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+  transition: background var(--t-med), border-color var(--t-med), color var(--t-med), filter var(--t-med);
+}
+html.ui-v2 #access-vault-section .ui-btn:hover,
+html.ui-v2 #access-custody-section .ui-btn:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2 #access-vault-section .ui-btn.primary {
+  border: 0;
+  padding: 8px 15px;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+}
+html.ui-v2 #access-vault-section .ui-btn.primary:hover {
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  filter: brightness(1.08);
+}
+html.ui-v2 #access-vault-section .ui-btn.danger {
+  border-color: rgba(var(--rose-rgb), .4);
+  background: transparent;
+  color: var(--rose);
+}
+html.ui-v2 #access-vault-section .ui-btn.danger:hover {
+  border-color: rgba(var(--rose-rgb), .55);
+  background: rgba(var(--rose-rgb), .1);
+}
+html.ui-v2 #access-vault-section .ui-btn:focus-visible,
+html.ui-v2 #access-custody-section .ui-btn:focus-visible {
+  outline: 2px solid var(--iris);
+  outline-offset: 2px;
+}
+
+/* ── notes, warnings, errors ── */
+html.ui-v2 #access-vault-section .vault-note {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+html.ui-v2 #access-vault-section .vault-warning {
+  border: 1px solid rgba(var(--amber-rgb), .32);
+  border-radius: 11px;
+  padding: 12px 14px;
+  background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02));
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--amber);
+}
+html.ui-v2 #access-vault-section .vault-error {
+  border: 1px solid rgba(var(--rose-rgb), .32);
+  border-radius: 11px;
+  padding: 10px 12px;
+  background: rgba(var(--rose-rgb), .07);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--rose);
+}
+
+/* ── create ceremony: the shown-once 12-word grid ── */
+html.ui-v2 #access-vault-section .vault-words {
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px 16px;
+  padding: 16px 18px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--code-bg);
+}
+html.ui-v2 #access-vault-section .vault-words .w {
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 14px;
+  letter-spacing: .02em;
+  line-height: 1.6;
+  color: var(--iris-2);
+}
+html.ui-v2 #access-vault-section .vault-words .n {
+  min-width: 18px;
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+/* ── inputs / selects / textareas ── */
+html.ui-v2 #access-vault-section .vault-phrase-input,
+html.ui-v2 #access-vault-section .vault-form-grid input,
+html.ui-v2 #access-vault-section .vault-form-grid select {
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  padding: 10px 12px;
+  outline: none;
+}
+html.ui-v2 #access-vault-section .vault-phrase-input { font-family: var(--mono); font-size: 12.5px; }
+html.ui-v2 #access-vault-section .vault-phrase-input::placeholder,
+html.ui-v2 #access-vault-section .vault-form-grid input::placeholder { color: var(--text-3); }
+html.ui-v2 #access-vault-section .vault-phrase-input:focus-visible,
+html.ui-v2 #access-vault-section .vault-form-grid input:focus-visible,
+html.ui-v2 #access-vault-section .vault-form-grid select:focus-visible {
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25);
+}
+html.ui-v2 #access-vault-section .vault-form-grid {
+  grid-template-columns: minmax(120px, 170px) 1fr;
+  gap: 10px 12px;
+}
+html.ui-v2 #access-vault-section .vault-form-grid label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+/* Selects (form kind/provider + the offline knob) as chevroned controls. */
+html.ui-v2 #access-vault-section select {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background:
+    url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23a7aebe" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>')
+    right 10px center / 15px 15px no-repeat,
+    var(--surface-2);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 700;
+  padding: 8px 32px 8px 12px;
+  cursor: pointer;
+  outline: none;
+}
+html.ui-v2 #access-vault-section select:focus-visible {
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .25);
+}
+
+/* The offline-window knob row reads as the security dial it is. */
+html.ui-v2 #access-vault-section .vault-actions:has(> select) {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 13px 16px;
+  gap: 12px;
+}
+html.ui-v2 #access-vault-section .vault-actions:has(> select) > .vault-note {
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* ── checkbox toggles (client egress + full-credential OAuth opt-in) ── */
+html.ui-v2 #access-vault-section input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  width: 42px;
+  height: 24px;
+  flex-shrink: 0;
+  margin: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--surface-3);
+  cursor: pointer;
+  transition: background var(--t-slow);
+  vertical-align: middle;
+}
+html.ui-v2 #access-vault-section input[type="checkbox"]::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, .4);
+  transition: left var(--t-slow);
+}
+html.ui-v2 #access-vault-section input[type="checkbox"]:checked { background: var(--iris); }
+html.ui-v2 #access-vault-section input[type="checkbox"]:checked::after { left: 20px; }
+html.ui-v2 #access-vault-section input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--iris);
+  outline-offset: 2px;
+}
+
+/* Per-provider relay toggles: the wrap is a .vault-note span. */
+html.ui-v2 #access-vault-section .vault-actions > .vault-note:has(> input[type="checkbox"]) {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+html.ui-v2 #access-vault-section .vault-actions > .vault-note > label { cursor: pointer; }
+/* Full-credential OAuth opt-in: dashed consent card, long-copy label. */
+html.ui-v2 #access-vault-section .vault-actions:has(> #vault-oauth-lease-toggle) {
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  border: 1px dashed var(--line-2);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+html.ui-v2 #access-vault-section .vault-actions:has(> #vault-oauth-lease-toggle) > .vault-note {
+  cursor: pointer;
+}
+
+/* ── folds: "Add a credential" reads as a dashed add button; the
+       Unlockers fold stays a quiet disclosure ── */
+html.ui-v2 #access-vault-section .acc-fold {
+  margin: 2px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+html.ui-v2 #access-vault-section .acc-fold > summary {
+  padding: 11px 15px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-2);
+}
+html.ui-v2 #access-vault-section .acc-fold > summary:hover { color: var(--text); }
+html.ui-v2 #access-vault-section .acc-fold > summary::before { color: var(--text-3); }
+html.ui-v2 #access-vault-section .acc-fold-body { padding: 4px 15px 15px; }
+html.ui-v2 #access-vault-section .acc-fold:has(.vault-form-grid):not([open]) {
+  width: max-content;
+  max-width: 100%;
+  border-style: dashed;
+  border-color: var(--line-2);
+  background: transparent;
+  border-radius: 10px;
+}
+html.ui-v2 #access-vault-section .acc-fold:has(.vault-form-grid) > summary::before {
+  content: '+';
+  font-size: 14px;
+  line-height: 1;
+  color: var(--iris-2);
+}
+
+/* Unlockers list */
+html.ui-v2 #access-vault-section .vault-unlockers {
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+/* ── custody trail ── */
+html.ui-v2 #access-custody-section .custody-trail {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  overflow: hidden;
+}
+html.ui-v2 #access-custody-section .custody-row {
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+html.ui-v2 #access-custody-section .custody-row:last-child { border-bottom: 0; }
+html.ui-v2 #access-custody-section .custody-ts {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+html.ui-v2 #access-custody-section .custody-chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 700;
+  background: var(--surface-3);
+  color: var(--text-2);
+}
+html.ui-v2 #access-custody-section .custody-chip.grant { background: rgba(var(--green-rgb), .12); color: var(--green); }
+html.ui-v2 #access-custody-section .custody-chip.revoke { background: rgba(var(--amber-rgb), .14); color: var(--amber); }
+html.ui-v2 #access-custody-section .custody-chip.expire { background: var(--surface-3); color: var(--text-2); }
+html.ui-v2 #access-custody-section .custody-chip.egress { background: rgba(var(--sky-rgb), .14); color: var(--sky); }
+html.ui-v2 #access-custody-section .custody-chip.reset { background: rgba(var(--rose-rgb), .14); color: var(--rose); }
+html.ui-v2 #access-custody-section .custody-main { color: var(--text); font-weight: 600; font-size: 12.5px; }
+html.ui-v2 #access-custody-section .custody-meta { color: var(--text-3); font-size: 11.5px; }
+html.ui-v2 #access-custody-section .vault-note {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+
+/* ── "Vault moved" pointer card left in Access → Advanced ── */
+html.ui-v2 .ui2-vault-moved-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  margin: 6px 0 20px;
+  border: 1px solid rgba(var(--iris-rgb), .24);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(var(--iris-rgb), .1), rgba(var(--iris-rgb), .03));
+  padding: 14px 16px;
+}
+html.ui-v2 .ui2-vault-moved-title {
+  flex: 1 1 100%;
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--iris-2);
+}
+html.ui-v2 .ui2-vault-moved-sub {
+  flex: 1 1 260px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+html.ui-v2 .ui2-vault-moved-go {
+  border: 1px solid var(--line-2);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 700;
+  padding: 7px 13px;
+  cursor: pointer;
+  transition: background var(--t-med), border-color var(--t-med);
+}
+html.ui-v2 .ui2-vault-moved-go:hover { background: var(--surface-2); border-color: var(--iris); }
+
+/* ── v1 fallback (unflagged, NEW elements only) ──
+   Under v1 the #vault pane is reachable only by a hand-typed hash and
+   contains just the pointer note; these ids exist on no other surface,
+   so existing v1 screens are untouched. */
+.vault-pane-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 20px;
+}
+#vault-v1-note { font-size: 12px; }
 </style>
 <!-- ── static/app/20-shell.html ── -->
 </head>
@@ -16896,6 +17415,26 @@ html.ui-v2 .station-composer-input::placeholder {
       </div>
     </div>
 
+    <!-- Vault Tab (design-overhaul P2): the ui-v2 top-level destination.
+         Under html.ui-v2, boot re-parents the vault + custody sections
+         (with their section heads) out of Access → Advanced into
+         #vault-tab-sections — every id, listener, and the
+         window.intendantVault contract survives the move
+         (ui2VaultAdoptSections in 32-vault-custody.js). Under v1 nothing
+         moves: no v1 control routes here, and a hand-typed #vault shows
+         only the pointer note below. -->
+    <div id="tab-vault" class="tab-pane">
+      <div class="vault-pane-body" id="vault-pane-body">
+        <div class="ui2-vault-pagehead" id="ui2-vault-pagehead" hidden>
+          <h1 class="ui2-acc-title">Vault</h1>
+        </div>
+        <div class="vault-note" id="vault-v1-note">
+          The credential vault lives in <a href="#access/advanced">Access &rarr; Advanced</a>.
+        </div>
+        <div id="vault-tab-sections"></div>
+      </div>
+    </div>
+
     <!-- Settings Tab -->
     <div id="tab-settings" class="tab-pane">
       <div class="subtabs">
@@ -17829,9 +18368,7 @@ const UI2_NAV_GROUPS = [
   ] },
   { label: 'Trust', items: [
     { tab: 'access', label: 'Access', icon: 'access' },
-    // Vault's own destination arrives with its program phase; until then
-    // this is an honest shortcut to today's vault home.
-    { route: ['access', 'advanced'], label: 'Vault', icon: 'vault' },
+    { tab: 'vault', label: 'Vault', icon: 'vault' },
   ] },
   { label: 'System', items: [
     { tab: 'settings', label: 'Settings', icon: 'settings' },
@@ -20996,7 +21533,7 @@ async function vaultEgressExecute(id) {
   }
 }
 
-/* ── Vault UI (Access → Advanced) ── */
+/* ── Vault UI (v1: Access → Advanced · ui-v2: the #vault destination) ── */
 
 function vaultProviderLabel(provider) {
   if (provider === 'anthropic') return 'Anthropic';
@@ -21630,6 +22167,56 @@ function renderAccessVaultSection() {
   mount.innerHTML = '';
   mount.appendChild(card);
 }
+
+/* ── ui-v2: Vault as its own top-level destination ──
+   Under the ui-v2 flag, boot moves the vault + custody sections (and the
+   two acc-section-heads introducing them) out of Access → Advanced into
+   the #tab-vault pane. The nodes are RE-PARENTED, never rebuilt: every id,
+   attached listener, and the window.intendantVault contract survives, and
+   all renderers keep finding their mounts by id (the same relocation
+   pattern the display canvases use). Under v1 (no flag) nothing runs, so
+   the vault validators' #access/advanced contract stays byte-intact.
+   Skipped on the standalone /access admin page, which is locked to the
+   Access tab — there the vault stays reachable inside Advanced. A small
+   link card is left behind so #access/advanced deep links (unfueled
+   empty-state, older bookmarks) still lead somewhere honest. */
+function ui2VaultAdoptSections() {
+  if (typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
+  if (DASHBOARD_ACCESS_PAGE_MODE) return;
+  const host = document.getElementById('vault-tab-sections');
+  const vaultMount = document.getElementById('access-vault-section');
+  const custodyMount = document.getElementById('access-custody-section');
+  if (!host || !vaultMount || !custodyMount) return;
+  const advancedBody = vaultMount.parentElement;
+  const vaultHead = vaultMount.previousElementSibling;
+  const custodyHead = custodyMount.previousElementSibling;
+  if (vaultHead?.classList.contains('acc-section-head')) host.appendChild(vaultHead);
+  host.appendChild(vaultMount);
+  if (custodyHead?.classList.contains('acc-section-head')) host.appendChild(custodyHead);
+  host.appendChild(custodyMount);
+  const pagehead = document.getElementById('ui2-vault-pagehead');
+  if (pagehead) pagehead.hidden = false;
+  const v1Note = document.getElementById('vault-v1-note');
+  if (v1Note) v1Note.hidden = true;
+  if (advancedBody) {
+    const moved = document.createElement('div');
+    moved.className = 'ui2-vault-moved-card';
+    const title = document.createElement('div');
+    title.className = 'ui2-vault-moved-title';
+    title.textContent = 'The vault has its own home now';
+    const sub = document.createElement('div');
+    sub.className = 'ui2-vault-moved-sub';
+    sub.textContent = 'Credential vault, fueling, and the custody trail moved to Vault in the navigation rail.';
+    const go = document.createElement('button');
+    go.type = 'button';
+    go.className = 'ui2-vault-moved-go';
+    go.textContent = 'Open Vault';
+    go.addEventListener('click', () => routeTo('vault'));
+    moved.append(title, sub, go);
+    advancedBody.prepend(moved);
+  }
+}
+ui2VaultAdoptSections();
 
 /* Debug/validator handle (the module scope hides the vault globals; the
    validators observe state through this, like intendantDashboardControl). */
@@ -47936,6 +48523,14 @@ function ui2AccessEnsurePageChrome() {
 function renderAccessAdminSummaries() {
   if (!document.getElementById('tab-access')) return;
   ui2AccessEnsurePageChrome();
+  // Under ui-v2 the vault + custody sections live on their own #vault pane
+  // (re-parented at boot): give them the same tick-driven cadence there
+  // that this fanout provides while the Access pane is visible under v1
+  // (lease countdowns, custody freshness). The v1 path is untouched —
+  // renderAccessVaultSection() still runs from the fanout below.
+  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+    renderOrDefer('vault', 'vault-section', renderAccessVaultSection);
+  }
   // Transport ticks call this 17-renderer fanout constantly; skip the DOM
   // work while the Access pane is hidden and run once on the next entry.
   if (!paneIsVisible('access')) {
@@ -53762,7 +54357,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 // We still use localStorage for preferences that aren't navigation
 // (verbosity, direct-mode, host filter, sessions filters).
 
-const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'debug', 'settings'];
+const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'vault', 'debug', 'settings'];
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
@@ -53988,6 +54583,16 @@ function switchTab(tabId) {
   }
   if (tabId === 'settings' && !apiKeyStatusLoaded) {
     loadApiKeyStatus();
+  }
+  if (tabId === 'vault') {
+    // ui-v2 destination (the vault sections are re-parented here at boot;
+    // under v1 this pane is only reachable by a hand-typed #vault and the
+    // render below is a harmless repaint of the sections in Access →
+    // Advanced). Vault state changes render eagerly on their own; entering
+    // the pane repaints once so lease countdowns are fresh — the renderer
+    // itself kicks the lease + custody refreshes.
+    paneDeferredRenders.delete('vault');
+    renderAccessVaultSection();
   }
   if (tabId === 'access') {
     paneDeferredRenders.delete('access');

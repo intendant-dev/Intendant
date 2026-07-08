@@ -2034,6 +2034,14 @@ function ui2AccessEnsurePageChrome() {
 function renderAccessAdminSummaries() {
   if (!document.getElementById('tab-access')) return;
   ui2AccessEnsurePageChrome();
+  // Under ui-v2 the vault + custody sections live on their own #vault pane
+  // (re-parented at boot): give them the same tick-driven cadence there
+  // that this fanout provides while the Access pane is visible under v1
+  // (lease countdowns, custody freshness). The v1 path is untouched —
+  // renderAccessVaultSection() still runs from the fanout below.
+  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+    renderOrDefer('vault', 'vault-section', renderAccessVaultSection);
+  }
   // Transport ticks call this 17-renderer fanout constantly; skip the DOM
   // work while the Access pane is hidden and run once on the next entry.
   if (!paneIsVisible('access')) {
