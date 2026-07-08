@@ -227,14 +227,28 @@ check_wasm() {
     echo ""
     echo "WASM build dependencies:"
 
-    if has_cmd wasm-pack; then
-        ok "wasm-pack"
+    # Pinned to the version the committed wasm blobs were built with —
+    # single-sourced from .wasm-pack-version (build.rs enforces the same
+    # pin and skips rebuilds under any other version, so a mismatched
+    # install silently ships stale WASM). `cargo install` resolves
+    # outside our Cargo.lock, so the exact version is the pin.
+    local script_dir wasm_pack_pin installed
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    wasm_pack_pin="$(tr -d '[:space:]' < "$script_dir/../.wasm-pack-version")"
+    installed="$(wasm-pack --version 2>/dev/null | cut -d' ' -f2 || true)"
+
+    if [ "$installed" = "$wasm_pack_pin" ]; then
+        ok "wasm-pack $installed (pinned)"
     else
-        miss "wasm-pack" "cargo install wasm-pack --version 0.14.0 --locked"
-        info "installing wasm-pack..."
-        # Pinned to the version the committed wasm blobs were built with;
-        # `cargo install` resolves outside our Cargo.lock.
-        cargo install wasm-pack --version 0.14.0 --locked
+        if [ -n "$installed" ]; then
+            miss "wasm-pack $installed != pin $wasm_pack_pin" "cargo install wasm-pack --version $wasm_pack_pin --locked --force"
+            info "reinstalling wasm-pack at the pinned version..."
+            cargo install wasm-pack --version "$wasm_pack_pin" --locked --force
+        else
+            miss "wasm-pack" "cargo install wasm-pack --version $wasm_pack_pin --locked"
+            info "installing wasm-pack..."
+            cargo install wasm-pack --version "$wasm_pack_pin" --locked
+        fi
     fi
 }
 

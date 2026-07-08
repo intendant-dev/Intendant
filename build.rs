@@ -16,6 +16,30 @@
 use std::path::Path;
 use std::process::Command;
 
+/// The wasm-pack version every committed artifact must be built with —
+/// single-sourced from `.wasm-pack-version` (the setup scripts install
+/// from the same file). Different wasm-pack releases emit byte-different
+/// output, and the artifacts are committed: a cross-version rebuild
+/// churns them and conflicts every concurrent landing that also rebuilt.
+/// To upgrade, bump the file and regenerate BOTH crates' artifacts in
+/// the same commit.
+const PINNED_WASM_PACK_VERSION: &str = include_str!(".wasm-pack-version");
+
+/// `wasm-pack --version` → the bare version string, or None when the
+/// binary is missing/unrunnable.
+fn installed_wasm_pack_version() -> Option<String> {
+    let out = Command::new("wasm-pack").arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // "wasm-pack 0.14.0"
+    String::from_utf8(out.stdout)
+        .ok()?
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_string)
+}
+
 /// A browser WASM crate whose wasm-pack artifacts are embedded into the
 /// gateway binary via `include_str!`/`include_bytes!`.
 struct WasmCrate {
@@ -102,6 +126,27 @@ impl WasmCrate {
 
         if !stale {
             return;
+        }
+
+        // Version gate: only the pinned wasm-pack may regenerate the
+        // committed artifacts (other releases emit byte-different output
+        // — see PINNED_WASM_PACK_VERSION). A mismatched or missing
+        // wasm-pack keeps the committed artifacts instead of churning
+        // them; the daemon still builds, just with stale WASM, and the
+        // warning names the one command that fixes it.
+        let pinned = PINNED_WASM_PACK_VERSION.trim();
+        match installed_wasm_pack_version() {
+            Some(v) if v == pinned => {}
+            got => {
+                println!(
+                    "cargo:warning={} WASM is stale but wasm-pack {} doesn't match the pin {} — SKIPPING the rebuild so the committed artifacts don't churn. Fix: cargo install wasm-pack --version {} --locked",
+                    self.crate_dir,
+                    got.as_deref().unwrap_or("(not installed)"),
+                    pinned,
+                    pinned
+                );
+                return;
+            }
         }
 
         println!(
@@ -228,6 +273,9 @@ fn main() {
     // a silently dropped fragment would embed a broken dashboard.
     println!("cargo:rerun-if-changed={}/", app_html_assembler::FRAGMENT_DIR);
     println!("cargo:rerun-if-changed={}", app_html_assembler::OUTPUT);
+    // The wasm-pack pin gates artifact rebuilds; a pin bump must re-run
+    // the staleness/version checks.
+    println!("cargo:rerun-if-changed=.wasm-pack-version");
     if let Err(err) = app_html_assembler::assemble(Path::new(".")) {
         panic!("app.html assembly failed: {err}");
     }
