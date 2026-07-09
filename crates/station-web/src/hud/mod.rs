@@ -152,6 +152,21 @@ impl Hud {
 /// Thumbnail placement rect in CSS px: `(x, y, w, h)`.
 pub(crate) type ThumbRect = (f32, f32, f32, f32);
 
+/// Vertical clearance reserved at the canvas bottom for the DOM
+/// `#station-status` chip (ui2-station.css): 28px tall + 12px inset,
+/// plus breathing room. Canvas furniture that would otherwise sit in
+/// that band (the activity-runway strip; the compass on canvases narrow
+/// enough for the chip to reach it) lifts above this line instead of
+/// being occluded (QA-fleet ST-02).
+pub(crate) const STATUS_CHIP_CLEARANCE: f32 = 44.0;
+
+/// The chip is anchored bottom-LEFT with max-width `min(560px, 100% −
+/// 24px)`; right-anchored furniture only collides when the canvas is
+/// narrow enough for the chip's right edge to cross it.
+pub(crate) fn status_chip_reaches(w: f32, right_anchored_x: f32) -> bool {
+    12.0 + 560.0_f32.min(w - 24.0) > right_anchored_x
+}
+
 /// Activity-lane metrics for a density setting: `(rows, row_pitch,
 /// lane_height)`. Density meaningfully packs the HUD: 0.5 shows 2 event
 /// rows, 1.0 the classic 3, 1.8 up to 5 (with a tighter pitch). Short

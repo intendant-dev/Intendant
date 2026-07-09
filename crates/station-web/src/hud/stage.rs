@@ -854,7 +854,10 @@ impl StationInner {
 
     pub(crate) fn draw_station_activity_lane(&mut self, x: f32, h: f32, w: f32) {
         let (rows, pitch, lane_h) = lane_metrics(self.density, h);
-        let y = (h - lane_h - 24.0).max(282.0);
+        // Glass panel extends lane_h + 10 below y, so this places the
+        // panel bottom at h − STATUS_CHIP_CLEARANCE: the strip's last row
+        // and border stay out of the DOM status chip's band (ST-02).
+        let y = (h - lane_h - 10.0 - STATUS_CHIP_CLEARANCE).max(282.0);
         self.glass_panel(x - 6.0, y, w + 12.0, lane_h + 10.0, 12.0, C_TEAL, 0.9, 0.9);
         self.hud.set_fill(C_TEAL_CSS);
         self.hud

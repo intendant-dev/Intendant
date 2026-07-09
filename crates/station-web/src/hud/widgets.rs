@@ -381,7 +381,15 @@ impl StationInner {
 
     pub(crate) fn draw_compass(&self, w: f32, h: f32) {
         let cx = w - 71.0;
-        let cy = h - 33.0;
+        // On narrow canvases the bottom-left DOM status chip reaches the
+        // compass's berth — lift the dial above the chip band (ST-02).
+        // The glass disc spans cy ± 18, so the lifted bottom edge lands
+        // just above h − STATUS_CHIP_CLEARANCE.
+        let cy = if status_chip_reaches(w, cx - 18.0) {
+            h - STATUS_CHIP_CLEARANCE - 19.0
+        } else {
+            h - 33.0
+        };
         // Small glass disc so the dial reads over any scene behind it.
         self.hud.ctx.begin_path();
         let _ = self
