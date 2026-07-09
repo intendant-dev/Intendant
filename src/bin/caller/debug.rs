@@ -175,8 +175,16 @@ pub fn spawn_debug_screen_handler(
         loop {
             match event_rx.recv().await {
                 Ok(AppEvent::ControlCommand(ControlMsg::SetupDebugScreen)) => {
-                    if screen.is_some() {
-                        eprintln!("[debug] Screen already active");
+                    if let Some(ref s) = screen {
+                        // A reloaded dashboard has no memory of the active
+                        // screen — re-announce it instead of going silent.
+                        eprintln!(
+                            "[debug] Screen already active on :{} — re-announcing",
+                            s.display_id
+                        );
+                        bus.send(AppEvent::DebugScreenReady {
+                            display_id: s.display_id,
+                        });
                         continue;
                     }
                     match setup_debug_screen(web_port).await {

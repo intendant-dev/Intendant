@@ -25512,7 +25512,9 @@ const SESSION_SOURCE_FILTER_OPTIONS = [
 const SESSION_STATUS_FILTER_OPTIONS = [
   { value: 'active', label: 'Active', plural: 'statuses' },
   { value: 'idle', label: 'Idle', plural: 'statuses' },
+  { value: 'resident', label: 'Resident', plural: 'statuses' },
   { value: 'completed', label: 'Completed', plural: 'statuses' },
+  { value: 'failed', label: 'Failed', plural: 'statuses' },
   { value: 'abandoned', label: 'Abandoned', plural: 'statuses' },
   { value: 'interrupted', label: 'Interrupted', plural: 'statuses' },
 ];
@@ -31920,7 +31922,8 @@ function stationSessionRow(session, indexedIds = new Set()) {
   return {
     id: rowId,
     action: indexedIds.has(String(id)) ? 'detail' : '',
-    label: stationSessionTask(session) || 'Untitled session',
+    label: stationSessionTask(session)
+      || (session?.role === 'resident' || session?.status === 'resident' ? 'Daemon session' : 'Untitled session'),
     value: [status, source].filter(Boolean).join(' · '),
     detail: [
       String(id).slice(0, 8),
@@ -34577,7 +34580,10 @@ function stationBuildSessionsSummary() {
     external: externalIds.size,
     totalTokens,
     diskBytes,
-    latestTask: latest ? (stationSessionTask(latest) || 'Untitled session') : '',
+    latestTask: latest
+      ? (stationSessionTask(latest)
+        || (latest?.role === 'resident' || latest?.status === 'resident' ? 'Daemon session' : 'Untitled session'))
+      : '',
     latestSource: latest
       ? (sessionConfigSource(sessionConfigMetadata(latest)) || stationSessionSource(latest) || latest?.source || 'session')
       : '',
@@ -49535,7 +49541,10 @@ function showApproval(id, command, category, sessionId) {
     focusSessionWindow(pendingApprovalSessionId);
   }
   document.getElementById('approval-command').textContent = command;
-  document.getElementById('approval-category').textContent = category || '';
+  const approvalCategoryEl = document.getElementById('approval-category');
+  approvalCategoryEl.textContent = category || '';
+  // No category (older sessions, rehydrated approvals) → no empty pill.
+  approvalCategoryEl.style.display = category ? '' : 'none';
   stationCurrentApproval = {
     id: String(id),
     command: command || '',
@@ -83780,8 +83789,9 @@ function buildSessionCard(m, derived, ctx) {
   const sessionName = compactSessionText(s.name);
   const taskText = compactSessionText(s.task);
   const sessionId = s.session_id || '';
-  const primaryText = sessionName || taskText || 'Untitled session';
-  const titleKindText = sessionName ? 'name' : taskText ? 'initial' : 'untitled';
+  const isResident = s.role === 'resident' || displayStatus === 'resident';
+  const primaryText = sessionName || taskText || (isResident ? 'Daemon session' : 'Untitled session');
+  const titleKindText = sessionName ? 'name' : taskText ? 'initial' : isResident ? 'resident' : 'untitled';
 
   // Top row: name/task + status badges
   const top = document.createElement('div');
@@ -83799,7 +83809,9 @@ function buildSessionCard(m, derived, ctx) {
     ? 'User-assigned session name'
     : taskText
       ? 'Initial message fallback'
-      : 'No initial message found';
+      : isResident
+        ? "The daemon's own resident session — becomes a task session when you message it"
+        : 'No initial message found';
   titleRow.appendChild(titleKind);
   const nameEl = document.createElement('div');
   nameEl.className = 'sc-name';
@@ -85177,14 +85189,17 @@ function renderSessionDetailTitle(session) {
   const source = session.source || 'intendant';
   const sessionName = compactSessionText(session.name);
   const task = compactSessionText(session.task);
-  const primaryText = sessionName || task || 'Untitled session';
+  const isResident = session.role === 'resident' || session.status === 'resident';
+  const primaryText = sessionName || task || (isResident ? 'Daemon session' : 'Untitled session');
   const sourceLabel = session.source_label || (source === 'intendant' ? 'Intendant' : prettyAgentName(source) || source);
-  const titleKindLabel = sessionName ? 'name' : task ? 'initial' : 'untitled';
+  const titleKindLabel = sessionName ? 'name' : task ? 'initial' : isResident ? 'resident' : 'untitled';
   const titleKindHelp = sessionName
     ? 'User-assigned session name'
     : task
       ? 'Initial message fallback'
-      : 'No initial message found';
+      : isResident
+        ? "The daemon's own resident session — becomes a task session when you message it"
+        : 'No initial message found';
 
   titleEl.innerHTML = '';
   const titleLine = document.createElement('div');

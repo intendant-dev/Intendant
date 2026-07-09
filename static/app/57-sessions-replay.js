@@ -449,8 +449,9 @@ function buildSessionCard(m, derived, ctx) {
   const sessionName = compactSessionText(s.name);
   const taskText = compactSessionText(s.task);
   const sessionId = s.session_id || '';
-  const primaryText = sessionName || taskText || 'Untitled session';
-  const titleKindText = sessionName ? 'name' : taskText ? 'initial' : 'untitled';
+  const isResident = s.role === 'resident' || displayStatus === 'resident';
+  const primaryText = sessionName || taskText || (isResident ? 'Daemon session' : 'Untitled session');
+  const titleKindText = sessionName ? 'name' : taskText ? 'initial' : isResident ? 'resident' : 'untitled';
 
   // Top row: name/task + status badges
   const top = document.createElement('div');
@@ -468,7 +469,9 @@ function buildSessionCard(m, derived, ctx) {
     ? 'User-assigned session name'
     : taskText
       ? 'Initial message fallback'
-      : 'No initial message found';
+      : isResident
+        ? "The daemon's own resident session — becomes a task session when you message it"
+        : 'No initial message found';
   titleRow.appendChild(titleKind);
   const nameEl = document.createElement('div');
   nameEl.className = 'sc-name';
@@ -1846,14 +1849,17 @@ function renderSessionDetailTitle(session) {
   const source = session.source || 'intendant';
   const sessionName = compactSessionText(session.name);
   const task = compactSessionText(session.task);
-  const primaryText = sessionName || task || 'Untitled session';
+  const isResident = session.role === 'resident' || session.status === 'resident';
+  const primaryText = sessionName || task || (isResident ? 'Daemon session' : 'Untitled session');
   const sourceLabel = session.source_label || (source === 'intendant' ? 'Intendant' : prettyAgentName(source) || source);
-  const titleKindLabel = sessionName ? 'name' : task ? 'initial' : 'untitled';
+  const titleKindLabel = sessionName ? 'name' : task ? 'initial' : isResident ? 'resident' : 'untitled';
   const titleKindHelp = sessionName
     ? 'User-assigned session name'
     : task
       ? 'Initial message fallback'
-      : 'No initial message found';
+      : isResident
+        ? "The daemon's own resident session — becomes a task session when you message it"
+        : 'No initial message found';
 
   titleEl.innerHTML = '';
   const titleLine = document.createElement('div');

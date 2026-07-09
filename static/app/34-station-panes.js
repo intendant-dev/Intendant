@@ -143,7 +143,8 @@ function stationSessionRow(session, indexedIds = new Set()) {
   return {
     id: rowId,
     action: indexedIds.has(String(id)) ? 'detail' : '',
-    label: stationSessionTask(session) || 'Untitled session',
+    label: stationSessionTask(session)
+      || (session?.role === 'resident' || session?.status === 'resident' ? 'Daemon session' : 'Untitled session'),
     value: [status, source].filter(Boolean).join(' · '),
     detail: [
       String(id).slice(0, 8),

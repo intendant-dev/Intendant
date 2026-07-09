@@ -572,7 +572,9 @@ const SESSION_SOURCE_FILTER_OPTIONS = [
 const SESSION_STATUS_FILTER_OPTIONS = [
   { value: 'active', label: 'Active', plural: 'statuses' },
   { value: 'idle', label: 'Idle', plural: 'statuses' },
+  { value: 'resident', label: 'Resident', plural: 'statuses' },
   { value: 'completed', label: 'Completed', plural: 'statuses' },
+  { value: 'failed', label: 'Failed', plural: 'statuses' },
   { value: 'abandoned', label: 'Abandoned', plural: 'statuses' },
   { value: 'interrupted', label: 'Interrupted', plural: 'statuses' },
 ];

@@ -326,6 +326,20 @@ impl SessionLog {
         self.write_meta_with_name_and_role(project_root, task, name, None);
     }
 
+    /// Write session metadata with an explicit role marker (e.g. `resident`
+    /// for the daemon's own base session). The role survives in
+    /// `session_meta.json` so the session catalog can tell the daemon's
+    /// resident session apart from an abandoned user task after this
+    /// process exits.
+    pub fn write_meta_with_role(
+        &self,
+        project_root: Option<&Path>,
+        task: Option<&str>,
+        role: Option<&str>,
+    ) {
+        self.write_meta_with_name_and_role(project_root, task, None, role);
+    }
+
     fn write_meta_with_name_and_role(
         &self,
         project_root: Option<&Path>,

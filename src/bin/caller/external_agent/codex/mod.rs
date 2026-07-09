@@ -438,6 +438,20 @@ impl CodexAgent {
         }
     }
 
+    /// Escalate a backend-internal warning to the session (dashboard
+    /// activity log via `AgentEvent::Log`, same as the resume-cwd mismatch)
+    /// in addition to the daemon's stderr — stderr-only warnings are
+    /// invisible to the operator watching the dashboard.
+    fn emit_backend_warning(&self, message: String) {
+        eprintln!("[codex] Warning: {message}");
+        if let Some(event_tx) = self.event_tx.as_ref() {
+            let _ = event_tx.send(AgentEvent::Log {
+                level: "warn".to_string(),
+                message,
+            });
+        }
+    }
+
     fn cleanup_temporary_request_trace_root(&mut self) {
         if !self.request_trace_temporary {
             return;
@@ -1313,19 +1327,19 @@ impl ExternalAgent for CodexAgent {
                 .mark_existing_context_requests_seen(Some(&thread_id))
                 .await
             {
-                eprintln!(
-                    "[codex] Warning: failed to seed context request trace baseline for resumed thread {thread_id}: {e}"
-                );
+                self.emit_backend_warning(format!(
+                    "failed to seed context request trace baseline for resumed thread {thread_id}: {e}"
+                ));
             }
             let rollout_path = match extract_thread_path(&result) {
                 Some(path) => Some(path),
                 None => match self.read_thread_snapshot(&thread_id).await {
                     Ok(snapshot) => snapshot.rollout_path,
                     Err(e) => {
-                        eprintln!(
-                            "[codex] Warning: failed to read resumed thread metadata for token usage seed: {}",
-                            e
-                        );
+                        self.emit_backend_warning(format!(
+                            "failed to read resumed thread metadata for token usage seed: {e}; \
+                             the context meter starts unseeded until the next turn reports usage"
+                        ));
                         None
                     }
                 },
@@ -1343,11 +1357,11 @@ impl ExternalAgent for CodexAgent {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        eprintln!(
-                            "[codex] Warning: failed to seed token usage from rollout {}: {}",
+                        self.emit_backend_warning(format!(
+                            "failed to seed token usage from rollout {}: {}",
                             rollout_path.display(),
                             e
-                        );
+                        ));
                     }
                 }
             }
