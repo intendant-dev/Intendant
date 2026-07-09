@@ -3213,4 +3213,346 @@ mod tests {
             golden_json_transcript("404 Not Found", &body)
         );
     }
+
+    // ── Golden HTTP transcripts: the fs mkdir/write/rename/delete wire
+    //    contract (S1b) — same discipline as the GET trio above. ──
+
+    /// The trusted-local root context dispatch hands the write quartet
+    /// on a plain direct-dashboard request.
+    fn golden_root_ctx() -> HttpAccessContext {
+        HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+                "golden-test",
+                "http",
+            ),
+            iam_state: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn golden_fs_mkdir_created_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("new-dir");
+        let body_text =
+            serde_json::json!({ "path": target.to_string_lossy() }).to_string();
+        let response = collect_handler_response(|stream| {
+            handle_fs_mkdir(stream, body_text, golden_root_ctx(), None, EventBus::new())
+        })
+        .await;
+        // Display path is canonicalized after creation.
+        let display = std::fs::canonicalize(&target).unwrap();
+        let body = serde_json::json!({
+            "ok": true,
+            "created": true,
+            "already_exists": false,
+            "path": display.to_string_lossy().to_string()
+        })
+        .to_string();
+        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+    }
+
+    #[tokio::test]
+    async fn golden_fs_mkdir_conflict_409_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("occupied");
+        std::fs::write(&file, b"file, not dir").unwrap();
+        let body_text = serde_json::json!({ "path": file.to_string_lossy() }).to_string();
+        let response = collect_handler_response(|stream| {
+            handle_fs_mkdir(stream, body_text, golden_root_ctx(), None, EventBus::new())
+        })
+        .await;
+        let body = serde_json::json!({
+            "error": format!("{} already exists and is not a directory", file.display())
+        })
+        .to_string();
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("409 Conflict", &body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_fs_mkdir_invalid_json_400_transcript() {
+        let response = collect_handler_response(|stream| {
+            handle_fs_mkdir(
+                stream,
+                "{}".to_string(),
+                golden_root_ctx(),
+                None,
+                EventBus::new(),
+            )
+        })
+        .await;
+        let body = r#"{"error":"invalid JSON: missing field `path` at line 1 column 2"}"#;
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("400 Bad Request", body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_fs_mkdir_scope_denied_403_transcript() {
+        // A session-reader-scoped browser principal holds no
+        // filesystem.write — the shared write-quartet 403 shape.
+        let cert_dir = tempfile::tempdir().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "golden-test",
+            "dashboard-control",
+        );
+        access_iam_upsert_user_client_grant_response_value_with_cert_dir(
+            cert_dir.path(),
+            serde_json::json!({
+                "kind": "browser_certificate",
+                "label": "Reader browser",
+                "fingerprint": "F1:1E",
+                "role_id": "role:session-reader"
+            }),
+            &actor,
+        )
+        .unwrap();
+        let scoped = http_access_context(cert_dir.path(), None, Some("f11e"), true, true)
+            .expect("scoped context");
+        let reason = scoped
+            .decision(crate::peer::access_policy::PeerOperation::FilesystemWrite)
+            .reason;
+        let dir = tempfile::tempdir().unwrap();
+        let body_text = serde_json::json!({
+            "path": dir.path().join("denied").to_string_lossy()
+        })
+        .to_string();
+        let response = collect_handler_response(|stream| {
+            handle_fs_mkdir(stream, body_text, scoped, None, EventBus::new())
+        })
+        .await;
+        let body = serde_json::json!({ "error": reason }).to_string();
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("403 Forbidden", &body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_fs_write_force_create_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("note.txt");
+        let content = "s1b golden write body\n";
+        let body_text = serde_json::json!({
+            "path": target.to_string_lossy(),
+            "content": content,
+            "force": true
+        })
+        .to_string();
+        let response = collect_handler_response(|stream| {
+            handle_fs_write(stream, body_text, golden_root_ctx(), None, EventBus::new())
+        })
+        .await;
+        // New file: the handler resolved canonical parent + name.
+        let resolved = std::fs::canonicalize(dir.path()).unwrap().join("note.txt");
+        let modified_ms = std::fs::metadata(&resolved)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(system_time_unix_ms);
+        let body = serde_json::json!({
+            "ok": true,
+            "path": resolved.to_string_lossy().to_string(),
+            "size": content.len(),
+            "sha256": fs_sha256_hex(content.as_bytes()),
+            "created": true,
+            "modified_ms": modified_ms,
+        })
+        .to_string();
+        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+        assert_eq!(std::fs::read(&resolved).unwrap(), content.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn golden_fs_write_sha_conflict_409_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("edited.txt");
+        std::fs::write(&target, b"current contents").unwrap();
+        let body_text = serde_json::json!({
+            "path": target.to_string_lossy(),
+            "content": "replacement",
+            "expected_sha256": fs_sha256_hex(b"what the client last read"),
+        })
+        .to_string();
+        let response = collect_handler_response(|stream| {
+            handle_fs_write(stream, body_text, golden_root_ctx(), None, EventBus::new())
+        })
+        .await;
+        let canonical = std::fs::canonicalize(&target).unwrap();
+        let modified_ms = std::fs::metadata(&canonical)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(system_time_unix_ms);
+        let body = serde_json::json!({
+            "error": format!("{} changed on disk since it was read", canonical.display()),
+            "code": "conflict",
+            "current_sha256": fs_sha256_hex(b"current contents"),
+            "size": b"current contents".len(),
+            "modified_ms": modified_ms,
+        })
+        .to_string();
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("409 Conflict", &body)
+        );
+        // The failed write must not have touched the file.
+        assert_eq!(std::fs::read(&canonical).unwrap(), b"current contents");
+    }
+
+    #[tokio::test]
+    async fn golden_fs_write_precondition_required_400_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bare.txt");
+        let body_text = serde_json::json!({
+            "path": target.to_string_lossy(),
+            "content": "no precondition stated"
+        })
+        .to_string();
+        let response = collect_handler_response(|stream| {
+            handle_fs_write(stream, body_text, golden_root_ctx(), None, EventBus::new())
+        })
+        .await;
+        let body = serde_json::json!({
+            "error": "write requires expected_sha256, create_new, or force",
+            "code": "precondition_required",
+        })
+        .to_string();
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("400 Bad Request", &body)
+        );
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn golden_fs_write_both_content_fields_400_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let body_text = serde_json::json!({
+            "path": dir.path().join("dup.txt").to_string_lossy(),
+            "content": "text",
+            "content_b64": "dGV4dA==",
+            "force": true
+        })
+        .to_string();
+        let response = collect_handler_response(|stream| {
+            handle_fs_write(stream, body_text, golden_root_ctx(), None, EventBus::new())
+        })
+        .await;
+        let body = r#"{"error":"provide either content or content_b64, not both"}"#;
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("400 Bad Request", body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_fs_rename_success_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("old-name.txt");
+        std::fs::write(&from, b"movable").unwrap();
+        // Canonical source path must be captured while it still exists.
+        let canonical_from = std::fs::canonicalize(&from).unwrap();
+        let to = dir.path().join("new-name.txt");
+        let body_text = serde_json::json!({
+            "from": from.to_string_lossy(),
+            "to": to.to_string_lossy()
+        })
+        .to_string();
+        let response = collect_handler_response(|stream| {
+            handle_fs_rename(stream, body_text, golden_root_ctx(), None, EventBus::new())
+        })
+        .await;
+        let resolved_to = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("new-name.txt");
+        let body = serde_json::json!({
+            "ok": true,
+            "from": canonical_from.to_string_lossy().to_string(),
+            "path": resolved_to.to_string_lossy().to_string(),
+            "renamed": true,
+        })
+        .to_string();
+        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+        assert!(resolved_to.exists() && !from.exists());
+    }
+
+    #[tokio::test]
+    async fn golden_fs_rename_destination_exists_409_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("src.txt");
+        let to = dir.path().join("dst.txt");
+        std::fs::write(&from, b"src").unwrap();
+        std::fs::write(&to, b"dst").unwrap();
+        let body_text = serde_json::json!({
+            "from": from.to_string_lossy(),
+            "to": to.to_string_lossy()
+        })
+        .to_string();
+        let response = collect_handler_response(|stream| {
+            handle_fs_rename(stream, body_text, golden_root_ctx(), None, EventBus::new())
+        })
+        .await;
+        let resolved_to = std::fs::canonicalize(dir.path()).unwrap().join("dst.txt");
+        let body = serde_json::json!({
+            "error": format!("{} already exists", resolved_to.display()),
+            "code": "exists",
+        })
+        .to_string();
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("409 Conflict", &body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_fs_delete_file_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("removable.txt");
+        std::fs::write(&target, b"bye").unwrap();
+        let path = target.to_string_lossy().into_owned();
+        let body_text = serde_json::json!({ "path": path }).to_string();
+        let response = collect_handler_response(|stream| {
+            handle_fs_delete(stream, body_text, golden_root_ctx(), None, EventBus::new())
+        })
+        .await;
+        // Delete reports the expanded (not canonicalized) request path.
+        let body = serde_json::json!({
+            "ok": true,
+            "path": path,
+            "deleted": true,
+            "dir": false,
+        })
+        .to_string();
+        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn golden_fs_delete_not_empty_409_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("full-dir");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("kept.txt"), b"keep").unwrap();
+        let path = target.to_string_lossy().into_owned();
+        let body_text = serde_json::json!({ "path": path }).to_string();
+        let response = collect_handler_response(|stream| {
+            handle_fs_delete(stream, body_text, golden_root_ctx(), None, EventBus::new())
+        })
+        .await;
+        let body = serde_json::json!({
+            "error": format!(
+                "{} is not empty — pass recursive to delete its contents",
+                target.display()
+            ),
+            "code": "not_empty",
+        })
+        .to_string();
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("409 Conflict", &body)
+        );
+        assert!(target.join("kept.txt").exists());
+    }
 }
