@@ -371,6 +371,54 @@ mod tests {
         assert!(daemon_fleet_label(" ").is_none());
     }
 
+    /// Operator-battery E2E (never in CI: live network + a registered
+    /// daemon). Drives the WHOLE issuance flow — signed address publish,
+    /// ACME DNS-01 against the rendezvous fleet zone, certificate
+    /// install — against a REAL rendezvous and the Let's Encrypt
+    /// staging CA. Run as:
+    ///
+    /// ```text
+    /// INTENDANT_HOME=<scratch> \
+    /// INTENDANT_CONNECT_RENDEZVOUS_URL=https://intendant.dev \
+    /// INTENDANT_CONNECT_DAEMON_ID=<registered daemon id> \
+    /// INTENDANT_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory \
+    /// cargo test --bin intendant fleet_cert_staging -- --ignored --nocapture
+    /// ```
+    ///
+    /// The daemon id must already be registered (the process signs with
+    /// the default daemon identity key, so register with that same key
+    /// first — e.g. by running a scratch daemon once).
+    #[tokio::test]
+    #[ignore = "operator battery: live rendezvous + Let's Encrypt staging"]
+    async fn fleet_cert_staging_e2e() {
+        let zone = std::env::var("INTENDANT_FLEET_ZONE")
+            .unwrap_or_else(|_| "fleet.intendant.dev".to_string());
+        let daemon_id = std::env::var("INTENDANT_CONNECT_DAEMON_ID")
+            .expect("set INTENDANT_CONNECT_DAEMON_ID to a registered daemon id");
+        assert!(
+            std::env::var("INTENDANT_ACME_DIRECTORY")
+                .unwrap_or_default()
+                .contains("staging"),
+            "refusing to run the battery against the production CA"
+        );
+        let name = format!("{}.{}", daemon_fleet_label(&daemon_id).unwrap(), zone);
+        note_fleet_dns(Some(zone), Some(name.clone()));
+
+        request_certificate(default_publish_addresses())
+            .await
+            .expect("staging issuance should succeed");
+
+        let status = status_snapshot();
+        assert_eq!(status.state, "valid");
+        assert!(status.not_after_unix_ms.unwrap() > now_unix_ms());
+        let cert_pem = std::fs::read_to_string(cert_path()).unwrap();
+        assert!(cert_pem.contains("BEGIN CERTIFICATE"));
+        println!(
+            "staging certificate issued for {name}, valid until {:?}, addresses {:?}",
+            status.not_after_unix_ms, status.addresses
+        );
+    }
+
     #[test]
     fn not_after_parses_a_real_certificate() {
         // A throwaway self-signed cert exercises the PEM + x509 path.
