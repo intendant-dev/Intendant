@@ -660,6 +660,8 @@ pub fn spawn_web_gateway(
                         if line.contains("\"event\":\"session_vitals\"")
                             || line.contains("\"event\":\"session_goal\"")
                             || line.contains("\"event\":\"session_started\"")
+                            || line.contains("\"event\":\"approval_required\"")
+                            || line.contains("\"event\":\"user_question\"")
                         {
                             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
                                 let kind = match parsed["event"].as_str() {
@@ -672,6 +674,14 @@ pub fn spawn_web_gateway(
                                     // (session_started routinely falls off
                                     // the tail-limited log replay).
                                     Some("session_started") => Some("session_started"),
+                                    // Pending approvals/questions: the
+                                    // daemon-side registry survives a page
+                                    // reload but the panel state does not —
+                                    // replay the ask so a reconnecting
+                                    // operator can still answer. Cleared on
+                                    // approval_resolved below.
+                                    Some("approval_required") => Some("approval_required"),
+                                    Some("user_question") => Some("user_question"),
                                     _ => None,
                                 };
                                 if let (Some(kind), Some(sid)) =
@@ -690,6 +700,34 @@ pub fn spawn_web_gateway(
                                         if guard.len() > 256 {
                                             if let Some(first) = guard.keys().next().cloned() {
                                                 guard.remove(&first);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if line.contains("\"event\":\"approval_resolved\"") {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
+                                if let (Some(sid), Some(id)) =
+                                    (parsed["session_id"].as_str(), parsed["id"].as_u64())
+                                {
+                                    if let Ok(mut guard) = session_state_cache.lock() {
+                                        if let Some(kinds) = guard.get_mut(sid) {
+                                            for kind in ["approval_required", "user_question"] {
+                                                let matches = kinds
+                                                    .get(kind)
+                                                    .and_then(|cached| {
+                                                        serde_json::from_str::<serde_json::Value>(
+                                                            cached,
+                                                        )
+                                                        .ok()
+                                                    })
+                                                    .is_some_and(|cached| {
+                                                        cached["id"].as_u64() == Some(id)
+                                                    });
+                                                if matches {
+                                                    kinds.remove(kind);
+                                                }
                                             }
                                         }
                                     }
