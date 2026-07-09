@@ -1995,98 +1995,142 @@ pub(crate) async fn handle_fs_write(
     finalize_http_stream(&mut stream).await;
 }
 
-pub(crate) async fn handle_fs_stat(mut stream: DemuxStream, request_line: &str) {
-    use tokio::io::AsyncWriteExt;
-    let path = query_param(request_line, "path").unwrap_or_default();
-    let response = match inspect_dashboard_fs_path(&path) {
-        Ok(status) => json_response(
-            "200 OK",
-            serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string()),
+/// Synthesize the fs GET trio's [`ApiRequest`] from the HTTP request
+/// line: the tunnel's params shape (`{"path": …}`) built from the query
+/// string, plus the verbatim `Range` header for reads.
+fn fs_api_request(request_line: &str, range: Option<ByteRange>) -> ApiRequest {
+    ApiRequest {
+        params: serde_json::json!({
+            "path": query_param(request_line, "path").unwrap_or_default(),
+        }),
+        range,
+    }
+}
+
+/// Transport-neutral core of `GET /api/fs/stat` (tunnel twin
+/// `api_fs_stat`; the tunnel lane delegates here in S2).
+pub(crate) fn fs_stat_api_response(request: &ApiRequest) -> ApiResponse {
+    match inspect_dashboard_fs_path(request.str_param("path")) {
+        Ok(status) => ApiResponse::json(
+            200,
+            JsonBody::PreSerialized(
+                serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string()),
+            ),
         ),
-        Err(e) => json_error("400 Bad Request", e),
-    };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+        Err(e) => ApiResponse::json_error(400, e),
+    }
 }
 
-pub(crate) async fn handle_fs_list(mut stream: DemuxStream, request_line: &str) {
-    use tokio::io::AsyncWriteExt;
-    let path = query_param(request_line, "path").unwrap_or_default();
-    let response = match list_dashboard_fs_dir(&path) {
-        Ok(body) => json_ok(body),
-        Err(e) => json_error("400 Bad Request", e),
-    };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+pub(crate) async fn handle_fs_stat(
+    stream: DemuxStream,
+    request_line: &str,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = fs_stat_api_response(&fs_api_request(request_line, None));
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
-pub(crate) async fn handle_fs_read(mut stream: DemuxStream, header_text: &str, request_line: &str) {
-    use tokio::io::AsyncWriteExt;
-    let path = query_param(request_line, "path").unwrap_or_default();
-    let range_header = dashboard_http_header_value(header_text, "range");
-    match dashboard_fs_read_file(&path, range_header) {
+/// Transport-neutral core of `GET /api/fs/list` (tunnel twin
+/// `api_fs_list`; the tunnel lane delegates here in S2).
+pub(crate) fn fs_list_api_response(request: &ApiRequest) -> ApiResponse {
+    match list_dashboard_fs_dir(request.str_param("path")) {
+        Ok(body) => ApiResponse::json(200, JsonBody::Value(body)),
+        Err(e) => ApiResponse::json_error(400, e),
+    }
+}
+
+pub(crate) async fn handle_fs_list(
+    stream: DemuxStream,
+    request_line: &str,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = fs_list_api_response(&fs_api_request(request_line, None));
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// Transport-neutral core of `GET /api/fs/read` (tunnel twin
+/// `api_fs_read`): bytes lane on success (200 full / 206 partial), JSON
+/// error shapes otherwise (the 416 keeps its range-probing header tail).
+pub(crate) fn fs_read_api_response(request: &ApiRequest) -> ApiResponse {
+    let range_header = request.range.as_ref().map(|range| {
+        let ByteRange::HttpHeader(value) = range;
+        value.as_str()
+    });
+    match dashboard_fs_read_file(request.str_param("path"), range_header) {
         Ok(file) => {
-            let status = if file.partial {
-                "206 Partial Content"
-            } else {
-                "200 OK"
-            };
-            let content_range = if file.partial {
-                format!(
-                    "Content-Range: bytes {}-{}/{}\r\n",
-                    file.range_start,
-                    file.range_end.saturating_sub(1),
-                    file.total_size
-                )
-            } else {
-                String::new()
-            };
-            // Full (non-range) reads carry the content
-            // hash so the editor has a conflict baseline
-            // for its later write-back.
-            let sha_header = if file.partial {
-                String::new()
-            } else {
-                format!("X-Content-Sha256: {}\r\n", fs_sha256_hex(&file.bytes))
-            };
-            let header = HttpResponse::new(status)
-                .header("Content-Type", &file.content_type)
-                .header("Content-Length", file.bytes.len().to_string())
-                .header("Accept-Ranges", "bytes")
-                .header_segment(&content_range)
-                .header_segment(&sha_header)
-                .header(
-                    "Content-Disposition",
+            let mut headers: Vec<(&'static str, String)> =
+                vec![("Accept-Ranges", "bytes".to_string())];
+            if file.partial {
+                headers.push((
+                    "Content-Range",
                     format!(
-                        "attachment; filename=\"{}\"",
-                        file.filename.replace('"', "")
+                        "bytes {}-{}/{}",
+                        file.range_start,
+                        file.range_end.saturating_sub(1),
+                        file.total_size
                     ),
-                )
-                .header("Cache-Control", "no-cache")
-                .header("Access-Control-Allow-Origin", "*")
-                .header("Access-Control-Expose-Headers", "X-Content-Sha256")
-                .header("Connection", "close")
-                .into_string();
-            let _ = stream.write_all(header.as_bytes()).await;
-            let _ = stream.write_all(&file.bytes).await;
+                ));
+            } else {
+                // Full (non-range) reads carry the content
+                // hash so the editor has a conflict baseline
+                // for its later write-back.
+                headers.push(("X-Content-Sha256", fs_sha256_hex(&file.bytes)));
+            }
+            headers.push((
+                "Content-Disposition",
+                format!(
+                    "attachment; filename=\"{}\"",
+                    file.filename.replace('"', "")
+                ),
+            ));
+            headers.push(("Cache-Control", "no-cache".to_string()));
+            headers.push(("Access-Control-Allow-Origin", "*".to_string()));
+            headers.push((
+                "Access-Control-Expose-Headers",
+                "X-Content-Sha256".to_string(),
+            ));
+            headers.push(("Connection", "close".to_string()));
+            ApiResponse::Bytes {
+                status: if file.partial { 206 } else { 200 },
+                content_type: file.content_type,
+                headers,
+                bytes: BytesPayload::InMemory(file.bytes),
+            }
         }
         Err(error) => {
-            let response = if let Some(total_size) = error.total_size {
-                let body = serde_json::json!({ "error": error.message }).to_string();
-                HttpResponse::with_content(&error.status, "application/json", body)
-                    .header("Content-Range", format!("bytes */{total_size}"))
-                    .header("Accept-Ranges", "bytes")
-                    .header("Cache-Control", "no-cache")
-                    .header("Access-Control-Allow-Origin", "*")
-                    .header("Connection", "close")
-                    .into_string()
+            let status = status_line_u16(&error.status);
+            if let Some(total_size) = error.total_size {
+                ApiResponse::Json {
+                    status,
+                    body: JsonBody::Value(serde_json::json!({ "error": error.message })),
+                    headers: vec![
+                        ("Content-Range", format!("bytes */{total_size}")),
+                        ("Accept-Ranges", "bytes".to_string()),
+                        ("Cache-Control", "no-cache".to_string()),
+                        ("Access-Control-Allow-Origin", "*".to_string()),
+                        ("Connection", "close".to_string()),
+                    ],
+                }
             } else {
-                json_error(&error.status, error.message)
-            };
-            let _ = stream.write_all(response.as_bytes()).await;
+                ApiResponse::json_error(status, error.message)
+            }
         }
     }
-    finalize_http_stream(&mut stream).await;
+}
+
+pub(crate) async fn handle_fs_read(
+    stream: DemuxStream,
+    header_text: &str,
+    request_line: &str,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let range = dashboard_http_header_value(header_text, "range")
+        .map(|value| ByteRange::HttpHeader(value.to_string()));
+    let response = fs_read_api_response(&fs_api_request(request_line, range));
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_fs_mkdir(
@@ -2942,6 +2986,231 @@ mod tests {
         assert_eq!(
             effective_upload_destination(crate::upload_store::UploadDestination::Task, true,),
             crate::upload_store::UploadDestination::Task
+        );
+    }
+
+    // ── Golden HTTP transcripts: the fs stat/list/read wire contract ──
+    //
+    // Byte-exact pins of the fs GET trio's HTTP responses, captured
+    // before the transport-neutral conversion (transport-unification
+    // design §6 S1, risk R1) and kept as the conversion's proof. The
+    // expected framing is hand-written below — never built through the
+    // response helpers under test.
+
+    /// Run one stream-consuming handler and collect every byte it wrote.
+    async fn collect_handler_response<Fut>(run: impl FnOnce(DemuxStream) -> Fut) -> Vec<u8>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tokio::io::AsyncReadExt;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        run(Box::pin(server)).await;
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("collect handler response");
+        response
+    }
+
+    /// The historical `json_response` framing, spelled out literally.
+    fn golden_json_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The CORS posture dispatch hands the shim — read from the route
+    /// table so a row-posture change fails these byte pins instead of
+    /// silently changing the wire.
+    fn fs_route_cors(path: &str) -> crate::gateway_routes::CorsPosture {
+        crate::gateway_routes::match_route("GET", path)
+            .expect("fs route declared")
+            .0
+            .cors
+    }
+
+    fn transcript(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn golden_fs_stat_success_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let request_line = format!("GET /api/fs/stat?path={path} HTTP/1.1");
+        let response =
+            collect_handler_response(|stream| {
+            handle_fs_stat(stream, &request_line, fs_route_cors("/api/fs/stat"), None)
+        })
+        .await;
+        let body = serde_json::to_string(&inspect_dashboard_fs_path(&path).unwrap()).unwrap();
+        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+    }
+
+    #[tokio::test]
+    async fn golden_fs_stat_error_transcript() {
+        let request_line = "GET /api/fs/stat?path=relative/notes.txt HTTP/1.1";
+        let response =
+            collect_handler_response(|stream| {
+            handle_fs_stat(stream, request_line, fs_route_cors("/api/fs/stat"), None)
+        })
+        .await;
+        let body = r#"{"error":"path must be absolute or start with ~/ (got relative/notes.txt)"}"#;
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("400 Bad Request", body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_fs_list_success_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("beta")).unwrap();
+        std::fs::write(dir.path().join("alpha.txt"), b"a").unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let request_line = format!("GET /api/fs/list?path={path} HTTP/1.1");
+        let response =
+            collect_handler_response(|stream| {
+            handle_fs_list(stream, &request_line, fs_route_cors("/api/fs/list"), None)
+        })
+        .await;
+        let body = list_dashboard_fs_dir(&path).unwrap().to_string();
+        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+    }
+
+    #[tokio::test]
+    async fn golden_fs_list_error_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain.txt");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let request_line = format!("GET /api/fs/list?path={path} HTTP/1.1");
+        let response =
+            collect_handler_response(|stream| {
+            handle_fs_list(stream, &request_line, fs_route_cors("/api/fs/list"), None)
+        })
+        .await;
+        let canonical = std::fs::canonicalize(&file).unwrap();
+        let body = serde_json::json!({
+            "error": format!("{} is not a directory", canonical.display())
+        })
+        .to_string();
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("400 Bad Request", &body)
+        );
+    }
+
+    /// Fixed fs-read fixture: 26 bytes, so the ranged expectations below
+    /// can be written as literals.
+    const GOLDEN_READ_CONTENT: &[u8] = b"golden transcript payload!";
+
+    fn golden_read_fixture(dir: &tempfile::TempDir) -> (String, String) {
+        let file = dir.path().join("golden.txt");
+        std::fs::write(&file, GOLDEN_READ_CONTENT).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let request_line = format!("GET /api/fs/read?path={path} HTTP/1.1");
+        (path, request_line)
+    }
+
+    #[tokio::test]
+    async fn golden_fs_read_full_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_path, request_line) = golden_read_fixture(&dir);
+        let header_text = format!("{request_line}\r\n\r\n");
+        let response = collect_handler_response(|stream| {
+            handle_fs_read(
+                stream,
+                &header_text,
+                &request_line,
+                fs_route_cors("/api/fs/read"),
+                None,
+            )
+        })
+        .await;
+        let mut expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nX-Content-Sha256: {}\r\nContent-Disposition: attachment; filename=\"golden.txt\"\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: X-Content-Sha256\r\nConnection: close\r\n\r\n",
+            GOLDEN_READ_CONTENT.len(),
+            fs_sha256_hex(GOLDEN_READ_CONTENT),
+        )
+        .into_bytes();
+        expected.extend_from_slice(GOLDEN_READ_CONTENT);
+        assert_eq!(transcript(&response), transcript(&expected));
+    }
+
+    #[tokio::test]
+    async fn golden_fs_read_partial_206_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_path, request_line) = golden_read_fixture(&dir);
+        let header_text = format!("{request_line}\r\nRange: bytes=7-16\r\n\r\n");
+        let response = collect_handler_response(|stream| {
+            handle_fs_read(
+                stream,
+                &header_text,
+                &request_line,
+                fs_route_cors("/api/fs/read"),
+                None,
+            )
+        })
+        .await;
+        // A partial read carries Content-Range instead of the sha header.
+        let mut expected = "HTTP/1.1 206 Partial Content\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 7-16/26\r\nContent-Disposition: attachment; filename=\"golden.txt\"\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: X-Content-Sha256\r\nConnection: close\r\n\r\n"
+            .to_string()
+            .into_bytes();
+        expected.extend_from_slice(&GOLDEN_READ_CONTENT[7..17]);
+        assert_eq!(transcript(&response), transcript(&expected));
+    }
+
+    #[tokio::test]
+    async fn golden_fs_read_unsatisfiable_416_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_path, request_line) = golden_read_fixture(&dir);
+        let header_text = format!("{request_line}\r\nRange: bytes=99-\r\n\r\n");
+        let response = collect_handler_response(|stream| {
+            handle_fs_read(
+                stream,
+                &header_text,
+                &request_line,
+                fs_route_cors("/api/fs/read"),
+                None,
+            )
+        })
+        .await;
+        let body = r#"{"error":"range is not satisfiable"}"#;
+        let expected = format!(
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nContent-Range: bytes */26\r\nAccept-Ranges: bytes\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(transcript(&response), expected);
+    }
+
+    #[tokio::test]
+    async fn golden_fs_read_missing_404_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.bin");
+        let path = missing.to_string_lossy().into_owned();
+        let request_line = format!("GET /api/fs/read?path={path} HTTP/1.1");
+        let header_text = format!("{request_line}\r\n\r\n");
+        let response = collect_handler_response(|stream| {
+            handle_fs_read(
+                stream,
+                &header_text,
+                &request_line,
+                fs_route_cors("/api/fs/read"),
+                None,
+            )
+        })
+        .await;
+        let io_error = std::fs::canonicalize(&missing).unwrap_err();
+        let body = serde_json::json!({
+            "error": format!("{} is not accessible: {}", missing.display(), io_error)
+        })
+        .to_string();
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("404 Not Found", &body)
         );
     }
 }

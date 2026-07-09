@@ -28,6 +28,9 @@ pub(crate) use static_assets::*;
 mod http;
 pub(crate) use http::*;
 
+mod api_core;
+pub(crate) use api_core::*;
+
 mod session_catalog;
 pub(crate) use session_catalog::*;
 
