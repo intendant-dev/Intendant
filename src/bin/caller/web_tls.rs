@@ -225,14 +225,92 @@ fn server_config_from(
             builder.with_client_cert_verifier(verifier)
         }
     };
-    let mut config = builder
-        .with_single_cert(cert_chain, key)
-        .map_err(|e| format!("rustls server config (cert/key) failed: {e}"))?;
+    // A resolver instead of `with_single_cert`: the base cert (installed
+    // access certs or the startup self-signed) answers by default, and a
+    // fleet certificate (fleet_cert.rs) can be installed LIVE for its
+    // SNI name — first issuance and every renewal apply without a daemon
+    // restart.
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+        .map_err(|e| format!("rustls server key unusable: {e}"))?;
+    let base = Arc::new(rustls::sign::CertifiedKey::new(cert_chain, signing_key));
+    fleet_sni_resolver().set_base(base);
+    let mut config = builder.with_cert_resolver(fleet_sni_resolver());
     // The dashboard speaks HTTP/1.1 and upgrades to WebSocket; advertise
     // only http/1.1 so a browser never negotiates h2 (which the gateway's
     // hand-rolled HTTP/1 handler doesn't implement).
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
+}
+
+/// SNI-aware certificate resolver: the daemon's base certificate by
+/// default; the fleet certificate for requests naming the fleet name.
+/// Process-global so `fleet_cert.rs` can hot-swap certificates into the
+/// running acceptor.
+#[derive(Debug, Default)]
+pub struct FleetSniResolver {
+    base: std::sync::RwLock<Option<Arc<rustls::sign::CertifiedKey>>>,
+    fleet: std::sync::RwLock<Option<(String, Arc<rustls::sign::CertifiedKey>)>>,
+}
+
+impl FleetSniResolver {
+    fn set_base(&self, key: Arc<rustls::sign::CertifiedKey>) {
+        *self.base.write().expect("tls resolver poisoned") = Some(key);
+    }
+
+    fn set_fleet(&self, name: String, key: Arc<rustls::sign::CertifiedKey>) {
+        *self.fleet.write().expect("tls resolver poisoned") = Some((name, key));
+    }
+}
+
+impl rustls::server::ResolvesServerCert for FleetSniResolver {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        if let Some(server_name) = client_hello.server_name() {
+            let fleet = self.fleet.read().expect("tls resolver poisoned");
+            if let Some((name, key)) = fleet.as_ref() {
+                if server_name.eq_ignore_ascii_case(name) {
+                    return Some(key.clone());
+                }
+            }
+        }
+        self.base.read().expect("tls resolver poisoned").clone()
+    }
+}
+
+fn fleet_sni_resolver() -> Arc<FleetSniResolver> {
+    static RESOLVER: std::sync::OnceLock<Arc<FleetSniResolver>> = std::sync::OnceLock::new();
+    RESOLVER
+        .get_or_init(|| Arc::new(FleetSniResolver::default()))
+        .clone()
+}
+
+/// Install (or replace) the fleet certificate served for `name` —
+/// called by `fleet_cert.rs` at startup-restore, first issuance, and
+/// every renewal. Applies to live acceptors immediately.
+pub fn install_fleet_certificate(
+    name: &str,
+    cert_chain_pem: &str,
+    key_pem: &str,
+) -> Result<(), String> {
+    use rustls::pki_types::pem::PemObject;
+    let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_slice_iter(cert_chain_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("parse fleet certificate: {e}"))?;
+    if cert_chain.is_empty() {
+        return Err("fleet certificate PEM holds no certificates".to_string());
+    }
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+        .map_err(|e| format!("parse fleet key: {e}"))?;
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+        .map_err(|e| format!("fleet key unusable: {e}"))?;
+    fleet_sni_resolver().set_fleet(
+        name.trim().trim_end_matches('.').to_ascii_lowercase(),
+        Arc::new(rustls::sign::CertifiedKey::new(cert_chain, signing_key)),
+    );
+    Ok(())
 }
 
 pub fn load_ca_roots(ca_path: &std::path::Path) -> Result<RootCertStore, String> {

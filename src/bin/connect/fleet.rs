@@ -883,6 +883,7 @@ mod tests {
     fn fleet_targets_merge_claimed_daemons_over_remembered_records() {
         let user_id = Uuid::new_v4();
         let store = Store {
+            dns_records: Vec::new(),
             users: Vec::new(),
             daemons: vec![DaemonRecord {
                 daemon_id: "daemon-1".to_string(),
@@ -1011,6 +1012,9 @@ mod tests {
             invite_required: false,
             open_daemon_registration: false,
             cookie_secure: true,
+            dns_zone: None,
+            dns_ns_name: None,
+            dns_listen: None,
         };
 
         let targets = fleet_targets_for_user(&config, &store, user_id);

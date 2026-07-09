@@ -152,6 +152,10 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // the hosted-control ceiling knob (mirrors the HTTP route rows).
     method("api_access_set_tier", PeerOperation::AccessManage),
     method("api_access_set_hosted_ceiling", PeerOperation::AccessManage),
+    // Fleet certificate: publish this daemon's addresses for its fleet
+    // name and run the ACME DNS-01 order (fleet_cert.rs). Slow flow,
+    // started async; progress rides the connect status payload.
+    method("api_fleet_cert_request", PeerOperation::AccessManage),
     // Credential custody (vault leases + client egress): granting, renewing,
     // revoking, and even reading lease status all sit behind the dedicated
     // gate — a scoped guest session can neither fuel nor drain a daemon, nor

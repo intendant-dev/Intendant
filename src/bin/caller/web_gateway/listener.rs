@@ -487,6 +487,10 @@ pub fn spawn_web_gateway(
         dashboard_control.clone(),
         tcp_advertised_port,
     );
+    // Fleet certificates: restore any stored certificate into the live
+    // SNI resolver and keep it renewed (fleet_cert.rs).
+    crate::fleet_cert::refresh_installed_state();
+    crate::fleet_cert::spawn_renewal_loop();
 
     // F-1.3b3 federated authority subscribers. Federated counterpart
     // to local 5c's per-WS subscriber loop: federated browsers don't
