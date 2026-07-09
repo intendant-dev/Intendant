@@ -360,6 +360,13 @@ pub async fn launch_display(_config: &DisplayConfig) -> Result<XvfbGuard, Caller
     ))
 }
 
+/// Whether this daemon can launch virtual displays at all (Xvfb-based,
+/// Linux-only). Dashboards derive their "New virtual display" affordance
+/// from this single source instead of mirroring the platform matrix.
+pub fn virtual_displays_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
 // ── Display accessibility ───────────────────────────────────────────────────
 
 /// On macOS, the native display is always accessible.

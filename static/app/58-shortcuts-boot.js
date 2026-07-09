@@ -231,16 +231,18 @@ function showDisplayPicker(displays) {
     });
     picker.appendChild(item);
   }
-  const createItem = document.createElement('div');
-  createItem.className = 'display-picker-item dp-action';
-  createItem.textContent = 'New virtual display';
-  createItem.title = 'Launch a virtual display (Xvfb) on the daemon host — no agent or API key needed. Linux hosts only.';
-  createItem.addEventListener('click', (e) => {
-    e.stopPropagation();
-    hideDisplayPicker();
-    createVirtualDisplay();
-  });
-  picker.appendChild(createItem);
+  if (daemonVirtualDisplaysAvailable === true) {
+    const createItem = document.createElement('div');
+    createItem.className = 'display-picker-item dp-action';
+    createItem.textContent = 'New virtual display';
+    createItem.title = 'Launch a virtual display (Xvfb) on the daemon host — no agent or API key needed.';
+    createItem.addEventListener('click', (e) => {
+      e.stopPropagation();
+      hideDisplayPicker();
+      createVirtualDisplay();
+    });
+    picker.appendChild(createItem);
+  }
   // ui-v2 hides #status-bar (the picker's v1 anchor subtree), so an
   // in-place open can never render — portal to <body> and pin the popover
   // to the live rail's "Your screen" card (the control that proxies the
@@ -631,6 +633,23 @@ document.getElementById('strip-minimize')?.addEventListener('click', (e) => {
     document.body.style.userSelect = '';
   });
 })();
+
+// ── Virtual display availability ──
+// Virtual displays are a host capability (Xvfb-based, Linux-only): derive
+// the "New virtual display" affordances from the daemon's displays payload
+// instead of offering a button that can only fail on macOS/Windows hosts.
+let daemonVirtualDisplaysAvailable = null;
+async function refreshVirtualDisplayAvailability() {
+  try {
+    const payload = await fetchLocalDisplaysPayload();
+    daemonVirtualDisplaysAvailable = payload?.virtual_displays_available === true;
+  } catch (_) {
+    daemonVirtualDisplaysAvailable = null;
+  }
+  const btn = document.getElementById('displays-create-virtual');
+  if (btn) btn.hidden = daemonVirtualDisplaysAvailable !== true;
+}
+refreshVirtualDisplayAvailability();
 
 // ── Start ──
 main();

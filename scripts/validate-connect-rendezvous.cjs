@@ -2387,7 +2387,7 @@ async function main() {
         Object.prototype.hasOwnProperty.call(result.safeReads.projectRoot, 'project_root'),
       'project-root RPC did not return project_root'
     );
-    assert(Array.isArray(result.safeReads?.displays), 'displays RPC did not return an array');
+    assert(Array.isArray(result.safeReads?.displays?.displays), 'displays RPC did not return a displays list');
     assert(Array.isArray(result.safeReads?.managedContextRecords?.records), 'managed context records RPC did not return records');
     assert(Array.isArray(result.safeReads?.managedContextAnchors?.anchors), 'managed context anchors RPC did not return anchors');
     assert(Array.isArray(result.safeReads?.managedContextFission?.groups), 'managed context fission RPC did not return groups');
@@ -2907,7 +2907,7 @@ async function main() {
         dashboardBootstrapFrameCount: result.dashboardBootstrap.frame_count,
         sessionCount: result.sessions.length,
         sessionsSearchResultCount: result.safeReads.sessionsSearch.results.length,
-        displaysCount: result.safeReads.displays.length,
+        displaysCount: result.safeReads.displays.displays.length,
         managedContextRecordCount: result.safeReads.managedContextRecords.records.length,
         managedContextAnchorCount: result.safeReads.managedContextAnchors.anchors.length,
         managedContextFissionGroupCount: result.safeReads.managedContextFission.groups.length,

@@ -76,6 +76,21 @@ pub(crate) async fn create_virtual_display(
     width: Option<u32>,
     height: Option<u32>,
 ) {
+    // Unsupported platforms bail before any display number is chosen: the
+    // failure fallback below reports through DisplayCaptureLost, and with
+    // no allocation the fallback id can collide with a live capture (a
+    // failed macOS create once tore down the real display-0 session).
+    if !vision::virtual_displays_supported() {
+        bus.send(AppEvent::PresenceLog {
+            message: "[virtual_display] not available on this platform: virtual displays are \
+                      Xvfb-based and Linux-only; use \"Your display\" to stream this desktop instead"
+                .to_string(),
+            level: Some(LogLevel::Warn),
+            turn: None,
+        });
+        return;
+    }
+
     // Displays this daemon holds alive must never be orphan-reclaimed by
     // the allocator: our own guards, plus every registered virtual capture
     // session (an agent-launched Xvfb has a session but no guard here).

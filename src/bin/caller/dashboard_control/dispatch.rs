@@ -2182,6 +2182,12 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
             "api_coordinator_available",
             peer_registry_available && peer_manage,
         ),
+        // Host capability, not a grant: dashboards derive the "New virtual
+        // display" affordance from this (Xvfb-based, Linux-only).
+        (
+            "virtual_displays_available",
+            crate::vision::virtual_displays_supported(),
+        ),
     ];
     for (name, available) in capabilities {
         result.insert(name.to_string(), serde_json::json!(available));
