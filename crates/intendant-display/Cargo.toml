@@ -35,7 +35,7 @@ pipewire = "0.8"
 x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "xtest"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-screencapturekit = "1.5"
+screencapturekit = "8.0"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 shiguredo_video_toolbox = "2026.1"
 

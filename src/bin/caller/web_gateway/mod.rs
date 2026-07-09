@@ -312,7 +312,15 @@ pub(crate) async fn displays_response_body(
     session_registry: &Option<crate::display::SharedSessionRegistry>,
 ) -> String {
     let displays = crate::display::enumerate_displays_with_sessions(session_registry).await;
-    serde_json::to_string(&displays).unwrap_or_else(|_| "[]".to_string())
+    // Object form (normalizeDisplaysPayload accepts both): the displays
+    // surface also advertises display capabilities, so dashboards derive
+    // affordances like "New virtual display" instead of mirroring the
+    // platform matrix.
+    serde_json::to_string(&serde_json::json!({
+        "displays": displays,
+        "virtual_displays_available": crate::vision::virtual_displays_supported(),
+    }))
+    .unwrap_or_else(|_| "{\"displays\":[]}".to_string())
 }
 
 async fn handle_diagnostics_visual_freshness(

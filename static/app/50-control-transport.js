@@ -1900,6 +1900,18 @@ function rangedDownloadTimeoutMs(chunkBytes) {
   return Math.max(30000, Math.ceil(size / (256 * 1024)) * 10000);
 }
 
+// Compose a caller's abort signal with a hard timeout. fetch() has no
+// default timeout, and the transfers pump runs entries strictly
+// sequentially — a single hung request must fail rather than wedge the
+// whole queue behind it.
+function dashboardComposeFetchSignal(signal, timeoutMs) {
+  const ms = Number(timeoutMs) || 0;
+  if (!(ms > 0) || typeof AbortSignal?.timeout !== 'function') return signal || undefined;
+  const timeout = AbortSignal.timeout(ms);
+  if (!signal) return timeout;
+  return typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : signal;
+}
+
 async function dashboardRequestBytesWithRetry(method, params, options = {}) {
   const retries = Number.isFinite(Number(options.retries)) ? Math.max(0, Number(options.retries)) : 2;
   let attempt = 0;

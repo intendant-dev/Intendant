@@ -231,16 +231,18 @@ function showDisplayPicker(displays) {
     });
     picker.appendChild(item);
   }
-  const createItem = document.createElement('div');
-  createItem.className = 'display-picker-item dp-action';
-  createItem.textContent = 'New virtual display';
-  createItem.title = 'Launch a virtual display (Xvfb) on the daemon host — no agent or API key needed. Linux hosts only.';
-  createItem.addEventListener('click', (e) => {
-    e.stopPropagation();
-    hideDisplayPicker();
-    createVirtualDisplay();
-  });
-  picker.appendChild(createItem);
+  if (virtualDisplaysAvailableNow()) {
+    const createItem = document.createElement('div');
+    createItem.className = 'display-picker-item dp-action';
+    createItem.textContent = 'New virtual display';
+    createItem.title = 'Launch a virtual display (Xvfb) on the daemon host — no agent or API key needed.';
+    createItem.addEventListener('click', (e) => {
+      e.stopPropagation();
+      hideDisplayPicker();
+      createVirtualDisplay();
+    });
+    picker.appendChild(createItem);
+  }
   // ui-v2 hides #status-bar (the picker's v1 anchor subtree), so an
   // in-place open can never render — portal to <body> and pin the popover
   // to the live rail's "Your screen" card (the control that proxies the

@@ -46,6 +46,11 @@ const MIN_HEIGHT: u32 = 240;
 const MAX_WIDTH: u32 = 3840;
 const MAX_HEIGHT: u32 = 2160;
 
+/// Failure-report id for platforms where no display number is ever
+/// allocated. Must never match a real capture session: the
+/// DisplayCaptureLost handler tears down whatever session carries the id.
+const VIRTUAL_DISPLAY_UNSUPPORTED_SENTINEL: u32 = u32::MAX;
+
 /// Resolve requested dimensions: defaults for omitted axes, bounds-checked,
 /// rounded down to even (VP8 rejects odd frame dimensions).
 pub(crate) fn virtual_display_dimensions(
@@ -76,6 +81,22 @@ pub(crate) async fn create_virtual_display(
     width: Option<u32>,
     height: Option<u32>,
 ) {
+    // Unsupported platforms bail before any display number is chosen. The
+    // error still flows through DisplayCaptureLost (the channel dashboards
+    // and MCP callers toast), but against a sentinel id: with no allocation
+    // the natural fallback id is 0, and the DisplayCaptureLost handler
+    // tears down whatever live session matches — a failed macOS create once
+    // killed the real display-0 capture that way.
+    if !vision::virtual_displays_supported() {
+        report_user_display_capture_unavailable(
+            bus,
+            VIRTUAL_DISPLAY_UNSUPPORTED_SENTINEL,
+            "virtual display create failed: virtual displays are Xvfb-based and Linux-only; \
+             use \"Your display\" to stream this machine's desktop instead",
+        );
+        return;
+    }
+
     // Displays this daemon holds alive must never be orphan-reclaimed by
     // the allocator: our own guards, plus every registered virtual capture
     // session (an agent-launched Xvfb has a session but no guard here).

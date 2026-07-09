@@ -291,6 +291,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     var backendProcess: Process?
     var healthTimer: Timer?
     var healthProbeFailures = 0
+    // Backend auto-restart: exponential backoff on abnormal exits, reset
+    // once a backend has stayed up long enough to count as stable.
+    var backendRestartAttempts = 0
+    var backendLastStart = Date.distantPast
+    var backendAutoRestartTimer: Timer?
+    var isTerminating = false
+    // Readiness-poll chains carry a generation stamp; bumping it orphans
+    // any chain already in flight (a crash mid-boot must not let a stale
+    // chain paint its dead-end failure page over the restart countdown).
+    var pollGeneration = 0
     var port: Int = 8765
     let portSearchLimit = 20
     var launchPlan: BackendLaunchPlan!
@@ -579,20 +589,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
 
     /// Crash-screen Restart button: relaunch the backend and re-enter the
     /// readiness poll (which lands on the placeholder / auto-activation).
-    func restartBackend() {
+    @discardableResult
+    func restartBackend() -> Bool {
         NSLog("Backend restart requested")
+        backendAutoRestartTimer?.invalidate()
         healthTimer?.invalidate()
         healthProbeFailures = 0
         if let proc = backendProcess, proc.isRunning {
+            proc.terminationHandler = nil
             proc.terminate()
         }
-        startBackend()
-        pollUntilReady()
+        let started = startBackend()
+        if started {
+            pollUntilReady()
+        }
+        return started
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        isTerminating = true
+        backendAutoRestartTimer?.invalidate()
         healthTimer?.invalidate()
         guard let proc = backendProcess, proc.isRunning else { return }
+        // Quitting kills the backend on purpose; don't let the exit handler
+        // paint a crash screen or schedule a restart mid-teardown.
+        proc.terminationHandler = nil
         proc.terminate()
         // Wait up to 3 seconds, then force-kill to avoid hanging on quit
         let deadline = Date().addingTimeInterval(3.0)
@@ -682,13 +703,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
 
     // MARK: - Backend
 
-    func startBackend() {
+    @discardableResult
+    func startBackend() -> Bool {
         let bundle = Bundle.main
         let binPath = bundle.bundlePath + "/Contents/MacOS/intendant-bin"
 
         guard FileManager.default.fileExists(atPath: binPath) else {
             NSLog("intendant-bin not found at \(binPath)")
-            return
+            return false
         }
 
         let process = Process()
@@ -746,9 +768,72 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         do {
             try process.run()
             backendProcess = process
+            backendLastStart = Date()
+            // React to backend death immediately (the 5s health tick stays
+            // as the belt for a missed handler). Remote dashboards have no
+            // crash screen — without a restart this machine just goes dark.
+            process.terminationHandler = { [weak self] proc in
+                DispatchQueue.main.async {
+                    self?.backendDidExit(proc)
+                }
+            }
             NSLog("Started intendant-bin (PID \(process.processIdentifier)) on port \(port)")
+            return true
         } catch {
             NSLog("Failed to start intendant-bin: \(error)")
+            return false
+        }
+    }
+
+    /// Backend exit policy: abnormal exits (signal / non-zero status)
+    /// auto-restart with capped exponential backoff; a clean exit means
+    /// someone stopped the daemon deliberately, so only the manual Restart
+    /// button revives it.
+    func backendDidExit(_ proc: Process) {
+        guard !isTerminating, proc === backendProcess, !proc.isRunning else { return }
+        // Consume the reference first: the health tick and the
+        // terminationHandler can both observe the same exit, and a second
+        // pass would double-count the attempt and reschedule the timer.
+        backendProcess = nil
+        healthTimer?.invalidate()
+        let signalled = proc.terminationReason == .uncaughtSignal
+        let status = proc.terminationStatus
+        let abnormal = signalled || status != 0
+        NSLog("Backend exited (\(signalled ? "signal" : "status") \(status), \(abnormal ? "abnormal" : "clean"))")
+        guard abnormal else {
+            pollGeneration += 1
+            showBackendCrash(
+                title: "Backend stopped",
+                detail: "The daemon exited cleanly. Restart it to keep using this app."
+            )
+            return
+        }
+        if Date().timeIntervalSince(backendLastStart) > 600 {
+            backendRestartAttempts = 0
+        }
+        scheduleBackendAutoRestart()
+    }
+
+    /// Arm (or re-arm) the auto-restart countdown with capped exponential
+    /// backoff, orphaning any readiness-poll chain so nothing paints over
+    /// the countdown screen. Re-entered by the timer itself when a spawn
+    /// attempt fails, so the chain never dead-ends.
+    func scheduleBackendAutoRestart() {
+        guard !isTerminating else { return }
+        pollGeneration += 1
+        let delay = min(60.0, pow(2.0, Double(backendRestartAttempts + 1)))
+        backendRestartAttempts += 1
+        NSLog("Auto-restarting backend in \(Int(delay))s (attempt \(backendRestartAttempts))")
+        showBackendCrash(
+            title: "Backend process crashed",
+            detail: "Restarting in \(Int(delay))s (attempt \(backendRestartAttempts)) — see ~/.intendant/app-backend.log"
+        )
+        backendAutoRestartTimer?.invalidate()
+        backendAutoRestartTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            guard let self = self, !self.isTerminating else { return }
+            if !self.restartBackend() {
+                self.scheduleBackendAutoRestart()
+            }
         }
     }
 
@@ -862,6 +947,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     // MARK: - Polling
 
     func pollUntilReady() {
+        pollGeneration += 1
         webView?.loadHTMLString("""
             <html>
             <body style="background:#1e1e2e;color:#cdd6f4;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
@@ -873,17 +959,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             </html>
             """, baseURL: nil)
 
-        poll(attempts: 0)
+        poll(attempts: 0, generation: pollGeneration)
     }
 
-    func poll(attempts: Int) {
+    func poll(attempts: Int, generation: Int) {
+        // A crash or scheduled restart bumps pollGeneration; a stale chain
+        // must go silent rather than paint over the countdown screen.
+        guard generation == pollGeneration else { return }
         if attempts > 30 {
             // The window may have been closed while the backend booted;
             // the poll keeps running regardless, only painting is skipped.
             webView?.loadHTMLString("""
                 <html>
-                <body style="background:#1e1e2e;color:#f38ba8;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
-                <div>Failed to connect to backend on port \(port)</div>
+                <body style="background:#1e1e2e;color:#cdd6f4;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+                <div style="text-align:center">
+                    <div style="font-size:20px;color:#f38ba8;margin-bottom:12px">Failed to connect to backend on port \(port)</div>
+                    <div style="font-size:14px;color:#6c7086;margin-bottom:16px">Check ~/.intendant/app-backend.log for details</div>
+                    <button onclick="window.webkit.messageHandlers.restart && window.webkit.messageHandlers.restart.postMessage(null)"
+                            style="padding:8px 24px;border:1px solid #89b4fa;border-radius:6px;background:transparent;color:#89b4fa;font-size:14px;cursor:pointer">
+                        Restart now
+                    </button>
+                </div>
                 </body>
                 </html>
                 """, baseURL: nil)
@@ -898,6 +994,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         backendSession.dataTask(with: request) { _, response, error in
             if let http = response as? HTTPURLResponse, http.statusCode == 200 {
                 DispatchQueue.main.async {
+                    guard generation == self.pollGeneration else { return }
                     // Backend is up. The SPA is deferred behind the
                     // placeholder unless a harness/user asked for it.
                     if self.autoActivateDashboard {
@@ -915,7 +1012,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
                     NSLog("Backend readiness poll failing (attempt \(attempts + 1)/30): status=\(status) error=\(error?.localizedDescription ?? "none")")
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    self.poll(attempts: attempts + 1)
+                    self.poll(attempts: attempts + 1, generation: generation)
                 }
             }
         }.resume()
@@ -930,7 +1027,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             // Check if the backend process is still alive
             if let proc = self.backendProcess, !proc.isRunning {
                 self.healthTimer?.invalidate()
-                self.showBackendCrash()
+                self.backendDidExit(proc)
                 return
             }
             // Idle unload: an SPA nobody has seen for hours is pure cost —
@@ -974,22 +1071,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         URL(string: "\(launchPlan.scheme)://127.0.0.1:\(port)\(path)")!
     }
 
-    func showBackendCrash() {
-        NSLog("Backend process is no longer running")
+    func showBackendCrash(
+        title: String = "Backend process exited",
+        detail: String = "Check ~/.intendant/app-backend.log for details"
+    ) {
+        NSLog("Backend crash screen: \(title) — \(detail)")
         // A dead daemon is worth a window even if the user had closed it —
         // remotely this machine just went dark.
         if window == nil { createWindow() }
         dashboardActive = false
         guard webView != nil else { return }
+        let esc = { (s: String) -> String in
+            s.replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+        }
         webView.loadHTMLString("""
             <html>
             <body style="background:#1e1e2e;color:#cdd6f4;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
             <div style="text-align:center">
-                <div style="font-size:20px;color:#f38ba8;margin-bottom:12px">Backend process exited</div>
-                <div style="font-size:14px;color:#6c7086;margin-bottom:16px">Check ~/.intendant/app-backend.log for details</div>
+                <div style="font-size:20px;color:#f38ba8;margin-bottom:12px">\(esc(title))</div>
+                <div style="font-size:14px;color:#6c7086;margin-bottom:16px">\(esc(detail))</div>
                 <button onclick="window.webkit.messageHandlers.restart && window.webkit.messageHandlers.restart.postMessage(null)"
                         style="padding:8px 24px;border:1px solid #89b4fa;border-radius:6px;background:transparent;color:#89b4fa;font-size:14px;cursor:pointer">
-                    Restart
+                    Restart now
                 </button>
             </div>
             </body>

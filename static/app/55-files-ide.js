@@ -225,6 +225,7 @@ async function filesIdeWriteFile(hostId, path, bytes, opts = {}) {
   if (opts.expected_sha256) params.expected_sha256 = opts.expected_sha256;
   if (opts.create_new) params.create_new = true;
   if (opts.force) params.force = true;
+  const requestOpts = { signal: opts.signal, timeoutMs: opts.timeoutMs };
   if (hostId) {
     const conn = await filesIdePeerConnection(hostId);
     if (conn.lastStatus && conn.lastStatus.api_fs_write_available === false) {
@@ -234,20 +235,21 @@ async function filesIdeWriteFile(hostId, path, bytes, opts = {}) {
         body: { error: `${filesIdeHostLabel(hostId)} grants read-only file access to this daemon` },
       };
     }
-    const payload = await conn.uploadBytes('api_fs_write', params, bytes);
+    const payload = await conn.uploadBytes('api_fs_write', params, bytes, requestOpts);
     return filesIdeNormalizePayload(payload);
   }
   if (dashboardConnectModeEnabled()) {
     if (!(dashboardTransport?.canUseRpc?.() && dashboardControlTransport?.lastStatus?.api_fs_write_available !== false)) {
       return { ok: false, status: 503, body: { error: 'File writes are unavailable until this dashboard reconnects' } };
     }
-    const payload = await dashboardControlTransport.uploadBytes('api_fs_write', params, bytes);
+    const payload = await dashboardControlTransport.uploadBytes('api_fs_write', params, bytes, requestOpts);
     return filesIdeNormalizePayload(payload);
   }
   const resp = await authedFetch('/api/fs/write', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ...params, content_b64: dashboardControlBytesToBase64(bytes) }),
+    signal: opts.signal,
   });
   const body = await resp.json().catch(() => ({}));
   return { ok: resp.ok, status: resp.status, body: body || {} };
