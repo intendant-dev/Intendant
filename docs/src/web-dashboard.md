@@ -488,6 +488,17 @@ summary uses the same access abstraction as Terminal: local/mTLS, hosted
 transports, and peer dashboard-control routes are shown as targets with their
 available capabilities rather than as transport internals.
 
+The daemon-side durable state behind this surface — staged uploads
+(`uploads/<session-id>/` blob + sidecar) and transfer job metadata
+(`transfers/jobs`, plus daemon-materialized `transfers/artifacts`) — lives
+under `<project>/.intendant/` on project-rooted daemons. A **projectless
+daemon** (the macOS app daemon, or any `intendant` launched from a directory
+with no project marker) serves the same endpoints from a daemon-global
+fallback store at `~/.intendant/global-store/` with an identical layout; a
+project root, when present, always wins. The global store is pruned on
+daemon startup: upload session dirs, job files, and materialized artifacts
+idle for more than 14 days are removed (project stores are never pruned).
+
 The **Editor** sub-tab is a full-bleed workbench: a slim toolbar (target
 picker + one-line route summary + new file/folder), a lazy directory tree
 rail on the left (rooted at the project root locally, `~` on peers;

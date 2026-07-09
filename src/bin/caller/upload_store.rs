@@ -10,12 +10,21 @@
 //!   dashboards. It now uses the same ignored `.intendant/uploads` store
 //!   instead of the old `<project_root>/workspace_files/` directory.
 //!
+//! Every store function takes a [`StoreScope`]: project-rooted daemons use
+//! the project-local store above; projectless daemons fall back to the
+//! daemon-global store (`~/.intendant/global-store/uploads/<session-id>/`,
+//! identical layout and sidecar format). The fallback store is pruned on
+//! daemon startup after [`crate::global_store::GLOBAL_STORE_RETENTION_DAYS`]
+//! days of inactivity — see `global_store.rs` for the resolution rule and
+//! retention policy.
+//!
 //! The browser-facing POST endpoint picks the destination based on a
 //! query param; both variants produce an [`UploadDescriptor`] that the
 //! dashboard can attach to a task via `attachments: ["upload:<id>", ...]`
 //! on [`crate::event::ControlMsg::StartTask`] / `FollowUp`.
 
 use crate::error::CallerError;
+use crate::global_store::StoreScope;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::fs::OpenOptions;
@@ -137,25 +146,17 @@ fn legacy_workspace_uploads_dir(project_root: &Path) -> PathBuf {
     project_root.join("workspace_files")
 }
 
-/// Root of the project-local ignored upload store.
-fn project_uploads_root(project_root: &Path) -> PathBuf {
-    project_root.join(".intendant").join("uploads")
+/// Root of the upload store for a scope: the project-local ignored store
+/// (`<project>/.intendant/uploads`) or the daemon-global fallback
+/// (`<global-store>/uploads`). Same layout either way.
+fn uploads_root(scope: &StoreScope) -> PathBuf {
+    scope.store_base().join("uploads")
 }
 
 /// Directory for uploads associated with one Intendant wrapper/worker session.
-fn project_session_uploads_dir(project_root: &Path, session_id: &str) -> PathBuf {
+fn session_uploads_dir(scope: &StoreScope, session_id: &str) -> PathBuf {
     let safe_session = sanitize_name(session_id);
-    project_uploads_root(project_root).join(safe_session)
-}
-
-/// Pick the target directory for a given destination.
-fn target_dir(
-    _destination: UploadDestination,
-    _session_dir: &Path,
-    session_id: &str,
-    project_root: &Path,
-) -> PathBuf {
-    project_session_uploads_dir(project_root, session_id)
+    uploads_root(scope).join(safe_session)
 }
 
 fn ignore_rule_matches_intendant_uploads(line: &str) -> bool {
@@ -252,15 +253,19 @@ pub fn commit_upload(
     mime: &str,
     size: u64,
     destination: UploadDestination,
-    session_dir: &Path,
+    _session_dir: &Path,
     session_id: &str,
-    project_root: &Path,
+    scope: &StoreScope,
 ) -> Result<UploadDescriptor, CallerError> {
     let id = uuid::Uuid::new_v4().to_string();
     let safe_name = sanitize_name(original_name);
     let original_display_name = display_name(original_name, &safe_name);
-    ensure_project_uploads_ignored(project_root)?;
-    let dir = target_dir(destination, session_dir, session_id, project_root);
+    // Only project stores live inside a checkout; the global store needs
+    // no ignore rule (it is daemon state, not project content).
+    if let Some(project_root) = scope.project_root() {
+        ensure_project_uploads_ignored(project_root)?;
+    }
+    let dir = session_uploads_dir(scope, session_id);
     fs::create_dir_all(&dir)?;
 
     // Filename layout:
@@ -324,16 +329,17 @@ fn descriptor_extension(path: &Path) -> String {
     }
 }
 
-/// Read all descriptors currently stored for a project/session, including
+/// Read all descriptors currently stored for a scope/session, including
 /// legacy pre-.intendant upload locations. Order: newest first (by
 /// `created_at`).
-pub fn list_uploads(session_dir: &Path, project_root: &Path) -> Vec<UploadDescriptor> {
+pub fn list_uploads(session_dir: &Path, scope: &StoreScope) -> Vec<UploadDescriptor> {
     let mut out: Vec<UploadDescriptor> = Vec::new();
-    let mut dirs = vec![
-        legacy_task_uploads_dir(session_dir),
-        legacy_workspace_uploads_dir(project_root),
-    ];
-    let root = project_uploads_root(project_root);
+    let mut dirs = vec![legacy_task_uploads_dir(session_dir)];
+    if let Some(project_root) = scope.project_root() {
+        // The legacy workspace store only ever existed inside projects.
+        dirs.push(legacy_workspace_uploads_dir(project_root));
+    }
+    let root = uploads_root(scope);
     if let Ok(entries) = fs::read_dir(&root) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -366,8 +372,8 @@ pub fn list_uploads(session_dir: &Path, project_root: &Path) -> Vec<UploadDescri
 }
 
 /// Look up a single upload by id. `None` if no descriptor matches.
-pub fn find_upload(id: &str, session_dir: &Path, project_root: &Path) -> Option<UploadDescriptor> {
-    list_uploads(session_dir, project_root)
+pub fn find_upload(id: &str, session_dir: &Path, scope: &StoreScope) -> Option<UploadDescriptor> {
+    list_uploads(session_dir, scope)
         .into_iter()
         .find(|u| u.id == id)
         .or_else(|| find_task_upload_in_sibling_sessions(id, session_dir))
@@ -408,8 +414,8 @@ fn find_task_upload_in_sibling_sessions(id: &str, session_dir: &Path) -> Option<
 /// Remove an upload and its sidecar. Returns `Ok(false)` if no descriptor
 /// matched (idempotent — the caller can treat "already gone" the same as
 /// "just deleted").
-pub fn delete_upload(id: &str, session_dir: &Path, project_root: &Path) -> io::Result<bool> {
-    let Some(descriptor) = find_upload(id, session_dir, project_root) else {
+pub fn delete_upload(id: &str, session_dir: &Path, scope: &StoreScope) -> io::Result<bool> {
+    let Some(descriptor) = find_upload(id, session_dir, scope) else {
         return Ok(false);
     };
     let sidecar = descriptor
@@ -433,6 +439,10 @@ mod tests {
         f.write_all(bytes).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    fn project_scope(project_root: &Path) -> StoreScope {
+        StoreScope::Project(project_root.to_path_buf())
     }
 
     #[test]
@@ -460,7 +470,7 @@ mod tests {
             UploadDestination::Task,
             &session_dir,
             "sess-1",
-            &project_root,
+            &project_scope(&project_root),
         )
         .unwrap();
 
@@ -488,7 +498,7 @@ mod tests {
             UploadDestination::Task,
             &session_dir,
             "sess-1",
-            &project_root,
+            &project_scope(&project_root),
         )
         .unwrap();
 
@@ -508,11 +518,61 @@ mod tests {
             &project_root.join(".gitignore")
         ));
 
-        let listed = list_uploads(&session_dir, &project_root);
+        let listed = list_uploads(&session_dir, &project_scope(&project_root));
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, descriptor.id);
         assert_eq!(listed[0].name, "notes.txt");
         assert_eq!(listed[0].destination, UploadDestination::Task);
+    }
+
+    /// A projectless daemon's scope stores the same blob + sidecar layout
+    /// under `<global-store>/uploads/<session-id>/`, with no git ignore
+    /// metadata written anywhere, and the full commit/list/find/delete
+    /// cycle works unchanged.
+    #[test]
+    fn global_scope_stores_under_global_store_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let global_base = crate::global_store::global_store_root_in(tmp.path());
+        let scope = StoreScope::Global(global_base.clone());
+
+        let descriptor = commit_upload(
+            mk_tempfile(b"projectless bytes"),
+            "notes.txt",
+            "text/plain",
+            17,
+            UploadDestination::Task,
+            &session_dir,
+            "sess-global",
+            &scope,
+        )
+        .unwrap();
+
+        assert!(
+            descriptor
+                .path
+                .starts_with(global_base.join("uploads").join("sess-global")),
+            "global-scope upload must live under <global-store>/uploads/<session>, got {}",
+            descriptor.path.display()
+        );
+        assert_eq!(
+            std::fs::read(&descriptor.path).unwrap(),
+            b"projectless bytes"
+        );
+        // No project: no ignore metadata may be created.
+        assert!(!tmp.path().join(".gitignore").exists());
+        assert!(!global_base.join(".gitignore").exists());
+
+        let listed = list_uploads(&session_dir, &scope);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, descriptor.id);
+
+        let found = find_upload(&descriptor.id, &session_dir, &scope).unwrap();
+        assert_eq!(found.path, descriptor.path);
+
+        assert!(delete_upload(&descriptor.id, &session_dir, &scope).unwrap());
+        assert!(!descriptor.path.exists());
     }
 
     #[test]
@@ -534,11 +594,16 @@ mod tests {
             UploadDestination::Task,
             &first_session_dir,
             "session-1",
-            &project_root,
+            &project_scope(&project_root),
         )
         .unwrap();
 
-        let found = find_upload(&descriptor.id, &second_session_dir, &project_root).unwrap();
+        let found = find_upload(
+            &descriptor.id,
+            &second_session_dir,
+            &project_scope(&project_root),
+        )
+        .unwrap();
         assert_eq!(found.id, descriptor.id);
         assert_eq!(found.path, descriptor.path);
         assert_eq!(found.destination, UploadDestination::Task);
@@ -561,7 +626,7 @@ mod tests {
             UploadDestination::Workspace,
             &session_dir,
             "sess-1",
-            &project_root,
+            &project_scope(&project_root),
         )
         .unwrap();
 
@@ -597,7 +662,7 @@ mod tests {
             UploadDestination::Task,
             &session_dir,
             "sess-1",
-            &project_root,
+            &project_scope(&project_root),
         )
         .unwrap();
 
@@ -625,14 +690,18 @@ mod tests {
             UploadDestination::Task,
             &session_dir,
             "sess-1",
-            &project_root,
+            &project_scope(&project_root),
         )
         .unwrap();
 
-        assert!(delete_upload(&descriptor.id, &session_dir, &project_root).unwrap());
+        assert!(
+            delete_upload(&descriptor.id, &session_dir, &project_scope(&project_root)).unwrap()
+        );
         assert!(!descriptor.path.exists());
         // Second delete: also Ok, returns false.
-        assert!(!delete_upload(&descriptor.id, &session_dir, &project_root).unwrap());
+        assert!(
+            !delete_upload(&descriptor.id, &session_dir, &project_scope(&project_root)).unwrap()
+        );
     }
 
     #[test]

@@ -2087,7 +2087,7 @@ mod tests {
             crate::upload_store::UploadDestination::Task,
             &session_dir,
             "parent-thread",
-            &project_root,
+            &crate::global_store::StoreScope::Project(project_root.clone()),
         )
         .unwrap();
 
