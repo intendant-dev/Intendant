@@ -160,7 +160,7 @@ cargo build --release -p intendant   # re-embed
 ### macOS app bundle
 
 `scripts/bundle-macos.sh` compiles a small Swift wrapper
-(`macos-app/main.swift`) with `swiftc`, bundles it with the release `intendant`
+(`macos-app/*.swift`) with `swiftc`, bundles it with the release `intendant`
 binary, codesigns it (a persistent self-signed identity, ad-hoc fallback), and
 installs to `/Applications/Intendant.app`.
 

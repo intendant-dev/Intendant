@@ -12,7 +12,7 @@
 # runtime. This script solves that by:
 #
 #   1. Compiling the Rust binaries (intendant + intendant-runtime).
-#   2. Compiling a small Swift wrapper (macos-app/main.swift) that
+#   2. Compiling a small Swift wrapper (macos-app/*.swift) that
 #      hosts a WKWebView loading the dashboard and spawns the Rust
 #      daemon as a child — so TCC grants to the .app flow through
 #      to the daemon (in-process CGEvent/AX computer use) and its
@@ -95,9 +95,10 @@ done < <($LS -dump 2>/dev/null | grep -o '/[^ ]*Intendant\.app' | sort -u)
 rm -rf "$APP"
 mkdir -p "$MACOS" "$RESOURCES"
 
-# Compile Swift wrapper
+# Compile Swift wrapper (main.swift must stay first: with multiple input
+# files, swiftc only allows top-level code in a file named main.swift)
 echo "Compiling macOS app wrapper..."
-swiftc -O -o "$MACOS/Intendant" macos-app/main.swift \
+swiftc -O -o "$MACOS/Intendant" macos-app/main.swift macos-app/BackendSupervisor.swift \
     -framework Cocoa -framework WebKit
 
 # Copy Rust binaries
