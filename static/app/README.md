@@ -16,6 +16,16 @@ Rules:
   `<script type="module">` scope (the tags live in the `*-open.html` /
   `*-close.html` wrappers), so declaration order across fragments matters
   exactly as it did in the monolith: **manifest order is program order**.
+  Getting that order wrong is fatal: top-level code reading a later
+  fragment's `let`/`const`/`class` throws a TDZ `ReferenceError` that kills
+  every fragment after it (the 2026-07-09 module death). Two guards exist —
+  the assembler's eval-order lint fails the build on direct top-level
+  references to later declarations
+  (`crates/app-html-assembler/src/eval_order.rs`, heuristic + limits
+  documented there), and the module-death canary pair
+  (`30-module-canary.js` first, `59-module-alive.js` last — keep them in
+  those slots) paints a fatal `[module-death]` banner within ~3s when the
+  module dies at runtime.
 - Every `.css`/`.js`/`.html` file here must be listed in `manifest.txt`
   exactly once; the build fails otherwise — nothing is silently dropped.
 - Numeric filename prefixes are cosmetic (they keep `ls` readable);
