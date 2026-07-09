@@ -254,6 +254,10 @@ impl DisplayBackend for X11Backend {
     async fn stop_capture(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
 
+        // Teardown contract: the capture thread owns the frame channel's only
+        // sender, so the join below doubles as the bounded channel-close —
+        // the receiver is guaranteed to see `None` once this returns. Taking
+        // the state also makes double-stop / stop-without-start no-ops.
         if let Some(state) = self.capture.lock().await.take() {
             // `std::thread::join()` is blocking — parking it on the tokio
             // executor thread stalls every other async task scheduled
@@ -868,5 +872,30 @@ DP-1 disconnected (normal left inverted right x axis y axis)
     fn parse_mode_token_invalid() {
         assert_eq!(parse_mode_token("primary"), (0, 0));
         assert_eq!(parse_mode_token(""), (0, 0));
+    }
+
+    /// Real-X-server teardown-contract stress: fast start/stop cycles with
+    /// per-cycle bounded channel-close assertions, plus a post-stop linger
+    /// (see `crate::capture_stress`). Ignored by default — needs a live X
+    /// display; skips itself cleanly on a Wayland-only or headless box. Run
+    /// on operator hardware:
+    ///
+    /// ```text
+    /// cargo test -p intendant-display --lib -- --ignored real_capture_stress
+    /// ```
+    ///
+    /// Tunables: `INTENDANT_DISPLAY_STRESS_CYCLES` (default 10),
+    /// `INTENDANT_DISPLAY_STRESS_LINGER_SECS` (default 60).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "real X11 capture: needs a live DISPLAY; run via -- --ignored real_capture_stress on operator hardware"]
+    async fn x11_real_capture_stress_cycles() {
+        let backend = match X11Backend::new() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[capture-stress] skipping: no X11 display available: {e}");
+                return;
+            }
+        };
+        crate::capture_stress::run_real_backend_stress(&backend).await;
     }
 }

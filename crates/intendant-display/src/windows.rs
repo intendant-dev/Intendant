@@ -493,6 +493,10 @@ impl DisplayBackend for WindowsBackend {
     async fn stop_capture(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
 
+        // Teardown contract: the capture thread (GDI or DXGI loop) owns the
+        // frame channel's only sender, so the join below doubles as the
+        // bounded channel-close. Taking the state makes double-stop /
+        // stop-without-start no-ops.
         if let Some(state) = self.capture.lock().await.take() {
             // `JoinHandle::join` is blocking; pushing it onto the blocking
             // pool keeps the executor thread free (same rationale as the X11
@@ -2365,5 +2369,26 @@ mod tests {
         let got = map_normalized_to_virtualdesk_abs(0.5, 0.5, rect, (0, 0, 0, 0));
         assert!((0..=65535).contains(&got.0));
         assert!((0..=65535).contains(&got.1));
+    }
+
+    /// Real-desktop teardown-contract stress (GDI default path): fast
+    /// start/stop cycles with per-cycle bounded channel-close assertions,
+    /// plus a post-stop linger (see `crate::capture_stress`). Ignored by
+    /// default — needs an interactive desktop (skips itself cleanly on the
+    /// headless Session 0 desktop, where capture init fails loudly). Run on
+    /// operator hardware:
+    ///
+    /// ```text
+    /// cargo test -p intendant-display --lib -- --ignored real_capture_stress
+    /// ```
+    ///
+    /// Tunables: `INTENDANT_DISPLAY_STRESS_CYCLES` (default 10),
+    /// `INTENDANT_DISPLAY_STRESS_LINGER_SECS` (default 60).
+    /// `INTENDANT_WINDOWS_CAPTURE=dxgi` stresses the DXGI path instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "real Windows desktop capture: needs an interactive desktop; run via -- --ignored real_capture_stress on operator hardware"]
+    async fn windows_real_capture_stress_cycles() {
+        let backend = WindowsBackend::new();
+        crate::capture_stress::run_real_backend_stress(&backend).await;
     }
 }
