@@ -263,6 +263,11 @@ impl DisplayBackend for WaylandBackend {
     async fn stop_capture(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
 
+        // Teardown contract: the PipeWire thread owns every sender clone of
+        // the frame channel (the process-callback clone lives in the stream
+        // listener, dropped when the thread's mainloop returns), so the join
+        // below doubles as the bounded channel-close. Taking the state makes
+        // double-stop / stop-without-start no-ops.
         if let Some(mut ps) = self.portal_session.lock().await.take() {
             if let Some(handle) = ps.pw_thread.take() {
                 // Same rationale as x11.rs: don't block the executor on

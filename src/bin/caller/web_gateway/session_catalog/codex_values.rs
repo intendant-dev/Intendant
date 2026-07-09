@@ -442,7 +442,12 @@ pub(crate) fn codex_thread_rollback_anchor(
     Some((item_id, position))
 }
 
-pub(crate) fn is_codex_injected_user_text(text: &str) -> bool {
+/// Harness-injected "user" text no human actually typed — Codex wrappers,
+/// Claude Code local-command plumbing, notification envelopes. One shared
+/// vocabulary for every external-transcript surface (Codex history, Codex
+/// catalog rows, Claude Code transcript replay): rendering these verbatim
+/// puts `<local-command-caveat>` rows in the Activity log.
+pub(crate) fn is_injected_external_user_text(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("# AGENTS.md instructions for ")
         || trimmed.starts_with("<turn_aborted>")
@@ -451,11 +456,18 @@ pub(crate) fn is_codex_injected_user_text(text: &str) -> bool {
         || trimmed.starts_with("<task-notification>")
         || trimmed.starts_with("<command-name>")
         || trimmed.starts_with("<command-message>")
+        || trimmed.starts_with("<command-args>")
+        || trimmed.starts_with("<local-command-caveat>")
         || trimmed.starts_with("<local-command-stdout>")
+        || trimmed.starts_with("<local-command-stderr>")
         || trimmed.starts_with("<bash-input>")
         || trimmed.starts_with("<bash-stdout>")
         || trimmed.starts_with("<bash-stderr>")
         || trimmed.starts_with("<user_shell_command>")
+}
+
+pub(crate) fn is_codex_injected_user_text(text: &str) -> bool {
+    is_injected_external_user_text(text)
 }
 
 pub(crate) fn codex_thread_display_name(value: Option<String>) -> Option<String> {

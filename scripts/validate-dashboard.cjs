@@ -2016,6 +2016,7 @@ class BrowserHarness {
         opts.timeoutMs,
         `page did not become ready at ${opts.url}`,
       );
+      await this.assertModuleAlive(opts.timeoutMs);
       for (const selector of opts.selectors) {
         await this.waitForSelector(selector, opts.timeoutMs);
       }
@@ -2108,6 +2109,48 @@ class BrowserHarness {
         alive: false,
         reason: error.message || String(error),
       };
+    }
+  }
+
+  async assertModuleAlive(timeoutMs) {
+    // Module-death canary: the dashboard SPA is ONE <script type="module">
+    // (static/app/ fragments concatenated); an uncaught top-level throw
+    // kills every fragment after it while the page still half-renders — the
+    // 2026-07-09 cross-fragment TDZ did exactly that. The last fragment
+    // (static/app/59-module-alive.js) sets window.__intendantModuleAlive;
+    // require it before probing what may be a half-dead page. Pages whose
+    // module script predates the canary (older daemons) are skipped.
+    const shipsCanary = await this.evaluate(
+      `Array.from(document.querySelectorAll('script[type="module"]'))` +
+        `.some((s) => (s.textContent || '').includes('__intendantModuleAlive'))`,
+    );
+    if (!shipsCanary) {
+      return;
+    }
+    let died = false;
+    await waitUntil(
+      async () => {
+        if (await this.evaluate('window.__intendantModuleAlive === true')) {
+          return true;
+        }
+        // The in-page canary declares death after ~3s; stop waiting then.
+        died = Boolean(
+          await this.evaluate(
+            `document.documentElement.dataset.intendantModuleDead === '1'`,
+          ),
+        );
+        return died;
+      },
+      timeoutMs,
+      'dashboard module never set window.__intendantModuleAlive ' +
+        '([module-death]: the <script type="module"> died during evaluation; ' +
+        'check the page console for the first uncaught error)',
+    );
+    if (died) {
+      throw new Error(
+        'dashboard module died during evaluation ([module-death] banner is up; ' +
+          'the first uncaught page console error names the throwing code)',
+      );
     }
   }
 
