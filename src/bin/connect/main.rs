@@ -35,6 +35,8 @@ mod fleet;
 pub(crate) use fleet::*;
 mod rendezvous;
 pub(crate) use rendezvous::*;
+mod dns;
+pub(crate) use dns::*;
 
 const PROTOCOL: &str = "intendant-connect-rendezvous-v1";
 const CLAIM_PROTOCOL: &str = "intendant-connect-claim-v1";
@@ -49,8 +51,13 @@ const CLAIM_PROTOCOL_V2: &str = "intendant-connect-claim-v2";
 const UNCLAIM_PROTOCOL: &str = "intendant-connect-unclaim-v1";
 /// Freshness window for daemon-signed unclaim payloads: signatures bind a
 /// timestamp so a captured release cannot be replayed to evict a future
-/// re-claim.
+/// re-claim. Fleet-DNS publishes reuse the same window.
 const UNCLAIM_MAX_SKEW_MS: u64 = 5 * 60 * 1000;
+/// Daemon-signed fleet-DNS publishes: address records for the daemon's
+/// own name, and short-lived ACME DNS-01 TXT tokens. The registered
+/// identity key is the only authority over a name (docs/src/trust-tiers.md).
+const DNS_PUBLISH_PROTOCOL: &str = "intendant-connect-dns-publish-v1";
+const DNS_ACME_PROTOCOL: &str = "intendant-connect-dns-acme-v1";
 const COOKIE_NAME: &str = "ic_session";
 const SESSION_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const OFFER_TIMEOUT_MS: u64 = 30_000;
@@ -90,6 +97,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !had_keys {
         save_store(&config.data_file, &store).map_err(|e| format!("persist service keys: {e}"))?;
     }
+    // Fleet DNS: build the zone, hydrate persisted records, and bind the
+    // sockets BEFORE serving — a misconfigured DNS listener must fail the
+    // whole startup loudly, not limp along HTTP-only.
+    let dns_zone = match (&config.dns_zone, &config.dns_ns_name, &config.dns_listen) {
+        (Some(zone_name), Some(ns_name), Some(_listen)) => {
+            let zone = Arc::new(FleetZone::new(zone_name, ns_name)?);
+            for entry in &store.dns_records {
+                let addresses: Vec<std::net::IpAddr> = entry
+                    .addresses
+                    .iter()
+                    .filter_map(|value| value.parse().ok())
+                    .collect();
+                if let Err(error) = zone.set_daemon_addresses(&entry.daemon_id, &addresses) {
+                    eprintln!(
+                        "[connect] skipping persisted dns record for {}: {error}",
+                        entry.daemon_id
+                    );
+                }
+            }
+            Some(zone)
+        }
+        _ => None,
+    };
     let state = Arc::new(AppState {
         config: config.clone(),
         webauthn,
@@ -109,10 +139,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         claim_codes: Mutex::new(HashMap::new()),
         rate_limits: Mutex::new(HashMap::new()),
         active_sessions: Mutex::new(HashMap::new()),
+        dns_zone,
     });
 
     tokio::spawn(presence_alert_monitor(state.clone()));
     tokio::spawn(handle_reclaim_monitor(state.clone()));
+    if let (Some(zone), Some(listen)) = (state.dns_zone.clone(), state.config.dns_listen) {
+        // Fail startup on an unbindable DNS listener (privileges, port
+        // in use); afterwards the server runs until process exit.
+        let server = bind_fleet_dns(zone, listen).await?;
+        eprintln!(
+            "[connect] fleet dns serving {} on {listen} (udp+tcp)",
+            state.config.dns_zone.as_deref().unwrap_or_default()
+        );
+        tokio::spawn(async move {
+            if let Err(error) = server.await {
+                eprintln!("[connect] fleet dns server exited: {error}");
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/", get(landing_ui))
@@ -185,6 +230,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/daemon/error", post(daemon_error))
         .route("/api/daemon/claim-proof", post(daemon_claim_proof))
         .route("/api/daemon/unclaim", post(daemon_unclaim))
+        .route("/api/dns/publish", post(dns_publish))
+        .route("/api/dns/acme-challenge", post(dns_acme_challenge))
         .route("/api/daemon/dry", post(daemon_dry))
         .route("/api/browser/offer", post(browser_offer))
         .route("/api/browser/ice", post(browser_ice))
@@ -223,6 +270,17 @@ struct ServiceConfig {
     /// what makes the landing one-liner's claim story reachable by
     /// someone who has never seen the operator token.
     open_daemon_registration: bool,
+    /// Fleet DNS (docs/src/self-hosted-rendezvous.md): the delegated
+    /// subzone this service answers for authoritatively (e.g.
+    /// `fleet.intendant.dev`). All three `dns_*` values must be set for
+    /// the DNS server and publish endpoints to switch on; default off.
+    dns_zone: Option<String>,
+    /// The zone's NS host as delegated in the parent zone (e.g.
+    /// `ns-fleet.intendant.dev`) — served in the apex SOA/NS records.
+    dns_ns_name: Option<String>,
+    /// UDP+TCP listen address for the DNS server (e.g. `0.0.0.0:53`;
+    /// binding :53 unprivileged needs CAP_NET_BIND_SERVICE).
+    dns_listen: Option<SocketAddr>,
 }
 
 impl ServiceConfig {
@@ -253,6 +311,24 @@ impl ServiceConfig {
         let mut open_daemon_registration = std::env::var("INTENDANT_CONNECT_OPEN_REGISTRATION")
             .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
             .unwrap_or(false);
+        let mut dns_zone = std::env::var("INTENDANT_CONNECT_DNS_ZONE")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let mut dns_ns_name = std::env::var("INTENDANT_CONNECT_DNS_NS_NAME")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let mut dns_listen: Option<SocketAddr> = match std::env::var("INTENDANT_CONNECT_DNS_LISTEN")
+        {
+            Ok(value) if !value.trim().is_empty() => Some(
+                value
+                    .trim()
+                    .parse()
+                    .map_err(|e| format!("invalid INTENDANT_CONNECT_DNS_LISTEN {value:?}: {e}"))?,
+            ),
+            _ => None,
+        };
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -285,6 +361,20 @@ impl ServiceConfig {
                 "--open-registration" => {
                     open_daemon_registration = true;
                 }
+                "--dns-zone" => {
+                    dns_zone = Some(args.next().ok_or("--dns-zone requires a zone name")?);
+                }
+                "--dns-ns-name" => {
+                    dns_ns_name = Some(args.next().ok_or("--dns-ns-name requires a host name")?);
+                }
+                "--dns-listen" => {
+                    let value = args.next().ok_or("--dns-listen requires an address")?;
+                    dns_listen = Some(
+                        value
+                            .parse()
+                            .map_err(|e| format!("invalid --dns-listen {value:?}: {e}"))?,
+                    );
+                }
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -306,6 +396,19 @@ impl ServiceConfig {
             }
         });
         let cookie_secure = parsed_origin.scheme() == "https";
+        // Fleet DNS is all-or-nothing: a partial config would serve a
+        // zone nobody delegated or delegate a zone nobody serves.
+        let dns_parts = [
+            dns_zone.is_some(),
+            dns_ns_name.is_some(),
+            dns_listen.is_some(),
+        ];
+        if dns_parts.iter().any(|set| *set) && !dns_parts.iter().all(|set| *set) {
+            return Err(
+                "fleet dns needs all of --dns-zone, --dns-ns-name, and --dns-listen (or none)"
+                    .to_string(),
+            );
+        }
         Ok(Self {
             listen,
             public_origin: trim_trailing_slash(&public_origin),
@@ -316,6 +419,9 @@ impl ServiceConfig {
             invite_required,
             open_daemon_registration,
             cookie_secure,
+            dns_zone,
+            dns_ns_name,
+            dns_listen,
         })
     }
 }
@@ -326,7 +432,10 @@ fn print_help() {
          \n\
          Env: INTENDANT_CONNECT_LISTEN, INTENDANT_CONNECT_ORIGIN, INTENDANT_CONNECT_RP_ID,\n\
               INTENDANT_CONNECT_STATIC_ROOT, INTENDANT_CONNECT_DATA_FILE, INTENDANT_CONNECT_TOKEN,\n\
-              INTENDANT_CONNECT_INVITE_REQUIRED, INTENDANT_CONNECT_OPEN_REGISTRATION"
+              INTENDANT_CONNECT_INVITE_REQUIRED, INTENDANT_CONNECT_OPEN_REGISTRATION,\n\
+              INTENDANT_CONNECT_DNS_ZONE, INTENDANT_CONNECT_DNS_NS_NAME, INTENDANT_CONNECT_DNS_LISTEN\n\
+              (--dns-zone fleet.example.com --dns-ns-name ns-fleet.example.com --dns-listen 0.0.0.0:53\n\
+               enable the embedded fleet DNS server; all three or none)"
     );
 }
 
@@ -372,6 +481,22 @@ struct AppState {
     vapid: ring::signature::EcdsaKeyPair,
     log_key: ring::signature::EcdsaKeyPair,
     push_http: reqwest::Client,
+    /// The fleet DNS zone when the `dns_*` config group is set — the
+    /// live record table the embedded server answers from (hydrated
+    /// from `Store::dns_records` at startup).
+    dns_zone: Option<Arc<FleetZone>>,
+}
+
+/// A daemon's published fleet-DNS addresses (`d-<label>.<zone>` A/AAAA).
+/// ACME TXT challenges are deliberately NOT persisted — they live only
+/// in the in-memory zone and self-expire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DnsRecordEntry {
+    daemon_id: String,
+    #[serde(default)]
+    addresses: Vec<String>,
+    #[serde(default)]
+    updated_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -380,6 +505,8 @@ struct Store {
     users: Vec<UserRecord>,
     #[serde(default)]
     daemons: Vec<DaemonRecord>,
+    #[serde(default)]
+    dns_records: Vec<DnsRecordEntry>,
     #[serde(default)]
     fleet_targets: Vec<FleetTargetRecord>,
     #[serde(default)]

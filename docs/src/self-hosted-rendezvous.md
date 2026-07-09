@@ -34,6 +34,9 @@ cargo build --release --bin intendant-connect
 | `--data-file` | `INTENDANT_CONNECT_DATA_FILE` | JSON state (accounts, claims, fleet records) |
 | `--daemon-token` | `INTENDANT_CONNECT_TOKEN` | Bearer token daemons present on the polling endpoints; also the admin-API credential |
 | `--open-registration` | `INTENDANT_CONNECT_OPEN_REGISTRATION` | Let daemons register/poll without the token (rate-limited; unclaimed records expire after a day; the gate moves to claim time). The token keeps guarding the admin API. This is what makes the landing one-liner claimable by people who never saw the token |
+| `--dns-zone` | `INTENDANT_CONNECT_DNS_ZONE` | Fleet DNS: the delegated subzone this service answers for authoritatively (see below). All three `--dns-*` values or none |
+| `--dns-ns-name` | `INTENDANT_CONNECT_DNS_NS_NAME` | The NS host the parent zone delegates to (served in the apex SOA/NS) |
+| `--dns-listen` | `INTENDANT_CONNECT_DNS_LISTEN` | UDP+TCP bind for the DNS server, e.g. `0.0.0.0:53` |
 
 The service speaks plain HTTP; terminate TLS in front of it (nginx,
 Caddy, a cloud load balancer). WebAuthn requires the public origin to be
@@ -59,6 +62,47 @@ connect.example.com {
 	}
 }
 ```
+
+## Fleet DNS: real certificates for daemons
+
+The convenient-direct-path option ([Trust Tiers](./trust-tiers.md)):
+delegate one subzone to the service and every registered daemon gets a
+real name — `d-<hash>.<zone>`, an opaque sha256-derived label (these
+names land in public CT logs) — plus a one-click Let's Encrypt
+certificate from its Access card. The daemon publishes its own
+addresses (LAN addresses are the point: public name + real certificate
++ private address gives a warning-free padlock on your own network with
+no port forwarding), answers the ACME DNS-01 challenge through the
+service with daemon-signed requests, and keeps its private keys local.
+The service's DNS authority covers exactly the subzone and nothing else
+— the zero-authority doctrine applied to DNS.
+
+Setup, one time:
+
+1. In the parent zone (wherever `example.com` is hosted), add two
+   records: `A ns-fleet.example.com → <this box's public IP>` and
+   `NS fleet.example.com → ns-fleet.example.com`. Pin that IP (an
+   elastic/static address) — replacing the box means keeping it.
+2. Open 53/udp and 53/tcp to the box. Binding :53 as a non-root service
+   needs `AmbientCapabilities=CAP_NET_BIND_SERVICE` in the systemd unit.
+3. Run with `--dns-zone fleet.example.com --dns-ns-name
+   ns-fleet.example.com --dns-listen 0.0.0.0:53`.
+
+The register response then carries each daemon's `fleet_dns` name; the
+daemon's Connect card shows it with a **Get a real certificate** button.
+Address records persist in the state file and follow the daemon-record
+lifecycle (they survive claim/release; the stale-unclaimed sweep drops
+them). ACME TXT challenges are in-memory and self-expire. Posture:
+authoritative-only, `Refused` outside the zone, no AXFR, RFC 8482
+minimal `ANY`, 60 s TTLs. Daemons validating against Let's Encrypt
+*staging* set `INTENDANT_ACME_DIRECTORY` to the staging directory URL.
+Honest caveats: a single NS is a SPOF for fleet *names* (enrolled
+browsers keep working via remembered routes; renewals retry), Let's
+Encrypt rate-limits new certificates per registered domain (~50/week —
+request a limit raise before any large fleet), and a hostile zone
+operator could mint certificates for fleet names — key verification
+protects enrolled browsers, and CT logs make mis-issuance public
+evidence.
 
 ## Pointing daemons at it
 

@@ -366,6 +366,12 @@ pub(crate) async fn daemon_register(
         let now = now_unix_ms();
         for stale_id in sweep_stale_unclaimed_daemons(&mut store, now) {
             claim_codes.remove(&stale_id);
+            // Names follow the daemon record: a hard-deleted record
+            // takes its fleet-DNS records with it.
+            store.dns_records.retain(|r| r.daemon_id != stale_id);
+            if let Some(zone) = state.dns_zone.as_ref() {
+                zone.remove_daemon(&stale_id);
+            }
         }
         let active_claim_hashes = active_claim_code_hashes(&store, &daemon_id, now);
         // Applies the unclaimed-record claim-code policy: a daemon-minted
@@ -487,6 +493,14 @@ pub(crate) async fn daemon_register(
         "claim_url": claim_url,
         "daemon_public_key": daemon_public_key,
         "observed_ip": observed_ip,
+        // Fleet DNS hint: the daemon's derived name under the delegated
+        // zone, when this rendezvous serves one. The daemon uses it to
+        // mint a real certificate (ACME DNS-01 via /api/dns/*).
+        "fleet_dns": state.dns_zone.as_ref().and_then(|zone| {
+            zone.daemon_fqdn(&daemon_id).map(|name| {
+                json!({ "zone": zone.origin_utf8(), "name": name })
+            })
+        }),
     })))
 }
 
@@ -1332,6 +1346,281 @@ pub(crate) async fn daemon_unclaim(
     Ok(Json(json!({ "ok": true, "changed": true })))
 }
 
+/* ── Fleet DNS: daemon-signed record publishes ──
+The embedded authoritative server (dns.rs) answers for the delegated
+subzone; these endpoints are the only way records get into it. Authority
+model: a daemon's REGISTERED identity key is the sole authority over its
+own derived name (`d-<hash>.<zone>`) — same signature + freshness
+discipline as unclaim, same key pinning. Names follow the daemon RECORD
+lifecycle (they survive claim/unclaim — the name serves the daemon's
+certificate, not the fleet binding) and are hard-dropped only when the
+stale-unclaimed sweep deletes the record itself. */
+
+pub(crate) fn dns_publish_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+    addresses_csv: &str,
+) -> String {
+    format!(
+        "{DNS_PUBLISH_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{addresses_csv}\n"
+    )
+}
+
+pub(crate) fn dns_acme_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+    txt_value: &str,
+) -> String {
+    format!(
+        "{DNS_ACME_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{txt_value}\n"
+    )
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DnsPublishRequest {
+    protocol: String,
+    daemon_id: String,
+    daemon_public_key: String,
+    issued_at_unix_ms: u64,
+    signature: String,
+    /// Routable unicast addresses for the daemon's name; empty clears.
+    /// Private-range addresses are deliberately legitimate (public name
+    /// + real certificate + LAN address is the point).
+    #[serde(default)]
+    addresses: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DnsAcmeChallengeRequest {
+    protocol: String,
+    daemon_id: String,
+    daemon_public_key: String,
+    issued_at_unix_ms: u64,
+    signature: String,
+    /// The DNS-01 TXT value to serve; empty together with `clear`.
+    #[serde(default)]
+    txt_value: String,
+    /// Remove this daemon's challenge records instead of adding one.
+    #[serde(default)]
+    clear: bool,
+}
+
+/// The shared front half of both DNS endpoints: bearer gate, rate
+/// limit, protocol + freshness checks, and the registered-key pin.
+/// Returns the daemon record the signature must verify against.
+async fn dns_request_daemon(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    rate_key: &str,
+    protocol: &str,
+    expected_protocol: &str,
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+) -> ApiResult<DaemonRecord> {
+    if state.dns_zone.is_none() {
+        return Err(ApiError::not_found("fleet dns is not enabled on this rendezvous"));
+    }
+    require_daemon_auth(state, headers)?;
+    check_rate_limit(state, headers, rate_key, 30, 60_000).await?;
+    if protocol != expected_protocol {
+        return Err(ApiError::bad_request("unsupported dns publish protocol"));
+    }
+    let now = now_unix_ms();
+    if now.abs_diff(issued_at_unix_ms) > UNCLAIM_MAX_SKEW_MS {
+        return Err(ApiError::bad_request(
+            "dns publish payload is stale — check the daemon clock and retry",
+        ));
+    }
+    let daemon = {
+        let store = state.store.lock().await;
+        store
+            .daemons
+            .iter()
+            .find(|d| d.daemon_id == daemon_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("daemon not found"))?
+    };
+    if daemon_public_key.trim() != daemon.daemon_public_key {
+        return Err(ApiError::bad_request(
+            "daemon_public_key does not match the registered key",
+        ));
+    }
+    Ok(daemon)
+}
+
+/// A publishable address: routable unicast only. Loopback, unspecified,
+/// multicast, broadcast, and link-local are refused — they are never a
+/// reachable daemon and some make cute mischief primitives.
+fn publishable_address(value: &str) -> Result<std::net::IpAddr, String> {
+    let ip: std::net::IpAddr = value
+        .trim()
+        .parse()
+        .map_err(|_| format!("not an IP address: {value:?}"))?;
+    let refused = match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_link_local()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    };
+    if refused {
+        return Err(format!("{ip} is not a publishable unicast address"));
+    }
+    Ok(ip)
+}
+
+pub(crate) async fn dns_publish(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DnsPublishRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let daemon_id = body.daemon_id.trim().to_string();
+    let daemon = dns_request_daemon(
+        &state,
+        &headers,
+        "dns_publish",
+        &body.protocol,
+        DNS_PUBLISH_PROTOCOL,
+        &daemon_id,
+        &body.daemon_public_key,
+        body.issued_at_unix_ms,
+    )
+    .await?;
+    if body.addresses.len() > 8 {
+        return Err(ApiError::bad_request("too many addresses (max 8)"));
+    }
+    let mut addresses = Vec::with_capacity(body.addresses.len());
+    for value in &body.addresses {
+        addresses.push(publishable_address(value).map_err(ApiError::bad_request)?);
+    }
+    // The signature covers the exact address list (trimmed, as parsed).
+    let addresses_csv = addresses
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let payload = dns_publish_signing_payload(
+        &daemon_id,
+        &daemon.daemon_public_key,
+        body.issued_at_unix_ms,
+        &addresses_csv,
+    );
+    if !verify_ed25519_b64u(
+        &daemon.daemon_public_key,
+        payload.as_bytes(),
+        body.signature.trim(),
+    ) {
+        return Err(ApiError::bad_request("dns publish signature invalid"));
+    }
+    let zone = state
+        .dns_zone
+        .as_ref()
+        .expect("checked in dns_request_daemon")
+        .clone();
+    let name = zone
+        .daemon_fqdn(&daemon_id)
+        .ok_or_else(|| ApiError::bad_request("daemon id does not derive a DNS label"))?;
+    zone.set_daemon_addresses(&daemon_id, &addresses)
+        .map_err(ApiError::bad_request)?;
+    let now = now_unix_ms();
+    {
+        let mut store = state.store.lock().await;
+        store.dns_records.retain(|r| r.daemon_id != daemon_id);
+        if !addresses.is_empty() {
+            store.dns_records.push(DnsRecordEntry {
+                daemon_id: daemon_id.clone(),
+                addresses: addresses.iter().map(|ip| ip.to_string()).collect(),
+                updated_unix_ms: now,
+            });
+        }
+        audit(
+            &mut store,
+            "dns_publish",
+            daemon.owner_user_id,
+            Some(daemon_id.clone()),
+            json!({ "name": name, "addresses": addresses.len() }),
+        );
+        persist_locked(&state, &store)?;
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "zone": zone.origin_utf8(),
+        "name": name,
+        "addresses": addresses.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+    })))
+}
+
+pub(crate) async fn dns_acme_challenge(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DnsAcmeChallengeRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let daemon_id = body.daemon_id.trim().to_string();
+    let daemon = dns_request_daemon(
+        &state,
+        &headers,
+        "dns_acme",
+        &body.protocol,
+        DNS_ACME_PROTOCOL,
+        &daemon_id,
+        &body.daemon_public_key,
+        body.issued_at_unix_ms,
+    )
+    .await?;
+    let txt_value = body.txt_value.trim().to_string();
+    if body.clear != txt_value.is_empty() {
+        return Err(ApiError::bad_request(
+            "set a txt_value, or clear=true with none — not both",
+        ));
+    }
+    let payload = dns_acme_signing_payload(
+        &daemon_id,
+        &daemon.daemon_public_key,
+        body.issued_at_unix_ms,
+        &txt_value,
+    );
+    if !verify_ed25519_b64u(
+        &daemon.daemon_public_key,
+        payload.as_bytes(),
+        body.signature.trim(),
+    ) {
+        return Err(ApiError::bad_request("dns acme signature invalid"));
+    }
+    let zone = state
+        .dns_zone
+        .as_ref()
+        .expect("checked in dns_request_daemon")
+        .clone();
+    let name = zone
+        .daemon_fqdn(&daemon_id)
+        .ok_or_else(|| ApiError::bad_request("daemon id does not derive a DNS label"))?;
+    if body.clear {
+        zone.clear_acme_txt(&daemon_id);
+    } else {
+        zone.set_acme_txt(&daemon_id, &txt_value, now_unix_ms())
+            .map_err(ApiError::bad_request)?;
+    }
+    // TXT challenges are in-memory + self-expiring: no persist, and no
+    // audit noise — the public CT log is the durable record of issuance.
+    Ok(Json(json!({
+        "ok": true,
+        "zone": zone.origin_utf8(),
+        "name": format!("_acme-challenge.{name}"),
+        "cleared": body.clear,
+    })))
+}
+
 pub(crate) fn verify_ed25519_b64u(public_key_b64u: &str, payload: &[u8], signature_b64u: &str) -> bool {
     let Ok(public_key) = b64u_decode(public_key_b64u) else {
         return false;
@@ -1672,6 +1961,43 @@ mod tests {
             unclaim_signing_payload("daemon-1", "PubKey", 1_700_000_000_000),
             "intendant-connect-unclaim-v1\ndaemon-1\nPubKey\n1700000000000\n"
         );
+        // Twin-pinned in the daemon (bin/caller/fleet_cert.rs) — change
+        // both together.
+        assert_eq!(
+            dns_publish_signing_payload(
+                "daemon-1",
+                "PubKey",
+                1_700_000_000_000,
+                "192.168.1.50,2001:db8::7"
+            ),
+            "intendant-connect-dns-publish-v1\ndaemon-1\nPubKey\n1700000000000\n192.168.1.50,2001:db8::7\n"
+        );
+        assert_eq!(
+            dns_acme_signing_payload("daemon-1", "PubKey", 1_700_000_000_000, "tok-value"),
+            "intendant-connect-dns-acme-v1\ndaemon-1\nPubKey\n1700000000000\ntok-value\n"
+        );
+    }
+
+    #[test]
+    fn publishable_addresses_are_routable_unicast_only() {
+        assert!(publishable_address("192.168.1.50").is_ok());
+        assert!(publishable_address("10.0.0.9").is_ok());
+        assert!(publishable_address("203.0.113.7").is_ok());
+        assert!(publishable_address("2001:db8::7").is_ok());
+        for refused in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "169.254.1.1",
+            "::1",
+            "::",
+            "ff02::1",
+            "fe80::1",
+            "not-an-ip",
+        ] {
+            assert!(publishable_address(refused).is_err(), "{refused} should be refused");
+        }
     }
 
     /// The v2 property the whole exercise exists for: the signature is
@@ -1757,6 +2083,7 @@ mod tests {
         let expired = "achieve-acid-acoustic-acquire-across-act-action";
         let claimed = "actor-actress-actual-adapt-add-addict-address";
         let store = Store {
+            dns_records: Vec::new(),
             users: Vec::new(),
             daemons: vec![
                 daemon_record("fresh", None, Some(fresh), Some(now)),

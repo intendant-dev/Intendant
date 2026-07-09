@@ -429,6 +429,15 @@ pub(crate) async fn handle_access_iam_state(
 /// a code exists and when it expires.
 pub(crate) fn access_connect_status_response_value() -> serde_json::Value {
     let status = crate::connect_rendezvous::status_snapshot();
+    let fleet_cert = crate::fleet_cert::status_snapshot();
+    let fleet_cert_value = serde_json::json!({
+        "zone": fleet_cert.zone,
+        "name": fleet_cert.name,
+        "state": fleet_cert.state,
+        "not_after_unix_ms": fleet_cert.not_after_unix_ms,
+        "last_error": fleet_cert.last_error,
+        "addresses": fleet_cert.addresses,
+    });
     serde_json::json!({
         "schema_version": 1,
         "configured": status.configured,
@@ -448,6 +457,7 @@ pub(crate) fn access_connect_status_response_value() -> serde_json::Value {
         "claim_code_expires_unix_ms": status.claim_code_expires_unix_ms,
         "bootstrap": status.bootstrap,
         "default_rendezvous_url": crate::project::DEFAULT_CONNECT_RENDEZVOUS_URL,
+        "fleet_cert": fleet_cert_value,
     })
 }
 

@@ -481,6 +481,42 @@ pub(crate) fn control_frame_response(
                         })),
                     }
                 }
+                "api_fleet_cert_request" => {
+                    // Optional explicit addresses; default = every
+                    // routable local address (the LAN is the point).
+                    let addresses: Vec<String> = params
+                        .as_ref()
+                        .and_then(|p| p.get("addresses"))
+                        .and_then(|v| v.as_array())
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .filter(|list: &Vec<String>| !list.is_empty())
+                        .unwrap_or_else(crate::fleet_cert::default_publish_addresses);
+                    if crate::fleet_cert::status_snapshot().name.is_none() {
+                        return Some(dashboard_control_error_response(
+                            id,
+                            "this daemon has no fleet name — enable Connect against a \
+                             rendezvous with fleet DNS and let it register first",
+                        ));
+                    }
+                    let spawned_addresses = addresses.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            crate::fleet_cert::request_certificate(spawned_addresses).await
+                        {
+                            eprintln!("[fleet-cert] request failed: {error}");
+                        }
+                    });
+                    Some(serde_json::json!({
+                        "t": "response",
+                        "id": id,
+                        "ok": true,
+                        "result": { "started": true, "addresses": addresses },
+                    }))
+                }
                 "api_access_org_trust"
                 | "api_access_org_revoke"
                 | "api_access_org_issue"

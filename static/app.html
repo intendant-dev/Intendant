@@ -50541,6 +50541,26 @@ async function accessSetHostedCeiling(roleId) {
   renderAccessAdminSummaries();
 }
 
+async function accessFleetCertRequest() {
+  try {
+    const resp = await dashboardJsonFetch('api_fleet_cert_request', {}, () => Promise.reject(new Error('fleet certificate requests ride the control channel — connect to the daemon first')), 'api_fleet_cert_request', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    showControlToast?.('success', 'Certificate request started — publishing DNS records and answering the Let’s Encrypt challenge (usually under a minute).');
+  } catch (err) {
+    showControlToast?.('error', err?.message || 'Certificate request failed');
+  }
+  // Poll the card a few times while the async flow runs.
+  for (const delay of [5000, 15000, 40000]) {
+    setTimeout(() => {
+      refreshAccessConnectStatus({ silent: true }).catch(() => null);
+      renderAccessAdminSummaries();
+    }, delay);
+  }
+  await refreshAccessConnectStatus({ silent: true }).catch(() => null);
+  renderAccessAdminSummaries();
+}
+
 async function accessConnectUnclaim() {
   try {
     const resp = await dashboardJsonFetch('api_access_connect_unclaim', {}, () => authedFetch('/api/access/connect/unclaim', {
@@ -53936,6 +53956,60 @@ function renderAccessConnectCard() {
     err.className = 'acc-connect-warn';
     err.textContent = `Last error: ${status.last_error}`;
     card.appendChild(err);
+  }
+
+  // Fleet certificate (docs/src/trust-tiers.md, the convenient direct
+  // path): when the rendezvous serves a fleet DNS zone, this daemon owns
+  // a real name — one click publishes its addresses and mints a
+  // Let's Encrypt certificate, so the direct dashboard gets a warning-free
+  // padlock (LAN address + public name included).
+  const fleetCert = status.fleet_cert || {};
+  if (fleetCert.name) {
+    const row = document.createElement('div');
+    row.className = 'acc-grant-flow-actions';
+    const label = document.createElement('span');
+    label.className = 'acc-principal-kind';
+    const validUntil = fleetCert.not_after_unix_ms
+      ? new Date(Number(fleetCert.not_after_unix_ms)).toLocaleDateString()
+      : '';
+    label.textContent = `Fleet name: ${fleetCert.name}`;
+    label.title = fleetCert.addresses?.length
+      ? `Resolves to ${fleetCert.addresses.join(', ')} (published by this daemon; LAN addresses are fine — the certificate makes the padlock, not the address).`
+      : 'No addresses published yet — requesting a certificate publishes this daemon’s routable addresses first.';
+    row.appendChild(label);
+    const chip = document.createElement('span');
+    if (fleetCert.state === 'valid') {
+      chip.className = 'acc-chip route-webrtc';
+      chip.textContent = validUntil ? `certificate ✓ until ${validUntil}` : 'certificate ✓';
+      chip.title = 'A browser-trusted Let’s Encrypt certificate is serving for this name — open the direct dashboard at https://' + fleetCert.name + (window.location.port ? ':' + window.location.port : '') + ' without warnings. Renewals are automatic.';
+    } else if (fleetCert.state === 'requesting') {
+      chip.className = 'acc-chip route-remembered';
+      chip.textContent = 'requesting…';
+      chip.title = 'Publishing DNS records and answering the Let’s Encrypt challenge — usually under a minute.';
+    } else if (fleetCert.state === 'error') {
+      chip.className = 'acc-chip route-danger';
+      chip.textContent = 'certificate error';
+      chip.title = fleetCert.last_error || 'The last certificate request failed.';
+    }
+    if (chip.textContent) row.appendChild(chip);
+    const canRequest = dashboardControlTransport?.lastStatus?.api_fleet_cert_request_available !== false;
+    if (fleetCert.state !== 'requesting' && fleetCert.state !== 'valid') {
+      const request = document.createElement('button');
+      request.type = 'button';
+      request.className = 'acc-btn primary';
+      request.textContent = 'Get a real certificate';
+      request.title = 'Publishes this daemon’s routable addresses under its fleet name and mints a Let’s Encrypt certificate (DNS-01 through the rendezvous — the private key never leaves this machine). The name lands in public CT logs; it is an opaque hash for that reason.';
+      request.disabled = !canRequest;
+      request.addEventListener('click', () => accessFleetCertRequest());
+      row.appendChild(request);
+    }
+    if (fleetCert.state === 'error' && fleetCert.last_error) {
+      const err = document.createElement('div');
+      err.className = 'acc-connect-warn';
+      err.textContent = `Certificate: ${fleetCert.last_error}`;
+      card.appendChild(err);
+    }
+    card.appendChild(row);
   }
 
   // The reveal: the twelve words, full-width, with where to type them.
