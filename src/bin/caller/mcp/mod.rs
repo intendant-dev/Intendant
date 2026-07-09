@@ -2120,7 +2120,7 @@ fn resolve_refs(value: &mut serde_json::Value, defs: &serde_json::Map<String, se
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::autonomy::{self, AutonomyState};
     use tempfile::tempdir;
@@ -2161,9 +2161,9 @@ mod tests {
         )))
     }
 
-    struct TestDisplayBackend {
-        width: u32,
-        height: u32,
+    pub(crate) struct TestDisplayBackend {
+        pub(crate) width: u32,
+        pub(crate) height: u32,
     }
 
     #[async_trait::async_trait]

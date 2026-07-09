@@ -83,7 +83,8 @@ external-agent approval routing through `external_approval_decision`.
 ## DisplayControl session grant
 
 `DisplayControl` uses a **session-grant** model: approve once — the dashboard's
-user-display toggle or `intendant ctl display grant-user` — and the agent keeps
+**Share with agent** action (or its v1 user-display toggle) or
+`intendant ctl display grant-user` — and the agent keeps
 access to the user's display for the rest of the session (used by both
 [computer use](./computer-use-and-audio.md) and WebRTC streaming). Revoke from
 the same places to drop it. The grant is enforced fail-closed at the CU
@@ -92,3 +93,12 @@ executor on every platform; only the owner's own surfaces (dashboard, local
 without it, because their call is the opt-in. Note the grant is a single
 per-daemon flag: once granted, it holds for every principal the IAM layer
 lets at the display tools until revoked.
+
+The dashboard's **View this machine** action is *not* a `DisplayControl`
+grant: it opens a **private user view** — a capture session flagged
+`agent_visible = false` that streams to the owner's dashboards only. It
+never touches this grant, and the session itself is skipped by every
+agent-facing display lookup (a second fence, independent of the flag —
+see [Computer Use](./computer-use-and-audio.md)). Revoking *any*
+user-display session — shared or private — clears the per-daemon grant
+flag: over-revocation is the fail-closed direction.

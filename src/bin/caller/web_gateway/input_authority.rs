@@ -990,7 +990,9 @@ pub(crate) async fn close_federated_peers_for_sessions(
     {
         let reg = sr.read().await;
         for (sid, did) in released {
-            if let Some(session) = reg.get(*did) {
+            // `get_any`: teardown must reach every session that could
+            // have accepted this connection's peers.
+            if let Some(session) = reg.get_any(*did) {
                 targets.push((session, peer_id_for_federated_session(sid)));
             }
         }

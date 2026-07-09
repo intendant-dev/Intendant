@@ -1504,16 +1504,20 @@ pub fn spawn_web_gateway(
                     let bootstrap_authority_snapshots: Vec<(u32, &'static str)> =
                         if let Some(ref sr) = session_registry {
                             let reg = sr.read().await;
-                            let active_ids: Vec<u32> = reg.display_ids();
+                            // Dashboards are the user surface: replay
+                            // private user views too (they exist FOR this
+                            // surface), tagged so the tile renders its
+                            // "private view" chip.
+                            let active_ids: Vec<u32> = reg.all_display_ids();
                             // Snapshot resolutions + auth states under the
                             // std lock, then drop the guard before any
                             // direct_tx.send calls.
-                            let resolutions: Vec<(u32, u32, u32)> = active_ids
+                            let resolutions: Vec<(u32, u32, u32, bool)> = active_ids
                                 .iter()
                                 .filter_map(|&did| {
-                                    reg.get(did).map(|session| {
+                                    reg.get_any(did).map(|session| {
                                         let (w, h) = session.resolution();
-                                        (did, w, h)
+                                        (did, w, h, session.agent_visible())
                                     })
                                 })
                                 .collect();
@@ -1522,19 +1526,20 @@ pub fn spawn_web_gateway(
                                     .read()
                                     .unwrap_or_else(|e| e.into_inner());
                                 compute_bootstrap_authority_snapshots(
-                                    resolutions.iter().map(|(did, _, _)| *did),
+                                    resolutions.iter().map(|(did, _, _, _)| *did),
                                     &auth,
                                     &connection_id,
                                 )
                             };
                             // Send the display_ready frames now; defer the
                             // authority frames until after log_replay.
-                            for (did, w, h) in resolutions {
+                            for (did, w, h, agent_visible) in resolutions {
                                 let ready = serde_json::json!({
                                     "event": "display_ready",
                                     "display_id": did,
                                     "width": w,
                                     "height": h,
+                                    "agent_visible": agent_visible,
                                 });
                                 let _ = direct_tx.send(ready.to_string());
                             }

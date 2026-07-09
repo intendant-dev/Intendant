@@ -191,9 +191,13 @@ function updateDisplayMetrics(d) {
 }
 
 // ── User display access toggle ──
-let userDisplayGranted = false;
-let grantedDisplayId = 0;
+// (userDisplayGranted / grantedDisplayId / userDisplayAgentVisible are
+// declared in fragment 32 next to the display maps: earlier fragments
+// render against them at load time.)
 let displayPickerVisible = false;
+// Which action the open picker performs: 'share' (agent access) or
+// 'view' (private remote view; the agent cannot see the display).
+let displayPickerMode = 'share';
 var cachedDisplays = null;
 
 function hideDisplayPicker() {
@@ -202,7 +206,8 @@ function hideDisplayPicker() {
   displayPickerVisible = false;
 }
 
-function showDisplayPicker(displays) {
+function showDisplayPicker(displays, mode) {
+  displayPickerMode = mode === 'view' ? 'view' : 'share';
   const picker = document.getElementById('display-picker');
   picker.innerHTML = '';
   for (const d of displays) {
@@ -225,13 +230,13 @@ function showDisplayPicker(displays) {
       e.stopPropagation();
       hideDisplayPicker();
       if (!app) return;
-      dispatchDashboardActionMsg({ action: 'grant_user_display', display_id: d.id });
-      grantedDisplayId = d.id;
-      setUserDisplayState(true);
+      grantUserDisplayTarget(d, displayPickerMode !== 'view');
     });
     picker.appendChild(item);
   }
-  if (virtualDisplaysAvailableNow()) {
+  if (displayPickerMode !== 'view' && virtualDisplaysAvailableNow()) {
+    // Virtual displays are agent workspaces — offering one from the
+    // private "View this machine" flow would conflate the two concepts.
     const createItem = document.createElement('div');
     createItem.className = 'display-picker-item dp-action';
     createItem.textContent = 'New virtual display';
@@ -291,14 +296,81 @@ window.createVirtualDisplay = function(event) {
   }
 };
 
-function grantUserDisplayTarget(display) {
+function grantUserDisplayTarget(display, agentVisible = true) {
   const displayId = Number(display?.id);
   const msg = { action: 'grant_user_display' };
   if (Number.isFinite(displayId) && displayId !== 0) msg.display_id = displayId;
+  // The bare message is the legacy wire shape and means "share with the
+  // agent"; only the private view sends the new field.
+  if (!agentVisible) msg.agent_visible = false;
   dispatchDashboardActionMsg(msg);
   grantedDisplayId = Number.isFinite(displayId) ? displayId : 0;
-  setUserDisplayState(true);
+  userDisplayIds.add(grantedDisplayId);
+  setDisplayAgentVisibility(grantedDisplayId, agentVisible);
+  setUserDisplayState(true, agentVisible);
 }
+
+// Start a user-display flow in the given mode: 'share' makes the chosen
+// display visible to the agent for computer use (the classic grant);
+// 'view' opens a private remote view of this machine that the agent
+// cannot see. Single physical display grants instantly; multiple open
+// the picker in that mode.
+function startUserDisplayGrantFlow(mode) {
+  if (!app) return;
+  const agentVisible = mode !== 'view';
+  const applyDisplayList = (displays) => {
+    cachedDisplays = displays;
+    const rows = Array.isArray(displays) ? displays : [];
+    const physicalDisplays = rows.filter((display) => display?.kind !== 'window');
+    if (rows.length <= 1 || physicalDisplays.length === 1) {
+      grantUserDisplayTarget(physicalDisplays[0] || rows[0], agentVisible);
+    } else {
+      showDisplayPicker(rows, mode);
+    }
+  };
+  if (cachedDisplays && cachedDisplays.length > 0) {
+    applyDisplayList(cachedDisplays);
+    return;
+  }
+  fetchLocalDisplaysPayload()
+    .then(normalizeDisplaysPayload)
+    .then(applyDisplayList)
+    .catch(() => {
+      // Fetch failed: fall back to the default display.
+      grantUserDisplayTarget(null, agentVisible);
+    });
+}
+
+// Revoke the active user-display session (share or private view).
+function revokeUserDisplayNow() {
+  if (!app || !userDisplayGranted) return;
+  // Tear the display slot down locally before the round-trip -- see
+  // toggleUserDisplay for why (decode-saturated main thread delays the
+  // server's revoke broadcast by seconds).
+  removeDisplaySlot(Number(grantedDisplayId));
+  dispatchDashboardActionMsg({ action: 'revoke_user_display', display_id: Number(grantedDisplayId) || 0 });
+  clearDisplayAgentVisibility(Number(grantedDisplayId));
+  setUserDisplayState(false);
+}
+window.revokeUserDisplayNow = revokeUserDisplayNow;
+
+// Upgrade the active private view to an agent share (or start a share
+// flow when nothing is active). Never downgrades an existing share.
+function shareUserDisplayWithAgent() {
+  if (!app) return;
+  if (userDisplayGranted && !userDisplayAgentVisible) {
+    const msg = { action: 'grant_user_display' };
+    if (Number(grantedDisplayId) !== 0) msg.display_id = Number(grantedDisplayId);
+    dispatchDashboardActionMsg(msg);
+    userDisplayIds.add(Number(grantedDisplayId));
+    setDisplayAgentVisibility(Number(grantedDisplayId), true);
+    setUserDisplayState(true, true);
+    return;
+  }
+  if (!userDisplayGranted) startUserDisplayGrantFlow('share');
+}
+window.shareUserDisplayWithAgent = shareUserDisplayWithAgent;
+window.startUserDisplayGrantFlow = startUserDisplayGrantFlow;
 
 window.cycleAutonomy = function() {
   const levels = ['Low', 'Medium', 'High', 'Full'];
@@ -310,6 +382,11 @@ window.cycleAutonomy = function() {
   dispatchControlMsg({ action: 'set_autonomy', level: next.toLowerCase() });
 };
 
+// The v1 status-bar chip stays a pure on/off toggle with its historical
+// agent-share semantics: off -> start a SHARE flow; anything active
+// (share or private view) -> revoke. Upgrading a private view to an
+// agent share is only ever an explicit button on the ui2 "Your screen"
+// card -- never a side effect of clicking a toggle.
 window.toggleUserDisplay = function(event) {
   if (!app) return;
   if (event?.stopPropagation) event.stopPropagation();
@@ -326,50 +403,28 @@ window.toggleUserDisplay = function(event) {
     // confirmation of something we've already done rather than a gate
     // on the UI response. removeDisplaySlot is idempotent — if the
     // broadcast does arrive later, re-running it is a no-op.
-    removeDisplaySlot(Number(grantedDisplayId));
-    dispatchDashboardActionMsg({ action: 'revoke_user_display', display_id: Number(grantedDisplayId) || 0 });
-    setUserDisplayState(false);
+    revokeUserDisplayNow();
     return;
   }
-  // If we've already enumerated displays this session, use the cached
-  // result and short-circuit the fetch. /api/displays runs xrandr
-  // against the X server, which blocks behind in-flight XShmGetImage
-  // calls from any concurrent capture — so right after a revoke
-  // (while the backgrounded capture thread is still joining), the
-  // call can take 1-1.5s and stalls the indicator flip by the same
-  // margin. Displays rarely change mid-session, so honoring the
-  // cache between toggles makes ON#2 as fast as ON#1 without trading
-  // correctness for speed: we still fetch on first toggle to
-  // populate the cache, and a hotplug that invalidates the cache
-  // would surface either as a stale picker entry (benign) or a
-  // failed grant that user can retry (also benign).
-  const applyDisplayList = (displays) => {
-    cachedDisplays = displays;
-    const rows = Array.isArray(displays) ? displays : [];
-    const physicalDisplays = rows.filter((display) => display?.kind !== 'window');
-    if (rows.length <= 1 || physicalDisplays.length === 1) {
-      grantUserDisplayTarget(physicalDisplays[0] || rows[0]);
-    } else {
-      showDisplayPicker(rows);
-    }
-  };
-  if (cachedDisplays && cachedDisplays.length > 0) {
-    applyDisplayList(cachedDisplays);
-    return;
-  }
-  fetchLocalDisplaysPayload()
-    .then(normalizeDisplaysPayload)
-    .then(applyDisplayList)
-    .catch(() => {
-      // Fetch failed: fall back to granting default display
-      grantUserDisplayTarget(null);
-    });
+  // startUserDisplayGrantFlow reuses the cached /api/displays result
+  // between toggles: the route runs xrandr against the X server, which
+  // blocks behind in-flight XShmGetImage calls from any concurrent
+  // capture — so right after a revoke (while the backgrounded capture
+  // thread is still joining), the call can take 1-1.5s and stalls the
+  // indicator flip by the same margin. Displays rarely change
+  // mid-session; a hotplug surfaces as a stale picker entry (benign)
+  // or a failed grant the user can retry (also benign).
+  startUserDisplayGrantFlow('share');
 };
-function setUserDisplayState(granted) {
+function setUserDisplayState(granted, agentVisible = true) {
   userDisplayGranted = granted;
+  userDisplayAgentVisible = granted ? agentVisible : true;
   const el = document.getElementById('sb-display-access');
-  el.textContent = granted ? 'on' : 'off';
-  el.classList.toggle('granted', granted);
+  // 'on' keeps its historical meaning: the AGENT has the display. A
+  // private view shows 'view' and never lights the granted style.
+  el.textContent = granted ? (agentVisible ? 'on' : 'view') : 'off';
+  el.classList.toggle('granted', granted && agentVisible);
+  el.classList.toggle('view-only', granted && !agentVisible);
 }
 
 // Dismiss display picker on click outside or Escape

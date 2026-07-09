@@ -395,6 +395,13 @@ pub enum AppEvent {
         display_id: u32,
         width: u32,
         height: u32,
+        /// Whether agents may see this display (mirrors
+        /// [`crate::display::DisplaySession::agent_visible`]). `false`
+        /// marks a private user view: consumers that surface displays to
+        /// agents or peers (presence display list, peer upcasters,
+        /// recording auto-start) must skip it; dashboards use it to
+        /// render the "private view" chip on the tile.
+        agent_visible: bool,
     },
 
     /// Resolution changed on a live display (e.g. monitor mode switch, scale
@@ -451,6 +458,13 @@ pub enum AppEvent {
     UserDisplayGranted {
         /// The display ID that was granted.  0 = primary (default).
         display_id: u32,
+        /// `true` = the classic grant: the display is shared with agents
+        /// for computer use (and the autonomy user-display grant is set
+        /// by the emitter). `false` = a private user view ("View this
+        /// machine"): the capture session streams to the owner's
+        /// dashboards only and stays out of every agent-facing lookup.
+        /// A `true` grant upgrades an existing private view in place.
+        agent_visible: bool,
     },
     UserDisplayRevoked {
         /// The display ID being revoked.  0 = primary (default).
@@ -1567,6 +1581,16 @@ pub enum ControlMsg {
         /// display (id 0) -- backwards-compatible with single-monitor setups.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_id: Option<u32>,
+        /// Whether the created display session is visible to agents.
+        /// `None` (absent on the wire) means `true` — the pre-split
+        /// message always meant "share with the agent for computer
+        /// use", and old frontends keep that meaning. `Some(false)` is
+        /// the dashboard's "View this machine": a private remote view
+        /// streamed to the user's dashboards only, invisible to agent
+        /// display enumeration/screenshot/CU paths and never touching
+        /// the autonomy user-display grant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_visible: Option<bool>,
     },
     RevokeUserDisplay {
         /// Optional display ID to revoke.  When `None`, revokes the primary
@@ -2122,10 +2146,12 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             display_id,
             width,
             height,
+            agent_visible,
         } => Some(OutboundEvent::DisplayReady {
             display_id: *display_id,
             width: *width,
             height: *height,
+            agent_visible: *agent_visible,
         }),
         AppEvent::DisplayResize {
             display_id,
@@ -2143,7 +2169,13 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             display_id: *display_id,
             note: note.clone(),
         }),
-        AppEvent::UserDisplayGranted { .. } => Some(OutboundEvent::UserDisplayGranted),
+        AppEvent::UserDisplayGranted {
+            display_id,
+            agent_visible,
+        } => Some(OutboundEvent::UserDisplayGranted {
+            display_id: *display_id,
+            agent_visible: *agent_visible,
+        }),
         AppEvent::UserDisplayRevoked { display_id, note } => {
             Some(OutboundEvent::UserDisplayRevoked {
                 display_id: *display_id,
@@ -2848,8 +2880,9 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             display_id,
             width,
             height,
+            agent_visible,
         } => {
-            log.display_ready(*display_id, *width, *height);
+            log.display_ready(*display_id, *width, *height, *agent_visible);
         }
         AppEvent::DisplayResize {
             display_id,
@@ -2896,9 +2929,17 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
                 .unwrap_or_default();
             log.info(&format!("Shared view {} on {}{}", action, target, detail));
         }
-        AppEvent::UserDisplayGranted { display_id } => {
+        AppEvent::UserDisplayGranted {
+            display_id,
+            agent_visible,
+        } => {
             log.info(&format!(
-                "User display access grant recorded (display_id: {})",
+                "User display {} recorded (display_id: {})",
+                if *agent_visible {
+                    "access grant"
+                } else {
+                    "private view"
+                },
                 display_id
             ));
         }
@@ -3583,7 +3624,10 @@ mod tests {
                 display_id: 99,
                 note: Some("done testing".to_string()),
             },
-            ControlMsg::GrantUserDisplay { display_id: None },
+            ControlMsg::GrantUserDisplay {
+                display_id: None,
+                agent_visible: None,
+            },
             ControlMsg::RevokeUserDisplay {
                 display_id: None,
                 note: Some("done with user display".to_string()),
@@ -4314,11 +4358,17 @@ mod tests {
 
     #[test]
     fn control_msg_grant_user_display_deserialize() {
+        // The legacy wire shape (no agent_visible) must keep parsing —
+        // and keep meaning "share with the agent" (None → true at the
+        // control plane).
         let json = r#"{"action":"grant_user_display"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         assert!(matches!(
             msg,
-            ControlMsg::GrantUserDisplay { display_id: None }
+            ControlMsg::GrantUserDisplay {
+                display_id: None,
+                agent_visible: None,
+            }
         ));
 
         // With explicit display_id
@@ -4327,7 +4377,19 @@ mod tests {
         assert!(matches!(
             msg,
             ControlMsg::GrantUserDisplay {
-                display_id: Some(2)
+                display_id: Some(2),
+                agent_visible: None,
+            }
+        ));
+
+        // The dashboard's "View this machine" — a private view.
+        let json = r#"{"action":"grant_user_display","display_id":2,"agent_visible":false}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ControlMsg::GrantUserDisplay {
+                display_id: Some(2),
+                agent_visible: Some(false),
             }
         ));
     }

@@ -2891,6 +2891,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_paths_cannot_reach_private_view_sessions() {
+        // A "View this machine" session (agent_visible == false) must be
+        // invisible to every agent-facing CU path even when the caller
+        // would otherwise be ALLOWED to reach the user session (owner
+        // surface / standing grant): the filtered registry lookup is a
+        // second, independent fence.
+        let dir = std::env::temp_dir();
+        let mut counter = 0u64;
+
+        // Private view of the primary display (0) and of a secondary
+        // monitor (3); one agent-owned virtual display (99).
+        let registry = crate::mcp::tests::test_session_registry_with_display(0, 1920, 1080);
+        {
+            let reg = registry.read().await;
+            reg.get_any(0).unwrap().set_agent_visible(false);
+        }
+        {
+            use std::sync::Arc;
+            let backend3 = Arc::new(crate::display::DisplaySession::new(
+                3,
+                Arc::new(crate::mcp::tests::TestDisplayBackend {
+                    width: 800,
+                    height: 600,
+                }),
+            ));
+            backend3.set_agent_visible(false);
+            let backend99 = Arc::new(crate::display::DisplaySession::new(
+                99,
+                Arc::new(crate::mcp::tests::TestDisplayBackend {
+                    width: 1024,
+                    height: 768,
+                }),
+            ));
+            let mut reg = registry.write().await;
+            reg.insert(3, backend3);
+            reg.insert(99, backend99);
+        }
+        let registry = Some(registry);
+
+        // Default target selection must not pick the private monitor (3):
+        // the lowest agent-VISIBLE non-zero session wins.
+        assert_eq!(
+            default_display_target(&registry).await,
+            DisplayTarget::Virtual { id: 99 },
+            "default target must skip private views"
+        );
+
+        // Session-only backend (Wayland), user_session target, caller
+        // allowed: the private session at 0 must read as absent — the
+        // call fails with the no-session guidance, it does NOT capture.
+        let results = execute_actions(
+            &[CuAction::Screenshot],
+            DisplayTarget::UserSession,
+            DisplayBackend::Wayland,
+            &dir,
+            &mut counter,
+            &registry,
+            None,
+            true,
+        )
+        .await;
+        assert!(!results[0].success);
+        assert_eq!(
+            results[0].error.as_deref(),
+            Some(no_session_message(DisplayBackend::Wayland, &DisplayTarget::UserSession, true))
+                .as_deref(),
+            "private view at 0 must be unreachable even for an allowed caller"
+        );
+
+        // Explicitly targeting the private secondary monitor by id fails
+        // the same way (Wayland virtual targets route via the session).
+        let results = execute_actions(
+            &[CuAction::Screenshot],
+            DisplayTarget::Virtual { id: 3 },
+            DisplayBackend::Windows,
+            &dir,
+            &mut counter,
+            &registry,
+            None,
+            true,
+        )
+        .await;
+        assert!(!results[0].success);
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("No virtual display 3"),
+            "private monitor must read as absent: {:?}",
+            results[0].error
+        );
+
+        // The agent-owned display is unaffected by the filtering.
+        assert!(
+            lookup_display_session(&registry, &DisplayTarget::Virtual { id: 99 })
+                .await
+                .is_some(),
+            "agent-visible sessions stay reachable"
+        );
+        assert!(
+            lookup_display_session(&registry, &DisplayTarget::UserSession)
+                .await
+                .is_none(),
+            "private view must be absent from the CU session lookup"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_actions_gate_leaves_virtual_targets_alone() {
         // A virtual target is agent-owned: the gate must not fire for it even
         // with user_session_allowed == false (Wayland backend: the virtual

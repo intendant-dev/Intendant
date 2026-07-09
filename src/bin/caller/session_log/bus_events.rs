@@ -607,21 +607,26 @@ impl SessionLog {
         });
     }
 
-    /// Log display ready.
-    pub fn display_ready(&mut self, display_id: u32, width: u32, height: u32) {
+    /// Log display ready. `agent_visible == false` marks a private user
+    /// view (streams to the owner's dashboards only; agents can't see it).
+    pub fn display_ready(&mut self, display_id: u32, width: u32, height: u32, agent_visible: bool) {
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
             event: "display_ready".to_string(),
             level: Some("info".to_string()),
             message: Some(format!(
-                "Display :{} ready ({}x{})",
-                display_id, width, height
+                "Display :{} ready ({}x{}){}",
+                display_id,
+                width,
+                height,
+                if agent_visible { "" } else { " [private user view]" }
             )),
             data: Some(serde_json::json!({
                 "display_id": display_id,
                 "width": width,
                 "height": height,
+                "agent_visible": agent_visible,
             })),
             file: None,
             file2: None,

@@ -350,9 +350,21 @@ pub(crate) struct PeerDisplayFold {
 }
 
 impl PeerDisplayFold {
-    /// Upsert from a `display_ready` / `display_resize`; emits only
-    /// when the display is new or its geometry actually changed.
-    fn ready(&mut self, display_id: u32, width: u32, height: u32) -> Vec<PeerEvent> {
+    /// Upsert from a `display_ready`; emits only when the display is new
+    /// or its geometry actually changed. `agent_visible == false` marks a
+    /// private user view — those are never announced to peers (a peer's
+    /// agents and dashboards are not the granting user), and one that was
+    /// previously tracked as shared retires with a `DisplayLost`.
+    fn ready(
+        &mut self,
+        display_id: u32,
+        width: u32,
+        height: u32,
+        agent_visible: bool,
+    ) -> Vec<PeerEvent> {
+        if !agent_visible {
+            return self.lost(display_id, Some("private user view".to_string()));
+        }
         let info = PeerDisplayInfo {
             display_id,
             width,
@@ -370,6 +382,17 @@ impl PeerDisplayFold {
         } else {
             vec![]
         }
+    }
+
+    /// Geometry update from a `display_resize`. Only updates displays
+    /// already tracked: resize events carry no visibility, so letting
+    /// them upsert would resurrect a private view (or a lost display)
+    /// from its resize traffic.
+    fn resize(&mut self, display_id: u32, width: u32, height: u32) -> Vec<PeerEvent> {
+        if !self.displays.contains_key(&display_id) {
+            return vec![];
+        }
+        self.ready(display_id, width, height, true)
     }
 
     /// Retire a display; emits only if it was actually tracked (a
@@ -967,7 +990,10 @@ impl AppEventUpcaster {
                 display_id,
                 width,
                 height,
-            } => self.displays.ready(*display_id, *width, *height),
+                agent_visible,
+            } => self
+                .displays
+                .ready(*display_id, *width, *height, *agent_visible),
 
             AppEvent::DisplayResize {
                 display_id,
@@ -979,7 +1005,7 @@ impl AppEventUpcaster {
                     "display",
                     format!("display {display_id} resized to {width}x{height}"),
                 )];
-                events.extend(self.displays.ready(*display_id, *width, *height));
+                events.extend(self.displays.resize(*display_id, *width, *height));
                 events
             }
 
@@ -1009,11 +1035,24 @@ impl AppEventUpcaster {
                 format!("display approval pending on {backend}"),
             )],
 
-            AppEvent::UserDisplayGranted { display_id } => vec![log_event(
-                LogLevel::Info,
-                "display",
-                format!("user granted display {display_id}"),
-            )],
+            // Private views ride the same event with agent_visible=false;
+            // peers are not told about them at all (not even a log line —
+            // "the owner is privately viewing their screen" is nobody
+            // else's telemetry).
+            AppEvent::UserDisplayGranted {
+                display_id,
+                agent_visible,
+            } => {
+                if *agent_visible {
+                    vec![log_event(
+                        LogLevel::Info,
+                        "display",
+                        format!("user granted display {display_id}"),
+                    )]
+                } else {
+                    vec![]
+                }
+            }
 
             AppEvent::UserDisplayRevoked { display_id, note } => {
                 let note_str = note.as_deref().unwrap_or("");
@@ -2305,7 +2344,10 @@ impl WireEventUpcaster {
                 display_id,
                 width,
                 height,
-            } => self.displays.ready(*display_id, *width, *height),
+                agent_visible,
+            } => self
+                .displays
+                .ready(*display_id, *width, *height, *agent_visible),
 
             OutboundEvent::DisplayResize {
                 display_id,
@@ -2317,7 +2359,7 @@ impl WireEventUpcaster {
                     "display",
                     format!("display {display_id} resized to {width}x{height}"),
                 )];
-                events.extend(self.displays.ready(*display_id, *width, *height));
+                events.extend(self.displays.resize(*display_id, *width, *height));
                 events
             }
 
@@ -2349,14 +2391,24 @@ impl WireEventUpcaster {
                 format!("display approval pending on {backend}"),
             )],
 
-            // OutboundEvent::UserDisplayGranted has NO fields on the
-            // wire — AppEvent has `display_id: u32` but that's dropped
-            // in app_event_to_outbound. Parity test documents this.
-            OutboundEvent::UserDisplayGranted => vec![log_event(
-                LogLevel::Info,
-                "display",
-                "user granted display".to_string(),
-            )],
+            // Private views (agent_visible=false) are not surfaced to
+            // peers at all — see the AppEvent twin. Old wires omit both
+            // fields; serde defaults them to display 0 / agent-visible,
+            // the pre-split meaning.
+            OutboundEvent::UserDisplayGranted {
+                display_id,
+                agent_visible,
+            } => {
+                if *agent_visible {
+                    vec![log_event(
+                        LogLevel::Info,
+                        "display",
+                        format!("user granted display {display_id}"),
+                    )]
+                } else {
+                    vec![]
+                }
+            }
 
             OutboundEvent::UserDisplayRevoked { display_id, note } => {
                 let note_str = note.as_deref().unwrap_or("");
@@ -3033,6 +3085,7 @@ mod tests {
             display_id: 1,
             width: 1920,
             height: 1080,
+            agent_visible: true,
         });
         assert_eq!(ready.len(), 1);
         match &ready[0] {
@@ -3831,6 +3884,7 @@ mod tests {
             display_id: 1,
             width: 1920,
             height: 1080,
+            agent_visible: true,
         });
     }
 
@@ -3857,6 +3911,7 @@ mod tests {
             display_id,
             width,
             height,
+            agent_visible: true,
         }
     }
 
@@ -4202,11 +4257,17 @@ mod tests {
         );
     }
 
-    /// `UserDisplayGranted` loses its `display_id` field on the wire
-    /// — `OutboundEvent::UserDisplayGranted` has no fields at all.
+    /// `UserDisplayGranted` carries `display_id` + `agent_visible` on
+    /// the wire since the private-view split (it was fieldless before);
+    /// both upcast paths preserve the id, and private views
+    /// (`agent_visible: false`) are silent on BOTH paths — peers are
+    /// never told about the owner's private screen view.
     #[test]
-    fn drift_user_display_granted_loses_display_id_on_wire() {
-        let app_event = AppEvent::UserDisplayGranted { display_id: 99 };
+    fn user_display_granted_paths_agree_and_hide_private_views() {
+        let app_event = AppEvent::UserDisplayGranted {
+            display_id: 99,
+            agent_visible: true,
+        };
         let mut app_upcaster = AppEventUpcaster::new();
         let path_a = app_upcaster.upcast(&app_event);
         let msg_a = match &path_a[0] {
@@ -4227,9 +4288,32 @@ mod tests {
             _ => panic!("expected Log"),
         };
         assert!(
-            !msg_b.contains("99"),
-            "wire path cannot include display_id because wire variant has no fields: {msg_b}"
+            msg_b.contains("99"),
+            "wire path preserves display_id since the private-view split: {msg_b}"
         );
+
+        // Private view: silence on both paths.
+        let private = AppEvent::UserDisplayGranted {
+            display_id: 3,
+            agent_visible: false,
+        };
+        assert!(
+            app_upcaster.upcast(&private).is_empty(),
+            "app path must not announce a private view to peers"
+        );
+        let outbound_private =
+            crate::event::app_event_to_outbound(&private).expect("UserDisplayGranted maps");
+        assert!(
+            wire_upcaster.upcast(&outbound_private).is_empty(),
+            "wire path must not announce a private view to peers"
+        );
+
+        // Legacy fieldless wire line: defaults keep the old meaning
+        // (display 0, agent-visible) and still announce.
+        let legacy: OutboundEvent =
+            serde_json::from_str(r#"{"event":"user_display_granted"}"#).unwrap();
+        let legacy_events = wire_upcaster.upcast(&legacy);
+        assert_eq!(legacy_events.len(), 1, "legacy grant lines still log");
     }
 
     // ===================================================================

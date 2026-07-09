@@ -1199,23 +1199,39 @@ pub(crate) async fn handle_control_command_mcp(
             );
             Some(RESOURCE_LOGS_URI)
         }
-        ControlMsg::GrantUserDisplay { display_id } => {
+        ControlMsg::GrantUserDisplay {
+            display_id,
+            agent_visible,
+        } => {
             let did = display_id.unwrap_or(0);
+            // Absent on the wire = the pre-split meaning: share with the
+            // agent. `Some(false)` = private user view — never touches
+            // the autonomy grant.
+            let agent_visible = agent_visible.unwrap_or(true);
+            // Filtered lookup on purpose: an active private view reads as
+            // absent, so an agent-visible grant falls through to the
+            // event and the activation listener upgrades it in place.
             let active_resolution = active_display_session_resolution(state, did).await;
             let autonomy = {
                 let mut s = state.write().await;
                 s.user_display_activation_pending.remove(&did);
                 s.autonomy.clone()
             };
-            autonomy.write().await.user_display_granted = true;
+            if agent_visible {
+                autonomy.write().await.user_display_granted = true;
+            }
             if let Some((width, height)) = active_resolution {
                 bus.send(AppEvent::DisplayReady {
                     display_id: did,
                     width,
                     height,
+                    agent_visible: true,
                 });
             } else {
-                bus.send(AppEvent::UserDisplayGranted { display_id: did });
+                bus.send(AppEvent::UserDisplayGranted {
+                    display_id: did,
+                    agent_visible,
+                });
             }
             emit_control_result(
                 control_tx,

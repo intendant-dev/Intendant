@@ -334,6 +334,29 @@ control (see [Display Pipeline](./display-pipeline.md)):
 - **Recording replay** — browse and play back recorded sessions with timeline
   seeking and speed control (1x / 2x / 4x)
 
+The live rail's **Your screen** card keeps the three screen-on-the-wire
+concepts separate (see
+[Computer Use](./computer-use-and-audio.md#three-separate-concepts-private-view-agent-share-presence-streaming)):
+
+- **View this machine** — a private remote view: watch and control this
+  machine's display from the dashboard. The agent cannot see it — the
+  session is `agent_visible = false` and every agent-facing display
+  lookup skips it. The tile wears a **Private view** chip and the live
+  rail row a `PRIVATE` tag.
+- **Share with agent** — the classic `DisplayControl` grant: the screen
+  becomes visible to the agent for computer-use tasks until revoked. The
+  tile wears an **Agent can see this** chip. Sharing while a private
+  view is active upgrades it in place; the reverse never happens
+  implicitly.
+- The tile's **Stream** button is the third, unrelated control: frames
+  to the live presence (voice) model only.
+
+Both modes revoke from the same card (**Stop viewing** / **Revoke
+access**), the v1 status-bar chip (`off`/`view`/`on`) stays a pure
+toggle with its historical agent-share semantics, and
+`GET /api/displays` annotates entries with `capture_active` +
+`agent_visible` so pickers and chips can render live state.
+
 Displays appear automatically when the agent's first command triggers Xvfb
 auto-launch, or when access to the user's real session display is granted.
 WebRTC negotiation (SDP offer/answer + ICE candidates) is multiplexed over the
