@@ -2944,4 +2944,183 @@ mod tests {
             crate::upload_store::UploadDestination::Task
         );
     }
+
+    // ── Golden HTTP transcripts: the fs stat/list/read wire contract ──
+    //
+    // Byte-exact pins of the fs GET trio's HTTP responses, captured
+    // before the transport-neutral conversion (transport-unification
+    // design §6 S1, risk R1) and kept as the conversion's proof. The
+    // expected framing is hand-written below — never built through the
+    // response helpers under test.
+
+    /// Run one stream-consuming handler and collect every byte it wrote.
+    async fn collect_handler_response<Fut>(run: impl FnOnce(DemuxStream) -> Fut) -> Vec<u8>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tokio::io::AsyncReadExt;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        run(Box::pin(server)).await;
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("collect handler response");
+        response
+    }
+
+    /// The historical `json_response` framing, spelled out literally.
+    fn golden_json_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn transcript(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn golden_fs_stat_success_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let request_line = format!("GET /api/fs/stat?path={path} HTTP/1.1");
+        let response =
+            collect_handler_response(|stream| handle_fs_stat(stream, &request_line)).await;
+        let body = serde_json::to_string(&inspect_dashboard_fs_path(&path).unwrap()).unwrap();
+        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+    }
+
+    #[tokio::test]
+    async fn golden_fs_stat_error_transcript() {
+        let request_line = "GET /api/fs/stat?path=relative/notes.txt HTTP/1.1";
+        let response =
+            collect_handler_response(|stream| handle_fs_stat(stream, request_line)).await;
+        let body = r#"{"error":"path must be absolute or start with ~/ (got relative/notes.txt)"}"#;
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("400 Bad Request", body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_fs_list_success_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("beta")).unwrap();
+        std::fs::write(dir.path().join("alpha.txt"), b"a").unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let request_line = format!("GET /api/fs/list?path={path} HTTP/1.1");
+        let response =
+            collect_handler_response(|stream| handle_fs_list(stream, &request_line)).await;
+        let body = list_dashboard_fs_dir(&path).unwrap().to_string();
+        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+    }
+
+    #[tokio::test]
+    async fn golden_fs_list_error_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain.txt");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let request_line = format!("GET /api/fs/list?path={path} HTTP/1.1");
+        let response =
+            collect_handler_response(|stream| handle_fs_list(stream, &request_line)).await;
+        let canonical = std::fs::canonicalize(&file).unwrap();
+        let body = serde_json::json!({
+            "error": format!("{} is not a directory", canonical.display())
+        })
+        .to_string();
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("400 Bad Request", &body)
+        );
+    }
+
+    /// Fixed fs-read fixture: 26 bytes, so the ranged expectations below
+    /// can be written as literals.
+    const GOLDEN_READ_CONTENT: &[u8] = b"golden transcript payload!";
+
+    fn golden_read_fixture(dir: &tempfile::TempDir) -> (String, String) {
+        let file = dir.path().join("golden.txt");
+        std::fs::write(&file, GOLDEN_READ_CONTENT).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let request_line = format!("GET /api/fs/read?path={path} HTTP/1.1");
+        (path, request_line)
+    }
+
+    #[tokio::test]
+    async fn golden_fs_read_full_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_path, request_line) = golden_read_fixture(&dir);
+        let header_text = format!("{request_line}\r\n\r\n");
+        let response = collect_handler_response(|stream| {
+            handle_fs_read(stream, &header_text, &request_line)
+        })
+        .await;
+        let mut expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nX-Content-Sha256: {}\r\nContent-Disposition: attachment; filename=\"golden.txt\"\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: X-Content-Sha256\r\nConnection: close\r\n\r\n",
+            GOLDEN_READ_CONTENT.len(),
+            fs_sha256_hex(GOLDEN_READ_CONTENT),
+        )
+        .into_bytes();
+        expected.extend_from_slice(GOLDEN_READ_CONTENT);
+        assert_eq!(transcript(&response), transcript(&expected));
+    }
+
+    #[tokio::test]
+    async fn golden_fs_read_partial_206_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_path, request_line) = golden_read_fixture(&dir);
+        let header_text = format!("{request_line}\r\nRange: bytes=7-16\r\n\r\n");
+        let response = collect_handler_response(|stream| {
+            handle_fs_read(stream, &header_text, &request_line)
+        })
+        .await;
+        // A partial read carries Content-Range instead of the sha header.
+        let mut expected = "HTTP/1.1 206 Partial Content\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 7-16/26\r\nContent-Disposition: attachment; filename=\"golden.txt\"\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: X-Content-Sha256\r\nConnection: close\r\n\r\n"
+            .to_string()
+            .into_bytes();
+        expected.extend_from_slice(&GOLDEN_READ_CONTENT[7..17]);
+        assert_eq!(transcript(&response), transcript(&expected));
+    }
+
+    #[tokio::test]
+    async fn golden_fs_read_unsatisfiable_416_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_path, request_line) = golden_read_fixture(&dir);
+        let header_text = format!("{request_line}\r\nRange: bytes=99-\r\n\r\n");
+        let response = collect_handler_response(|stream| {
+            handle_fs_read(stream, &header_text, &request_line)
+        })
+        .await;
+        let body = r#"{"error":"range is not satisfiable"}"#;
+        let expected = format!(
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nContent-Range: bytes */26\r\nAccept-Ranges: bytes\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(transcript(&response), expected);
+    }
+
+    #[tokio::test]
+    async fn golden_fs_read_missing_404_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.bin");
+        let path = missing.to_string_lossy().into_owned();
+        let request_line = format!("GET /api/fs/read?path={path} HTTP/1.1");
+        let header_text = format!("{request_line}\r\n\r\n");
+        let response = collect_handler_response(|stream| {
+            handle_fs_read(stream, &header_text, &request_line)
+        })
+        .await;
+        let io_error = std::fs::canonicalize(&missing).unwrap_err();
+        let body = serde_json::json!({
+            "error": format!("{} is not accessible: {}", missing.display(), io_error)
+        })
+        .to_string();
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("404 Not Found", &body)
+        );
+    }
 }
