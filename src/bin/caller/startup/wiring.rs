@@ -25,13 +25,15 @@
 
 use crate::*;
 
-/// Handles for the two session listeners every mode spawns first:
-/// the recording listener and the user-display grant/revoke listener.
+/// Handles for the session listeners every mode spawns first:
+/// the recording listener, the user-display grant/revoke listener, and
+/// the session-list cache invalidator.
 /// tokio tasks detach on drop; the struct mirrors the original
 /// keep-until-scope-end bindings.
 pub(crate) struct SessionListeners {
     pub(crate) _recording_listener: tokio::task::JoinHandle<()>,
     pub(crate) _user_display_listener: tokio::task::JoinHandle<()>,
+    pub(crate) _session_list_cache_invalidator: tokio::task::JoinHandle<()>,
 }
 
 pub(crate) fn spawn_session_listeners(
@@ -51,10 +53,43 @@ pub(crate) fn spawn_session_listeners(
         session_registry.clone(),
         Some(frame_registry.clone()),
     );
+    let _session_list_cache_invalidator = spawn_session_list_cache_invalidator(bus.subscribe());
     SessionListeners {
         _recording_listener,
         _user_display_listener,
+        _session_list_cache_invalidator,
     }
+}
+
+/// Session-list response caches go stale the moment session membership
+/// changes; the daemon emits those changes on the bus, so listen and drop
+/// the cached bodies instead of serving ghosts for up to the SWR window
+/// (bit the dashboard's own post-create refresh and every parameterless
+/// /api/sessions caller).
+fn spawn_session_list_cache_invalidator(
+    mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match event_rx.recv().await {
+                Ok(
+                    AppEvent::SessionStarted { .. }
+                    | AppEvent::SessionEnded { .. }
+                    | AppEvent::SessionAttached { .. }
+                    | AppEvent::SessionIdentity { .. }
+                    | AppEvent::SessionRelationship { .. },
+                ) => {
+                    crate::web_gateway::invalidate_session_list_response_caches();
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Missed events ⇒ the list may have changed unseen.
+                    crate::web_gateway::invalidate_session_list_response_caches();
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 /// The debug-screen handler, spawned only when the web gateway is up

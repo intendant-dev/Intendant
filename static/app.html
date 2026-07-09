@@ -37292,8 +37292,8 @@ function processCommands(cmds) {
       case 'delete_recording': deleteRecordingStream(c.stream_name); break;
       case 'recording_error': /* logged via add_log_entry */ break;
       case 'session_started':
-        managedContextSessionManuallySelected = false;
-        onSessionStarted(c.session_id, c.task);
+        if (!c.replayed) managedContextSessionManuallySelected = false;
+        onSessionStarted(c.session_id, c.task, { replayed: !!c.replayed });
         scheduleManagedContextRefresh(400);
         stationScheduleUpdate();
         break;
@@ -75574,34 +75574,45 @@ if (typeof ui2Enabled === 'function' && ui2Enabled()) {
 }
 /* ── static/app/54-session-lifecycle.js ── */
 // ── Session Lifecycle ──
-function onSessionStarted(sessionId, task) {
+function onSessionStarted(sessionId, task, opts = {}) {
   const sid = String(sessionId || '').trim();
   const hasTask = hasSessionLifecycleTask(task);
-  if (hasTask) {
+  // A replayed announcement (connect-time bootstrap for a session that
+  // started before this page existed) rebuilds the window but must not
+  // act like a live birth: no focus steal, no current-task clobber, no
+  // thinking phase, no changes-pane reset.
+  const replayed = !!opts.replayed;
+  if (hasTask && !replayed) {
     stationCurrentTask = compactSessionText(task);
     stationCurrentApproval = null;
   }
   stationScheduleUpdate();
-  const shouldFocusActivity = newSessionSpawnPending;
+  const shouldFocusActivity = !replayed && newSessionSpawnPending;
   const currentTarget = resolvePromptTargetSessionId();
-  finishNewSessionSpawnNotice(sid, task);
+  if (!replayed) finishNewSessionSpawnNotice(sid, task);
   const alias = externalBackendAliasForSession(sid);
   const visibleSessionId = alias?.backendSessionId || sid;
   if (visibleSessionId) {
     setSessionWindowDetached(visibleSessionId, false);
     const meta = {
-      phase: processingLogReplay || !hasTask ? 'idle' : 'thinking',
+      phase: replayed || processingLogReplay || !hasTask ? 'idle' : 'thinking',
       ended: false,
       ...(alias?.source ? { source: alias.source, backendSource: alias.source } : {}),
     };
     if (hasTask) meta.task = task;
     ensureSessionWindow(visibleSessionId, meta);
-    focusSessionWindowFromLifecycle(visibleSessionId, {
-      force: shouldFocusActivity,
-      currentTarget,
-    });
+    if (!replayed) {
+      focusSessionWindowFromLifecycle(visibleSessionId, {
+        force: shouldFocusActivity,
+        currentTarget,
+      });
+    }
   } else {
     updateTaskTargetChip();
+  }
+  if (replayed) {
+    refreshSessionWindowMetadata(250);
+    return;
   }
   resetChangesPane();
   focusActivityForSessionEvent({ force: shouldFocusActivity });
