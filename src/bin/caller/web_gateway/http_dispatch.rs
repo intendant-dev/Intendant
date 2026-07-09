@@ -462,13 +462,32 @@ pub(crate) async fn serve_http_request(
                 return handle_sessions_list(stream, request_line).await;
             }
             RouteHandlerId::FsStat => {
-                return handle_fs_stat(stream, request_line).await;
+                return handle_fs_stat(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::FsList => {
-                return handle_fs_list(stream, request_line).await;
+                return handle_fs_list(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::FsRead => {
-                return handle_fs_read(stream, header_text, request_line).await;
+                return handle_fs_read(
+                    stream,
+                    header_text,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::FsMkdir => {
                 return handle_fs_mkdir(
@@ -1260,4 +1279,147 @@ pub(crate) async fn serve_http_request(
     // inline before returning, and every table-dispatched
     // handler owns its stream and finalizes it itself.
     finalize_http_stream(&mut stream).await;
+}
+
+/// HTTP adapter for the transport-neutral core (transport-unification
+/// design §2.1): render an [`ApiResponse`] into the exact wire bytes the
+/// legacy handler emitted — status line via [`status_reason`],
+/// `Content-Type`/`Content-Length`, the response's declared header tail
+/// in order, then the row's CORS posture applied exactly as the dispatch
+/// error paths apply it (`OwnOrigin` adds nothing; `Public` appends the
+/// wildcard last; `FleetAllowlist` strips/echoes + `Vary: Origin`).
+pub(crate) fn api_response_http_bytes(
+    response: ApiResponse,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) -> Vec<u8> {
+    let http = match response {
+        ApiResponse::Json {
+            status,
+            body,
+            headers,
+        } => {
+            let mut http = HttpResponse::with_content(
+                status_reason(status),
+                "application/json",
+                body.into_string(),
+            );
+            for (name, value) in headers {
+                http = http.header(name, value);
+            }
+            http
+        }
+        ApiResponse::Bytes {
+            status,
+            content_type,
+            headers,
+            bytes,
+        } => {
+            let BytesPayload::InMemory(payload) = bytes;
+            let mut http =
+                HttpResponse::with_content(status_reason(status), content_type, payload);
+            for (name, value) in headers {
+                http = http.header(name, value);
+            }
+            http
+        }
+    };
+    let http = match cors {
+        crate::gateway_routes::CorsPosture::OwnOrigin => http,
+        crate::gateway_routes::CorsPosture::Public => http.public_cors(),
+        crate::gateway_routes::CorsPosture::FleetAllowlist => http.fleet_cors(fleet_origin),
+    };
+    http.into_bytes()
+}
+
+/// Write an [`ApiResponse`] to the HTTP lane and finalize the stream —
+/// the whole tail of a converted handler shim.
+pub(crate) async fn write_api_response(
+    mut stream: DemuxStream,
+    response: ApiResponse,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    use tokio::io::AsyncWriteExt;
+    let bytes = api_response_http_bytes(response, cors, fleet_origin);
+    let _ = stream.write_all(&bytes).await;
+    finalize_http_stream(&mut stream).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway_routes::CorsPosture;
+
+    #[test]
+    fn api_json_render_matches_legacy_json_response() {
+        let body = r#"{"ok":true}"#.to_string();
+        let legacy = json_response("400 Bad Request", body.clone());
+        let rendered = api_response_http_bytes(
+            ApiResponse::json(400, JsonBody::PreSerialized(body)),
+            CorsPosture::OwnOrigin,
+            None,
+        );
+        assert_eq!(String::from_utf8(rendered).unwrap(), legacy);
+    }
+
+    #[test]
+    fn api_json_error_render_matches_legacy_json_error() {
+        let legacy = json_error("403 Forbidden", "denied");
+        let rendered = api_response_http_bytes(
+            ApiResponse::json_error(403, "denied"),
+            CorsPosture::OwnOrigin,
+            None,
+        );
+        assert_eq!(String::from_utf8(rendered).unwrap(), legacy);
+    }
+
+    #[test]
+    fn api_render_public_posture_matches_legacy_public_cors() {
+        let body = r#"{"ok":true}"#.to_string();
+        let legacy = HttpResponse::json("200 OK", body.clone())
+            .public_cors()
+            .into_string();
+        let rendered = api_response_http_bytes(
+            ApiResponse::json(200, JsonBody::PreSerialized(body)),
+            CorsPosture::Public,
+            None,
+        );
+        assert_eq!(String::from_utf8(rendered).unwrap(), legacy);
+    }
+
+    #[test]
+    fn api_render_fleet_posture_echoes_allowed_origin_and_varies() {
+        let rendered = api_response_http_bytes(
+            ApiResponse::Json {
+                status: 200,
+                body: JsonBody::PreSerialized(r#"{"ok":true}"#.to_string()),
+                headers: vec![
+                    ("Access-Control-Allow-Origin", "*".to_string()),
+                    ("Connection", "close".to_string()),
+                ],
+            },
+            CorsPosture::FleetAllowlist,
+            Some("https://fleet.example"),
+        );
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(
+            text.contains("Access-Control-Allow-Origin: https://fleet.example\r\n"),
+            "{text}"
+        );
+        assert!(!text.contains("Access-Control-Allow-Origin: *"), "{text}");
+        assert!(text.contains("Vary: Origin\r\n"), "{text}");
+    }
+
+    #[test]
+    fn api_render_fleet_posture_without_origin_strips_cors() {
+        let rendered = api_response_http_bytes(
+            ApiResponse::json(200, JsonBody::PreSerialized("{}".to_string())),
+            CorsPosture::FleetAllowlist,
+            None,
+        );
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(!text.contains("Access-Control-Allow-Origin"), "{text}");
+        assert!(text.contains("Vary: Origin\r\n"), "{text}");
+    }
 }

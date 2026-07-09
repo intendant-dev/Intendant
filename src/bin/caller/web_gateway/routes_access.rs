@@ -2047,27 +2047,13 @@ pub(crate) fn access_iam_update_grant_response_body(
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct HttpAccessContext {
-    pub(crate) principal: crate::access::iam::AccessPrincipal,
-    pub(crate) iam_state: Option<crate::access::iam::LocalIamState>,
-}
-
-impl HttpAccessContext {
-    pub(crate) fn decision(
-        &self,
-        op: crate::peer::access_policy::PeerOperation,
-    ) -> crate::access::iam::AccessDecision {
-        match &self.iam_state {
-            Some(state) => crate::access::iam::evaluate_principal_operation_with_state(
-                state,
-                &self.principal,
-                op,
-            ),
-            None => crate::access::iam::evaluate_principal_operation(&self.principal, op),
-        }
-    }
-}
+/// The HTTP lane's name for the unified [`RequestAuthority`]
+/// (transport-unification design §2.3): the principal + pre-loaded IAM
+/// state pair built once per connection from the transport facts (peer
+/// identity / browser-mTLS binding / trusted local fallback). Kept as an
+/// alias so every existing gate and handler reads unchanged while the
+/// tunnel lane converges on the same type.
+pub(crate) type HttpAccessContext = RequestAuthority;
 
 pub(crate) fn http_access_context(
     cert_dir: &std::path::Path,
