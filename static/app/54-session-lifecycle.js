@@ -1866,6 +1866,7 @@ function filesUpdateActiveDownloadSummary(transfer = null) {
 }
 
 function queueFilesTransfer(transfer) {
+  transfer.queueEpoch = (transfer.queueEpoch || 0) + 1;
   filesTransferCompletion(transfer);
   filesTransfers.unshift(transfer);
   filesTransferPersistState();
@@ -2185,27 +2186,7 @@ async function runFilesDownloadTransfer(transfer) {
       }
       if (transfer.loaded >= transfer.totalSize || range.bytes.byteLength === 0) break;
     }
-    const blob = new Blob(transfer.parts, { type: transfer.contentType || 'application/octet-stream' });
-    const result = {
-      ok: true,
-      blob,
-      parts: transfer.parts.slice(),
-      filename: transfer.filename || 'download.bin',
-      content_type: transfer.contentType,
-      size: blob.size,
-      total_size: transfer.totalSize || blob.size,
-      range_start: 0,
-      range_end: transfer.loaded,
-      range_count: transfer.rangeCount,
-      resumable: true,
-    };
-    transfer.result = result;
-    transfer.status = 'completed';
-    filesTransferPersistState();
-    setFilesDownloadProgress(result.size, result.total_size || result.size);
-    setFilesDownloadStatus('ok', `Downloaded ${result.filename} (${humanBytes(result.size)})`);
-    if (!transfer.skipBrowserSave) downloadDashboardBlob(result.blob, result.filename, result.content_type);
-    transfer.resolve?.(result);
+    settleCompletedFilesDownload(transfer, { resumable: true });
   } catch (err) {
     const message = err?.message || String(err);
     if (transfer.cancelRequested) {
@@ -2237,6 +2218,34 @@ async function runFilesDownloadTransfer(transfer) {
   }
 }
 
+// Shared settle for a fully-downloaded transfer: build the result from the
+// accumulated parts, mark completed, and surface it. Both the ranged runner
+// and the one-shot staged-raw path end here — keep them from diverging.
+function settleCompletedFilesDownload(transfer, { resumable }) {
+  const blob = new Blob(transfer.parts, { type: transfer.contentType || 'application/octet-stream' });
+  const result = {
+    ok: true,
+    blob,
+    parts: transfer.parts.slice(),
+    filename: transfer.filename || 'download.bin',
+    content_type: transfer.contentType,
+    size: blob.size,
+    total_size: transfer.totalSize || blob.size,
+    range_start: 0,
+    range_end: transfer.loaded,
+    range_count: transfer.rangeCount,
+    resumable,
+  };
+  transfer.result = result;
+  transfer.status = 'completed';
+  filesTransferPersistState();
+  setFilesDownloadProgress(result.size, result.total_size || result.size);
+  setFilesDownloadStatus('ok', `Downloaded ${result.filename} (${humanBytes(result.size)})`);
+  if (!transfer.skipBrowserSave) downloadDashboardBlob(result.blob, result.filename, result.content_type);
+  transfer.resolve?.(result);
+  return result;
+}
+
 // Server errors like "no project root" are accurate but unactionable in the
 // transfers pane; translate the known ones before surfacing.
 function filesTransferFriendlyServerError(error, fallback) {
@@ -2246,19 +2255,6 @@ function filesTransferFriendlyServerError(error, fallback) {
     return 'This daemon has no project open — staged uploads and resumable transfers need an active session with a project root';
   }
   return message;
-}
-
-function filesTransferBlobToBase64(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error('Failed to read upload file'));
-    reader.onload = () => {
-      const url = String(reader.result || '');
-      const comma = url.indexOf(',');
-      resolve(comma >= 0 ? url.slice(comma + 1) : '');
-    };
-    reader.readAsDataURL(blob);
-  });
 }
 
 // Staged-upload artifact download over plain HTTP: one-shot fetch of
@@ -2275,7 +2271,7 @@ async function runFilesStagedRawHttpDownload(transfer, controller) {
   const id = String(transfer.artifact?.id || '').trim();
   const resp = await authedFetch(`/api/session/current/uploads/${encodeURIComponent(id)}/raw`, {
     cache: 'no-store',
-    signal: controller.signal,
+    signal: dashboardComposeFetchSignal(controller.signal, transfer.timeoutMs || 300000),
   });
   if (!resp.ok) {
     const body = await resp.json().catch(() => ({}));
@@ -2300,26 +2296,7 @@ async function runFilesStagedRawHttpDownload(transfer, controller) {
   transfer.totalSize = bytes.byteLength;
   transfer.loaded = bytes.byteLength;
   transfer.rangeCount = 1;
-  const result = {
-    ok: true,
-    blob,
-    parts: transfer.parts.slice(),
-    filename: transfer.filename,
-    content_type: transfer.contentType,
-    size: blob.size,
-    total_size: blob.size,
-    range_start: 0,
-    range_end: bytes.byteLength,
-    range_count: 1,
-    resumable: false,
-  };
-  transfer.result = result;
-  transfer.status = 'completed';
-  filesTransferPersistState();
-  setFilesDownloadProgress(result.size, result.total_size || result.size);
-  setFilesDownloadStatus('ok', `Downloaded ${result.filename} (${humanBytes(result.size)})`);
-  if (!transfer.skipBrowserSave) downloadDashboardBlob(result.blob, result.filename, result.content_type);
-  transfer.resolve?.(result);
+  settleCompletedFilesDownload(transfer, { resumable: false });
 }
 
 // Filesystem upload over plain HTTP: the durable transfer-job RPC needs the
@@ -2343,24 +2320,13 @@ async function runFilesFilesystemUploadHttpFallback(transfer, controller) {
   }
   const destination = await filesResolveHttpUploadDestinationPath(transfer, file);
   setFilesUploadStatus('warn', `Uploading ${transfer.name} to ${destination}`);
-  const body = {
-    path: destination,
-    content_b64: await filesTransferBlobToBase64(file),
-  };
-  if (conflict === 'overwrite') {
-    body.force = true;
-  } else {
-    body.create_new = true;
-  }
-  const resp = await authedFetch('/api/fs/write', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: controller.signal,
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const resp = await filesIdeWriteFile('', destination, bytes, {
+    ...(conflict === 'overwrite' ? { force: true } : { create_new: true }),
+    signal: dashboardComposeFetchSignal(controller.signal, transfer.timeoutMs || rangedDownloadTimeoutMs(file.size)),
   });
-  const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok || payload?.ok === false) {
-    throw new Error(filesTransferFriendlyServerError(payload?.error, `file write returned HTTP ${resp.status}`));
+  if (!resp.ok) {
+    throw new Error(filesTransferFriendlyServerError(resp.body?.error, `file write returned HTTP ${resp.status}`));
   }
   transfer.loaded = transfer.totalSize;
   transfer.status = 'completed';
@@ -2377,11 +2343,14 @@ async function filesResolveHttpUploadDestinationPath(transfer, file) {
   const raw = String(transfer.destination || '').trim();
   if (!raw) throw new Error('missing upload destination');
   const name = String(transfer.name || file.name || 'upload.bin');
-  let status = null;
+  let status;
   try {
     status = await fetchProjectPathStatus(raw);
-  } catch (_) {
-    status = null;
+  } catch (err) {
+    // A failed stat is not "does not exist": guessing here either rejects
+    // a valid directory destination or writes the file over the directory
+    // path itself. Fail retryably instead.
+    throw new Error(`Could not verify upload destination ${raw}: ${err?.message || err}`);
   }
   if (status?.exists && status.is_dir) {
     return `${raw.replace(/\/+$/, '')}/${name}`;
@@ -2394,6 +2363,14 @@ async function filesResolveHttpUploadDestinationPath(transfer, file) {
 
 async function runFilesFilesystemUploadTransfer(transfer, controller) {
   if (!await ensureDashboardTransferUploadAvailable({ signal: controller.signal })) {
+    if (transfer.serverJobId || transfer.resumeToken) {
+      // A durable job already holds this upload's chunks server-side.
+      // Rerouting to the whole-file fallback would orphan that job (no
+      // GC; the Files tab re-merges it as a ghost row forever) and throw
+      // away resumability — fail clearly and keep the resume for when
+      // the control channel is back.
+      throw new Error('Resuming this upload needs the dashboard control channel — retry when it reconnects, or cancel to discard the partial upload');
+    }
     if (!dashboardConnectModeEnabled()) {
       return runFilesFilesystemUploadHttpFallback(transfer, controller);
     }
@@ -2497,6 +2474,7 @@ async function runFilesUploadTransfer(transfer) {
   transfer.error = '';
   transfer.loaded = Number(transfer.loaded || 0);
   transfer.cancelRequested = false;
+  transfer.transport = '';
   const controller = new AbortController();
   transfer.abortController = controller;
   renderFilesTransfers();
@@ -2548,7 +2526,7 @@ async function runFilesUploadTransfer(transfer) {
             method: 'POST',
             headers: { 'Content-Type': transfer.file.type || transfer.mime || 'application/octet-stream' },
             body: transfer.file,
-            signal: controller.signal,
+            signal: dashboardComposeFetchSignal(controller.signal, transfer.timeoutMs || rangedDownloadTimeoutMs(transfer.file.size)),
           }
         );
         const payload = await resp.json().catch(() => null);
@@ -2592,18 +2570,25 @@ async function pumpFilesTransfers() {
     for (;;) {
       const transfer = filesTransfers.slice().reverse().find(item => item.status === 'queued');
       if (!transfer) break;
+      const epoch = transfer.queueEpoch || 0;
       const failure = transfer.kind === 'upload'
         ? await runFilesUploadTransfer(transfer).then(() => null, err => err)
         : await runFilesDownloadTransfer(transfer).then(() => null, err => err);
-      if (['queued', 'running'].includes(transfer.status)) {
+      if (
+        ['queued', 'running'].includes(transfer.status) &&
+        (transfer.queueEpoch || 0) === epoch
+      ) {
         // Forward-progress backstop: a runner that exits without settling
         // its transfer would be re-picked by the find() above forever — a
         // synchronous microtask spin that freezes the page and allocates
         // without bound. Force the entry failed so the pump always drains.
+        // The epoch check exempts entries the user legitimately re-queued
+        // (Resume/Retry bump it) while the runner was tearing down.
         transfer.status = 'failed';
         transfer.error = failure?.message || transfer.error || 'transfer runner exited without settling';
         filesTransferPersistState();
         renderFilesTransfers();
+        transfer.reject?.(failure || new Error(transfer.error));
       }
       // Macrotask yield: even a misbehaving runner that settles instantly
       // can only busy the tab, never wedge the event loop.
@@ -2662,6 +2647,7 @@ function cancelFilesTransfer(id) {
 function resumeFilesTransfer(id) {
   const transfer = filesTransferById(id);
   if (!transfer || !['paused', 'failed'].includes(transfer.status)) return null;
+  transfer.queueEpoch = (transfer.queueEpoch || 0) + 1;
   transfer.status = 'queued';
   transfer.error = '';
   transfer.pauseRequested = false;
@@ -2677,6 +2663,7 @@ function retryFilesTransfer(id) {
   const transfer = filesTransferById(id);
   if (!transfer || !['failed', 'cancelled', 'completed'].includes(transfer.status)) return null;
   if (transfer.kind === 'download') resetFilesDownloadTransfer(transfer);
+  transfer.queueEpoch = (transfer.queueEpoch || 0) + 1;
   transfer.status = 'queued';
   transfer.error = '';
   transfer.cancelRequested = false;
@@ -2831,49 +2818,23 @@ async function downloadFilesStagedUpload(id) {
   const upload = filesStagedUploads.get(String(id || ''));
   if (!upload) return null;
   try {
-    if (dashboardTransferDownloadAvailable()) {
-      const name = filesStagedDescriptorName(upload);
-      const transfer = queueDashboardArtifactDownload({
-        type: 'staged_upload',
-        id: String(id || ''),
-      }, {
-        sourceLabel: `Staged upload: ${name}`,
-        filename: name,
-        contentType: upload.mime || upload.content_type || 'application/octet-stream',
-        directMethod: 'api_session_current_upload_raw',
-        directParams: { id: String(id || '') },
-      });
-      if (!transfer) throw new Error('Staged upload download was not queued');
-      const result = await transfer.completion;
-      setFilesUploadStatus('ok', `Downloaded ${result.filename || name}`);
-      return result;
-    }
-    if (dashboardConnectModeEnabled()) {
-      throw new Error('Staged upload download is unavailable until file access is ready');
-    }
+    // One implementation for every transport: queue a transfer and let
+    // runFilesDownloadTransfer pick durable RPC, byte-stream, or the
+    // staged-raw HTTP fallback — the inline fetch this replaces had
+    // drifted (no size cap, no cancel, raw server errors).
     const name = filesStagedDescriptorName(upload);
-    const resp = await authedFetch(`/api/session/current/uploads/${encodeURIComponent(id)}/raw`, {
-      cache: 'no-store',
-    });
-    if (!resp.ok) {
-      const body = await resp.json().catch(() => ({}));
-      throw new Error(body.error || `staged upload download returned ${resp.status}`);
-    }
-    const blob = await resp.blob();
-    const result = {
-      ok: true,
-      blob,
+    const transfer = queueDashboardArtifactDownload({
+      type: 'staged_upload',
+      id: String(id || ''),
+    }, {
+      sourceLabel: `Staged upload: ${name}`,
       filename: name,
-      content_type: resp.headers.get('content-type') || upload.mime || 'application/octet-stream',
-      size: blob.size,
-      total_size: blob.size,
-      range_count: 1,
-    };
-    downloadDashboardBlob(
-      result.blob,
-      result.filename || name,
-      result.content_type || upload.mime || 'application/octet-stream'
-    );
+      contentType: upload.mime || upload.content_type || 'application/octet-stream',
+      directMethod: 'api_session_current_upload_raw',
+      directParams: { id: String(id || '') },
+    });
+    if (!transfer) throw new Error('Staged upload download was not queued');
+    const result = await transfer.completion;
     setFilesUploadStatus('ok', `Downloaded ${result.filename || name}`);
     return result;
   } catch (err) {

@@ -297,6 +297,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     var backendLastStart = Date.distantPast
     var backendAutoRestartTimer: Timer?
     var isTerminating = false
+    // Readiness-poll chains carry a generation stamp; bumping it orphans
+    // any chain already in flight (a crash mid-boot must not let a stale
+    // chain paint its dead-end failure page over the restart countdown).
+    var pollGeneration = 0
     var port: Int = 8765
     let portSearchLimit = 20
     var launchPlan: BackendLaunchPlan!
@@ -585,7 +589,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
 
     /// Crash-screen Restart button: relaunch the backend and re-enter the
     /// readiness poll (which lands on the placeholder / auto-activation).
-    func restartBackend() {
+    @discardableResult
+    func restartBackend() -> Bool {
         NSLog("Backend restart requested")
         backendAutoRestartTimer?.invalidate()
         healthTimer?.invalidate()
@@ -594,8 +599,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             proc.terminationHandler = nil
             proc.terminate()
         }
-        startBackend()
-        pollUntilReady()
+        let started = startBackend()
+        if started {
+            pollUntilReady()
+        }
+        return started
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -695,13 +703,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
 
     // MARK: - Backend
 
-    func startBackend() {
+    @discardableResult
+    func startBackend() -> Bool {
         let bundle = Bundle.main
         let binPath = bundle.bundlePath + "/Contents/MacOS/intendant-bin"
 
         guard FileManager.default.fileExists(atPath: binPath) else {
             NSLog("intendant-bin not found at \(binPath)")
-            return
+            return false
         }
 
         let process = Process()
@@ -769,8 +778,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
                 }
             }
             NSLog("Started intendant-bin (PID \(process.processIdentifier)) on port \(port)")
+            return true
         } catch {
             NSLog("Failed to start intendant-bin: \(error)")
+            return false
         }
     }
 
@@ -780,12 +791,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     /// button revives it.
     func backendDidExit(_ proc: Process) {
         guard !isTerminating, proc === backendProcess, !proc.isRunning else { return }
+        // Consume the reference first: the health tick and the
+        // terminationHandler can both observe the same exit, and a second
+        // pass would double-count the attempt and reschedule the timer.
+        backendProcess = nil
         healthTimer?.invalidate()
         let signalled = proc.terminationReason == .uncaughtSignal
         let status = proc.terminationStatus
         let abnormal = signalled || status != 0
         NSLog("Backend exited (\(signalled ? "signal" : "status") \(status), \(abnormal ? "abnormal" : "clean"))")
         guard abnormal else {
+            pollGeneration += 1
             showBackendCrash(
                 title: "Backend stopped",
                 detail: "The daemon exited cleanly. Restart it to keep using this app."
@@ -795,6 +811,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         if Date().timeIntervalSince(backendLastStart) > 600 {
             backendRestartAttempts = 0
         }
+        scheduleBackendAutoRestart()
+    }
+
+    /// Arm (or re-arm) the auto-restart countdown with capped exponential
+    /// backoff, orphaning any readiness-poll chain so nothing paints over
+    /// the countdown screen. Re-entered by the timer itself when a spawn
+    /// attempt fails, so the chain never dead-ends.
+    func scheduleBackendAutoRestart() {
+        guard !isTerminating else { return }
+        pollGeneration += 1
         let delay = min(60.0, pow(2.0, Double(backendRestartAttempts + 1)))
         backendRestartAttempts += 1
         NSLog("Auto-restarting backend in \(Int(delay))s (attempt \(backendRestartAttempts))")
@@ -805,7 +831,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         backendAutoRestartTimer?.invalidate()
         backendAutoRestartTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
             guard let self = self, !self.isTerminating else { return }
-            self.restartBackend()
+            if !self.restartBackend() {
+                self.scheduleBackendAutoRestart()
+            }
         }
     }
 
@@ -919,6 +947,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     // MARK: - Polling
 
     func pollUntilReady() {
+        pollGeneration += 1
         webView?.loadHTMLString("""
             <html>
             <body style="background:#1e1e2e;color:#cdd6f4;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
@@ -930,17 +959,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             </html>
             """, baseURL: nil)
 
-        poll(attempts: 0)
+        poll(attempts: 0, generation: pollGeneration)
     }
 
-    func poll(attempts: Int) {
+    func poll(attempts: Int, generation: Int) {
+        // A crash or scheduled restart bumps pollGeneration; a stale chain
+        // must go silent rather than paint over the countdown screen.
+        guard generation == pollGeneration else { return }
         if attempts > 30 {
             // The window may have been closed while the backend booted;
             // the poll keeps running regardless, only painting is skipped.
             webView?.loadHTMLString("""
                 <html>
-                <body style="background:#1e1e2e;color:#f38ba8;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
-                <div>Failed to connect to backend on port \(port)</div>
+                <body style="background:#1e1e2e;color:#cdd6f4;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+                <div style="text-align:center">
+                    <div style="font-size:20px;color:#f38ba8;margin-bottom:12px">Failed to connect to backend on port \(port)</div>
+                    <div style="font-size:14px;color:#6c7086;margin-bottom:16px">Check ~/.intendant/app-backend.log for details</div>
+                    <button onclick="window.webkit.messageHandlers.restart && window.webkit.messageHandlers.restart.postMessage(null)"
+                            style="padding:8px 24px;border:1px solid #89b4fa;border-radius:6px;background:transparent;color:#89b4fa;font-size:14px;cursor:pointer">
+                        Restart now
+                    </button>
+                </div>
                 </body>
                 </html>
                 """, baseURL: nil)
@@ -955,6 +994,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         backendSession.dataTask(with: request) { _, response, error in
             if let http = response as? HTTPURLResponse, http.statusCode == 200 {
                 DispatchQueue.main.async {
+                    guard generation == self.pollGeneration else { return }
                     // Backend is up. The SPA is deferred behind the
                     // placeholder unless a harness/user asked for it.
                     if self.autoActivateDashboard {
@@ -972,7 +1012,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
                     NSLog("Backend readiness poll failing (attempt \(attempts + 1)/30): status=\(status) error=\(error?.localizedDescription ?? "none")")
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    self.poll(attempts: attempts + 1)
+                    self.poll(attempts: attempts + 1, generation: generation)
                 }
             }
         }.resume()

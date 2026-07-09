@@ -228,6 +228,7 @@ function dashboardUpdateTransportStatus() {
   renderConnectHealthPanel(status, summary);
   renderDashboardTargetSummaries();
   refreshFilesDownloadAvailability();
+  updateVirtualDisplayAvailabilityUi();
   if (activeTab === 'files') refreshFilesTransferJobs();
   maybeOpenShellAfterTransportReady();
 }
