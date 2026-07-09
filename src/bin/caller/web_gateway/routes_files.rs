@@ -1939,60 +1939,68 @@ pub(crate) fn upload_error_response(status: &str, message: &str) -> String {
         .into_string()
 }
 
+/// Transport-neutral core of `POST /api/fs/write` (tunnel twin
+/// `api_fs_write`'s apply leg): decode the request's content payload,
+/// then run the precondition-guarded atomic write off the async
+/// runtime. Path authorization is the caller's lane gate.
+pub(crate) async fn fs_write_api_response(req: FsWriteRequest) -> ApiResponse {
+    match fs_write_request_bytes(&req) {
+        Ok(bytes) => {
+            let args = FsWriteArgs {
+                path: req.path.clone(),
+                expected_sha256: req.expected_sha256.clone(),
+                create_new: req.create_new,
+                force: req.force,
+            };
+            let (status, body) =
+                tokio::task::spawn_blocking(move || apply_dashboard_fs_write(&args, &bytes))
+                    .await
+                    .unwrap_or_else(|e| {
+                        (
+                            "500 Internal Server Error".to_string(),
+                            serde_json::json!({
+                                "error": format!(
+                                    "filesystem write task failed: {e}"
+                                )
+                            }),
+                        )
+                    });
+            ApiResponse::json(
+                status_line_u16(&status),
+                JsonBody::PreSerialized(body.to_string()),
+            )
+        }
+        Err(message) => ApiResponse::json_error(400, message),
+    }
+}
+
 pub(crate) async fn handle_fs_write(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     http_access_context: HttpAccessContext,
     peer_connection_identity: Option<PeerConnectionIdentity>,
     bus: EventBus,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
     // Dispatch already read the body under the row's envelope cap
     // (UPLOAD_MAX_BYTES plus half again — base64/escaping overhead on top
     // of the content cap apply_dashboard_fs_write enforces).
-    let response = {
-        match serde_json::from_str::<FsWriteRequest>(&body_text) {
-            Ok(req) => match authorize_http_filesystem_access(
-                &http_access_context,
-                peer_connection_identity.as_ref(),
-                crate::peer::access_policy::PeerOperation::FilesystemWrite,
-                crate::peer::access_policy::FilesystemAccessKind::Write,
-                &req.path,
-                &bus,
-            ) {
-                Ok(()) => match fs_write_request_bytes(&req) {
-                    Ok(bytes) => {
-                        let args = FsWriteArgs {
-                            path: req.path.clone(),
-                            expected_sha256: req.expected_sha256.clone(),
-                            create_new: req.create_new,
-                            force: req.force,
-                        };
-                        let (status, body) = tokio::task::spawn_blocking(move || {
-                            apply_dashboard_fs_write(&args, &bytes)
-                        })
-                        .await
-                        .unwrap_or_else(|e| {
-                            (
-                                "500 Internal Server Error".to_string(),
-                                serde_json::json!({
-                                    "error": format!(
-                                        "filesystem write task failed: {e}"
-                                    )
-                                }),
-                            )
-                        });
-                        json_response(&status, body.to_string())
-                    }
-                    Err(message) => json_error("400 Bad Request", message),
-                },
-                Err(message) => json_error("403 Forbidden", message),
-            },
-            Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
-        }
+    let response = match serde_json::from_str::<FsWriteRequest>(&body_text) {
+        Ok(req) => match authorize_http_filesystem_access(
+            &http_access_context,
+            peer_connection_identity.as_ref(),
+            crate::peer::access_policy::PeerOperation::FilesystemWrite,
+            crate::peer::access_policy::FilesystemAccessKind::Write,
+            &req.path,
+            &bus,
+        ) {
+            Ok(()) => fs_write_api_response(req).await,
+            Err(message) => ApiResponse::json_error(403, message),
+        },
+        Err(e) => ApiResponse::json_error(400, format!("invalid JSON: {e}")),
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 /// Synthesize the fs GET trio's [`ApiRequest`] from the HTTP request
@@ -2133,14 +2141,25 @@ pub(crate) async fn handle_fs_read(
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
+/// Transport-neutral core of `POST /api/fs/mkdir` (tunnel twin
+/// `api_fs_mkdir`; the tunnel lane delegates here in S2). Path
+/// authorization is the caller's lane gate.
+pub(crate) fn fs_mkdir_api_response(path: &str) -> ApiResponse {
+    match mkdir_dashboard_fs_path(path) {
+        Ok(body) => ApiResponse::json(200, JsonBody::Value(body)),
+        Err((status, message)) => ApiResponse::json_error(status_line_u16(&status), message),
+    }
+}
+
 pub(crate) async fn handle_fs_mkdir(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     http_access_context: HttpAccessContext,
     peer_connection_identity: Option<PeerConnectionIdentity>,
     bus: EventBus,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
     let response = match serde_json::from_str::<FsMkdirRequest>(&body_text) {
         Ok(req) => match authorize_http_filesystem_access(
             &http_access_context,
@@ -2150,26 +2169,46 @@ pub(crate) async fn handle_fs_mkdir(
             &req.path,
             &bus,
         ) {
-            Ok(()) => match mkdir_dashboard_fs_path(&req.path) {
-                Ok(body) => json_ok(body),
-                Err((status, message)) => json_error(&status, message),
-            },
-            Err(message) => json_error("403 Forbidden", message),
+            Ok(()) => fs_mkdir_api_response(&req.path),
+            Err(message) => ApiResponse::json_error(403, message),
         },
-        Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
+        Err(e) => ApiResponse::json_error(400, format!("invalid JSON: {e}")),
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// Transport-neutral core of `POST /api/fs/rename` (tunnel twin
+/// `api_fs_rename`; the tunnel lane delegates here in S2). Both paths'
+/// authorization is the caller's lane gate.
+pub(crate) async fn fs_rename_api_response(from: String, to: String) -> ApiResponse {
+    let (status, body) =
+        tokio::task::spawn_blocking(move || apply_dashboard_fs_rename(&from, &to))
+            .await
+            .unwrap_or_else(|e| {
+                (
+                    "500 Internal Server Error".to_string(),
+                    serde_json::json!({
+                        "error": format!(
+                            "filesystem rename task failed: {e}"
+                        )
+                    }),
+                )
+            });
+    ApiResponse::json(
+        status_line_u16(&status),
+        JsonBody::PreSerialized(body.to_string()),
+    )
 }
 
 pub(crate) async fn handle_fs_rename(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     http_access_context: HttpAccessContext,
     peer_connection_identity: Option<PeerConnectionIdentity>,
     bus: EventBus,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
     let response = match serde_json::from_str::<FsRenameRequest>(&body_text) {
         // Removing the source entry and creating the
         // destination are both writes — each leg passes
@@ -2192,39 +2231,46 @@ pub(crate) async fn handle_fs_rename(
                 &bus,
             )
         }) {
-            Ok(()) => {
-                let (status, body) = tokio::task::spawn_blocking(move || {
-                    apply_dashboard_fs_rename(&req.from, &req.to)
-                })
-                .await
-                .unwrap_or_else(|e| {
-                    (
-                        "500 Internal Server Error".to_string(),
-                        serde_json::json!({
-                            "error": format!(
-                                "filesystem rename task failed: {e}"
-                            )
-                        }),
-                    )
-                });
-                json_response(&status, body.to_string())
-            }
-            Err(message) => json_error("403 Forbidden", message),
+            Ok(()) => fs_rename_api_response(req.from, req.to).await,
+            Err(message) => ApiResponse::json_error(403, message),
         },
-        Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
+        Err(e) => ApiResponse::json_error(400, format!("invalid JSON: {e}")),
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// Transport-neutral core of `POST /api/fs/delete` (tunnel twin
+/// `api_fs_delete`; the tunnel lane delegates here in S2). Path
+/// authorization is the caller's lane gate.
+pub(crate) async fn fs_delete_api_response(path: String, recursive: bool) -> ApiResponse {
+    let (status, body) =
+        tokio::task::spawn_blocking(move || apply_dashboard_fs_delete(&path, recursive))
+            .await
+            .unwrap_or_else(|e| {
+                (
+                    "500 Internal Server Error".to_string(),
+                    serde_json::json!({
+                        "error": format!(
+                            "filesystem delete task failed: {e}"
+                        )
+                    }),
+                )
+            });
+    ApiResponse::json(
+        status_line_u16(&status),
+        JsonBody::PreSerialized(body.to_string()),
+    )
 }
 
 pub(crate) async fn handle_fs_delete(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     http_access_context: HttpAccessContext,
     peer_connection_identity: Option<PeerConnectionIdentity>,
     bus: EventBus,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
     let response = match serde_json::from_str::<FsDeleteRequest>(&body_text) {
         Ok(req) => match authorize_http_filesystem_access(
             &http_access_context,
@@ -2234,29 +2280,12 @@ pub(crate) async fn handle_fs_delete(
             &req.path,
             &bus,
         ) {
-            Ok(()) => {
-                let (status, body) = tokio::task::spawn_blocking(move || {
-                    apply_dashboard_fs_delete(&req.path, req.recursive)
-                })
-                .await
-                .unwrap_or_else(|e| {
-                    (
-                        "500 Internal Server Error".to_string(),
-                        serde_json::json!({
-                            "error": format!(
-                                "filesystem delete task failed: {e}"
-                            )
-                        }),
-                    )
-                });
-                json_response(&status, body.to_string())
-            }
-            Err(message) => json_error("403 Forbidden", message),
+            Ok(()) => fs_delete_api_response(req.path, req.recursive).await,
+            Err(message) => ApiResponse::json_error(403, message),
         },
-        Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
+        Err(e) => ApiResponse::json_error(400, format!("invalid JSON: {e}")),
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 // Parameter count rides until a request-context bundle collapses the
@@ -3026,6 +3055,7 @@ mod tests {
     /// silently changing the wire.
     fn fs_route_cors(path: &str) -> crate::gateway_routes::CorsPosture {
         crate::gateway_routes::match_route("GET", path)
+            .or_else(|| crate::gateway_routes::match_route("POST", path))
             .expect("fs route declared")
             .0
             .cors
@@ -3236,7 +3266,15 @@ mod tests {
         let body_text =
             serde_json::json!({ "path": target.to_string_lossy() }).to_string();
         let response = collect_handler_response(|stream| {
-            handle_fs_mkdir(stream, body_text, golden_root_ctx(), None, EventBus::new())
+            handle_fs_mkdir(
+                stream,
+                body_text,
+                golden_root_ctx(),
+                None,
+                EventBus::new(),
+                fs_route_cors("/api/fs/mkdir"),
+                None,
+            )
         })
         .await;
         // Display path is canonicalized after creation.
@@ -3258,7 +3296,15 @@ mod tests {
         std::fs::write(&file, b"file, not dir").unwrap();
         let body_text = serde_json::json!({ "path": file.to_string_lossy() }).to_string();
         let response = collect_handler_response(|stream| {
-            handle_fs_mkdir(stream, body_text, golden_root_ctx(), None, EventBus::new())
+            handle_fs_mkdir(
+                stream,
+                body_text,
+                golden_root_ctx(),
+                None,
+                EventBus::new(),
+                fs_route_cors("/api/fs/mkdir"),
+                None,
+            )
         })
         .await;
         let body = serde_json::json!({
@@ -3280,6 +3326,8 @@ mod tests {
                 golden_root_ctx(),
                 None,
                 EventBus::new(),
+                fs_route_cors("/api/fs/mkdir"),
+                None,
             )
         })
         .await;
@@ -3321,7 +3369,15 @@ mod tests {
         })
         .to_string();
         let response = collect_handler_response(|stream| {
-            handle_fs_mkdir(stream, body_text, scoped, None, EventBus::new())
+            handle_fs_mkdir(
+                stream,
+                body_text,
+                scoped,
+                None,
+                EventBus::new(),
+                fs_route_cors("/api/fs/mkdir"),
+                None,
+            )
         })
         .await;
         let body = serde_json::json!({ "error": reason }).to_string();
@@ -3343,7 +3399,15 @@ mod tests {
         })
         .to_string();
         let response = collect_handler_response(|stream| {
-            handle_fs_write(stream, body_text, golden_root_ctx(), None, EventBus::new())
+            handle_fs_write(
+                stream,
+                body_text,
+                golden_root_ctx(),
+                None,
+                EventBus::new(),
+                fs_route_cors("/api/fs/write"),
+                None,
+            )
         })
         .await;
         // New file: the handler resolved canonical parent + name.
@@ -3377,7 +3441,15 @@ mod tests {
         })
         .to_string();
         let response = collect_handler_response(|stream| {
-            handle_fs_write(stream, body_text, golden_root_ctx(), None, EventBus::new())
+            handle_fs_write(
+                stream,
+                body_text,
+                golden_root_ctx(),
+                None,
+                EventBus::new(),
+                fs_route_cors("/api/fs/write"),
+                None,
+            )
         })
         .await;
         let canonical = std::fs::canonicalize(&target).unwrap();
@@ -3411,7 +3483,15 @@ mod tests {
         })
         .to_string();
         let response = collect_handler_response(|stream| {
-            handle_fs_write(stream, body_text, golden_root_ctx(), None, EventBus::new())
+            handle_fs_write(
+                stream,
+                body_text,
+                golden_root_ctx(),
+                None,
+                EventBus::new(),
+                fs_route_cors("/api/fs/write"),
+                None,
+            )
         })
         .await;
         let body = serde_json::json!({
@@ -3437,7 +3517,15 @@ mod tests {
         })
         .to_string();
         let response = collect_handler_response(|stream| {
-            handle_fs_write(stream, body_text, golden_root_ctx(), None, EventBus::new())
+            handle_fs_write(
+                stream,
+                body_text,
+                golden_root_ctx(),
+                None,
+                EventBus::new(),
+                fs_route_cors("/api/fs/write"),
+                None,
+            )
         })
         .await;
         let body = r#"{"error":"provide either content or content_b64, not both"}"#;
@@ -3461,7 +3549,15 @@ mod tests {
         })
         .to_string();
         let response = collect_handler_response(|stream| {
-            handle_fs_rename(stream, body_text, golden_root_ctx(), None, EventBus::new())
+            handle_fs_rename(
+                stream,
+                body_text,
+                golden_root_ctx(),
+                None,
+                EventBus::new(),
+                fs_route_cors("/api/fs/rename"),
+                None,
+            )
         })
         .await;
         let resolved_to = std::fs::canonicalize(dir.path())
@@ -3491,7 +3587,15 @@ mod tests {
         })
         .to_string();
         let response = collect_handler_response(|stream| {
-            handle_fs_rename(stream, body_text, golden_root_ctx(), None, EventBus::new())
+            handle_fs_rename(
+                stream,
+                body_text,
+                golden_root_ctx(),
+                None,
+                EventBus::new(),
+                fs_route_cors("/api/fs/rename"),
+                None,
+            )
         })
         .await;
         let resolved_to = std::fs::canonicalize(dir.path()).unwrap().join("dst.txt");
@@ -3514,7 +3618,15 @@ mod tests {
         let path = target.to_string_lossy().into_owned();
         let body_text = serde_json::json!({ "path": path }).to_string();
         let response = collect_handler_response(|stream| {
-            handle_fs_delete(stream, body_text, golden_root_ctx(), None, EventBus::new())
+            handle_fs_delete(
+                stream,
+                body_text,
+                golden_root_ctx(),
+                None,
+                EventBus::new(),
+                fs_route_cors("/api/fs/delete"),
+                None,
+            )
         })
         .await;
         // Delete reports the expanded (not canonicalized) request path.
@@ -3538,7 +3650,15 @@ mod tests {
         let path = target.to_string_lossy().into_owned();
         let body_text = serde_json::json!({ "path": path }).to_string();
         let response = collect_handler_response(|stream| {
-            handle_fs_delete(stream, body_text, golden_root_ctx(), None, EventBus::new())
+            handle_fs_delete(
+                stream,
+                body_text,
+                golden_root_ctx(),
+                None,
+                EventBus::new(),
+                fs_route_cors("/api/fs/delete"),
+                None,
+            )
         })
         .await;
         let body = serde_json::json!({

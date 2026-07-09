@@ -746,6 +746,7 @@ pub(crate) fn status_reason(status: u16) -> &'static str {
         403 => "403 Forbidden",
         404 => "404 Not Found",
         405 => "405 Method Not Allowed",
+        409 => "409 Conflict",
         413 => "413 Payload Too Large",
         416 => "416 Range Not Satisfiable",
         429 => "429 Too Many Requests",
