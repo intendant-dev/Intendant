@@ -49677,9 +49677,9 @@ function showUserQuestion(id, questions, sessionId) {
     const free = document.createElement('input');
     free.className = 'question-free-text';
     free.type = 'text';
-    free.placeholder = q.multi_select
+    free.placeholder = (q.options || []).length
       ? 'Or type your own answer…'
-      : 'Or type your own answer…';
+      : 'Type your answer…';
     free.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); sendQuestionAnswer(); }
     });

@@ -1503,3 +1503,120 @@ async fn supervised_session_surfaces_approvals_on_the_dashboard() {
 
     let _ = child.kill().await;
 }
+
+/// The native askHuman command reaches the dashboard question rail: a
+/// supervised session's question arrives as a `user_question` event tagged
+/// with the session id, the dashboard's `answer_question` resolves it, and
+/// the answer text reaches the model as the tool result (pinned by the mock
+/// script's transcript expectation on the next step).
+#[tokio::test]
+async fn supervised_session_ask_human_reaches_the_question_rail() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    let script = rig.write_script(&serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "I need to know the color before painting.",
+                  "tool_calls": [{ "name": "ask_human",
+                                   "arguments": { "nonce": 1, "question": "Which color should the widget be?" } }] },
+                // The transcript gate proves the rail answer became the
+                // askHuman tool result the model actually read.
+                { "content": "Painting it cerulean.",
+                  "expect_transcript_contains": "cerulean",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "question answered" } }] }
+            ]
+        }]
+    }));
+    let session_project = tempfile::tempdir().expect("session project dir");
+
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script)
+        .args(["--no-tls", "--web", "18942"]);
+    let mut child = cmd.spawn().expect("spawn intendant daemon");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let _stderr_drain = drain_pipe_into(child.stderr.take().expect("stderr"), stderr_buf.clone());
+    let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
+
+    let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
+    let port: u16 = stderr_so_far
+        .lines()
+        .find_map(|line| {
+            let url = line.strip_prefix("Dashboard: http://")?;
+            url.rsplit(':').next()?.trim().parse().ok()
+        })
+        .expect("parse the dashboard port from the startup line");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Same startup race + retry shape as the approvals e2e above.
+    let mut question = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "paint the widget the right color",
+                "project_root": session_project.path().to_string_lossy(),
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send create_session");
+        question = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("user_question")
+        })
+        .await;
+        if question.is_some() {
+            break;
+        }
+    }
+    let question = question.unwrap_or_else(|| {
+        panic!(
+            "no user_question from the supervised session's askHuman (file-park regression?); daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let session_id = question
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("user_question must carry its session id, got {question}"))
+        .to_string();
+    let question_id = question
+        .get("id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| panic!("user_question must carry an id, got {question}"));
+    let question_text = question
+        .pointer("/questions/0/question")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("user_question must carry the question text, got {question}"));
+    assert_eq!(question_text, "Which color should the widget be?");
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "answer_question",
+            "session_id": session_id,
+            "id": question_id,
+            "answers": { question_text: "cerulean" },
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send answer_question");
+
+    // signal_done only fires after the transcript gate saw "cerulean" —
+    // reaching a completed round IS the proof the answer landed.
+    let stderr_ctx = stderr_buf.clone();
+    complete_and_stop_session(&mut ws, &session_id, move || {
+        stderr_ctx.lock().map(|b| b.clone()).unwrap_or_default()
+    })
+    .await;
+
+    let _ = child.kill().await;
+}
