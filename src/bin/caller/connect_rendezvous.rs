@@ -89,6 +89,19 @@ struct RegisterResponse {
     /// authority).
     #[serde(default)]
     observed_ip: Option<String>,
+    /// Fleet DNS hint: this daemon's derived name under the rendezvous's
+    /// delegated zone, when it serves one (fleet certificates —
+    /// `fleet_cert.rs`).
+    #[serde(default)]
+    fleet_dns: Option<FleetDnsHint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FleetDnsHint {
+    #[serde(default)]
+    zone: String,
+    #[serde(default)]
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -850,6 +863,20 @@ fn note_register_response(response: &RegisterResponse, base_url: &Url) {
     };
     let now = crate::access::client_key::now_unix_ms();
     let mut print_claim: Option<String> = None;
+    // Fleet DNS: hand the name to the certificate machinery (it installs
+    // any stored certificate the first time the name is learned).
+    crate::fleet_cert::note_fleet_dns(
+        response
+            .fleet_dns
+            .as_ref()
+            .map(|hint| hint.zone.clone())
+            .filter(|zone| !zone.is_empty()),
+        response
+            .fleet_dns
+            .as_ref()
+            .map(|hint| hint.name.clone())
+            .filter(|name| !name.is_empty()),
+    );
     with_status(|status| {
         status.registered = true;
         status.last_register_unix_ms = Some(now);
@@ -1752,6 +1779,150 @@ pub(crate) async fn request_unclaim(config: &ConnectConfig) -> Result<bool, Stri
     Ok(changed)
 }
 
+/* ── Fleet DNS: daemon-signed record publishes (fleet_cert.rs) ──
+Payloads REPLICATE bin/connect/rendezvous.rs (twin golden test below);
+same resolution + signing discipline as request_unclaim. */
+
+const DNS_PUBLISH_PROTOCOL: &str = "intendant-connect-dns-publish-v1";
+const DNS_ACME_PROTOCOL: &str = "intendant-connect-dns-acme-v1";
+
+fn dns_publish_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+    addresses_csv: &str,
+) -> String {
+    format!(
+        "{DNS_PUBLISH_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{addresses_csv}\n"
+    )
+}
+
+fn dns_acme_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+    txt_value: &str,
+) -> String {
+    format!(
+        "{DNS_ACME_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{txt_value}\n"
+    )
+}
+
+/// The signing context every fleet-DNS call needs: effective config,
+/// rendezvous URL, identity, and the effective daemon id.
+fn dns_signing_context() -> Result<(ConnectConfig, Url, DaemonIdentity, String), String> {
+    let mut config = crate::project::ConnectConfig::default().effective_with_env();
+    if config.rendezvous_url.is_none() {
+        config.rendezvous_url = status_snapshot().rendezvous_url;
+    }
+    if config.daemon_id.is_none() {
+        config.daemon_id = status_snapshot().daemon_id;
+    }
+    let base_url = config
+        .rendezvous_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| "no rendezvous configured".to_string())?;
+    let base_url = Url::parse(base_url).map_err(|e| format!("invalid rendezvous_url: {e}"))?;
+    let identity = DaemonIdentity::load_or_create_default()?;
+    let daemon_id = config
+        .daemon_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| identity.public_key_b64u());
+    Ok((config, base_url, identity, daemon_id))
+}
+
+async fn dns_signed_post(
+    path: &str,
+    protocol: &str,
+    payload_tail: &str,
+    extra: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let (config, base_url, identity, daemon_id) = dns_signing_context()?;
+    let daemon_public_key = identity.public_key_b64u();
+    let issued_at_unix_ms = crate::access::client_key::now_unix_ms().max(0) as u64;
+    let payload = format!(
+        "{protocol}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{payload_tail}\n"
+    );
+    let mut body = serde_json::json!({
+        "protocol": protocol,
+        "daemon_id": daemon_id,
+        "daemon_public_key": daemon_public_key,
+        "issued_at_unix_ms": issued_at_unix_ms,
+        "signature": identity.sign_b64u(payload.as_bytes()),
+    });
+    if let (Some(map), Some(extra_map)) = (body.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra_map {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = authenticated(&config, client.post(join_url(&base_url, path)?))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("dns publish rejected: HTTP {status} {text}"));
+    }
+    response.json().await.map_err(|e| e.to_string())
+}
+
+/// Publish this daemon's A/AAAA addresses for its fleet name. Returns
+/// the address list the service accepted.
+pub(crate) async fn dns_publish_addresses(addresses: &[String]) -> Result<Vec<String>, String> {
+    let addresses_csv = addresses.join(",");
+    let body = dns_signed_post(
+        "api/dns/publish",
+        DNS_PUBLISH_PROTOCOL,
+        &addresses_csv,
+        serde_json::json!({ "addresses": addresses }),
+    )
+    .await?;
+    Ok(body
+        .get("addresses")
+        .and_then(|value| value.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Publish an ACME DNS-01 TXT value for this daemon's name.
+pub(crate) async fn dns_acme_set(txt_value: &str) -> Result<(), String> {
+    dns_signed_post(
+        "api/dns/acme-challenge",
+        DNS_ACME_PROTOCOL,
+        txt_value,
+        serde_json::json!({ "txt_value": txt_value }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Clear this daemon's ACME TXT records (order finished either way).
+pub(crate) async fn dns_acme_clear() -> Result<(), String> {
+    dns_signed_post(
+        "api/dns/acme-challenge",
+        DNS_ACME_PROTOCOL,
+        "",
+        serde_json::json!({ "clear": true }),
+    )
+    .await
+    .map(|_| ())
+}
+
 async fn post_error(
     client: &Client,
     base_url: &Url,
@@ -2131,6 +2302,19 @@ mod tests {
             unclaim_signing_payload("daemon-1", "PubKey", 1_700_000_000_000),
             "intendant-connect-unclaim-v1\ndaemon-1\nPubKey\n1700000000000\n"
         );
+        assert_eq!(
+            dns_publish_signing_payload(
+                "daemon-1",
+                "PubKey",
+                1_700_000_000_000,
+                "192.168.1.50,2001:db8::7"
+            ),
+            "intendant-connect-dns-publish-v1\ndaemon-1\nPubKey\n1700000000000\n192.168.1.50,2001:db8::7\n"
+        );
+        assert_eq!(
+            dns_acme_signing_payload("daemon-1", "PubKey", 1_700_000_000_000, "tok-value"),
+            "intendant-connect-dns-acme-v1\ndaemon-1\nPubKey\n1700000000000\ntok-value\n"
+        );
     }
 
     /// Twin of the service's normalize/hash tests — one shared literal
@@ -2318,6 +2502,7 @@ mod tests {
                 claim_code_expires_unix_ms: None,
                 claim_url: None,
                 observed_ip: None,
+                fleet_dns: None,
             },
             &base_url,
         );
@@ -2336,6 +2521,7 @@ mod tests {
                 claim_code_expires_unix_ms: None,
                 claim_url: None,
                 observed_ip: None,
+                fleet_dns: None,
             },
             &base_url,
         );
@@ -2357,6 +2543,7 @@ mod tests {
                     "https://connect.example/connect?claim_code=word-word-word".to_string(),
                 ),
                 observed_ip: None,
+                fleet_dns: None,
             },
             &base_url,
         );

@@ -803,6 +803,26 @@ async function accessSetHostedCeiling(roleId) {
   renderAccessAdminSummaries();
 }
 
+async function accessFleetCertRequest() {
+  try {
+    const resp = await dashboardJsonFetch('api_fleet_cert_request', {}, () => Promise.reject(new Error('fleet certificate requests ride the control channel — connect to the daemon first')), 'api_fleet_cert_request', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    showControlToast?.('success', 'Certificate request started — publishing DNS records and answering the Let’s Encrypt challenge (usually under a minute).');
+  } catch (err) {
+    showControlToast?.('error', err?.message || 'Certificate request failed');
+  }
+  // Poll the card a few times while the async flow runs.
+  for (const delay of [5000, 15000, 40000]) {
+    setTimeout(() => {
+      refreshAccessConnectStatus({ silent: true }).catch(() => null);
+      renderAccessAdminSummaries();
+    }, delay);
+  }
+  await refreshAccessConnectStatus({ silent: true }).catch(() => null);
+  renderAccessAdminSummaries();
+}
+
 async function accessConnectUnclaim() {
   try {
     const resp = await dashboardJsonFetch('api_access_connect_unclaim', {}, () => authedFetch('/api/access/connect/unclaim', {

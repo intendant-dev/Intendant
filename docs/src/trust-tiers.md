@@ -121,13 +121,16 @@ was built *for* boxes you do not trust. Apply it there and only there:
 Getting a pleasant direct origin today: the fleet strip offers **↗
 direct** wherever a daemon's own URL is known, and the daemon-store vault
 ([Credential Custody](./credential-custody.md#the-vault)) makes that tab
-self-sufficient. For a warning-free padlock, give the daemon a real
-certificate — a hostname you own with a DNS-01 Let's Encrypt cert, or
-`tailscale cert` on a tailnet — otherwise accept the browser's one-time
-exception for the self-signed cert and let the enrollment ceremony carry
-identity from there. A fleet-DNS service that mints per-daemon names and
-certificates automatically (the Tailscale pattern, operated by the
-rendezvous as pure plumbing) is the designed follow-on.
+self-sufficient. For the warning-free padlock, **fleet certificates** do
+it in one click: a rendezvous serving a delegated DNS subzone
+([Self-Hosted Rendezvous → Fleet DNS](./self-hosted-rendezvous.md#fleet-dns-real-certificates-for-daemons))
+gives each daemon a real name, and the Connect card's *Get a real
+certificate* button publishes the daemon's addresses (LAN included — no
+port forwarding needed) and mints a Let's Encrypt certificate via DNS-01,
+renewed automatically, private keys never leaving the machine. Without
+fleet DNS, the manual routes remain: a hostname you own with a DNS-01
+cert, `tailscale cert` on a tailnet, or the browser's one-time exception
+plus the enrollment ceremony.
 
 A worked example, one fleet:
 

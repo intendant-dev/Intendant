@@ -29,6 +29,7 @@ mod event;
 mod external_agent;
 mod external_wrapper_index;
 mod file_watcher;
+mod fleet_cert;
 mod fission_ledger;
 mod fission_lifecycle;
 pub(crate) use intendant_core::frames;
