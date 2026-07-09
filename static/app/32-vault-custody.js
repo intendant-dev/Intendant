@@ -51,8 +51,39 @@ let vaultCeremony = null;          // { phrase } while the create ceremony is on
 let vaultPublishChain = Promise.resolve(true);
 const vaultRevealedEntries = new Set();
 
+/* ── Vault storage backends ──
+   The blob has two possible homes, both blind to its contents:
+   - 'account': the Connect service stores one blob per account (hosted
+     tabs — the original path; follows the person across daemons).
+   - 'daemon': this daemon stores the blob itself (~/.intendant/
+     vault-blob.json via api_daemon_vault_fetch/publish) — the local
+     vault for direct dashboards, no Connect service in the loop.
+   The stores are independent (each keeps its own revision ratchet);
+   copying between them is an explicit user action, never implicit. */
+function vaultDaemonStoreReady() {
+  if (DASHBOARD_CONNECT_MODE) return false; // hosted tabs use the account store
+  try {
+    const status = window.intendantDashboardControl?.status?.();
+    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
+    // An empty feature list means the hello_ack hasn't landed yet: fall
+    // through and let the RPCs answer (mirrors vaultLeaseTransportReady).
+    const features = status.controlFeatures;
+    if (Array.isArray(features) && features.length) {
+      return features.includes('api_daemon_vault_fetch');
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function vaultBackendKind() {
+  if (DASHBOARD_CONNECT_MODE) return 'account';
+  return vaultDaemonStoreReady() ? 'daemon' : null;
+}
+
 function vaultAvailable() {
-  return DASHBOARD_CONNECT_MODE && Boolean(crypto?.subtle);
+  return Boolean(crypto?.subtle) && vaultBackendKind() !== null;
 }
 
 /* ── Vault crypto ── */
@@ -335,6 +366,14 @@ function vaultWriteLocal() {
 }
 
 async function vaultServerFetch() {
+  if (vaultBackendKind() === 'daemon') {
+    const result = await vaultLeaseRpc('api_daemon_vault_fetch');
+    return {
+      authenticated: true,
+      revision: Number(result?.revision) || 0,
+      vault: result?.vault || null,
+    };
+  }
   const resp = await fetch(accessFleetHostedUrl('/api/vault'));
   if (resp.status === 401) return { authenticated: false };
   const body = await resp.json().catch(() => ({}));
@@ -343,6 +382,21 @@ async function vaultServerFetch() {
 }
 
 async function vaultServerPublish(blob) {
+  if (vaultBackendKind() === 'daemon') {
+    try {
+      return await vaultLeaseRpc('api_daemon_vault_publish', {
+        revision: blob.revision,
+        vault: blob,
+      });
+    } catch (err) {
+      // The daemon store's conflict travels as an error string; give it
+      // the same shape the hosted store's HTTP 409 gets.
+      if (/revision conflict|stale vault/i.test(String(err?.message || ''))) {
+        err.vaultConflict = true;
+      }
+      throw err;
+    }
+  }
   const headers = await accessFleetHostedHeaders();
   if (!headers) throw new Error('sign in to the hosted account first');
   const resp = await fetch(accessFleetHostedUrl('/api/vault'), {
@@ -1147,7 +1201,6 @@ async function vaultOauthAccessTokenMaterial(entry, kind) {
 }
 
 function vaultLeaseTransportReady() {
-  if (!DASHBOARD_CONNECT_MODE) return false;
   try {
     const status = window.intendantDashboardControl?.status?.();
     if (!status?.connected || !status?.verifiedBinding?.ok) return false;
@@ -1168,6 +1221,19 @@ function vaultLeaseTransportReady() {
 
 function vaultLeaseRpc(method, params = {}) {
   return window.intendantDashboardControl.request(method, params, { timeoutMs: 15000 });
+}
+
+/* Whether the tunneled daemon advertises local vault storage — strict
+   (feature must be listed) because this only gates an optional action. */
+function vaultTunnelDaemonVaultAvailable() {
+  try {
+    const status = window.intendantDashboardControl?.status?.();
+    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
+    const features = status.controlFeatures;
+    return Array.isArray(features) && features.includes('api_daemon_vault_publish');
+  } catch {
+    return false;
+  }
 }
 
 /* The lease kind a vault entry fuels, or null when it cannot fuel.
@@ -1955,9 +2021,10 @@ function vaultRenderAddForm(card) {
 }
 
 /* Fueling panel: this daemon's active leases + a fuel button per
-   fuelable vault entry. Rendered only in connect mode. */
+   fuelable vault entry. Renders wherever a vault store is reachable —
+   hosted tabs (account vault) and direct dashboards (local vault). */
 function vaultRenderFueling(card) {
-  if (!DASHBOARD_CONNECT_MODE) return;
+  if (!vaultAvailable()) return;
   const head = document.createElement('div');
   head.className = 'vault-status-line';
   const title = document.createElement('span');
@@ -2264,9 +2331,11 @@ function renderAccessVaultSection() {
   switch (vaultState.status) {
     case 'unavailable':
       chip.textContent = 'unavailable';
-      statusText = DASHBOARD_CONNECT_MODE
+      statusText = !crypto?.subtle
         ? 'This browser lacks the WebCrypto features the vault needs.'
-        : 'The vault rides your hosted account — open this dashboard through Hosted Connect to use it.';
+        : DASHBOARD_CONNECT_MODE
+          ? 'The hosted vault store is unreachable right now.'
+          : 'No vault store reachable yet: this daemon predates local vault storage, this session lacks credentials.manage, or the control channel is still connecting (retries automatically). Hosted Connect dashboards use the account vault instead.';
       break;
     case 'signed-out':
       chip.textContent = 'signed out';
@@ -2290,8 +2359,27 @@ function renderAccessVaultSection() {
       chip.textContent = 'checking';
       statusText = 'Looking for your vault…';
   }
+  // Which store backs this vault — the one-glance answer to "where does
+  // this blob live?" (docs/src/credential-custody.md, storage backends).
+  const backend = vaultBackendKind();
+  if (backend && vaultState.status !== 'unavailable') {
+    const store = document.createElement('span');
+    store.className = 'vault-chip';
+    store.textContent = backend === 'daemon' ? 'stored on this daemon' : 'account store';
+    store.title = backend === 'daemon'
+      ? 'The sealed blob lives on this daemon (~/.intendant/vault-blob.json) — no Connect service in the loop. The daemon cannot read or forge it.'
+      : 'The sealed blob lives with your hosted account and follows you across daemons. The service cannot read or forge it.';
+    statusLine.appendChild(store);
+  }
   statusLine.append(chip, document.createTextNode(statusText));
   card.appendChild(statusLine);
+
+  // The backend can appear after boot (control channel connects, feature
+  // list lands): leave 'unavailable' as soon as a store is reachable.
+  if (vaultState.status === 'unavailable' && vaultAvailable()) {
+    vaultInitPromise = null;
+    vaultInit();
+  }
 
   if (vaultState.rollbackWarning) {
     const warning = document.createElement('div');
@@ -2304,6 +2392,36 @@ function renderAccessVaultSection() {
     error.className = 'vault-error';
     error.textContent = vaultState.lastError;
     card.appendChild(error);
+  }
+
+  // Hosted tab + unlocked vault + a daemon that has local vault storage:
+  // offer to keep a sealed copy there, so its direct dashboard has a
+  // vault home without any Connect service in the loop. Explicit and
+  // one-way — the two stores keep independent revision ratchets.
+  if (
+    vaultState.status === 'unlocked' &&
+    backend === 'account' &&
+    vaultState.blob &&
+    vaultTunnelDaemonVaultAvailable()
+  ) {
+    const copyRow = document.createElement('div');
+    copyRow.className = 'vault-actions';
+    const copyBtn = vaultButton('Keep a sealed copy on this daemon', async () => {
+      try {
+        const result = await vaultLeaseRpc('api_daemon_vault_publish', {
+          revision: vaultState.blob.revision,
+          vault: vaultState.blob,
+        });
+        showControlToast?.('success', result?.stored
+          ? `Sealed vault copy (revision ${vaultState.blob.revision}) stored on this daemon — its direct dashboard can now unseal it with your passkey or phrase.`
+          : 'This daemon already holds this exact vault revision.');
+      } catch (err) {
+        showControlToast?.('error', `Vault copy failed: ${err?.message || err}`);
+      }
+    });
+    copyBtn.title = 'Publishes the encrypted blob to this daemon (~/.intendant/vault-blob.json). The daemon cannot read it; a direct dashboard on that machine unseals it with the same passkey or recovery phrase. The copy does not auto-sync afterwards.';
+    copyRow.appendChild(copyBtn);
+    card.appendChild(copyRow);
   }
 
   if (vaultCeremony) {

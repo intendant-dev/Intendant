@@ -627,6 +627,24 @@ function renderAccessFleetStrip() {
     }
     const provenanceChip = accessTargetProvenanceChip(target);
     if (provenanceChip) meta.appendChild(provenanceChip);
+    // The door to the direct path (docs/src/trust-tiers.md): when the
+    // record carries the daemon's own URL, offer it — a direct tab talks
+    // straight to that daemon (local vault, no Connect service in the
+    // loop). Self-signed daemons show the browser's certificate warning
+    // on first visit until a real cert or the enrollment ceremony.
+    const directUrl = String(target.url || descriptor.peer?.url || '').trim();
+    if (directUrl && !target.local && !descriptor.local && /^https?:\/\//.test(directUrl)) {
+      const direct = document.createElement('button');
+      direct.type = 'button';
+      direct.className = 'acc-btn acc-fleet-direct';
+      direct.textContent = '↗ direct';
+      direct.title = `Open ${directUrl} — this daemon's own dashboard, no rendezvous in the loop. Works when this browser can reach it (same LAN/VPN); a self-signed daemon shows a one-time certificate warning.`;
+      direct.addEventListener('click', event => {
+        event.stopPropagation();
+        window.open(directUrl, '_blank', 'noopener');
+      });
+      meta.appendChild(direct);
+    }
     card.append(top, meta);
     card.addEventListener('click', () => routeTo('access', 'daemons'));
     mount.appendChild(card);
