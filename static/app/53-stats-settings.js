@@ -789,10 +789,12 @@ function sessionCost(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
+// Smart precision: 2dp normally, 4dp only for sub-cent values (a $0.43 cost
+// reads $0.43 next to $12.94, but $0.0043 doesn't flatten to $0.00).
 function formatUsd(value, digits) {
   const n = Number(value);
   if (!Number.isFinite(n)) return '$--';
-  const places = digits != null ? digits : (Math.abs(n) > 0 && Math.abs(n) < 1 ? 4 : 2);
+  const places = digits != null ? digits : (Math.abs(n) > 0 && Math.abs(n) < 0.01 ? 4 : 2);
   return '$' + n.toFixed(places);
 }
 
@@ -806,7 +808,7 @@ function formatUsdCompact(value) {
       maximumFractionDigits: 1,
     }).format(n);
   }
-  return formatUsd(n, 2);
+  return formatUsd(n);
 }
 
 function sessionDate(session) {
@@ -1252,7 +1254,7 @@ function renderTokenActivityMonths(startIso) {
     lastMonth = month;
     const span = document.createElement('span');
     span.className = 'token-activity-month';
-    span.style.gridColumn = `${col + 1} / span 4`;
+    span.style.gridColumn = `${col + 1} / span ${Math.min(4, TOKEN_ACTIVITY_WEEKS - col)}`;
     span.textContent = formatMonthLabel(day);
     el.appendChild(span);
   }
@@ -1355,7 +1357,7 @@ function renderTokenActivitySelectedDay(buckets, todayIso) {
       ${tokenActivityMetricHtml('Input', exactNumber(bucket.input))}
       ${tokenActivityMetricHtml('Cached', exactNumber(bucket.cached))}
       ${tokenActivityMetricHtml('Output', exactNumber(bucket.output))}
-      ${tokenActivityMetricHtml('Cost', formatUsd(bucket.cost, 4))}
+      ${tokenActivityMetricHtml('Cost', formatUsd(bucket.cost))}
       ${tokenActivityMetricHtml('Sessions', exactNumber(bucket.sessions))}
     </div>
   `;
@@ -1462,7 +1464,7 @@ function renderSessionStatsFallback(sessions) {
       { label: 'Cached', value: cached.toLocaleString() },
       { label: 'Output tokens', value: output.toLocaleString() },
       { label: 'Total tokens', value: total.toLocaleString() },
-      { label: 'Estimated cost', value: formatUsd(sessionCost(latest.estimated_cost), 4) },
+      { label: 'Estimated cost', value: formatUsd(sessionCost(latest.estimated_cost)) },
     ]));
   }
 
@@ -1491,9 +1493,9 @@ function renderSessionStatsFallback(sessions) {
     if (grid) {
       grid.style.gridTemplateColumns = 'auto 1fr';
       grid.innerHTML = `
-        <span class="label">Today</span><span class="value">${formatUsd(totals.todayCost, 2)}</span>
-        <span class="label">Last 7 Days</span><span class="value">${formatUsd(totals.weekCost, 2)}</span>
-        <span class="label strong">All Time</span><span class="value">${formatUsd(totals.allCost, 2)}</span>
+        <span class="label">Today</span><span class="value">${formatUsd(totals.todayCost)}</span>
+        <span class="label">Last 7 Days</span><span class="value">${formatUsd(totals.weekCost)}</span>
+        <span class="label strong">All Time</span><span class="value">${formatUsd(totals.allCost)}</span>
       `;
     }
   }
@@ -1687,7 +1689,7 @@ function renderDailyUsage(sessions) {
       <span class="value">${exactNumber(row.input)}</span>
       <span class="value">${exactNumber(row.cached)}</span>
       <span class="value">${exactNumber(row.output)}</span>
-      <span class="value">${formatUsd(row.cost, 4)}</span>
+      <span class="value">${formatUsd(row.cost)}</span>
     `);
   }
   grid.innerHTML = cells.join('');
@@ -1928,7 +1930,7 @@ function renderUi2UsageByModel(sessions) {
     // "—", not a fake $0.00 (same contract as the by-agent table).
     const costText = b.cost > 0
       ? formatUsdCompact(b.cost)
-      : (b.unpricedTokens > 0 ? '—' : formatUsd(0, 2));
+      : (b.unpricedTokens > 0 ? '—' : formatUsd(0));
     const subBits = [];
     if (b.cost > 0 && totalCost > 0) {
       subBits.push(`${share.toFixed(share >= 10 ? 0 : 1)}% of all-time cost`);

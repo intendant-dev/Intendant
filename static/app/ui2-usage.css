@@ -60,7 +60,7 @@ html.ui-v2 #tab-stats .stats-host-select {
   min-height: 30px;
   padding: 5px 28px 5px 11px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background-color: var(--surface);
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23A7AEBE' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
@@ -287,7 +287,7 @@ html.ui-v2 #tab-stats .ui-section-sub {
 html.ui-v2 #tab-stats .usage-cards { gap: 12px; }
 html.ui-v2 #tab-stats .usage-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   box-shadow: none;
   padding: 14px 16px;
@@ -429,7 +429,7 @@ html.ui-v2 #tab-stats .token-activity-segment button:disabled {
 }
 html.ui-v2 #tab-stats .token-activity-stats {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface-2);
 }
 html.ui-v2 #tab-stats .token-activity-stat { border-right: 1px solid var(--line); }
@@ -599,7 +599,7 @@ html.ui-v2 #tab-stats .ui2-fold-head {
   width: 100%;
   padding: 12px 14px;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);

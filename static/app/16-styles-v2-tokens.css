@@ -32,7 +32,7 @@ html.ui-v2 {
   /* — ink — */
   --text: #EAECF2;
   --text-2: #A7AEBE;
-  --text-3: #6C7482;
+  --text-3: #7E8896; /* AA on bg/surface/surface-2 (5.4/5.0/4.6:1); #6C7482 was 3.5:1 on cards */
 
   /* — type recipes (one eyebrow, everywhere — drift killer) — */
   --eyebrow-size: 10px;
@@ -67,10 +67,11 @@ html.ui-v2 {
   --sans: 'Hanken Grotesk', system-ui, -apple-system, sans-serif;
   --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
 
-  /* — radii ladder — */
+  /* — radii ladder (retuned 2026-07-08 to the values the surfaces settled on:
+       10 controls / 12 cards; 11 stays a literal middle step for banners) — */
   --r-inset: 8px;
-  --r-ctl: 9px;
-  --r-card: 13px;
+  --r-ctl: 10px;
+  --r-card: 12px;
   --r-panel: 17px;
   --r-pill: 999px;
 

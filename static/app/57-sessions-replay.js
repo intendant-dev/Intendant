@@ -663,7 +663,7 @@ function buildSessionCard(m, derived, ctx) {
     meta.appendChild(loading);
   } else {
     if (s.total_tokens > 0) addMetaField('tokens', s.total_tokens.toLocaleString());
-    if (s.estimated_cost > 0) addMetaField('cost', formatUsd(s.estimated_cost, 2));
+    if (s.estimated_cost > 0) addMetaField('cost', formatUsd(s.estimated_cost));
   }
 
   const tipParts = [];
@@ -1920,7 +1920,7 @@ function renderSessionDetailTitle(session) {
     addStat('out', (session.completion_tokens || 0).toLocaleString());
     addStat('total', session.total_tokens.toLocaleString());
   }
-  if (session.estimated_cost > 0) addStat('cost', formatUsd(session.estimated_cost, 4));
+  if (session.estimated_cost > 0) addStat('cost', formatUsd(session.estimated_cost));
   if (session.total_bytes > 0) addStat('disk', _fmtBytes(session.total_bytes));
   if (stats.children.length > 0) titleEl.appendChild(stats);
 

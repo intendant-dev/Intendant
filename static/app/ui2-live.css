@@ -41,7 +41,7 @@ html.ui-v2 .display-approval-banner {
   align-items: center;
   gap: 12px;
   border: 1px solid rgba(var(--amber-rgb), .32);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02));
 }
 html.ui-v2 .display-approval-banner .icon {
@@ -70,7 +70,7 @@ html.ui-v2 .shared-view-banner {
   padding: 10px 14px;
   gap: 10px;
   border: 1px solid rgba(var(--sky-rgb), .32);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: linear-gradient(180deg, rgba(var(--sky-rgb), .10), rgba(var(--sky-rgb), .03));
   font-size: 12.5px;
 }
@@ -278,7 +278,7 @@ html.ui-v2 .display-toolbar button {
   min-height: 0;
   padding: 6px 11px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
   font-family: var(--sans);
@@ -613,7 +613,7 @@ html.ui-v2 .recording-controls button {
   min-width: 34px;
   padding: 6px 11px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
   font-family: var(--sans);
@@ -670,7 +670,7 @@ html.ui-v2 .ann-close {
   width: 30px;
   height: 30px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
   font-size: 13px;
@@ -702,7 +702,7 @@ html.ui-v2 .ann-color.active {
 }
 html.ui-v2 .ann-note {
   border: 1px solid var(--line-2);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-family: var(--sans);
@@ -718,7 +718,7 @@ html.ui-v2 .clip-toolbar .clip-send-btn {
   min-height: 0;
   padding: 6px 13px;
   border: 0;
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-family: var(--sans);
@@ -751,7 +751,7 @@ html.ui-v2 .ann-attach-btn {
   min-height: 0;
   padding: 6px 12px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -769,7 +769,7 @@ html.ui-v2 .clip-toolbar .clip-save-btn {
   min-height: 0;
   padding: 6px 12px;
   border: 1px solid transparent;
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
   font-family: var(--sans);
@@ -843,7 +843,7 @@ html.ui-v2 .clip-toolbar button {
   min-height: 0;
   padding: 6px 11px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
   font-family: var(--sans);
@@ -916,7 +916,7 @@ html.ui-v2 .thumb-label {
 html.ui-v2 .display-picker {
   background: linear-gradient(180deg, var(--surface-2), var(--surface));
   border: 1px solid var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   padding: 5px;
   box-shadow: var(--shadow-overlay);
 }
@@ -1070,7 +1070,7 @@ html.ui-v2 .ui2-live-row-chev { flex: 0 0 auto; color: var(--text-3); font-size:
 
 html.ui-v2 .ui2-live-card {
   border: 1px solid var(--line);
-  border-radius: 13px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 14px 15px;
 }
@@ -1128,7 +1128,7 @@ html.ui-v2 .ui2-live-card-btn {
   margin-top: 9px;
   padding: 9px;
   border: 0;
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-family: var(--sans);

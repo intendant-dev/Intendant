@@ -164,7 +164,7 @@ html.ui-v2 .session-window-close:hover {
 html.ui-v2 .session-window-menu,
 html.ui-v2 .session-window-submenu-panel {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-card);
   background: var(--surface);
   box-shadow: var(--shadow-menu);
   padding: 4px;

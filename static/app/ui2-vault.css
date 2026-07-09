@@ -129,7 +129,7 @@ html.ui-v2 #access-vault-section .vault-entry-list { gap: 10px; }
 html.ui-v2 #access-vault-section .vault-entry-row {
   gap: 10px;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 13px 16px;
   font-size: 12px;
@@ -191,7 +191,7 @@ html.ui-v2 #access-custody-section .ui-btn {
   gap: 7px;
   padding: 7px 13px;
   border: 1px solid var(--line);
-  border-radius: 10px; /* fleet control radius (Access .acc-btn, Settings controls) */
+  border-radius: var(--r-ctl); /* fleet control radius (Access .acc-btn, Settings controls) */
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -266,7 +266,7 @@ html.ui-v2 #access-vault-section .vault-words {
   gap: 10px 16px;
   padding: 16px 18px;
   border: 1px solid var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--code-bg);
 }
 html.ui-v2 #access-vault-section .vault-words .w {
@@ -292,7 +292,7 @@ html.ui-v2 #access-vault-section .vault-phrase-input,
 html.ui-v2 #access-vault-section .vault-form-grid input {
   min-height: 36px;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-size: 13px;
@@ -328,7 +328,7 @@ html.ui-v2 #access-vault-section select {
   -webkit-appearance: none;
   min-height: 36px;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background:
     url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23a7aebe" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>')
     right 10px center / 15px 15px no-repeat,
@@ -366,7 +366,7 @@ html.ui-v2 #access-vault-section .vault-form-grid select {
 html.ui-v2 #access-vault-section .vault-actions:has(> select) {
   justify-content: space-between;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 13px 16px;
   gap: 12px;
@@ -448,7 +448,7 @@ html.ui-v2 #access-vault-section .vault-actions:has(> #vault-oauth-lease-toggle)
   align-items: flex-start;
   gap: 12px;
   border: 1px dashed var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   padding: 12px 14px;
 }
 html.ui-v2 #access-vault-section .vault-actions:has(> #vault-oauth-lease-toggle) > .vault-note {
@@ -461,7 +461,7 @@ html.ui-v2 #access-vault-section .vault-actions:has(> #vault-oauth-lease-toggle)
 html.ui-v2 #access-vault-section .acc-fold {
   margin: 2px 0 0;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 html.ui-v2 #access-vault-section .acc-fold > summary {
@@ -469,7 +469,7 @@ html.ui-v2 #access-vault-section .acc-fold > summary {
   font-size: 12.5px;
   font-weight: 700;
   color: var(--text-2);
-  border-radius: 12px; /* the keyboard focus ring follows this — square ring on a rounded card otherwise */
+  border-radius: var(--r-card); /* the keyboard focus ring follows this — square ring on a rounded card otherwise */
 }
 html.ui-v2 #access-vault-section .acc-fold > summary:hover { color: var(--text); }
 html.ui-v2 #access-vault-section .acc-fold > summary::before { color: var(--text-3); }
@@ -490,7 +490,7 @@ html.ui-v2 #access-vault-section .acc-fold:has(.vault-form-grid):not([open]) {
   border-style: dashed;
   border-color: var(--line-2);
   background: transparent;
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
 }
 html.ui-v2 #access-vault-section .acc-fold:has(.vault-form-grid) > summary::before {
   content: '+';
@@ -510,7 +510,7 @@ html.ui-v2 #access-vault-section .vault-unlockers {
 /* ── custody trail ── */
 html.ui-v2 #access-custody-section .custody-trail {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   overflow: hidden;
 }
@@ -566,7 +566,7 @@ html.ui-v2 .ui2-vault-moved-card {
   gap: 6px 14px;
   margin: 6px 0 20px;
   border: 1px solid rgba(var(--iris-rgb), .24);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: linear-gradient(180deg, rgba(var(--iris-rgb), .1), rgba(var(--iris-rgb), .03));
   padding: 14px 16px;
 }
@@ -584,7 +584,7 @@ html.ui-v2 .ui2-vault-moved-sub {
 }
 html.ui-v2 .ui2-vault-moved-go {
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);

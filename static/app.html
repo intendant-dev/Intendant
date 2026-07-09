@@ -11962,7 +11962,7 @@ html.ui-v2 {
   /* — ink — */
   --text: #EAECF2;
   --text-2: #A7AEBE;
-  --text-3: #6C7482;
+  --text-3: #7E8896; /* AA on bg/surface/surface-2 (5.4/5.0/4.6:1); #6C7482 was 3.5:1 on cards */
 
   /* — type recipes (one eyebrow, everywhere — drift killer) — */
   --eyebrow-size: 10px;
@@ -11997,10 +11997,11 @@ html.ui-v2 {
   --sans: 'Hanken Grotesk', system-ui, -apple-system, sans-serif;
   --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
 
-  /* — radii ladder — */
+  /* — radii ladder (retuned 2026-07-08 to the values the surfaces settled on:
+       10 controls / 12 cards; 11 stays a literal middle step for banners) — */
   --r-inset: 8px;
-  --r-ctl: 9px;
-  --r-card: 13px;
+  --r-ctl: 10px;
+  --r-card: 12px;
   --r-panel: 17px;
   --r-pill: 999px;
 
@@ -12242,7 +12243,7 @@ html.ui-v2 .ui2-brand-word { font-weight: 800; font-size: 16px; letter-spacing: 
 
 html.ui-v2 .ui2-host-btn {
   display: flex; align-items: center; gap: 9px; width: 100%;
-  padding: 7px 9px; border: 1px solid var(--line); border-radius: 10px;
+  padding: 7px 9px; border: 1px solid var(--line); border-radius: var(--r-ctl);
   background: var(--surface); color: var(--text); cursor: pointer;
   text-align: left; transition: background var(--t-med), border-color var(--t-med);
   font: inherit;
@@ -12268,7 +12269,7 @@ html.ui-v2 .ui2-nav-eyebrow {
 }
 html.ui-v2 .ui2-nav-item {
   display: flex; align-items: center; gap: 11px; width: 100%;
-  padding: 8px 9px; border: 0; border-radius: 9px; margin-bottom: 1px;
+  padding: 8px 9px; border: 0; border-radius: var(--r-ctl); margin-bottom: 1px;
   background: transparent; color: var(--text-2); cursor: pointer;
   text-align: left; font-family: inherit; font-size: 13.5px; font-weight: 600;
   transition: background var(--t-fast), color var(--t-fast);
@@ -12293,7 +12294,7 @@ html.ui-v2 .ui2-nav-bottom {
 }
 html.ui-v2 .ui2-autonomy {
   display: flex; align-items: center; gap: 10px; width: 100%;
-  padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-ctl);
   background: var(--surface); color: var(--text); cursor: pointer;
   text-align: left; font: inherit;
   transition: background var(--t-med), border-color var(--t-med);
@@ -12983,7 +12984,7 @@ html.ui-v2 .acc-btn {
   min-height: 36px; /* one control height across form action rows */
   padding: 8px 14px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -13127,7 +13128,7 @@ html.ui-v2 .acc-attention { gap: 10px; }
 html.ui-v2 .acc-attention:not(:empty) { margin-bottom: 18px; }
 html.ui-v2 .acc-attention-item {
   padding: 13px 16px;
-  border-radius: 12px;
+  border-radius: var(--r-card);
   border: 1px solid rgba(var(--amber-rgb), .32);
   background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02));
   box-shadow: none;
@@ -13293,7 +13294,7 @@ html.ui-v2 .acc-fleet-strip {
 }
 html.ui-v2 .acc-fleet-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 12px 14px;
   gap: 6px;
@@ -13325,7 +13326,7 @@ html.ui-v2 .acc-fleet-meta .acc-chip,
 html.ui-v2 .acc-fleet-meta .acc-badge { padding: 2px 8px; font-size: 10px; }
 html.ui-v2 .acc-fleet-add {
   border: 1px dashed var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   color: var(--text-2);
   font-size: 12.5px;
   font-weight: 600;
@@ -13352,7 +13353,7 @@ html.ui-v2 #tab-access .acc-explainer {
 html.ui-v2 #tab-access .acc-explainer-arrow { display: none; }
 html.ui-v2 #tab-access .acc-explainer-step {
   border: 1px solid var(--line);
-  border-radius: 13px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 16px;
   counter-increment: ui2-acc-step;
@@ -13378,7 +13379,7 @@ html.ui-v2 #tab-access .acc-explainer-text { font-size: 12px; line-height: 1.55;
 /* ── folds ── */
 html.ui-v2 #tab-access .acc-fold {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 html.ui-v2 #tab-access .acc-fold > summary {
@@ -13423,7 +13424,7 @@ html.ui-v2 .acc-step-label::after { background: var(--line); }
 html.ui-v2 .acc-choice-row { gap: 10px; }
 html.ui-v2 .acc-choice-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 13px 14px;
   gap: 4px;
@@ -13490,7 +13491,7 @@ html.ui-v2 .acc-field-grid select {
   min-height: 36px;
   padding: 8px 12px;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-size: 13px;
@@ -13524,7 +13525,7 @@ html.ui-v2 #tab-access .coord-textarea:focus {
 html.ui-v2 .acc-role-picker { gap: 10px; }
 html.ui-v2 .acc-role-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 13px 14px;
   gap: 5px;
@@ -13582,7 +13583,7 @@ html.ui-v2 .acc-grant-fs-roots > span {
 }
 html.ui-v2 .acc-grant-fs-roots textarea {
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--code-bg);
   font-family: var(--mono);
   font-size: 12px;
@@ -13590,7 +13591,7 @@ html.ui-v2 .acc-grant-fs-roots textarea {
 }
 html.ui-v2 .acc-status-toggle {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   padding: 3px;
   gap: 3px;
@@ -13615,7 +13616,7 @@ html.ui-v2 .acc-status-toggle input:checked + span {
 /* ── principal cards + grant rows (People & Devices) ── */
 html.ui-v2 .acc-principal-card {
   border: 1px solid var(--line);
-  border-radius: 13px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 14px 16px;
 }
@@ -13676,7 +13677,7 @@ html.ui-v2 .acc-connect-warn {
 }
 html.ui-v2 .acc-connect-phrase {
   border: 1px solid var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--code-bg);
   padding: 16px;
   margin-top: 12px;
@@ -13700,7 +13701,7 @@ html.ui-v2 .access-target-surface { gap: 10px; }
 html.ui-v2 .access-target-row {
   border: 1px solid var(--line);
   border-left: 3px solid var(--neutral-dot);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   box-shadow: none;
   padding: 13px 16px;
@@ -13750,7 +13751,7 @@ html.ui-v2 .access-target-actions button {
   min-height: 0;
   padding: 7px 13px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-family: var(--sans);
@@ -13823,7 +13824,7 @@ html.ui-v2 .daemon-add-row input {
   min-height: 36px;
   padding: 8px 12px;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-family: var(--sans);
@@ -13855,7 +13856,7 @@ html.ui-v2 .daemon-add-row button {
   min-height: 36px;
   padding: 8px 14px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -13876,7 +13877,7 @@ html.ui-v2 .daemons-status.ok { color: var(--green); }
    (#daemon-request-code), which wears the design's claim-phrase block */
 html.ui-v2 .daemon-pairing-secret {
   border: 1px solid rgba(var(--amber-rgb), .26);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: rgba(var(--amber-rgb), .08);
   padding: 8px 12px;
   font-size: 11.5px;
@@ -13885,7 +13886,7 @@ html.ui-v2 .daemon-pairing-secret {
 html.ui-v2 .daemon-pairing-secret:empty { display: none; }
 html.ui-v2 #daemon-request-code {
   border: 1px solid var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--code-bg);
   padding: 12px 16px;
   font-family: var(--mono);
@@ -13900,7 +13901,7 @@ html.ui-v2 .daemon-add-persist { font-size: 12.5px; color: var(--text-2); }
 html.ui-v2 .daemon-access-request-card,
 html.ui-v2 .daemon-identity-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--bg-1);
   padding: 12px 14px;
 }
@@ -14001,7 +14002,7 @@ html.ui-v2 .coord-section-label {
 html.ui-v2 #tab-access .coord-row input,
 html.ui-v2 #tab-access .coord-textarea {
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-size: 13px;
@@ -14010,7 +14011,7 @@ html.ui-v2 #tab-access .coord-textarea {
 html.ui-v2 #tab-access .coord-textarea { font-family: var(--mono); font-size: 12px; background: var(--code-bg); }
 html.ui-v2 #tab-access .coord-row button {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-size: 12.5px;
@@ -14027,7 +14028,7 @@ html.ui-v2 #tab-access .access-overview-grid {
 }
 html.ui-v2 #tab-access .access-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 13px 16px;
 }
@@ -14145,7 +14146,7 @@ html.ui-v2 #connect-self-test-btn {
   min-height: 0;
   padding: 8px 14px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-family: var(--sans);
@@ -14162,7 +14163,7 @@ html.ui-v2 .connect-self-test-detail { font-family: var(--mono); font-size: 10.5
 html.ui-v2 .acc-role-catalog { gap: 10px; }
 html.ui-v2 .acc-role-info {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 13px 14px;
 }
@@ -14171,7 +14172,7 @@ html.ui-v2 .acc-role-info .perms { font-family: var(--mono); font-size: 10px; co
 
 html.ui-v2 #tab-access .access-matrix {
   border: 1px solid var(--line);
-  border-radius: 13px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 html.ui-v2 #tab-access .access-matrix-table th {
@@ -14234,7 +14235,7 @@ html.ui-v2 #tab-access .access-matrix-cell.planned { background: rgba(var(--ambe
 html.ui-v2 #tab-access .access-admin-grid.two { gap: 12px; }
 html.ui-v2 #tab-access .access-detail-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 html.ui-v2 #tab-access .access-detail-head { border-bottom: 1px solid var(--line); padding: 11px 14px; }
@@ -14252,7 +14253,7 @@ html.ui-v2 #tab-access .access-detail-actions { padding: 0 14px 14px; }
 
 html.ui-v2 #tab-access .access-model-section {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 html.ui-v2 #tab-access .access-model-section-head { border-bottom: 1px solid var(--line); padding: 11px 14px; }
@@ -14315,7 +14316,7 @@ html.ui-v2 #tab-access .access-empty {
   min-height: 64px;
   padding: 18px 16px;
   border: 1px dashed var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   text-align: center;
   font-size: 12.5px;
   color: var(--text-3);
@@ -14410,7 +14411,7 @@ html.ui-v2 #tab-files select {
   min-height: 32px;
   padding: 6px 30px 6px 12px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background-color: var(--surface);
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23A7AEBE' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
@@ -15294,7 +15295,7 @@ html.ui-v2 #tab-debug .ui-btn {
   min-height: 0;
   padding: 8px 14px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-size: 12.5px;
@@ -15363,7 +15364,7 @@ html.ui-v2 #tab-debug .debug-workspace-form select {
                    staggered by 1px each in the shared grid row */
   padding: 8px 12px;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-size: 13px;
@@ -15582,7 +15583,7 @@ html.ui-v2 .station-pane {
      chip must stay dark glass with light ink even under data-theme=light
      (theme vars would flip it to a milky pill on a dark canvas). */
 html.ui-v2 .station-status {
-  color: #6C7482;
+  color: #7E8896; /* tracks dark --text-3 (kept literal per the note above) */
   font-family: var(--mono);
   font-size: 10.5px;
   padding: 6px 10px;
@@ -15608,7 +15609,7 @@ html.ui-v2 .station-composer-input {
   font-family: var(--mono);
 }
 html.ui-v2 .station-composer-input::placeholder {
-  color: #6C7482;
+  color: #7E8896; /* tracks dark --text-3 (kept literal per the note above) */
   opacity: 1;
 }
 
@@ -15747,7 +15748,7 @@ html.ui-v2 #access-vault-section .vault-entry-list { gap: 10px; }
 html.ui-v2 #access-vault-section .vault-entry-row {
   gap: 10px;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 13px 16px;
   font-size: 12px;
@@ -15809,7 +15810,7 @@ html.ui-v2 #access-custody-section .ui-btn {
   gap: 7px;
   padding: 7px 13px;
   border: 1px solid var(--line);
-  border-radius: 10px; /* fleet control radius (Access .acc-btn, Settings controls) */
+  border-radius: var(--r-ctl); /* fleet control radius (Access .acc-btn, Settings controls) */
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -15884,7 +15885,7 @@ html.ui-v2 #access-vault-section .vault-words {
   gap: 10px 16px;
   padding: 16px 18px;
   border: 1px solid var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--code-bg);
 }
 html.ui-v2 #access-vault-section .vault-words .w {
@@ -15910,7 +15911,7 @@ html.ui-v2 #access-vault-section .vault-phrase-input,
 html.ui-v2 #access-vault-section .vault-form-grid input {
   min-height: 36px;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-size: 13px;
@@ -15946,7 +15947,7 @@ html.ui-v2 #access-vault-section select {
   -webkit-appearance: none;
   min-height: 36px;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background:
     url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23a7aebe" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>')
     right 10px center / 15px 15px no-repeat,
@@ -15984,7 +15985,7 @@ html.ui-v2 #access-vault-section .vault-form-grid select {
 html.ui-v2 #access-vault-section .vault-actions:has(> select) {
   justify-content: space-between;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 13px 16px;
   gap: 12px;
@@ -16066,7 +16067,7 @@ html.ui-v2 #access-vault-section .vault-actions:has(> #vault-oauth-lease-toggle)
   align-items: flex-start;
   gap: 12px;
   border: 1px dashed var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   padding: 12px 14px;
 }
 html.ui-v2 #access-vault-section .vault-actions:has(> #vault-oauth-lease-toggle) > .vault-note {
@@ -16079,7 +16080,7 @@ html.ui-v2 #access-vault-section .vault-actions:has(> #vault-oauth-lease-toggle)
 html.ui-v2 #access-vault-section .acc-fold {
   margin: 2px 0 0;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 html.ui-v2 #access-vault-section .acc-fold > summary {
@@ -16087,7 +16088,7 @@ html.ui-v2 #access-vault-section .acc-fold > summary {
   font-size: 12.5px;
   font-weight: 700;
   color: var(--text-2);
-  border-radius: 12px; /* the keyboard focus ring follows this — square ring on a rounded card otherwise */
+  border-radius: var(--r-card); /* the keyboard focus ring follows this — square ring on a rounded card otherwise */
 }
 html.ui-v2 #access-vault-section .acc-fold > summary:hover { color: var(--text); }
 html.ui-v2 #access-vault-section .acc-fold > summary::before { color: var(--text-3); }
@@ -16108,7 +16109,7 @@ html.ui-v2 #access-vault-section .acc-fold:has(.vault-form-grid):not([open]) {
   border-style: dashed;
   border-color: var(--line-2);
   background: transparent;
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
 }
 html.ui-v2 #access-vault-section .acc-fold:has(.vault-form-grid) > summary::before {
   content: '+';
@@ -16128,7 +16129,7 @@ html.ui-v2 #access-vault-section .vault-unlockers {
 /* ── custody trail ── */
 html.ui-v2 #access-custody-section .custody-trail {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   overflow: hidden;
 }
@@ -16184,7 +16185,7 @@ html.ui-v2 .ui2-vault-moved-card {
   gap: 6px 14px;
   margin: 6px 0 20px;
   border: 1px solid rgba(var(--iris-rgb), .24);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: linear-gradient(180deg, rgba(var(--iris-rgb), .1), rgba(var(--iris-rgb), .03));
   padding: 14px 16px;
 }
@@ -16202,7 +16203,7 @@ html.ui-v2 .ui2-vault-moved-sub {
 }
 html.ui-v2 .ui2-vault-moved-go {
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -16306,7 +16307,7 @@ html.ui-v2 #tab-sessions .ui-btn {
   min-height: 0;
   padding: 7px 13px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-family: var(--sans);
@@ -16375,7 +16376,7 @@ html.ui-v2 #tab-sessions .sessions-header.ui2-tools-open .sessions-toolbar {
   display: grid;
   padding: 12px;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 /* v1's fixed track plans overflow once the fold adds 26px of card chrome
@@ -16412,7 +16413,7 @@ html.ui-v2 #tab-sessions .sessions-multi-filter-btn {
   height: 32px;
   padding: 5px 10px;
   border: 1px solid var(--line-2);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-family: var(--sans);
@@ -16436,7 +16437,7 @@ html.ui-v2 #tab-sessions .sessions-multi-filter-btn[aria-expanded="true"] {
 html.ui-v2 #tab-sessions .sessions-multi-filter-menu {
   padding: 6px;
   border: 1px solid var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   box-shadow: var(--shadow-menu);
 }
@@ -16465,7 +16466,7 @@ html.ui-v2 #tab-sessions .sessions-toggle {
   height: 32px;
   padding: 0 10px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text-2);
   font-size: 12px;
@@ -16504,7 +16505,7 @@ html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat {
   margin: 0;
   padding: 14px 16px;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   box-shadow: none;
 }
@@ -16603,7 +16604,7 @@ html.ui-v2 #tab-sessions .sessions-list { gap: 10px; }
 html.ui-v2 #tab-sessions .session-card {
   padding: 14px 282px 14px 17px;
   border: 1px solid var(--line);
-  border-radius: 13px;
+  border-radius: var(--r-card);
   background: var(--surface);
   box-shadow: none;
   cursor: pointer;
@@ -16781,7 +16782,7 @@ html.ui-v2 #tab-sessions .session-card .sc-actions {
 html.ui-v2 #tab-sessions .session-card .sc-actions .ui-btn {
   min-height: 0;
   padding: 6px 11px;
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   font-size: 11.5px;
   font-weight: 700;
   background: transparent;
@@ -16835,7 +16836,7 @@ html.ui-v2 #tab-sessions .session-card:hover .sc-actions .ui-btn.danger:hover {
 /* Delete target menu. */
 html.ui-v2 #tab-sessions .sc-delete-menu {
   border: 1px solid var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   box-shadow: var(--shadow-menu);
   padding: 5px;
@@ -16866,7 +16867,7 @@ html.ui-v2 #tab-sessions .sessions-show-more { padding: 14px 0 4px; }
 html.ui-v2 #tab-sessions .sessions-show-more-btn {
   padding: 9px 16px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
   font-size: 12.5px;
@@ -16906,7 +16907,7 @@ html.ui-v2 #tab-sessions .worktrees-list > .empty-state::before {
 }
 html.ui-v2 #tab-sessions .sessions-skel-card {
   height: 76px;
-  border-radius: 13px;
+  border-radius: var(--r-card);
   background: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
   background-size: 420px 100%;
 }
@@ -16916,7 +16917,7 @@ html.ui-v2 #tab-sessions .sessions-skel-card {
 html.ui-v2 #tab-sessions .sessions-deep-search {
   padding: 14px 16px;
   border: 1px solid var(--line);
-  border-radius: 13px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 html.ui-v2 #tab-sessions .sessions-deep-search-title { font-size: 13px; font-weight: 800; color: var(--text); }
@@ -16937,7 +16938,7 @@ html.ui-v2 #tab-sessions .sessions-deep-search-query select {
   height: 34px;
   padding: 6px 11px;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-size: 13px;
@@ -16955,7 +16956,7 @@ html.ui-v2 #tab-sessions .sessions-deep-search-btn {
   height: 34px;
   padding: 6px 15px;
   border: 0;
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-size: 12.5px;
@@ -17121,7 +17122,7 @@ html.ui-v2 #worktree-inspect-modal .worktree-inspect-summary { color: var(--text
 html.ui-v2 #worktree-inspect-modal .worktree-inspect-metric,
 html.ui-v2 #worktree-inspect-modal .worktree-inspect-section {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 html.ui-v2 #worktree-inspect-modal .worktree-inspect-metric .label {
@@ -17174,7 +17175,7 @@ html.ui-v2 #worktree-inspect-modal .modal-confirm,
 html.ui-v2 #worktree-inspect-modal .modal-cancel,
 html.ui-v2 #worktree-inspect-modal .ui-btn {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   padding: 7px 13px;
   background: var(--surface-2);
   color: var(--text);
@@ -17297,7 +17298,7 @@ html.ui-v2 #tab-sessions .sessions-new-external-grid select {
   min-height: 36px;
   padding: 8px 12px;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-size: 13px;
@@ -17330,7 +17331,7 @@ html.ui-v2 #tab-sessions .sessions-new-task input:disabled {
 html.ui-v2 #tab-sessions .sessions-attach-btn {
   padding: 7px 13px;
   border: 1px dashed var(--line-2);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
   font-size: 12px;
@@ -17355,7 +17356,7 @@ html.ui-v2 #tab-sessions .sessions-project-create-label {
   min-height: 36px;
   padding: 8px 13px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text-2);
   font-size: 12.5px;
@@ -17448,7 +17449,7 @@ html.ui-v2 #tab-sessions .sessions-new-fast-toggle {
   min-height: 36px;
   padding: 8px 12px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text-2);
   font-size: 12.5px;
@@ -17551,7 +17552,7 @@ html.ui-v2 #tab-sessions .session-detail-header {
 html.ui-v2 #tab-sessions .session-back-btn {
   padding: 6px 12px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text-2);
   font-size: 12px;
@@ -17580,7 +17581,7 @@ html.ui-v2 #tab-sessions .sd-meta-strip .value { color: var(--text-2); }
 html.ui-v2 #tab-sessions .session-detail-action-btn {
   padding: 6px 13px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text-2);
   font-size: 12px;
@@ -17699,7 +17700,7 @@ html.ui-v2 #tab-sessions .session-detail-logs .log-turn-sep {
    recording chrome is another phase's surface). */
 html.ui-v2 #tab-sessions #session-detail-recordings {
   border: 1px solid var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   overflow: hidden;
   background: var(--code-bg);
   margin: 6px 0 10px;
@@ -18052,7 +18053,7 @@ html.ui-v2 #approval-panel .approval-category:empty { display: none; }
 html.ui-v2 #approval-panel .approval-actions { display: flex; gap: 9px; flex-wrap: wrap; align-items: center; }
 html.ui-v2 #approval-panel .approval-actions button {
   padding: 9px 15px;
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   border: 1px solid var(--line);
   background: transparent;
   color: var(--text-2);
@@ -18211,7 +18212,7 @@ html.ui-v2 .ui2-rail-advanced {
   margin-top: 2px;
   padding: 7px 10px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-3);
   font-family: inherit;
@@ -18307,7 +18308,7 @@ html.ui-v2 #human-panel .input-question {
 html.ui-v2 #human-panel .input-area { gap: 9px; }
 html.ui-v2 #human-panel .input-area textarea {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-size: 13px;
@@ -18321,7 +18322,7 @@ html.ui-v2 #human-panel .input-area textarea:focus {
 }
 html.ui-v2 #human-panel .input-area button {
   border: 0;
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   padding: 9px 16px;
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
@@ -18354,7 +18355,7 @@ html.ui-v2 #question-panel .question-header-chip {
 }
 html.ui-v2 #question-panel .question-option {
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   transition: background var(--t-fast), border-color var(--t-fast);
 }
@@ -18368,7 +18369,7 @@ html.ui-v2 #question-panel .question-option.selected {
 }
 html.ui-v2 #question-panel .question-free-text {
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
 }
@@ -18547,7 +18548,7 @@ html.ui-v2 .session-window-close:hover {
 html.ui-v2 .session-window-menu,
 html.ui-v2 .session-window-submenu-panel {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-card);
   background: var(--surface);
   box-shadow: var(--shadow-menu);
   padding: 4px;
@@ -18680,7 +18681,7 @@ html.ui-v2 .display-approval-banner {
   align-items: center;
   gap: 12px;
   border: 1px solid rgba(var(--amber-rgb), .32);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02));
 }
 html.ui-v2 .display-approval-banner .icon {
@@ -18709,7 +18710,7 @@ html.ui-v2 .shared-view-banner {
   padding: 10px 14px;
   gap: 10px;
   border: 1px solid rgba(var(--sky-rgb), .32);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: linear-gradient(180deg, rgba(var(--sky-rgb), .10), rgba(var(--sky-rgb), .03));
   font-size: 12.5px;
 }
@@ -18917,7 +18918,7 @@ html.ui-v2 .display-toolbar button {
   min-height: 0;
   padding: 6px 11px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
   font-family: var(--sans);
@@ -19252,7 +19253,7 @@ html.ui-v2 .recording-controls button {
   min-width: 34px;
   padding: 6px 11px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
   font-family: var(--sans);
@@ -19309,7 +19310,7 @@ html.ui-v2 .ann-close {
   width: 30px;
   height: 30px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
   font-size: 13px;
@@ -19341,7 +19342,7 @@ html.ui-v2 .ann-color.active {
 }
 html.ui-v2 .ann-note {
   border: 1px solid var(--line-2);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-family: var(--sans);
@@ -19357,7 +19358,7 @@ html.ui-v2 .clip-toolbar .clip-send-btn {
   min-height: 0;
   padding: 6px 13px;
   border: 0;
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-family: var(--sans);
@@ -19390,7 +19391,7 @@ html.ui-v2 .ann-attach-btn {
   min-height: 0;
   padding: 6px 12px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -19408,7 +19409,7 @@ html.ui-v2 .clip-toolbar .clip-save-btn {
   min-height: 0;
   padding: 6px 12px;
   border: 1px solid transparent;
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
   font-family: var(--sans);
@@ -19482,7 +19483,7 @@ html.ui-v2 .clip-toolbar button {
   min-height: 0;
   padding: 6px 11px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
   font-family: var(--sans);
@@ -19555,7 +19556,7 @@ html.ui-v2 .thumb-label {
 html.ui-v2 .display-picker {
   background: linear-gradient(180deg, var(--surface-2), var(--surface));
   border: 1px solid var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   padding: 5px;
   box-shadow: var(--shadow-overlay);
 }
@@ -19709,7 +19710,7 @@ html.ui-v2 .ui2-live-row-chev { flex: 0 0 auto; color: var(--text-3); font-size:
 
 html.ui-v2 .ui2-live-card {
   border: 1px solid var(--line);
-  border-radius: 13px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 14px 15px;
 }
@@ -19767,7 +19768,7 @@ html.ui-v2 .ui2-live-card-btn {
   margin-top: 9px;
   padding: 9px;
   border: 0;
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
   font-family: var(--sans);
@@ -19868,7 +19869,7 @@ html.ui-v2 #tab-stats .stats-host-select {
   min-height: 30px;
   padding: 5px 28px 5px 11px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background-color: var(--surface);
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23A7AEBE' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
@@ -20095,7 +20096,7 @@ html.ui-v2 #tab-stats .ui-section-sub {
 html.ui-v2 #tab-stats .usage-cards { gap: 12px; }
 html.ui-v2 #tab-stats .usage-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   box-shadow: none;
   padding: 14px 16px;
@@ -20237,7 +20238,7 @@ html.ui-v2 #tab-stats .token-activity-segment button:disabled {
 }
 html.ui-v2 #tab-stats .token-activity-stats {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface-2);
 }
 html.ui-v2 #tab-stats .token-activity-stat { border-right: 1px solid var(--line); }
@@ -20407,7 +20408,7 @@ html.ui-v2 #tab-stats .ui2-fold-head {
   width: 100%;
   padding: 12px 14px;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -20502,7 +20503,7 @@ html.ui-v2 .ui2-set-nav-btn {
   width: 100%;
   padding: 9px 11px;
   border: 0;
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   min-height: 0;
   background: transparent;
   color: var(--text-2);
@@ -20590,7 +20591,7 @@ html.ui-v2 #tab-settings .settings-row select {
   width: 280px;
   max-width: 52%;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-family: var(--mono);   /* models, binaries, endpoints, keys */
@@ -20914,7 +20915,7 @@ html.ui-v2 #tab-settings .settings-env-overrides {
   margin-top: 4px;
   padding: 14px 16px;
   border: 1px solid var(--line);
-  border-radius: 10px;   /* v1 ships 6px + bare bg — off the v2 ladder */
+  border-radius: var(--r-ctl);   /* v1 ships 6px + bare bg — off the v2 ladder */
   background: var(--surface);
 }
 html.ui-v2 #tab-settings .settings-env-overrides h4 {
@@ -20935,7 +20936,7 @@ html.ui-v2 #tab-settings .ui-btn {
   gap: 8px;
   min-height: 0;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -49749,12 +49750,12 @@ function renderUsageTab(c) {
     const grid = document.getElementById('cost-grid');
     const cells = [];
     for (const cl of cost.lines) {
-      cells.push(`<span class="label">${cl.label}</span><span class="value">$${cl.cost.toFixed(4)}</span>`);
-      cells.push(`<span class="label sub">Input</span><span class="value sub">$${cl.input_cost.toFixed(4)}</span>`);
-      cells.push(`<span class="label sub">Output</span><span class="value sub">$${cl.output_cost.toFixed(4)}</span>`);
+      cells.push(`<span class="label">${cl.label}</span><span class="value">${formatUsd(cl.cost)}</span>`);
+      cells.push(`<span class="label sub">Input</span><span class="value sub">${formatUsd(cl.input_cost)}</span>`);
+      cells.push(`<span class="label sub">Output</span><span class="value sub">${formatUsd(cl.output_cost)}</span>`);
     }
     if (cost.lines.length > 1) {
-      cells.push(`<span class="label strong">Total</span><span class="value">$${cost.total.toFixed(4)}</span>`);
+      cells.push(`<span class="label strong">Total</span><span class="value">${formatUsd(cost.total)}</span>`);
     }
     grid.innerHTML = cells.join('');
   } else {
@@ -73454,10 +73455,12 @@ function sessionCost(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
+// Smart precision: 2dp normally, 4dp only for sub-cent values (a $0.43 cost
+// reads $0.43 next to $12.94, but $0.0043 doesn't flatten to $0.00).
 function formatUsd(value, digits) {
   const n = Number(value);
   if (!Number.isFinite(n)) return '$--';
-  const places = digits != null ? digits : (Math.abs(n) > 0 && Math.abs(n) < 1 ? 4 : 2);
+  const places = digits != null ? digits : (Math.abs(n) > 0 && Math.abs(n) < 0.01 ? 4 : 2);
   return '$' + n.toFixed(places);
 }
 
@@ -73471,7 +73474,7 @@ function formatUsdCompact(value) {
       maximumFractionDigits: 1,
     }).format(n);
   }
-  return formatUsd(n, 2);
+  return formatUsd(n);
 }
 
 function sessionDate(session) {
@@ -73917,7 +73920,7 @@ function renderTokenActivityMonths(startIso) {
     lastMonth = month;
     const span = document.createElement('span');
     span.className = 'token-activity-month';
-    span.style.gridColumn = `${col + 1} / span 4`;
+    span.style.gridColumn = `${col + 1} / span ${Math.min(4, TOKEN_ACTIVITY_WEEKS - col)}`;
     span.textContent = formatMonthLabel(day);
     el.appendChild(span);
   }
@@ -74020,7 +74023,7 @@ function renderTokenActivitySelectedDay(buckets, todayIso) {
       ${tokenActivityMetricHtml('Input', exactNumber(bucket.input))}
       ${tokenActivityMetricHtml('Cached', exactNumber(bucket.cached))}
       ${tokenActivityMetricHtml('Output', exactNumber(bucket.output))}
-      ${tokenActivityMetricHtml('Cost', formatUsd(bucket.cost, 4))}
+      ${tokenActivityMetricHtml('Cost', formatUsd(bucket.cost))}
       ${tokenActivityMetricHtml('Sessions', exactNumber(bucket.sessions))}
     </div>
   `;
@@ -74127,7 +74130,7 @@ function renderSessionStatsFallback(sessions) {
       { label: 'Cached', value: cached.toLocaleString() },
       { label: 'Output tokens', value: output.toLocaleString() },
       { label: 'Total tokens', value: total.toLocaleString() },
-      { label: 'Estimated cost', value: formatUsd(sessionCost(latest.estimated_cost), 4) },
+      { label: 'Estimated cost', value: formatUsd(sessionCost(latest.estimated_cost)) },
     ]));
   }
 
@@ -74156,9 +74159,9 @@ function renderSessionStatsFallback(sessions) {
     if (grid) {
       grid.style.gridTemplateColumns = 'auto 1fr';
       grid.innerHTML = `
-        <span class="label">Today</span><span class="value">${formatUsd(totals.todayCost, 2)}</span>
-        <span class="label">Last 7 Days</span><span class="value">${formatUsd(totals.weekCost, 2)}</span>
-        <span class="label strong">All Time</span><span class="value">${formatUsd(totals.allCost, 2)}</span>
+        <span class="label">Today</span><span class="value">${formatUsd(totals.todayCost)}</span>
+        <span class="label">Last 7 Days</span><span class="value">${formatUsd(totals.weekCost)}</span>
+        <span class="label strong">All Time</span><span class="value">${formatUsd(totals.allCost)}</span>
       `;
     }
   }
@@ -74352,7 +74355,7 @@ function renderDailyUsage(sessions) {
       <span class="value">${exactNumber(row.input)}</span>
       <span class="value">${exactNumber(row.cached)}</span>
       <span class="value">${exactNumber(row.output)}</span>
-      <span class="value">${formatUsd(row.cost, 4)}</span>
+      <span class="value">${formatUsd(row.cost)}</span>
     `);
   }
   grid.innerHTML = cells.join('');
@@ -74593,7 +74596,7 @@ function renderUi2UsageByModel(sessions) {
     // "—", not a fake $0.00 (same contract as the by-agent table).
     const costText = b.cost > 0
       ? formatUsdCompact(b.cost)
-      : (b.unpricedTokens > 0 ? '—' : formatUsd(0, 2));
+      : (b.unpricedTokens > 0 ? '—' : formatUsd(0));
     const subBits = [];
     if (b.cost > 0 && totalCost > 0) {
       subBits.push(`${share.toFixed(share >= 10 ? 0 : 1)}% of all-time cost`);
@@ -83849,7 +83852,7 @@ function buildSessionCard(m, derived, ctx) {
     meta.appendChild(loading);
   } else {
     if (s.total_tokens > 0) addMetaField('tokens', s.total_tokens.toLocaleString());
-    if (s.estimated_cost > 0) addMetaField('cost', formatUsd(s.estimated_cost, 2));
+    if (s.estimated_cost > 0) addMetaField('cost', formatUsd(s.estimated_cost));
   }
 
   const tipParts = [];
@@ -85106,7 +85109,7 @@ function renderSessionDetailTitle(session) {
     addStat('out', (session.completion_tokens || 0).toLocaleString());
     addStat('total', session.total_tokens.toLocaleString());
   }
-  if (session.estimated_cost > 0) addStat('cost', formatUsd(session.estimated_cost, 4));
+  if (session.estimated_cost > 0) addStat('cost', formatUsd(session.estimated_cost));
   if (session.total_bytes > 0) addStat('disk', _fmtBytes(session.total_bytes));
   if (stats.children.length > 0) titleEl.appendChild(stats);
 

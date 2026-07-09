@@ -99,7 +99,7 @@ html.ui-v2 .station-pane {
      chip must stay dark glass with light ink even under data-theme=light
      (theme vars would flip it to a milky pill on a dark canvas). */
 html.ui-v2 .station-status {
-  color: #6C7482;
+  color: #7E8896; /* tracks dark --text-3 (kept literal per the note above) */
   font-family: var(--mono);
   font-size: 10.5px;
   padding: 6px 10px;
@@ -125,7 +125,7 @@ html.ui-v2 .station-composer-input {
   font-family: var(--mono);
 }
 html.ui-v2 .station-composer-input::placeholder {
-  color: #6C7482;
+  color: #7E8896; /* tracks dark --text-3 (kept literal per the note above) */
   opacity: 1;
 }
 
