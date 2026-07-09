@@ -215,7 +215,7 @@ html.ui-v2 #approval-panel .approval-category:empty { display: none; }
 html.ui-v2 #approval-panel .approval-actions { display: flex; gap: 9px; flex-wrap: wrap; align-items: center; }
 html.ui-v2 #approval-panel .approval-actions button {
   padding: 9px 15px;
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   border: 1px solid var(--line);
   background: transparent;
   color: var(--text-2);
@@ -374,7 +374,7 @@ html.ui-v2 .ui2-rail-advanced {
   margin-top: 2px;
   padding: 7px 10px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-3);
   font-family: inherit;
@@ -470,7 +470,7 @@ html.ui-v2 #human-panel .input-question {
 html.ui-v2 #human-panel .input-area { gap: 9px; }
 html.ui-v2 #human-panel .input-area textarea {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-size: 13px;
@@ -484,7 +484,7 @@ html.ui-v2 #human-panel .input-area textarea:focus {
 }
 html.ui-v2 #human-panel .input-area button {
   border: 0;
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   padding: 9px 16px;
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   color: var(--on-accent);
@@ -517,7 +517,7 @@ html.ui-v2 #question-panel .question-header-chip {
 }
 html.ui-v2 #question-panel .question-option {
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   transition: background var(--t-fast), border-color var(--t-fast);
 }
@@ -531,7 +531,7 @@ html.ui-v2 #question-panel .question-option.selected {
 }
 html.ui-v2 #question-panel .question-free-text {
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
 }

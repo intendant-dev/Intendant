@@ -49,7 +49,7 @@ html.ui-v2 .ui2-set-nav-btn {
   width: 100%;
   padding: 9px 11px;
   border: 0;
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   min-height: 0;
   background: transparent;
   color: var(--text-2);
@@ -137,7 +137,7 @@ html.ui-v2 #tab-settings .settings-row select {
   width: 280px;
   max-width: 52%;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-family: var(--mono);   /* models, binaries, endpoints, keys */
@@ -461,7 +461,7 @@ html.ui-v2 #tab-settings .settings-env-overrides {
   margin-top: 4px;
   padding: 14px 16px;
   border: 1px solid var(--line);
-  border-radius: 10px;   /* v1 ships 6px + bare bg — off the v2 ladder */
+  border-radius: var(--r-ctl);   /* v1 ships 6px + bare bg — off the v2 ladder */
   background: var(--surface);
 }
 html.ui-v2 #tab-settings .settings-env-overrides h4 {
@@ -482,7 +482,7 @@ html.ui-v2 #tab-settings .ui-btn {
   gap: 8px;
   min-height: 0;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);

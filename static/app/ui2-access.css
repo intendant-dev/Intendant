@@ -97,7 +97,7 @@ html.ui-v2 .acc-btn {
   min-height: 36px; /* one control height across form action rows */
   padding: 8px 14px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -241,7 +241,7 @@ html.ui-v2 .acc-attention { gap: 10px; }
 html.ui-v2 .acc-attention:not(:empty) { margin-bottom: 18px; }
 html.ui-v2 .acc-attention-item {
   padding: 13px 16px;
-  border-radius: 12px;
+  border-radius: var(--r-card);
   border: 1px solid rgba(var(--amber-rgb), .32);
   background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02));
   box-shadow: none;
@@ -407,7 +407,7 @@ html.ui-v2 .acc-fleet-strip {
 }
 html.ui-v2 .acc-fleet-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 12px 14px;
   gap: 6px;
@@ -439,7 +439,7 @@ html.ui-v2 .acc-fleet-meta .acc-chip,
 html.ui-v2 .acc-fleet-meta .acc-badge { padding: 2px 8px; font-size: 10px; }
 html.ui-v2 .acc-fleet-add {
   border: 1px dashed var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   color: var(--text-2);
   font-size: 12.5px;
   font-weight: 600;
@@ -466,7 +466,7 @@ html.ui-v2 #tab-access .acc-explainer {
 html.ui-v2 #tab-access .acc-explainer-arrow { display: none; }
 html.ui-v2 #tab-access .acc-explainer-step {
   border: 1px solid var(--line);
-  border-radius: 13px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 16px;
   counter-increment: ui2-acc-step;
@@ -492,7 +492,7 @@ html.ui-v2 #tab-access .acc-explainer-text { font-size: 12px; line-height: 1.55;
 /* ── folds ── */
 html.ui-v2 #tab-access .acc-fold {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 html.ui-v2 #tab-access .acc-fold > summary {
@@ -537,7 +537,7 @@ html.ui-v2 .acc-step-label::after { background: var(--line); }
 html.ui-v2 .acc-choice-row { gap: 10px; }
 html.ui-v2 .acc-choice-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 13px 14px;
   gap: 4px;
@@ -604,7 +604,7 @@ html.ui-v2 .acc-field-grid select {
   min-height: 36px;
   padding: 8px 12px;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-size: 13px;
@@ -638,7 +638,7 @@ html.ui-v2 #tab-access .coord-textarea:focus {
 html.ui-v2 .acc-role-picker { gap: 10px; }
 html.ui-v2 .acc-role-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 13px 14px;
   gap: 5px;
@@ -696,7 +696,7 @@ html.ui-v2 .acc-grant-fs-roots > span {
 }
 html.ui-v2 .acc-grant-fs-roots textarea {
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--code-bg);
   font-family: var(--mono);
   font-size: 12px;
@@ -704,7 +704,7 @@ html.ui-v2 .acc-grant-fs-roots textarea {
 }
 html.ui-v2 .acc-status-toggle {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   padding: 3px;
   gap: 3px;
@@ -729,7 +729,7 @@ html.ui-v2 .acc-status-toggle input:checked + span {
 /* ── principal cards + grant rows (People & Devices) ── */
 html.ui-v2 .acc-principal-card {
   border: 1px solid var(--line);
-  border-radius: 13px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 14px 16px;
 }
@@ -790,7 +790,7 @@ html.ui-v2 .acc-connect-warn {
 }
 html.ui-v2 .acc-connect-phrase {
   border: 1px solid var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--code-bg);
   padding: 16px;
   margin-top: 12px;
@@ -814,7 +814,7 @@ html.ui-v2 .access-target-surface { gap: 10px; }
 html.ui-v2 .access-target-row {
   border: 1px solid var(--line);
   border-left: 3px solid var(--neutral-dot);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   box-shadow: none;
   padding: 13px 16px;
@@ -864,7 +864,7 @@ html.ui-v2 .access-target-actions button {
   min-height: 0;
   padding: 7px 13px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-family: var(--sans);
@@ -937,7 +937,7 @@ html.ui-v2 .daemon-add-row input {
   min-height: 36px;
   padding: 8px 12px;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-family: var(--sans);
@@ -969,7 +969,7 @@ html.ui-v2 .daemon-add-row button {
   min-height: 36px;
   padding: 8px 14px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
@@ -990,7 +990,7 @@ html.ui-v2 .daemons-status.ok { color: var(--green); }
    (#daemon-request-code), which wears the design's claim-phrase block */
 html.ui-v2 .daemon-pairing-secret {
   border: 1px solid rgba(var(--amber-rgb), .26);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: rgba(var(--amber-rgb), .08);
   padding: 8px 12px;
   font-size: 11.5px;
@@ -999,7 +999,7 @@ html.ui-v2 .daemon-pairing-secret {
 html.ui-v2 .daemon-pairing-secret:empty { display: none; }
 html.ui-v2 #daemon-request-code {
   border: 1px solid var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--code-bg);
   padding: 12px 16px;
   font-family: var(--mono);
@@ -1014,7 +1014,7 @@ html.ui-v2 .daemon-add-persist { font-size: 12.5px; color: var(--text-2); }
 html.ui-v2 .daemon-access-request-card,
 html.ui-v2 .daemon-identity-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--bg-1);
   padding: 12px 14px;
 }
@@ -1115,7 +1115,7 @@ html.ui-v2 .coord-section-label {
 html.ui-v2 #tab-access .coord-row input,
 html.ui-v2 #tab-access .coord-textarea {
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-size: 13px;
@@ -1124,7 +1124,7 @@ html.ui-v2 #tab-access .coord-textarea {
 html.ui-v2 #tab-access .coord-textarea { font-family: var(--mono); font-size: 12px; background: var(--code-bg); }
 html.ui-v2 #tab-access .coord-row button {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface);
   color: var(--text);
   font-size: 12.5px;
@@ -1141,7 +1141,7 @@ html.ui-v2 #tab-access .access-overview-grid {
 }
 html.ui-v2 #tab-access .access-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 13px 16px;
 }
@@ -1259,7 +1259,7 @@ html.ui-v2 #connect-self-test-btn {
   min-height: 0;
   padding: 8px 14px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-ctl);
   background: var(--surface-2);
   color: var(--text);
   font-family: var(--sans);
@@ -1276,7 +1276,7 @@ html.ui-v2 .connect-self-test-detail { font-family: var(--mono); font-size: 10.5
 html.ui-v2 .acc-role-catalog { gap: 10px; }
 html.ui-v2 .acc-role-info {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
   padding: 13px 14px;
 }
@@ -1285,7 +1285,7 @@ html.ui-v2 .acc-role-info .perms { font-family: var(--mono); font-size: 10px; co
 
 html.ui-v2 #tab-access .access-matrix {
   border: 1px solid var(--line);
-  border-radius: 13px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 html.ui-v2 #tab-access .access-matrix-table th {
@@ -1348,7 +1348,7 @@ html.ui-v2 #tab-access .access-matrix-cell.planned { background: rgba(var(--ambe
 html.ui-v2 #tab-access .access-admin-grid.two { gap: 12px; }
 html.ui-v2 #tab-access .access-detail-card {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 html.ui-v2 #tab-access .access-detail-head { border-bottom: 1px solid var(--line); padding: 11px 14px; }
@@ -1366,7 +1366,7 @@ html.ui-v2 #tab-access .access-detail-actions { padding: 0 14px 14px; }
 
 html.ui-v2 #tab-access .access-model-section {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 html.ui-v2 #tab-access .access-model-section-head { border-bottom: 1px solid var(--line); padding: 11px 14px; }
@@ -1429,7 +1429,7 @@ html.ui-v2 #tab-access .access-empty {
   min-height: 64px;
   padding: 18px 16px;
   border: 1px dashed var(--line-2);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   text-align: center;
   font-size: 12.5px;
   color: var(--text-3);

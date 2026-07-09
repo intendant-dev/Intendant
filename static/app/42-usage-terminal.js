@@ -136,12 +136,12 @@ function renderUsageTab(c) {
     const grid = document.getElementById('cost-grid');
     const cells = [];
     for (const cl of cost.lines) {
-      cells.push(`<span class="label">${cl.label}</span><span class="value">$${cl.cost.toFixed(4)}</span>`);
-      cells.push(`<span class="label sub">Input</span><span class="value sub">$${cl.input_cost.toFixed(4)}</span>`);
-      cells.push(`<span class="label sub">Output</span><span class="value sub">$${cl.output_cost.toFixed(4)}</span>`);
+      cells.push(`<span class="label">${cl.label}</span><span class="value">${formatUsd(cl.cost)}</span>`);
+      cells.push(`<span class="label sub">Input</span><span class="value sub">${formatUsd(cl.input_cost)}</span>`);
+      cells.push(`<span class="label sub">Output</span><span class="value sub">${formatUsd(cl.output_cost)}</span>`);
     }
     if (cost.lines.length > 1) {
-      cells.push(`<span class="label strong">Total</span><span class="value">$${cost.total.toFixed(4)}</span>`);
+      cells.push(`<span class="label strong">Total</span><span class="value">${formatUsd(cost.total)}</span>`);
     }
     grid.innerHTML = cells.join('');
   } else {
