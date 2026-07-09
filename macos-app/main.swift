@@ -282,25 +282,17 @@ final class AppMessageBridge: NSObject, WKScriptMessageHandler {
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelegate,
-    WKNavigationDelegate
+    WKNavigationDelegate, BackendSupervisorDelegate
 {
     let consoleBridge = ConsoleBridge()
     let messageBridge = AppMessageBridge()
     var window: NSWindow!
     var webView: WKWebView!
-    var backendProcess: Process?
-    var healthTimer: Timer?
-    var healthProbeFailures = 0
-    // Backend auto-restart: exponential backoff on abnormal exits, reset
-    // once a backend has stayed up long enough to count as stable.
-    var backendRestartAttempts = 0
-    var backendLastStart = Date.distantPast
-    var backendAutoRestartTimer: Timer?
-    var isTerminating = false
-    // Readiness-poll chains carry a generation stamp; bumping it orphans
-    // any chain already in flight (a crash mid-boot must not let a stale
-    // chain paint its dead-end failure page over the restart countdown).
-    var pollGeneration = 0
+    /// Owns the daemon child process, restart/backoff policy, readiness
+    /// polling, health checks, and the backend log (see
+    /// macos-app/BackendSupervisor.swift). State changes come back through
+    /// BackendSupervisorDelegate and drive the screens below.
+    var backendSupervisor: BackendSupervisor!
     var port: Int = 8765
     let portSearchLimit = 20
     var launchPlan: BackendLaunchPlan!
@@ -354,9 +346,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         configureBackendSession()
         checkPermissions()
         installMainMenu()
-        startBackend()
+        backendSupervisor = makeBackendSupervisor()
+        backendSupervisor.startBackend()
         createWindow()
-        pollUntilReady()
+        backendSupervisor.pollUntilReady()
     }
 
     /// The app historically had no menu bar because closing the window
@@ -591,38 +584,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     /// readiness poll (which lands on the placeholder / auto-activation).
     @discardableResult
     func restartBackend() -> Bool {
-        NSLog("Backend restart requested")
-        backendAutoRestartTimer?.invalidate()
-        healthTimer?.invalidate()
-        healthProbeFailures = 0
-        if let proc = backendProcess, proc.isRunning {
-            proc.terminationHandler = nil
-            proc.terminate()
-        }
-        let started = startBackend()
-        if started {
-            pollUntilReady()
-        }
-        return started
+        backendSupervisor.restartBackend()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        isTerminating = true
-        backendAutoRestartTimer?.invalidate()
-        healthTimer?.invalidate()
-        guard let proc = backendProcess, proc.isRunning else { return }
-        // Quitting kills the backend on purpose; don't let the exit handler
-        // paint a crash screen or schedule a restart mid-teardown.
-        proc.terminationHandler = nil
-        proc.terminate()
-        // Wait up to 3 seconds, then force-kill to avoid hanging on quit
-        let deadline = Date().addingTimeInterval(3.0)
-        while proc.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.1)
-        }
-        if proc.isRunning {
-            kill(proc.processIdentifier, SIGKILL)
-        }
+        // Quitting kills the backend on purpose; the supervisor suppresses
+        // its exit handling and takes the child down with a bounded wait.
+        backendSupervisor?.shutdown()
     }
 
     // MARK: - WKUIDelegate (JS alert/confirm/prompt)
@@ -701,20 +669,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         NSLog("Dashboard failed to load: \(error.localizedDescription)")
     }
 
-    // MARK: - Backend
+    // MARK: - Backend supervision
 
-    @discardableResult
-    func startBackend() -> Bool {
-        let bundle = Bundle.main
-        let binPath = bundle.bundlePath + "/Contents/MacOS/intendant-bin"
-
-        guard FileManager.default.fileExists(atPath: binPath) else {
-            NSLog("intendant-bin not found at \(binPath)")
-            return false
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: binPath)
+    /// Assemble the supervisor for the bundled daemon. Argument policy
+    /// (TLS mode, forwarded CLI args) derives from the launch plan here;
+    /// process lifecycle, restart backoff, readiness polling, health
+    /// checks, and the backend log live in BackendSupervisor.
+    func makeBackendSupervisor() -> BackendSupervisor {
         // Forward any extra CLI arguments (e.g. --agent codex) to the backend
         var args = ["--web", String(port)]
         if launchPlan.autoMtls {
@@ -723,117 +684,52 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             args.append("--no-tls")
         }
         args.append(contentsOf: launchPlan.extraArgs)
-        process.arguments = args
-
-        // Inherit environment + ensure Homebrew PATH
-        var env = ProcessInfo.processInfo.environment
-        let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin"]
-        let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        let missing = extraPaths.filter { !currentPath.contains($0) && FileManager.default.fileExists(atPath: $0) }
-        if !missing.isEmpty {
-            env["PATH"] = missing.joined(separator: ":") + ":" + currentPath
-        }
-        process.environment = env
-
-        // Working directory: plainly the user's home. Nothing derives from
-        // the launch cwd anymore — a daemon started outside a project (no
-        // .git / intendant.toml at cwd) runs projectless on the Rust side:
-        // no cwd file watching, no cwd-derived sandbox scope, no default
-        // session project. Each session picks its project directory in the
-        // dashboard's New Session pane. (Home may itself contain a project
-        // marker; if so the daemon simply roots there, which is the normal
-        // rooted behavior, not a scan hazard — projectless/marker gating
-        // lives in the Rust daemon.)
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-        process.currentDirectoryURL = dir
-        NSLog("Working directory: \(dir.path)")
-
-        // Log backend output for debugging (append mode — preserves crash info
-        // from previous sessions; the Rust panic hook writes per-session panic.log
-        // files for structured auditing, this is the fallback for pre-session crashes)
-        let logDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".intendant")
-        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
-        let logFile = logDir.appendingPathComponent("app-backend.log")
-        if !FileManager.default.fileExists(atPath: logFile.path) {
-            FileManager.default.createFile(atPath: logFile.path, contents: nil)
-        }
-        let logHandle = FileHandle(forWritingAtPath: logFile.path)
-        logHandle?.seekToEndOfFile()
-        // Write launch separator
-        let sep = "\n--- Launch \(ISO8601DateFormatter().string(from: Date())) ---\n"
-        logHandle?.write(sep.data(using: .utf8) ?? Data())
-        process.standardOutput = logHandle ?? FileHandle.nullDevice
-        process.standardError = logHandle ?? FileHandle.nullDevice
-
-        do {
-            try process.run()
-            backendProcess = process
-            backendLastStart = Date()
-            // React to backend death immediately (the 5s health tick stays
-            // as the belt for a missed handler). Remote dashboards have no
-            // crash screen — without a restart this machine just goes dark.
-            process.terminationHandler = { [weak self] proc in
-                DispatchQueue.main.async {
-                    self?.backendDidExit(proc)
-                }
-            }
-            NSLog("Started intendant-bin (PID \(process.processIdentifier)) on port \(port)")
-            return true
-        } catch {
-            NSLog("Failed to start intendant-bin: \(error)")
-            return false
-        }
-    }
-
-    /// Backend exit policy: abnormal exits (signal / non-zero status)
-    /// auto-restart with capped exponential backoff; a clean exit means
-    /// someone stopped the daemon deliberately, so only the manual Restart
-    /// button revives it.
-    func backendDidExit(_ proc: Process) {
-        guard !isTerminating, proc === backendProcess, !proc.isRunning else { return }
-        // Consume the reference first: the health tick and the
-        // terminationHandler can both observe the same exit, and a second
-        // pass would double-count the attempt and reschedule the timer.
-        backendProcess = nil
-        healthTimer?.invalidate()
-        let signalled = proc.terminationReason == .uncaughtSignal
-        let status = proc.terminationStatus
-        let abnormal = signalled || status != 0
-        NSLog("Backend exited (\(signalled ? "signal" : "status") \(status), \(abnormal ? "abnormal" : "clean"))")
-        guard abnormal else {
-            pollGeneration += 1
-            showBackendCrash(
-                title: "Backend stopped",
-                detail: "The daemon exited cleanly. Restart it to keep using this app."
-            )
-            return
-        }
-        if Date().timeIntervalSince(backendLastStart) > 600 {
-            backendRestartAttempts = 0
-        }
-        scheduleBackendAutoRestart()
-    }
-
-    /// Arm (or re-arm) the auto-restart countdown with capped exponential
-    /// backoff, orphaning any readiness-poll chain so nothing paints over
-    /// the countdown screen. Re-entered by the timer itself when a spawn
-    /// attempt fails, so the chain never dead-ends.
-    func scheduleBackendAutoRestart() {
-        guard !isTerminating else { return }
-        pollGeneration += 1
-        let delay = min(60.0, pow(2.0, Double(backendRestartAttempts + 1)))
-        backendRestartAttempts += 1
-        NSLog("Auto-restarting backend in \(Int(delay))s (attempt \(backendRestartAttempts))")
-        showBackendCrash(
-            title: "Backend process crashed",
-            detail: "Restarting in \(Int(delay))s (attempt \(backendRestartAttempts)) — see ~/.intendant/app-backend.log"
+        let supervisor = BackendSupervisor(
+            binaryPath: Bundle.main.bundlePath + "/Contents/MacOS/intendant-bin",
+            arguments: args,
+            port: port,
+            scheme: launchPlan.scheme,
+            session: backendSession
         )
-        backendAutoRestartTimer?.invalidate()
-        backendAutoRestartTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-            guard let self = self, !self.isTerminating else { return }
-            if !self.restartBackend() {
-                self.scheduleBackendAutoRestart()
+        supervisor.delegate = self
+        return supervisor
+    }
+
+    /// Map supervision states to the screens the user sees. The supervisor
+    /// owns the process and the policy; this layer only paints.
+    func backendSupervisor(_ supervisor: BackendSupervisor,
+                           didChangeState state: BackendState,
+                           detail: String) {
+        switch state {
+        case .starting:
+            showBackendStarting(detail: detail)
+        case .ready:
+            // Backend is up. The SPA is deferred behind the
+            // placeholder unless a harness/user asked for it.
+            if autoActivateDashboard {
+                activateDashboard()
+            } else {
+                showPlaceholder(paused: false)
             }
+        case .unreachable:
+            showBackendUnreachable(detail: detail)
+        case .stoppedCleanly:
+            showBackendCrash(title: "Backend stopped", detail: detail)
+        case .crashed:
+            showBackendCrash(title: "Backend process crashed", detail: detail)
+        }
+    }
+
+    /// 5s housekeeping tick from the supervisor's health timer.
+    func backendSupervisorHealthTick(_ supervisor: BackendSupervisor) {
+        // Idle unload: an SPA nobody has seen for hours is pure cost —
+        // its web-content process grows with every streamed session.
+        if dashboardActive,
+           idleUnloadSeconds > 0,
+           let win = window,
+           !win.occlusionState.contains(.visible),
+           Date().timeIntervalSince(lastWindowVisibleAt) > idleUnloadSeconds {
+            showPlaceholder(paused: true)
         }
     }
 
@@ -944,131 +840,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         window.appearance = NSAppearance(named: .darkAqua)
     }
 
-    // MARK: - Polling
+    // MARK: - Backend screens
 
-    func pollUntilReady() {
-        pollGeneration += 1
+    /// Boot screen while the readiness poll runs. The window may be
+    /// closed; the poll keeps running regardless, only painting is
+    /// skipped.
+    func showBackendStarting(detail: String) {
         webView?.loadHTMLString("""
             <html>
             <body style="background:#1e1e2e;color:#cdd6f4;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
             <div style="text-align:center">
                 <div style="font-size:24px;margin-bottom:8px">Starting Intendant...</div>
-                <div style="font-size:14px;color:#6c7086">Waiting for backend on port \(port)</div>
+                <div style="font-size:14px;color:#6c7086">\(detail)</div>
             </div>
             </body>
             </html>
             """, baseURL: nil)
-
-        poll(attempts: 0, generation: pollGeneration)
     }
 
-    func poll(attempts: Int, generation: Int) {
-        // A crash or scheduled restart bumps pollGeneration; a stale chain
-        // must go silent rather than paint over the countdown screen.
-        guard generation == pollGeneration else { return }
-        if attempts > 30 {
-            // The window may have been closed while the backend booted;
-            // the poll keeps running regardless, only painting is skipped.
-            webView?.loadHTMLString("""
-                <html>
-                <body style="background:#1e1e2e;color:#cdd6f4;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
-                <div style="text-align:center">
-                    <div style="font-size:20px;color:#f38ba8;margin-bottom:12px">Failed to connect to backend on port \(port)</div>
-                    <div style="font-size:14px;color:#6c7086;margin-bottom:16px">Check ~/.intendant/app-backend.log for details</div>
-                    <button onclick="window.webkit.messageHandlers.restart && window.webkit.messageHandlers.restart.postMessage(null)"
-                            style="padding:8px 24px;border:1px solid #89b4fa;border-radius:6px;background:transparent;color:#89b4fa;font-size:14px;cursor:pointer">
-                        Restart now
-                    </button>
-                </div>
-                </body>
-                </html>
-                """, baseURL: nil)
-            return
-        }
-
-        // Poll the backend directly; under bundled auto-TLS/mTLS this is
-        // HTTPS and uses the same local trust delegate as the intendant:// proxy.
-        let healthURL = backendURL("/")
-        var request = URLRequest(url: healthURL, timeoutInterval: 1)
-        request.httpMethod = "HEAD"
-        backendSession.dataTask(with: request) { _, response, error in
-            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                DispatchQueue.main.async {
-                    guard generation == self.pollGeneration else { return }
-                    // Backend is up. The SPA is deferred behind the
-                    // placeholder unless a harness/user asked for it.
-                    if self.autoActivateDashboard {
-                        self.activateDashboard()
-                    } else {
-                        self.showPlaceholder(paused: false)
-                    }
-                    self.startHealthCheck()
-                }
-            } else {
-                // Silent-by-default; the last attempts say why the failure
-                // page is about to render (slow cold start vs TLS refusal).
-                if attempts >= 28 {
-                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                    NSLog("Backend readiness poll failing (attempt \(attempts + 1)/30): status=\(status) error=\(error?.localizedDescription ?? "none")")
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    self.poll(attempts: attempts + 1, generation: generation)
-                }
-            }
-        }.resume()
-    }
-
-    // MARK: - Health Check
-
-    func startHealthCheck() {
-        healthTimer?.invalidate()
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            // Check if the backend process is still alive
-            if let proc = self.backendProcess, !proc.isRunning {
-                self.healthTimer?.invalidate()
-                self.backendDidExit(proc)
-                return
-            }
-            // Idle unload: an SPA nobody has seen for hours is pure cost —
-            // its web-content process grows with every streamed session.
-            if self.dashboardActive,
-               self.idleUnloadSeconds > 0,
-               let win = self.window,
-               !win.occlusionState.contains(.visible),
-               Date().timeIntervalSince(self.lastWindowVisibleAt) > self.idleUnloadSeconds {
-                self.showPlaceholder(paused: true)
-            }
-            // Also ping the HTTP endpoint. Probe failures are logged, never
-            // fatal: the process-liveness check above is the only thing
-            // allowed to declare a crash — a slow daemon or a stalled TLS
-            // probe must not replace a working dashboard with a false
-            // "Backend process exited" screen.
-            let url = self.backendURL("/")
-            var req = URLRequest(url: url, timeoutInterval: 2)
-            req.httpMethod = "HEAD"
-            self.backendSession.dataTask(with: req) { _, response, error in
-                let ok = (response as? HTTPURLResponse)?.statusCode == 200
-                DispatchQueue.main.async {
-                    if ok {
-                        if self.healthProbeFailures >= 3 {
-                            NSLog("Backend health probe recovered after \(self.healthProbeFailures) failures")
-                        }
-                        self.healthProbeFailures = 0
-                        return
-                    }
-                    self.healthProbeFailures += 1
-                    if self.healthProbeFailures == 3 || self.healthProbeFailures % 24 == 0 {
-                        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                        NSLog("Backend health probe failing (\(self.healthProbeFailures) consecutive; status=\(status) error=\(error?.localizedDescription ?? "none")) — process is still running")
-                    }
-                }
-            }.resume()
-        }
-    }
-
-    func backendURL(_ path: String) -> URL {
-        URL(string: "\(launchPlan.scheme)://127.0.0.1:\(port)\(path)")!
+    /// Readiness poll exhausted. Unlike a crash this never conjures a
+    /// window — if it was closed mid-boot, only the painting is skipped.
+    func showBackendUnreachable(detail: String) {
+        paintBackendFailurePage(
+            title: "Failed to connect to backend on port \(port)",
+            detail: detail
+        )
     }
 
     func showBackendCrash(
@@ -1080,6 +876,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         // remotely this machine just went dark.
         if window == nil { createWindow() }
         dashboardActive = false
+        paintBackendFailurePage(title: title, detail: detail)
+    }
+
+    /// Shared failure page (red title, detail line, Restart button);
+    /// paints only when a webview exists.
+    func paintBackendFailurePage(title: String, detail: String) {
         guard webView != nil else { return }
         let esc = { (s: String) -> String in
             s.replacingOccurrences(of: "&", with: "&amp;")
