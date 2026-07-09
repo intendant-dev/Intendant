@@ -35,6 +35,7 @@ mod fission_lifecycle;
 pub(crate) use intendant_core::frames;
 mod frontend;
 mod gateway_routes;
+mod global_store;
 pub(crate) use intendant_core::knowledge;
 mod lineage_ledger;
 mod linux_display_env;
@@ -1312,7 +1313,11 @@ async fn apply_user_approval(
     }
     if cat == autonomy::ActionCategory::DisplayControl && !state.user_display_granted {
         state.user_display_granted = true;
-        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
+        // Approving an agent display-control action IS the agent opt-in.
+        bus.send(AppEvent::UserDisplayGranted {
+            display_id: 0,
+            agent_visible: true,
+        });
     }
 }
 
@@ -2764,12 +2769,16 @@ pub fn spawn_user_display_listener(
         let mut virtual_display_guards = virtual_display::VirtualDisplayGuards::new();
         loop {
             match rx.recv().await {
-                Ok(AppEvent::UserDisplayGranted { display_id }) => {
+                Ok(AppEvent::UserDisplayGranted {
+                    display_id,
+                    agent_visible,
+                }) => {
                     activate_user_display(
                         &bus,
                         &session_registry,
                         frame_registry.clone(),
                         display_id,
+                        agent_visible,
                     )
                     .await;
                 }

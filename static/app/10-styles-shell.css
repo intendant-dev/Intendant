@@ -211,6 +211,9 @@ html {
   color: var(--red);
 }
 .status-bar #sb-display-access.granted { color: var(--green); }
+/* Private view active: the chip reads 'view' in a neutral accent — the
+   agent does NOT have the display, so the granted green stays off. */
+.status-bar #sb-display-access.view-only { color: var(--blue); }
 .display-toggle-wrap { position: relative; display: inline-flex; align-items: center; gap: 4px; }
 .display-picker {
   display: none;

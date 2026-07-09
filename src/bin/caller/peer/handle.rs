@@ -1007,6 +1007,7 @@ mod tests {
                     display_id: 99,
                     width: 1920,
                     height: 1080,
+                    agent_visible: true,
                 })
                 .unwrap(),
             )

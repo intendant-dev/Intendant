@@ -216,9 +216,10 @@ pub(crate) fn spawn_mode_web_gateway(
     project: &Project,
     // The mode's project root as served to gateway routes (project-root
     // endpoint, Changes tab, worktree scan, settings persistence). `None`
-    // = projectless daemon; the gateway routes already answer honestly
-    // ("no project root") in that case. Non-daemon modes pass
-    // `Some(project.root)`.
+    // = projectless daemon: routes that need a durable store (staged
+    // uploads, transfer jobs) fall back to the daemon-global store
+    // (`global_store::StoreScope`); the rest answer honestly ("no
+    // project root"). Non-daemon modes pass `Some(project.root)`.
     project_root: Option<PathBuf>,
     autonomy: &SharedAutonomy,
     log_dir: &Path,

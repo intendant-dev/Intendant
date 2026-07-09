@@ -2947,6 +2947,38 @@ const SHELL_KEY_SEQS = {
 // Displays
 const displaySlots = new Map();
 const peerDisplayConnections = new Map(); // sessionKey -> PeerDisplayConnection
+// Per-display agent visibility, fed by `display_ready` / `user_display_granted`
+// events (both carry `agent_visible` since the private-view split). false =
+// a private user view ("View this machine"): streams to this dashboard only,
+// invisible to agent screenshot/CU/enumeration paths on the daemon.
+const displayAgentVisibility = new Map();
+// Display ids that are user-display sessions (granted or private-viewed) --
+// distinguishes "agent can see this" chips on user screens from ordinary
+// agent-owned virtual displays, which get no chip.
+const userDisplayIds = new Set();
+// User-display grant state (single active slot, matching the daemon's
+// per-daemon grant flag). Declared here -- before the display fragments
+// that render against it at load time -- because module-scope `let` from
+// a later fragment is in TDZ during earlier fragments' initial render.
+let userDisplayGranted = false;
+let grantedDisplayId = 0;
+// Mode of the active user-display session: true = shared with the agent
+// (computer use), false = a private view. Meaningful only while
+// userDisplayGranted is true.
+let userDisplayAgentVisible = true;
+function setDisplayAgentVisibility(displayId, visible) {
+  displayId = Number(displayId);
+  displayAgentVisibility.set(displayId, !!visible);
+  const slot = displaySlots.get(displayId);
+  if (slot && typeof slot.setAgentVisibility === 'function') {
+    slot.setAgentVisibility(!!visible);
+  }
+}
+function clearDisplayAgentVisibility(displayId) {
+  displayId = Number(displayId);
+  displayAgentVisibility.delete(displayId);
+  userDisplayIds.delete(displayId);
+}
 // Session/phase state is read by Station during direct #station boot before
 // the lower dashboard sections finish registering their helpers.
 const sessionsListCache = new Map();

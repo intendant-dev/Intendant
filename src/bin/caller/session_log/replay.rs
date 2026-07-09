@@ -828,6 +828,12 @@ pub fn session_log_entry_to_app_event(
             display_id: u32_from_data(data, "display_id")?,
             width: u32_from_data(data, "width").unwrap_or(0),
             height: u32_from_data(data, "height").unwrap_or(0),
+            // Logs that predate the private-view split never hid displays
+            // from agents, so absent means agent-visible.
+            agent_visible: data
+                .and_then(|d| d.get("agent_visible"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
         }),
         "display_resize" => Some(AppEvent::DisplayResize {
             display_id: u32_from_data(data, "display_id")?,
@@ -1872,7 +1878,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
-        log.display_ready(99, 1920, 1080);
+        log.display_ready(99, 1920, 1080, true);
         log.display_taken(99);
         log.display_released(99, Some("session ended"));
         drop(log);
@@ -1883,10 +1889,24 @@ mod tests {
                 display_id,
                 width,
                 height,
+                agent_visible,
             } => {
                 assert_eq!(display_id, 99);
                 assert_eq!(width, 1920);
                 assert_eq!(height, 1080);
+                assert!(agent_visible);
+            }
+            other => panic!("expected DisplayReady, got {:?}", other),
+        }
+
+        // Pre-split log lines have no agent_visible — absent means true.
+        let mut legacy = ready.clone();
+        if let Some(data) = legacy.get_mut("data").and_then(|d| d.as_object_mut()) {
+            data.remove("agent_visible");
+        }
+        match session_log_entry_to_app_event(&legacy, &log_dir).unwrap() {
+            AppEvent::DisplayReady { agent_visible, .. } => {
+                assert!(agent_visible, "legacy display_ready lines default visible");
             }
             other => panic!("expected DisplayReady, got {:?}", other),
         }

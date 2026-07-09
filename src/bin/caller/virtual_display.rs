@@ -100,8 +100,10 @@ pub(crate) async fn create_virtual_display(
     // Displays this daemon holds alive must never be orphan-reclaimed by
     // the allocator: our own guards, plus every registered virtual capture
     // session (an agent-launched Xvfb has a session but no guard here).
+    // `all_display_ids`: allocation must also avoid ids held by private
+    // user views, which the agent-facing enumeration hides.
     let mut exclude: Vec<u32> = guards.keys().copied().collect();
-    for id in session_registry.read().await.display_ids() {
+    for id in session_registry.read().await.all_display_ids() {
         if id != 0 && !exclude.contains(&id) {
             exclude.push(id);
         }
@@ -132,10 +134,14 @@ pub(crate) async fn create_virtual_display(
                 level: Some(LogLevel::Info),
                 turn: None,
             });
-            activate_user_display(bus, session_registry, frame_registry, display_id).await;
+            // Dashboard-created virtual displays are agent workspaces:
+            // always agent-visible.
+            activate_user_display(bus, session_registry, frame_registry, display_id, true).await;
             // Activation failure already reported its reason; don't leave a
             // guarded Xvfb running with no tile and no way to destroy it.
-            if session_registry.read().await.get(display_id).is_none()
+            // (`get_any` for symmetry — this is lifecycle bookkeeping, not
+            // an agent lookup, though virtual displays are never hidden.)
+            if session_registry.read().await.get_any(display_id).is_none()
                 && guards.remove(&display_id).is_some()
             {
                 eprintln!("[virtual_display] :{display_id} activation failed — Xvfb reaped");

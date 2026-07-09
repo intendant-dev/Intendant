@@ -650,7 +650,10 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 }),
             }
         }
-        ControlMsg::GrantUserDisplay { display_id } => {
+        ControlMsg::GrantUserDisplay {
+            display_id,
+            agent_visible,
+        } => {
             // Owned here (not by any frontend) so the display-control path
             // never depends on a rendering loop to process revokes/grants.
             // Historically this lived in the TUI's control handler, where a
@@ -662,20 +665,31 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             // before any web terminal connects; subsequent grants after
             // churn would have shown the same lag.
             let did = display_id.unwrap_or(0);
-            {
+            // Wire absence means the pre-split message: share with the
+            // agent. `Some(false)` is the dashboard's "View this machine"
+            // — a private view that must never mint agent authority.
+            let agent_visible = agent_visible.unwrap_or(true);
+            if agent_visible {
                 // The autonomy guard is the single holder of the grant;
                 // runtime children observe it via the env derivation at the
-                // spawn boundary (agent_runner).
+                // spawn boundary (agent_runner). A private view leaves the
+                // guard untouched: viewing your own machine grants the
+                // agent nothing.
                 let mut guard = state.autonomy.write().await;
                 guard.user_display_granted = true;
             }
-            state
-                .bus
-                .send(AppEvent::UserDisplayGranted { display_id: did });
+            state.bus.send(AppEvent::UserDisplayGranted {
+                display_id: did,
+                agent_visible,
+            });
         }
         ControlMsg::RevokeUserDisplay { display_id, note } => {
             let did = display_id.unwrap_or(0);
             {
+                // Cleared unconditionally: the grant is a single per-daemon
+                // flag, and dropping agent authority on any user-display
+                // revoke (even of a private view that never set it) is the
+                // fail-closed direction.
                 let mut guard = state.autonomy.write().await;
                 guard.user_display_granted = false;
             }
@@ -876,6 +890,83 @@ mod tests {
             permission_mode: "default".to_string(),
             allowed_tools: Vec::new(),
         }))
+    }
+
+    #[tokio::test]
+    async fn grant_user_display_agent_visibility_controls_autonomy_grant() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let state = ControlPlaneState {
+            autonomy: autonomy.clone(),
+            external_agent: Arc::new(RwLock::new(None)),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        };
+
+        // "View this machine": a private view must never mint agent
+        // display authority.
+        handle_control_msg(
+            &ControlMsg::GrantUserDisplay {
+                display_id: Some(3),
+                agent_visible: Some(false),
+            },
+            &state,
+        )
+        .await;
+        assert!(
+            !autonomy.read().await.user_display_granted,
+            "a private view must not set the autonomy user-display grant"
+        );
+        match events.try_recv() {
+            Ok(AppEvent::UserDisplayGranted {
+                display_id,
+                agent_visible,
+            }) => {
+                assert_eq!(display_id, 3);
+                assert!(!agent_visible, "the event must carry the private mode");
+            }
+            other => panic!("expected UserDisplayGranted, got {other:?}"),
+        }
+
+        // The legacy wire shape (agent_visible absent) keeps its historical
+        // meaning: share with the agent.
+        handle_control_msg(
+            &ControlMsg::GrantUserDisplay {
+                display_id: None,
+                agent_visible: None,
+            },
+            &state,
+        )
+        .await;
+        assert!(
+            autonomy.read().await.user_display_granted,
+            "a legacy grant still sets the autonomy user-display grant"
+        );
+        match events.try_recv() {
+            Ok(AppEvent::UserDisplayGranted {
+                display_id,
+                agent_visible,
+            }) => {
+                assert_eq!(display_id, 0);
+                assert!(agent_visible);
+            }
+            other => panic!("expected UserDisplayGranted, got {other:?}"),
+        }
+
+        // Revoke clears the grant (of any user-display session — the flag
+        // is per-daemon; over-revocation is the fail-closed direction).
+        handle_control_msg(
+            &ControlMsg::RevokeUserDisplay {
+                display_id: None,
+                note: None,
+            },
+            &state,
+        )
+        .await;
+        assert!(!autonomy.read().await.user_display_granted);
     }
 
     #[tokio::test]

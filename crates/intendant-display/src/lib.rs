@@ -581,13 +581,82 @@ impl DisplayMetricsSnapshot {
 // ---------------------------------------------------------------------------
 
 /// Platform-specific display capture and input injection.
+///
+/// # Capture lifecycle contract
+///
+/// [`Self::start_capture`] / [`Self::stop_capture`] form a session lifecycle
+/// that every backend must implement with the same observable semantics, so
+/// the capture bridge ([`DisplaySession::start`]) can reason about teardown
+/// identically on every platform:
+///
+/// - **Serialized calls.** Callers serialize `start_capture` / `stop_capture`
+///   per backend instance (`DisplaySession` owns its backend and does so).
+///   Backends are not required to make *concurrent* start/stop calls
+///   linearizable, but every serialized call must leave the backend in a
+///   state where the next call upholds this contract.
+/// - **`start_capture` yields a fresh session.** Each successful call
+///   returns a new bounded frame channel (capacity 4; producers `try_send`
+///   and drop frames when the buffer is full). Starting while a previous
+///   session is still running first tears that session down (its channel
+///   closes) and then starts clean — an implicit `stop_capture`. A *failed*
+///   `start_capture` leaves no capture state behind: no threads, no OS
+///   streams, and `stop_capture` remains a no-op.
+/// - **The channel may close early.** When the OS source ends on its own
+///   (portal revoked, display disconnected, capture thread died), the
+///   producer side drops and the receiver sees `None`. Consumers must treat
+///   channel-close as capture-lost — the capture bridge emits
+///   [`DisplayEvent::CaptureLost`].
+///
+/// # Teardown contract (`stop_capture`)
+///
+/// After `stop_capture().await` returns:
+///
+/// 1. **The frame channel closes within bounded time.** The receiver from
+///    the most recent `start_capture` drains at most the few buffered frames
+///    and then sees `None`. Thread-backed backends (x11, wayland, windows)
+///    join the producer thread before returning, so the close is immediate;
+///    the macOS callback backend empties its shared sender slot before
+///    returning. ("Bounded" presumes the one in-flight OS capture call
+///    itself returns — a hung X server or SCK daemon can extend it.)
+/// 2. **No captured-frame side effect may touch freed state.** The backend
+///    owns whatever quiesce its OS needs: joining capture threads where
+///    possible, or — where the OS delivery queue cannot be joined (macOS
+///    ScreenCaptureKit) — keeping handler state alive until the OS truly
+///    stops calling it *and* gating the handler body on a per-session
+///    shutdown flag so post-stop callbacks are no-ops. This clause is paid
+///    for: on 2026-07-08 SCK delivered a frame ~53 s after `stop_capture()`
+///    and the then-current screencapturekit crate had freed the handler
+///    state on `Drop` — the late callback segfaulted the daemon.
+/// 3. **Double-stop and stop-without-start are no-ops** — cheap and
+///    side-effect-free beyond taking the state mutex.
+/// 4. **Start after stop yields a fresh, clean session** — a new channel and
+///    new per-session teardown state. Nothing from a previous session (late
+///    frames, a stale shutdown flag, an unjoined producer) may leak into or
+///    tear down the new one.
+///
+/// The `capture_teardown_contract` tests in this crate hammer these
+/// guarantees on synthetic backends in both conformance styles (join-on-stop
+/// and detached-callbacks); each real OS backend additionally has an
+/// `#[ignore]`d start/stop stress test for operator hardware (Wayland
+/// excepted: every portal session re-prompts for user approval, so it cannot
+/// run unattended).
 #[async_trait]
 pub trait DisplayBackend: Send + Sync + 'static {
     /// Begin capturing frames at the target framerate.
-    /// Returns a receiver for raw frames (bounded channel, backend drops on full).
+    /// Returns the receiver of a bounded frame channel (capacity 4, backend
+    /// `try_send`s and drops on full).
+    ///
+    /// Implements the fresh-session semantics of the [capture lifecycle
+    /// contract](DisplayBackend): implicit teardown of any session still
+    /// running, and no residual capture state when it returns `Err`.
     async fn start_capture(&self, fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError>;
 
-    /// Stop capturing. Blocks until the capture thread/task has exited.
+    /// Stop capturing and quiesce the platform source.
+    ///
+    /// Upholds the [teardown contract](DisplayBackend): on return the frame
+    /// channel closes within bounded time, no late captured-frame side effect
+    /// can touch freed state, double-stop / stop-without-start are no-ops,
+    /// and a subsequent `start_capture` gets a clean slate.
     async fn stop_capture(&self);
 
     /// Inject a browser input event into the display.
@@ -710,6 +779,19 @@ pub struct DisplaySession {
     /// lower 32 bits of `(arrived - session_epoch).as_millis()`, so each
     /// frame carries its capture-time timestamp without a side channel.
     diagnostics_visual_marker: Arc<AtomicBool>,
+    /// **Agent visibility.** `true` (the default) means this display may be
+    /// seen and driven by agents: it appears in agent-facing registry
+    /// lookups ([`SessionRegistry::get`], [`SessionRegistry::display_ids`])
+    /// and its 1 Hz FrameRegistry sampler publishes `display_<id>` frames
+    /// for model feeds. `false` marks a **private user view** ("View this
+    /// machine"): the session still streams to the owner's dashboards over
+    /// WebRTC and accepts dashboard input, but every agent-facing lookup
+    /// skips it and the FrameRegistry sampler stays silent, so agent
+    /// screenshot/CU/frame paths cannot reach it (fail closed). Flipped to
+    /// `true` in place when the user later shares the display with the
+    /// agent — no capture restart needed; frames start publishing on the
+    /// next sampler tick. Never downgraded automatically.
+    agent_visible: Arc<AtomicBool>,
     /// Reference instant for the diagnostic marker's 32-bit timestamp.
     /// Set once in [`Self::new`]; the bridge computes
     /// `arrived.duration_since(session_epoch).as_millis() as u32` per
@@ -1144,9 +1226,23 @@ impl DisplaySession {
             tile_epoch: Arc::new(AtomicU32::new(1)),
             tile_snapshot_id: Arc::new(AtomicU32::new(1)),
             diagnostics_visual_marker: Arc::new(AtomicBool::new(false)),
+            agent_visible: Arc::new(AtomicBool::new(true)),
             session_epoch: Instant::now(),
             layer_policy_handle: Mutex::new(None),
         }
+    }
+
+    /// Set whether agents may see this display (see the `agent_visible`
+    /// field docs). Callers only ever *raise* visibility automatically on
+    /// an explicit user grant; creation-time hiding happens before the
+    /// session enters the registry.
+    pub fn set_agent_visible(&self, visible: bool) {
+        self.agent_visible.store(visible, Ordering::Relaxed);
+    }
+
+    /// Whether agents may see this display. `false` = private user view.
+    pub fn agent_visible(&self) -> bool {
+        self.agent_visible.load(Ordering::Relaxed)
     }
 
     /// Toggle the Phase 0 visual-freshness diagnostic marker on or off.
@@ -1453,6 +1549,7 @@ impl DisplaySession {
             let latest = Arc::clone(&self.latest_frame);
             let shutdown_reg = self.shutdown.clone();
             let display_id = self.display_id;
+            let agent_visible = Arc::clone(&self.agent_visible);
             let mut frame_counter = 0u64;
             let reg_handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -1460,6 +1557,13 @@ impl DisplaySession {
                     tokio::select! {
                         _ = shutdown_reg.cancelled() => break,
                         _ = interval.tick() => {
+                            // The FrameRegistry is a model feed (agent
+                            // auto-attach, presence frame tools, MCP
+                            // list_frames/read_frame). A private user view
+                            // must publish nothing to it — checked per tick
+                            // so a later "share with agent" upgrade starts
+                            // publishing without a capture restart.
+                            if !agent_visible.load(Ordering::Relaxed) { continue }
                             let frame = latest.read().await.clone();
                             let Some(frame) = frame else { continue };
                             let w = frame.width;
@@ -2964,7 +3068,27 @@ impl SessionRegistry {
         }
     }
 
+    /// Agent-facing lookup — the **fail-closed default**. Returns the
+    /// session only when it is agent-visible; a private user view
+    /// ("View this machine", [`DisplaySession::agent_visible`] == false)
+    /// reads as absent. Every agent-reachable path (CU action execution,
+    /// screenshot session lookup, default-target selection, display
+    /// enumeration overlays, federated peer streaming) goes through this,
+    /// so new callers are private-view-safe unless they explicitly opt
+    /// into [`Self::get_any`].
     pub fn get(&self, display_id: u32) -> Option<Arc<DisplaySession>> {
+        self.sessions
+            .get(&display_id)
+            .filter(|s| s.agent_visible())
+            .cloned()
+    }
+
+    /// Unfiltered lookup for **user/dashboard surfaces only** (WebRTC
+    /// offers and input from the owner's dashboards, lifecycle teardown,
+    /// activation dedupe, explicit user-initiated recording). Returns
+    /// private user views too — never call this from a path whose output
+    /// reaches an agent.
+    pub fn get_any(&self, display_id: u32) -> Option<Arc<DisplaySession>> {
         self.sessions.get(&display_id).cloned()
     }
 
@@ -2983,8 +3107,20 @@ impl SessionRegistry {
         self.sessions.remove(&display_id)
     }
 
-    /// All active display IDs.
+    /// Agent-visible display IDs — the fail-closed default enumeration
+    /// (see [`Self::get`]). Private user views are excluded.
     pub fn display_ids(&self) -> Vec<u32> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| s.agent_visible())
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// All active display IDs including private user views — for
+    /// user/dashboard surfaces only (bootstrap replay, input-authority
+    /// snapshots, virtual-display id allocation).
+    pub fn all_display_ids(&self) -> Vec<u32> {
         self.sessions.keys().copied().collect()
     }
 
@@ -3056,6 +3192,118 @@ pub(crate) fn gated_input_handler(
             }
         });
     })
+}
+
+// ---------------------------------------------------------------------------
+// Capture teardown-contract stress driver (test-only, shared with the
+// per-OS backend modules)
+// ---------------------------------------------------------------------------
+
+/// Shared driver for the per-backend `#[ignore]`d real-OS capture stress
+/// tests (`macos.rs` / `x11.rs` / `windows.rs`). Hammers start/stop cycles
+/// against the [`DisplayBackend`] teardown contract on real capture
+/// hardware, then lingers so a late OS callback into freed state (the
+/// 2026-07-08 ScreenCaptureKit incident class: a frame delivered ~53 s
+/// after stop) crashes the test process instead of a production daemon.
+///
+/// Run on operator hardware (needs a display; macOS additionally needs the
+/// Screen Recording TCC grant):
+///
+/// ```text
+/// cargo test -p intendant-display --lib -- --ignored real_capture_stress
+/// ```
+///
+/// Tunables: `INTENDANT_DISPLAY_STRESS_CYCLES` (default 10) and
+/// `INTENDANT_DISPLAY_STRESS_LINGER_SECS` (default 60 — sized to cover the
+/// observed ~53 s late-callback window).
+#[cfg(test)]
+pub(crate) mod capture_stress {
+    use super::DisplayBackend;
+    use std::time::Duration;
+
+    fn env_u64(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Drive `cycles` fast start/stop cycles, asserting per cycle that a
+    /// frame flows and that the frame channel closes within bounded time of
+    /// `stop_capture` returning, then linger to catch late OS callbacks.
+    ///
+    /// If the very first `start_capture` fails, the environment simply
+    /// cannot run this backend (headless box, missing TCC grant, Session 0
+    /// desktop) — the test logs and returns instead of failing, so the
+    /// `--ignored` battery stays runnable on any operator machine. A
+    /// failure on a *later* cycle is a real contract violation
+    /// (start-after-stop must yield a fresh session) and panics.
+    pub(crate) async fn run_real_backend_stress(backend: &dyn DisplayBackend) {
+        let cycles = env_u64("INTENDANT_DISPLAY_STRESS_CYCLES", 10);
+        let linger = Duration::from_secs(env_u64("INTENDANT_DISPLAY_STRESS_LINGER_SECS", 60));
+
+        for cycle in 0..cycles {
+            let mut rx = match backend.start_capture(30).await {
+                Ok(rx) => rx,
+                Err(e) if cycle == 0 => {
+                    eprintln!(
+                        "[capture-stress] skipping: {} capture unavailable in this \
+                         environment: {e}",
+                        backend.kind(),
+                    );
+                    return;
+                }
+                Err(e) => panic!(
+                    "cycle {cycle}: start_capture after stop_capture must yield a \
+                     fresh session: {e}"
+                ),
+            };
+
+            match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
+                Ok(Some(_frame)) => {}
+                Ok(None) => panic!("cycle {cycle}: capture channel closed before the first frame"),
+                Err(_) => panic!("cycle {cycle}: no frame within 15s of start_capture"),
+            }
+
+            backend.stop_capture().await;
+
+            // Contract clause 1: bounded channel-close. Drain whatever was
+            // buffered; `None` must arrive promptly.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(_buffered)) => continue,
+                    Ok(None) => break,
+                    Err(_) => panic!(
+                        "cycle {cycle}: frame channel still open 5s after \
+                         stop_capture returned"
+                    ),
+                }
+            }
+
+            // Small pause so any immediately-late OS callback overlaps the
+            // *next* session's startup — the exact per-session-state race
+            // the contract's clause 4 exists for.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        eprintln!(
+            "[capture-stress] {} cycles complete on {}; lingering {:?} to catch \
+             late OS callbacks into freed state",
+            cycles,
+            backend.kind(),
+            linger,
+        );
+        tokio::time::sleep(linger).await;
+
+        // The backend must still be fully usable after the linger.
+        let mut rx = backend
+            .start_capture(30)
+            .await
+            .expect("start_capture after linger must yield a fresh session");
+        let _ = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
+        backend.stop_capture().await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3642,6 +3890,60 @@ mod tests {
             Some(now),
             min
         ));
+    }
+
+    #[test]
+    fn session_registry_agent_hidden_sessions_absent_from_agent_lookups() {
+        let mut reg = SessionRegistry::new();
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
+        let private_view = Arc::new(DisplaySession::new(0, Arc::clone(&backend) as _));
+        private_view.set_agent_visible(false);
+        let agent_display = Arc::new(DisplaySession::new(99, backend as _));
+        reg.insert(0, Arc::clone(&private_view));
+        reg.insert(99, Arc::clone(&agent_display));
+
+        // Agent-facing default lookups: the private view reads as absent.
+        assert!(
+            reg.get(0).is_none(),
+            "agent-facing get must not return a private user view"
+        );
+        assert!(reg.get(99).is_some(), "agent displays stay visible");
+        assert_eq!(
+            reg.display_ids(),
+            vec![99],
+            "agent-facing enumeration must exclude the private view"
+        );
+
+        // Dashboard surfaces see everything.
+        assert!(reg.get_any(0).is_some(), "dashboard get_any sees the view");
+        let mut all = reg.all_display_ids();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 99]);
+
+        // A later "share with agent" upgrade makes it visible in place.
+        private_view.set_agent_visible(true);
+        assert!(reg.get(0).is_some(), "upgraded session becomes agent-visible");
+        let mut ids = reg.display_ids();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 99]);
+    }
+
+    #[test]
+    fn display_session_agent_visible_defaults_true() {
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
+        let session = DisplaySession::new(1, backend);
+        assert!(
+            session.agent_visible(),
+            "sessions default to agent-visible (legacy grant semantics)"
+        );
+        session.set_agent_visible(false);
+        assert!(!session.agent_visible());
     }
 
     #[test]
@@ -4915,5 +5217,340 @@ mod tests {
             2,
             "gate must check authorization on every event, not at construction time"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Capture teardown-contract stress (Wave 1C)
+    //
+    // Hammers the `DisplayBackend` start/stop lifecycle contract on a
+    // synthetic backend with a real producer thread, in the two conformance
+    // styles the real backends use:
+    //
+    //  - `TeardownStyle::JoinOnStop` — the x11/wayland/windows shape:
+    //    `stop_capture` joins the producer thread, so channel-close is
+    //    implied by the join.
+    //  - `TeardownStyle::DetachedCallbacks` — the macOS ScreenCaptureKit
+    //    shape: the producer cannot be joined (it models an OS callback
+    //    queue), so `stop_capture` gates a per-session shutdown flag and
+    //    empties a shared sender slot, and the producer deliberately lingers
+    //    afterward firing "late callbacks" — proving they are harmless
+    //    no-ops and that the channel still closed within bounded time.
+    //
+    // The real-OS counterparts live as `#[ignore]`d tests in the per-backend
+    // modules, driven by `crate::capture_stress::run_real_backend_stress`.
+    // -----------------------------------------------------------------------
+
+    mod capture_teardown_contract {
+        use super::*;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum TeardownStyle {
+            JoinOnStop,
+            DetachedCallbacks,
+        }
+
+        /// How long a detached producer keeps firing late callbacks after it
+        /// observes shutdown (models SCK's post-stop delivery window,
+        /// compressed to test scale).
+        const DETACHED_LINGER: Duration = Duration::from_millis(120);
+        /// Contract bound the tests hold `stop_capture` to: the receiver
+        /// must see `None` within this window after stop returns. Generous
+        /// versus the ~2ms producer interval to stay robust on loaded CI.
+        const CLOSE_BOUND: Duration = Duration::from_secs(2);
+
+        struct SyntheticCaptureState {
+            shutdown: Arc<AtomicBool>,
+            frame_tx: Arc<StdMutex<Option<mpsc::Sender<Frame>>>>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        /// Test-only `DisplayBackend` whose producer is a real OS thread, so
+        /// the stress exercises genuine cross-thread teardown rather than a
+        /// pre-closed stub channel (`StubBackend`).
+        struct SyntheticCaptureBackend {
+            style: TeardownStyle,
+            capture: Mutex<Option<SyntheticCaptureState>>,
+            /// Producer threads currently alive. Join-style stops must leave
+            /// this at 0 synchronously; detached-style producers may outlive
+            /// stop by `DETACHED_LINGER`.
+            live_producers: Arc<AtomicUsize>,
+            starts: AtomicUsize,
+        }
+
+        impl SyntheticCaptureBackend {
+            fn new(style: TeardownStyle) -> Self {
+                Self {
+                    style,
+                    capture: Mutex::new(None),
+                    live_producers: Arc::new(AtomicUsize::new(0)),
+                    starts: AtomicUsize::new(0),
+                }
+            }
+
+            fn test_frame() -> Frame {
+                Frame {
+                    data: vec![0u8; 16 * 16 * 4],
+                    format: FrameFormat::Bgra,
+                    width: 16,
+                    height: 16,
+                    stride: 16 * 4,
+                    timestamp: Instant::now(),
+                    dirty_rects: None,
+                }
+            }
+        }
+
+        #[async_trait]
+        impl DisplayBackend for SyntheticCaptureBackend {
+            async fn start_capture(
+                &self,
+                _fps: u32,
+            ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+                // Contract: implicit teardown of any session still running.
+                self.stop_capture().await;
+
+                self.starts.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::channel::<Frame>(4);
+                let frame_tx = Arc::new(StdMutex::new(Some(tx)));
+                let shutdown = Arc::new(AtomicBool::new(false));
+
+                let producer_slot = Arc::clone(&frame_tx);
+                let producer_shutdown = Arc::clone(&shutdown);
+                let live = Arc::clone(&self.live_producers);
+                let style = self.style;
+                live.fetch_add(1, Ordering::SeqCst);
+                let thread = std::thread::spawn(move || {
+                    loop {
+                        if producer_shutdown.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if let Some(tx) = producer_slot
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                        {
+                            let _ = tx.try_send(Self::test_frame());
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    if style == TeardownStyle::DetachedCallbacks {
+                        // Late-callback phase: nobody joins us; keep firing
+                        // against the (already emptied) slot and the flag,
+                        // like SCK delivering frames after stop. Every
+                        // attempt must be a harmless no-op.
+                        let deadline = Instant::now() + DETACHED_LINGER;
+                        while Instant::now() < deadline {
+                            if let Some(tx) = producer_slot
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .as_ref()
+                            {
+                                let _ = tx.try_send(Self::test_frame());
+                            }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    }
+                    live.fetch_sub(1, Ordering::SeqCst);
+                });
+
+                *self.capture.lock().await = Some(SyntheticCaptureState {
+                    shutdown,
+                    frame_tx,
+                    thread: Some(thread),
+                });
+                Ok(rx)
+            }
+
+            async fn stop_capture(&self) {
+                let Some(mut state) = self.capture.lock().await.take() else {
+                    return;
+                };
+                state.shutdown.store(true, Ordering::SeqCst);
+                match self.style {
+                    TeardownStyle::JoinOnStop => {
+                        // x11/wayland/windows shape: join implies close.
+                        if let Some(thread) = state.thread.take() {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let _ = thread.join();
+                            })
+                            .await;
+                        }
+                    }
+                    TeardownStyle::DetachedCallbacks => {
+                        // macOS shape: no join possible; close the channel by
+                        // emptying the slot, leave the producer to its late
+                        // callbacks.
+                        state
+                            .frame_tx
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take();
+                        drop(state.thread.take());
+                    }
+                }
+            }
+
+            async fn inject_input(&self, _event: InputEvent) -> Result<(), CallerError> {
+                Ok(())
+            }
+            fn resolution(&self) -> (u32, u32) {
+                (16, 16)
+            }
+            fn kind(&self) -> &'static str {
+                "synthetic-stress"
+            }
+        }
+
+        /// Receive until the first frame arrives, failing on close/timeout.
+        async fn expect_frame(rx: &mut mpsc::Receiver<Frame>, ctx: &str) {
+            match tokio::time::timeout(CLOSE_BOUND, rx.recv()).await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("{ctx}: channel closed before delivering a frame"),
+                Err(_) => panic!("{ctx}: no frame within {CLOSE_BOUND:?}"),
+            }
+        }
+
+        /// Drain buffered frames until the channel closes, bounded.
+        async fn expect_close(rx: &mut mpsc::Receiver<Frame>, ctx: &str) {
+            let deadline = tokio::time::Instant::now() + CLOSE_BOUND;
+            loop {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(_buffered)) => continue,
+                    Ok(None) => return,
+                    Err(_) => panic!(
+                        "{ctx}: channel still open {CLOSE_BOUND:?} after stop_capture returned"
+                    ),
+                }
+            }
+        }
+
+        /// Wait (bounded) for every producer thread to wind down.
+        async fn expect_no_live_producers(backend: &SyntheticCaptureBackend, ctx: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while backend.live_producers.load(Ordering::SeqCst) != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "{ctx}: producer threads still alive 5s after teardown"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn join_style_start_stop_cycles_close_channel_and_leak_no_threads() {
+            let backend = SyntheticCaptureBackend::new(TeardownStyle::JoinOnStop);
+            for cycle in 0..50 {
+                let mut rx = backend.start_capture(60).await.expect("start");
+                expect_frame(&mut rx, &format!("join cycle {cycle}")).await;
+                backend.stop_capture().await;
+                // Join-on-stop makes both guarantees synchronous.
+                assert_eq!(
+                    backend.live_producers.load(Ordering::SeqCst),
+                    0,
+                    "join cycle {cycle}: stop_capture returned with the producer alive"
+                );
+                expect_close(&mut rx, &format!("join cycle {cycle}")).await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn detached_style_channel_closes_promptly_despite_late_callbacks() {
+            let backend = SyntheticCaptureBackend::new(TeardownStyle::DetachedCallbacks);
+            for cycle in 0..25 {
+                let mut rx = backend.start_capture(60).await.expect("start");
+                expect_frame(&mut rx, &format!("detached cycle {cycle}")).await;
+                backend.stop_capture().await;
+                // The channel must close within the bound even though the
+                // producer is still alive firing late callbacks — the whole
+                // point of the sender-slot pattern.
+                expect_close(&mut rx, &format!("detached cycle {cycle}")).await;
+                // Immediately start the next cycle: fresh sessions must be
+                // undisturbed by the previous session's lingering producer.
+            }
+            backend.stop_capture().await;
+            expect_no_live_producers(&backend, "detached stress").await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn rapid_unconsumed_cycles_never_wedge() {
+            // Never read a single frame: producers run against a full
+            // channel (try_send drop path) while start/stop churns.
+            for style in [TeardownStyle::JoinOnStop, TeardownStyle::DetachedCallbacks] {
+                let backend = SyntheticCaptureBackend::new(style);
+                let mut receivers = Vec::new();
+                for _ in 0..40 {
+                    receivers.push(backend.start_capture(60).await.expect("start"));
+                }
+                backend.stop_capture().await;
+                // Every superseded session's channel must have closed too
+                // (implicit teardown on start-over-running).
+                for (i, rx) in receivers.iter_mut().enumerate() {
+                    expect_close(rx, &format!("rapid session {i}")).await;
+                }
+                expect_no_live_producers(&backend, "rapid churn").await;
+                assert_eq!(backend.starts.load(Ordering::SeqCst), 40);
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn double_stop_and_stop_without_start_are_noops() {
+            for style in [TeardownStyle::JoinOnStop, TeardownStyle::DetachedCallbacks] {
+                let backend = SyntheticCaptureBackend::new(style);
+                // Stop-without-start: nothing to do, returns promptly.
+                backend.stop_capture().await;
+                backend.stop_capture().await;
+
+                let mut rx = backend.start_capture(60).await.expect("start");
+                expect_frame(&mut rx, "noop test").await;
+                backend.stop_capture().await;
+                expect_close(&mut rx, "noop test").await;
+                // Double-stop after a real stop: still a no-op.
+                backend.stop_capture().await;
+
+                // Contract clause 4: start after (multiple) stops yields a
+                // fresh working session.
+                let mut rx2 = backend.start_capture(60).await.expect("restart");
+                expect_frame(&mut rx2, "restart after double-stop").await;
+                backend.stop_capture().await;
+                expect_close(&mut rx2, "restart after double-stop").await;
+                expect_no_live_producers(&backend, "noop test").await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn start_over_running_capture_supersedes_previous_session() {
+            for style in [TeardownStyle::JoinOnStop, TeardownStyle::DetachedCallbacks] {
+                let backend = SyntheticCaptureBackend::new(style);
+                let mut rx1 = backend.start_capture(60).await.expect("first start");
+                expect_frame(&mut rx1, "first session").await;
+
+                let mut rx2 = backend.start_capture(60).await.expect("second start");
+                // The superseded session's channel closes...
+                expect_close(&mut rx1, "superseded session").await;
+                // ...while the new session flows frames.
+                expect_frame(&mut rx2, "successor session").await;
+
+                backend.stop_capture().await;
+                expect_close(&mut rx2, "successor session").await;
+                expect_no_live_producers(&backend, "supersede test").await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stop_returns_even_when_receiver_was_dropped_first() {
+            for style in [TeardownStyle::JoinOnStop, TeardownStyle::DetachedCallbacks] {
+                let backend = SyntheticCaptureBackend::new(style);
+                let rx = backend.start_capture(60).await.expect("start");
+                drop(rx);
+                // Producer now try_sends into a closed channel; stop must
+                // still tear down cleanly within the bound.
+                tokio::time::timeout(CLOSE_BOUND, backend.stop_capture())
+                    .await
+                    .expect("stop_capture wedged after receiver drop");
+                expect_no_live_producers(&backend, "receiver-drop test").await;
+            }
+        }
     }
 }

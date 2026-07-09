@@ -892,8 +892,13 @@ async fn start_display_auto(
         return Err("ffmpeg not installed".to_string());
     }
 
+    // `get_any`: reaching this function is already an authorized recording
+    // decision (the auto path skips private views before calling; the
+    // manual path is an explicit user command), and the frame-fed branch
+    // must find a private view's session or it would fall through to the
+    // legacy x11grab path and record the same pixels anyway.
     let display_session = match session_registry {
-        Some(sr) => sr.read().await.get(display_id),
+        Some(sr) => sr.read().await.get_any(display_id),
         None => None,
     };
 
@@ -936,10 +941,22 @@ pub fn spawn_recording_listener(
                     display_id,
                     width,
                     height,
-                    ..
+                    agent_visible,
                 }) => {
                     // Auto-recording is opt-in; if disabled in config, skip.
                     if !registry.read().await.is_enabled() {
+                        continue;
+                    }
+                    // Never auto-record a private user view: its frames
+                    // would land on disk in the session log dir, which
+                    // agents routinely read. An explicit user-initiated
+                    // StartRecording (the arm below) still works — that is
+                    // the user's own recording decision.
+                    if !agent_visible {
+                        eprintln!(
+                            "[recording] display {display_id} is a private user view; \
+                             skipping auto-record"
+                        );
                         continue;
                     }
                     match start_display_auto(

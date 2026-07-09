@@ -702,19 +702,7 @@ pub(crate) async fn api_session_current_upload_raw_task_response(
             };
         }
     };
-    let Some(root) = runtime.project_root.clone() else {
-        return ControlTaskResponse {
-            id: id.clone(),
-            frame: http_body_response(
-                id,
-                404,
-                serde_json::json!({ "ok": false, "error": "no project root" }).to_string(),
-                "upload raw",
-            ),
-            byte_stream: None,
-            done: true,
-        };
-    };
+    let scope = crate::global_store::StoreScope::resolve(runtime.project_root.as_deref());
     let session_log = {
         let session = runtime.shared_session.read().await;
         session.session_log.clone()
@@ -724,7 +712,7 @@ pub(crate) async fn api_session_current_upload_raw_task_response(
             .lock()
             .map(|log| log.dir().to_path_buf())
             .map_err(|_| "session log lock poisoned".to_string()),
-        None => Ok(crate::web_gateway::pending_upload_session_dir(&root)),
+        None => Ok(crate::web_gateway::pending_upload_session_dir(&scope)),
     };
     let session_dir = match session_dir_result {
         Ok(session_dir) => session_dir,
@@ -744,7 +732,7 @@ pub(crate) async fn api_session_current_upload_raw_task_response(
     };
     let upload_id_for_stream = upload_id.clone();
     let read_result = tokio::task::spawn_blocking(move || {
-        let Some(descriptor) = crate::upload_store::find_upload(&upload_id, &session_dir, &root)
+        let Some(descriptor) = crate::upload_store::find_upload(&upload_id, &session_dir, &scope)
         else {
             return Err((
                 404,
@@ -887,18 +875,11 @@ pub(crate) async fn api_session_current_uploads_response(
             );
         }
     };
-    let Some(root) = project_root else {
-        return http_body_response(
-            id,
-            404,
-            serde_json::json!({ "error": "no project root" }).to_string(),
-            "current uploads",
-        );
-    };
+    let scope = crate::global_store::StoreScope::resolve(project_root.as_deref());
     let session_dir =
-        session_dir.unwrap_or_else(|| crate::web_gateway::pending_upload_session_dir(&root));
+        session_dir.unwrap_or_else(|| crate::web_gateway::pending_upload_session_dir(&scope));
     let result = tokio::task::spawn_blocking(move || {
-        serde_json::to_string(&crate::upload_store::list_uploads(&session_dir, &root))
+        serde_json::to_string(&crate::upload_store::list_uploads(&session_dir, &scope))
             .unwrap_or_else(|_| "[]".to_string())
     })
     .await;
@@ -1253,7 +1234,7 @@ pub(crate) async fn api_sessions_search_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dashboard_control::tests::{runtime};
+    use crate::dashboard_control::tests::runtime;
 
     #[tokio::test]
     async fn session_report_rpc_returns_zip_for_active_log() {
@@ -1370,6 +1351,8 @@ mod tests {
 
     #[tokio::test]
     async fn current_upload_delete_preserves_http_status() {
+        // Projectless daemons resolve the daemon-global store instead of
+        // refusing; deleting an id that is not there stays idempotent-ok.
         let rt_no_root = runtime();
         let no_root = api_session_current_upload_delete_response(
             "upl1".to_string(),
@@ -1379,9 +1362,8 @@ mod tests {
         .await;
         assert_eq!(no_root["t"], "response");
         assert_eq!(no_root["ok"], true);
-        assert_eq!(no_root["result"]["error"], "no project root");
-        assert_eq!(no_root["result"]["_httpStatus"], 404);
-        assert_eq!(no_root["result"]["_httpOk"], false);
+        assert_eq!(no_root["result"]["_httpStatus"], 200);
+        assert_eq!(no_root["result"]["_httpOk"], true);
 
         let dir = tempfile::tempdir().unwrap();
         let rt = runtime();
@@ -1514,6 +1496,69 @@ mod tests {
             invalid.frame["result"]["error"],
             "range start beyond upload size"
         );
+    }
+
+    /// Route-level proof for projectless daemons (task "Wave 1F"): with no
+    /// project root anywhere, a staged upload POST commits into the
+    /// daemon-global store and the raw read streams the same bytes back.
+    /// Fixture writes go through the process state root (the live
+    /// `~/.intendant` in bin unit tests — same convention as the
+    /// session-frame transfer test), so the session id is unique per run
+    /// and the store dir is removed afterwards.
+    #[tokio::test]
+    async fn projectless_staged_upload_posts_and_reads_raw_from_global_store() {
+        let mut rt = runtime();
+        assert!(rt.project_root.is_none());
+        rt.session_id = format!(
+            "projectless-upload-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let session_store_dir = crate::global_store::global_store_root()
+            .join("uploads")
+            .join(&rt.session_id);
+
+        let bytes = b"projectless staged upload bytes";
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), bytes).unwrap();
+
+        // POST: commit with no project root resolves the global store.
+        let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            None,
+            None,
+            Some(rt.session_id.as_str()),
+            "projectless.txt",
+            "text/plain",
+            crate::upload_store::UploadDestination::Task,
+            tmp,
+            bytes.len(),
+            &rt.bus,
+        );
+        assert_eq!(status, "200 OK");
+        let descriptor: crate::upload_store::UploadDescriptor =
+            serde_json::from_str(&body).unwrap();
+        assert!(
+            descriptor.path.starts_with(&session_store_dir),
+            "projectless upload must land in the global store, got {}",
+            descriptor.path.display()
+        );
+
+        // Raw GET: the projectless runtime resolves the same store.
+        let response = api_session_current_upload_raw_task_response(
+            "projectless-raw".to_string(),
+            Some(&serde_json::json!({ "id": descriptor.id })),
+            &rt,
+        )
+        .await;
+        let cleanup = std::fs::remove_dir_all(&session_store_dir);
+        assert!(response.done);
+        let stream = response.byte_stream.expect("raw read must stream bytes");
+        assert_eq!(stream.bytes, bytes);
+        assert_eq!(stream.result["ok"], true);
+        assert_eq!(stream.result["id"], descriptor.id);
+        cleanup.expect("global-store session dir cleanup");
     }
 
     #[tokio::test]

@@ -1633,6 +1633,24 @@
   right: 12px;
   top: 34px;
 }
+/* sc-split cards lay the actions out as a real second column instead of
+   floating them over the content — the absolute cluster used to overlap
+   the badge chips and clip its last button on short/dense cards. */
+.session-card.sc-split {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+.session-card.sc-split .sc-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.session-card.sc-split .sc-actions {
+  position: static;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
 /* Card action buttons are compact ui-btn variants; ui-btn (+.danger)
    carries look and hover states. At rest they go quiet (ghost) so the
    list reads as content instead of a wall of buttons; engaging the card
@@ -2671,6 +2689,14 @@
 .control-toast.error { border-left-color: var(--red); }
 .control-toast.success { border-left-color: var(--green); }
 .control-toast.info { border-left-color: var(--blue); }
+/* The base gradient is a literal dark glass; under the ui-v2 light theme
+   --text flips to dark ink, which rendered toasts dark-on-dark ("Load
+   failed" unreadable). Light mode gets a light raised surface instead. */
+html.ui-v2[data-theme="light"] .control-toast {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.97), rgba(241, 243, 249, 0.97));
+  border-color: var(--line-2);
+  box-shadow: 0 10px 28px rgba(18, 23, 42, 0.18);
+}
 .control-toast.global-command-toast {
   position: fixed;
   bottom: 16px;

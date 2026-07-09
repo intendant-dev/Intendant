@@ -177,6 +177,12 @@ pub struct UserQuestion {
     pub multi_select: bool,
 }
 
+/// Serde default for fields whose wire absence means `true` (lines
+/// written before the field existed keep their historical meaning).
+fn default_true() -> bool {
+    true
+}
+
 /// Events sent to connected control socket clients, web gateway, and MCP.
 ///
 /// Also deserialized by `crate::peer::upcast::OutboundEventUpcaster`
@@ -290,6 +296,12 @@ pub enum OutboundEvent {
         display_id: u32,
         width: u32,
         height: u32,
+        /// `false` marks a private user view ("View this machine"):
+        /// dashboards render the tile with a "private view" chip; peer
+        /// upcasters skip it. Absent on wires older than the split —
+        /// those daemons never hid displays, so default `true`.
+        #[serde(default = "default_true")]
+        agent_visible: bool,
     },
     DisplayResize {
         display_id: u32,
@@ -304,7 +316,18 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
-    UserDisplayGranted,
+    UserDisplayGranted {
+        /// Which display the grant/view targets. Absent on wires older
+        /// than the private-view split (the variant used to be fieldless);
+        /// 0 = primary, matching the historical single-display meaning.
+        #[serde(default)]
+        display_id: u32,
+        /// `false` = private user view (dashboard-only); `true` = shared
+        /// with the agent for computer use. Absent-means-true keeps old
+        /// wire lines meaning what they always meant.
+        #[serde(default = "default_true")]
+        agent_visible: bool,
+    },
     UserDisplayRevoked {
         display_id: u32,
         #[serde(skip_serializing_if = "Option::is_none")]

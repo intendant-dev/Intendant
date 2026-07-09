@@ -5,13 +5,12 @@
 
 use super::*;
 
-pub(crate) fn transfer_project_root(runtime: &ControlRuntime) -> Result<PathBuf, serde_json::Value> {
-    runtime.project_root.clone().ok_or_else(|| {
-        serde_json::json!({
-            "ok": false,
-            "error": "project root unavailable",
-        })
-    })
+/// Resolve where transfer jobs persist for this daemon: the project store
+/// when a project root exists, the daemon-global fallback store otherwise
+/// (see `global_store.rs`). Infallible — projectless daemons are served,
+/// not refused.
+pub(crate) fn transfer_store_scope(runtime: &ControlRuntime) -> crate::global_store::StoreScope {
+    crate::global_store::StoreScope::resolve(runtime.project_root.as_deref())
 }
 
 pub(crate) fn transfer_http_error_response(
@@ -73,7 +72,7 @@ pub(crate) fn transfer_artifact_type(artifact: &serde_json::Value) -> String {
 }
 
 pub(crate) async fn transfer_create_download_job_from_params(
-    project_root: PathBuf,
+    scope: crate::global_store::StoreScope,
     params: serde_json::Value,
     runtime: &ControlRuntime,
 ) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
@@ -82,7 +81,7 @@ pub(crate) async fn transfer_create_download_job_from_params(
         .filter(|value| value.is_object())
         .cloned()
     {
-        return transfer_create_artifact_download_job(project_root, artifact, runtime).await;
+        return transfer_create_artifact_download_job(scope, artifact, runtime).await;
     }
     let path = string_param(&params, &["path", "source_path", "sourcePath", "source"]);
     if path.is_empty() {
@@ -91,15 +90,13 @@ pub(crate) async fn transfer_create_download_job_from_params(
             "missing path",
         ));
     }
-    tokio::task::spawn_blocking(move || {
-        crate::transfer_store::create_download_job(&project_root, &path)
-    })
-    .await
-    .map_err(|e| transfer_store_task_error(e, "transfer create"))?
+    tokio::task::spawn_blocking(move || crate::transfer_store::create_download_job(&scope, &path))
+        .await
+        .map_err(|e| transfer_store_task_error(e, "transfer create"))?
 }
 
 pub(crate) async fn transfer_create_upload_job_from_params(
-    project_root: PathBuf,
+    scope: crate::global_store::StoreScope,
     params: serde_json::Value,
 ) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
     let destination = string_param(
@@ -158,7 +155,7 @@ pub(crate) async fn transfer_create_upload_job_from_params(
             })?;
     tokio::task::spawn_blocking(move || {
         crate::transfer_store::create_upload_job(
-            &project_root,
+            &scope,
             &destination,
             &original_name,
             &mime,
@@ -171,27 +168,25 @@ pub(crate) async fn transfer_create_upload_job_from_params(
 }
 
 pub(crate) async fn transfer_create_artifact_download_job(
-    project_root: PathBuf,
+    scope: crate::global_store::StoreScope,
     artifact: serde_json::Value,
     runtime: &ControlRuntime,
 ) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
     match transfer_artifact_type(&artifact).as_str() {
         "session_report" | "session-report" => {
-            transfer_create_session_report_download_job(project_root, artifact, runtime).await
+            transfer_create_session_report_download_job(scope, artifact, runtime).await
         }
         "staged_upload" | "staged-upload" | "upload" => {
-            transfer_create_staged_upload_download_job(project_root, artifact, runtime).await
+            transfer_create_staged_upload_download_job(scope, artifact, runtime).await
         }
         "recording_asset" | "recording-asset" => {
-            transfer_create_recording_asset_download_job(project_root, artifact, runtime, false)
-                .await
+            transfer_create_recording_asset_download_job(scope, artifact, runtime, false).await
         }
         "session_recording_asset" | "session-recording-asset" => {
-            transfer_create_recording_asset_download_job(project_root, artifact, runtime, true)
-                .await
+            transfer_create_recording_asset_download_job(scope, artifact, runtime, true).await
         }
         "session_frame_asset" | "session-frame-asset" | "frame_asset" | "frame-asset" => {
-            transfer_create_session_frame_download_job(project_root, artifact).await
+            transfer_create_session_frame_download_job(scope, artifact).await
         }
         "" => Err(crate::transfer_store::TransferStoreError::new(
             400,
@@ -205,7 +200,7 @@ pub(crate) async fn transfer_create_artifact_download_job(
 }
 
 pub(crate) async fn transfer_create_session_report_download_job(
-    project_root: PathBuf,
+    scope: crate::global_store::StoreScope,
     artifact: serde_json::Value,
     runtime: &ControlRuntime,
 ) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
@@ -243,7 +238,7 @@ pub(crate) async fn transfer_create_session_report_download_job(
     })?;
     tokio::task::spawn_blocking(move || {
         crate::transfer_store::create_download_job_from_bytes(
-            &project_root,
+            &scope,
             report.bytes,
             &report.filename,
             "application/zip",
@@ -257,7 +252,7 @@ pub(crate) async fn transfer_create_session_report_download_job(
 }
 
 pub(crate) async fn transfer_create_staged_upload_download_job(
-    project_root: PathBuf,
+    scope: crate::global_store::StoreScope,
     artifact: serde_json::Value,
     runtime: &ControlRuntime,
 ) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
@@ -271,16 +266,22 @@ pub(crate) async fn transfer_create_staged_upload_download_job(
     let (upload_root, session_dir) = active_upload_handles(runtime)
         .await
         .map_err(|error| crate::transfer_store::TransferStoreError::new(500, error))?;
-    let upload_root = upload_root.unwrap_or_else(|| project_root.clone());
-    let session_dir =
-        session_dir.unwrap_or_else(|| crate::web_gateway::pending_upload_session_dir(&upload_root));
+    // The staged upload may live under the active session's project store
+    // (when one is set) rather than the daemon's own; without either, both
+    // resolve to the daemon-global store.
+    let upload_scope = match upload_root {
+        Some(root) => crate::global_store::StoreScope::Project(root),
+        None => scope.clone(),
+    };
+    let session_dir = session_dir
+        .unwrap_or_else(|| crate::web_gateway::pending_upload_session_dir(&upload_scope));
     tokio::task::spawn_blocking(move || {
-        let descriptor = crate::upload_store::find_upload(&upload_id, &session_dir, &upload_root)
+        let descriptor = crate::upload_store::find_upload(&upload_id, &session_dir, &upload_scope)
             .ok_or_else(|| {
-            crate::transfer_store::TransferStoreError::new(404, "upload not found")
-        })?;
+                crate::transfer_store::TransferStoreError::new(404, "upload not found")
+            })?;
         crate::transfer_store::create_download_job_from_path(
-            &project_root,
+            &scope,
             descriptor.path.clone(),
             Some(descriptor.name.clone()),
             Some(descriptor.mime.clone()),
@@ -294,7 +295,7 @@ pub(crate) async fn transfer_create_staged_upload_download_job(
 }
 
 pub(crate) async fn transfer_create_recording_asset_download_job(
-    project_root: PathBuf,
+    scope: crate::global_store::StoreScope,
     artifact: serde_json::Value,
     runtime: &ControlRuntime,
     session_scoped: bool,
@@ -341,11 +342,11 @@ pub(crate) async fn transfer_create_recording_asset_download_job(
     .map_err(|(status, body)| {
         crate::transfer_store::TransferStoreError::new(status, transfer_json_error_message(&body))
     })?;
-    transfer_create_recording_asset_job(project_root, artifact, stream_name, asset, resolved).await
+    transfer_create_recording_asset_job(scope, artifact, stream_name, asset, resolved).await
 }
 
 pub(crate) async fn transfer_create_recording_asset_job(
-    project_root: PathBuf,
+    scope: crate::global_store::StoreScope,
     artifact: serde_json::Value,
     stream_name: String,
     asset: String,
@@ -358,7 +359,7 @@ pub(crate) async fn transfer_create_recording_asset_job(
             filename,
         } => tokio::task::spawn_blocking(move || {
             crate::transfer_store::create_download_job_from_bytes(
-                &project_root,
+                &scope,
                 bytes,
                 &filename,
                 content_type,
@@ -375,7 +376,7 @@ pub(crate) async fn transfer_create_recording_asset_job(
             filename,
         } => tokio::task::spawn_blocking(move || {
             crate::transfer_store::create_download_job_from_path(
-                &project_root,
+                &scope,
                 path,
                 Some(filename),
                 Some(content_type.to_string()),
@@ -390,7 +391,7 @@ pub(crate) async fn transfer_create_recording_asset_job(
 }
 
 pub(crate) async fn transfer_create_session_frame_download_job(
-    project_root: PathBuf,
+    scope: crate::global_store::StoreScope,
     artifact: serde_json::Value,
 ) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
     let session_id = string_param(&artifact, &["session_id", "sessionId", "id"]);
@@ -426,7 +427,7 @@ pub(crate) async fn transfer_create_session_frame_download_job(
     };
     tokio::task::spawn_blocking(move || {
         crate::transfer_store::create_download_job_from_path(
-            &project_root,
+            &scope,
             path,
             Some(filename.clone()),
             Some(content_type.to_string()),
@@ -439,13 +440,13 @@ pub(crate) async fn transfer_create_session_frame_download_job(
     .map_err(|e| transfer_store_task_error(e, "session frame transfer"))?
 }
 
-pub(crate) async fn api_transfer_jobs_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
-    let project_root = match transfer_project_root(runtime) {
-        Ok(project_root) => project_root,
-        Err(body) => return http_body_response(id, 404, body.to_string(), "transfer jobs"),
-    };
+pub(crate) async fn api_transfer_jobs_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let scope = transfer_store_scope(runtime);
     let result =
-        tokio::task::spawn_blocking(move || crate::transfer_store::list_jobs(&project_root)).await;
+        tokio::task::spawn_blocking(move || crate::transfer_store::list_jobs(&scope)).await;
     let jobs = match result {
         Ok(jobs) => jobs,
         Err(e) => {
@@ -474,10 +475,7 @@ pub(crate) async fn api_transfer_job_create_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    let project_root = match transfer_project_root(runtime) {
-        Ok(project_root) => project_root,
-        Err(body) => return http_body_response(id, 404, body.to_string(), "transfer create"),
-    };
+    let scope = transfer_store_scope(runtime);
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let kind = string_param(&params, &["kind", "type"]);
     let kind = match crate::transfer_store::TransferKind::from_str(&kind.to_ascii_lowercase()) {
@@ -493,10 +491,10 @@ pub(crate) async fn api_transfer_job_create_response(
     };
     let result = match kind {
         crate::transfer_store::TransferKind::Download => {
-            transfer_create_download_job_from_params(project_root, params, runtime).await
+            transfer_create_download_job_from_params(scope, params, runtime).await
         }
         crate::transfer_store::TransferKind::Upload => {
-            transfer_create_upload_job_from_params(project_root, params).await
+            transfer_create_upload_job_from_params(scope, params).await
         }
     };
     match result {
@@ -519,19 +517,15 @@ pub(crate) async fn api_transfer_job_delete_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    let project_root = match transfer_project_root(runtime) {
-        Ok(project_root) => project_root,
-        Err(body) => return http_body_response(id, 404, body.to_string(), "transfer delete"),
-    };
+    let scope = transfer_store_scope(runtime);
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let job_id = transfer_id_param(&params);
     if job_id.is_empty() {
         return transfer_http_error_response(id, 400, "missing id", "transfer delete");
     }
-    let result = tokio::task::spawn_blocking(move || {
-        crate::transfer_store::delete_job(&project_root, &job_id)
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || crate::transfer_store::delete_job(&scope, &job_id))
+            .await;
     match result {
         Ok(Ok(deleted)) => http_body_response(
             id,
@@ -558,19 +552,14 @@ pub(crate) async fn api_transfer_upload_commit_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    let project_root = match transfer_project_root(runtime) {
-        Ok(project_root) => project_root,
-        Err(body) => {
-            return http_body_response(id, 404, body.to_string(), "transfer upload commit")
-        }
-    };
+    let scope = transfer_store_scope(runtime);
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let job_id = transfer_id_param(&params);
     if job_id.is_empty() {
         return transfer_http_error_response(id, 400, "missing id", "transfer upload commit");
     }
     let result = tokio::task::spawn_blocking(move || {
-        crate::transfer_store::commit_upload_job(&project_root, &job_id)
+        crate::transfer_store::commit_upload_job(&scope, &job_id)
     })
     .await;
     match result {
@@ -599,17 +588,7 @@ pub(crate) async fn api_transfer_upload_chunk_task_response(
     upload: InboundUploadState,
     runtime: ControlRuntime,
 ) -> ControlTaskResponse {
-    let project_root = match transfer_project_root(&runtime) {
-        Ok(project_root) => project_root,
-        Err(body) => {
-            return ControlTaskResponse {
-                id: id.clone(),
-                frame: http_body_response(id, 404, body.to_string(), "transfer upload chunk"),
-                byte_stream: None,
-                done: true,
-            };
-        }
-    };
+    let scope = transfer_store_scope(&runtime);
     let job_id = transfer_id_param(&upload.params);
     if job_id.is_empty() {
         return ControlTaskResponse {
@@ -633,11 +612,7 @@ pub(crate) async fn api_transfer_upload_chunk_task_response(
     let chunk_len = upload.received_bytes as u64;
     let result = tokio::task::spawn_blocking(move || {
         crate::transfer_store::append_upload_tempfile(
-            &project_root,
-            &job_id,
-            offset,
-            upload.tmp,
-            chunk_len,
+            &scope, &job_id, offset, upload.tmp, chunk_len,
         )
     })
     .await;
@@ -673,17 +648,7 @@ pub(crate) async fn api_transfer_download_read_task_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> ControlTaskResponse {
-    let project_root = match transfer_project_root(runtime) {
-        Ok(project_root) => project_root,
-        Err(body) => {
-            return ControlTaskResponse {
-                id: id.clone(),
-                frame: http_body_response(id, 404, body.to_string(), "transfer download"),
-                byte_stream: None,
-                done: true,
-            };
-        }
-    };
+    let scope = transfer_store_scope(runtime);
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let job_id = transfer_id_param(&params);
     if job_id.is_empty() {
@@ -699,7 +664,7 @@ pub(crate) async fn api_transfer_download_read_task_response(
     };
     let result = tokio::task::spawn_blocking(move || {
         crate::transfer_store::read_download_range(
-            &project_root,
+            &scope,
             &job_id,
             offset,
             length,
