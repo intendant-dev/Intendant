@@ -954,6 +954,27 @@ fn has_ask_human_command(json_str: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// True when the batch consists ENTIRELY of askHuman commands — the shape
+/// models actually emit for a blocking question. The question-rail
+/// interception only fires for this shape; a mixed batch would need the
+/// controller to reorder execution around the runtime.
+fn batch_is_all_ask_human(json_str: &str) -> bool {
+    let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    parsed
+        .get("commands")
+        .and_then(|v| v.as_array())
+        .map(|commands| {
+            !commands.is_empty()
+                && commands.iter().all(|cmd| {
+                    cmd.get("function").and_then(|v| v.as_str()) == Some("askHuman")
+                })
+        })
+        .unwrap_or(false)
+}
+
 /// Extract the question text from an askHuman command in a batch JSON string.
 fn extract_ask_human_question(json_str: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
@@ -2239,6 +2260,20 @@ Also: {"source": "bare"}"#;
     #[test]
     fn has_ask_human_command_invalid_json() {
         assert!(!has_ask_human_command("not json"));
+    }
+
+    #[test]
+    fn batch_is_all_ask_human_pure_batch() {
+        let json = r#"{"commands":[{"function":"askHuman","question":"a?","nonce":1},{"function":"askHuman","question":"b?","nonce":2}]}"#;
+        assert!(batch_is_all_ask_human(json));
+    }
+
+    #[test]
+    fn batch_is_all_ask_human_rejects_mixed_empty_and_invalid() {
+        let mixed = r#"{"commands":[{"function":"execAsAgent","nonce":1},{"function":"askHuman","nonce":2}]}"#;
+        assert!(!batch_is_all_ask_human(mixed));
+        assert!(!batch_is_all_ask_human(r#"{"commands":[]}"#));
+        assert!(!batch_is_all_ask_human("not json"));
     }
 
     #[test]

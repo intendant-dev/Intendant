@@ -1626,6 +1626,65 @@ pub(crate) async fn run_agent_loop(
                     bus.send(AppEvent::HumanQuestionDetected { question });
                 }
             }
+            // askHuman with a dashboard attached: a question is a request for
+            // *input*, not permission — route it through the same question
+            // rail external backends use (UserQuestionRequired → answered via
+            // AnswerQuestion into this session's approval registry) instead
+            // of dispatching to the runtime, which would park on the
+            // human_question file no frontend watches under the daemon.
+            // Scope: batches that are entirely askHuman (the shape models
+            // emit — a blocking question stands alone); a mixed batch keeps
+            // the legacy path and logs why.
+            if !headless && json_approval.is_none() && has_ask_human_command(&json_str) {
+                if batch_is_all_ask_human(&json_str) {
+                    let question = extract_ask_human_question(&json_str)
+                        .unwrap_or_else(|| "The agent asked for your input.".to_string());
+                    slog(&session_log, |l| l.human_question(&question));
+                    let question_id = turn as u64;
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    approval_registry.lock().unwrap().insert(question_id, tx);
+                    bus.send(AppEvent::UserQuestionRequired {
+                        session_id: local_session_id.clone(),
+                        id: question_id,
+                        questions: vec![crate::types::UserQuestion {
+                            question: question.clone(),
+                            header: String::new(),
+                            options: Vec::new(),
+                            multi_select: false,
+                        }],
+                    });
+                    let answer = match rx.await {
+                        Ok(event::ApprovalResponse::Answer { answers }) => answers
+                            .get(&question)
+                            .cloned()
+                            .or_else(|| answers.values().next().cloned())
+                            .unwrap_or_default(),
+                        Ok(_) | Err(_) => String::new(),
+                    };
+                    let reply = if answer.trim().is_empty() {
+                        "The user dismissed the question without answering. Proceed with \
+                         your best judgment; you can re-ask later if it is still relevant."
+                            .to_string()
+                    } else {
+                        slog(&session_log, |l| l.human_response_sent());
+                        answer
+                    };
+                    for (call_id, tool_name) in &batch.call_id_names {
+                        if handled_call_ids.contains(call_id) {
+                            continue;
+                        }
+                        conversation.add_tool_result(call_id, tool_name, &reply);
+                    }
+                    continue;
+                }
+                slog(&session_log, |l| {
+                    l.warn(
+                        "askHuman arrived mixed into a command batch; the runtime file \
+                         prompt handles it, which no dashboard surfaces — answer via MCP \
+                         or expect the model to re-ask",
+                    )
+                });
+            }
 
             // Autonomy / approval check (same as text path)
             let needs_approval = {
@@ -2080,6 +2139,47 @@ Proceed with explicit assumptions and continue without additional questions."
                 if let Some(question) = extract_ask_human_question(&json_str) {
                     bus.send(AppEvent::HumanQuestionDetected { question });
                 }
+            }
+            // askHuman with a dashboard attached → the question rail (see the
+            // JSON-batch twin above). The text loop mirrors its headless
+            // precedent: the batch is consumed by the question — the model
+            // re-issues any other commands after reading the answer.
+            if !headless && json_approval.is_none() && has_ask_human_command(&json_str) {
+                let question = extract_ask_human_question(&json_str)
+                    .unwrap_or_else(|| "The agent asked for your input.".to_string());
+                slog(&session_log, |l| l.human_question(&question));
+                let question_id = turn as u64;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                approval_registry.lock().unwrap().insert(question_id, tx);
+                bus.send(AppEvent::UserQuestionRequired {
+                    session_id: local_session_id.clone(),
+                    id: question_id,
+                    questions: vec![crate::types::UserQuestion {
+                        question: question.clone(),
+                        header: String::new(),
+                        options: Vec::new(),
+                        multi_select: false,
+                    }],
+                });
+                let answer = match rx.await {
+                    Ok(event::ApprovalResponse::Answer { answers }) => answers
+                        .get(&question)
+                        .cloned()
+                        .or_else(|| answers.values().next().cloned())
+                        .unwrap_or_default(),
+                    Ok(_) | Err(_) => String::new(),
+                };
+                if answer.trim().is_empty() {
+                    conversation.add_user(
+                        "The user dismissed the question without answering. Proceed with \
+                         your best judgment; you can re-ask later if it is still relevant."
+                            .to_string(),
+                    );
+                } else {
+                    slog(&session_log, |l| l.human_response_sent());
+                    conversation.add_user(format!("The user's answer to your question: {answer}"));
+                }
+                continue;
             }
 
             // Check autonomy / approval for commands
