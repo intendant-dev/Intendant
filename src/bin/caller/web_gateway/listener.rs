@@ -655,11 +655,19 @@ pub fn spawn_web_gateway(
                         }
                         if line.contains("\"event\":\"session_vitals\"")
                             || line.contains("\"event\":\"session_goal\"")
+                            || line.contains("\"event\":\"session_started\"")
                         {
                             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
                                 let kind = match parsed["event"].as_str() {
                                     Some("session_vitals") => Some("session_vitals"),
                                     Some("session_goal") => Some("session_goal"),
+                                    // A live session's birth announcement:
+                                    // replayed to late joiners so their
+                                    // Activity grid rebuilds windows for
+                                    // work that predates the connection
+                                    // (session_started routinely falls off
+                                    // the tail-limited log replay).
+                                    Some("session_started") => Some("session_started"),
                                     _ => None,
                                 };
                                 if let (Some(kind), Some(sid)) =
@@ -1346,17 +1354,38 @@ pub fn spawn_web_gateway(
                     }
 
                     // Re-send the latest change-detected per-session state
-                    // (session_vitals / session_goal). These fire on change
-                    // only, so without this a late joiner — a refreshed
-                    // browser on an idle daemon, or a peer transport
-                    // attaching — would never see state that last changed
-                    // before this connection existed.
+                    // (session_started / session_vitals / session_goal).
+                    // These fire on change only, so without this a late
+                    // joiner — a refreshed browser on an idle daemon, or a
+                    // peer transport attaching — would never see state that
+                    // last changed before this connection existed. Each
+                    // session's `session_started` goes FIRST (windows must
+                    // exist before state lands on them) and is stamped
+                    // `replayed: true` so the frontend rebuilds the window
+                    // without live-start side effects (thinking phase,
+                    // focus steal, current-task clobber).
                     let session_state_replay: Vec<String> = session_state_lines
                         .lock()
                         .map(|guard| {
                             guard
                                 .values()
-                                .flat_map(|kinds| kinds.values().cloned())
+                                .flat_map(|kinds| {
+                                    let started = kinds.get("session_started").map(|line| {
+                                        match serde_json::from_str::<serde_json::Value>(line) {
+                                            Ok(mut parsed) => {
+                                                parsed["replayed"] = serde_json::json!(true);
+                                                parsed.to_string()
+                                            }
+                                            Err(_) => line.clone(),
+                                        }
+                                    });
+                                    started.into_iter().chain(
+                                        kinds
+                                            .iter()
+                                            .filter(|(kind, _)| **kind != "session_started")
+                                            .map(|(_, line)| line.clone()),
+                                    )
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();

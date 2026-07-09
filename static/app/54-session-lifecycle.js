@@ -1,32 +1,43 @@
 // ── Session Lifecycle ──
-function onSessionStarted(sessionId, task) {
+function onSessionStarted(sessionId, task, opts = {}) {
   const sid = String(sessionId || '').trim();
   const hasTask = hasSessionLifecycleTask(task);
-  if (hasTask) {
+  // A replayed announcement (connect-time bootstrap for a session that
+  // started before this page existed) rebuilds the window but must not
+  // act like a live birth: no focus steal, no current-task clobber, no
+  // thinking phase, no changes-pane reset.
+  const replayed = !!opts.replayed;
+  if (hasTask && !replayed) {
     stationCurrentTask = compactSessionText(task);
     stationCurrentApproval = null;
   }
   stationScheduleUpdate();
-  const shouldFocusActivity = newSessionSpawnPending;
+  const shouldFocusActivity = !replayed && newSessionSpawnPending;
   const currentTarget = resolvePromptTargetSessionId();
-  finishNewSessionSpawnNotice(sid, task);
+  if (!replayed) finishNewSessionSpawnNotice(sid, task);
   const alias = externalBackendAliasForSession(sid);
   const visibleSessionId = alias?.backendSessionId || sid;
   if (visibleSessionId) {
     setSessionWindowDetached(visibleSessionId, false);
     const meta = {
-      phase: processingLogReplay || !hasTask ? 'idle' : 'thinking',
+      phase: replayed || processingLogReplay || !hasTask ? 'idle' : 'thinking',
       ended: false,
       ...(alias?.source ? { source: alias.source, backendSource: alias.source } : {}),
     };
     if (hasTask) meta.task = task;
     ensureSessionWindow(visibleSessionId, meta);
-    focusSessionWindowFromLifecycle(visibleSessionId, {
-      force: shouldFocusActivity,
-      currentTarget,
-    });
+    if (!replayed) {
+      focusSessionWindowFromLifecycle(visibleSessionId, {
+        force: shouldFocusActivity,
+        currentTarget,
+      });
+    }
   } else {
     updateTaskTargetChip();
+  }
+  if (replayed) {
+    refreshSessionWindowMetadata(250);
+    return;
   }
   resetChangesPane();
   focusActivityForSessionEvent({ force: shouldFocusActivity });

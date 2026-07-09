@@ -376,6 +376,23 @@ pub(crate) fn serve_session_list_cache_entry(
     None
 }
 
+/// Drop every cached session-list response. Called on session lifecycle
+/// events (create/end/attach/identity/relationship): the daemon KNOWS the
+/// list just changed, and serving out the 30s hard-TTL / 15-minute SWR
+/// window after a membership change hands ghosts to the dashboard's own
+/// post-create refresh and to every parameterless caller (MCP, ctl,
+/// peers). Status-only drift still rides the TTLs — that freshness
+/// trade-off is the cache's reason to exist on 50GB log trees.
+pub(crate) fn invalidate_session_list_response_caches() {
+    if let Some(cache) = SESSION_LIST_RESPONSE_CACHE.get() {
+        *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    cached_limited_session_list_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
 pub(crate) fn cached_list_sessions() -> String {
     let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
     {
@@ -2391,6 +2408,30 @@ pub(crate) fn stream_sessions_from_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalidate_session_list_response_caches_clears_both_tiers() {
+        {
+            let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
+            *cache.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(SessionListResponseCacheEntry {
+                    generated_at: std::time::Instant::now(),
+                    body: "[{\"session_id\":\"stale\"}]".to_string(),
+                });
+        }
+        store_session_list_response(5, "[]".to_string());
+        invalidate_session_list_response_caches();
+        assert!(SESSION_LIST_RESPONSE_CACHE
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_none());
+        assert!(cached_limited_session_list_cache()
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn summary_json_status_maps_outcomes_honestly() {

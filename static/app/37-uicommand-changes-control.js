@@ -93,8 +93,8 @@ function processCommands(cmds) {
       case 'delete_recording': deleteRecordingStream(c.stream_name); break;
       case 'recording_error': /* logged via add_log_entry */ break;
       case 'session_started':
-        managedContextSessionManuallySelected = false;
-        onSessionStarted(c.session_id, c.task);
+        if (!c.replayed) managedContextSessionManuallySelected = false;
+        onSessionStarted(c.session_id, c.task, { replayed: !!c.replayed });
         scheduleManagedContextRefresh(400);
         stationScheduleUpdate();
         break;
