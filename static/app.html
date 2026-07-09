@@ -8571,6 +8571,24 @@ body.context-focus-active {
   right: 12px;
   top: 34px;
 }
+/* sc-split cards lay the actions out as a real second column instead of
+   floating them over the content — the absolute cluster used to overlap
+   the badge chips and clip its last button on short/dense cards. */
+.session-card.sc-split {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+.session-card.sc-split .sc-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.session-card.sc-split .sc-actions {
+  position: static;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
 /* Card action buttons are compact ui-btn variants; ui-btn (+.danger)
    carries look and hover states. At rest they go quiet (ghost) so the
    list reads as content instead of a wall of buttons; engaging the card
@@ -9609,6 +9627,14 @@ body.context-focus-active {
 .control-toast.error { border-left-color: var(--red); }
 .control-toast.success { border-left-color: var(--green); }
 .control-toast.info { border-left-color: var(--blue); }
+/* The base gradient is a literal dark glass; under the ui-v2 light theme
+   --text flips to dark ink, which rendered toasts dark-on-dark ("Load
+   failed" unreadable). Light mode gets a light raised surface instead. */
+html.ui-v2[data-theme="light"] .control-toast {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.97), rgba(241, 243, 249, 0.97));
+  border-color: var(--line-2);
+  box-shadow: 0 10px 28px rgba(18, 23, 42, 0.18);
+}
 .control-toast.global-command-toast {
   position: fixed;
   bottom: 16px;
@@ -16784,6 +16810,13 @@ html.ui-v2 #tab-sessions .session-card .sc-actions {
   flex-wrap: nowrap;
   justify-content: flex-end;
   gap: 6px;
+}
+/* sc-split cards: the actions are a flex column sibling, not an overlay —
+   undo the centered-absolute positioning above. */
+html.ui-v2 #tab-sessions .session-card.sc-split .sc-actions {
+  top: auto;
+  right: auto;
+  transform: none;
 }
 html.ui-v2 #tab-sessions .session-card .sc-actions .ui-btn {
   min-height: 0;
@@ -84162,10 +84195,17 @@ function buildSessionCard(m, derived, ctx) {
 
   const rowIsPartial = s.partial === true;
   const card = document.createElement('div');
-  card.className = 'session-card';
+  // sc-split: content column + actions column as real flex layout. The
+  // actions used to float absolutely over the card and collided with the
+  // badge chips (and clipped "Delete…") whenever the cluster grew or the
+  // card ran short.
+  card.className = 'session-card sc-split';
   if (isCurrent) card.classList.add('current');
   if (displayStatus === 'abandoned') card.classList.add('dimmed');
   if (rowIsPartial) card.classList.add('partial');
+  const main = document.createElement('div');
+  main.className = 'sc-main';
+  card.appendChild(main);
 
   const sessionName = compactSessionText(s.name);
   const taskText = compactSessionText(s.task);
@@ -84281,7 +84321,7 @@ function buildSessionCard(m, derived, ctx) {
     top.appendChild(badge);
   }
 
-  card.appendChild(top);
+  main.appendChild(top);
 
   // Task
   if (taskText && sessionName) {
@@ -84400,7 +84440,7 @@ function buildSessionCard(m, derived, ctx) {
   if (!rowIsPartial && s.total_bytes > 0) tipParts.push(`disk: ${_fmtBytes(s.total_bytes)}`);
   if (projectPath) tipParts.push(`project: ${projectPath}`);
   if (tipParts.length) meta.title = tipParts.join('\n');
-  card.appendChild(meta);
+  main.appendChild(meta);
 
   // Media stats row (recordings, annotations, clips) + total session size
   const hasMedia = (s.recordings > 0 || s.annotations > 0 || s.clips > 0);
@@ -84423,7 +84463,7 @@ function buildSessionCard(m, derived, ctx) {
     if (s.annotations > 0) addMediaField('annotations', s.annotations, 'v-peach');
     if (s.clips > 0) addMediaField('clips', s.clips, 'v-peach');
     if (s.total_bytes > 0) addMediaField('size', _fmtBytes(s.total_bytes), 'v-dim');
-    card.appendChild(mediaMeta);
+    main.appendChild(mediaMeta);
   }
 
   // Actions row. While browsing a peer host the cards are read-only —

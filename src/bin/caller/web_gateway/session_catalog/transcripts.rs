@@ -776,6 +776,12 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
         if text.is_empty() {
             continue;
         }
+        // Claude Code writes its local-command plumbing (/login, /compact …)
+        // as ordinary user lines; the Codex surfaces already filter this
+        // vocabulary and the Activity log must not render it either.
+        if typ == "user" && is_injected_external_user_text(&text) {
+            continue;
+        }
         entries.push(serde_json::json!({
             "ts": value_str(&obj, "timestamp").unwrap_or_default(),
             "level": if typ == "assistant" { "model" } else { "info" },
