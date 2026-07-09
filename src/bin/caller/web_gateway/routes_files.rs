@@ -98,8 +98,13 @@ pub(crate) struct FsDeleteRequest {
 /// configurable later via `[upload] max_size_mb` in intendant.toml.
 pub(crate) const UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024;
 
-pub(crate) fn pending_upload_session_dir(project_root: &std::path::Path) -> std::path::PathBuf {
-    project_root.join(".intendant").join("pending_uploads")
+/// Session-dir stand-in used when no session log is active:
+/// `<project>/.intendant/pending_uploads`, or the equivalent directory in
+/// the daemon-global store on projectless daemons.
+pub(crate) fn pending_upload_session_dir(
+    scope: &crate::global_store::StoreScope,
+) -> std::path::PathBuf {
+    scope.store_base().join("pending_uploads")
 }
 
 pub(crate) fn current_upload_commit_response_body(
@@ -113,12 +118,7 @@ pub(crate) fn current_upload_commit_response_body(
     size: usize,
     bus: &crate::event::EventBus,
 ) -> (&'static str, String) {
-    let Some(root) = project_root else {
-        return (
-            "400 Bad Request",
-            serde_json::json!({ "error": "no project root" }).to_string(),
-        );
-    };
+    let scope = crate::global_store::StoreScope::resolve(project_root);
 
     let (session_dir, session_id) = if let Some(slog) = session_log {
         match slog.lock() {
@@ -132,7 +132,7 @@ pub(crate) fn current_upload_commit_response_body(
         }
     } else {
         (
-            pending_upload_session_dir(root),
+            pending_upload_session_dir(&scope),
             daemon_session_id.unwrap_or("pending").to_string(),
         )
     };
@@ -145,7 +145,7 @@ pub(crate) fn current_upload_commit_response_body(
         destination,
         &session_dir,
         &session_id,
-        root,
+        &scope,
     ) {
         Ok(descriptor) => {
             bus.send(crate::event::AppEvent::UploadReady {
@@ -168,13 +168,7 @@ pub(crate) fn current_upload_delete_response_body(
     session_dir: Option<&std::path::Path>,
     id: &str,
 ) -> (&'static str, String, Option<String>) {
-    let Some(root) = project_root else {
-        return (
-            "404 Not Found",
-            serde_json::json!({ "error": "no project root" }).to_string(),
-            None,
-        );
-    };
+    let scope = crate::global_store::StoreScope::resolve(project_root);
     let id = id.trim();
     if id.is_empty() {
         return (
@@ -187,11 +181,11 @@ pub(crate) fn current_upload_delete_response_body(
     let session_dir = match session_dir {
         Some(dir) => dir,
         None => {
-            pending_dir = pending_upload_session_dir(root);
+            pending_dir = pending_upload_session_dir(&scope);
             pending_dir.as_path()
         }
     };
-    match crate::upload_store::delete_upload(id, session_dir, root) {
+    match crate::upload_store::delete_upload(id, session_dir, &scope) {
         Ok(_) => (
             "200 OK",
             serde_json::json!({ "ok": true }).to_string(),
@@ -2239,10 +2233,11 @@ pub(crate) async fn handle_current_uploads_post(
     //   <raw bytes>
     //
     // Streams the body into a tempfile, commits it into
-    // the project-local ignored upload store
-    // (`.intendant/uploads/<session-id>/`), and
-    // broadcasts UploadReady so all connected browsers
-    // see it.
+    // the upload store for this daemon's scope (the
+    // project-local ignored `.intendant/uploads/<session-id>/`,
+    // or the daemon-global store on projectless daemons),
+    // and broadcasts UploadReady so all connected
+    // browsers see it.
     //
     // Route sits in the `/api/session/current/*` family
     // alongside `changes`, `history`, `rollback`, etc.
@@ -2252,9 +2247,7 @@ pub(crate) async fn handle_current_uploads_post(
     // protect uploads, gate the whole family at once.
     use tokio::io::AsyncWriteExt;
     let response = 'upload: {
-        let Some(ref root) = project_root_for_changes else {
-            break 'upload upload_error_response("400 Bad Request", "no project root");
-        };
+        let scope = crate::global_store::StoreScope::resolve(project_root_for_changes.as_deref());
 
         let name = query_param(request_line, "name").unwrap_or_else(|| "upload.bin".to_string());
         let requested_destination = query_param(request_line, "destination")
@@ -2292,7 +2285,7 @@ pub(crate) async fn handle_current_uploads_post(
                         }
                     } else {
                         (
-                            pending_upload_session_dir(root),
+                            pending_upload_session_dir(&scope),
                             daemon_session_id
                                 .clone()
                                 .unwrap_or_else(|| "pending".to_string()),
@@ -2309,7 +2302,7 @@ pub(crate) async fn handle_current_uploads_post(
                     destination,
                     &session_dir,
                     &session_id,
-                    root,
+                    &scope,
                 ) {
                     Ok(descriptor) => {
                         bus.send(crate::event::AppEvent::UploadReady {
@@ -2345,9 +2338,7 @@ pub(crate) async fn handle_current_uploads_get(
     // GET /api/session/current/uploads/<id>/raw  — stream bytes of one upload
     use tokio::io::AsyncWriteExt;
     let response = 'get_upload: {
-        let Some(ref root) = project_root_for_changes else {
-            break 'get_upload upload_error_response("404 Not Found", "no project root");
-        };
+        let scope = crate::global_store::StoreScope::resolve(project_root_for_changes.as_deref());
         let session_dir = if let Some(ref slog) = session_log {
             match slog.lock() {
                 Ok(l) => l.dir().to_path_buf(),
@@ -2359,7 +2350,7 @@ pub(crate) async fn handle_current_uploads_get(
                 }
             }
         } else {
-            pending_upload_session_dir(root)
+            pending_upload_session_dir(&scope)
         };
         // Path after /api/session/current/uploads
         let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
@@ -2368,7 +2359,7 @@ pub(crate) async fn handle_current_uploads_get(
             .trim_start_matches("/api/session/current/uploads")
             .trim_matches('/');
         if suffix.is_empty() {
-            let uploads = crate::upload_store::list_uploads(&session_dir, root);
+            let uploads = crate::upload_store::list_uploads(&session_dir, &scope);
             let body = serde_json::to_string(&uploads).unwrap_or_else(|_| "[]".to_string());
             HttpResponse::with_content("200 OK", "application/json", body)
                 .header("Cache-Control", "no-cache")
@@ -2377,7 +2368,7 @@ pub(crate) async fn handle_current_uploads_get(
                 .into_string()
         } else if let Some(id) = suffix.strip_suffix("/raw") {
             // GET raw bytes for one upload.
-            match crate::upload_store::find_upload(id, &session_dir, root) {
+            match crate::upload_store::find_upload(id, &session_dir, &scope) {
                 None => upload_error_response("404 Not Found", "upload not found"),
                 Some(d) => {
                     match std::fs::read(&d.path) {
@@ -2543,11 +2534,16 @@ mod tests {
     }
 
     #[test]
-    fn pending_upload_session_dir_is_project_scoped() {
+    fn pending_upload_session_dir_follows_store_scope() {
         let root = std::path::PathBuf::from("/tmp/project");
         assert_eq!(
-            pending_upload_session_dir(&root),
+            pending_upload_session_dir(&crate::global_store::StoreScope::Project(root.clone())),
             root.join(".intendant").join("pending_uploads")
+        );
+        let global = std::path::PathBuf::from("/tmp/state/global-store");
+        assert_eq!(
+            pending_upload_session_dir(&crate::global_store::StoreScope::Global(global.clone())),
+            global.join("pending_uploads")
         );
     }
 

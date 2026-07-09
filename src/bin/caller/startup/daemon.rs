@@ -86,6 +86,10 @@ pub(crate) async fn run_daemon(
     daemon_startup_resume_dir: Option<PathBuf>,
     provider_identity: crate::usage_rail::ProviderIdentity,
 ) -> Result<(), CallerError> {
+    // Retention guard for the daemon-global fallback store (projectless
+    // staged uploads / transfer jobs): prune entries idle past the
+    // retention window so the store cannot grow unbounded across restarts.
+    tokio::task::spawn_blocking(global_store::prune_at_daemon_startup);
     let bus = EventBus::new();
     let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
     let _session_listeners = startup::wiring::spawn_session_listeners(

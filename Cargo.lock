@@ -2649,7 +2649,6 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "schemars",
- "screencapturekit",
  "security-framework",
  "serde",
  "serde_json",

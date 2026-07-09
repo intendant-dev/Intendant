@@ -551,6 +551,13 @@ html.ui-v2 #tab-sessions .session-card .sc-actions {
   justify-content: flex-end;
   gap: 6px;
 }
+/* sc-split cards: the actions are a flex column sibling, not an overlay —
+   undo the centered-absolute positioning above. */
+html.ui-v2 #tab-sessions .session-card.sc-split .sc-actions {
+  top: auto;
+  right: auto;
+  transform: none;
+}
 html.ui-v2 #tab-sessions .session-card .sc-actions .ui-btn {
   min-height: 0;
   padding: 6px 11px;

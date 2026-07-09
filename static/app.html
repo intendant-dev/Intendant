@@ -8574,6 +8574,24 @@ body.context-focus-active {
   right: 12px;
   top: 34px;
 }
+/* sc-split cards lay the actions out as a real second column instead of
+   floating them over the content — the absolute cluster used to overlap
+   the badge chips and clip its last button on short/dense cards. */
+.session-card.sc-split {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+.session-card.sc-split .sc-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.session-card.sc-split .sc-actions {
+  position: static;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
 /* Card action buttons are compact ui-btn variants; ui-btn (+.danger)
    carries look and hover states. At rest they go quiet (ghost) so the
    list reads as content instead of a wall of buttons; engaging the card
@@ -9612,6 +9630,14 @@ body.context-focus-active {
 .control-toast.error { border-left-color: var(--red); }
 .control-toast.success { border-left-color: var(--green); }
 .control-toast.info { border-left-color: var(--blue); }
+/* The base gradient is a literal dark glass; under the ui-v2 light theme
+   --text flips to dark ink, which rendered toasts dark-on-dark ("Load
+   failed" unreadable). Light mode gets a light raised surface instead. */
+html.ui-v2[data-theme="light"] .control-toast {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.97), rgba(241, 243, 249, 0.97));
+  border-color: var(--line-2);
+  box-shadow: 0 10px 28px rgba(18, 23, 42, 0.18);
+}
 .control-toast.global-command-toast {
   position: fixed;
   bottom: 16px;
@@ -16809,6 +16835,13 @@ html.ui-v2 #tab-sessions .session-card .sc-actions {
   justify-content: flex-end;
   gap: 6px;
 }
+/* sc-split cards: the actions are a flex column sibling, not an overlay —
+   undo the centered-absolute positioning above. */
+html.ui-v2 #tab-sessions .session-card.sc-split .sc-actions {
+  top: auto;
+  right: auto;
+  transform: none;
+}
 html.ui-v2 #tab-sessions .session-card .sc-actions .ui-btn {
   min-height: 0;
   padding: 6px 11px;
@@ -23891,6 +23924,82 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
   </div>
 </div>
 <script type="module">
+/* ── static/app/30-module-canary.js ── */
+// ── Module-death canary (arm) ───────────────────────────────────────────
+// The whole dashboard is ONE <script type="module"> — every .js fragment in
+// manifest order. An uncaught top-level throw during evaluation (e.g. the
+// 2026-07-09 cross-fragment TDZ ReferenceError) kills every fragment after
+// the throwing line: listeners and window.* exposures silently never
+// initialize while the page still half-renders. This fragment arms a check
+// ~3s after module start: if static/app/59-module-alive.js (the LAST
+// fragment) never ran, paint an unmissable banner and tag the console with
+// [module-death].
+//
+// Placement rules (manifest.txt): this must stay the FIRST .js fragment so
+// nothing can throw before the check is armed, and 59-module-alive.js must
+// stay the last so reaching it proves the whole module evaluated. The
+// build-time complement is the assembler's eval-order lint
+// (crates/app-html-assembler/src/eval_order.rs), which statically rejects
+// direct top-level references to later-fragment let/const/class bindings.
+//
+// Known limit: a SyntaxError anywhere in the module aborts the PARSE, so
+// this fragment never runs either (no banner) — but then no script runs at
+// all, which is visibly broken; the canary targets the sneaky partial-death
+// class. Everything here is dependency-free plain DOM wrapped in try/catch:
+// the canary must never be what kills the module.
+(() => {
+  try {
+    let firstError = '';
+    window.addEventListener('error', (e) => {
+      if (firstError || window.__intendantModuleAlive === true) return;
+      try {
+        const where = e && e.filename ? ' @ ' + e.filename + ':' + e.lineno : '';
+        firstError = String((e && e.error && e.error.message) || (e && e.message) || 'unknown error') + where;
+      } catch (_) {
+        firstError = 'unknown error';
+      }
+    });
+    setTimeout(() => {
+      try {
+        if (window.__intendantModuleAlive === true) return;
+        document.documentElement.dataset.intendantModuleDead = '1';
+        console.error(
+          '[module-death] dashboard module never finished evaluating: the assembled ' +
+          '<script type="module"> threw at top level' +
+          (firstError ? ' (first uncaught error: ' + firstError + ')' : '') +
+          ' — every fragment after the throwing line (listeners, window.* exposures) is dead. ' +
+          'static/app/manifest.txt order is program order; see docs in static/app/30-module-canary.js.'
+        );
+        const banner = document.createElement('div');
+        banner.id = 'intendant-module-death-banner';
+        banner.setAttribute('role', 'alert');
+        banner.style.cssText =
+          'position:fixed;top:10px;left:50%;transform:translateX(-50%);' +
+          'z-index:2147483647;max-width:min(760px,calc(100vw - 32px));' +
+          'background:#7f1d1d;color:#fff;border:1px solid #fca5a5;border-radius:10px;' +
+          'padding:10px 14px;font:600 13px/1.45 system-ui,-apple-system,sans-serif;' +
+          'box-shadow:0 6px 24px rgba(0,0,0,.45);display:flex;align-items:center;gap:12px;';
+        const text = document.createElement('span');
+        text.textContent =
+          'Dashboard failed to initialize — reload; see console ([module-death]).' +
+          (firstError ? ' First error: ' + firstError : '');
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = 'Reload';
+        btn.style.cssText =
+          'flex:none;background:#fff;color:#7f1d1d;border:0;border-radius:7px;' +
+          'padding:6px 12px;font:600 12px system-ui,-apple-system,sans-serif;cursor:pointer;';
+        btn.addEventListener('click', () => location.reload());
+        banner.append(text, btn);
+        (document.body || document.documentElement).appendChild(banner);
+      } catch (err) {
+        try { console.error('[module-death] canary failed to render the banner:', err); } catch (_) { /* nothing left to try */ }
+      }
+    }, 3000);
+  } catch (_) {
+    // Never let the canary itself take the module down.
+  }
+})();
 /* ── static/app/31-ui2-foundation.js ── */
 // ── ui-v2 foundation: flag helpers + inline-SVG icon registry ──────────
 // Design-overhaul program. The ui-v2 class itself is decided pre-paint in
@@ -75761,6 +75870,240 @@ function ui2SettingsBuild() {
 if (typeof ui2Enabled === 'function' && ui2Enabled()) {
   ui2SettingsBuild();
 }
+/* ── static/app/53-transfer-fsm.js ── */
+// ── Files-transfer state machine ─────────────────────────────────────────
+// Every `status` write on a filesTransfers entry flows through this module:
+// filesTransferFsmInit() when an entry is created (queue* entry points,
+// localStorage restore, server-job merge) and filesTransferTransition() for
+// every mutation afterwards. The table below is the contract that used to be
+// implicit across ~20 ad-hoc mutation sites in 54-session-lifecycle.js; the
+// runner/pump invariants it encodes are load-bearing:
+//
+//  - Runners settle `status` away from 'queued' before any guard can throw
+//    (runFiles*Transfer marks 'running' as its first statement):
+//    pumpFilesTransfers re-picks 'queued' entries, so an entry left 'queued'
+//    after its runner returned would be re-picked forever — a microtask spin
+//    that freezes the tab and allocates without bound.
+//  - The pump backstop force-fails an entry whose runner exited without
+//    settling it, and that transition MUST reject the completion promise —
+//    unless the entry's queueEpoch moved, which marks a legitimate re-queue
+//    (Resume/Retry) racing the runner's teardown.
+//  - Terminal statuses settle `completion`: entering 'completed' resolves
+//    it, entering 'failed'/'cancelled' rejects it. The transition performs
+//    the settle, so a terminal entry can never strand an awaiting caller.
+//    (Settling an already-settled promise is a no-op, so late duplicates —
+//    retry-after-completed, server re-merges — are harmless.)
+//  - Entering 'queued' re-arms the attempt: queueEpoch bumps, the teardown
+//    flags clear, and a fresh completion promise is minted for the new run.
+//
+// Statuses: queued | running | paused | failed | cancelled | completed,
+// plus 'ready' on server-side transfer jobs merged from api_transfer_jobs.
+// Actors: 'user' (transfer-pane buttons + the queue* entry points),
+// 'runner' (runFilesDownloadTransfer / runFilesUploadTransfer and their
+// settle paths), 'pump' (pumpFilesTransfers' forward-progress backstop),
+// 'restore' (restoreFilesTransferState), 'server' (filesTransferMergeServerJob).
+
+const FILES_TRANSFER_STATUSES = new Set([
+  'queued', 'running', 'paused', 'failed', 'cancelled', 'completed', 'ready',
+]);
+
+// Settled history: pruning, Clear-history, and the persistence filter treat
+// these as finished; the FSM settles the completion promise on entry.
+const FILES_TRANSFER_TERMINAL_STATUSES = new Set(['completed', 'cancelled', 'failed']);
+
+// from-status → to-status → actors allowed to perform it. The 'server'
+// actor is not listed here: filesTransferMergeServerJob may overwrite any
+// row whose local status is not actively owned by this tab (see
+// filesTransferTransitionAllowed below).
+const FILES_TRANSFER_TRANSITIONS = {
+  queued: {
+    running: ['runner'],   // pump picked the entry; runner marks it before any guard can throw
+    paused: ['user'],      // Pause on a not-yet-started entry parks it in place
+    cancelled: ['user'],   // Cancel before the pump picks the entry up
+    failed: ['pump'],      // backstop: runner exited with the entry unsettled (epoch unchanged)
+  },
+  running: {
+    completed: ['runner'],
+    paused: ['runner'],    // pauseRequested teardown / AbortError
+    cancelled: ['runner'], // cancelRequested teardown
+    failed: ['runner', 'pump'],
+  },
+  paused: {
+    queued: ['user'],      // Resume
+    cancelled: ['user'],
+  },
+  failed: {
+    queued: ['user'],      // Resume (downloads with partial progress) or Retry
+  },
+  cancelled: {
+    queued: ['user'],      // Retry
+  },
+  completed: {
+    // Documented exceptions — deliberate quirks, not bugs:
+    queued: ['user'],      // Retry re-runs a finished transfer from scratch
+    failed: ['user'],      // Save after reload with the cached download chunks evicted
+  },
+  ready: {},               // server-owned; only the server merge moves it
+};
+
+// Statuses an entry may be created in, per creating actor. The queue*
+// entry points always mint 'queued'; restoreFilesTransferState only sees
+// what filesTransferPersistable writes (running/queued normalize to
+// 'paused'; cancelled rows and completed uploads are dropped — a restored
+// 'completed' is always a download); server merges mirror the job's own
+// status (filesTransferStatusFromJob normalizes unknowns to 'queued').
+const FILES_TRANSFER_INITIAL_STATUSES = {
+  user: ['queued'],
+  restore: ['paused', 'failed', 'completed', 'ready'],
+  server: ['queued', 'running', 'paused', 'failed', 'cancelled', 'completed', 'ready'],
+};
+
+const FILES_TRANSFER_FSM_TAG = '[transfer-fsm]';
+let filesTransferFsmIllegalCount = 0;
+const filesTransferFsmRecentReports = [];
+
+// Diagnostics only — the offending transition is still applied afterwards
+// (the UI must keep working; the table polices intent, it never gates
+// behavior). NEVER throw from here.
+function filesTransferFsmReport(message, transfer, detail = {}) {
+  filesTransferFsmIllegalCount += 1;
+  const report = {
+    message,
+    id: transfer?.id || '',
+    kind: transfer?.kind || '',
+    ...detail,
+  };
+  filesTransferFsmRecentReports.push(report);
+  if (filesTransferFsmRecentReports.length > 20) filesTransferFsmRecentReports.shift();
+  console.error(FILES_TRANSFER_FSM_TAG, message, report);
+}
+
+function filesTransferTransitionAllowed(from, to, actor) {
+  if (actor === 'server') {
+    // Mirror of the filesTransferMergeServerJob guard: a row whose local
+    // status is actively owned by this tab (queued/running/paused/failed)
+    // is never overwritten by a merged job; for anything else the server
+    // job's status is authoritative, whatever it says.
+    return !['queued', 'running', 'paused', 'failed'].includes(from);
+  }
+  const actors = FILES_TRANSFER_TRANSITIONS[from]?.[to];
+  return Array.isArray(actors) && actors.includes(actor);
+}
+
+// Settle the completion promise for a transfer entering `status`:
+// completed → resolve(result); failed/cancelled → reject(failure, or an
+// Error built from transfer.error). Other statuses settle only when the
+// caller hands in the teardown failure — pausing a *running* transfer
+// rejects the in-flight attempt (AbortError) while pausing a *queued* one
+// leaves the promise pending; Resume mints a fresh promise either way.
+function filesTransferFsmSettle(transfer, status, { result, failure } = {}) {
+  if (status === 'completed') {
+    transfer.resolve?.(result);
+  } else if (status === 'failed' || status === 'cancelled') {
+    transfer.reject?.(failure !== undefined ? failure : new Error(transfer.error || `transfer ${status}`));
+  } else if (failure !== undefined) {
+    transfer.reject?.(failure);
+  }
+}
+
+// Register a newly created entry with the machine: validate its initial
+// status for the creating actor, arm the completion promise, and settle it
+// immediately when the entry is born terminal (a restored 'completed'
+// download, a merged job that already finished) so "terminal ⇒ settled"
+// holds from birth. User creations bump queueEpoch — together with the
+// Resume/Retry re-arm these are the "queue/resume/retry" bumps the pump
+// backstop keys on.
+function filesTransferFsmInit(transfer, { actor = 'unknown' } = {}) {
+  if (!transfer) return null;
+  const status = transfer.status;
+  const allowed = FILES_TRANSFER_INITIAL_STATUSES[actor];
+  if (!allowed || !allowed.includes(status)) {
+    filesTransferFsmReport(
+      `illegal initial status '${status}' for actor '${actor}'`,
+      transfer,
+      { actor, to: status }
+    );
+  }
+  if (actor === 'user') transfer.queueEpoch = (transfer.queueEpoch || 0) + 1;
+  filesTransferCompletion(transfer);
+  filesTransferFsmSettle(transfer, status, {});
+  return transfer;
+}
+
+// The single mutation point for transfer.status. Options:
+//   actor   — 'user' | 'runner' | 'pump' | 'server'; checked against the
+//             table, illegal moves are reported (console.error, counted in
+//             window.qa.transfers()) and then applied anyway.
+//   error   — string (including '') assigns transfer.error; undefined
+//             applies the default (entering queued/running clears it, as
+//             every queue/resume/retry/runner-start site does; other
+//             targets leave it untouched); null forces leave-untouched
+//             even for queued/running (the server merge owns error itself).
+//   result  — resolve value for the completion promise when to='completed'.
+//   failure — reject error for the completion promise (defaults to an
+//             Error from transfer.error for failed/cancelled; also rejects
+//             the in-flight attempt on a runner's pause teardown).
+//   reason  — free-text context for the illegal-transition report.
+//   persist/render — default true; the server-merge loop batches both.
+function filesTransferTransition(transfer, to, options = {}) {
+  const {
+    actor = 'unknown',
+    error,
+    reason = '',
+    result,
+    failure,
+    persist = true,
+    render = true,
+  } = options;
+  if (!transfer) {
+    filesTransferFsmReport(`transition to '${to}' on a missing transfer`, null, { actor, to, reason });
+    return null;
+  }
+  const from = transfer.status;
+  if (!FILES_TRANSFER_STATUSES.has(to)) {
+    filesTransferFsmReport(`unknown target status '${to}'`, transfer, { actor, from, to, reason });
+  } else if (!filesTransferTransitionAllowed(from, to, actor)) {
+    filesTransferFsmReport(`illegal transition ${from} → ${to} (actor '${actor}')`, transfer, { actor, from, to, reason });
+  }
+  transfer.status = to;
+  if (to === 'queued') {
+    // Re-arm: entering the queue is a fresh attempt. Bump queueEpoch (the
+    // pump backstop exempts entries whose epoch moved — re-queues racing a
+    // runner teardown are legitimate), clear the teardown flags, and mint a
+    // fresh completion promise for the new attempt.
+    transfer.queueEpoch = (transfer.queueEpoch || 0) + 1;
+    transfer.pauseRequested = false;
+    transfer.cancelRequested = false;
+    if (error === undefined) transfer.error = '';
+    filesTransferCompletion(transfer);
+  } else if (to === 'running') {
+    transfer.pauseRequested = false;
+    transfer.cancelRequested = false;
+    if (error === undefined) transfer.error = '';
+  }
+  if (error !== undefined && error !== null) transfer.error = error;
+  if (persist) filesTransferPersistState();
+  if (render) renderFilesTransfers();
+  filesTransferFsmSettle(transfer, to, { result, failure });
+  return transfer;
+}
+
+// QA readback (window.qa convention): the transfer table harnesses assert
+// on — entry states plus the FSM's illegal-transition counter (0 in a
+// healthy session). Probe stays cheap and side-effect-free.
+window.qa = Object.assign(window.qa || {}, {
+  transfers: () => ({
+    entries: filesTransfers.map(transfer => ({
+      id: transfer.id,
+      kind: transfer.kind,
+      status: transfer.status,
+      error: transfer.error || '',
+      epoch: Number(transfer.queueEpoch || 0),
+    })),
+    illegalTransitions: filesTransferFsmIllegalCount,
+    recentReports: filesTransferFsmRecentReports.slice(),
+  }),
+});
 /* ── static/app/54-session-lifecycle.js ── */
 // ── Session Lifecycle ──
 function onSessionStarted(sessionId, task, opts = {}) {
@@ -77094,7 +77437,7 @@ function restoreFilesTransferState() {
       cancelRequested: false,
       abortController: null,
     };
-    filesTransferCompletion(transfer);
+    filesTransferFsmInit(transfer, { actor: 'restore' });
     filesTransfers.push(transfer);
   }
 }
@@ -77468,8 +77811,15 @@ function filesTransferMergeServerJob(job) {
     abortController: null,
   };
   transfer.kind = kind;
-  if (!existing || !['queued', 'running', 'paused', 'failed'].includes(existing.status || '')) {
-    transfer.status = filesTransferStatusFromJob(job);
+  if (existing && !['queued', 'running', 'paused', 'failed'].includes(existing.status || '')) {
+    // A row this tab does not actively own mirrors the server job's status.
+    // (A brand-new row was already minted with it, so no self-transition.)
+    filesTransferTransition(transfer, filesTransferStatusFromJob(job), {
+      actor: 'server',
+      error: null,     // job.error merges below, after the status move
+      persist: false,  // refreshFilesTransferJobs persists + renders once per batch
+      render: false,
+    });
   }
   transfer.path = transfer.path || source;
   transfer.destination = transfer.destination || destination;
@@ -77482,7 +77832,7 @@ function filesTransferMergeServerJob(job) {
   transfer.error = job.error || transfer.error || '';
   filesTransferApplyServerJob(transfer, job);
   if (!existing) {
-    filesTransferCompletion(transfer);
+    filesTransferFsmInit(transfer, { actor: 'server' });
     filesTransfers.unshift(transfer);
   }
   return transfer;
@@ -77511,7 +77861,7 @@ async function refreshFilesTransferJobs() {
 
 // Finished transfers accumulate for the lifetime of the page; keep the
 // list bounded (active/queued/paused transfers are never pruned).
-const FILES_TRANSFER_TERMINAL_STATUSES = new Set(['completed', 'cancelled', 'failed']);
+// FILES_TRANSFER_TERMINAL_STATUSES lives in 53-transfer-fsm.js.
 const FILES_TRANSFER_HISTORY_LIMIT = 100;
 function pruneFinishedFilesTransfers() {
   let terminal = 0;
@@ -77630,8 +77980,7 @@ function filesUpdateActiveDownloadSummary(transfer = null) {
 }
 
 function queueFilesTransfer(transfer) {
-  transfer.queueEpoch = (transfer.queueEpoch || 0) + 1;
-  filesTransferCompletion(transfer);
+  filesTransferFsmInit(transfer, { actor: 'user' });
   filesTransfers.unshift(transfer);
   filesTransferPersistState();
   renderFilesTransfers();
@@ -77770,15 +78119,11 @@ async function runFilesDownloadTransfer(transfer) {
   // that left the status at 'queued' would make pumpFilesTransfers re-pick
   // the same entry forever, so every failure must flow through the catch
   // below. The transport guards therefore live inside the try.
-  transfer.status = 'running';
-  transfer.error = '';
-  transfer.pauseRequested = false;
-  transfer.cancelRequested = false;
+  filesTransferTransition(transfer, 'running', { actor: 'runner' });
   const controller = new AbortController();
   transfer.abortController = controller;
   transfer.transport = '';
   filesDownloadAbort = controller;
-  renderFilesTransfers();
   filesUpdateActiveDownloadSummary(transfer);
   let peerConnection = null;
   let peerDashboardConnection = null;
@@ -77954,22 +78299,15 @@ async function runFilesDownloadTransfer(transfer) {
   } catch (err) {
     const message = err?.message || String(err);
     if (transfer.cancelRequested) {
-      transfer.status = 'cancelled';
-      transfer.error = '';
-      filesTransferPersistState();
-      transfer.reject?.(err);
+      filesTransferTransition(transfer, 'cancelled', { actor: 'runner', error: '', failure: err });
       setFilesDownloadStatus('warn', 'Download cancelled');
     } else if (transfer.pauseRequested || err?.name === 'AbortError') {
-      transfer.status = 'paused';
-      transfer.error = '';
-      filesTransferPersistState();
-      transfer.reject?.(err);
+      // Non-terminal teardown: the in-flight attempt's promise still
+      // rejects (failure) — Resume mints a fresh one.
+      filesTransferTransition(transfer, 'paused', { actor: 'runner', error: '', failure: err });
       setFilesDownloadStatus('warn', `Paused at ${filesTransferProgressText(transfer)}`);
     } else {
-      transfer.status = 'failed';
-      transfer.error = message;
-      filesTransferPersistState();
-      transfer.reject?.(err);
+      filesTransferTransition(transfer, 'failed', { actor: 'runner', error: message, failure: err });
       setFilesDownloadStatus('error', message);
       if (typeof showControlToast === 'function') showControlToast('error', message);
     }
@@ -78001,22 +78339,22 @@ function settleCompletedFilesDownload(transfer, { resumable }) {
     resumable,
   };
   transfer.result = result;
-  transfer.status = 'completed';
-  filesTransferPersistState();
+  filesTransferTransition(transfer, 'completed', { actor: 'runner', result });
   setFilesDownloadProgress(result.size, result.total_size || result.size);
   setFilesDownloadStatus('ok', `Downloaded ${result.filename} (${humanBytes(result.size)})`);
   if (!transfer.skipBrowserSave) downloadDashboardBlob(result.blob, result.filename, result.content_type);
-  transfer.resolve?.(result);
   return result;
 }
 
 // Server errors like "no project root" are accurate but unactionable in the
-// transfers pane; translate the known ones before surfacing.
+// transfers pane; translate the known ones before surfacing. Current daemons
+// serve projectless staged uploads/transfers from a daemon-global store, so
+// these strings only reach us from older daemons that still refuse.
 function filesTransferFriendlyServerError(error, fallback) {
   const message = String(error || '').trim();
   if (!message) return fallback;
-  if (message === 'no project root') {
-    return 'This daemon has no project open — staged uploads and resumable transfers need an active session with a project root';
+  if (message === 'no project root' || message === 'project root unavailable') {
+    return 'This daemon predates projectless staged uploads and transfers — it needs a project open (or a daemon upgrade)';
   }
   return message;
 }
@@ -78093,11 +78431,12 @@ async function runFilesFilesystemUploadHttpFallback(transfer, controller) {
     throw new Error(filesTransferFriendlyServerError(resp.body?.error, `file write returned HTTP ${resp.status}`));
   }
   transfer.loaded = transfer.totalSize;
-  transfer.status = 'completed';
-  filesTransferPersistState();
+  filesTransferTransition(transfer, 'completed', {
+    actor: 'runner',
+    result: { ok: true, path: destination, transport: 'http-fs-write' },
+  });
   await filesTransferDeleteUploadBlob(transfer.id);
   setFilesUploadStatus('ok', `Uploaded ${transfer.name} to ${destination}`);
-  transfer.resolve?.({ ok: true, path: destination, transport: 'http-fs-write' });
 }
 
 // Mirror the durable-job destination semantics client-side: an existing
@@ -78215,11 +78554,9 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
   filesTransferApplyServerJob(transfer, committed.job);
   transfer.loaded = transfer.totalSize;
   transfer.descriptor = committed.job;
-  transfer.status = 'completed';
-  filesTransferPersistState();
+  filesTransferTransition(transfer, 'completed', { actor: 'runner', result: committed.job });
   await filesTransferDeleteUploadBlob(transfer.id);
   setFilesUploadStatus('ok', `Uploaded ${transfer.name || 'upload.bin'}`);
-  transfer.resolve?.(committed.job);
 }
 
 function filesDeleteServerTransfer(transfer) {
@@ -78234,14 +78571,11 @@ function filesDeleteServerTransfer(transfer) {
 async function runFilesUploadTransfer(transfer) {
   // Same rule as downloads: settle the status before any guard can throw,
   // so pumpFilesTransfers never re-picks a permanently 'queued' entry.
-  transfer.status = 'running';
-  transfer.error = '';
+  filesTransferTransition(transfer, 'running', { actor: 'runner' });
   transfer.loaded = Number(transfer.loaded || 0);
-  transfer.cancelRequested = false;
   transfer.transport = '';
   const controller = new AbortController();
   transfer.abortController = controller;
-  renderFilesTransfers();
   try {
     const filesystemUpload = Boolean(transfer.destination && transfer.destination !== 'task');
     if (filesystemUpload && transfer.uploadBlobPersistPromise) {
@@ -78303,23 +78637,18 @@ async function runFilesUploadTransfer(transfer) {
       }
       transfer.loaded = transfer.file.size;
       transfer.descriptor = descriptor;
-      transfer.status = 'completed';
+      filesTransferTransition(transfer, 'completed', { actor: 'runner', result: descriptor });
       filesStagedUploads.set(String(descriptor.id || transfer.id), descriptor);
       setFilesUploadStatus('ok', `Uploaded ${descriptor.name || transfer.file.name || 'upload.bin'}`);
       renderFilesStagedUploads();
-      transfer.resolve?.(descriptor);
     }
   } catch (err) {
     if (transfer.cancelRequested || err?.name === 'AbortError') {
-      transfer.status = 'cancelled';
-      transfer.error = '';
+      filesTransferTransition(transfer, 'cancelled', { actor: 'runner', error: '', failure: err });
     } else {
-      transfer.status = 'failed';
-      transfer.error = err?.message || String(err);
+      filesTransferTransition(transfer, 'failed', { actor: 'runner', error: err?.message || String(err), failure: err });
       setFilesUploadStatus('error', transfer.error);
     }
-    filesTransferPersistState();
-    transfer.reject?.(err);
   } finally {
     transfer.abortController = null;
     filesTransferPersistState();
@@ -78345,14 +78674,16 @@ async function pumpFilesTransfers() {
         // Forward-progress backstop: a runner that exits without settling
         // its transfer would be re-picked by the find() above forever — a
         // synchronous microtask spin that freezes the page and allocates
-        // without bound. Force the entry failed so the pump always drains.
-        // The epoch check exempts entries the user legitimately re-queued
-        // (Resume/Retry bump it) while the runner was tearing down.
-        transfer.status = 'failed';
-        transfer.error = failure?.message || transfer.error || 'transfer runner exited without settling';
-        filesTransferPersistState();
-        renderFilesTransfers();
-        transfer.reject?.(failure || new Error(transfer.error));
+        // without bound. Force the entry failed so the pump always drains
+        // (the transition also rejects the completion promise). The epoch
+        // check exempts entries legitimately re-queued (Resume/Retry bump
+        // it) while the runner was tearing down.
+        filesTransferTransition(transfer, 'failed', {
+          actor: 'pump',
+          error: failure?.message || transfer.error || 'transfer runner exited without settling',
+          failure: failure || undefined,
+          reason: 'runner exited without settling its transfer',
+        });
       }
       // Macrotask yield: even a misbehaving runner that settles instantly
       // can only busy the tab, never wedge the event loop.
@@ -78380,9 +78711,9 @@ function pauseFilesTransfer(id) {
   const transfer = filesTransferById(id);
   if (!transfer) return;
   if (transfer.status === 'queued') {
-    transfer.status = 'paused';
-    filesTransferPersistState();
-    renderFilesTransfers();
+    // Not started yet: park it in place. The completion promise stays
+    // pending until Resume re-arms it — only a runner teardown rejects.
+    filesTransferTransition(transfer, 'paused', { actor: 'user' });
     return;
   }
   if (transfer.status !== 'running') return;
@@ -78400,10 +78731,10 @@ function cancelFilesTransfer(id) {
   if (transfer.status === 'running') {
     transfer.abortController?.abort();
   } else if (['queued', 'paused'].includes(transfer.status)) {
-    transfer.status = 'cancelled';
-    transfer.reject?.(new Error('transfer cancelled'));
-    filesTransferPersistState();
-    renderFilesTransfers();
+    filesTransferTransition(transfer, 'cancelled', {
+      actor: 'user',
+      failure: new Error('transfer cancelled'),
+    });
     pumpFilesTransfers();
   }
 }
@@ -78411,14 +78742,8 @@ function cancelFilesTransfer(id) {
 function resumeFilesTransfer(id) {
   const transfer = filesTransferById(id);
   if (!transfer || !['paused', 'failed'].includes(transfer.status)) return null;
-  transfer.queueEpoch = (transfer.queueEpoch || 0) + 1;
-  transfer.status = 'queued';
-  transfer.error = '';
-  transfer.pauseRequested = false;
-  transfer.cancelRequested = false;
-  filesTransferCompletion(transfer);
-  filesTransferPersistState();
-  renderFilesTransfers();
+  // Entering 'queued' re-arms the attempt (epoch bump, flags, completion).
+  filesTransferTransition(transfer, 'queued', { actor: 'user' });
   pumpFilesTransfers();
   return transfer.completion;
 }
@@ -78427,21 +78752,15 @@ function retryFilesTransfer(id) {
   const transfer = filesTransferById(id);
   if (!transfer || !['failed', 'cancelled', 'completed'].includes(transfer.status)) return null;
   if (transfer.kind === 'download') resetFilesDownloadTransfer(transfer);
-  transfer.queueEpoch = (transfer.queueEpoch || 0) + 1;
-  transfer.status = 'queued';
-  transfer.error = '';
-  transfer.cancelRequested = false;
-  transfer.pauseRequested = false;
-  filesTransferCompletion(transfer);
-  filesTransferPersistState();
-  renderFilesTransfers();
+  // Entering 'queued' re-arms the attempt (epoch bump, flags, completion).
+  filesTransferTransition(transfer, 'queued', { actor: 'user' });
   pumpFilesTransfers();
   return transfer.completion;
 }
 
 function clearFilesTransferHistory() {
   for (let i = filesTransfers.length - 1; i >= 0; i -= 1) {
-    if (['completed', 'failed', 'cancelled'].includes(filesTransfers[i].status)) {
+    if (FILES_TRANSFER_TERMINAL_STATUSES.has(filesTransfers[i].status)) {
       filesTransferDeleteDownloadParts(filesTransfers[i].id, Number(filesTransfers[i].rangeCount || 512));
       filesTransferDeleteUploadBlob(filesTransfers[i].id);
       filesTransfers.splice(i, 1);
@@ -78457,10 +78776,13 @@ async function saveCompletedFilesDownload(id) {
   if (!transfer.result?.blob) {
     const hydrated = await filesTransferLoadDownloadParts(transfer);
     if (!hydrated) {
-      transfer.status = 'failed';
-      transfer.error = 'download chunks are no longer available';
-      filesTransferPersistState();
-      renderFilesTransfers();
+      // Documented completed → failed exception: Save clicked after the
+      // cached download chunks were evicted (typically post-reload).
+      filesTransferTransition(transfer, 'failed', {
+        actor: 'user',
+        error: 'download chunks are no longer available',
+        reason: 'saved download chunks were evicted',
+      });
       return null;
     }
     const blob = new Blob(transfer.parts || [], { type: transfer.contentType || 'application/octet-stream' });
@@ -80039,11 +80361,27 @@ function filesIdeOnTabShown() {
   if (filesIdeCm) requestAnimationFrame(() => filesIdeCm.refresh());
 }
 
-function configureFsPicker({ mode, target, title, placeholder, useLabel, showCreate }) {
+// Multi-select state for the fs picker. Only download-source pickers opt in
+// (configureFsPicker's multiSelect flag); every other target stays
+// single-select. fsPickerSelectedPaths always mirrors fsPickerSelectedPath:
+// single-select pickers hold [] or [fsPickerSelectedPath], multi-select
+// pickers hold the selection in click order with fsPickerSelectedPath
+// tracking the most recently selected entry. fsPickerAnchorPath is the
+// shift-click range anchor within the current directory listing.
+let fsPickerMultiSelect = false;
+let fsPickerSelectedPaths = [];
+let fsPickerAnchorPath = '';
+let fsPickerUseLabelBase = 'Use path';
+
+function configureFsPicker({ mode, target, title, placeholder, useLabel, showCreate, multiSelect }) {
   fsPickerMode = mode || 'directory';
   fsPickerTarget = target || 'project';
   fsPickerCurrentPath = '';
   fsPickerSelectedPath = '';
+  fsPickerMultiSelect = fsPickerMode === 'file' && !!multiSelect;
+  fsPickerSelectedPaths = [];
+  fsPickerAnchorPath = '';
+  fsPickerUseLabelBase = useLabel || 'Use path';
   fsPickerDownloadAbort = null;
   const dialog = document.querySelector('#fs-picker-modal .fs-picker-dialog');
   const titleEl = document.getElementById('fs-picker-title');
@@ -80057,27 +80395,104 @@ function configureFsPicker({ mode, target, title, placeholder, useLabel, showCre
   if (createBtn) createBtn.style.display = showCreate ? '' : 'none';
   if (downloadCancelBtn) downloadCancelBtn.classList.add('hidden');
   if (useBtn) {
-    useBtn.textContent = useLabel || 'Use path';
+    useBtn.textContent = fsPickerUseLabelBase;
     useBtn.disabled = true;
   }
+}
+
+function fsPickerMultiSelectHint() {
+  const mod = /Mac|iP(hone|ad|od)/.test(navigator.platform || '') ? 'cmd' : 'ctrl';
+  return `${mod}-click to select multiple`;
+}
+
+function fsPickerSelectionStatusText() {
+  const count = fsPickerSelectedPaths.length;
+  if (!count) return fsPickerMultiSelect ? fsPickerMultiSelectHint() : '';
+  if (!fsPickerMultiSelect) return 'File selected';
+  return count === 1 ? `1 file selected — ${fsPickerMultiSelectHint()}` : `${count} files selected`;
+}
+
+function fsPickerEntryIsSelected(path) {
+  if (!path) return false;
+  return fsPickerSelectedPaths.includes(path) || path === fsPickerSelectedPath;
 }
 
 function setFsPickerUseButtonState() {
   const useBtn = document.getElementById('fs-picker-use-btn');
   if (!useBtn) return;
   const downloading = Boolean(fsPickerDownloadAbort);
-  useBtn.disabled = downloading || (fsPickerMode === 'file' ? !fsPickerSelectedPath : !fsPickerCurrentPath);
+  const hasSelection = fsPickerMode === 'file'
+    ? (fsPickerMultiSelect ? fsPickerSelectedPaths.length > 0 : !!fsPickerSelectedPath)
+    : !!fsPickerCurrentPath;
+  useBtn.disabled = downloading || !hasSelection;
+  if (fsPickerMultiSelect) {
+    const count = fsPickerSelectedPaths.length;
+    useBtn.textContent = count > 1
+      ? `${fsPickerUseLabelBase} ${count} files`
+      : count === 1
+        ? `${fsPickerUseLabelBase} 1 file`
+        : fsPickerUseLabelBase;
+  }
 }
 
-function selectFsPickerFile(path) {
-  fsPickerSelectedPath = String(path || '').trim();
+// Central selection setter: dedupes, keeps fsPickerSelectedPath pointing at
+// the most recent entry, and refreshes row highlights, the confirm button,
+// and the status line.
+function fsPickerApplySelection(paths) {
+  const unique = [];
+  for (const path of paths) {
+    const clean = String(path || '').trim();
+    if (clean && !unique.includes(clean)) unique.push(clean);
+  }
+  fsPickerSelectedPaths = unique;
+  fsPickerSelectedPath = unique.length ? unique[unique.length - 1] : '';
   const input = document.getElementById('fs-picker-path');
   if (input && fsPickerSelectedPath) input.value = fsPickerSelectedPath;
   setFsPickerUseButtonState();
   document.querySelectorAll('#fs-picker-list .fs-picker-entry.file').forEach(btn => {
-    btn.classList.toggle('selected', (btn.dataset.path || '') === fsPickerSelectedPath);
+    btn.classList.toggle('selected', fsPickerSelectedPaths.includes(btn.dataset.path || ''));
   });
-  if (fsPickerSelectedPath) setFsPickerStatus('', 'File selected');
+  if (fsPickerSelectedPaths.length || fsPickerMultiSelect) {
+    setFsPickerStatus('', fsPickerSelectionStatusText());
+  }
+}
+
+function selectFsPickerFile(path) {
+  const target = String(path || '').trim();
+  fsPickerAnchorPath = target;
+  fsPickerApplySelection(target ? [target] : []);
+}
+
+function handleFsPickerFileClick(ev, path) {
+  const target = String(path || '').trim();
+  if (!target) return;
+  if (!fsPickerMultiSelect) {
+    selectFsPickerFile(target);
+    return;
+  }
+  if (ev.shiftKey && fsPickerAnchorPath) {
+    // Range within the current listing, file rows only (directories are
+    // never multi-selectable). The anchor survives so a follow-up
+    // shift-click re-ranges from the same starting row.
+    const listed = Array.from(document.querySelectorAll('#fs-picker-list .fs-picker-entry.file'))
+      .map(btn => btn.dataset.path || '')
+      .filter(Boolean);
+    const from = listed.indexOf(fsPickerAnchorPath);
+    const to = listed.indexOf(target);
+    if (from !== -1 && to !== -1) {
+      fsPickerApplySelection(listed.slice(Math.min(from, to), Math.max(from, to) + 1));
+      return;
+    }
+  }
+  if (ev.metaKey || ev.ctrlKey) {
+    const next = fsPickerSelectedPaths.includes(target)
+      ? fsPickerSelectedPaths.filter(item => item !== target)
+      : [...fsPickerSelectedPaths, target];
+    fsPickerAnchorPath = target;
+    fsPickerApplySelection(next);
+    return;
+  }
+  selectFsPickerFile(target);
 }
 
 function setFsPickerDownloadBusy(busy) {
@@ -80110,7 +80525,7 @@ function renderFsPicker(data) {
     const cls = entry.is_dir ? 'dir' : 'file';
     const title = escapeHtml(entry.path || entry.name || '');
     const selectableFile = fsPickerMode === 'file' && entry.is_file;
-    const selected = selectableFile && (entry.path || '') === fsPickerSelectedPath ? ' selected' : '';
+    const selected = selectableFile && fsPickerEntryIsSelected(entry.path || '') ? ' selected' : '';
     const disabled = entry.is_dir || selectableFile ? '' : 'disabled';
     rows.push(
       `<button type="button" class="fs-picker-entry ${cls}${selected}" data-path="${title}" ${disabled}>` +
@@ -80126,16 +80541,17 @@ function renderFsPicker(data) {
   });
   if (fsPickerMode === 'file') {
     list.querySelectorAll('.fs-picker-entry.file').forEach(btn => {
-      btn.addEventListener('click', () => selectFsPickerFile(btn.dataset.path || ''));
-      btn.addEventListener('dblclick', () => {
+      btn.addEventListener('click', ev => handleFsPickerFileClick(ev, btn.dataset.path || ''));
+      btn.addEventListener('dblclick', ev => {
+        // In multi-select mode a modified double-click is part of toggling /
+        // ranging, not a confirm gesture.
+        if (fsPickerMultiSelect && (ev.metaKey || ev.ctrlKey || ev.shiftKey)) return;
         selectFsPickerFile(btn.dataset.path || '');
         useFsPickerSelection();
       });
     });
   }
-  if (useBtn) {
-    useBtn.disabled = fsPickerMode === 'file' ? !fsPickerSelectedPath : !fsPickerCurrentPath;
-  }
+  if (useBtn) setFsPickerUseButtonState();
 }
 
 async function resolveFsPickerListTarget(target) {
@@ -80169,11 +80585,15 @@ async function loadFsPicker(path) {
   if (input) input.value = target;
   fsPickerCurrentPath = '';
   fsPickerSelectedPath = '';
+  fsPickerSelectedPaths = [];
+  fsPickerAnchorPath = '';
   setFsPickerUseButtonState();
   setFsPickerStatus('', 'Loading...');
   try {
     const resolved = await resolveFsPickerListTarget(target);
     fsPickerSelectedPath = resolved.selectedPath || '';
+    fsPickerSelectedPaths = fsPickerSelectedPath ? [fsPickerSelectedPath] : [];
+    fsPickerAnchorPath = fsPickerSelectedPath;
     const resp = await dashboardJsonFetch('api_fs_list', { path: resolved.listPath }, () => (
       authedFetch('/api/fs/list?path=' + encodeURIComponent(resolved.listPath))
     ), 'api_fs_list');
@@ -80181,10 +80601,10 @@ async function loadFsPicker(path) {
     if (!resp.ok) throw new Error(data.error || `Directory load failed (${resp.status})`);
     if (input) input.value = fsPickerSelectedPath || data.path || resolved.listPath;
     const statusText = fsPickerSelectedPath
-      ? 'File selected'
+      ? fsPickerSelectionStatusText()
       : data.truncated
         ? 'Showing first 500 entries'
-        : '';
+        : fsPickerSelectionStatusText();
     setFsPickerStatus('', statusText);
     renderFsPicker(data);
   } catch (e) {
@@ -80253,10 +80673,11 @@ function openFilesDownloadPicker() {
   configureFsPicker({
     mode: 'file',
     target: 'filesDownload',
-    title: 'Choose file to download',
+    title: 'Choose files to download',
     placeholder: '/path/to/file',
-    useLabel: 'Select file',
+    useLabel: 'Download',
     showCreate: false,
+    multiSelect: true,
   });
   const modal = document.getElementById('fs-picker-modal');
   if (modal) modal.style.display = 'flex';
@@ -80357,10 +80778,19 @@ function useFsPickerSelection() {
     return;
   }
   if (fsPickerTarget === 'filesDownload') {
-    if (!fsPickerSelectedPath) return;
-    setFilesDownloadPath(fsPickerSelectedPath);
-    setFilesDownloadStatus('', 'Ready');
-    setFilesDownloadProgress(0, 0);
+    const paths = fsPickerSelectedPaths.length
+      ? fsPickerSelectedPaths.slice()
+      : (fsPickerSelectedPath ? [fsPickerSelectedPath] : []);
+    if (!paths.length) return;
+    if (!filesDownloadTunnelAvailable()) {
+      setFsPickerStatus('error', filesDownloadUnavailableMessage());
+      return;
+    }
+    // One transfer per selected file: the transfers pump runs them
+    // sequentially and each completed download saves through the existing
+    // per-transfer browser-save flow. No bundling.
+    for (const path of paths) startFilesDownload({ path });
+    if (paths.length > 1) setFilesDownloadStatus('warn', `Queued ${paths.length} downloads`);
     closeFsPicker();
     return;
   }
@@ -84229,10 +84659,17 @@ function buildSessionCard(m, derived, ctx) {
 
   const rowIsPartial = s.partial === true;
   const card = document.createElement('div');
-  card.className = 'session-card';
+  // sc-split: content column + actions column as real flex layout. The
+  // actions used to float absolutely over the card and collided with the
+  // badge chips (and clipped "Delete…") whenever the cluster grew or the
+  // card ran short.
+  card.className = 'session-card sc-split';
   if (isCurrent) card.classList.add('current');
   if (displayStatus === 'abandoned') card.classList.add('dimmed');
   if (rowIsPartial) card.classList.add('partial');
+  const main = document.createElement('div');
+  main.className = 'sc-main';
+  card.appendChild(main);
 
   const sessionName = compactSessionText(s.name);
   const taskText = compactSessionText(s.task);
@@ -84348,7 +84785,7 @@ function buildSessionCard(m, derived, ctx) {
     top.appendChild(badge);
   }
 
-  card.appendChild(top);
+  main.appendChild(top);
 
   // Task
   if (taskText && sessionName) {
@@ -84467,7 +84904,7 @@ function buildSessionCard(m, derived, ctx) {
   if (!rowIsPartial && s.total_bytes > 0) tipParts.push(`disk: ${_fmtBytes(s.total_bytes)}`);
   if (projectPath) tipParts.push(`project: ${projectPath}`);
   if (tipParts.length) meta.title = tipParts.join('\n');
-  card.appendChild(meta);
+  main.appendChild(meta);
 
   // Media stats row (recordings, annotations, clips) + total session size
   const hasMedia = (s.recordings > 0 || s.annotations > 0 || s.clips > 0);
@@ -84490,7 +84927,7 @@ function buildSessionCard(m, derived, ctx) {
     if (s.annotations > 0) addMediaField('annotations', s.annotations, 'v-peach');
     if (s.clips > 0) addMediaField('clips', s.clips, 'v-peach');
     if (s.total_bytes > 0) addMediaField('size', _fmtBytes(s.total_bytes), 'v-dim');
-    card.appendChild(mediaMeta);
+    main.appendChild(mediaMeta);
   }
 
   // Actions row. While browsing a peer host the cards are read-only —
@@ -87563,6 +88000,17 @@ document.getElementById('strip-minimize')?.addEventListener('click', (e) => {
 
 // ── Start ──
 main();
+/* ── static/app/59-module-alive.js ── */
+// ── Module-death canary (sentinel) ──────────────────────────────────────
+// MUST stay the LAST .js fragment in manifest.txt (only 59-module-close.html
+// after it), and must stay dependency-free: reaching these two lines proves
+// the entire dashboard module evaluated without an uncaught top-level throw.
+// static/app/30-module-canary.js (the first fragment) checks for the flag
+// ~3s after module start and paints a fatal [module-death] banner when it is
+// missing; scripts/validate-dashboard.cjs asserts it on every validation.
+// Appending fragments after this one silently weakens the canary — don't.
+window.__intendantModuleAlive = true;
+document.documentElement.dataset.intendantModuleAlive = '1';
 </script>
 </body>
 </html>

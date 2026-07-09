@@ -22,6 +22,11 @@ name: Keyless smokes
 # probes) need keys or a display and deliberately stay OUT of the merge gate;
 # they run as post-landing checks on operator hardware.
 #
+# One exception rides along as a separate ADVISORY job (not in the required
+# set): dashboard-boot, which loads the dashboard SPA from a keyless mock
+# daemon in headless Chromium and asserts it actually booted. Headless
+# browsers need no display, so it is CI-safe — see the job comment.
+#
 # Linux only: the drivers are platform-agnostic PROTOCOL probes (control
 # socket, /ws, /api) — a second Unix platform mostly duplicates the same
 # code paths while doubling the flake surface, and every flake costs a
@@ -189,3 +194,181 @@ jobs:
         env:
           INTENDANT_BIN: ${{ github.workspace }}/target/debug/intendant
         run: python3 tests/skills/peer-sessions-smoke/peer-rig.py
+
+  # Dashboard boot smoke — ADVISORY. On 2026-07-09 a cross-fragment TDZ
+  # error killed the whole dashboard SPA silently (every JS fragment is one
+  # <script type="module">, so one eval error kills everything after it),
+  # and every gate stayed green because nothing in CI boots the SPA in a
+  # real browser. This job does: it builds the daemon, launches it keyless
+  # (PROVIDER=mock), loads the page in headless Chromium over raw CDP
+  # (scripts/smoke-dashboard-boot.cjs — the lightweight boot gate;
+  # scripts/validate-dashboard.cjs stays the operator-side deep battery),
+  # and asserts the late-module window exposures exist, no page errors
+  # fired during boot, and the shell rendered.
+  #
+  # Deliberately a SEPARATE job with its own check name: it must not be
+  # able to flip the required `smokes (...)` context red. Keep it OUT of
+  # the required-check set until it has a soak record; promotion to
+  # required is a ruleset (org-owner) decision.
+  dashboard-boot:
+    name: dashboard-boot (${{ matrix.os }})
+    # Same trust-based routing as the smokes job: trusted refs on the
+    # self-hosted fleet (the Linux boxes have chromium installed), fork
+    # PRs on GitHub-hosted runners (whose images ship Chrome/Chromium).
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
+    env:
+      # Share the runner's warm debuginfo-off debug tree with the smokes
+      # and test jobs (see the smokes job comment).
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            runner: [self-hosted, intendant-linux]
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      # Same fleet preflight as the smokes job: fail fast on a nearly-full
+      # disk, warn on pathological load.
+      - name: Fleet preflight
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          avail_kb=$(df -Pk . | awk 'NR==2 {print $4}')
+          avail_gb=$((avail_kb / 1024 / 1024))
+          echo "disk available: ${avail_gb}G"
+          if [ "$avail_gb" -lt 20 ]; then
+            echo "::error::fleet preflight: only ${avail_gb}G free on this runner — below the 20G floor. Reclaim disk (merged worktrees' target/ dirs are the usual culprits) and rerun."
+            exit 1
+          fi
+          cores=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          load=$(awk '{print $1}' /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg | awk '{print $2}')
+          echo "load average: $load (cores: $cores)"
+          awk -v l="$load" -v c="$cores" 'BEGIN { if (l > 3*c) print "::warning::fleet preflight: load " l " is over 3x the " c " cores — timing-sensitive tests may flake; consider draining the box" }'
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      # Same in-job relevance detection as the smokes job: doc-only diffs
+      # skip the build + smoke (this job is advisory, but fleet capacity
+      # is shared with the required gates).
+      - name: Detect CI-relevant changes
+        id: relevance
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.merge_group.base_sha }}"
+          fi
+          git fetch --quiet --depth=1 origin "$base"
+          relevant=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              docs/*|*.md|LICENSE|.gitignore) ;;
+              *) relevant=true; break;;
+            esac
+          done < <(git diff --name-only "$base" HEAD)
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "CI-relevant change detected: $relevant"
+
+      # Same native build deps as the smokes job. Hosted-only: the
+      # self-hosted boxes are pre-provisioned, and the runner user has
+      # no sudo.
+      - name: Install Linux build deps
+        if: runner.environment == 'github-hosted' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libclang-dev libvpx-dev libpipewire-0.3-dev \
+            libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
+
+      # Hosted-only: self-hosted runners keep a persistent target/.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: runner.environment == 'github-hosted'
+        with:
+          key: dashboard-boot-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo build
+        if: steps.relevance.outputs.relevant != 'false'
+        run: cargo build -p intendant --bins --locked
+
+      # Idle keyless daemon: mock provider (no API keys by construction —
+      # the driver env strips them like the other smoke rigs), kernel-
+      # assigned port parsed from the Dashboard line (same recipe as
+      # peer-rig.py), empty intendant.toml as the minimal project marker
+      # (same as the e2e daemon rigs), isolated temp HOME.
+      - name: Launch keyless daemon
+        id: daemon
+        if: steps.relevance.outputs.relevant != 'false'
+        shell: bash
+        run: |
+          rig="$RUNNER_TEMP/dashboard-boot"
+          rm -rf "$rig"
+          mkdir -p "$rig/home" "$rig/proj" "$rig/artifacts"
+          printf '{"profiles":[{"steps":[{"content":"ok"}]}]}' > "$rig/home/mock_script.json"
+          : > "$rig/proj/intendant.toml"
+          cd "$rig/proj"
+          env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u GEMINI_API_KEY -u MODEL_NAME \
+            HOME="$rig/home" PROVIDER=mock INTENDANT_MOCK_SCRIPT="$rig/home/mock_script.json" \
+            "$GITHUB_WORKSPACE/target/debug/intendant" --web 0 --bind 127.0.0.1 --no-tls \
+            > "$rig/daemon.log" 2>&1 &
+          pid=$!
+          echo "pid=$pid" >> "$GITHUB_OUTPUT"
+          echo "rig=$rig" >> "$GITHUB_OUTPUT"
+          port=""
+          for _ in $(seq 1 120); do
+            port=$(sed -nE 's#.*Dashboard: https?://127\.0\.0\.1:([0-9]+).*#\1#p' "$rig/daemon.log" | head -1)
+            [ -n "$port" ] && break
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "::error::daemon exited during startup"
+              tail -n 40 "$rig/daemon.log"
+              exit 1
+            fi
+            sleep 0.5
+          done
+          if [ -z "$port" ]; then
+            echo "::error::daemon did not print its Dashboard URL within 60s"
+            tail -n 40 "$rig/daemon.log"
+            exit 1
+          fi
+          echo "port=$port" >> "$GITHUB_OUTPUT"
+          echo "daemon pid=$pid port=$port"
+
+      - name: dashboard-boot smoke
+        if: steps.relevance.outputs.relevant != 'false'
+        run: >
+          node scripts/smoke-dashboard-boot.cjs
+          --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/"
+          --artifact-dir "${{ steps.daemon.outputs.rig }}/artifacts"
+
+      - name: Stop daemon
+        if: always() && steps.daemon.outputs.pid != ''
+        shell: bash
+        run: kill "${{ steps.daemon.outputs.pid }}" 2>/dev/null || true
+
+      # Inline visibility first (the artifact needs a download), then the
+      # full daemon log + the smoke's screenshot/error dumps as artifacts.
+      - name: Daemon log tail (failure)
+        if: failure() && steps.daemon.outputs.rig != ''
+        shell: bash
+        run: tail -n 80 "${{ steps.daemon.outputs.rig }}/daemon.log" || true
+
+      - name: Upload failure artifacts
+        if: failure() && steps.daemon.outputs.rig != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dashboard-boot-failure-${{ matrix.os }}
+          path: |
+            ${{ steps.daemon.outputs.rig }}/daemon.log
+            ${{ steps.daemon.outputs.rig }}/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true

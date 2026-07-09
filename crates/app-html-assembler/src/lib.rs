@@ -18,6 +18,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod eval_order;
+
 /// Fragment directory, relative to the repo root.
 pub const FRAGMENT_DIR: &str = "static/app";
 /// Assembly-order manifest inside [`FRAGMENT_DIR`].
@@ -96,6 +98,9 @@ pub fn assemble(repo_root: &Path) -> Result<Outcome, String> {
 
     let mut assembled: Vec<u8> = Vec::new();
     assembled.extend_from_slice(GENERATED_HEADER.as_bytes());
+    // All .js fragments share one <script type="module"> scope in manifest
+    // order; lint them (below) as the single program they become.
+    let mut js_fragments: Vec<(String, String)> = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         if let Some(banner) = fragment_banner(entry, index) {
             assembled.extend_from_slice(banner.as_bytes());
@@ -103,8 +108,15 @@ pub fn assemble(repo_root: &Path) -> Result<Outcome, String> {
         let path = fragment_dir.join(entry);
         let bytes = fs::read(&path)
             .map_err(|e| format!("failed to read fragment {}: {e}", path.display()))?;
+        if entry.ends_with(".js") {
+            js_fragments.push((
+                format!("{FRAGMENT_DIR}/{entry}"),
+                String::from_utf8_lossy(&bytes).into_owned(),
+            ));
+        }
         assembled.extend_from_slice(&bytes);
     }
+    eval_order::check_eval_order(&js_fragments)?;
 
     let output_path = repo_root.join(OUTPUT);
     let existing = fs::read(&output_path).ok();
@@ -336,6 +348,41 @@ mod tests {
         );
         let err = assemble(dir.path()).unwrap_err();
         assert!(err.contains("do not exist") && err.contains("90-gone.js"), "{err}");
+    }
+
+    #[test]
+    fn assemble_fails_on_cross_fragment_eval_order_hazard() {
+        // Integration of the eval-order lint (eval_order.rs, where the
+        // scanner-level cases live): a top-level reference to a later
+        // fragment's `let` must fail assembly, not ship a dashboard that
+        // dies at module evaluation.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "static/app/30-open.html", "<script type=\"module\">\n");
+        write(dir.path(), "static/app/40-a.js", "if (laterFlag) { console.log(1); }\n");
+        write(dir.path(), "static/app/50-b.js", "let laterFlag = true;\n");
+        write(dir.path(), "static/app/59-close.html", "</script>\n");
+        write(
+            dir.path(),
+            "static/app/manifest.txt",
+            "30-open.html\n40-a.js\n50-b.js\n59-close.html\n",
+        );
+        let err = assemble(dir.path()).unwrap_err();
+        assert!(err.contains("eval-order lint failed"), "{err}");
+        assert!(err.contains("laterFlag"), "{err}");
+        assert!(err.contains("40-a.js"), "{err}");
+        assert!(err.contains("50-b.js"), "{err}");
+        // No artifact must be written for a failing fragment set.
+        assert!(!dir.path().join(OUTPUT).exists());
+
+        // The incident's fix shape resolves it: declare in the referencing
+        // fragment; later fragments keep only ordinary uses.
+        write(
+            dir.path(),
+            "static/app/40-a.js",
+            "let laterFlag = true;\nif (laterFlag) { console.log(1); }\n",
+        );
+        write(dir.path(), "static/app/50-b.js", "console.log(laterFlag);\n");
+        assemble(dir.path()).unwrap();
     }
 
     #[test]

@@ -518,14 +518,23 @@ impl SessionSupervisor {
         let _ = handle.await;
     }
 
-    fn attachment_project_roots(&self, primary: &Path) -> Vec<PathBuf> {
-        let mut roots = vec![primary.to_path_buf()];
-        if let Some(default_root) = self.config.project_root.as_deref() {
-            if default_root != primary {
-                roots.push(default_root.to_path_buf());
+    fn attachment_store_scopes(&self, primary: &Path) -> Vec<crate::global_store::StoreScope> {
+        let mut scopes = vec![crate::global_store::StoreScope::Project(
+            primary.to_path_buf(),
+        )];
+        match self.config.project_root.as_deref() {
+            Some(default_root) => {
+                if default_root != primary {
+                    scopes.push(crate::global_store::StoreScope::Project(
+                        default_root.to_path_buf(),
+                    ));
+                }
             }
+            // Projectless daemon: dashboard-staged uploads live in the
+            // daemon-global store, not under any project root.
+            None => scopes.push(crate::global_store::StoreScope::resolve(None)),
         }
-        roots
+        scopes
     }
 
     async fn resolve_session_attachments(
@@ -537,16 +546,15 @@ impl SessionSupervisor {
         if attachments.is_empty() {
             return Vec::new();
         }
-        let roots = self.attachment_project_roots(primary_project_root);
-        resolve_attachments_with_project_roots(
+        let scopes = self.attachment_store_scopes(primary_project_root);
+        resolve_attachments_with_scopes(
             attachments,
             &self.config.frame_registry,
             session_dir,
-            &roots,
+            &scopes,
         )
         .await
     }
-
 }
 
 fn normalize_supervisor_phase(phase: &str) -> String {

@@ -26,7 +26,7 @@ use screencapturekit::cm::{CMTime, SCFrameStatus};
 use screencapturekit::cv::CVPixelBufferLockFlags;
 use screencapturekit::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use tokio::sync::{mpsc, Mutex};
 
 /// Synthetic display IDs at and above this value represent macOS native
@@ -79,9 +79,27 @@ impl InputGeometry {
     }
 }
 
-/// Active capture state: holds the `SCStream` and shutdown flag.
+/// One active ScreenCaptureKit session.
+///
+/// All teardown-relevant state is **per-session** (created fresh by each
+/// `start_capture` and owned here), not per-backend: unlike the thread-backed
+/// backends, ScreenCaptureKit's callback queue cannot be joined, so a late
+/// callback from a *previous* stream can fire long after `stop_capture`
+/// returned (~53 s observed in the 2026-07-08 incident) — possibly while a
+/// *new* session is already running. Per-session flags/slots mean such a
+/// callback can only ever observe its own, already-quiesced session.
 struct CaptureState {
     stream: SCStream,
+    /// Shutdown gate shared with this session's SCK output handler. Set
+    /// first during teardown; late callbacks check it and return before
+    /// touching pixels, geometry, or the channel.
+    shutdown: Arc<AtomicBool>,
+    /// The frame channel's only `Sender`, shared with the output handler.
+    /// `stop_capture` takes it out of the slot, closing the channel
+    /// immediately (the teardown contract's bounded channel-close) instead
+    /// of waiting for the OS to release the handler closure that would
+    /// otherwise keep the sender alive.
+    frame_tx: Arc<StdMutex<Option<mpsc::Sender<Frame>>>>,
 }
 
 /// macOS screen capture and input injection backend.
@@ -92,7 +110,6 @@ pub struct MacOSBackend {
     capture: Mutex<Option<CaptureState>>,
     width: Arc<AtomicU32>,
     height: Arc<AtomicU32>,
-    shutdown: Arc<AtomicBool>,
     input_geometry: Arc<RwLock<InputGeometry>>,
     target: CaptureTarget,
 }
@@ -115,7 +132,6 @@ impl MacOSBackend {
             capture: Mutex::new(None),
             width: Arc::new(AtomicU32::new(0)),
             height: Arc::new(AtomicU32::new(0)),
-            shutdown: Arc::new(AtomicBool::new(false)),
             input_geometry: Arc::new(RwLock::new(InputGeometry::from_frame_size(0, 0))),
             target,
         }
@@ -484,13 +500,11 @@ fn enumerate_window_display_infos(content: &SCShareableContent) -> Vec<super::Di
 #[async_trait]
 impl DisplayBackend for MacOSBackend {
     async fn start_capture(&self, fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
-        // Defensive: matching the x11.rs pattern — teardown any previous
-        // capture before starting a new one, so a double-start doesn't
-        // leak the ScreenCaptureKit stream. `stop_capture` is idempotent
-        // when nothing's running.
+        // Contract: starting over a running capture first tears the old
+        // session down (matching the x11.rs pattern) so a double-start
+        // doesn't leak the ScreenCaptureKit stream. `stop_capture` is
+        // idempotent when nothing's running.
         self.stop_capture().await;
-
-        self.shutdown.store(false, Ordering::SeqCst);
 
         // Get shareable content (triggers TCC permission prompt on first use).
         let content = SCShareableContent::create()
@@ -520,10 +534,21 @@ impl DisplayBackend for MacOSBackend {
             .with_shows_cursor(true)
             .with_minimum_frame_interval(&frame_interval);
 
-        // Bounded channel: backend drops frames if consumer is slow.
+        // Bounded channel: backend drops frames if consumer is slow. The
+        // sender lives in a per-session slot shared with the output handler
+        // so `stop_capture` can close the channel promptly (see
+        // `CaptureState`); it stays the channel's *only* sender — cloning it
+        // out of the slot would let a late callback keep the channel open
+        // past teardown.
         let (tx, rx) = mpsc::channel::<Frame>(4);
+        let frame_slot = Arc::new(StdMutex::new(Some(tx)));
 
-        let shutdown_flag = Arc::clone(&self.shutdown);
+        // Per-session teardown state (see `CaptureState` for why these must
+        // not be backend-shared).
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+        let handler_slot = Arc::clone(&frame_slot);
+        let handler_shutdown = Arc::clone(&shutdown_flag);
         // Share width/height atomics with the output handler so it can
         // update them when ScreenCaptureKit delivers frames at a different
         // resolution (e.g. Retina scale change, resolution switch).
@@ -539,7 +564,12 @@ impl DisplayBackend for MacOSBackend {
                 if of_type != SCStreamOutputType::Screen {
                     return;
                 }
-                if shutdown_flag.load(Ordering::SeqCst) {
+                // Teardown gate: ScreenCaptureKit can deliver callbacks well
+                // after SCStream::stop_capture (observed ~53 s late). The
+                // handler state itself stays ARC-retained by the crate's
+                // Swift bridge until the OS releases it, so this runs against
+                // live memory; the flag makes it a no-op.
+                if handler_shutdown.load(Ordering::SeqCst) {
                     return;
                 }
                 let Some(buffer) = sample.image_buffer() else {
@@ -599,8 +629,18 @@ impl DisplayBackend for MacOSBackend {
                     dirty_rects,
                 };
 
-                // Backpressure: drop frame if channel is full.
-                let _ = tx.try_send(frame);
+                // Send while holding the slot lock: `stop_capture` empties
+                // the slot under the same lock, so once it returns no
+                // callback can slip another frame into the channel.
+                // Backpressure: `try_send` drops the frame if the channel
+                // is full.
+                if let Some(tx) = handler_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                {
+                    let _ = tx.try_send(frame);
+                }
             },
             SCStreamOutputType::Screen,
         );
@@ -609,17 +649,47 @@ impl DisplayBackend for MacOSBackend {
             .start_capture()
             .map_err(|e| CallerError::Display(format!("start_capture: {e}")))?;
 
-        *self.capture.lock().await = Some(CaptureState { stream });
+        *self.capture.lock().await = Some(CaptureState {
+            stream,
+            shutdown: shutdown_flag,
+            frame_tx: frame_slot,
+        });
 
         Ok(rx)
     }
 
     async fn stop_capture(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        // Double-stop / stop-without-start: nothing registered, no-op.
+        let Some(state) = self.capture.lock().await.take() else {
+            return;
+        };
 
-        if let Some(state) = self.capture.lock().await.take() {
+        // Quiesce order matters:
+        // 1. Gate first — callbacks that fire from here on return without
+        //    touching pixels, geometry atomics, or the channel.
+        state.shutdown.store(true, Ordering::SeqCst);
+        // 2. Close the frame channel now (contract: bounded channel-close).
+        //    The slot holds the channel's only sender; SCK may keep the
+        //    handler closure — and thus the slot Arc — alive long after
+        //    stop, so waiting for the closure to drop would leave the
+        //    receiver hanging for tens of seconds.
+        state
+            .frame_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        // 3. Stop and release the stream off the executor thread —
+        //    SCStream::stop_capture blocks on an SCK completion handler
+        //    (same executor-stall class as the x11 thread-join). A late OS
+        //    callback after this is safe: the crate's Swift bridge keeps the
+        //    handler context ARC-retained until the OS stops calling it
+        //    (screencapturekit 8.0 — the 1.5 free-on-Drop was the 2026-07-08
+        //    daemon segfault), and the callback body hits the gate above.
+        let _ = tokio::task::spawn_blocking(move || {
             let _ = state.stream.stop_capture();
-        }
+            drop(state);
+        })
+        .await;
     }
 
     async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
@@ -834,5 +904,28 @@ mod tests {
         for value in ["", "0", "false", "no", "off", "enabled"] {
             assert!(!sck_dirty_rects_enabled_value(value), "{value}");
         }
+    }
+
+    /// Real-ScreenCaptureKit teardown-contract stress: fast start/stop
+    /// cycles, per-cycle bounded channel-close assertions, then a long
+    /// linger so a late SCK callback into freed state (the 2026-07-08
+    /// segfault class: a frame delivered ~53 s after stop) crashes this
+    /// test process instead of a production daemon.
+    ///
+    /// Ignored by default — drives the real OS capture stack, so it needs a
+    /// display and the Screen Recording TCC grant (it skips itself cleanly
+    /// when capture is unavailable). Run on operator hardware:
+    ///
+    /// ```text
+    /// cargo test -p intendant-display --lib -- --ignored real_capture_stress
+    /// ```
+    ///
+    /// Tunables: `INTENDANT_DISPLAY_STRESS_CYCLES` (default 10),
+    /// `INTENDANT_DISPLAY_STRESS_LINGER_SECS` (default 60).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "real ScreenCaptureKit capture: needs a display + Screen Recording TCC; run via -- --ignored real_capture_stress on operator hardware"]
+    async fn macos_real_capture_stress_cycles() {
+        let backend = MacOSBackend::new();
+        crate::capture_stress::run_real_backend_stress(&backend).await;
     }
 }

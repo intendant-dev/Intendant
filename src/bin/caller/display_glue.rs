@@ -152,20 +152,22 @@ pub(crate) async fn resolve_attachments(
     session_dir: &std::path::Path,
     project_root: &std::path::Path,
 ) -> Vec<external_agent::AgentAttachment> {
-    resolve_attachments_with_project_roots(
+    resolve_attachments_with_scopes(
         ids,
         registry,
         session_dir,
-        &[project_root.to_path_buf()],
+        &[crate::global_store::StoreScope::Project(
+            project_root.to_path_buf(),
+        )],
     )
     .await
 }
 
-pub(crate) async fn resolve_attachments_with_project_roots(
+pub(crate) async fn resolve_attachments_with_scopes(
     ids: &[String],
     registry: &Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     session_dir: &std::path::Path,
-    project_roots: &[PathBuf],
+    scopes: &[crate::global_store::StoreScope],
 ) -> Vec<external_agent::AgentAttachment> {
     if ids.is_empty() {
         return Vec::new();
@@ -173,9 +175,9 @@ pub(crate) async fn resolve_attachments_with_project_roots(
     let mut out: Vec<external_agent::AgentAttachment> = Vec::with_capacity(ids.len());
     for raw in ids {
         if let Some(upload_id) = raw.strip_prefix("upload:") {
-            let Some(d) = project_roots
+            let Some(d) = scopes
                 .iter()
-                .find_map(|root| upload_store::find_upload(upload_id, session_dir, root))
+                .find_map(|scope| upload_store::find_upload(upload_id, session_dir, scope))
             else {
                 continue;
             };
@@ -1644,7 +1646,6 @@ pub(crate) async fn execute_cu_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
 
     #[tokio::test]
     async fn resolve_attachments_includes_uploaded_files_and_images() {
@@ -1671,7 +1672,7 @@ mod tests {
             upload_store::UploadDestination::Workspace,
             &session_dir,
             "sess-1",
-            &project_root,
+            &crate::global_store::StoreScope::Project(project_root.clone()),
         )
         .unwrap();
         let image_upload = upload_store::commit_upload(
@@ -1682,7 +1683,7 @@ mod tests {
             upload_store::UploadDestination::Task,
             &session_dir,
             "sess-1",
-            &project_root,
+            &crate::global_store::StoreScope::Project(project_root.clone()),
         )
         .unwrap();
 
@@ -1744,7 +1745,7 @@ mod tests {
             upload_store::UploadDestination::Task,
             &session_dir,
             "daemon-session",
-            &daemon_project_root,
+            &crate::global_store::StoreScope::Project(daemon_project_root.clone()),
         )
         .unwrap();
 
@@ -1759,9 +1760,12 @@ mod tests {
             "single-root lookup should not find uploads committed under another project"
         );
 
-        let roots = vec![launch_project_root, daemon_project_root];
+        let scopes = vec![
+            crate::global_store::StoreScope::Project(launch_project_root),
+            crate::global_store::StoreScope::Project(daemon_project_root),
+        ];
         let attachments =
-            resolve_attachments_with_project_roots(&ids, &registry, &session_dir, &roots).await;
+            resolve_attachments_with_scopes(&ids, &registry, &session_dir, &scopes).await;
 
         assert_eq!(attachments.len(), 1);
         match &attachments[0] {

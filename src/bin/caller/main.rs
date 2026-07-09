@@ -35,6 +35,7 @@ mod fission_lifecycle;
 pub(crate) use intendant_core::frames;
 mod frontend;
 mod gateway_routes;
+mod global_store;
 pub(crate) use intendant_core::knowledge;
 mod lineage_ledger;
 mod linux_display_env;

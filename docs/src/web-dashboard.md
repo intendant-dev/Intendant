@@ -511,6 +511,17 @@ summary uses the same access abstraction as Terminal: local/mTLS, hosted
 transports, and peer dashboard-control routes are shown as targets with their
 available capabilities rather than as transport internals.
 
+The daemon-side durable state behind this surface — staged uploads
+(`uploads/<session-id>/` blob + sidecar) and transfer job metadata
+(`transfers/jobs`, plus daemon-materialized `transfers/artifacts`) — lives
+under `<project>/.intendant/` on project-rooted daemons. A **projectless
+daemon** (the macOS app daemon, or any `intendant` launched from a directory
+with no project marker) serves the same endpoints from a daemon-global
+fallback store at `~/.intendant/global-store/` with an identical layout; a
+project root, when present, always wins. The global store is pruned on
+daemon startup: upload session dirs, job files, and materialized artifacts
+idle for more than 14 days are removed (project stores are never pruned).
+
 The **Editor** sub-tab is a full-bleed workbench: a slim toolbar (target
 picker + one-line route summary + new file/folder), a lazy directory tree
 rail on the left (rooted at the project root locally, `~` on peers;
@@ -1923,10 +1934,10 @@ family (sub-routes elided where the family is uniform):
 | `WS /` or `WS /ws` | Main WebSocket: events, fallback Shell terminal I/O, presence protocol, WebRTC signaling |
 | `GET /api/sessions` | List past sessions (`/stream` NDJSON variant, `/search` full-text) |
 | `GET /api/session/{id}/*` | Per-session detail, report, log replay, context snapshots, recordings, frame assets |
-| `POST /api/session/{id}/agent-output` | Append agent output for a historical/session-scoped backend transcript |
+| `POST /api/session/{id}/agent-output` | Fetch persisted agent output by id for a historical/session-scoped transcript (POST-shaped read: the ids ride the body) |
 | `DELETE /api/session/{id}[/{target}]`, `POST /api/session/{id}/delete[/{target}]` | Delete archived session data (native DELETE plus WKWebView fallback) |
 | `GET /api/session/current/history`, `GET /api/session/current/changes[/*]` | Current-session reads: serialized history and file-change list/detail |
-| `POST /api/session/current/{rollback,redo,prune,agent-output}` | Current-session mutations: history rollback/redo/prune and active-session agent-output append |
+| `POST /api/session/current/{rollback,redo,prune,agent-output}` | Current-session actions: history rollback/redo/prune mutations, plus the POST-shaped agent-output fetch |
 | `GET /api/session/current/uploads[/*]`, `POST /api/session/current/uploads`, `DELETE /api/session/current/uploads/{id}` | Task attachment store: list, upload, raw fetch, delete |
 | `GET /api/managed-context/{records,anchors,fission}` | Managed-context state: rewind records, anchors, fission groups |
 | `GET /recordings/*`, `GET /frames/*` | Current-session recording segments and captured frame assets |
@@ -1970,7 +1981,7 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/session/current/rollback` | SessionManage | own origin | bounded | Roll the current session back to a round (optionally reverting files) |
 | POST | `/api/session/current/redo` | SessionManage | own origin | bounded | Redo the last rolled-back round |
 | POST | `/api/session/current/prune` | SessionManage | own origin | bounded | Prune rollback state for the current session |
-| POST | `/api/session/current/agent-output` | SessionManage | own origin | bounded | Append agent output to the current session's log |
+| POST | `/api/session/current/agent-output` | SessionManage | own origin | bounded | Fetch the current session's persisted agent output by id (POST-shaped read) |
 | POST | `/api/session/current/uploads` | SessionManage | own origin | streaming | Upload a file attachment (raw streamed body; name/destination in query) |
 | GET | `/api/session/current/uploads[/…]` | SessionManage | own origin | none | List uploads, or fetch one (subpath {id}/raw) |
 | DELETE | `/api/session/current/uploads/{upload_id}` | SessionManage | own origin | none | Delete one upload (file + sidecar) |
@@ -1979,7 +1990,7 @@ its operation per method/path from `federation_http_operation`.
 | DELETE | `/api/session/{id}/{target}/delete` | SessionManage | own origin | none | Delete one data kind for a session (suffix form) |
 | POST | `/api/session/{id}/delete` | SessionManage | own origin | none | Delete a session's data (POST fallback for WKWebView) |
 | POST | `/api/session/{id}/{target}/delete` | SessionManage | own origin | none | Delete one data kind for a session (POST fallback) |
-| POST | `/api/session/{id}/agent-output` | SessionManage | own origin | bounded | Append agent output to a session's log by id |
+| POST | `/api/session/{id}/agent-output` | SessionInspect | own origin | bounded | Fetch a session's persisted agent output by id (POST-shaped read) |
 | GET | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail and artifact sub-routes |
 | POST | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail sub-routes (POST fallback callers) |
 | GET | `/api/session[/…]` | SessionInspect | own origin | none | Session detail; context-snapshot, recordings (+segments/playlist), report zip, frames |
