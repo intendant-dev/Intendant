@@ -718,11 +718,17 @@ permissions in that session, no matter what its grant says — the grant record
 itself is untouched. `connect_account` sessions are always subject to their
 ceiling; `client_key` sessions only when the key's recorded enrollment origin
 is listed in `hosted_origins` (default `["https://connect.intendant.dev"]`) —
-keys enrolled from a daemon-served origin are anchor-grade and uncapped. This
-is the honest degraded-trust tier from the trust architecture: hosted-route
-sessions can operate but cannot administer. Owners who accept hosted-root
-risk can raise a ceiling or disable them all with an explicit empty map
-(`"role_ceilings": {}`).
+keys enrolled from any other origin are uncapped by default. Uncapped is a
+routing statement, not a blessing: a typed direct address is trustless first
+contact, while a fleet-certificate name is daemon-served *code* on a
+rendezvous-named *route* ([first-contact rung
+two](./trust-tiers.md#first-contact-three-rungs)); owners who want
+fleet-name sessions capped like hosted ones add the daemon's own fleet
+origin to `hosted_origins` (exact-origin match — the daemon's fleet URL,
+not the bare zone). This is the honest degraded-trust tier from the trust
+architecture: hosted-route sessions can operate but cannot administer.
+Owners who accept hosted-root risk can raise a ceiling or disable them all
+with an explicit empty map (`"role_ceilings": {}`).
 
 The common moves have a one-knob UI: the **hosted-control cap** on
 Access → Overview's Trust tier card writes both hosted bindings at once
