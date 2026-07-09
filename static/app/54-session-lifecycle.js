@@ -1330,7 +1330,7 @@ function restoreFilesTransferState() {
       cancelRequested: false,
       abortController: null,
     };
-    filesTransferCompletion(transfer);
+    filesTransferFsmInit(transfer, { actor: 'restore' });
     filesTransfers.push(transfer);
   }
 }
@@ -1704,8 +1704,15 @@ function filesTransferMergeServerJob(job) {
     abortController: null,
   };
   transfer.kind = kind;
-  if (!existing || !['queued', 'running', 'paused', 'failed'].includes(existing.status || '')) {
-    transfer.status = filesTransferStatusFromJob(job);
+  if (existing && !['queued', 'running', 'paused', 'failed'].includes(existing.status || '')) {
+    // A row this tab does not actively own mirrors the server job's status.
+    // (A brand-new row was already minted with it, so no self-transition.)
+    filesTransferTransition(transfer, filesTransferStatusFromJob(job), {
+      actor: 'server',
+      error: null,     // job.error merges below, after the status move
+      persist: false,  // refreshFilesTransferJobs persists + renders once per batch
+      render: false,
+    });
   }
   transfer.path = transfer.path || source;
   transfer.destination = transfer.destination || destination;
@@ -1718,7 +1725,7 @@ function filesTransferMergeServerJob(job) {
   transfer.error = job.error || transfer.error || '';
   filesTransferApplyServerJob(transfer, job);
   if (!existing) {
-    filesTransferCompletion(transfer);
+    filesTransferFsmInit(transfer, { actor: 'server' });
     filesTransfers.unshift(transfer);
   }
   return transfer;
@@ -1747,7 +1754,7 @@ async function refreshFilesTransferJobs() {
 
 // Finished transfers accumulate for the lifetime of the page; keep the
 // list bounded (active/queued/paused transfers are never pruned).
-const FILES_TRANSFER_TERMINAL_STATUSES = new Set(['completed', 'cancelled', 'failed']);
+// FILES_TRANSFER_TERMINAL_STATUSES lives in 53-transfer-fsm.js.
 const FILES_TRANSFER_HISTORY_LIMIT = 100;
 function pruneFinishedFilesTransfers() {
   let terminal = 0;
@@ -1866,8 +1873,7 @@ function filesUpdateActiveDownloadSummary(transfer = null) {
 }
 
 function queueFilesTransfer(transfer) {
-  transfer.queueEpoch = (transfer.queueEpoch || 0) + 1;
-  filesTransferCompletion(transfer);
+  filesTransferFsmInit(transfer, { actor: 'user' });
   filesTransfers.unshift(transfer);
   filesTransferPersistState();
   renderFilesTransfers();
@@ -2006,15 +2012,11 @@ async function runFilesDownloadTransfer(transfer) {
   // that left the status at 'queued' would make pumpFilesTransfers re-pick
   // the same entry forever, so every failure must flow through the catch
   // below. The transport guards therefore live inside the try.
-  transfer.status = 'running';
-  transfer.error = '';
-  transfer.pauseRequested = false;
-  transfer.cancelRequested = false;
+  filesTransferTransition(transfer, 'running', { actor: 'runner' });
   const controller = new AbortController();
   transfer.abortController = controller;
   transfer.transport = '';
   filesDownloadAbort = controller;
-  renderFilesTransfers();
   filesUpdateActiveDownloadSummary(transfer);
   let peerConnection = null;
   let peerDashboardConnection = null;
@@ -2190,22 +2192,15 @@ async function runFilesDownloadTransfer(transfer) {
   } catch (err) {
     const message = err?.message || String(err);
     if (transfer.cancelRequested) {
-      transfer.status = 'cancelled';
-      transfer.error = '';
-      filesTransferPersistState();
-      transfer.reject?.(err);
+      filesTransferTransition(transfer, 'cancelled', { actor: 'runner', error: '', failure: err });
       setFilesDownloadStatus('warn', 'Download cancelled');
     } else if (transfer.pauseRequested || err?.name === 'AbortError') {
-      transfer.status = 'paused';
-      transfer.error = '';
-      filesTransferPersistState();
-      transfer.reject?.(err);
+      // Non-terminal teardown: the in-flight attempt's promise still
+      // rejects (failure) — Resume mints a fresh one.
+      filesTransferTransition(transfer, 'paused', { actor: 'runner', error: '', failure: err });
       setFilesDownloadStatus('warn', `Paused at ${filesTransferProgressText(transfer)}`);
     } else {
-      transfer.status = 'failed';
-      transfer.error = message;
-      filesTransferPersistState();
-      transfer.reject?.(err);
+      filesTransferTransition(transfer, 'failed', { actor: 'runner', error: message, failure: err });
       setFilesDownloadStatus('error', message);
       if (typeof showControlToast === 'function') showControlToast('error', message);
     }
@@ -2237,12 +2232,10 @@ function settleCompletedFilesDownload(transfer, { resumable }) {
     resumable,
   };
   transfer.result = result;
-  transfer.status = 'completed';
-  filesTransferPersistState();
+  filesTransferTransition(transfer, 'completed', { actor: 'runner', result });
   setFilesDownloadProgress(result.size, result.total_size || result.size);
   setFilesDownloadStatus('ok', `Downloaded ${result.filename} (${humanBytes(result.size)})`);
   if (!transfer.skipBrowserSave) downloadDashboardBlob(result.blob, result.filename, result.content_type);
-  transfer.resolve?.(result);
   return result;
 }
 
@@ -2329,11 +2322,12 @@ async function runFilesFilesystemUploadHttpFallback(transfer, controller) {
     throw new Error(filesTransferFriendlyServerError(resp.body?.error, `file write returned HTTP ${resp.status}`));
   }
   transfer.loaded = transfer.totalSize;
-  transfer.status = 'completed';
-  filesTransferPersistState();
+  filesTransferTransition(transfer, 'completed', {
+    actor: 'runner',
+    result: { ok: true, path: destination, transport: 'http-fs-write' },
+  });
   await filesTransferDeleteUploadBlob(transfer.id);
   setFilesUploadStatus('ok', `Uploaded ${transfer.name} to ${destination}`);
-  transfer.resolve?.({ ok: true, path: destination, transport: 'http-fs-write' });
 }
 
 // Mirror the durable-job destination semantics client-side: an existing
@@ -2451,11 +2445,9 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
   filesTransferApplyServerJob(transfer, committed.job);
   transfer.loaded = transfer.totalSize;
   transfer.descriptor = committed.job;
-  transfer.status = 'completed';
-  filesTransferPersistState();
+  filesTransferTransition(transfer, 'completed', { actor: 'runner', result: committed.job });
   await filesTransferDeleteUploadBlob(transfer.id);
   setFilesUploadStatus('ok', `Uploaded ${transfer.name || 'upload.bin'}`);
-  transfer.resolve?.(committed.job);
 }
 
 function filesDeleteServerTransfer(transfer) {
@@ -2470,14 +2462,11 @@ function filesDeleteServerTransfer(transfer) {
 async function runFilesUploadTransfer(transfer) {
   // Same rule as downloads: settle the status before any guard can throw,
   // so pumpFilesTransfers never re-picks a permanently 'queued' entry.
-  transfer.status = 'running';
-  transfer.error = '';
+  filesTransferTransition(transfer, 'running', { actor: 'runner' });
   transfer.loaded = Number(transfer.loaded || 0);
-  transfer.cancelRequested = false;
   transfer.transport = '';
   const controller = new AbortController();
   transfer.abortController = controller;
-  renderFilesTransfers();
   try {
     const filesystemUpload = Boolean(transfer.destination && transfer.destination !== 'task');
     if (filesystemUpload && transfer.uploadBlobPersistPromise) {
@@ -2539,23 +2528,18 @@ async function runFilesUploadTransfer(transfer) {
       }
       transfer.loaded = transfer.file.size;
       transfer.descriptor = descriptor;
-      transfer.status = 'completed';
+      filesTransferTransition(transfer, 'completed', { actor: 'runner', result: descriptor });
       filesStagedUploads.set(String(descriptor.id || transfer.id), descriptor);
       setFilesUploadStatus('ok', `Uploaded ${descriptor.name || transfer.file.name || 'upload.bin'}`);
       renderFilesStagedUploads();
-      transfer.resolve?.(descriptor);
     }
   } catch (err) {
     if (transfer.cancelRequested || err?.name === 'AbortError') {
-      transfer.status = 'cancelled';
-      transfer.error = '';
+      filesTransferTransition(transfer, 'cancelled', { actor: 'runner', error: '', failure: err });
     } else {
-      transfer.status = 'failed';
-      transfer.error = err?.message || String(err);
+      filesTransferTransition(transfer, 'failed', { actor: 'runner', error: err?.message || String(err), failure: err });
       setFilesUploadStatus('error', transfer.error);
     }
-    filesTransferPersistState();
-    transfer.reject?.(err);
   } finally {
     transfer.abortController = null;
     filesTransferPersistState();
@@ -2581,14 +2565,16 @@ async function pumpFilesTransfers() {
         // Forward-progress backstop: a runner that exits without settling
         // its transfer would be re-picked by the find() above forever — a
         // synchronous microtask spin that freezes the page and allocates
-        // without bound. Force the entry failed so the pump always drains.
-        // The epoch check exempts entries the user legitimately re-queued
-        // (Resume/Retry bump it) while the runner was tearing down.
-        transfer.status = 'failed';
-        transfer.error = failure?.message || transfer.error || 'transfer runner exited without settling';
-        filesTransferPersistState();
-        renderFilesTransfers();
-        transfer.reject?.(failure || new Error(transfer.error));
+        // without bound. Force the entry failed so the pump always drains
+        // (the transition also rejects the completion promise). The epoch
+        // check exempts entries legitimately re-queued (Resume/Retry bump
+        // it) while the runner was tearing down.
+        filesTransferTransition(transfer, 'failed', {
+          actor: 'pump',
+          error: failure?.message || transfer.error || 'transfer runner exited without settling',
+          failure: failure || undefined,
+          reason: 'runner exited without settling its transfer',
+        });
       }
       // Macrotask yield: even a misbehaving runner that settles instantly
       // can only busy the tab, never wedge the event loop.
@@ -2616,9 +2602,9 @@ function pauseFilesTransfer(id) {
   const transfer = filesTransferById(id);
   if (!transfer) return;
   if (transfer.status === 'queued') {
-    transfer.status = 'paused';
-    filesTransferPersistState();
-    renderFilesTransfers();
+    // Not started yet: park it in place. The completion promise stays
+    // pending until Resume re-arms it — only a runner teardown rejects.
+    filesTransferTransition(transfer, 'paused', { actor: 'user' });
     return;
   }
   if (transfer.status !== 'running') return;
@@ -2636,10 +2622,10 @@ function cancelFilesTransfer(id) {
   if (transfer.status === 'running') {
     transfer.abortController?.abort();
   } else if (['queued', 'paused'].includes(transfer.status)) {
-    transfer.status = 'cancelled';
-    transfer.reject?.(new Error('transfer cancelled'));
-    filesTransferPersistState();
-    renderFilesTransfers();
+    filesTransferTransition(transfer, 'cancelled', {
+      actor: 'user',
+      failure: new Error('transfer cancelled'),
+    });
     pumpFilesTransfers();
   }
 }
@@ -2647,14 +2633,8 @@ function cancelFilesTransfer(id) {
 function resumeFilesTransfer(id) {
   const transfer = filesTransferById(id);
   if (!transfer || !['paused', 'failed'].includes(transfer.status)) return null;
-  transfer.queueEpoch = (transfer.queueEpoch || 0) + 1;
-  transfer.status = 'queued';
-  transfer.error = '';
-  transfer.pauseRequested = false;
-  transfer.cancelRequested = false;
-  filesTransferCompletion(transfer);
-  filesTransferPersistState();
-  renderFilesTransfers();
+  // Entering 'queued' re-arms the attempt (epoch bump, flags, completion).
+  filesTransferTransition(transfer, 'queued', { actor: 'user' });
   pumpFilesTransfers();
   return transfer.completion;
 }
@@ -2663,21 +2643,15 @@ function retryFilesTransfer(id) {
   const transfer = filesTransferById(id);
   if (!transfer || !['failed', 'cancelled', 'completed'].includes(transfer.status)) return null;
   if (transfer.kind === 'download') resetFilesDownloadTransfer(transfer);
-  transfer.queueEpoch = (transfer.queueEpoch || 0) + 1;
-  transfer.status = 'queued';
-  transfer.error = '';
-  transfer.cancelRequested = false;
-  transfer.pauseRequested = false;
-  filesTransferCompletion(transfer);
-  filesTransferPersistState();
-  renderFilesTransfers();
+  // Entering 'queued' re-arms the attempt (epoch bump, flags, completion).
+  filesTransferTransition(transfer, 'queued', { actor: 'user' });
   pumpFilesTransfers();
   return transfer.completion;
 }
 
 function clearFilesTransferHistory() {
   for (let i = filesTransfers.length - 1; i >= 0; i -= 1) {
-    if (['completed', 'failed', 'cancelled'].includes(filesTransfers[i].status)) {
+    if (FILES_TRANSFER_TERMINAL_STATUSES.has(filesTransfers[i].status)) {
       filesTransferDeleteDownloadParts(filesTransfers[i].id, Number(filesTransfers[i].rangeCount || 512));
       filesTransferDeleteUploadBlob(filesTransfers[i].id);
       filesTransfers.splice(i, 1);
@@ -2693,10 +2667,13 @@ async function saveCompletedFilesDownload(id) {
   if (!transfer.result?.blob) {
     const hydrated = await filesTransferLoadDownloadParts(transfer);
     if (!hydrated) {
-      transfer.status = 'failed';
-      transfer.error = 'download chunks are no longer available';
-      filesTransferPersistState();
-      renderFilesTransfers();
+      // Documented completed → failed exception: Save clicked after the
+      // cached download chunks were evicted (typically post-reload).
+      filesTransferTransition(transfer, 'failed', {
+        actor: 'user',
+        error: 'download chunks are no longer available',
+        reason: 'saved download chunks were evicted',
+      });
       return null;
     }
     const blob = new Blob(transfer.parts || [], { type: transfer.contentType || 'application/octet-stream' });
