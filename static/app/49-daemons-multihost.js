@@ -199,6 +199,38 @@ function dashboardSetControlLastError(message = '', kind = '') {
   dashboardControlLastErrorKind = dashboardControlLastError ? String(kind || '').trim() : '';
 }
 
+// ── Virtual display availability ──
+// Virtual displays are a host capability (Xvfb-based, Linux-only): derive
+// the "New virtual display" affordances from the daemon instead of offering
+// a button that can only fail on macOS/Windows hosts. Two sources, because
+// each covers a transport the other can't: the displays payload reaches
+// direct dashboards over HTTP, and the dashboard-control status capability
+// reaches Connect dashboards once the channel is up (the HTTP probe is
+// impossible there, so dashboardUpdateTransportStatus re-applies the gate
+// whenever transport state changes). Declared HERE, before that function's
+// first eval-time call — a later-fragment `let` would be a TDZ trap that
+// kills the whole module.
+let daemonVirtualDisplaysAvailable = null;
+function virtualDisplaysAvailableNow() {
+  return daemonVirtualDisplaysAvailable === true ||
+    dashboardControlTransport?.lastStatus?.virtual_displays_available === true;
+}
+function updateVirtualDisplayAvailabilityUi() {
+  const btn = document.getElementById('displays-create-virtual');
+  if (btn) btn.hidden = !virtualDisplaysAvailableNow();
+}
+async function refreshVirtualDisplayAvailability() {
+  if (!dashboardConnectModeEnabled()) {
+    try {
+      const payload = await fetchLocalDisplaysPayload();
+      daemonVirtualDisplaysAvailable = payload?.virtual_displays_available === true;
+    } catch (_) {
+      daemonVirtualDisplaysAvailable = null;
+    }
+  }
+  updateVirtualDisplayAvailabilityUi();
+}
+
 function dashboardUpdateTransportStatus() {
   const group = document.getElementById('sb-dashboard-transport');
   const dot = document.getElementById('sb-dashboard-transport-dot');
@@ -930,6 +962,7 @@ class DashboardTransport {
 
 dashboardTransport = new DashboardTransport();
 dashboardUpdateTransportStatus();
+refreshVirtualDisplayAvailability();
 
 function maybeStartDashboardControlTransport() {
   return dashboardTransport.startControl();
