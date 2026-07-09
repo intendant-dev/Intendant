@@ -37,6 +37,11 @@ ui2-settings.css
 ui2-shell.html
 
 30-module-open.html
+# 30-module-canary.js must stay the FIRST .js fragment and
+# 59-module-alive.js the LAST (module-death canary pair — an uncaught
+# top-level throw anywhere between them paints a fatal banner; see either
+# file's header).
+30-module-canary.js
 31-ui2-foundation.js
 ui2-chrome.js
 ui2-voice.js
@@ -73,4 +78,5 @@ ui2-settings.js
 56-debug-sessions.js
 57-sessions-replay.js
 58-shortcuts-boot.js
+59-module-alive.js
 59-module-close.html

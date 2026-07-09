@@ -341,6 +341,20 @@ Windows backends in detail.
 `WAYLAND_DISPLAY` before falling back to `DISPLAY`; macOS and Windows always use
 the native backend.
 
+Every backend implements the same **capture teardown contract** (doc-commented
+on the `DisplayBackend` trait in `crates/intendant-display/src/lib.rs` — that
+doc is canonical): after `stop_capture()` returns, the frame channel closes
+within bounded time; no late captured-frame callback may touch freed state
+(each backend owns whatever quiesce its OS needs — the thread-backed backends
+join their capture thread, while macOS gates ScreenCaptureKit's unjoinable
+callback queue behind a per-session shutdown flag and sender slot, because SCK
+has been observed delivering frames ~53 s after stop); double-stop and
+stop-without-start are no-ops; and start-after-stop yields a fresh, clean
+session. The `capture_teardown_contract` tests stress the contract on
+synthetic backends in CI, and each real OS backend has an `#[ignore]`d
+start/stop stress test for operator hardware
+(`cargo test -p intendant-display --lib -- --ignored real_capture_stress`).
+
 > **Browser input is physical-key-only (Phase 1).** Injected key events use the
 > DOM `code` field (physical key position), not `key`. Non-US keyboard layouts
 > therefore produce incorrect character output until a future phase adds

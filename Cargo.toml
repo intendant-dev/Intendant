@@ -156,7 +156,8 @@ x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "xtest"] }
 atspi = { version = "0.30", features = ["tokio"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-screencapturekit = "8.0"
+# (screencapturekit moved to crates/intendant-display with the display
+# pipeline — macos.rs there is its only user in the workspace.)
 core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
 shiguredo_video_toolbox = "2026.1"
