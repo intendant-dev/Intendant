@@ -118,6 +118,17 @@ was built *for* boxes you do not trust. Apply it there and only there:
   non-technical user's consolation prize; it is *everyone's* correct client
   for the machines that matter.
 
+Getting a pleasant direct origin today: the fleet strip offers **↗
+direct** wherever a daemon's own URL is known, and the daemon-store vault
+([Credential Custody](./credential-custody.md#the-vault)) makes that tab
+self-sufficient. For a warning-free padlock, give the daemon a real
+certificate — a hostname you own with a DNS-01 Let's Encrypt cert, or
+`tailscale cert` on a tailnet — otherwise accept the browser's one-time
+exception for the self-signed cert and let the enrollment ceremony carry
+identity from there. A fleet-DNS service that mints per-daemon names and
+certificates automatically (the Tailscale pattern, operated by the
+rendezvous as pure plumbing) is the designed follow-on.
+
 A worked example, one fleet:
 
 | Daemon | Tier | Control origins | Custody | Peer grants |
@@ -162,7 +173,8 @@ the owner's memory. All three are **shipped**:
    lease/relay ceremony with the session's origin class
    (`hosted`/`direct`/`local`/`peer`). Honest limits, stated in the UI
    too: this is client-side self-enforcement — protection against
-   mistakes and casual exfiltration, not against a malicious bundle —
-   and until the direct/app vault path exists (the local-vault work),
-   a trusted-only entry is stored-but-sealed everywhere the vault
-   currently opens.
+   mistakes and casual exfiltration, not against a malicious bundle.
+   With the **local vault** shipped (the daemon-store backend in
+   [Credential Custody](./credential-custody.md#the-vault)), trusted-only
+   entries do real work: sealed against hosted tabs, fully usable from a
+   direct dashboard backed by the daemon's own store.

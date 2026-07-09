@@ -287,6 +287,12 @@
   transition: border-color 0.15s ease, color 0.15s ease;
 }
 .acc-fleet-add:hover { border-color: var(--blue); color: var(--blue); }
+.acc-fleet-direct {
+  font-size: 10.5px;
+  padding: 2px 7px;
+  min-height: 0;
+  line-height: 1.4;
+}
 
 /* "How access works" explainer. */
 .acc-explainer, .ui-explainer {

@@ -70,10 +70,39 @@ hosted tabs — no reveal, no lease fueling, no egress relay, no voice
 mirror — while still syncing inside the encrypted body. This is
 client-side self-enforcement (a guard against mistakes and casual
 exfiltration, not against a malicious bundle — see
-[Trust Tiers](./trust-tiers.md)); and since today's vault only opens
-through a Connect service, a trusted-only entry stays stored-but-sealed
-until the direct/app vault path exists. The policy field is invisible
-to the service like every other entry field.
+[Trust Tiers](./trust-tiers.md)). On a **direct** dashboard backed by
+the daemon store (below), trusted-only entries work normally — that is
+the tier the policy reserves them for. The policy field is invisible
+to every store like any other entry field.
+
+**Storage backends.** The sealed blob has two possible homes, both
+blind to its contents, and the dashboard says which one backs it (the
+store chip on the vault card):
+
+- **Account store** (hosted tabs): the Connect service keeps one blob
+  per account — the vault follows the person across daemons. This is
+  the original path and remains the default wherever the dashboard
+  arrived through Connect.
+- **Daemon store** (direct dashboards): the daemon itself keeps the
+  blob at `~/.intendant/vault-blob.json` (0600), served over the
+  verified control channel (`api_daemon_vault_fetch` /
+  `api_daemon_vault_publish`, `credentials.manage`-gated). No Connect
+  service is in the loop: a direct dashboard creates, unseals, and
+  fuels from a vault that never leaves machines the owner controls.
+  The daemon-side rules replicate the hosted store's exactly
+  (`vault_store.rs` twin-tested against `bin/connect/fleet.rs`): shape
+  validation, the monotonic-revision rollback ratchet, same-revision
+  divergence conflicts, and the MAC-presence ratchet.
+
+The two stores are **independent** — each keeps its own revision
+ratchet, and nothing syncs implicitly between them. Moving a vault is
+an explicit action: a hosted tab with an unlocked vault offers **"Keep
+a sealed copy on this daemon"**, which publishes the encrypted blob to
+the tunneled daemon's store; the direct dashboard there then unseals it
+with the same recovery phrase, or with a passkey enrolled from that
+origin (passkeys are origin-scoped, so the first unseal on a new origin
+is phrase-first, then enroll the local passkey — the blob holds one
+envelope per unlocker).
 
 **Keying.** A random 256-bit vault master key `K` encrypts the vault
 body (AES-GCM). `K` itself is never stored — it is wrapped into one
@@ -144,6 +173,8 @@ raw frame names are reserved for the `egress_*` relay path):
 | `api_credential_lease_revoke` | browser → daemon request with optional `lease_id` / `leaseId` / `kind`; omitted revokes every lease on the daemon | `revoked` count |
 | `api_credential_lease_status` | browser → daemon request with no params | active `leases` (`lease_id`, `kind`, `label`, `mode`, grant/renew/expiry timestamps, `ttl_ms`, `offline_ms`, `use_count`), active `egress` relays, and `expired_note` |
 | `api_credential_custody_trail` | browser → daemon request with no params | recent custody events (`at_unix_ms`, `event`, `kind`, `label`, `actor`, `origin`, `detail`) from the daemon's own record — lease grants/expiries/revocations, relay changes, restart resets; metadata only, never material. `origin` stamps the session's origin class on ceremonies (`hosted` / `direct` / `local` / `peer`; empty on sessionless events and pre-field records). Kept at `~/.intendant/custody-audit.jsonl` (0600, bounded), rendered in Access → Advanced → Custody trail |
+| `api_daemon_vault_fetch` | browser → daemon request with no params | the daemon-stored sealed blob, if any: `revision`, `vault` (E2E ciphertext the daemon cannot read), `updated_unix_ms`; `revision: 0, vault: null` when empty |
+| `api_daemon_vault_publish` | browser → daemon request with `revision` and the full `vault` blob | `stored` (`false` = idempotent same-revision republish); rollback, same-revision divergence, and MAC-stripping are refused with a `vault revision conflict:`-prefixed error the dashboard treats like the hosted store's HTTP 409 |
 
 Leases ride the same per-frame IAM checks as every other tunnel
 operation; granting requires a session whose principal holds a new

@@ -241,6 +241,7 @@ pub(crate) fn control_frame_response(
                                 "kind": event.kind,
                                 "label": event.label,
                                 "actor": event.actor,
+                                "origin": event.origin,
                                 "detail": event.detail,
                             })
                         })
@@ -251,6 +252,48 @@ pub(crate) fn control_frame_response(
                         "ok": true,
                         "result": { "events": events },
                     }))
+                }
+                "api_daemon_vault_fetch" => {
+                    // Blind storage: the blob is E2E ciphertext this daemon
+                    // can neither read nor forge (vault_store.rs).
+                    let result = match crate::vault_store::fetch() {
+                        Some((revision, vault, updated_unix_ms)) => serde_json::json!({
+                            "revision": revision,
+                            "vault": vault,
+                            "updated_unix_ms": updated_unix_ms,
+                        }),
+                        None => serde_json::json!({ "revision": 0, "vault": null }),
+                    };
+                    Some(serde_json::json!({
+                        "t": "response",
+                        "id": id,
+                        "ok": true,
+                        "result": result,
+                    }))
+                }
+                "api_daemon_vault_publish" => {
+                    let params_ref = params.as_ref();
+                    let revision = match params_ref
+                        .map(|p| optional_u64_param(p, &["revision"]))
+                        .unwrap_or(Ok(None))
+                    {
+                        Ok(value) => value.unwrap_or(0),
+                        Err(error) => return Some(dashboard_control_error_response(id, error)),
+                    };
+                    let vault = params_ref
+                        .and_then(|p| p.get("vault"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    Some(match crate::vault_store::publish(revision, vault, now) {
+                        Ok(stored) => serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": true,
+                            "result": { "stored": stored, "revision": revision },
+                        }),
+                        Err(error) => dashboard_control_error_response(id, error.message()),
+                    })
                 }
                 "api_credential_egress_register" => {
                     let kinds: Vec<String> = params

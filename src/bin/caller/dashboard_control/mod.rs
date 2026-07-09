@@ -162,6 +162,13 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     method("api_credential_lease_revoke", PeerOperation::CredentialsManage),
     method("api_credential_lease_status", PeerOperation::CredentialsManage),
     method("api_credential_custody_trail", PeerOperation::CredentialsManage),
+    // Daemon-local vault blob storage (the local-vault half of custody):
+    // blind E2E ciphertext the daemon can neither read nor forge, so a
+    // direct dashboard has a vault home without any Connect service in
+    // the loop. Same gate as leases — fetch included: envelope metadata
+    // and revision history are custody-sensitive.
+    method("api_daemon_vault_fetch", PeerOperation::CredentialsManage),
+    method("api_daemon_vault_publish", PeerOperation::CredentialsManage),
     method(
         "api_credential_egress_register",
         PeerOperation::CredentialsManage,

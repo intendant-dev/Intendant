@@ -74,6 +74,7 @@ mod transcription;
 mod transfer_store;
 mod types;
 mod upload_store;
+mod vault_store;
 mod virtual_display;
 pub(crate) use intendant_platform::vision;
 mod web_gateway;
