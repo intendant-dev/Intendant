@@ -441,10 +441,17 @@ function buildSessionCard(m, derived, ctx) {
 
   const rowIsPartial = s.partial === true;
   const card = document.createElement('div');
-  card.className = 'session-card';
+  // sc-split: content column + actions column as real flex layout. The
+  // actions used to float absolutely over the card and collided with the
+  // badge chips (and clipped "Delete…") whenever the cluster grew or the
+  // card ran short.
+  card.className = 'session-card sc-split';
   if (isCurrent) card.classList.add('current');
   if (displayStatus === 'abandoned') card.classList.add('dimmed');
   if (rowIsPartial) card.classList.add('partial');
+  const main = document.createElement('div');
+  main.className = 'sc-main';
+  card.appendChild(main);
 
   const sessionName = compactSessionText(s.name);
   const taskText = compactSessionText(s.task);
@@ -560,7 +567,7 @@ function buildSessionCard(m, derived, ctx) {
     top.appendChild(badge);
   }
 
-  card.appendChild(top);
+  main.appendChild(top);
 
   // Task
   if (taskText && sessionName) {
@@ -679,7 +686,7 @@ function buildSessionCard(m, derived, ctx) {
   if (!rowIsPartial && s.total_bytes > 0) tipParts.push(`disk: ${_fmtBytes(s.total_bytes)}`);
   if (projectPath) tipParts.push(`project: ${projectPath}`);
   if (tipParts.length) meta.title = tipParts.join('\n');
-  card.appendChild(meta);
+  main.appendChild(meta);
 
   // Media stats row (recordings, annotations, clips) + total session size
   const hasMedia = (s.recordings > 0 || s.annotations > 0 || s.clips > 0);
@@ -702,7 +709,7 @@ function buildSessionCard(m, derived, ctx) {
     if (s.annotations > 0) addMediaField('annotations', s.annotations, 'v-peach');
     if (s.clips > 0) addMediaField('clips', s.clips, 'v-peach');
     if (s.total_bytes > 0) addMediaField('size', _fmtBytes(s.total_bytes), 'v-dim');
-    card.appendChild(mediaMeta);
+    main.appendChild(mediaMeta);
   }
 
   // Actions row. While browsing a peer host the cards are read-only —

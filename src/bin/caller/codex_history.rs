@@ -186,19 +186,9 @@ impl UserTurnRevisionState {
 }
 
 pub(crate) fn is_codex_injected_user_text_for_main(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with("# AGENTS.md instructions for ")
-        || trimmed.starts_with("<turn_aborted>")
-        || trimmed.starts_with("<subagent_notification>")
-        || trimmed.starts_with("<environment_context>")
-        || trimmed.starts_with("<task-notification>")
-        || trimmed.starts_with("<command-name>")
-        || trimmed.starts_with("<command-message>")
-        || trimmed.starts_with("<local-command-stdout>")
-        || trimmed.starts_with("<bash-input>")
-        || trimmed.starts_with("<bash-stdout>")
-        || trimmed.starts_with("<bash-stderr>")
-        || trimmed.starts_with("<user_shell_command>")
+    // Delegates to the canonical predicate — this was a byte-for-byte copy
+    // that had already drifted from the session-catalog vocabulary.
+    crate::web_gateway::is_injected_external_user_text(text)
 }
 
 pub(crate) fn codex_user_turn_state_from_history(session_id: &str) -> Option<UserTurnRevisionState> {
