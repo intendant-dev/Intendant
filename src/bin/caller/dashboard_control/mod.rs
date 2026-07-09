@@ -243,7 +243,21 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     method("api_sessions_stream", PeerOperation::SessionInspect),
     method("api_session_detail", PeerOperation::SessionInspect),
     method("api_session_report", PeerOperation::SessionInspect),
+    // Fetches persisted stdout/stderr chunks by output id — a pure
+    // session-log read, inspect-grade like the neighboring by-id reads.
+    // Keep equal to the HTTP twin row (POST /api/session/{id}/agent-output;
+    // POST-shaped only because the ids ride the body) until transport
+    // unification derives tunnel ops from the route rows — pinned by
+    // `formerly_divergent_twins_gate_identically_on_both_lanes`.
     method("api_session_agent_output", PeerOperation::SessionInspect),
+    // Replays one archived context snapshot out of the session log — a
+    // pure read; inspect-grade to match the HTTP twin (the GET
+    // /api/session sub-router row serving {id}/context-snapshot). It was
+    // originally mis-grouped with the manage-gated mutations below. Keep
+    // equal to the route row until transport unification derives tunnel
+    // ops from the rows — pinned by
+    // `formerly_divergent_twins_gate_identically_on_both_lanes`.
+    method("api_session_context_snapshot", PeerOperation::SessionInspect),
     method("api_sessions_search", PeerOperation::SessionInspect),
     method("api_session_recordings", PeerOperation::SessionInspect),
     method("api_session_recording_asset", PeerOperation::SessionInspect),
@@ -266,7 +280,6 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
         "api_session_current_agent_output",
         PeerOperation::SessionManage,
     ),
-    method("api_session_context_snapshot", PeerOperation::SessionManage),
     method("api_session_control_msg", PeerOperation::SessionManage),
     method("api_worktrees_scan", PeerOperation::SessionManage),
     method("api_worktrees_remove", PeerOperation::SessionManage),
@@ -2978,6 +2991,47 @@ mod tests {
             method_operation("api_transfer_upload_chunk"),
             Some(PeerOperation::FilesystemWrite)
         );
+    }
+
+    /// The two methods whose tunnel rows historically diverged from their
+    /// HTTP route rows are pinned equal across BOTH lanes. Their handlers
+    /// are pure session-log reads (`session_agent_output_post_response`
+    /// fetches persisted output chunks by id;
+    /// `session_context_snapshot_response_body` replays one archived
+    /// snapshot), so both lanes gate them inspect-grade. Transport
+    /// unification will derive the tunnel op from the route row and make
+    /// this drift class unrepresentable; until then this test is the pin
+    /// — if either declaration moves, move its twin in the same commit.
+    #[test]
+    fn formerly_divergent_twins_gate_identically_on_both_lanes() {
+        use crate::gateway_routes::{classify, TableClassification};
+        use crate::peer::access_policy::PeerOperation;
+        for (method, http_method, http_path) in [
+            (
+                "api_session_agent_output",
+                "POST",
+                "/api/session/abc123/agent-output",
+            ),
+            (
+                "api_session_context_snapshot",
+                "GET",
+                "/api/session/abc123/context-snapshot",
+            ),
+        ] {
+            let tunnel_op = method_operation(method);
+            assert_eq!(
+                tunnel_op,
+                Some(PeerOperation::SessionInspect),
+                "{method}: session-log reads are inspect-grade"
+            );
+            let TableClassification::Matched(route_op) = classify(http_method, http_path) else {
+                panic!("{http_method} {http_path} must classify via the route table");
+            };
+            assert_eq!(
+                tunnel_op, route_op,
+                "{method} must gate identically on the tunnel and on {http_method} {http_path}"
+            );
+        }
     }
 
     #[tokio::test]

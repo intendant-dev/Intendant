@@ -472,13 +472,16 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::CurrentPrune,
         "Prune rollback state for the current session",
     ),
+    // POST-shaped read (the body carries output ids; nothing is written).
+    // Manage-gated only because the whole current/* family deliberately
+    // is (see the sub-router comment below), not because it mutates.
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/session/current/agent-output"),
         PeerOperation::SessionManage,
         BodyPolicy::Default,
         RouteHandlerId::CurrentAgentOutput,
-        "Append agent output to the current session's log",
+        "Fetch the current session's persisted agent output by id (POST-shaped read)",
     ),
     op_route(
         RouteMethod::Post,
@@ -570,6 +573,16 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::SessionDelete,
         "Delete one data kind for a session (POST fallback)",
     ),
+    // POST-shaped read: the body carries output ids and the handler
+    // (`session_agent_output_post_response`) only fetches persisted
+    // stdout/stderr chunks back out of the session's log — nothing is
+    // appended, so it is inspect-grade like every other by-id session
+    // read. The legacy verb-shaped classifier (POST under /api/session ⇒
+    // manage) mis-tagged it and diverged from the tunnel twin
+    // `api_session_agent_output`. Keep the two lanes' operations equal
+    // (pinned by dashboard_control's
+    // `formerly_divergent_twins_gate_identically_on_both_lanes`) until
+    // transport unification derives the tunnel op from this row.
     op_route(
         RouteMethod::Post,
         PathPattern::Segments(
@@ -579,10 +592,10 @@ pub(crate) static ROUTES: &[Route] = &[
                 SegmentSpec::Literal("agent-output"),
             ],
         ),
-        PeerOperation::SessionManage,
+        PeerOperation::SessionInspect,
         BodyPolicy::Default,
         RouteHandlerId::SessionAgentOutput,
-        "Append agent output to a session's log by id",
+        "Fetch a session's persisted agent output by id (POST-shaped read)",
     ),
     // ── Session detail + artifacts sub-router. Method-explicit ports of
     //    the method-blind legacy catch-all: the classifier's historical
@@ -1699,6 +1712,27 @@ mod tests {
             classify("GET", "/api/definitely-not-a-route"),
             TableClassification::NoMatch
         ));
+        // The formerly-divergent dashboard twins classify inspect-grade:
+        // both are pure session-log reads (agent-output is POST-shaped
+        // only because the output ids ride the body). The tunnel lane is
+        // pinned equal by dashboard_control's
+        // `formerly_divergent_twins_gate_identically_on_both_lanes`;
+        // transport unification will replace both pins with derivation.
+        for (method, path) in [
+            ("POST", "/api/session/abc123/agent-output"),
+            ("GET", "/api/session/abc123/context-snapshot"),
+        ] {
+            match classify(method, path) {
+                TableClassification::Matched(op) => assert_eq!(
+                    op,
+                    Some(PeerOperation::SessionInspect),
+                    "{method} {path} is a read and must classify inspect-grade"
+                ),
+                TableClassification::NoMatch => {
+                    panic!("{method} {path} must classify via table")
+                }
+            }
+        }
     }
 
     /// The docs chapter's generated endpoint table must equal the one
