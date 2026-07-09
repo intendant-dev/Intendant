@@ -47,6 +47,11 @@ ui2-chrome.js
 ui2-voice.js
 ui2-activity.js
 31-init-identity-fleet.js
+# 32-daemon-api.js must stay AFTER 31-init-identity-fleet.js (it reads the
+# transport `let` bindings and peer registries declared there) and BEFORE
+# every daemonApi consumer fragment (the F1+ family migrations start at
+# 32-vault-custody.js and run through 55-files-ide.js).
+32-daemon-api.js
 32-vault-custody.js
 33-station-core.js
 34-station-panes.js
