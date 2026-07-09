@@ -2950,6 +2950,173 @@ mod tests {
         );
     }
 
+    /// The SPA's `daemonApi` facade mirrors the HTTP twins of its tunnel
+    /// methods as `DAEMON_API_HTTP_MAP` (static/app/32-daemon-api.js). That
+    /// copy can't derive from `gateway_routes::ROUTES`, so pin every entry
+    /// against the table — same pattern as
+    /// `spa_action_msg_rpc_set_mirrors_dashboard_action_allowlist`
+    /// (api_control.rs). Four facts per entry: the tunnel twin exists in
+    /// `CONTROL_METHODS`; the verb + instantiated path resolve to a
+    /// declared route whose verb is declared exactly (never via `Any`);
+    /// the row's IAM operation equals the tunnel method's; and the path
+    /// template restates the row's declared pattern (captures by name).
+    /// Plus the exact coverage set, so entries appear and disappear
+    /// deliberately. When the route table grows its `tunnel:` column
+    /// (transport program S3), this hand-derivation collapses into the
+    /// table itself.
+    #[test]
+    fn daemon_api_http_map_mirrors_gateway_routes() {
+        use crate::gateway_routes::{
+            match_route, PathPattern, RouteAuthz, RouteMethod, SegmentSpec,
+        };
+
+        let app = include_str!("../../../../static/app.html");
+        let start = "const DAEMON_API_HTTP_MAP = Object.freeze({";
+        let from = app
+            .find(start)
+            .expect("DAEMON_API_HTTP_MAP not found in app.html")
+            + start.len();
+        let rest = &app[from..];
+        let to = rest.find("});").expect("DAEMON_API_HTTP_MAP is unterminated");
+
+        // One `name: { verb: '…', path: '…', … },` entry per line — the
+        // fragment documents that contract next to the literal.
+        fn quoted(entry: &str, key: &str) -> Option<String> {
+            let marker = format!("{key}: '");
+            let at = entry.find(&marker)? + marker.len();
+            let rest = &entry[at..];
+            Some(rest[..rest.find('\'')?].to_string())
+        }
+        let mut entries: std::collections::BTreeMap<String, (String, String)> =
+            Default::default();
+        for line in rest[..to].lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            let name = line
+                .split(':')
+                .next()
+                .expect("descriptor entry names a method")
+                .trim()
+                .to_string();
+            let verb = quoted(line, "verb").unwrap_or_else(|| panic!("{name}: missing verb"));
+            let path = quoted(line, "path").unwrap_or_else(|| panic!("{name}: missing path"));
+            assert!(
+                entries.insert(name.clone(), (verb, path)).is_none(),
+                "duplicate descriptor entry: {name}"
+            );
+        }
+
+        // Coverage pin: exactly the F1 family's twinned methods (fs +
+        // staged uploads). The `api_transfer_*` methods join when their
+        // HTTP rows land (task #6, /api/transfers); adding or dropping an
+        // entry updates this list in the same change, deliberately.
+        let expected: std::collections::BTreeSet<&str> = [
+            "api_fs_stat",
+            "api_fs_list",
+            "api_fs_read",
+            "api_fs_mkdir",
+            "api_fs_write",
+            "api_fs_rename",
+            "api_fs_delete",
+            "api_session_current_uploads",
+            "api_session_current_upload",
+            "api_session_current_upload_raw",
+            "api_session_current_upload_delete",
+        ]
+        .into_iter()
+        .collect();
+        let actual: std::collections::BTreeSet<&str> =
+            entries.keys().map(String::as_str).collect();
+        assert_eq!(actual, expected, "DAEMON_API_HTTP_MAP coverage drifted");
+
+        for (method_name, (verb, template)) in &entries {
+            let spec = control_method_spec(method_name).unwrap_or_else(|| {
+                panic!("{method_name}: descriptor entry has no CONTROL_METHODS row")
+            });
+            let tunnel_op = spec
+                .op
+                .unwrap_or_else(|| panic!("{method_name}: twinned methods must be op-gated"));
+
+            // Resolve the template through the real router, with sample
+            // segments standing in for the captures.
+            let concrete = template
+                .split('/')
+                .map(|segment| {
+                    if segment.starts_with('{') && segment.ends_with('}') {
+                        "cap-sample"
+                    } else {
+                        segment
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            let (route, _captures) = match_route(verb, &concrete).unwrap_or_else(|| {
+                panic!("{method_name}: {verb} {concrete} matches no declared route")
+            });
+
+            // The verb must be declared exactly — a map entry riding an
+            // `Any` row would hide a method-tightening regression.
+            let declared = match verb.as_str() {
+                "GET" => RouteMethod::Get,
+                "POST" => RouteMethod::Post,
+                "DELETE" => RouteMethod::Delete,
+                other => panic!("{method_name}: unsupported descriptor verb {other}"),
+            };
+            assert_eq!(
+                route.method, declared,
+                "{method_name}: route declares {:?}, descriptor says {verb}",
+                route.method
+            );
+
+            // IAM twin agreement: the same operation gates the method on
+            // both transports.
+            match route.authz {
+                RouteAuthz::Operation(op) => assert_eq!(
+                    op, tunnel_op,
+                    "{method_name}: tunnel op {tunnel_op:?} != route op {op:?}"
+                ),
+                _ => panic!("{method_name}: twinned rows must be Operation-gated"),
+            }
+
+            // The template must restate the row's declared shape, not just
+            // happen to resolve through it.
+            match route.pattern {
+                PathPattern::Exact(base) => {
+                    assert_eq!(template, base, "{method_name}: template != exact route path")
+                }
+                PathPattern::Under(base) => assert!(
+                    template == base || template.starts_with(&format!("{base}/")),
+                    "{method_name}: template {template} is not under {base}"
+                ),
+                PathPattern::Segments(base, segments) => {
+                    let mut rendered = String::from(base);
+                    for segment in segments {
+                        match segment {
+                            SegmentSpec::Capture(name) => {
+                                rendered.push_str("/{");
+                                rendered.push_str(name);
+                                rendered.push('}');
+                            }
+                            SegmentSpec::Literal(literal) => {
+                                rendered.push('/');
+                                rendered.push_str(literal);
+                            }
+                            SegmentSpec::OneOf(_) => {
+                                panic!("{method_name}: OneOf rows are not in the twinned set")
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        template, &rendered,
+                        "{method_name}: template != rendered Segments pattern"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn unknown_dashboard_control_methods_are_denied_fail_closed() {
         let rt = runtime();

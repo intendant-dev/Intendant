@@ -26196,6 +26196,656 @@ async function accessFleetRefreshProvenance() {
   if (changed) renderAccessAdminSummaries();
 }
 
+/* ── static/app/32-daemon-api.js ── */
+// ── daemonApi — the unified daemon-call facade (transport program, F0) ────
+// One call surface for every request/response exchange with a daemon, over
+// three transport adapters (docs: the transport-unification design, §3):
+//
+//   daemonApi.request(method, params, opts)          -> {ok, status, body}
+//   daemonApi.bytes(method, params, opts)            -> {bytes, meta:{rangeStart,rangeEnd,totalSize,sha256,filename,contentType,job}}
+//   daemonApi.upload(method, params, source, opts)   -> {ok, status, body}   (source: Blob | Uint8Array)
+//   daemonApi.stream(method, params, opts, onEvent)  -> completion summary
+//   daemonApi.availability(method, target)           -> {ok, reason}
+//   // opts: { target?: hostId|null, signal?, timeoutMs?, retries?, fallback?: 'auto'|'never' }
+//
+// `method` is always the tunnel method name; DAEMON_API_HTTP_MAP maps it to
+// the HTTP twin when the direct lane serves the call. Adapters:
+//   - local tunnel: the `dashboardControlTransport` protocol client
+//     (50-control-transport.js) — request/bytes/upload/stream map 1:1;
+//   - peer tunnel: `peerDashboardControlConnectionForHost(hostId)` — same
+//     wire; peers have NO HTTP lane by design (the browser never
+//     authenticates to a peer over HTTP);
+//   - HTTP: `authedFetch` + the descriptor table. Connect mode is policy,
+//     not an adapter: it forces `fallback:'never'` (hosted validators probe
+//     exactly this no-legacy-fallback behavior).
+//
+// STATUS (F0): wired to NOTHING. No existing call site consumes this yet —
+// the F1+ family migrations (transfers/fs first, per the design's frontend
+// track) move `rpcOrHttp`/`jsonFetch`/`filesIdeRpc`/pump call sites onto
+// these verbs family by family; the boot smoke's window.qa.daemonApi()
+// probe is the only reader today.
+//
+// Fragment placement: this file must evaluate BEFORE every consumer
+// fragment's eval-time code (manifest order is program order — the
+// cross-fragment TDZ lint in crates/app-html-assembler enforces the direct
+// case). It sits right after 31-init-identity-fleet.js, which declares the
+// `let` bindings the adapters read (dashboardControlTransport,
+// peerDashboardControlConnectionsByHost); every other reference here
+// (authedFetch, dashboardConnectModeEnabled, peerDashboardControlConnectionForHost,
+// dashboardComposeFetchSignal, dashboardControlRequestTimeoutMs,
+// dashboardControlBase64ToBytes, dashboardControlBytesToBase64) is a
+// module-hoisted function declaration, and ALL cross-fragment references in
+// this file live inside function bodies — nothing here touches another
+// fragment's binding at eval time.
+
+// ── Descriptor table: tunnel method -> HTTP twin ──────────────────────────
+// Hand-written mirror of gateway_routes::ROUTES for the methods the facade
+// can serve over direct HTTP. A daemon-side parity test
+// (`daemon_api_http_map_mirrors_gateway_routes` in
+// src/bin/caller/dashboard_control/mod.rs) pins every entry's verb + path
+// template against the route table and the tunnel method's IAM operation —
+// the sanctioned mirror-with-parity-test pattern (CLAUDE.md "Derive, don't
+// mirror"). KEEP ONE ENTRY PER LINE: the test parses this literal.
+//
+// Coverage (F0): the F1 family's twinned methods only — filesystem and
+// staged uploads. The `api_transfer_*` methods are deliberately absent:
+// they have no HTTP rows until the server-track stage that adds
+// /api/transfers (task #6); F1 adds their entries when those rows land.
+// Entry shape: verb + path template (`{name}` segments are lifted from
+// params), `query` = param keys lifted into the query string, `lane` =
+// non-JSON response/request lane ('bytes' | 'upload'), `encode` = upload
+// body encoding ('raw' streamed body | 'json-b64' JSON envelope with
+// content_b64). `mutation` is DERIVED from the verb (POST/DELETE), never
+// stored — that derivation is the fallback policy (§3.7).
+const DAEMON_API_HTTP_MAP = Object.freeze({
+  api_fs_stat: { verb: 'GET', path: '/api/fs/stat', query: ['path'] },
+  api_fs_list: { verb: 'GET', path: '/api/fs/list', query: ['path'] },
+  api_fs_read: { verb: 'GET', path: '/api/fs/read', query: ['path'], lane: 'bytes' },
+  api_fs_mkdir: { verb: 'POST', path: '/api/fs/mkdir' },
+  api_fs_write: { verb: 'POST', path: '/api/fs/write', lane: 'upload', encode: 'json-b64' },
+  api_fs_rename: { verb: 'POST', path: '/api/fs/rename' },
+  api_fs_delete: { verb: 'POST', path: '/api/fs/delete' },
+  api_session_current_uploads: { verb: 'GET', path: '/api/session/current/uploads' },
+  api_session_current_upload: { verb: 'POST', path: '/api/session/current/uploads', query: ['name', 'destination'], lane: 'upload', encode: 'raw' },
+  api_session_current_upload_raw: { verb: 'GET', path: '/api/session/current/uploads/{id}/raw', lane: 'bytes' },
+  api_session_current_upload_delete: { verb: 'DELETE', path: '/api/session/current/uploads/{upload_id}' },
+});
+
+// ── Uniform error shape (§3.5) ────────────────────────────────────────────
+// UI code branches on `kind`, never on message strings:
+//   'abort'       — the caller's signal fired
+//   'timeout'     — the composed timeout fired (tunnel waitFor / fetch)
+//   'transport'   — the lane itself failed (channel closed, fetch threw,
+//                   tunnel down with no permissible fallback)
+//   'denied'      — the daemon's authorizer refused the method
+//   'unavailable' — no lane can serve this method here (unknown method on
+//                   an old daemon, tunnel-only method with no tunnel)
+//   'http'        — the daemon answered with an error result (status set
+//                   when the response carried one)
+class DaemonApiError extends Error {
+  constructor(kind, method, target, message, status = null) {
+    super(message);
+    this.name = 'DaemonApiError';
+    this.kind = kind;
+    this.method = method;
+    this.target = target || null;
+    this.status = Number.isFinite(Number(status)) ? Number(status) : null;
+  }
+}
+
+// Classify a tunnel rejection. The transport rejects with plain Errors; the
+// server's authorizer texts are the stable markers ("… is not allowed: …"
+// and "unknown dashboard-control method: …" from
+// authorize_dashboard_control_method), and waitFor stamps "timed out".
+function daemonApiTunnelError(err, method, target) {
+  if (err instanceof DaemonApiError) return err;
+  const message = (err && err.message) || String(err);
+  if (err && err.name === 'AbortError') return new DaemonApiError('abort', method, target, message);
+  if (err && err.name === 'TimeoutError') return new DaemonApiError('timeout', method, target, message);
+  if (/timed out/i.test(message)) return new DaemonApiError('timeout', method, target, message);
+  if (/is not allowed/.test(message)) return new DaemonApiError('denied', method, target, message);
+  if (/unknown dashboard-control method/.test(message)) {
+    return new DaemonApiError('unavailable', method, target, message);
+  }
+  return new DaemonApiError('transport', method, target, message);
+}
+
+// Classify a fetch() rejection. With the composed signal (§3.6) a timeout
+// aborts the fetch with a TimeoutError reason; a caller abort keeps
+// AbortError; everything else is the network lane failing.
+function daemonApiHttpError(err, method, target = null) {
+  if (err instanceof DaemonApiError) return err;
+  const message = (err && err.message) || String(err);
+  if (err && err.name === 'TimeoutError') return new DaemonApiError('timeout', method, target, message);
+  if (err && err.name === 'AbortError') return new DaemonApiError('abort', method, target, message);
+  return new DaemonApiError('transport', method, target, message);
+}
+
+// ── Envelopes ─────────────────────────────────────────────────────────────
+// {ok, status, body} from a tunnel result payload. The _httpStatus/_httpOk
+// sidecar keys are part of the wire contract (design §5); this is the
+// facade's own normalizer — the fake-Response shim (responseFromPayload,
+// 49-daemons-multihost.js) and its clones retire onto it at family flips.
+function daemonApiEnvelopeFromPayload(payload) {
+  const rawStatus = Number(payload && payload._httpStatus);
+  const status = Number.isFinite(rawStatus) && rawStatus >= 100 && rawStatus <= 599 ? rawStatus : 200;
+  const ok = typeof (payload && payload._httpOk) === 'boolean'
+    ? payload._httpOk
+    : status >= 200 && status < 300;
+  let body = payload;
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    body = { ...body };
+    delete body._httpStatus;
+    delete body._httpOk;
+  }
+  return { ok, status, body: body ?? {} };
+}
+
+// {bytes, meta} from a tunnel byte-stream result. Field names follow the
+// byte_stream_end.result sidecar (range_start/range_end are exclusive-end,
+// matching the server's dashboard_fs_read_file shape). An ok:false result
+// (the daemon answered, with an error) throws 'http' — it is a delivered
+// response, so it must never be retried or replayed.
+function daemonApiBytesEnvelope(result, method, target) {
+  if (!result || result.ok === false || result._httpOk === false) {
+    const raw = Number(result && result._httpStatus);
+    throw new DaemonApiError(
+      'http',
+      method,
+      target,
+      (result && result.error) || `${method} returned an error`,
+      Number.isFinite(raw) ? raw : null
+    );
+  }
+  const bytes = result.bytes instanceof Uint8Array
+    ? result.bytes
+    : (typeof result.data_base64 === 'string' && result.data_base64
+      ? dashboardControlBase64ToBytes(result.data_base64)
+      : new Uint8Array(0));
+  const num = value => (Number.isFinite(Number(value)) ? Number(value) : null);
+  return {
+    bytes,
+    meta: {
+      rangeStart: num(result.range_start ?? result.offset),
+      rangeEnd: num(result.range_end),
+      totalSize: num(result.total_size ?? result.totalSize),
+      sha256: typeof result.sha256 === 'string' ? result.sha256 : '',
+      filename: result.filename ? String(result.filename) : '',
+      contentType: result.content_type ? String(result.content_type) : '',
+      job: result.job && typeof result.job === 'object' ? result.job : null,
+    },
+  };
+}
+
+// ── Timeouts & abort (§3.6): the composed-signal rule ─────────────────────
+// Every adapter call runs under the caller's signal composed with a hard
+// per-method timeout — no facade call may run signal-less (the
+// transfers-pump wedge class stays unrepresentable). Family defaults come
+// from dashboardControlRequestTimeoutMs (50-control-transport.js).
+function daemonApiTimeoutMs(method, opts) {
+  const timeout = Number(opts && opts.timeoutMs);
+  return Number.isFinite(timeout) && timeout > 0
+    ? timeout
+    : dashboardControlRequestTimeoutMs(method);
+}
+
+function daemonApiHttpSignal(method, opts) {
+  return dashboardComposeFetchSignal(opts && opts.signal, daemonApiTimeoutMs(method, opts));
+}
+
+// Tunnel options: signal passes through; timeoutMs is honored by the
+// bytes/upload/stream verbs. (The transport's `request` verb applies its
+// own per-method default and ignores options.timeoutMs today — changing
+// that is a transport-file edit that belongs to a family flip, not F0.)
+function daemonApiTunnelOptions(method, opts) {
+  return {
+    signal: opts && opts.signal,
+    timeoutMs: daemonApiTimeoutMs(method, opts),
+  };
+}
+
+// ── Fallback policy as data (§3.7) ────────────────────────────────────────
+// Derived from the twin's verb, never judged per call site: reads (GET
+// twins) may fall back to HTTP and retry; mutations (POST/DELETE twins)
+// must never be replayed over HTTP after a tunnel attempt that MAY have
+// reached the daemon (today's fallbackAfterRpcFailure:false semantics, the
+// no-replay rule the hosted validators probe). Mutations may still use
+// HTTP when no tunnel attempt was made at all. Connect mode never uses
+// HTTP for any method.
+function daemonApiFallbackPolicy(method) {
+  const spec = DAEMON_API_HTTP_MAP[method] || null;
+  if (!spec) return { httpTwin: false, mutation: null, replayAfterAttempt: false };
+  const mutation = spec.verb !== 'GET';
+  return { httpTwin: true, mutation, replayAfterAttempt: !mutation };
+}
+
+// Gate the HTTP lane for a local-target call. `tunnelError` is the
+// classified failure of a tunnel attempt (null when no attempt was made);
+// when fallback is not permitted the original tunnel error propagates so
+// callers see the true failure, not a policy artifact.
+function daemonApiEnsureHttpFallback(method, opts, tunnelError) {
+  const policy = daemonApiFallbackPolicy(method);
+  if (dashboardConnectModeEnabled()) {
+    throw tunnelError || new DaemonApiError(
+      'transport', method, null,
+      `dashboard tunnel is not connected for ${method} (Connect mode has no HTTP lane)`
+    );
+  }
+  if (!policy.httpTwin) {
+    throw tunnelError || new DaemonApiError(
+      'unavailable', method, null,
+      `${method} has no HTTP twin and the dashboard tunnel is not connected`
+    );
+  }
+  if (opts && opts.fallback === 'never') {
+    throw tunnelError || new DaemonApiError(
+      'transport', method, null,
+      `dashboard tunnel is not connected for ${method} (fallback disabled)`
+    );
+  }
+  if (tunnelError && !policy.replayAfterAttempt) throw tunnelError;
+}
+
+// ── HTTP adapter ──────────────────────────────────────────────────────────
+// Builds verb/path/query/body from the descriptor. `{name}` path segments
+// lift (and consume) params[name]; `query` keys lift into the query
+// string; for JSON POSTs the remaining params become the body verbatim.
+function daemonApiHttpTarget(spec, method, params) {
+  const source = params && typeof params === 'object' ? params : {};
+  const used = new Set();
+  const path = spec.path.replace(/\{([A-Za-z0-9_]+)\}/g, (match, key) => {
+    const value = source[key];
+    if (value === undefined || value === null || String(value) === '') {
+      throw new TypeError(`daemonApi: ${method} requires params.${key} for ${spec.path}`);
+    }
+    used.add(key);
+    return encodeURIComponent(String(value));
+  });
+  const query = [];
+  for (const key of spec.query || []) {
+    const value = source[key];
+    if (value === undefined || value === null) continue;
+    used.add(key);
+    query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+  }
+  const rest = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (!used.has(key)) rest[key] = value;
+  }
+  return { url: query.length ? `${path}?${query.join('&')}` : path, rest };
+}
+
+async function daemonApiHttpRequest(method, params, opts) {
+  const spec = DAEMON_API_HTTP_MAP[method];
+  const { url, rest } = daemonApiHttpTarget(spec, method, params);
+  const init = { method: spec.verb, signal: daemonApiHttpSignal(method, opts) };
+  if (spec.verb === 'POST') {
+    init.headers = { 'Content-Type': 'application/json' };
+    init.body = JSON.stringify(rest);
+  }
+  let resp;
+  try {
+    resp = await authedFetch(url, init);
+  } catch (err) {
+    throw daemonApiHttpError(err, method);
+  }
+  const body = await resp.json().catch(() => ({}));
+  return { ok: resp.ok, status: resp.status, body: body ?? {} };
+}
+
+async function daemonApiHttpBytes(method, params, opts) {
+  const spec = DAEMON_API_HTTP_MAP[method];
+  const { url } = daemonApiHttpTarget(spec, method, params);
+  const init = { method: spec.verb, signal: daemonApiHttpSignal(method, opts) };
+  // The tunnel twin takes offset/length params; the HTTP lane speaks Range
+  // headers (handle_fs_read). Content-Range's end is inclusive — normalize
+  // back to the tunnel's exclusive rangeEnd below.
+  const offset = Number(params && params.offset);
+  const length = Number(params && params.length);
+  if (Number.isFinite(offset) && offset >= 0 && Number.isFinite(length) && length > 0) {
+    init.headers = { Range: `bytes=${offset}-${offset + length - 1}` };
+  } else if (Number.isFinite(offset) && offset > 0) {
+    init.headers = { Range: `bytes=${offset}-` };
+  }
+  let resp;
+  try {
+    resp = await authedFetch(url, init);
+  } catch (err) {
+    throw daemonApiHttpError(err, method);
+  }
+  if (!resp.ok) {
+    const detail = await resp.json().catch(() => ({}));
+    throw new DaemonApiError(
+      'http', method, null,
+      (detail && detail.error) || `${method} returned HTTP ${resp.status}`,
+      resp.status
+    );
+  }
+  const bytes = new Uint8Array(await resp.arrayBuffer());
+  const headers = resp.headers;
+  const header = name => (headers && typeof headers.get === 'function' ? headers.get(name) || '' : '');
+  const rangeMatch = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/.exec(header('content-range').trim());
+  const partial = resp.status === 206;
+  const filenameMatch = /filename="([^"]*)"/.exec(header('content-disposition'));
+  return {
+    bytes,
+    meta: {
+      rangeStart: rangeMatch ? Number(rangeMatch[1]) : (partial ? null : 0),
+      rangeEnd: rangeMatch ? Number(rangeMatch[2]) + 1 : (partial ? null : bytes.byteLength),
+      totalSize: rangeMatch && rangeMatch[3] !== '*'
+        ? Number(rangeMatch[3])
+        : (partial ? null : bytes.byteLength),
+      sha256: header('x-content-sha256'),
+      filename: filenameMatch ? filenameMatch[1] : '',
+      contentType: header('content-type') || 'application/octet-stream',
+      job: null,
+    },
+  };
+}
+
+async function daemonApiHttpUpload(method, params, source, opts) {
+  const spec = DAEMON_API_HTTP_MAP[method];
+  const { url, rest } = daemonApiHttpTarget(spec, method, params);
+  const init = { method: spec.verb, signal: daemonApiHttpSignal(method, opts) };
+  if (spec.encode === 'raw') {
+    // Raw streamed body (staged uploads): metadata rides the query string;
+    // a tunnel-only `mime` param becomes the Content-Type header.
+    init.headers = {
+      'Content-Type': (opts && opts.contentType) || rest.mime || (source && source.type) || 'application/octet-stream',
+    };
+    init.body = source;
+  } else {
+    // json-b64 twins (api_fs_write): JSON envelope with base64 content.
+    let bytes;
+    if (source instanceof Blob) bytes = new Uint8Array(await source.arrayBuffer());
+    else if (source instanceof Uint8Array) bytes = source;
+    else bytes = new Uint8Array(source || []);
+    init.headers = { 'Content-Type': 'application/json' };
+    init.body = JSON.stringify({ ...rest, content_b64: dashboardControlBytesToBase64(bytes) });
+  }
+  let resp;
+  try {
+    resp = await authedFetch(url, init);
+  } catch (err) {
+    throw daemonApiHttpError(err, method);
+  }
+  const body = await resp.json().catch(() => ({}));
+  return { ok: resp.ok, status: resp.status, body: body ?? {} };
+}
+
+// ── Tunnel adapters ───────────────────────────────────────────────────────
+// Local and peer speak the same DashboardControlTransport protocol; the
+// peer adapter resolves (or dials) the per-host connection first. A peer
+// target never falls back to HTTP.
+async function daemonApiPeerTransport(target, method) {
+  let conn;
+  try {
+    conn = await peerDashboardControlConnectionForHost(target, { timeoutMs: 30000 });
+  } catch (err) {
+    throw daemonApiTunnelError(err, method, target);
+  }
+  if (!conn || !conn.canUseRpc()) {
+    throw new DaemonApiError('transport', method, target, 'peer dashboard-control tunnel is unavailable');
+  }
+  return conn;
+}
+
+// Bounded-retry byte read over a tunnel (promoted
+// dashboardRequestBytesWithRetry semantics): retries transport-level
+// rejections only; a delivered error response ('http', via the envelope)
+// and aborts propagate immediately. Reads only — bytes is a GET-lane verb.
+async function daemonApiTunnelBytes(transport, method, params, opts, target) {
+  const configured = Number(opts && opts.retries);
+  const retries = Number.isFinite(configured) ? Math.max(0, configured) : 2;
+  let attempt = 0;
+  for (;;) {
+    if (opts && opts.signal && opts.signal.aborted) {
+      throw new DaemonApiError('abort', method, target, 'daemon api request aborted');
+    }
+    let result;
+    try {
+      result = await transport.requestBytes(method, params, daemonApiTunnelOptions(method, opts));
+    } catch (err) {
+      const classified = daemonApiTunnelError(err, method, target);
+      if (classified.kind === 'abort' || attempt >= retries) throw classified;
+      attempt += 1;
+      await new Promise(resolve => setTimeout(resolve, 200 * attempt));
+      continue;
+    }
+    return daemonApiBytesEnvelope(result, method, target);
+  }
+}
+
+// ── The four verbs ────────────────────────────────────────────────────────
+async function daemonApiRequest(method, params = {}, opts = {}) {
+  const target = opts.target || null;
+  if (target) {
+    const conn = await daemonApiPeerTransport(target, method);
+    try {
+      const payload = await conn.request(method, params, daemonApiTunnelOptions(method, opts));
+      return daemonApiEnvelopeFromPayload(payload);
+    } catch (err) {
+      throw daemonApiTunnelError(err, method, target);
+    }
+  }
+  const transport = dashboardControlTransport;
+  let tunnelError = null;
+  if (transport && transport.canUseRpc()) {
+    try {
+      const payload = await transport.request(method, params, daemonApiTunnelOptions(method, opts));
+      return daemonApiEnvelopeFromPayload(payload);
+    } catch (err) {
+      tunnelError = daemonApiTunnelError(err, method, null);
+      if (tunnelError.kind === 'abort') throw tunnelError;
+    }
+  }
+  daemonApiEnsureHttpFallback(method, opts, tunnelError);
+  return daemonApiHttpRequest(method, params, opts);
+}
+
+async function daemonApiBytes(method, params = {}, opts = {}) {
+  const target = opts.target || null;
+  if (target) {
+    const conn = await daemonApiPeerTransport(target, method);
+    return daemonApiTunnelBytes(conn, method, params, opts, target);
+  }
+  const transport = dashboardControlTransport;
+  let tunnelError = null;
+  if (transport && transport.canUseRpc()) {
+    try {
+      return await daemonApiTunnelBytes(transport, method, params, opts, null);
+    } catch (err) {
+      const classified = daemonApiTunnelError(err, method, null);
+      // Delivered responses ('http') and aborts are final — only a failed
+      // lane consults the fallback policy.
+      if (classified.kind === 'abort' || classified.kind === 'http') throw classified;
+      tunnelError = classified;
+    }
+  }
+  daemonApiEnsureHttpFallback(method, opts, tunnelError);
+  return daemonApiHttpBytes(method, params, opts);
+}
+
+async function daemonApiUpload(method, params = {}, source, opts = {}) {
+  const target = opts.target || null;
+  if (target) {
+    const conn = await daemonApiPeerTransport(target, method);
+    try {
+      const payload = await conn.uploadBytes(method, params, source, daemonApiTunnelOptions(method, opts));
+      return daemonApiEnvelopeFromPayload(payload);
+    } catch (err) {
+      throw daemonApiTunnelError(err, method, target);
+    }
+  }
+  const transport = dashboardControlTransport;
+  let tunnelError = null;
+  if (transport && transport.canUseRpc()) {
+    try {
+      const payload = await transport.uploadBytes(method, params, source, daemonApiTunnelOptions(method, opts));
+      return daemonApiEnvelopeFromPayload(payload);
+    } catch (err) {
+      tunnelError = daemonApiTunnelError(err, method, null);
+      if (tunnelError.kind === 'abort') throw tunnelError;
+    }
+  }
+  // Uploads are POST twins: the policy derivation refuses HTTP after any
+  // tunnel attempt; a never-attempted upload may take the HTTP lane.
+  daemonApiEnsureHttpFallback(method, opts, tunnelError);
+  return daemonApiHttpUpload(method, params, source, opts);
+}
+
+async function daemonApiStream(method, params = {}, opts = {}, onEvent = {}) {
+  const target = opts.target || null;
+  if (target) {
+    const conn = await daemonApiPeerTransport(target, method);
+    try {
+      return await conn.stream(method, params, daemonApiTunnelOptions(method, opts), onEvent);
+    } catch (err) {
+      throw daemonApiTunnelError(err, method, target);
+    }
+  }
+  const transport = dashboardControlTransport;
+  if (!transport || !transport.canUseRpc()) {
+    // No stream twin exists in the F0 descriptor family; the NDJSON HTTP
+    // lane arrives with the sessions family (F2) once the server stream
+    // stage lands. Until then streams are tunnel-only.
+    throw new DaemonApiError(
+      'unavailable', method, null,
+      `dashboard tunnel is not connected for ${method} (streams have no HTTP lane yet)`
+    );
+  }
+  try {
+    return await transport.stream(method, params, daemonApiTunnelOptions(method, opts), onEvent);
+  } catch (err) {
+    throw daemonApiTunnelError(err, method, null);
+  }
+}
+
+// ── Availability (§3.4): one function, derived ────────────────────────────
+// Inputs, in order: adapter connection state; the hello `features` list
+// (distinguishes "daemon too old" from "denied"); the status
+// `<method>_available` booleans (server-derived from its method table —
+// false rolls denial and runtime-not-ready into one honest "no");
+// connect-mode policy; HTTP-map presence (a direct dashboard with no
+// tunnel still reports twinned methods as reachable). The scattered
+// canUse*/`*Available` probes become one-line derivations over this at
+// their family flips.
+function daemonApiTunnelMethodAvailability(transport, method) {
+  const spec = DAEMON_API_HTTP_MAP[method] || null;
+  const status = transport.lastStatus || null;
+  const features = Array.isArray(transport.controlFeatures) ? transport.controlFeatures : [];
+  const lane = (spec && spec.lane) || 'json';
+  const laneFeature = lane === 'bytes' ? 'byte_streams' : (lane === 'upload' ? 'upload_frames' : '');
+  if (laneFeature) {
+    const laneOk = status ? status[`${laneFeature}_available`] === true : features.includes(laneFeature);
+    if (!laneOk) return { ok: false, reason: 'unsupported' };
+  }
+  const flag = status ? status[`${method}_available`] : undefined;
+  if (typeof flag === 'boolean') {
+    return flag ? { ok: true, reason: 'connected' } : { ok: false, reason: 'denied' };
+  }
+  if (features.length) {
+    // Upload-only methods are not named in `features` — they advertise
+    // through the upload_frames umbrella (CONTROL_METHODS upload_only).
+    const advertised = features.includes(method) || (lane === 'upload' && features.includes('upload_frames'));
+    return advertised ? { ok: true, reason: 'connected' } : { ok: false, reason: 'unsupported' };
+  }
+  // Channel open but hello_ack/status not yet digested: optimistic, like
+  // every existing call path (the request itself reports the truth).
+  return { ok: true, reason: 'connected' };
+}
+
+function daemonApiAvailability(method, target = null) {
+  if (target) {
+    const conn = peerDashboardControlConnectionsByHost.get(String(target));
+    if (conn && conn.canUseRpc()) return daemonApiTunnelMethodAvailability(conn, method);
+    // Peers have no HTTP lane by design: dialable-but-unconnected is a
+    // down transport; an unavailable signaling lane can never be reached
+    // from this dashboard at all.
+    if (peerDashboardControlSignalAvailable(target)) return { ok: false, reason: 'transport-down' };
+    return { ok: false, reason: 'never' };
+  }
+  const transport = dashboardControlTransport;
+  if (transport && transport.canUseRpc()) return daemonApiTunnelMethodAvailability(transport, method);
+  if (dashboardConnectModeEnabled()) return { ok: false, reason: 'transport-down' };
+  if (DAEMON_API_HTTP_MAP[method]) return { ok: true, reason: 'http-only' };
+  return { ok: false, reason: 'transport-down' };
+}
+
+// ── Descriptor checksum ───────────────────────────────────────────────────
+// FNV-1a over the canonicalized descriptor — a cheap drift beacon the boot
+// smoke can log and harnesses can compare across daemon/browser pairs.
+function daemonApiDescriptorChecksum() {
+  const canonical = Object.keys(DAEMON_API_HTTP_MAP).sort().map(name => {
+    const spec = DAEMON_API_HTTP_MAP[name];
+    return [name, spec.verb, spec.path, (spec.query || []).join(','), spec.lane || 'json', spec.encode || ''].join('|');
+  }).join('\n');
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < canonical.length; i += 1) {
+    hash ^= canonical.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+// The facade. Frozen so a consumer can't monkey-patch a verb out from
+// under the others; DAEMON_API_HTTP_MAP rides along read-only for
+// harnesses and the F1 transfer adapters.
+const daemonApi = Object.freeze({
+  request: daemonApiRequest,
+  bytes: daemonApiBytes,
+  upload: daemonApiUpload,
+  stream: daemonApiStream,
+  availability: daemonApiAvailability,
+  fallbackPolicy: daemonApiFallbackPolicy,
+  httpMap: DAEMON_API_HTTP_MAP,
+  descriptorChecksum: daemonApiDescriptorChecksum,
+  Error: DaemonApiError,
+});
+
+// QA readback (window.qa convention): adapter states, an availability
+// sample across the three lanes, and the descriptor checksum. Cheap and
+// side-effect-free — availability() only reads connection state. The boot
+// smoke asserts this probe exists and answers; nothing else consumes the
+// facade in F0.
+window.qa = Object.assign(window.qa || {}, {
+  daemonApi: () => {
+    const transport = dashboardControlTransport;
+    const peers = [];
+    for (const [hostId, conn] of peerDashboardControlConnectionsByHost) {
+      peers.push({ hostId, connected: Boolean(conn && conn.canUseRpc()) });
+    }
+    return {
+      adapters: {
+        localTunnel: {
+          present: Boolean(transport),
+          connected: Boolean(transport && transport.canUseRpc()),
+          features: Array.isArray(transport && transport.controlFeatures)
+            ? transport.controlFeatures.length
+            : 0,
+          statusBooleans: transport && transport.lastStatus
+            ? Object.keys(transport.lastStatus).filter(key => key.endsWith('_available')).length
+            : 0,
+          lastErrorKind: (transport && transport.lastErrorKind) || '',
+        },
+        peerTunnels: peers,
+        http: {
+          connectMode: Boolean(dashboardConnectModeEnabled()),
+          reachable: !dashboardConnectModeEnabled(),
+        },
+      },
+      availability: {
+        api_fs_stat: daemonApiAvailability('api_fs_stat'),
+        api_fs_write: daemonApiAvailability('api_fs_write'),
+        api_session_current_upload: daemonApiAvailability('api_session_current_upload'),
+      },
+      descriptor: {
+        methods: Object.keys(DAEMON_API_HTTP_MAP).length,
+        checksum: daemonApiDescriptorChecksum(),
+      },
+    };
+  },
+});
 /* ── static/app/32-vault-custody.js ── */
 /* ── Credential vault (credential custody v1) ──
    The user's provider credentials, end-to-end encrypted client-side and
