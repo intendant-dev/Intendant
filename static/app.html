@@ -77868,12 +77868,14 @@ function settleCompletedFilesDownload(transfer, { resumable }) {
 }
 
 // Server errors like "no project root" are accurate but unactionable in the
-// transfers pane; translate the known ones before surfacing.
+// transfers pane; translate the known ones before surfacing. Current daemons
+// serve projectless staged uploads/transfers from a daemon-global store, so
+// these strings only reach us from older daemons that still refuse.
 function filesTransferFriendlyServerError(error, fallback) {
   const message = String(error || '').trim();
   if (!message) return fallback;
-  if (message === 'no project root') {
-    return 'This daemon has no project open — staged uploads and resumable transfers need an active session with a project root';
+  if (message === 'no project root' || message === 'project root unavailable') {
+    return 'This daemon predates projectless staged uploads and transfers — it needs a project open (or a daemon upgrade)';
   }
   return message;
 }
