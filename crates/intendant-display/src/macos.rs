@@ -63,7 +63,12 @@ impl InputGeometry {
     }
 
     fn from_sck_rect(rect: ScRect) -> Self {
-        Self::new(rect.x, rect.y, rect.width.max(1.0), rect.height.max(1.0))
+        Self::new(
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width.max(1.0),
+            rect.size.height.max(1.0),
+        )
     }
 
     fn point(self, x: f64, y: f64) -> CGPoint {
@@ -189,15 +194,15 @@ fn resolve_capture_target(
                 .find(|w| w.window_id() == window_id)
                 .ok_or_else(|| CallerError::Display(format!("window {window_id} not found")))?;
             let frame = window.frame();
-            if frame.width <= 0.0 || frame.height <= 0.0 {
+            if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
                 return Err(CallerError::Display(format!(
                     "window {window_id} has invalid frame {}x{}",
-                    frame.width, frame.height
+                    frame.size.width, frame.size.height
                 )));
             }
             let scale = display_scale_for_sck_rect(frame);
-            let width = even_dimension_from_f64(frame.width * scale);
-            let height = even_dimension_from_f64(frame.height * scale);
+            let width = even_dimension_from_f64(frame.size.width * scale);
+            let height = even_dimension_from_f64(frame.size.height * scale);
             let filter = SCContentFilter::create().with_window(&window).build();
             Ok(ResolvedCaptureTarget {
                 filter,
@@ -251,8 +256,8 @@ fn current_input_geometry(target: &Arc<RwLock<InputGeometry>>) -> InputGeometry 
 
 fn display_scale_for_sck_rect(rect: ScRect) -> f64 {
     let cg_rect = CgRect::new(
-        &CGPoint::new(rect.x, rect.y),
-        &CGSize::new(rect.width.max(1.0), rect.height.max(1.0)),
+        &CGPoint::new(rect.origin.x, rect.origin.y),
+        &CGSize::new(rect.size.width.max(1.0), rect.size.height.max(1.0)),
     );
     if let Ok((display_ids, count)) = CGDisplay::displays_with_rect(cg_rect, 8) {
         if count > 0 {
@@ -312,14 +317,14 @@ fn dirty_rect_scale(sample: &CMSampleBuffer, rects: &[ScRect], frame_w: u32, fra
     let Some(content) = sample.content_rect() else {
         return 1.0;
     };
-    let scaled_w_matches = approx_eq(content.width * scale, frame_w as f64, 3.0);
-    let scaled_h_matches = approx_eq(content.height * scale, frame_h as f64, 3.0);
+    let scaled_w_matches = approx_eq(content.size.width * scale, frame_w as f64, 3.0);
+    let scaled_h_matches = approx_eq(content.size.height * scale, frame_h as f64, 3.0);
     if !scaled_w_matches || !scaled_h_matches {
         return 1.0;
     }
     let max_x = rects.iter().map(|r| r.max_x()).fold(0.0, f64::max);
     let max_y = rects.iter().map(|r| r.max_y()).fold(0.0, f64::max);
-    if max_x > content.width + 1.0 || max_y > content.height + 1.0 {
+    if max_x > content.size.width + 1.0 || max_y > content.size.height + 1.0 {
         1.0
     } else {
         scale
@@ -336,15 +341,15 @@ fn scaled_rect_to_damage_rect(
     frame_w: u32,
     frame_h: u32,
 ) -> Option<Rect> {
-    if frame_w == 0 || frame_h == 0 || rect.width <= 0.0 || rect.height <= 0.0 {
+    if frame_w == 0 || frame_h == 0 || rect.size.width <= 0.0 || rect.size.height <= 0.0 {
         return None;
     }
-    let x0 = (rect.x * scale).floor().clamp(0.0, frame_w as f64);
-    let y0 = (rect.y * scale).floor().clamp(0.0, frame_h as f64);
-    let x1 = ((rect.x + rect.width) * scale)
+    let x0 = (rect.origin.x * scale).floor().clamp(0.0, frame_w as f64);
+    let y0 = (rect.origin.y * scale).floor().clamp(0.0, frame_h as f64);
+    let x1 = ((rect.origin.x + rect.size.width) * scale)
         .ceil()
         .clamp(0.0, frame_w as f64);
-    let y1 = ((rect.y + rect.height) * scale)
+    let y1 = ((rect.origin.y + rect.size.height) * scale)
         .ceil()
         .clamp(0.0, frame_h as f64);
     if x1 <= x0 || y1 <= y0 {
@@ -435,12 +440,12 @@ fn enumerate_window_display_infos(content: &SCShareableContent) -> Vec<super::Di
             continue;
         };
         let frame = window.frame();
-        if frame.width <= 0.0 || frame.height <= 0.0 {
+        if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
             continue;
         }
         let scale = display_scale_for_sck_rect(frame);
-        let width = even_dimension_from_f64(frame.width * scale);
-        let height = even_dimension_from_f64(frame.height * scale);
+        let width = even_dimension_from_f64(frame.size.width * scale);
+        let height = even_dimension_from_f64(frame.size.height * scale);
         if width < super::encode::pool::MIN_LAYER_DIM || height < super::encode::pool::MIN_LAYER_DIM
         {
             continue;
@@ -555,7 +560,7 @@ impl DisplayBackend for MacOSBackend {
 
                 if is_window_capture {
                     if let Some(bounds) = sample.bounding_rect() {
-                        if bounds.width > 0.0 && bounds.height > 0.0 {
+                        if bounds.size.width > 0.0 && bounds.size.height > 0.0 {
                             set_input_geometry(
                                 &input_geometry,
                                 InputGeometry::from_sck_rect(bounds),
