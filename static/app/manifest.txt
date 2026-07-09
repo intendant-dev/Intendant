@@ -72,6 +72,7 @@ ui2-activity.js
 52-peer-display.js
 53-stats-settings.js
 ui2-settings.js
+53-transfer-fsm.js
 54-session-lifecycle.js
 55-files-ide.js
 56-debug-sessions.js
