@@ -79896,11 +79896,27 @@ function filesIdeOnTabShown() {
   if (filesIdeCm) requestAnimationFrame(() => filesIdeCm.refresh());
 }
 
-function configureFsPicker({ mode, target, title, placeholder, useLabel, showCreate }) {
+// Multi-select state for the fs picker. Only download-source pickers opt in
+// (configureFsPicker's multiSelect flag); every other target stays
+// single-select. fsPickerSelectedPaths always mirrors fsPickerSelectedPath:
+// single-select pickers hold [] or [fsPickerSelectedPath], multi-select
+// pickers hold the selection in click order with fsPickerSelectedPath
+// tracking the most recently selected entry. fsPickerAnchorPath is the
+// shift-click range anchor within the current directory listing.
+let fsPickerMultiSelect = false;
+let fsPickerSelectedPaths = [];
+let fsPickerAnchorPath = '';
+let fsPickerUseLabelBase = 'Use path';
+
+function configureFsPicker({ mode, target, title, placeholder, useLabel, showCreate, multiSelect }) {
   fsPickerMode = mode || 'directory';
   fsPickerTarget = target || 'project';
   fsPickerCurrentPath = '';
   fsPickerSelectedPath = '';
+  fsPickerMultiSelect = fsPickerMode === 'file' && !!multiSelect;
+  fsPickerSelectedPaths = [];
+  fsPickerAnchorPath = '';
+  fsPickerUseLabelBase = useLabel || 'Use path';
   fsPickerDownloadAbort = null;
   const dialog = document.querySelector('#fs-picker-modal .fs-picker-dialog');
   const titleEl = document.getElementById('fs-picker-title');
@@ -79914,27 +79930,104 @@ function configureFsPicker({ mode, target, title, placeholder, useLabel, showCre
   if (createBtn) createBtn.style.display = showCreate ? '' : 'none';
   if (downloadCancelBtn) downloadCancelBtn.classList.add('hidden');
   if (useBtn) {
-    useBtn.textContent = useLabel || 'Use path';
+    useBtn.textContent = fsPickerUseLabelBase;
     useBtn.disabled = true;
   }
+}
+
+function fsPickerMultiSelectHint() {
+  const mod = /Mac|iP(hone|ad|od)/.test(navigator.platform || '') ? 'cmd' : 'ctrl';
+  return `${mod}-click to select multiple`;
+}
+
+function fsPickerSelectionStatusText() {
+  const count = fsPickerSelectedPaths.length;
+  if (!count) return fsPickerMultiSelect ? fsPickerMultiSelectHint() : '';
+  if (!fsPickerMultiSelect) return 'File selected';
+  return count === 1 ? `1 file selected — ${fsPickerMultiSelectHint()}` : `${count} files selected`;
+}
+
+function fsPickerEntryIsSelected(path) {
+  if (!path) return false;
+  return fsPickerSelectedPaths.includes(path) || path === fsPickerSelectedPath;
 }
 
 function setFsPickerUseButtonState() {
   const useBtn = document.getElementById('fs-picker-use-btn');
   if (!useBtn) return;
   const downloading = Boolean(fsPickerDownloadAbort);
-  useBtn.disabled = downloading || (fsPickerMode === 'file' ? !fsPickerSelectedPath : !fsPickerCurrentPath);
+  const hasSelection = fsPickerMode === 'file'
+    ? (fsPickerMultiSelect ? fsPickerSelectedPaths.length > 0 : !!fsPickerSelectedPath)
+    : !!fsPickerCurrentPath;
+  useBtn.disabled = downloading || !hasSelection;
+  if (fsPickerMultiSelect) {
+    const count = fsPickerSelectedPaths.length;
+    useBtn.textContent = count > 1
+      ? `${fsPickerUseLabelBase} ${count} files`
+      : count === 1
+        ? `${fsPickerUseLabelBase} 1 file`
+        : fsPickerUseLabelBase;
+  }
 }
 
-function selectFsPickerFile(path) {
-  fsPickerSelectedPath = String(path || '').trim();
+// Central selection setter: dedupes, keeps fsPickerSelectedPath pointing at
+// the most recent entry, and refreshes row highlights, the confirm button,
+// and the status line.
+function fsPickerApplySelection(paths) {
+  const unique = [];
+  for (const path of paths) {
+    const clean = String(path || '').trim();
+    if (clean && !unique.includes(clean)) unique.push(clean);
+  }
+  fsPickerSelectedPaths = unique;
+  fsPickerSelectedPath = unique.length ? unique[unique.length - 1] : '';
   const input = document.getElementById('fs-picker-path');
   if (input && fsPickerSelectedPath) input.value = fsPickerSelectedPath;
   setFsPickerUseButtonState();
   document.querySelectorAll('#fs-picker-list .fs-picker-entry.file').forEach(btn => {
-    btn.classList.toggle('selected', (btn.dataset.path || '') === fsPickerSelectedPath);
+    btn.classList.toggle('selected', fsPickerSelectedPaths.includes(btn.dataset.path || ''));
   });
-  if (fsPickerSelectedPath) setFsPickerStatus('', 'File selected');
+  if (fsPickerSelectedPaths.length || fsPickerMultiSelect) {
+    setFsPickerStatus('', fsPickerSelectionStatusText());
+  }
+}
+
+function selectFsPickerFile(path) {
+  const target = String(path || '').trim();
+  fsPickerAnchorPath = target;
+  fsPickerApplySelection(target ? [target] : []);
+}
+
+function handleFsPickerFileClick(ev, path) {
+  const target = String(path || '').trim();
+  if (!target) return;
+  if (!fsPickerMultiSelect) {
+    selectFsPickerFile(target);
+    return;
+  }
+  if (ev.shiftKey && fsPickerAnchorPath) {
+    // Range within the current listing, file rows only (directories are
+    // never multi-selectable). The anchor survives so a follow-up
+    // shift-click re-ranges from the same starting row.
+    const listed = Array.from(document.querySelectorAll('#fs-picker-list .fs-picker-entry.file'))
+      .map(btn => btn.dataset.path || '')
+      .filter(Boolean);
+    const from = listed.indexOf(fsPickerAnchorPath);
+    const to = listed.indexOf(target);
+    if (from !== -1 && to !== -1) {
+      fsPickerApplySelection(listed.slice(Math.min(from, to), Math.max(from, to) + 1));
+      return;
+    }
+  }
+  if (ev.metaKey || ev.ctrlKey) {
+    const next = fsPickerSelectedPaths.includes(target)
+      ? fsPickerSelectedPaths.filter(item => item !== target)
+      : [...fsPickerSelectedPaths, target];
+    fsPickerAnchorPath = target;
+    fsPickerApplySelection(next);
+    return;
+  }
+  selectFsPickerFile(target);
 }
 
 function setFsPickerDownloadBusy(busy) {
@@ -79967,7 +80060,7 @@ function renderFsPicker(data) {
     const cls = entry.is_dir ? 'dir' : 'file';
     const title = escapeHtml(entry.path || entry.name || '');
     const selectableFile = fsPickerMode === 'file' && entry.is_file;
-    const selected = selectableFile && (entry.path || '') === fsPickerSelectedPath ? ' selected' : '';
+    const selected = selectableFile && fsPickerEntryIsSelected(entry.path || '') ? ' selected' : '';
     const disabled = entry.is_dir || selectableFile ? '' : 'disabled';
     rows.push(
       `<button type="button" class="fs-picker-entry ${cls}${selected}" data-path="${title}" ${disabled}>` +
@@ -79983,16 +80076,17 @@ function renderFsPicker(data) {
   });
   if (fsPickerMode === 'file') {
     list.querySelectorAll('.fs-picker-entry.file').forEach(btn => {
-      btn.addEventListener('click', () => selectFsPickerFile(btn.dataset.path || ''));
-      btn.addEventListener('dblclick', () => {
+      btn.addEventListener('click', ev => handleFsPickerFileClick(ev, btn.dataset.path || ''));
+      btn.addEventListener('dblclick', ev => {
+        // In multi-select mode a modified double-click is part of toggling /
+        // ranging, not a confirm gesture.
+        if (fsPickerMultiSelect && (ev.metaKey || ev.ctrlKey || ev.shiftKey)) return;
         selectFsPickerFile(btn.dataset.path || '');
         useFsPickerSelection();
       });
     });
   }
-  if (useBtn) {
-    useBtn.disabled = fsPickerMode === 'file' ? !fsPickerSelectedPath : !fsPickerCurrentPath;
-  }
+  if (useBtn) setFsPickerUseButtonState();
 }
 
 async function resolveFsPickerListTarget(target) {
@@ -80026,11 +80120,15 @@ async function loadFsPicker(path) {
   if (input) input.value = target;
   fsPickerCurrentPath = '';
   fsPickerSelectedPath = '';
+  fsPickerSelectedPaths = [];
+  fsPickerAnchorPath = '';
   setFsPickerUseButtonState();
   setFsPickerStatus('', 'Loading...');
   try {
     const resolved = await resolveFsPickerListTarget(target);
     fsPickerSelectedPath = resolved.selectedPath || '';
+    fsPickerSelectedPaths = fsPickerSelectedPath ? [fsPickerSelectedPath] : [];
+    fsPickerAnchorPath = fsPickerSelectedPath;
     const resp = await dashboardJsonFetch('api_fs_list', { path: resolved.listPath }, () => (
       authedFetch('/api/fs/list?path=' + encodeURIComponent(resolved.listPath))
     ), 'api_fs_list');
@@ -80038,10 +80136,10 @@ async function loadFsPicker(path) {
     if (!resp.ok) throw new Error(data.error || `Directory load failed (${resp.status})`);
     if (input) input.value = fsPickerSelectedPath || data.path || resolved.listPath;
     const statusText = fsPickerSelectedPath
-      ? 'File selected'
+      ? fsPickerSelectionStatusText()
       : data.truncated
         ? 'Showing first 500 entries'
-        : '';
+        : fsPickerSelectionStatusText();
     setFsPickerStatus('', statusText);
     renderFsPicker(data);
   } catch (e) {
@@ -80110,10 +80208,11 @@ function openFilesDownloadPicker() {
   configureFsPicker({
     mode: 'file',
     target: 'filesDownload',
-    title: 'Choose file to download',
+    title: 'Choose files to download',
     placeholder: '/path/to/file',
-    useLabel: 'Select file',
+    useLabel: 'Download',
     showCreate: false,
+    multiSelect: true,
   });
   const modal = document.getElementById('fs-picker-modal');
   if (modal) modal.style.display = 'flex';
@@ -80214,10 +80313,19 @@ function useFsPickerSelection() {
     return;
   }
   if (fsPickerTarget === 'filesDownload') {
-    if (!fsPickerSelectedPath) return;
-    setFilesDownloadPath(fsPickerSelectedPath);
-    setFilesDownloadStatus('', 'Ready');
-    setFilesDownloadProgress(0, 0);
+    const paths = fsPickerSelectedPaths.length
+      ? fsPickerSelectedPaths.slice()
+      : (fsPickerSelectedPath ? [fsPickerSelectedPath] : []);
+    if (!paths.length) return;
+    if (!filesDownloadTunnelAvailable()) {
+      setFsPickerStatus('error', filesDownloadUnavailableMessage());
+      return;
+    }
+    // One transfer per selected file: the transfers pump runs them
+    // sequentially and each completed download saves through the existing
+    // per-transfer browser-save flow. No bundling.
+    for (const path of paths) startFilesDownload({ path });
+    if (paths.length > 1) setFilesDownloadStatus('warn', `Queued ${paths.length} downloads`);
     closeFsPicker();
     return;
   }
