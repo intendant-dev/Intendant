@@ -858,7 +858,7 @@ function renderAccessTierCard() {
   const capLabel = document.createElement('span');
   capLabel.className = 'acc-principal-kind';
   capLabel.textContent = 'Hosted tabs may:';
-  capLabel.title = 'Applies to sessions arriving with hosted provenance — Connect accounts and browser keys enrolled from a hosted origin. Direct, app, and anchor-served sessions are never capped by this.';
+  capLabel.title = 'Applies to sessions arriving with hosted provenance — Connect accounts and browser keys enrolled from a hosted origin. Direct and app sessions are never capped by this. Fleet-name sessions (d-….fleet…) are uncapped by default because this daemon serves their code; to cap them too, add the fleet zone\'s origins to hosted_origins in iam.json (docs: trust-tiers, first contact).';
   capRow.appendChild(capLabel);
   const select = document.createElement('select');
   select.className = 'acc-btn';
@@ -1045,10 +1045,20 @@ function renderAccessConnectCard() {
       : 'No addresses published yet — requesting a certificate publishes this daemon’s routable addresses first.';
     row.appendChild(label);
     const chip = document.createElement('span');
+    if (fleetCert.ct_state === 'alert') {
+      const ct = document.createElement('span');
+      ct.className = 'acc-chip route-danger';
+      ct.textContent = 'CT ALERT';
+      ct.title = `The public Certificate Transparency logs hold ${fleetCert.ct_unknown?.length || 'unknown'} certificate(s) for this daemon's fleet name that this daemon never requested: ${(fleetCert.ct_unknown || []).join(' | ')}. If you did not mint these yourself through another channel, someone who controls the fleet zone (or a CA) issued a certificate for this name — treat the fleet route as compromised and reach this daemon directly or through the app.`;
+      row.appendChild(ct);
+    }
     if (fleetCert.state === 'valid') {
       chip.className = 'acc-chip route-webrtc';
       chip.textContent = validUntil ? `certificate ✓ until ${validUntil}` : 'certificate ✓';
-      chip.title = 'A browser-trusted Let’s Encrypt certificate is serving for this name — open the direct dashboard at https://' + fleetCert.name + (window.location.port ? ':' + window.location.port : '') + ' without warnings. Renewals are automatic.';
+      chip.title = 'A browser-trusted Let’s Encrypt certificate is serving for this name — open the direct dashboard at https://' + fleetCert.name + (window.location.port ? ':' + window.location.port : '') + ' without warnings. Renewals are automatic.'
+        + (fleetCert.ct_state === 'ok' && fleetCert.ct_checked_unix_ms
+          ? ` CT tripwire: all publicly logged certificates for this name are this daemon's own (checked ${new Date(Number(fleetCert.ct_checked_unix_ms)).toLocaleString()}).`
+          : '');
     } else if (fleetCert.state === 'requesting') {
       chip.className = 'acc-chip route-remembered';
       chip.textContent = 'requesting…';
@@ -1235,12 +1245,19 @@ function renderAccessEnrollmentRequests() {
     kind.textContent = `${attempts === 1 ? '1 attempt' : `${attempts} attempts`} · last ${new Date(Number(request.last_seen_unix_ms || 0)).toLocaleString()}`;
     nameWrap.append(name, kind);
     headRow.append(glyphEl, nameWrap);
-    if (request.origin) {
-      headRow.appendChild(accessRouteChip('connect', 'via hosted route', `The offer arrived through ${request.origin}; the key will be recorded with that origin, so the role ceiling applies until it is re-enrolled from an anchor origin.`));
-      if (accessModelLabel(accessIamModel(accessOverviewModel()).tier) === 'integrated') {
-        headRow.appendChild(accessRouteChip('danger', 'integrated tier',
-          'This is an integrated-tier machine and the key arrived through a hosted route. Approving is an upward grant (docs: trust-tiers) — the hosted-control cap still bounds the session, but prefer enrolling this device from a direct or app origin.'));
-      }
+    // Route provenance chip: which first-contact rung the key arrived on
+    // (classified daemon-side — origin_class; docs/src/trust-tiers.md).
+    const originClass = request.origin_class || (request.origin ? 'hosted' : 'unknown');
+    if (originClass === 'hosted') {
+      headRow.appendChild(accessRouteChip('connect', 'via hosted route', `The offer arrived through ${request.origin}; the rendezvous serves that page's code, so the hosted role ceiling applies until the key is re-enrolled from a daemon-served origin.`));
+    } else if (originClass === 'fleet') {
+      headRow.appendChild(accessRouteChip('remembered', 'via fleet name', `The offer arrived through ${request.origin} — this daemon serves that page's code, but the rendezvous names the route (it could hijack DNS and mint a certificate; such an attack is active-only and lands in public CT logs, which this daemon monitors). Rung two of first contact: stronger than hosted, weaker than a typed address. No ceiling applies by default; add the fleet zone to hosted_origins in iam.json to cap it.`));
+    } else if (request.origin) {
+      headRow.appendChild(accessRouteChip('local', 'via direct origin', `The offer arrived through ${request.origin} — a daemon-served origin the rendezvous neither serves nor names.`));
+    }
+    if (request.origin && accessModelLabel(accessIamModel(accessOverviewModel()).tier) === 'integrated') {
+      headRow.appendChild(accessRouteChip('danger', 'integrated tier',
+        'This is an integrated-tier machine and the key arrived over the network. Approving grants remote authority here — verify the fingerprint below against the requesting device before approving anything above observer (docs: trust-tiers).'));
     }
     if (request.account_hint) {
       headRow.appendChild(request.account_attested
