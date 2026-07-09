@@ -710,6 +710,19 @@ pub struct DisplaySession {
     /// lower 32 bits of `(arrived - session_epoch).as_millis()`, so each
     /// frame carries its capture-time timestamp without a side channel.
     diagnostics_visual_marker: Arc<AtomicBool>,
+    /// **Agent visibility.** `true` (the default) means this display may be
+    /// seen and driven by agents: it appears in agent-facing registry
+    /// lookups ([`SessionRegistry::get`], [`SessionRegistry::display_ids`])
+    /// and its 1 Hz FrameRegistry sampler publishes `display_<id>` frames
+    /// for model feeds. `false` marks a **private user view** ("View this
+    /// machine"): the session still streams to the owner's dashboards over
+    /// WebRTC and accepts dashboard input, but every agent-facing lookup
+    /// skips it and the FrameRegistry sampler stays silent, so agent
+    /// screenshot/CU/frame paths cannot reach it (fail closed). Flipped to
+    /// `true` in place when the user later shares the display with the
+    /// agent — no capture restart needed; frames start publishing on the
+    /// next sampler tick. Never downgraded automatically.
+    agent_visible: Arc<AtomicBool>,
     /// Reference instant for the diagnostic marker's 32-bit timestamp.
     /// Set once in [`Self::new`]; the bridge computes
     /// `arrived.duration_since(session_epoch).as_millis() as u32` per
@@ -1144,9 +1157,23 @@ impl DisplaySession {
             tile_epoch: Arc::new(AtomicU32::new(1)),
             tile_snapshot_id: Arc::new(AtomicU32::new(1)),
             diagnostics_visual_marker: Arc::new(AtomicBool::new(false)),
+            agent_visible: Arc::new(AtomicBool::new(true)),
             session_epoch: Instant::now(),
             layer_policy_handle: Mutex::new(None),
         }
+    }
+
+    /// Set whether agents may see this display (see the `agent_visible`
+    /// field docs). Callers only ever *raise* visibility automatically on
+    /// an explicit user grant; creation-time hiding happens before the
+    /// session enters the registry.
+    pub fn set_agent_visible(&self, visible: bool) {
+        self.agent_visible.store(visible, Ordering::Relaxed);
+    }
+
+    /// Whether agents may see this display. `false` = private user view.
+    pub fn agent_visible(&self) -> bool {
+        self.agent_visible.load(Ordering::Relaxed)
     }
 
     /// Toggle the Phase 0 visual-freshness diagnostic marker on or off.
@@ -1453,6 +1480,7 @@ impl DisplaySession {
             let latest = Arc::clone(&self.latest_frame);
             let shutdown_reg = self.shutdown.clone();
             let display_id = self.display_id;
+            let agent_visible = Arc::clone(&self.agent_visible);
             let mut frame_counter = 0u64;
             let reg_handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -1460,6 +1488,13 @@ impl DisplaySession {
                     tokio::select! {
                         _ = shutdown_reg.cancelled() => break,
                         _ = interval.tick() => {
+                            // The FrameRegistry is a model feed (agent
+                            // auto-attach, presence frame tools, MCP
+                            // list_frames/read_frame). A private user view
+                            // must publish nothing to it — checked per tick
+                            // so a later "share with agent" upgrade starts
+                            // publishing without a capture restart.
+                            if !agent_visible.load(Ordering::Relaxed) { continue }
                             let frame = latest.read().await.clone();
                             let Some(frame) = frame else { continue };
                             let w = frame.width;
@@ -2964,7 +2999,27 @@ impl SessionRegistry {
         }
     }
 
+    /// Agent-facing lookup — the **fail-closed default**. Returns the
+    /// session only when it is agent-visible; a private user view
+    /// ("View this machine", [`DisplaySession::agent_visible`] == false)
+    /// reads as absent. Every agent-reachable path (CU action execution,
+    /// screenshot session lookup, default-target selection, display
+    /// enumeration overlays, federated peer streaming) goes through this,
+    /// so new callers are private-view-safe unless they explicitly opt
+    /// into [`Self::get_any`].
     pub fn get(&self, display_id: u32) -> Option<Arc<DisplaySession>> {
+        self.sessions
+            .get(&display_id)
+            .filter(|s| s.agent_visible())
+            .cloned()
+    }
+
+    /// Unfiltered lookup for **user/dashboard surfaces only** (WebRTC
+    /// offers and input from the owner's dashboards, lifecycle teardown,
+    /// activation dedupe, explicit user-initiated recording). Returns
+    /// private user views too — never call this from a path whose output
+    /// reaches an agent.
+    pub fn get_any(&self, display_id: u32) -> Option<Arc<DisplaySession>> {
         self.sessions.get(&display_id).cloned()
     }
 
@@ -2983,8 +3038,20 @@ impl SessionRegistry {
         self.sessions.remove(&display_id)
     }
 
-    /// All active display IDs.
+    /// Agent-visible display IDs — the fail-closed default enumeration
+    /// (see [`Self::get`]). Private user views are excluded.
     pub fn display_ids(&self) -> Vec<u32> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| s.agent_visible())
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// All active display IDs including private user views — for
+    /// user/dashboard surfaces only (bootstrap replay, input-authority
+    /// snapshots, virtual-display id allocation).
+    pub fn all_display_ids(&self) -> Vec<u32> {
         self.sessions.keys().copied().collect()
     }
 
@@ -3642,6 +3709,60 @@ mod tests {
             Some(now),
             min
         ));
+    }
+
+    #[test]
+    fn session_registry_agent_hidden_sessions_absent_from_agent_lookups() {
+        let mut reg = SessionRegistry::new();
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
+        let private_view = Arc::new(DisplaySession::new(0, Arc::clone(&backend) as _));
+        private_view.set_agent_visible(false);
+        let agent_display = Arc::new(DisplaySession::new(99, backend as _));
+        reg.insert(0, Arc::clone(&private_view));
+        reg.insert(99, Arc::clone(&agent_display));
+
+        // Agent-facing default lookups: the private view reads as absent.
+        assert!(
+            reg.get(0).is_none(),
+            "agent-facing get must not return a private user view"
+        );
+        assert!(reg.get(99).is_some(), "agent displays stay visible");
+        assert_eq!(
+            reg.display_ids(),
+            vec![99],
+            "agent-facing enumeration must exclude the private view"
+        );
+
+        // Dashboard surfaces see everything.
+        assert!(reg.get_any(0).is_some(), "dashboard get_any sees the view");
+        let mut all = reg.all_display_ids();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 99]);
+
+        // A later "share with agent" upgrade makes it visible in place.
+        private_view.set_agent_visible(true);
+        assert!(reg.get(0).is_some(), "upgraded session becomes agent-visible");
+        let mut ids = reg.display_ids();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 99]);
+    }
+
+    #[test]
+    fn display_session_agent_visible_defaults_true() {
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
+        let session = DisplaySession::new(1, backend);
+        assert!(
+            session.agent_visible(),
+            "sessions default to agent-visible (legacy grant semantics)"
+        );
+        session.set_agent_visible(false);
+        assert!(!session.agent_visible());
     }
 
     #[test]

@@ -1289,8 +1289,14 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             display_id,
             width,
             height,
-            ..
+            agent_visible,
         } => {
+            // A private user view is not an available display for the
+            // presence model's routing decisions — it belongs to the
+            // user's dashboards only.
+            if !agent_visible {
+                return;
+            }
             let prefix = if *display_id == 0 {
                 "user_session".to_string()
             } else {

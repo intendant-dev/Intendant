@@ -312,6 +312,28 @@ pub(crate) async fn displays_response_body(
     session_registry: &Option<crate::display::SharedSessionRegistry>,
 ) -> String {
     let displays = crate::display::enumerate_displays_with_sessions(session_registry).await;
+    // This route serves the owner's dashboards (the display picker), so
+    // each entry is annotated with its live capture state via the
+    // unfiltered registry view: `capture_active` plus `agent_visible`
+    // (false = private user view). Agent-facing display enumeration
+    // (MCP `list_displays`, ctl) uses the filtered lookups and never
+    // sees a private view's session.
+    let mut displays: Vec<serde_json::Value> = displays
+        .iter()
+        .map(|d| serde_json::to_value(d).unwrap_or_else(|_| serde_json::json!({})))
+        .collect();
+    if let Some(sr) = session_registry.as_ref() {
+        let reg = sr.read().await;
+        for entry in displays.iter_mut() {
+            let Some(id) = entry.get("id").and_then(|v| v.as_u64()) else {
+                continue;
+            };
+            if let Some(session) = reg.get_any(id as u32) {
+                entry["capture_active"] = serde_json::json!(true);
+                entry["agent_visible"] = serde_json::json!(session.agent_visible());
+            }
+        }
+    }
     // Object form (normalizeDisplaysPayload accepts both): the displays
     // surface also advertises display capabilities, so dashboards derive
     // affordances like "New virtual display" instead of mirroring the

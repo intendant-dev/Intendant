@@ -131,6 +131,7 @@ class DisplaySlot {
     this.el.innerHTML = `
       <div class="display-toolbar">
         <span class="display-label">${label}</span>
+        <span class="display-visibility" id="ds-visibility-${displayId}" style="display:none"></span>
         <span class="display-status" id="ds-status-${displayId}">Connecting...</span>
         <span class="display-input-authority" id="ds-authority-${displayId}" style="display:none" title="Input authority for this display: who can drive keyboard/mouse. Phase 5c."></span>
         <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
@@ -147,6 +148,7 @@ class DisplaySlot {
       </div>
       <div class="display-canvas" id="display-canvas-${displayId}"></div>`;
     this.statusEl = this.el.querySelector(`#ds-status-${displayId}`);
+    this.visibilityEl = this.el.querySelector(`#ds-visibility-${displayId}`);
     this.authorityEl = this.el.querySelector(`#ds-authority-${displayId}`);
     this.noteInput = this.el.querySelector(`#ds-note-${displayId}`);
     this.takeBtn = this.el.querySelector(`#ds-take-${displayId}`);
@@ -223,6 +225,7 @@ class DisplaySlot {
     const displayId = Number(this.displayId);
     dispatchDashboardActionMsg({ action: 'revoke_user_display', display_id: displayId });
     removeDisplaySlot(displayId);
+    clearDisplayAgentVisibility(displayId);
     if (Number(grantedDisplayId) === displayId) {
       setUserDisplayState(false);
     }
@@ -901,6 +904,36 @@ class DisplaySlot {
   // the source of truth for input enforcement; this UI logic exists
   // strictly to keep the chip + buttons + interactive mode consistent
   // with what the gate is doing.
+  // Render the agent-visibility chip: "Private view" (the agent cannot
+  // see this display) vs "Agent can see this" (a user display shared for
+  // computer use). Agent-owned virtual displays get no chip -- they are
+  // the agent's own workspaces, so annotating them is noise.
+  setAgentVisibility(visible) {
+    if (!this.visibilityEl) return;
+    const id = Number(this.displayId);
+    if (visible === false) {
+      this.visibilityEl.textContent = 'Private view';
+      this.visibilityEl.title =
+        'Only your dashboard can see this display. It is hidden from the ' +
+        "agent's screenshot, computer-use, and display-listing paths.";
+      this.visibilityEl.classList.add('private');
+      this.visibilityEl.classList.remove('agent');
+      this.visibilityEl.style.display = '';
+    } else if (visible === true && userDisplayIds.has(id)) {
+      this.visibilityEl.textContent = 'Agent can see this';
+      this.visibilityEl.title =
+        'This screen is shared with the agent for computer-use tasks ' +
+        'until you revoke access.';
+      this.visibilityEl.classList.add('agent');
+      this.visibilityEl.classList.remove('private');
+      this.visibilityEl.style.display = '';
+    } else {
+      this.visibilityEl.style.display = 'none';
+    }
+    // The ui2 live rail re-renders via its MutationObserver on
+    // #displays-container (class/style/text changes on this chip).
+  }
+
   setAuthority(state) {
     if (state !== 'you' && state !== 'other' && state !== 'unclaimed') {
       // Forward-compat: future state strings (we don't expect any) leave
@@ -1393,6 +1426,11 @@ function addDisplaySlot(displayId, width, height) {
   }
   const slot = new DisplaySlot(displayId, width, height);
   displaySlots.set(displayId, slot);
+  // Apply the recorded agent-visibility mode (from display_ready /
+  // user_display_granted events, which may precede slot creation).
+  if (displayAgentVisibility.has(displayId)) {
+    slot.setAgentVisibility(displayAgentVisibility.get(displayId));
+  }
   // Phase 5c: drain any authority state that arrived before this slot
   // existed.  See pendingAuthorityStates docs for the race rationale.
   const pendingState = pendingAuthorityStates.get(displayId);
@@ -1656,6 +1694,13 @@ if (typeof ui2Enabled === 'function' && ui2Enabled()) (() => {
       main.appendChild(meta);
       row.appendChild(dot);
       row.appendChild(main);
+      if (displayAgentVisibility.get(Number(slot.displayId)) === false) {
+        const tag = document.createElement('span');
+        tag.className = 'ui2-live-row-tag';
+        tag.textContent = 'PRIVATE';
+        tag.title = 'Private view — the agent cannot see this display';
+        row.appendChild(tag);
+      }
       if (slot.connected) {
         const tag = document.createElement('span');
         tag.className = 'ui2-live-row-tag';
@@ -1781,7 +1826,6 @@ if (typeof ui2Enabled === 'function' && ui2Enabled()) (() => {
 
   function renderYourScreen() {
     yourScreen.textContent = '';
-    const chip = document.getElementById('sb-display-access');
     const card = document.createElement('div');
     card.className = 'ui2-live-card';
     const head = document.createElement('div');
@@ -1792,32 +1836,64 @@ if (typeof ui2Enabled === 'function' && ui2Enabled()) (() => {
     title.className = 'ui2-live-card-title';
     title.style.flex = '1';
     title.textContent = 'Your screen';
-    const granted = !!(chip && chip.classList.contains('granted'));
+    // Two distinct things can be active here, and the card never
+    // conflates them:
+    //  - a PRIVATE VIEW ("View this machine"): remote view/control of
+    //    this machine from the dashboard; the agent cannot see it;
+    //  - an AGENT SHARE ("Share with agent"): the screen is visible to
+    //    the agent for computer-use tasks.
+    // (Streaming frames to the live presence/voice model is a third,
+    // separate control -- the Stream button on the display tile.)
+    const granted = userDisplayGranted;
+    const shared = granted && userDisplayAgentVisible;
     const pill = document.createElement('span');
-    pill.className = 'ui2-live-state-pill' + (granted ? ' you' : '');
-    pill.textContent = granted ? 'shared' : 'off';
+    pill.className = 'ui2-live-state-pill'
+      + (shared ? ' other' : granted ? ' you' : '');
+    pill.textContent = shared ? 'agent can see this' : granted ? 'private view' : 'off';
     head.appendChild(title);
     head.appendChild(pill);
     const sub = document.createElement('div');
     sub.className = 'ui2-live-card-sub';
-    sub.textContent = granted
+    sub.textContent = shared
       ? 'The agent can see and drive this screen for computer-use tasks until you revoke access.'
-      : 'Share your own screen with the agent for computer-use tasks. You choose the display and can revoke at any time.';
+      : granted
+        ? 'Streaming to your dashboard only. The agent cannot see this display.'
+        : 'View and control this machine’s display from here, or share it with the agent for computer-use tasks. You choose the display and can stop at any time.';
     card.appendChild(head);
     card.appendChild(sub);
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'ui2-live-card-btn ' + (granted ? 'danger' : 'secondary');
-    btn.textContent = granted ? 'Revoke access' : 'Share your screen…';
-    btn.title = chip ? chip.title : '';
-    btn.disabled = !chip;
-    btn.addEventListener('click', (e) => {
-      // Same flow as the status-bar chip (single display → instant
-      // grant; multiple → picker popover anchored at the chip).
-      e.stopPropagation();
-      if (chip) chip.click();
-    });
-    card.appendChild(btn);
+    const addBtn = (label, cls, title, onClick) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ui2-live-card-btn ' + cls;
+      btn.textContent = label;
+      btn.title = title;
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        onClick();
+      });
+      card.appendChild(btn);
+      return btn;
+    };
+    if (!granted) {
+      // Primary: private remote view. Secondary: the agent share.
+      addBtn('View this machine', 'secondary',
+        'Watch and control this machine’s display from the dashboard. Private: the agent cannot see it.',
+        () => { if (typeof startUserDisplayGrantFlow === 'function') startUserDisplayGrantFlow('view'); });
+      addBtn('Share with agent…', 'secondary',
+        'Make this screen visible to the agent for computer-use tasks. Revocable at any time.',
+        () => { if (typeof startUserDisplayGrantFlow === 'function') startUserDisplayGrantFlow('share'); });
+    } else if (!shared) {
+      addBtn('Stop viewing', 'danger',
+        'Close the private view of this machine.',
+        () => { if (typeof revokeUserDisplayNow === 'function') revokeUserDisplayNow(); });
+      addBtn('Share with agent', 'secondary',
+        'Upgrade this private view: make the display visible to the agent for computer-use tasks.',
+        () => { if (typeof shareUserDisplayWithAgent === 'function') shareUserDisplayWithAgent(); });
+    } else {
+      addBtn('Revoke access', 'danger',
+        'Take the display away from the agent and stop streaming it.',
+        () => { if (typeof revokeUserDisplayNow === 'function') revokeUserDisplayNow(); });
+    }
     yourScreen.appendChild(card);
   }
 

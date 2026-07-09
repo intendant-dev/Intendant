@@ -197,6 +197,11 @@ impl IntendantServer {
                 .to_string();
         }
         let display_id = params.display_id.unwrap_or(0);
+        // Filtered lookup on purpose: an active *private view* session
+        // reads as absent here, so the grant falls through to the
+        // UserDisplayGranted event and the activation listener upgrades
+        // the view to agent-shared in place (this tool is owner-surface
+        // only — the call is the opt-in).
         let active_resolution = active_display_session_resolution(&self.state, display_id).await;
         let autonomy = {
             let mut state = self.state.write().await;
@@ -209,9 +214,13 @@ impl IntendantServer {
                 display_id,
                 width,
                 height,
+                agent_visible: true,
             });
         } else {
-            self.bus.send(AppEvent::UserDisplayGranted { display_id });
+            self.bus.send(AppEvent::UserDisplayGranted {
+                display_id,
+                agent_visible: true,
+            });
         }
         user_display_grant_result_message(display_id, active_resolution)
     }
@@ -286,8 +295,14 @@ impl IntendantServer {
                 state.user_display_activation_pending.get(&0).copied(),
             )
         };
+        // `get_any`: a private user view is still a live portal session —
+        // re-emitting a grant here would upgrade it to agent-visible from
+        // an implicit reacquire path. With the view treated as "already
+        // active", the screenshot's own (filtered) session lookup then
+        // fails with the no-session guidance and the caller must use the
+        // explicit owner-only grant to share it.
         if let Some(registry) = &session_registry {
-            if registry.read().await.get(0).is_some() {
+            if registry.read().await.get_any(0).is_some() {
                 self.state.write().await.note_display_capture_ready(0);
                 return UserSessionDisplayActivationRequest::AlreadyActive;
             }
@@ -322,8 +337,10 @@ impl IntendantServer {
             let mut guard = autonomy.write().await;
             guard.user_display_granted = true;
         }
-        self.bus
-            .send(AppEvent::UserDisplayGranted { display_id: 0 });
+        self.bus.send(AppEvent::UserDisplayGranted {
+            display_id: 0,
+            agent_visible: true,
+        });
         UserSessionDisplayActivationRequest::Requested
     }
 
@@ -374,8 +391,12 @@ impl IntendantServer {
             }
         }
 
+        // `get_any`: an existing private view counts as "already active"
+        // — sharing a view is an explicit grant, not a side effect of a
+        // shared-view call (the capture verb's own filtered lookup still
+        // refuses to read the private session).
         if let Some(registry) = session_registry {
-            if registry.read().await.get(display_id).is_some() {
+            if registry.read().await.get_any(display_id).is_some() {
                 return Ok(());
             }
         }
@@ -386,7 +407,10 @@ impl IntendantServer {
             let mut guard = autonomy.write().await;
             guard.user_display_granted = true;
         }
-        self.bus.send(AppEvent::UserDisplayGranted { display_id });
+        self.bus.send(AppEvent::UserDisplayGranted {
+            display_id,
+            agent_visible: true,
+        });
         Ok(())
     }
 
@@ -1078,7 +1102,8 @@ mod tests {
             assert!(!result.is_error.unwrap_or(false));
 
             match timeout(Duration::from_secs(1), rx.recv()).await {
-                Ok(Ok(AppEvent::UserDisplayGranted { display_id })) => {
+                Ok(Ok(AppEvent::UserDisplayGranted { display_id, agent_visible })) => {
+                    assert!(agent_visible, "MCP grant paths always share with the agent");
                     assert_eq!(display_id, 99);
                 }
                 other => panic!("expected UserDisplayGranted event, got {other:?}"),
@@ -1187,7 +1212,8 @@ mod tests {
             assert!(!result.is_error.unwrap_or(false));
 
             match timeout(Duration::from_secs(1), rx.recv()).await {
-                Ok(Ok(AppEvent::UserDisplayGranted { display_id })) => {
+                Ok(Ok(AppEvent::UserDisplayGranted { display_id, agent_visible })) => {
+                    assert!(agent_visible, "MCP grant paths always share with the agent");
                     assert_eq!(display_id, 0);
                 }
                 other => panic!("expected UserDisplayGranted event, got {other:?}"),
@@ -1415,7 +1441,8 @@ mod tests {
             assert!(!result.is_error.unwrap_or(false));
 
             match timeout(Duration::from_secs(1), rx.recv()).await {
-                Ok(Ok(AppEvent::UserDisplayGranted { display_id })) => {
+                Ok(Ok(AppEvent::UserDisplayGranted { display_id, agent_visible })) => {
+                    assert!(agent_visible, "MCP grant paths always share with the agent");
                     assert_eq!(display_id, 2);
                 }
                 other => panic!("expected UserDisplayGranted event, got {other:?}"),
@@ -1498,7 +1525,8 @@ mod tests {
             );
 
             match timeout(Duration::from_secs(1), rx.recv()).await {
-                Ok(Ok(AppEvent::UserDisplayGranted { display_id })) => {
+                Ok(Ok(AppEvent::UserDisplayGranted { display_id, agent_visible })) => {
+                    assert!(agent_visible, "MCP grant paths always share with the agent");
                     assert_eq!(display_id, 0);
                 }
                 other => panic!("expected UserDisplayGranted event, got {other:?}"),
@@ -1605,7 +1633,8 @@ mod tests {
                 "refreshed pending timestamp should be current"
             );
             match timeout(Duration::from_secs(1), rx.recv()).await {
-                Ok(Ok(AppEvent::UserDisplayGranted { display_id })) => {
+                Ok(Ok(AppEvent::UserDisplayGranted { display_id, agent_visible })) => {
+                    assert!(agent_visible, "MCP grant paths always share with the agent");
                     assert_eq!(display_id, 0);
                 }
                 other => panic!("expected refreshed UserDisplayGranted event, got {other:?}"),
@@ -1656,9 +1685,11 @@ mod tests {
                     display_id,
                     width,
                     height,
+                    agent_visible,
                 })) => {
                     assert_eq!(display_id, 0);
                     assert_eq!((width, height), (1920, 1080));
+                    assert!(agent_visible, "the MCP grant shares with the agent");
                 }
                 other => panic!("expected DisplayReady event, got {other:?}"),
             }

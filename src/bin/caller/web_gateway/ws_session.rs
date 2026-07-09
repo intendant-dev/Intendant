@@ -85,8 +85,11 @@ pub(crate) async fn ws_outbound_task(
                         // tokio lock for the active-display list — order
                         // matters: take the std lock LAST and drop it before
                         // awaiting the send to avoid awaiting under a sync guard.
-                                        let display_ids: Vec<u32> = match session_registry.as_ref() {
-                            Some(sr) => sr.read().await.display_ids(),
+                                        // `all_display_ids`: authority chips are a
+                        // dashboard surface — private user views hold
+                        // input authority like any other display.
+                        let display_ids: Vec<u32> = match session_registry.as_ref() {
+                            Some(sr) => sr.read().await.all_display_ids(),
                             None => Vec::new(),
                         };
                         let snapshots: Vec<(u32, &'static str)> = {
@@ -1255,10 +1258,12 @@ pub(crate) async fn ws_inbound_task(
                         // (notably deactivate_user_display's
                         // registry.write()) for as long as this block
                         // runs. The Arc keeps the session alive
-                        // independently of the lock.
+                        // independently of the lock. `get_any`: local
+                        // dashboard viewers are the user surface —
+                        // private user views stream here (and only here).
                         let session: Option<Arc<crate::display::DisplaySession>> =
                             match session_registry_inbound.as_ref() {
-                                Some(sr) => sr.read().await.get(display_id),
+                                Some(sr) => sr.read().await.get_any(display_id),
                                 None => None,
                             };
                         if let Some(session) = session {
@@ -1388,9 +1393,12 @@ pub(crate) async fn ws_inbound_task(
                             // first lets deactivate proceed
                             // immediately; the session Arc keeps the
                             // target alive while mDNS resolves.
+                            // `get_any`: same local-dashboard leg as the
+                            // display_offer handler — private user views
+                            // stream to the owner's dashboards.
                             let session: Option<Arc<crate::display::DisplaySession>> =
                                 match sr_clone.as_ref() {
-                                    Some(sr) => sr.read().await.get(display_id),
+                                    Some(sr) => sr.read().await.get_any(display_id),
                                     None => None,
                                 };
                             if let Some(session) = session {
@@ -1696,9 +1704,12 @@ pub(crate) async fn ws_inbound_task(
                             if let Ok(input_event) =
                                 serde_json::from_value::<crate::display::InputEvent>(evt.clone())
                             {
+                                // `get_any`: dashboard input drives private
+                                // user views too (that's the remote-control
+                                // point of "View this machine").
                                 let session: Option<Arc<crate::display::DisplaySession>> =
                                     match session_registry_inbound.as_ref() {
-                                        Some(sr) => sr.read().await.get(display_id),
+                                        Some(sr) => sr.read().await.get_any(display_id),
                                         None => None,
                                     };
                                 if let Some(session) = session {
@@ -2058,12 +2069,13 @@ pub(crate) async fn ws_inbound_task(
     if is_presence_connected && is_active {
         bus_inbound.send(AppEvent::PresenceDisconnected);
     }
-    // Remove this peer from display sessions it connected to
+    // Remove this peer from display sessions it connected to. `get_any`:
+    // teardown must find private user views too, or their RTC peers leak.
     if !peer_display_ids.is_empty() {
         if let Some(ref sr) = session_registry_inbound {
             let reg = sr.read().await;
             for did in &peer_display_ids {
-                if let Some(session) = reg.get(*did) {
+                if let Some(session) = reg.get_any(*did) {
                     session.remove_peer(peer_id).await;
                 }
             }

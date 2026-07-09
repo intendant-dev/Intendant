@@ -145,13 +145,59 @@ platforms: the element tree reveals window titles and field values just as
 pixels do, and it bypasses the session pipeline entirely.)
 
 User-session access uses a **session-grant** model: approve once (the `d` hotkey
-the dashboard control, MCP `grant_user_display`, or
+the dashboard's **Share with agent** action, MCP `grant_user_display`, or
 `intendant ctl display grant-user`), and the grant holds for the rest of the
 session until revoked. On Wayland, granting starts the GNOME portal flow. For
 Computer Use, the operator must enable **Allow Remote Interaction** in the
 physical portal dialog before clicking **Share**; approving screen sharing alone
 can produce screenshots while leaving keyboard/mouse injection unavailable. See
 [Autonomy & Approvals](./autonomy.md) for the approval surface.
+
+### Three separate concepts: private view, agent share, presence streaming
+
+Putting the user's screen on the wire means one of three deliberately
+distinct things, and the surfaces never conflate them:
+
+1. **Private view** (dashboard **View this machine**) — remote
+   view/control of this machine's display from the owner's dashboards.
+   The capture session is created with **`agent_visible = false`**
+   (`ControlMsg::GrantUserDisplay { agent_visible: false }`): it streams
+   over WebRTC to connected dashboards and accepts dashboard input like
+   any display, but it is invisible to agents, **fail closed**, at two
+   independent layers:
+   - the `DisplayControl` autonomy grant is never set (so the CU
+     `execute_actions` chokepoint, `INTENDANT_USER_DISPLAY_GRANTED` on
+     runtime children, `shared_view`, and `read_screen` all refuse the
+     user session exactly as if nothing was granted), and
+   - the session itself is skipped by every agent-facing registry
+     lookup — `SessionRegistry::get` / `display_ids()` are filtered by
+     the session's `agent_visible` flag, so CU session routing, the
+     screenshot session lookup, `default_display_target`,
+     `list_displays` resolution overlays, federated peer streaming and
+     peer display announcements, presence's available-display list, and
+     the 1 Hz FrameRegistry sampler (`display_<id>` model-feed frames,
+     hence `list_frames`/`read_frame` and conversation auto-attach) all
+     read it as absent. Dashboard surfaces use the unfiltered
+     `get_any` / `all_display_ids` accessors.
+   Auto-recording also skips private views (an explicit user-initiated
+   `StartRecording` still works — that is the user's own decision).
+2. **Agent share** (dashboard **Share with agent**, MCP
+   `grant_user_display`, ctl `display grant-user`) — the classic grant:
+   `agent_visible = true`, the autonomy grant is set, and the display is
+   enumerable/screenshotable/drivable by agents until revoked. A share
+   over an existing private view **upgrades it in place** (frames start
+   feeding the registry on the next sampler tick; no capture restart,
+   no second portal dialog). The reverse never happens implicitly: a
+   view request over a shared display does not downgrade it — taking
+   the agent's access away is an explicit revoke.
+3. **Presence streaming** (the tile's **Stream** button) — continuous
+   frames to the live presence (voice) model only. Independent of both
+   modes above and unchanged by them; main agents are not affected.
+
+Revoking a user display (either mode) tears the session down and clears
+the per-daemon grant flag. On the wire, `GrantUserDisplay` without
+`agent_visible` keeps its historical meaning (`true` — the agent share),
+so pre-split frontends and scripts are unaffected.
 
 Granting is itself owner-surface-only: `grant_user_display` from a scoped
 caller is refused (revoke stays open — de-escalation is fail-safe), and the

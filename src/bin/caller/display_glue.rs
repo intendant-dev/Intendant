@@ -477,15 +477,38 @@ pub(crate) fn report_user_display_capture_unavailable(
 /// `target_display_id` is the intendant-stable display ID (0 = primary).
 /// This wires the user's display into the same lifecycle as virtual displays —
 /// the recording listener starts ffmpeg and the web dashboard shows a display slot.
+///
+/// `agent_visible` selects the session mode: `true` is the classic grant
+/// (agents may enumerate/screenshot/drive it), `false` a private user view
+/// streamed to the owner's dashboards only. When a session already exists,
+/// a `true` grant **upgrades** a private view in place (the emitters of
+/// agent-visible grant events are all explicit owner opt-ins — the
+/// dashboard/ctl ControlMsg and the owner-surface-only MCP grant tool;
+/// every implicit re-activation path first checks for an existing session
+/// via `get_any` and never emits over one). A `false` request never
+/// downgrades an existing shared session: taking the agent's access away
+/// is an explicit revoke, not a side effect of opening a view.
 pub(crate) async fn activate_user_display(
     bus: &EventBus,
     session_registry: &display::SharedSessionRegistry,
     frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<frames::FrameRegistry>>>,
     target_display_id: u32,
+    agent_visible: bool,
 ) {
     let display_id: u32 = target_display_id;
 
-    if let Some(session) = session_registry.read().await.get(display_id) {
+    // Dedupe against ANY live session — a private view is still a live
+    // capture. The filtered `get` would miss it and stack a second
+    // capture session onto the same display, with the visible insert
+    // clobbering the private one (an accidental upgrade).
+    if let Some(session) = session_registry.read().await.get_any(display_id) {
+        if agent_visible && !session.agent_visible() {
+            eprintln!(
+                "[user_display] Display :{} upgraded from private view to agent-shared",
+                display_id
+            );
+            session.set_agent_visible(true);
+        }
         let (width, height) = session.resolution();
         eprintln!(
             "[user_display] Display :{} capture already active ({}x{}); skipping activation",
@@ -495,6 +518,7 @@ pub(crate) async fn activate_user_display(
             display_id,
             width,
             height,
+            agent_visible: session.agent_visible(),
         });
         return;
     }
@@ -524,6 +548,7 @@ pub(crate) async fn activate_user_display(
             }
         };
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
+        session.set_agent_visible(agent_visible);
         if let Err(e) = session
             .start(
                 30,
@@ -547,6 +572,7 @@ pub(crate) async fn activate_user_display(
             display_id,
             width,
             height,
+            agent_visible,
         });
         return;
     }
@@ -582,6 +608,7 @@ pub(crate) async fn activate_user_display(
         );
         let backend = display::wayland::WaylandBackend::new();
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
+        session.set_agent_visible(agent_visible);
         // The portal dialog requires user interaction on the physical display.
         // If the user is accessing intendant remotely (web dashboard, SSH) they
         // may never see the dialog, so emit a status event for the dashboard to
@@ -612,6 +639,7 @@ pub(crate) async fn activate_user_display(
                     display_id,
                     width,
                     height,
+                    agent_visible,
                 });
                 return;
             }
@@ -684,6 +712,7 @@ pub(crate) async fn activate_user_display(
             };
             if let Ok(backend) = backend {
                 let session = display::DisplaySession::new(display_id, Arc::new(backend));
+                session.set_agent_visible(agent_visible);
                 if let Err(e) = session
                     .start(
                         30,
@@ -716,6 +745,7 @@ pub(crate) async fn activate_user_display(
                         display_id,
                         width,
                         height,
+                        agent_visible,
                     });
                     return;
                 }
@@ -755,6 +785,7 @@ pub(crate) async fn activate_user_display(
             display::macos::MacOSBackend::new()
         };
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
+        session.set_agent_visible(agent_visible);
         if let Err(e) = session
             .start(30, frame_registry, Some(display_event_forwarder(bus.clone())))
             .await {
@@ -773,6 +804,7 @@ pub(crate) async fn activate_user_display(
                 display_id,
                 width,
                 height,
+                agent_visible,
             });
             return;
         }
@@ -799,6 +831,7 @@ pub(crate) async fn activate_user_display(
             display::windows::WindowsBackend::new()
         };
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
+        session.set_agent_visible(agent_visible);
         if let Err(e) = session
             .start(30, frame_registry, Some(display_event_forwarder(bus.clone())))
             .await {
@@ -817,6 +850,7 @@ pub(crate) async fn activate_user_display(
                 display_id,
                 width,
                 height,
+                agent_visible,
             });
             return;
         }
@@ -910,7 +944,7 @@ pub(crate) async fn auto_activate_windows_user_display(
         let mut guard = autonomy.write().await;
         guard.user_display_granted = true;
     }
-    activate_user_display(bus, session_registry, frame_registry, 0).await;
+    activate_user_display(bus, session_registry, frame_registry, 0, true).await;
 }
 
 /// Detect a Wayland compositor socket even when WAYLAND_DISPLAY is not set.
@@ -1392,14 +1426,20 @@ pub(crate) async fn handle_shared_view_calls(
         let output = match action {
             "show" => {
                 // (Re)activate a granted user display whose session is gone;
-                // the grant listener owns the platform work.
+                // the grant listener owns the platform work. `get_any`: a
+                // private user view is still a live session — re-emitting a
+                // grant over it would upgrade it to agent-visible from an
+                // agent tool call, which only explicit owner grants may do.
                 if display_id == Some(0) {
                     let session_missing = match session_registry {
-                        Some(registry) => registry.read().await.get(0).is_none(),
+                        Some(registry) => registry.read().await.get_any(0).is_none(),
                         None => false,
                     };
                     if session_missing {
-                        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
+                        bus.send(AppEvent::UserDisplayGranted {
+                            display_id: 0,
+                            agent_visible: true,
+                        });
                     }
                 }
                 bus.send(emit("show", None));
@@ -1818,16 +1858,18 @@ mod tests {
             registry.insert(0, session);
             let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
 
-            activate_user_display(&bus, &registry, None, 0).await;
+            activate_user_display(&bus, &registry, None, 0, true).await;
 
             match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await {
                 Ok(Ok(AppEvent::DisplayReady {
                     display_id,
                     width,
                     height,
+                    agent_visible,
                 })) => {
                     assert_eq!(display_id, 0);
                     assert_eq!((width, height), (1920, 1080));
+                    assert!(agent_visible);
                 }
                 other => panic!("expected DisplayReady for active capture, got {other:?}"),
             }
@@ -1837,6 +1879,68 @@ mod tests {
                     .is_err(),
                 "already-active capture should not emit a portal-pending event"
             );
+        });
+    }
+
+    #[test]
+    fn activate_user_display_upgrades_private_view_on_agent_grant_only() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let backend = std::sync::Arc::new(ActiveDisplayBackend {
+                width: 1920,
+                height: 1080,
+            });
+            let session = std::sync::Arc::new(display::DisplaySession::new(0, backend));
+            session.set_agent_visible(false);
+            let mut registry = display::SessionRegistry::new();
+            registry.insert(0, std::sync::Arc::clone(&session));
+            let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
+
+            // A view request over an existing private view: stays private.
+            activate_user_display(&bus, &registry, None, 0, false).await;
+            match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::DisplayReady { agent_visible, .. })) => {
+                    assert!(!agent_visible, "view request must not change the mode");
+                }
+                other => panic!("expected DisplayReady, got {other:?}"),
+            }
+            assert!(!session.agent_visible());
+            assert!(
+                registry.read().await.get(0).is_none(),
+                "agent lookups still can't see the private view"
+            );
+
+            // An explicit agent grant upgrades the private view in place.
+            activate_user_display(&bus, &registry, None, 0, true).await;
+            match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::DisplayReady { agent_visible, .. })) => {
+                    assert!(agent_visible, "grant must report the upgraded mode");
+                }
+                other => panic!("expected DisplayReady, got {other:?}"),
+            }
+            assert!(session.agent_visible(), "session upgraded in place");
+            assert!(
+                registry.read().await.get(0).is_some(),
+                "agent lookups see the display after the upgrade"
+            );
+
+            // And a later view request never downgrades the shared session.
+            activate_user_display(&bus, &registry, None, 0, false).await;
+            match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::DisplayReady { agent_visible, .. })) => {
+                    assert!(
+                        agent_visible,
+                        "revoking agent access is an explicit revoke, not a view side effect"
+                    );
+                }
+                other => panic!("expected DisplayReady, got {other:?}"),
+            }
+            assert!(session.agent_visible());
         });
     }
 

@@ -597,13 +597,19 @@ async function main() {
           }
         }
       }
-      // Track user display grant/revoke events
+      // Track user display grant/revoke events. `agent_visible` is
+      // absent on wires older than the private-view split; absent
+      // means the classic agent share.
       if (d.event === 'user_display_granted') {
         grantedDisplayId = Number(d.display_id || 0);
-        setUserDisplayState(true);
+        const agentVisible = d.agent_visible !== false;
+        userDisplayIds.add(grantedDisplayId);
+        setDisplayAgentVisibility(grantedDisplayId, agentVisible);
+        setUserDisplayState(true, agentVisible);
       } else if (d.event === 'user_display_revoked') {
         const revokedId = Number(d.display_id || 0);
         if (Number(grantedDisplayId) === revokedId) setUserDisplayState(false);
+        clearDisplayAgentVisibility(revokedId);
         removeDisplaySlot(revokedId);
         const banner = document.getElementById('display-approval-banner');
         if (banner) banner.classList.add('hidden');
@@ -644,6 +650,11 @@ async function main() {
       if (d.event === 'display_ready') {
         const banner = document.getElementById('display-approval-banner');
         if (banner) banner.classList.add('hidden');
+        // Record the display's agent-visibility mode for the tile chip
+        // (live events and the gateway's bootstrap replay both carry it).
+        if (d.agent_visible !== undefined) {
+          setDisplayAgentVisibility(Number(d.display_id || 0), d.agent_visible !== false);
+        }
       }
       // Track recording state on display slots
       if (d.event === 'recording_started' && d.stream_name) {

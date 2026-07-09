@@ -297,6 +297,9 @@ html {
   color: var(--red);
 }
 .status-bar #sb-display-access.granted { color: var(--green); }
+/* Private view active: the chip reads 'view' in a neutral accent — the
+   agent does NOT have the display, so the granted green stays off. */
+.status-bar #sb-display-access.view-only { color: var(--blue); }
 .display-toggle-wrap { position: relative; display: inline-flex; align-items: center; gap: 4px; }
 .display-picker {
   display: none;
@@ -10250,6 +10253,27 @@ body.display-fullscreen-open {
   color: var(--blue);
   font-family: monospace;
   white-space: nowrap;
+}
+/* Agent-visibility chip on the display tile: "Private view" (the agent
+   cannot see this display) vs "Agent can see this" (a user display
+   shared for computer use). Hidden for agent-owned virtual displays. */
+.display-visibility {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--surface1);
+  white-space: nowrap;
+}
+.display-visibility.private {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 40%, transparent);
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+}
+.display-visibility.agent {
+  color: var(--peach);
+  border-color: color-mix(in srgb, var(--peach) 40%, transparent);
+  background: color-mix(in srgb, var(--peach) 12%, transparent);
 }
 .display-status {
   font-size: 12px;
@@ -29013,6 +29037,38 @@ const SHELL_KEY_SEQS = {
 // Displays
 const displaySlots = new Map();
 const peerDisplayConnections = new Map(); // sessionKey -> PeerDisplayConnection
+// Per-display agent visibility, fed by `display_ready` / `user_display_granted`
+// events (both carry `agent_visible` since the private-view split). false =
+// a private user view ("View this machine"): streams to this dashboard only,
+// invisible to agent screenshot/CU/enumeration paths on the daemon.
+const displayAgentVisibility = new Map();
+// Display ids that are user-display sessions (granted or private-viewed) --
+// distinguishes "agent can see this" chips on user screens from ordinary
+// agent-owned virtual displays, which get no chip.
+const userDisplayIds = new Set();
+// User-display grant state (single active slot, matching the daemon's
+// per-daemon grant flag). Declared here -- before the display fragments
+// that render against it at load time -- because module-scope `let` from
+// a later fragment is in TDZ during earlier fragments' initial render.
+let userDisplayGranted = false;
+let grantedDisplayId = 0;
+// Mode of the active user-display session: true = shared with the agent
+// (computer use), false = a private view. Meaningful only while
+// userDisplayGranted is true.
+let userDisplayAgentVisible = true;
+function setDisplayAgentVisibility(displayId, visible) {
+  displayId = Number(displayId);
+  displayAgentVisibility.set(displayId, !!visible);
+  const slot = displaySlots.get(displayId);
+  if (slot && typeof slot.setAgentVisibility === 'function') {
+    slot.setAgentVisibility(!!visible);
+  }
+}
+function clearDisplayAgentVisibility(displayId) {
+  displayId = Number(displayId);
+  displayAgentVisibility.delete(displayId);
+  userDisplayIds.delete(displayId);
+}
 // Session/phase state is read by Station during direct #station boot before
 // the lower dashboard sections finish registering their helpers.
 const sessionsListCache = new Map();
@@ -36691,13 +36747,19 @@ async function main() {
           }
         }
       }
-      // Track user display grant/revoke events
+      // Track user display grant/revoke events. `agent_visible` is
+      // absent on wires older than the private-view split; absent
+      // means the classic agent share.
       if (d.event === 'user_display_granted') {
         grantedDisplayId = Number(d.display_id || 0);
-        setUserDisplayState(true);
+        const agentVisible = d.agent_visible !== false;
+        userDisplayIds.add(grantedDisplayId);
+        setDisplayAgentVisibility(grantedDisplayId, agentVisible);
+        setUserDisplayState(true, agentVisible);
       } else if (d.event === 'user_display_revoked') {
         const revokedId = Number(d.display_id || 0);
         if (Number(grantedDisplayId) === revokedId) setUserDisplayState(false);
+        clearDisplayAgentVisibility(revokedId);
         removeDisplaySlot(revokedId);
         const banner = document.getElementById('display-approval-banner');
         if (banner) banner.classList.add('hidden');
@@ -36738,6 +36800,11 @@ async function main() {
       if (d.event === 'display_ready') {
         const banner = document.getElementById('display-approval-banner');
         if (banner) banner.classList.add('hidden');
+        // Record the display's agent-visibility mode for the tile chip
+        // (live events and the gateway's bootstrap replay both carry it).
+        if (d.agent_visible !== undefined) {
+          setDisplayAgentVisibility(Number(d.display_id || 0), d.agent_visible !== false);
+        }
       }
       // Track recording state on display slots
       if (d.event === 'recording_started' && d.stream_name) {
@@ -56340,6 +56407,7 @@ class DisplaySlot {
     this.el.innerHTML = `
       <div class="display-toolbar">
         <span class="display-label">${label}</span>
+        <span class="display-visibility" id="ds-visibility-${displayId}" style="display:none"></span>
         <span class="display-status" id="ds-status-${displayId}">Connecting...</span>
         <span class="display-input-authority" id="ds-authority-${displayId}" style="display:none" title="Input authority for this display: who can drive keyboard/mouse. Phase 5c."></span>
         <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
@@ -56356,6 +56424,7 @@ class DisplaySlot {
       </div>
       <div class="display-canvas" id="display-canvas-${displayId}"></div>`;
     this.statusEl = this.el.querySelector(`#ds-status-${displayId}`);
+    this.visibilityEl = this.el.querySelector(`#ds-visibility-${displayId}`);
     this.authorityEl = this.el.querySelector(`#ds-authority-${displayId}`);
     this.noteInput = this.el.querySelector(`#ds-note-${displayId}`);
     this.takeBtn = this.el.querySelector(`#ds-take-${displayId}`);
@@ -56432,6 +56501,7 @@ class DisplaySlot {
     const displayId = Number(this.displayId);
     dispatchDashboardActionMsg({ action: 'revoke_user_display', display_id: displayId });
     removeDisplaySlot(displayId);
+    clearDisplayAgentVisibility(displayId);
     if (Number(grantedDisplayId) === displayId) {
       setUserDisplayState(false);
     }
@@ -57110,6 +57180,36 @@ class DisplaySlot {
   // the source of truth for input enforcement; this UI logic exists
   // strictly to keep the chip + buttons + interactive mode consistent
   // with what the gate is doing.
+  // Render the agent-visibility chip: "Private view" (the agent cannot
+  // see this display) vs "Agent can see this" (a user display shared for
+  // computer use). Agent-owned virtual displays get no chip -- they are
+  // the agent's own workspaces, so annotating them is noise.
+  setAgentVisibility(visible) {
+    if (!this.visibilityEl) return;
+    const id = Number(this.displayId);
+    if (visible === false) {
+      this.visibilityEl.textContent = 'Private view';
+      this.visibilityEl.title =
+        'Only your dashboard can see this display. It is hidden from the ' +
+        "agent's screenshot, computer-use, and display-listing paths.";
+      this.visibilityEl.classList.add('private');
+      this.visibilityEl.classList.remove('agent');
+      this.visibilityEl.style.display = '';
+    } else if (visible === true && userDisplayIds.has(id)) {
+      this.visibilityEl.textContent = 'Agent can see this';
+      this.visibilityEl.title =
+        'This screen is shared with the agent for computer-use tasks ' +
+        'until you revoke access.';
+      this.visibilityEl.classList.add('agent');
+      this.visibilityEl.classList.remove('private');
+      this.visibilityEl.style.display = '';
+    } else {
+      this.visibilityEl.style.display = 'none';
+    }
+    // The ui2 live rail re-renders via its MutationObserver on
+    // #displays-container (class/style/text changes on this chip).
+  }
+
   setAuthority(state) {
     if (state !== 'you' && state !== 'other' && state !== 'unclaimed') {
       // Forward-compat: future state strings (we don't expect any) leave
@@ -57602,6 +57702,11 @@ function addDisplaySlot(displayId, width, height) {
   }
   const slot = new DisplaySlot(displayId, width, height);
   displaySlots.set(displayId, slot);
+  // Apply the recorded agent-visibility mode (from display_ready /
+  // user_display_granted events, which may precede slot creation).
+  if (displayAgentVisibility.has(displayId)) {
+    slot.setAgentVisibility(displayAgentVisibility.get(displayId));
+  }
   // Phase 5c: drain any authority state that arrived before this slot
   // existed.  See pendingAuthorityStates docs for the race rationale.
   const pendingState = pendingAuthorityStates.get(displayId);
@@ -57865,6 +57970,13 @@ if (typeof ui2Enabled === 'function' && ui2Enabled()) (() => {
       main.appendChild(meta);
       row.appendChild(dot);
       row.appendChild(main);
+      if (displayAgentVisibility.get(Number(slot.displayId)) === false) {
+        const tag = document.createElement('span');
+        tag.className = 'ui2-live-row-tag';
+        tag.textContent = 'PRIVATE';
+        tag.title = 'Private view — the agent cannot see this display';
+        row.appendChild(tag);
+      }
       if (slot.connected) {
         const tag = document.createElement('span');
         tag.className = 'ui2-live-row-tag';
@@ -57990,7 +58102,6 @@ if (typeof ui2Enabled === 'function' && ui2Enabled()) (() => {
 
   function renderYourScreen() {
     yourScreen.textContent = '';
-    const chip = document.getElementById('sb-display-access');
     const card = document.createElement('div');
     card.className = 'ui2-live-card';
     const head = document.createElement('div');
@@ -58001,32 +58112,64 @@ if (typeof ui2Enabled === 'function' && ui2Enabled()) (() => {
     title.className = 'ui2-live-card-title';
     title.style.flex = '1';
     title.textContent = 'Your screen';
-    const granted = !!(chip && chip.classList.contains('granted'));
+    // Two distinct things can be active here, and the card never
+    // conflates them:
+    //  - a PRIVATE VIEW ("View this machine"): remote view/control of
+    //    this machine from the dashboard; the agent cannot see it;
+    //  - an AGENT SHARE ("Share with agent"): the screen is visible to
+    //    the agent for computer-use tasks.
+    // (Streaming frames to the live presence/voice model is a third,
+    // separate control -- the Stream button on the display tile.)
+    const granted = userDisplayGranted;
+    const shared = granted && userDisplayAgentVisible;
     const pill = document.createElement('span');
-    pill.className = 'ui2-live-state-pill' + (granted ? ' you' : '');
-    pill.textContent = granted ? 'shared' : 'off';
+    pill.className = 'ui2-live-state-pill'
+      + (shared ? ' other' : granted ? ' you' : '');
+    pill.textContent = shared ? 'agent can see this' : granted ? 'private view' : 'off';
     head.appendChild(title);
     head.appendChild(pill);
     const sub = document.createElement('div');
     sub.className = 'ui2-live-card-sub';
-    sub.textContent = granted
+    sub.textContent = shared
       ? 'The agent can see and drive this screen for computer-use tasks until you revoke access.'
-      : 'Share your own screen with the agent for computer-use tasks. You choose the display and can revoke at any time.';
+      : granted
+        ? 'Streaming to your dashboard only. The agent cannot see this display.'
+        : 'View and control this machine’s display from here, or share it with the agent for computer-use tasks. You choose the display and can stop at any time.';
     card.appendChild(head);
     card.appendChild(sub);
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'ui2-live-card-btn ' + (granted ? 'danger' : 'secondary');
-    btn.textContent = granted ? 'Revoke access' : 'Share your screen…';
-    btn.title = chip ? chip.title : '';
-    btn.disabled = !chip;
-    btn.addEventListener('click', (e) => {
-      // Same flow as the status-bar chip (single display → instant
-      // grant; multiple → picker popover anchored at the chip).
-      e.stopPropagation();
-      if (chip) chip.click();
-    });
-    card.appendChild(btn);
+    const addBtn = (label, cls, title, onClick) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ui2-live-card-btn ' + cls;
+      btn.textContent = label;
+      btn.title = title;
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        onClick();
+      });
+      card.appendChild(btn);
+      return btn;
+    };
+    if (!granted) {
+      // Primary: private remote view. Secondary: the agent share.
+      addBtn('View this machine', 'secondary',
+        'Watch and control this machine’s display from the dashboard. Private: the agent cannot see it.',
+        () => { if (typeof startUserDisplayGrantFlow === 'function') startUserDisplayGrantFlow('view'); });
+      addBtn('Share with agent…', 'secondary',
+        'Make this screen visible to the agent for computer-use tasks. Revocable at any time.',
+        () => { if (typeof startUserDisplayGrantFlow === 'function') startUserDisplayGrantFlow('share'); });
+    } else if (!shared) {
+      addBtn('Stop viewing', 'danger',
+        'Close the private view of this machine.',
+        () => { if (typeof revokeUserDisplayNow === 'function') revokeUserDisplayNow(); });
+      addBtn('Share with agent', 'secondary',
+        'Upgrade this private view: make the display visible to the agent for computer-use tasks.',
+        () => { if (typeof shareUserDisplayWithAgent === 'function') shareUserDisplayWithAgent(); });
+    } else {
+      addBtn('Revoke access', 'danger',
+        'Take the display away from the agent and stop streaming it.',
+        () => { if (typeof revokeUserDisplayNow === 'function') revokeUserDisplayNow(); });
+    }
     yourScreen.appendChild(card);
   }
 
@@ -86920,9 +87063,13 @@ function updateDisplayMetrics(d) {
 }
 
 // ── User display access toggle ──
-let userDisplayGranted = false;
-let grantedDisplayId = 0;
+// (userDisplayGranted / grantedDisplayId / userDisplayAgentVisible are
+// declared in fragment 32 next to the display maps: earlier fragments
+// render against them at load time.)
 let displayPickerVisible = false;
+// Which action the open picker performs: 'share' (agent access) or
+// 'view' (private remote view; the agent cannot see the display).
+let displayPickerMode = 'share';
 var cachedDisplays = null;
 
 function hideDisplayPicker() {
@@ -86931,7 +87078,8 @@ function hideDisplayPicker() {
   displayPickerVisible = false;
 }
 
-function showDisplayPicker(displays) {
+function showDisplayPicker(displays, mode) {
+  displayPickerMode = mode === 'view' ? 'view' : 'share';
   const picker = document.getElementById('display-picker');
   picker.innerHTML = '';
   for (const d of displays) {
@@ -86954,13 +87102,13 @@ function showDisplayPicker(displays) {
       e.stopPropagation();
       hideDisplayPicker();
       if (!app) return;
-      dispatchDashboardActionMsg({ action: 'grant_user_display', display_id: d.id });
-      grantedDisplayId = d.id;
-      setUserDisplayState(true);
+      grantUserDisplayTarget(d, displayPickerMode !== 'view');
     });
     picker.appendChild(item);
   }
-  if (virtualDisplaysAvailableNow()) {
+  if (displayPickerMode !== 'view' && virtualDisplaysAvailableNow()) {
+    // Virtual displays are agent workspaces — offering one from the
+    // private "View this machine" flow would conflate the two concepts.
     const createItem = document.createElement('div');
     createItem.className = 'display-picker-item dp-action';
     createItem.textContent = 'New virtual display';
@@ -87020,14 +87168,81 @@ window.createVirtualDisplay = function(event) {
   }
 };
 
-function grantUserDisplayTarget(display) {
+function grantUserDisplayTarget(display, agentVisible = true) {
   const displayId = Number(display?.id);
   const msg = { action: 'grant_user_display' };
   if (Number.isFinite(displayId) && displayId !== 0) msg.display_id = displayId;
+  // The bare message is the legacy wire shape and means "share with the
+  // agent"; only the private view sends the new field.
+  if (!agentVisible) msg.agent_visible = false;
   dispatchDashboardActionMsg(msg);
   grantedDisplayId = Number.isFinite(displayId) ? displayId : 0;
-  setUserDisplayState(true);
+  userDisplayIds.add(grantedDisplayId);
+  setDisplayAgentVisibility(grantedDisplayId, agentVisible);
+  setUserDisplayState(true, agentVisible);
 }
+
+// Start a user-display flow in the given mode: 'share' makes the chosen
+// display visible to the agent for computer use (the classic grant);
+// 'view' opens a private remote view of this machine that the agent
+// cannot see. Single physical display grants instantly; multiple open
+// the picker in that mode.
+function startUserDisplayGrantFlow(mode) {
+  if (!app) return;
+  const agentVisible = mode !== 'view';
+  const applyDisplayList = (displays) => {
+    cachedDisplays = displays;
+    const rows = Array.isArray(displays) ? displays : [];
+    const physicalDisplays = rows.filter((display) => display?.kind !== 'window');
+    if (rows.length <= 1 || physicalDisplays.length === 1) {
+      grantUserDisplayTarget(physicalDisplays[0] || rows[0], agentVisible);
+    } else {
+      showDisplayPicker(rows, mode);
+    }
+  };
+  if (cachedDisplays && cachedDisplays.length > 0) {
+    applyDisplayList(cachedDisplays);
+    return;
+  }
+  fetchLocalDisplaysPayload()
+    .then(normalizeDisplaysPayload)
+    .then(applyDisplayList)
+    .catch(() => {
+      // Fetch failed: fall back to the default display.
+      grantUserDisplayTarget(null, agentVisible);
+    });
+}
+
+// Revoke the active user-display session (share or private view).
+function revokeUserDisplayNow() {
+  if (!app || !userDisplayGranted) return;
+  // Tear the display slot down locally before the round-trip -- see
+  // toggleUserDisplay for why (decode-saturated main thread delays the
+  // server's revoke broadcast by seconds).
+  removeDisplaySlot(Number(grantedDisplayId));
+  dispatchDashboardActionMsg({ action: 'revoke_user_display', display_id: Number(grantedDisplayId) || 0 });
+  clearDisplayAgentVisibility(Number(grantedDisplayId));
+  setUserDisplayState(false);
+}
+window.revokeUserDisplayNow = revokeUserDisplayNow;
+
+// Upgrade the active private view to an agent share (or start a share
+// flow when nothing is active). Never downgrades an existing share.
+function shareUserDisplayWithAgent() {
+  if (!app) return;
+  if (userDisplayGranted && !userDisplayAgentVisible) {
+    const msg = { action: 'grant_user_display' };
+    if (Number(grantedDisplayId) !== 0) msg.display_id = Number(grantedDisplayId);
+    dispatchDashboardActionMsg(msg);
+    userDisplayIds.add(Number(grantedDisplayId));
+    setDisplayAgentVisibility(Number(grantedDisplayId), true);
+    setUserDisplayState(true, true);
+    return;
+  }
+  if (!userDisplayGranted) startUserDisplayGrantFlow('share');
+}
+window.shareUserDisplayWithAgent = shareUserDisplayWithAgent;
+window.startUserDisplayGrantFlow = startUserDisplayGrantFlow;
 
 window.cycleAutonomy = function() {
   const levels = ['Low', 'Medium', 'High', 'Full'];
@@ -87039,6 +87254,11 @@ window.cycleAutonomy = function() {
   dispatchControlMsg({ action: 'set_autonomy', level: next.toLowerCase() });
 };
 
+// The v1 status-bar chip stays a pure on/off toggle with its historical
+// agent-share semantics: off -> start a SHARE flow; anything active
+// (share or private view) -> revoke. Upgrading a private view to an
+// agent share is only ever an explicit button on the ui2 "Your screen"
+// card -- never a side effect of clicking a toggle.
 window.toggleUserDisplay = function(event) {
   if (!app) return;
   if (event?.stopPropagation) event.stopPropagation();
@@ -87055,50 +87275,28 @@ window.toggleUserDisplay = function(event) {
     // confirmation of something we've already done rather than a gate
     // on the UI response. removeDisplaySlot is idempotent — if the
     // broadcast does arrive later, re-running it is a no-op.
-    removeDisplaySlot(Number(grantedDisplayId));
-    dispatchDashboardActionMsg({ action: 'revoke_user_display', display_id: Number(grantedDisplayId) || 0 });
-    setUserDisplayState(false);
+    revokeUserDisplayNow();
     return;
   }
-  // If we've already enumerated displays this session, use the cached
-  // result and short-circuit the fetch. /api/displays runs xrandr
-  // against the X server, which blocks behind in-flight XShmGetImage
-  // calls from any concurrent capture — so right after a revoke
-  // (while the backgrounded capture thread is still joining), the
-  // call can take 1-1.5s and stalls the indicator flip by the same
-  // margin. Displays rarely change mid-session, so honoring the
-  // cache between toggles makes ON#2 as fast as ON#1 without trading
-  // correctness for speed: we still fetch on first toggle to
-  // populate the cache, and a hotplug that invalidates the cache
-  // would surface either as a stale picker entry (benign) or a
-  // failed grant that user can retry (also benign).
-  const applyDisplayList = (displays) => {
-    cachedDisplays = displays;
-    const rows = Array.isArray(displays) ? displays : [];
-    const physicalDisplays = rows.filter((display) => display?.kind !== 'window');
-    if (rows.length <= 1 || physicalDisplays.length === 1) {
-      grantUserDisplayTarget(physicalDisplays[0] || rows[0]);
-    } else {
-      showDisplayPicker(rows);
-    }
-  };
-  if (cachedDisplays && cachedDisplays.length > 0) {
-    applyDisplayList(cachedDisplays);
-    return;
-  }
-  fetchLocalDisplaysPayload()
-    .then(normalizeDisplaysPayload)
-    .then(applyDisplayList)
-    .catch(() => {
-      // Fetch failed: fall back to granting default display
-      grantUserDisplayTarget(null);
-    });
+  // startUserDisplayGrantFlow reuses the cached /api/displays result
+  // between toggles: the route runs xrandr against the X server, which
+  // blocks behind in-flight XShmGetImage calls from any concurrent
+  // capture — so right after a revoke (while the backgrounded capture
+  // thread is still joining), the call can take 1-1.5s and stalls the
+  // indicator flip by the same margin. Displays rarely change
+  // mid-session; a hotplug surfaces as a stale picker entry (benign)
+  // or a failed grant the user can retry (also benign).
+  startUserDisplayGrantFlow('share');
 };
-function setUserDisplayState(granted) {
+function setUserDisplayState(granted, agentVisible = true) {
   userDisplayGranted = granted;
+  userDisplayAgentVisible = granted ? agentVisible : true;
   const el = document.getElementById('sb-display-access');
-  el.textContent = granted ? 'on' : 'off';
-  el.classList.toggle('granted', granted);
+  // 'on' keeps its historical meaning: the AGENT has the display. A
+  // private view shows 'view' and never lights the granted style.
+  el.textContent = granted ? (agentVisible ? 'on' : 'view') : 'off';
+  el.classList.toggle('granted', granted && agentVisible);
+  el.classList.toggle('view-only', granted && !agentVisible);
 }
 
 // Dismiss display picker on click outside or Escape

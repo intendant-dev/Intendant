@@ -603,12 +603,20 @@ pub fn spawn_event_listener(
                         resource_changed = Some("intendant://logs");
                     }
 
-                    AppEvent::UserDisplayGranted { display_id } => {
+                    AppEvent::UserDisplayGranted {
+                        display_id,
+                        agent_visible,
+                    } => {
                         let active_resolution = s.display_session_resolution_now(display_id);
-                        s.push_log(
-                            LogLevel::Warn,
-                            user_display_grant_result_message(display_id, active_resolution),
-                        );
+                        let msg = if agent_visible {
+                            user_display_grant_result_message(display_id, active_resolution)
+                        } else {
+                            format!(
+                                "User display {display_id} opened as a private view \
+                                 (dashboard-only; not agent-visible)"
+                            )
+                        };
+                        s.push_log(LogLevel::Warn, msg);
                         resource_changed = Some("intendant://logs");
                     }
 
