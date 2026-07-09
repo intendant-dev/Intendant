@@ -16,6 +16,7 @@ impl SessionSupervisor {
         claude_model: Option<String>,
         claude_permission_mode: Option<String>,
         claude_effort: Option<String>,
+        codex_model: Option<String>,
         codex_sandbox: Option<String>,
         codex_approval_policy: Option<String>,
         codex_managed_context: Option<String>,
@@ -201,6 +202,20 @@ impl SessionSupervisor {
                 return;
             };
             if let Err(e) = apply_session_claude_effort(&mut project, backend, effort.to_string()) {
+                self.loop_error(format!("Session create failed: {}", e));
+                return;
+            }
+        }
+        if let Some(model) = codex_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error("Session create failed: codex_model requires Codex".to_string());
+                return;
+            };
+            if let Err(e) = apply_session_codex_model(&mut project, backend, model.to_string()) {
                 self.loop_error(format!("Session create failed: {}", e));
                 return;
             }

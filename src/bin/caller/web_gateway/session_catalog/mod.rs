@@ -1494,6 +1494,29 @@ pub(crate) fn session_file_fingerprints_digest(entries: &[SessionFileFingerprint
     out
 }
 
+/// Status for a session whose `summary.json` exists: the session ended,
+/// but not necessarily well. A backend that died ("external agent event
+/// channel closed", spawn failures, `error: …`) must not present as
+/// `completed` — that flattening hid real backend deaths from operators.
+fn summary_json_status(dir: &Path) -> Option<&'static str> {
+    let raw = std::fs::read_to_string(dir.join("summary.json")).ok()?;
+    let summary: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let outcome = summary
+        .get("outcome")
+        .and_then(|v| v.as_str())
+        .unwrap_or("completed");
+    let normalized = outcome.trim().to_ascii_lowercase();
+    Some(
+        if normalized.is_empty() || normalized == "completed" || normalized == "done" {
+            "completed"
+        } else if normalized.contains("stopped by user") || normalized.contains("interrupt") {
+            "interrupted"
+        } else {
+            "failed"
+        },
+    )
+}
+
 pub(crate) fn intendant_session_list_row_from_dir(
     dir: &Path,
     session_id: &str,
@@ -1751,8 +1774,10 @@ pub(crate) fn intendant_session_list_row_from_dir(
         }
     }
 
-    if status != "completed" && dir.join("summary.json").exists() {
-        status = "completed".to_string();
+    if status != "completed" {
+        if let Some(ended) = summary_json_status(dir) {
+            status = ended.to_string();
+        }
     }
 
     let mut recording_count: u64 = 0;
@@ -1843,11 +1868,16 @@ pub(crate) fn intendant_session_list_row_from_dir(
 
     let total_bytes = recording_bytes + frames_bytes + turns_bytes + logs_bytes;
 
-    if status != "completed" {
+    let session_ended = matches!(status.as_str(), "completed" | "failed" | "interrupted");
+    if !session_ended {
         let has_model_work = turns > 0 || total_tokens > 0;
         if !has_model_work {
             let has_media = recording_count > 0 || annotation_count > 0 || clip_count > 0;
-            if task.is_some() || has_media {
+            if role.as_deref() == Some("resident") {
+                // The daemon's own base session (marked at boot): a bare
+                // one is the daemon idling, not an abandoned user task.
+                status = "resident".to_string();
+            } else if task.is_some() || has_media {
                 status = "idle".to_string();
             } else {
                 status = "abandoned".to_string();
@@ -2032,8 +2062,10 @@ pub(crate) fn intendant_session_skeleton_from_dir(
             role = value_str(&meta, "role");
         }
     }
-    if status != "completed" && dir.join("summary.json").exists() {
-        status = "completed".to_string();
+    if status != "completed" {
+        if let Some(ended) = summary_json_status(dir) {
+            status = ended.to_string();
+        }
     }
     if created_at.is_none() {
         created_at = mtime_secs_to_string(file_mtime_secs(dir));
@@ -2359,6 +2391,70 @@ pub(crate) fn stream_sessions_from_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_json_status_maps_outcomes_honestly() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |outcome: &str| {
+            std::fs::write(
+                dir.path().join("summary.json"),
+                serde_json::json!({ "task": "t", "outcome": outcome }).to_string(),
+            )
+            .unwrap();
+        };
+        write("completed");
+        assert_eq!(summary_json_status(dir.path()), Some("completed"));
+        write("stopped by user");
+        assert_eq!(summary_json_status(dir.path()), Some("interrupted"));
+        write("Interrupted");
+        assert_eq!(summary_json_status(dir.path()), Some("interrupted"));
+        write("external agent event channel closed");
+        assert_eq!(summary_json_status(dir.path()), Some("failed"));
+        write("error: spawn failed");
+        assert_eq!(summary_json_status(dir.path()), Some("failed"));
+        // Legacy summaries without an outcome field still read completed.
+        std::fs::write(dir.path().join("summary.json"), "{\"task\":\"t\"}").unwrap();
+        assert_eq!(summary_json_status(dir.path()), Some("completed"));
+        // No summary at all → the session has not ended.
+        std::fs::remove_file(dir.path().join("summary.json")).unwrap();
+        assert_eq!(summary_json_status(dir.path()), None);
+    }
+
+    #[test]
+    fn resident_role_dir_classifies_as_resident_not_abandoned() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "resident-1",
+                "created_at": "2026-07-08T00:00:00",
+                "status": "running",
+                "role": "resident",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let row = intendant_session_list_row_from_dir(dir.path(), "resident-1").unwrap();
+        assert_eq!(row["status"], "resident");
+        assert_eq!(row["role"], "resident");
+    }
+
+    #[test]
+    fn bare_taskless_dir_without_role_still_classifies_abandoned() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "ghost-1",
+                "created_at": "2026-07-08T00:00:00",
+                "status": "running",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let row = intendant_session_list_row_from_dir(dir.path(), "ghost-1").unwrap();
+        assert_eq!(row["status"], "abandoned");
+    }
 
     #[test]
     fn session_row_answers_to_id_checks_all_identity_fields() {

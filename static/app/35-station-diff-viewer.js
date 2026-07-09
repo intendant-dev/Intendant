@@ -869,7 +869,10 @@ function stationBuildSessionsSummary() {
     external: externalIds.size,
     totalTokens,
     diskBytes,
-    latestTask: latest ? (stationSessionTask(latest) || 'Untitled session') : '',
+    latestTask: latest
+      ? (stationSessionTask(latest)
+        || (latest?.role === 'resident' || latest?.status === 'resident' ? 'Daemon session' : 'Untitled session'))
+      : '',
     latestSource: latest
       ? (sessionConfigSource(sessionConfigMetadata(latest)) || stationSessionSource(latest) || latest?.source || 'session')
       : '',

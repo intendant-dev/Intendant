@@ -520,6 +520,10 @@ impl LaunchOverrides {
         crate::session_config::WireSessionAgentFields {
             source: Some(source),
             agent_command: self.agent_command.as_deref(),
+            // Launch-time only (CreateSession): a codex session cannot
+            // switch models mid-session, so configure/restart never carries
+            // one and the persisted pin must survive untouched.
+            codex_model: None,
             codex_sandbox: self.codex_sandbox.as_deref(),
             codex_approval_policy: self.codex_approval_policy.as_deref(),
             codex_managed_context: self.codex_managed_context.as_deref(),
@@ -643,6 +647,20 @@ pub(crate) fn apply_session_claude_effort(
             Ok(())
         }
         _ => Err("claude_effort requires Claude Code".to_string()),
+    }
+}
+
+pub(crate) fn apply_session_codex_model(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    model: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Codex => {
+            project.config.agent.codex.model = Some(model);
+            Ok(())
+        }
+        _ => Err("codex_model requires Codex".to_string()),
     }
 }
 

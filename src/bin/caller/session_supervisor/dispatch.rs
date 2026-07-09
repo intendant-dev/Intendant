@@ -16,6 +16,7 @@ impl SessionSupervisor {
                 claude_model,
                 claude_permission_mode,
                 claude_effort,
+                codex_model,
                 codex_sandbox,
                 codex_approval_policy,
                 codex_managed_context,
@@ -54,6 +55,7 @@ impl SessionSupervisor {
                                 None,
                                 None,
                                 None,
+                                codex_model,
                                 codex_sandbox,
                                 codex_approval_policy,
                                 codex_managed_context,
@@ -80,6 +82,7 @@ impl SessionSupervisor {
                         || claude_model.is_some()
                         || claude_permission_mode.is_some()
                         || claude_effort.is_some()
+                        || codex_model.is_some()
                         || codex_sandbox.is_some()
                         || codex_approval_policy.is_some()
                         || codex_managed_context.is_some()
@@ -104,6 +107,7 @@ impl SessionSupervisor {
                     claude_model,
                     claude_permission_mode,
                     claude_effort,
+                    codex_model,
                     codex_sandbox,
                     codex_approval_policy,
                     codex_managed_context,
@@ -170,6 +174,7 @@ impl SessionSupervisor {
                                 None,
                                 None,
                                 None,
+                                None,
                                 orchestrate,
                                 direct,
                                 Vec::new(),
@@ -196,6 +201,7 @@ impl SessionSupervisor {
                 }
                 self.start_new_session(
                     task,
+                    None,
                     None,
                     None,
                     None,

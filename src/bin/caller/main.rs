@@ -3447,9 +3447,16 @@ async fn main() -> Result<(), CallerError> {
 
     // Write session metadata (project root, task will be filled in later if
     // available). A projectless daemon's base session honestly records no
-    // project instead of attributing itself to the launch cwd.
+    // project instead of attributing itself to the launch cwd. The daemon's
+    // own base session is marked `resident` so the catalog labels it as the
+    // daemon's resident session instead of an abandoned user task; the
+    // marker is dropped by the next write_meta if a task ever lands on it.
     slog(&session_log, |l| {
-        l.write_meta(daemon_project_root.as_deref(), None);
+        if web_daemon_requested {
+            l.write_meta_with_role(daemon_project_root.as_deref(), None, Some("resident"));
+        } else {
+            l.write_meta(daemon_project_root.as_deref(), None);
+        }
     });
 
     // Web gateway is on by default unless explicitly disabled, or when running

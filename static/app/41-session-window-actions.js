@@ -2389,7 +2389,10 @@ function showApproval(id, command, category, sessionId) {
     focusSessionWindow(pendingApprovalSessionId);
   }
   document.getElementById('approval-command').textContent = command;
-  document.getElementById('approval-category').textContent = category || '';
+  const approvalCategoryEl = document.getElementById('approval-category');
+  approvalCategoryEl.textContent = category || '';
+  // No category (older sessions, rehydrated approvals) → no empty pill.
+  approvalCategoryEl.style.display = category ? '' : 'none';
   stationCurrentApproval = {
     id: String(id),
     command: command || '',

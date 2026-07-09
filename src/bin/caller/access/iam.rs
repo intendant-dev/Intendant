@@ -2295,6 +2295,9 @@ pub fn grant_overview_values(state: &LocalIamState, default_target_id: &str) -> 
                 "source": if grant.source.is_empty() { "local_iam_state" } else { grant.source.as_str() },
                 "status": status,
                 "enforced": grant.is_active_at(now),
+                // The dashboard's grant-row fs chip reads this; a grant
+                // without a scope serializes null so the chip stays off.
+                "fs_scope": grant.fs_scope.as_ref().filter(|scope| !scope.is_empty()),
                 "reason": grant.reason.clone(),
                 "created_at_unix_ms": grant.created_at_unix_ms,
                 "revoked_at_unix_ms": grant.revoked_at_unix_ms,

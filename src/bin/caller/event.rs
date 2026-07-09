@@ -1330,6 +1330,13 @@ pub enum ControlMsg {
         /// the resolved agent is Claude Code.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_effort: Option<String>,
+        /// Optional one-shot Codex model override for this session (e.g.
+        /// "gpt-5.3-codex"). Launch-time only — Codex sessions cannot switch
+        /// models mid-session, so unlike `claude_model` there is no matching
+        /// per-session update path. Only applies when the resolved agent is
+        /// Codex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_model: Option<String>,
         /// Optional one-shot Codex sandbox mode for this session. Only applies
         /// when the resolved agent is Codex.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3534,6 +3541,7 @@ mod tests {
                 claude_model: None,
                 claude_effort: None,
                 claude_permission_mode: None,
+                codex_model: Some("gpt-5.3-codex".to_string()),
                 codex_sandbox: Some("danger-full-access".to_string()),
                 codex_approval_policy: Some("never".to_string()),
                 codex_managed_context: Some("managed".to_string()),
@@ -3791,7 +3799,7 @@ mod tests {
 
     #[test]
     fn control_msg_create_session_deserialize() {
-        let json = r#"{"action":"create_session","task":"fix bug","name":"Bugfix work","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","codex_sandbox":"danger-full-access","codex_approval_policy":"never","codex_managed_context":"managed","codex_context_archive":"exact","codex_service_tier":"priority","direct":true,"attachments":["upload:u1"]}"#;
+        let json = r#"{"action":"create_session","task":"fix bug","name":"Bugfix work","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","codex_model":"gpt-5.3-codex","codex_sandbox":"danger-full-access","codex_approval_policy":"never","codex_managed_context":"managed","codex_context_archive":"exact","codex_service_tier":"priority","direct":true,"attachments":["upload:u1"]}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::CreateSession {
@@ -3803,6 +3811,7 @@ mod tests {
                 claude_model,
                 claude_permission_mode,
                 claude_effort,
+                codex_model,
                 codex_sandbox,
                 codex_approval_policy,
                 codex_managed_context,
@@ -3822,6 +3831,7 @@ mod tests {
                 assert_eq!(project_root.as_deref(), Some("/repo"));
                 assert_eq!(agent.as_deref(), Some("codex"));
                 assert_eq!(agent_command.as_deref(), Some("/opt/codex/bin/codex"));
+                assert_eq!(codex_model.as_deref(), Some("gpt-5.3-codex"));
                 assert_eq!(codex_sandbox.as_deref(), Some("danger-full-access"));
                 assert_eq!(codex_approval_policy.as_deref(), Some("never"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));

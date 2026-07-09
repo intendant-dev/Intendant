@@ -19,6 +19,8 @@ pub struct SessionAgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_sandbox: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_approval_policy: Option<String>,
@@ -61,6 +63,7 @@ impl SessionAgentConfig {
         self.source.is_none()
             && self.project_root.is_none()
             && self.agent_command.is_none()
+            && self.codex_model.is_none()
             && self.codex_sandbox.is_none()
             && self.codex_approval_policy.is_none()
             && self.codex_managed_context.is_none()
@@ -83,6 +86,9 @@ impl SessionAgentConfig {
         }
         if self.agent_command.is_none() {
             self.agent_command = fallback.agent_command;
+        }
+        if self.codex_model.is_none() {
+            self.codex_model = fallback.codex_model;
         }
         if self.codex_sandbox.is_none() {
             self.codex_sandbox = fallback.codex_sandbox;
@@ -135,6 +141,13 @@ pub fn normalize_project_root(root: Option<&str>) -> Option<String> {
 
 pub fn normalize_codex_service_tier(tier: Option<&str>) -> Option<String> {
     crate::project::normalize_codex_service_tier(tier)
+}
+
+pub fn normalize_codex_model(model: Option<&str>) -> Option<String> {
+    model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 pub fn normalize_codex_home(home: Option<&str>) -> Option<String> {
@@ -254,6 +267,7 @@ pub fn effective_codex_home() -> Option<String> {
 pub struct WireSessionAgentFields<'a> {
     pub source: Option<&'a str>,
     pub agent_command: Option<&'a str>,
+    pub codex_model: Option<&'a str>,
     pub codex_sandbox: Option<&'a str>,
     pub codex_approval_policy: Option<&'a str>,
     pub codex_managed_context: Option<&'a str>,
@@ -297,6 +311,9 @@ pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
         source,
         project_root: None,
         agent_command: normalize_agent_command(fields.agent_command),
+        codex_model: is_codex
+            .then(|| normalize_codex_model(fields.codex_model))
+            .flatten(),
         codex_sandbox: is_codex
             .then(|| normalize_codex_sandbox(fields.codex_sandbox))
             .flatten(),
@@ -335,6 +352,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             source: Some("codex".to_string()),
             project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
             agent_command: Some(project.config.agent.codex.command.clone()),
+            codex_model: normalize_codex_model(project.config.agent.codex.model.as_deref()),
             codex_sandbox: Some(crate::project::normalize_sandbox_mode(
                 &project.config.agent.codex.sandbox,
             )),
@@ -363,6 +381,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 source: Some("claude-code".to_string()),
                 project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
                 agent_command: Some(claude.command.clone()),
+                codex_model: None,
                 codex_sandbox: None,
                 codex_approval_policy: None,
                 codex_managed_context: None,
@@ -393,6 +412,9 @@ pub fn apply_to_project(
         AgentBackend::Codex => {
             if let Some(command) = config.agent_command.clone() {
                 project.config.agent.codex.command = command;
+            }
+            if let Some(model) = config.codex_model.clone() {
+                project.config.agent.codex.model = Some(model);
             }
             if let Some(mode) = config.codex_sandbox.clone() {
                 project.config.agent.codex.sandbox = crate::project::normalize_sandbox_mode(&mode);
@@ -475,6 +497,9 @@ fn normalize_session_agent_config(
     }
     if let Some(command) = config.agent_command.take() {
         config.agent_command = normalize_agent_command(Some(&command));
+    }
+    if let Some(model) = config.codex_model.take() {
+        config.codex_model = normalize_codex_model(Some(&model));
     }
     if let Some(mode) = config.codex_sandbox.take() {
         config.codex_sandbox = normalize_codex_sandbox(Some(&mode));
@@ -765,6 +790,9 @@ pub fn apply_config_to_session_json(session: &mut Value, config: &SessionAgentCo
     }
     if let Some(home) = config.codex_home.as_deref() {
         obj.insert("codex_home".to_string(), Value::String(home.to_string()));
+    }
+    if let Some(model) = config.codex_model.as_deref() {
+        obj.insert("codex_model".to_string(), Value::String(model.to_string()));
     }
     if let Some(model) = config.claude_model.as_deref() {
         obj.insert("claude_model".to_string(), Value::String(model.to_string()));
