@@ -1051,6 +1051,23 @@ mod tests {
     use tokio::time::{timeout, Duration};
     use crate::mcp::tests::{test_session_registry_with_display, test_state};
 
+    /// A fragment unique to the user-session opt-in refusal
+    /// (`computer_use::user_session_denied_message`, which both gated MCP
+    /// paths return verbatim). Deliberately NOT "explicit opt-in": that
+    /// phrase also lives in tool descriptions and the supervision prompt,
+    /// which external-agent transcripts render in the dashboard — i.e. it
+    /// can be literally visible on screen, and a granted read_screen
+    /// faithfully returns screen text, so asserting its absence flaked on
+    /// a desktop with a live dashboard frontmost (2026-07-09).
+    fn opt_in_refusal_marker() -> &'static str {
+        let marker = "the user must grant their display first";
+        assert!(
+            crate::computer_use::user_session_denied_message().contains(marker),
+            "marker drifted from user_session_denied_message()"
+        );
+        marker
+    }
+
     #[test]
     fn shared_view_tool_activates_target_and_emits_dashboard_event() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1142,7 +1159,7 @@ mod tests {
                 .expect("tool should dispatch");
             let rendered = serde_json::to_string(&result).unwrap_or_default();
             assert!(
-                rendered.contains("explicit opt-in"),
+                rendered.contains(opt_in_refusal_marker()),
                 "scoped caller must get the opt-in refusal, got: {rendered}"
             );
 
@@ -1241,7 +1258,7 @@ mod tests {
                 .expect("tool should dispatch");
             let rendered = serde_json::to_string(&result).unwrap_or_default();
             assert!(
-                rendered.contains("explicit opt-in"),
+                rendered.contains(opt_in_refusal_marker()),
                 "scoped ungranted read_screen must be refused, got: {rendered}"
             );
 
@@ -1261,7 +1278,7 @@ mod tests {
                 .expect("tool should dispatch");
             let rendered = serde_json::to_string(&result).unwrap_or_default();
             assert!(
-                !rendered.contains("explicit opt-in"),
+                !rendered.contains(opt_in_refusal_marker()),
                 "granted read_screen must clear the gate, got: {rendered}"
             );
         });
