@@ -87,20 +87,6 @@ pub(crate) fn session_wildcard_json_error(status: u16, message: &str) -> ApiResp
     session_wildcard_json_response(status, serde_json::json!({ "error": message }).to_string())
 }
 
-/// Transitional raw-HTTP rendering for the tunnel callers that have not
-/// yet converted to [`ApiResponse`] (the S4c tunnel commit retires it
-/// with the last `http_wire_response` caller); byte-identical to the
-/// historical hand-rolled strings (the HTTP adapter's parity tests pin
-/// the framing).
-pub(crate) fn api_response_to_http_string(response: ApiResponse) -> String {
-    String::from_utf8_lossy(&api_response_http_bytes(
-        response,
-        crate::gateway_routes::CorsPosture::OwnOrigin,
-        None,
-    ))
-    .into_owned()
-}
-
 pub(crate) fn current_agent_output_response_for_ids(
     ids: Vec<String>,
     log_dir: &Path,
@@ -157,12 +143,6 @@ pub(crate) fn current_agent_output_api_response(body: &str, log_dir: &Path) -> A
         Ok(ids) => current_agent_output_response_for_ids(ids, log_dir),
         Err(e) => session_wildcard_json_error(400, &e),
     }
-}
-
-/// Transitional raw-string form for the unconverted tunnel twin (the
-/// S4c tunnel commit retires it together with `http_wire_response`).
-pub(crate) fn current_agent_output_post_response(body: &str, log_dir: &Path) -> String {
-    api_response_to_http_string(current_agent_output_api_response(body, log_dir))
 }
 
 pub(crate) fn external_agent_output_response_for_ids(
@@ -5161,8 +5141,10 @@ mod tests {
         log.agent_output_with_id("first output", "", Some("Codex"), Some("out-1"));
         drop(log);
 
-        let response =
-            current_agent_output_post_response(r#"{"ids":["out-1","missing-out"]}"#, &log_dir);
+        let response = test_render_api_response(current_agent_output_api_response(
+            r#"{"ids":["out-1","missing-out"]}"#,
+            &log_dir,
+        ));
         assert!(response.starts_with("HTTP/1.1 200 OK"));
 
         let body = response.split("\r\n\r\n").nth(1).unwrap();
@@ -5175,7 +5157,8 @@ mod tests {
     #[test]
     fn agent_output_post_response_rejects_empty_json_ids() {
         let dir = tempfile::tempdir().unwrap();
-        let response = current_agent_output_post_response(r#"{"ids":[""]}"#, dir.path());
+        let response =
+            test_render_api_response(current_agent_output_api_response(r#"{"ids":[""]}"#, dir.path()));
         assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
         assert!(response.contains("missing output ids"));
     }

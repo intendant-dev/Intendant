@@ -1758,23 +1758,6 @@ fn http_body_response(id: String, status: u16, body: String, label: &str) -> ser
     }
 }
 
-fn http_wire_response(id: String, response: String, label: &str) -> serde_json::Value {
-    let (status, body) = split_http_response(&response);
-    http_body_response(id, status, body.to_string(), label)
-}
-
-fn split_http_response(response: &str) -> (u16, &str) {
-    let (head, body) = response.split_once("\r\n\r\n").unwrap_or(("", response));
-    let status = head
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("HTTP/1.1 "))
-        .and_then(|line| line.split_whitespace().next())
-        .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or(200);
-    (status, body)
-}
-
 // One status-line parser across both lanes (the api core's (status,
 // body) helper vocabulary).
 pub(crate) use crate::web_gateway::status_line_code;
@@ -4374,17 +4357,6 @@ mod tests {
             "GET /api/managed-context/anchors?session_id=wrapper+id&backend_session_id=thread%2F1&intendant_session_id=daemon%2Bsession HTTP/1.1"
         );
         assert!(managed_context_request_line("fission", &serde_json::json!({})).is_none());
-    }
-
-    #[test]
-    fn http_wire_response_preserves_http_status_metadata() {
-        let response = "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":\"missing\"}";
-        let frame = http_wire_response("m1".into(), response.into(), "managed context");
-        assert_eq!(frame["t"], "response");
-        assert_eq!(frame["ok"], true);
-        assert_eq!(frame["result"]["error"], "missing");
-        assert_eq!(frame["result"]["_httpStatus"], 404);
-        assert_eq!(frame["result"]["_httpOk"], false);
     }
 
 }
