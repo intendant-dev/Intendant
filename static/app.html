@@ -10979,6 +10979,29 @@ body.display-fullscreen-open {
   color: var(--subtext1);
   font-size: 11px;
 }
+.log-attachment-link {
+  display: inline-flex;
+  line-height: 0;
+  border-radius: 4px;
+}
+.log-attachment-link:hover .log-attachment-thumb {
+  border-color: var(--blue);
+}
+.log-attachment-missing {
+  border-style: dashed;
+  color: var(--overlay0);
+  font-style: italic;
+}
+/* Display-only session notes (post_session_note / ctl session note):
+   subtle accent so agent annotations read apart from run output. */
+.log-entry[data-kind="session_note"] {
+  border-left: 2px solid var(--mauve);
+  background: color-mix(in srgb, var(--mauve) 6%, transparent);
+  border-radius: 0 4px 4px 0;
+}
+.log-entry[data-kind="session_note"] > .log-level {
+  color: var(--mauve);
+}
 .pending-attachment-chip .chip-remove {
   width: 14px;
   height: 14px;
@@ -25780,6 +25803,8 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'user_display_granted',
   'user_display_revoked',
   'shared_view',
+  // Unique note_id per note makes the JSON.stringify dedupe key exact.
+  'session_note',
   'recording_started',
   'recording_stopped',
   'recording_deleted',
@@ -37301,6 +37326,12 @@ async function main() {
         handleSharedViewEvent(d);
         return;
       }
+      if (d.event === 'session_note') {
+        // Display-only transcript note: rendered end to end in JS (the
+        // WASM presence layer does not know this event).
+        handleSessionNoteEvent(d);
+        return;
+      }
       if (d.t === 'browser_workspace_snapshot' || d.event === 'browser_workspace_changed') {
         handleBrowserWorkspaceMessage(d);
         return;
@@ -37322,7 +37353,13 @@ async function main() {
         const wasProcessingLogReplay = processingLogReplay;
         processingLogReplay = true;
         try {
-          const cmds = app.handle_server_message(filtered);
+          // session_note entries ride the WASM pipeline as note-styled
+          // log_entry rows (see sessionNoteReplayEntryToLogEntry) so the
+          // replayed transcript keeps chronological order.
+          const cmds = app.handle_server_message({
+            ...filtered,
+            entries: filtered.entries.map(sessionNoteReplayEntryToLogEntry),
+          });
           if (cmds) processCommands(cmds);
         } finally {
           processingLogReplay = wasProcessingLogReplay;
@@ -44021,6 +44058,18 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
     if (!content) return null;
     return { ...base, level: level || 'info', source: source || 'system', content, kind, output_id: entry.output_id || entry.outputId || '' };
   }
+  if (event === 'session_note') {
+    const noteText = String(entry.text || content || '').trim();
+    if (!noteText) return null;
+    return {
+      ...base,
+      level: 'info',
+      source: source || 'note',
+      content: noteText,
+      kind: 'session_note',
+      attachment_previews: sessionNoteAttachmentPreviews(entry),
+    };
+  }
   if (event === 'model_response') {
     if (!content) {
       const reasoning = String(entry.reasoning_summary || entry.reasoningSummary || '').trim();
@@ -46478,6 +46527,7 @@ function buildSessionWindowLogEntry(c) {
   cnt.className = 'log-content';
   renderLogContentElement(cnt, c);
   appendLogStateBadges(cnt, c);
+  appendLogAttachmentStrip(cnt, c);
   entry.appendChild(cnt);
   appendCopyLogEntryButton(entry, c.content ?? '');
   appendEditUserMessageButton(entry, c);
@@ -48692,6 +48742,7 @@ function sessionWindowRecordFromLogCommand(c) {
     superseded: !!c?.superseded,
     superseded_reason: c?.superseded_reason || c?.supersededReason || '',
     collapsible: !!c?.collapsible,
+    attachment_previews: Array.isArray(c?.attachment_previews) ? c.attachment_previews : [],
   };
 }
 
@@ -49977,6 +50028,130 @@ function appendEditUserMessageButton(entry, c) {
   entry.appendChild(btn);
 }
 
+// Render a log entry's attachment previews as a thumbnail strip.
+// Each preview is { dataUrl?, url?, name?, note?, frameId?, mime? }:
+// `dataUrl` (a data: URL or a same-origin /raw URL) renders as an <img>;
+// `url` additionally wraps the thumb in a click-through link that opens
+// the blob in a new tab. A preview without pixels — or one whose blob was
+// deleted from the upload store (the <img> error path) — degrades to a
+// named chip instead of a broken image.
+function appendLogAttachmentStrip(cnt, c) {
+  const attachmentPreviews = Array.isArray(c?.attachment_previews) ? c.attachment_previews : [];
+  if (attachmentPreviews.length === 0) return;
+  const strip = document.createElement('div');
+  strip.className = 'log-attachment-strip';
+  const missingChip = (att) => {
+    const chip = document.createElement('span');
+    chip.className = 'log-attachment-file';
+    chip.textContent = (att && (att.name || att.frameId)) || 'attachment';
+    return chip;
+  };
+  for (const att of attachmentPreviews) {
+    if (att && att.dataUrl) {
+      const img = document.createElement('img');
+      img.className = 'log-attachment-thumb';
+      img.loading = 'lazy';
+      img.src = att.dataUrl;
+      img.alt = '';
+      img.title = att.note || att.name || att.frameId || 'attachment';
+      let holder = img;
+      if (att.url) {
+        const link = document.createElement('a');
+        link.className = 'log-attachment-link';
+        link.href = att.url;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.title = img.title;
+        link.appendChild(img);
+        holder = link;
+      }
+      img.addEventListener('error', () => {
+        const chip = missingChip(att);
+        chip.classList.add('log-attachment-missing');
+        chip.title = 'attachment unavailable (blob deleted from the upload store)';
+        holder.replaceWith(chip);
+      }, { once: true });
+      strip.appendChild(holder);
+    } else {
+      strip.appendChild(missingChip(att));
+    }
+  }
+  cnt.appendChild(strip);
+}
+
+// ── Session notes (display-only transcript notes) ──
+// Wire shape: { event: 'session_note', session_id, note_id, text,
+// attachments: [{upload_id, name, mime, url}], source?, ts }.
+// Rendered as an ordinary log entry with kind 'session_note' (distinct
+// styling via .log-entry[data-kind=session_note]) and the attachment
+// strip fed by the upload-store /raw URLs.
+
+function sessionNoteAttachmentPreviews(d) {
+  const attachments = Array.isArray(d?.attachments) ? d.attachments : [];
+  return attachments.map(att => ({
+    dataUrl: att?.url || '',
+    url: att?.url || '',
+    name: att?.name || 'image',
+    mime: att?.mime || '',
+  }));
+}
+
+// Normalize a session_note wire event (live WS or a raw replay/session-
+// detail entry) into the log-command shape renderLogEntry consumes.
+function sessionNoteLogCommand(d) {
+  const text = String(d?.text ?? d?.content ?? '').trim();
+  if (!text) return null;
+  const tsMs = Number(d?.ts_ms ?? d?.tsMs ?? d?.ts);
+  return {
+    session_id: String(d?.session_id || d?.sessionId || '').trim(),
+    level: 'info',
+    source: String(d?.source || '').trim() || 'note',
+    kind: 'session_note',
+    content: text,
+    note_id: d?.note_id || d?.noteId || '',
+    event_id: d?.event_id || d?.eventId || (d?.note_id ? `session-note:${d.note_id}` : ''),
+    delivery: d?.delivery || d?.delivery_class || d?.deliveryClass || '',
+    // Raw wire events carry unix-ms in `ts`; replay entries carry the
+    // session log's HH:MM:SS string there instead, so only accept numbers.
+    ts_ms: Number.isFinite(tsMs) && tsMs > 0 ? tsMs : undefined,
+    ts: typeof d?.ts === 'string' ? d.ts : '',
+    attachment_previews: sessionNoteAttachmentPreviews(d),
+  };
+}
+
+// Live-path handler for the session_note WS event (the WASM presence
+// layer does not know this event; the JS owns its rendering end to end).
+function handleSessionNoteEvent(d) {
+  const c = sessionNoteLogCommand(d);
+  if (!c) return;
+  stationPushLogEvent(c);
+  renderLogEntry(c);
+  stationScheduleUpdate();
+}
+
+// Bootstrap-replay adapter: the WASM activity-feed pipeline only carries
+// log_entry-shaped replay rows (AddLogEntry has no attachment fields), so
+// session_note entries replay as note-styled text entries; the session
+// windows and the Sessions detail view re-attach the thumbnails from the
+// raw entries. The content deliberately stays byte-identical to the raw
+// note text so the transcript-signature dedupe collapses this row with
+// the attachment-bearing record the external window sync later inserts.
+// Everything else passes through untouched.
+function sessionNoteReplayEntryToLogEntry(entry) {
+  if (!entry || entry.event !== 'session_note') return entry;
+  return {
+    event: 'log_entry',
+    level: 'info',
+    source: String(entry.source || '').trim() || 'note',
+    kind: 'session_note',
+    content: String(entry.text || '').trim(),
+    session_id: entry.session_id || '',
+    ts: entry.ts,
+    event_id: entry.event_id || '',
+    delivery: entry.delivery || '',
+  };
+}
+
 function renderLogEntry(c) {
   if (isCommandOutputLog(c)) {
     inferSessionPhaseFromLog(c);
@@ -50000,34 +50175,13 @@ function renderLogEntry(c) {
   appendLogStateBadges(cnt, c);
 
   const hasImages = c.images && c.images.length > 0;
-  const attachmentPreviews = Array.isArray(c.attachment_previews) ? c.attachment_previews : [];
   if (hasImages) {
     const badge = document.createElement('span');
     badge.className = 'log-image-badge';
     badge.textContent = c.images.length === 1 ? '[screenshot]' : '[' + c.images.length + ' screenshots]';
     cnt.appendChild(badge);
   }
-  if (attachmentPreviews.length > 0) {
-    const strip = document.createElement('div');
-    strip.className = 'log-attachment-strip';
-    for (const att of attachmentPreviews) {
-      if (att && att.dataUrl) {
-        const img = document.createElement('img');
-        img.className = 'log-attachment-thumb';
-        img.loading = 'lazy';
-        img.src = att.dataUrl;
-        img.alt = '';
-        img.title = att.note || att.name || att.frameId || 'attachment';
-        strip.appendChild(img);
-      } else {
-        const chip = document.createElement('span');
-        chip.className = 'log-attachment-file';
-        chip.textContent = (att && (att.name || att.frameId)) || 'attachment';
-        strip.appendChild(chip);
-      }
-    }
-    cnt.appendChild(strip);
-  }
+  appendLogAttachmentStrip(cnt, c);
 
   entry.appendChild(cnt);
   appendCopyLogEntryButton(entry, c.content ?? '');
@@ -87514,7 +87668,15 @@ function buildSessionDetailRows(entries) {
   let lastTurn = null;
   const visibleLevels = sessionDetailVisibleLevels();
 
-  for (const e of entries || []) {
+  for (let e of entries || []) {
+    // Display-only session notes carry their body in `text` and their
+    // image references in `attachments`; normalize them into the generic
+    // record shape (content + attachment_previews) the renderer expects.
+    if (e && e.event === 'session_note') {
+      const note = sessionNoteLogCommand(e);
+      if (!note) continue;
+      e = { ...e, ...note };
+    }
     const level = e.level || 'info';
     if (!visibleLevels.includes(level)) continue;
     if (!sessionDetailEntryMatchesLogFilter(e)) continue;
@@ -87729,6 +87891,7 @@ function materializeSessionDetailRow(view, row, index) {
   const entry = document.createElement('div');
   entry.className = 'log-entry level-' + e.level;
   entry.dataset.detailRowIndex = String(index);
+  if (e.kind) entry.dataset.kind = e.kind;
   const sourceClass = String(e.source).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
   if (sourceClass) entry.classList.add('source-' + sourceClass);
   if (e.session_id) entry.dataset.sessionId = e.session_id;
@@ -87794,6 +87957,7 @@ function materializeSessionDetailRow(view, row, index) {
     content: e.content
   });
   appendLogStateBadges(cnt, e);
+  appendLogAttachmentStrip(cnt, e);
   if (sessionDetailLevelColors[e.level]) cnt.style.color = sessionDetailLevelColors[e.level];
 
   entry.appendChild(ts);

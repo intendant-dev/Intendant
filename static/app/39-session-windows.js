@@ -1303,6 +1303,18 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
     if (!content) return null;
     return { ...base, level: level || 'info', source: source || 'system', content, kind, output_id: entry.output_id || entry.outputId || '' };
   }
+  if (event === 'session_note') {
+    const noteText = String(entry.text || content || '').trim();
+    if (!noteText) return null;
+    return {
+      ...base,
+      level: 'info',
+      source: source || 'note',
+      content: noteText,
+      kind: 'session_note',
+      attachment_previews: sessionNoteAttachmentPreviews(entry),
+    };
+  }
   if (event === 'model_response') {
     if (!content) {
       const reasoning = String(entry.reasoning_summary || entry.reasoningSummary || '').trim();
