@@ -27,6 +27,7 @@ pub(crate) struct PeerConnectionIdentity {
 pub(crate) fn dashboard_targets_response_value(
     agent_card: &serde_json::Value,
     registry: Option<&crate::peer::PeerRegistry>,
+    local_tier: Option<&str>,
 ) -> serde_json::Value {
     let local_id = agent_card
         .get("id")
@@ -68,6 +69,17 @@ pub(crate) fn dashboard_targets_response_value(
         if let Some(value) = agent_card.get(key).and_then(|v| v.as_str()) {
             local_target[key] = serde_json::Value::String(value.to_string());
         }
+    }
+    // Trust tier rides the *targets* payload, deliberately not the public
+    // agent card: the card is unauthenticated and CORS-open, and an
+    // "integrated" label there would advertise which boxes are worth
+    // attacking. Here it reaches only sessions the daemon already
+    // authorized, and the browser folds it into the signed fleet record
+    // (payload v4) so the owner's other devices see each daemon's zone —
+    // offline daemons included — without the store being able to forge it
+    // (docs/src/trust-tiers.md § metadata carriers).
+    if let Some(tier) = local_tier.map(str::trim).filter(|t| !t.is_empty()) {
+        local_target["tier"] = serde_json::Value::String(tier.to_string());
     }
     let mut targets = vec![local_target];
 
@@ -118,8 +130,19 @@ pub(crate) fn dashboard_targets_response_value(
 pub(crate) fn dashboard_targets_response_body(
     agent_card: &serde_json::Value,
     registry: Option<&crate::peer::PeerRegistry>,
+    local_tier: Option<&str>,
 ) -> String {
-    dashboard_targets_response_value(agent_card, registry).to_string()
+    dashboard_targets_response_value(agent_card, registry, local_tier).to_string()
+}
+
+/// The daemon's own trust tier for the targets payload, resolved from
+/// local IAM at request time so a tier change on the Access card shows
+/// up without a daemon restart. Missing/unreadable state reads as no
+/// tier (the doctrine's "unset" — the UI shows nothing).
+pub(crate) fn local_daemon_tier(cert_dir: &std::path::Path) -> Option<String> {
+    crate::access::iam::load_state_for_overview(cert_dir)
+        .state
+        .tier
 }
 
 /// Build the shared access overview model.
@@ -167,9 +190,13 @@ pub(crate) async fn handle_dashboard_targets(
     agent_card_value_for_targets: serde_json::Value,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
+    local_tier: Option<&str>,
 ) {
-    let response =
-        dashboard_targets_api_response(&agent_card_value_for_targets, peer_registry.as_ref());
+    let response = dashboard_targets_api_response(
+        &agent_card_value_for_targets,
+        peer_registry.as_ref(),
+        local_tier,
+    );
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -645,10 +672,13 @@ pub(crate) fn access_manage_denied_api_response(
 pub(crate) fn dashboard_targets_api_response(
     agent_card: &serde_json::Value,
     registry: Option<&crate::peer::PeerRegistry>,
+    local_tier: Option<&str>,
 ) -> ApiResponse {
     ApiResponse::json(
         200,
-        JsonBody::PreSerialized(dashboard_targets_response_body(agent_card, registry)),
+        JsonBody::PreSerialized(dashboard_targets_response_body(
+            agent_card, registry, local_tier,
+        )),
     )
 }
 
@@ -1012,7 +1042,8 @@ pub(crate) fn access_overview_response_value_with_identities_and_iam(
     iam_state: &crate::access::iam::LoadedIamState,
     current_principal: Option<&crate::access::iam::AccessPrincipal>,
 ) -> serde_json::Value {
-    let targets_value = dashboard_targets_response_value(agent_card, registry);
+    let targets_value =
+        dashboard_targets_response_value(agent_card, registry, iam_state.state.tier.as_deref());
     let targets = targets_value
         .get("targets")
         .and_then(|v| v.as_array())
@@ -2654,6 +2685,29 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_targets_stamp_local_tier_but_never_the_card() {
+        let card = serde_json::json!({
+            "id": "d-abc", "label": "box", "capabilities": []
+        });
+        // Tier set: the local target carries it; peer targets never do.
+        let value = dashboard_targets_response_value(&card, None, Some("integrated"));
+        let targets = value["targets"].as_array().unwrap();
+        assert_eq!(targets[0]["tier"], serde_json::json!("integrated"));
+        // Unset / blank tier: the key is absent, not an empty string.
+        for tier in [None, Some(""), Some("  ")] {
+            let value = dashboard_targets_response_value(&card, None, tier);
+            assert!(
+                value["targets"][0].get("tier").is_none(),
+                "blank tier must not stamp ({tier:?})"
+            );
+        }
+        // The public agent card value itself is never mutated — the tier
+        // reaches only the authorized targets payload (beacon rule,
+        // docs/src/trust-tiers.md § metadata carriers).
+        assert!(card.get("tier").is_none());
+    }
+
+    #[test]
     fn fleet_origin_gate_normalizes_and_allowlists() {
         assert_eq!(
             normalized_origin("WSS://Daemon.Local:8765").as_deref(),
@@ -3522,9 +3576,9 @@ mod tests {
         // An empty agent card and no registry produce the deterministic
         // local-only target list through the untouched builder.
         let card = serde_json::json!({});
-        let body = dashboard_targets_response_body(&card, None);
+        let body = dashboard_targets_response_body(&card, None, None);
         let response = collect_access_handler_response(|stream| {
-            handle_dashboard_targets(stream, None, card.clone(), cors, None)
+            handle_dashboard_targets(stream, None, card.clone(), cors, None, None)
         })
         .await;
         assert_eq!(

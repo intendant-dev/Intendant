@@ -271,11 +271,10 @@ the owner's memory. All four are **shipped**:
    on an integrated machine, the peer pairing-approval card warns that
    approving grants a peer authority *here* (the upward-grant alarm), and
    hosted-route device enrollments get an integrated-tier warning chip
-   beside the existing hosted-route one. *Deliberately deferred:*
-   cross-daemon tier visibility (a tier field on fleet records or agent
-   cards, so the granting side can compare both ends' tiers) — that needs
-   a metadata-carrier decision (browser-signed fleet payload v4 vs. the
-   public agent card) and is not required for the local alarm.
+   beside the existing hosted-route one. Same-account cross-daemon
+   visibility ships via the signed fleet record — each fleet card carries
+   its daemon's tier chip, offline daemons included (the carrier
+   reasoning is [Where fleet metadata rides](#where-fleet-metadata-rides)).
 2. **Per-daemon hosted-ceiling knob.** The same card carries "Hosted tabs
    may: Operate / View only / Nothing" — one control writing both
    hosted-provenance `role_ceilings` bindings
@@ -310,3 +309,39 @@ the owner's memory. All four are **shipped**:
    on any serial the daemon never requested. Advisory and fail-open by
    design: a crt.sh outage stamps `ct_last_error` rather than blocking
    renewal.
+
+## Where fleet metadata rides
+
+Fleet facts have three possible carriers, and each datum lands where its
+provenance and audience allow — not where plumbing is cheapest:
+
+- **The public agent card** (`/.well-known/agent-card.json` — unauthenticated,
+  CORS-open) carries operational facts a stranger legitimately needs
+  *before* any trust exists: transports, capabilities, auth requirements,
+  the advertised rendezvous base — and connection hints like ICE servers,
+  should the hosted path ever need browser-side TURN (a parked seed with
+  no consumer today). The card is daemon-asserted and unauthenticated by
+  nature; nothing on it may function as evidence.
+- **The signed fleet record** (browser-signed payload, v4) carries the
+  owner's account-scoped view: labels, daemon URLs (PRF-encrypted), the
+  rendezvous base — and the daemon's **trust tier**. The record is
+  verifiable by the owner's own devices and readable without the daemon
+  being up, which is exactly what tier chips on fleet cards need.
+- **The daemon's authorized payloads** (the dashboard targets response,
+  overview) carry daemon truth to sessions the daemon already admitted —
+  the seam through which the tier reaches the browser to be folded into
+  the record.
+
+Two deliberate absences, so their reasons don't get re-litigated:
+
+- **The tier is not on the public card.** An unauthenticated "integrated"
+  label is a target beacon — it tells an attacker which box is worth the
+  effort — and as a self-assertion it cannot serve the upward-grant
+  guard as evidence anyway.
+- **The pairing doorbell carries no tier claim.** A cross-owner requester
+  asserting "I'm disposable" is unverifiable exactly when it matters;
+  showing it on the approval card would dress an assertion as evidence.
+  Cross-owner tier comparison waits for an authenticated daemon-identity
+  linkage in the doorbell (the requester proving which daemon key it is,
+  so a claim could at least be pinned to an identity) — a prerequisite,
+  not a plumbing gap.

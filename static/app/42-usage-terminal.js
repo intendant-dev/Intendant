@@ -263,6 +263,10 @@ function normalizeDashboardAccessTarget(target) {
     effective_role: String(target.effective_role || target.effectiveRole || '').trim(),
     effective_role_label: String(target.effective_role_label || target.effectiveRoleLabel || '').trim(),
     profile: String(target.profile || '').trim(),
+    // Owner-set trust tier, stamped by the daemon into its own targets
+    // payload and carried in the signed v4 fleet record (never on the
+    // public agent card — docs/src/trust-tiers.md § metadata carriers).
+    tier: String(target.tier || '').trim(),
     connected: target.connected !== false,
     capabilities,
   };

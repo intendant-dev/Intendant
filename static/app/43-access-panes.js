@@ -627,6 +627,17 @@ function renderAccessFleetStrip() {
     }
     const provenanceChip = accessTargetProvenanceChip(target);
     if (provenanceChip) meta.appendChild(provenanceChip);
+    // Owner-set trust tier from the signed v4 fleet record (or the live
+    // targets payload for the current daemon) — the fleet's zones at a
+    // glance, offline daemons included. Absent = unset: show nothing.
+    const tierMeta = ACCESS_TIER_META[String(target.tier || '').trim()];
+    if (tierMeta) {
+      const tierChip = document.createElement('span');
+      tierChip.className = `acc-chip acc-tier-${String(target.tier).trim()}`;
+      tierChip.textContent = `${tierMeta.glyph} ${tierMeta.label}`;
+      tierChip.title = tierMeta.short;
+      meta.appendChild(tierChip);
+    }
     // The door to the direct path (docs/src/trust-tiers.md): when the
     // record carries the daemon's own URL, offer it — a direct tab talks
     // straight to that daemon (local vault, no Connect service in the
