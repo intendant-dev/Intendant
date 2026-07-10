@@ -782,11 +782,13 @@
                     <option value="default" selected>default</option>
                     <option value="acceptEdits">acceptEdits</option>
                     <option value="plan">plan</option>
+                    <option value="auto">auto</option>
+                    <option value="dontAsk">dontAsk</option>
                     <option value="bypassPermissions">bypassPermissions</option>
                   </select>
                 </div>
                 <div class="control-hint">
-                  <strong>default</strong>: tools outside the allowed list ask — prompts surface as Intendant approvals. <strong>acceptEdits</strong>: file edits auto-approve, commands still ask. <strong>plan</strong>: read-only planning. <strong>bypassPermissions</strong>: nothing asks — prefer an external sandbox.
+                  <strong>default</strong>: tools outside the allowed list ask — prompts surface as Intendant approvals. <strong>acceptEdits</strong>: file edits auto-approve, commands still ask. <strong>plan</strong>: read-only planning. <strong>auto</strong>: a classifier auto-approves safe calls, the rest still ask. <strong>dontAsk</strong>: anything that would ask is denied instead. <strong>bypassPermissions</strong>: nothing asks — prefer an external sandbox.
                 </div>
               </fieldset>
               <fieldset class="control-group">
@@ -1426,6 +1428,8 @@
                           <option value="default">default</option>
                           <option value="acceptEdits">acceptEdits</option>
                           <option value="plan">plan</option>
+                          <option value="auto">auto</option>
+                          <option value="dontAsk">dontAsk</option>
                           <option value="bypassPermissions">bypassPermissions</option>
                         </select>
                       </label>
@@ -1438,6 +1442,7 @@
                           <option value="high">high</option>
                           <option value="xhigh">xhigh</option>
                           <option value="max">max</option>
+                          <option value="ultracode">ultracode</option>
                         </select>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-codex-sandbox">

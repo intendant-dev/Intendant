@@ -428,18 +428,31 @@ pub struct ClaudeCodeConfig {
     /// Model to use.
     #[serde(default)]
     pub model: Option<String>,
-    /// Permission mode: "default", "acceptEdits", "plan", "bypassPermissions".
-    /// The legacy value "auto" (never a real Claude Code mode) is accepted
-    /// and treated as "default".
+    /// Permission mode: "default", "acceptEdits", "plan", "auto",
+    /// "dontAsk", or "bypassPermissions" ("manual" is the CLI's alias for
+    /// "default"). "auto" (classifier-based approvals) became a real CLI
+    /// mode in 2.1.x — configs that predate Intendant 2026-07-04 and still
+    /// carry the old shipped default "auto" now get that documented mode
+    /// instead of the historical coercion to "default".
     #[serde(default = "default_claude_code_permission_mode")]
     pub permission_mode: String,
     /// Allowed tools list (empty = all).
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     /// Reasoning-effort level passed as `--effort`: "low", "medium",
-    /// "high", "xhigh", or "max". `None` omits the flag (CLI default).
+    /// "high", "xhigh", "max", or "ultracode" (2.1.203+: xhigh with the
+    /// ultracode meta-mode on). `None` omits the flag (CLI default).
     #[serde(default)]
     pub effort: Option<String>,
+    /// Hard per-session dollar backstop passed as `--max-budget-usd`
+    /// (print mode; CLI-enforced, cumulative across the process AND its
+    /// resumes). On exceed the CLI ends every further turn with a
+    /// `result` of subtype `error_max_budget_usd` (probed on 2.1.206),
+    /// surfaced as a backend error with a recovery hint. `None` omits the
+    /// flag. Complements goal budgets: goals measure fresh tokens and
+    /// steer the model; this is the CLI's own hard stop.
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
 }
 
 fn default_claude_code_command() -> String {
@@ -451,30 +464,34 @@ fn default_claude_code_permission_mode() -> String {
 }
 
 /// Canonicalize a Claude Code reasoning-effort level. The CLI accepts
-/// low / medium / high / xhigh / max; empty and "default" mean "don't pass
-/// the flag". Unknown values pass through trimmed for forward
-/// compatibility with newer CLIs.
+/// low / medium / high / xhigh / max / ultracode (2.1.203+); empty and
+/// "default" mean "don't pass the flag". Unknown values pass through
+/// trimmed for forward compatibility with newer CLIs.
 pub fn normalize_claude_effort(effort: Option<&str>) -> Option<String> {
     let trimmed = effort.map(str::trim).filter(|s| !s.is_empty())?;
     let lowered = trimmed.to_ascii_lowercase();
     match lowered.as_str() {
         "default" | "inherit" => None,
-        "low" | "medium" | "high" | "xhigh" | "max" => Some(lowered),
+        "low" | "medium" | "high" | "xhigh" | "max" | "ultracode" => Some(lowered),
         _ => Some(trimmed.to_string()),
     }
 }
 
-/// Canonicalize a Claude Code permission mode. The CLI's real modes are
-/// `default`, `acceptEdits`, `plan`, and `bypassPermissions`; the legacy
-/// Intendant default "auto" (never a real mode — the CLI silently coerces
-/// it) maps to `default`. Unknown values pass through trimmed for forward
-/// compatibility with newer CLIs.
+/// Canonicalize a Claude Code permission mode. The CLI's modes on 2.1.206
+/// are `default` (alias `manual`), `acceptEdits`, `plan`, `auto`
+/// (classifier-based approvals), `dontAsk` (auto-deny anything that would
+/// prompt), and `bypassPermissions` — all probed accepted. `auto` was once
+/// coerced to `default` here (pre-2.1.83 CLIs silently coerced it); now
+/// that it is a documented mode it passes through. Unknown values pass
+/// through trimmed for forward compatibility with newer CLIs.
 pub fn normalize_claude_permission_mode(mode: &str) -> String {
     let trimmed = mode.trim();
     match trimmed.to_ascii_lowercase().as_str() {
-        "" | "default" | "auto" => "default".to_string(),
+        "" | "default" | "manual" => "default".to_string(),
         "acceptedits" | "accept-edits" | "accept_edits" => "acceptEdits".to_string(),
         "plan" => "plan".to_string(),
+        "auto" => "auto".to_string(),
+        "dontask" | "dont-ask" | "dont_ask" => "dontAsk".to_string(),
         "bypasspermissions" | "bypass-permissions" | "bypass_permissions" => {
             "bypassPermissions".to_string()
         }
@@ -490,6 +507,7 @@ impl Default for ClaudeCodeConfig {
             permission_mode: default_claude_code_permission_mode(),
             effort: None,
             allowed_tools: Vec::new(),
+            max_budget_usd: None,
         }
     }
 }

@@ -1645,6 +1645,14 @@ impl CcReader {
             if was_interrupt {
                 out.log("info", "Claude Code turn interrupted");
             } else {
+                // The budget backstop is cumulative for the process AND its
+                // resumes — without a hint this reads as a mystery failure.
+                let recovery_hint = (subtype == "error_max_budget_usd").then(|| {
+                    "The session hit its --max-budget-usd backstop; raise \
+                     [agent.claude_code] max_budget_usd (or unset it) and \
+                     restart the session"
+                        .to_string()
+                });
                 out.events.push(AgentEvent::BackendError {
                     message: message
                         .clone()
@@ -1654,7 +1662,7 @@ impl CcReader {
                     details: None,
                     will_retry: false,
                     likely_generation_starvation: false,
-                    recovery_hint: None,
+                    recovery_hint,
                 });
             }
         }
@@ -1882,9 +1890,14 @@ pub struct ClaudeCodeAgent {
     command: String,
     model: Option<String>,
     permission_mode: String,
-    /// Reasoning-effort level for `--effort` (low/medium/high/xhigh/max);
-    /// `None` omits the flag.
+    /// Reasoning-effort level for `--effort` (low/medium/high/xhigh/max/
+    /// ultracode); `None` omits the flag.
     effort: Option<String>,
+    /// Hard dollar backstop for `--max-budget-usd`; `None` omits the flag.
+    /// On exceed the CLI fails every further turn with a `result` of
+    /// subtype `error_max_budget_usd` (probed 2.1.206) — cumulative across
+    /// the process and its resumes.
+    max_budget_usd: Option<f64>,
     allowed_tools: Vec<String>,
     web_port: Option<u16>,
     working_dir: Option<PathBuf>,
@@ -1932,6 +1945,7 @@ impl ClaudeCodeAgent {
             model,
             permission_mode,
             effort: crate::project::normalize_claude_effort(effort.as_deref()),
+            max_budget_usd: None,
             allowed_tools,
             web_port,
             working_dir: None,
@@ -1949,6 +1963,13 @@ impl ClaudeCodeAgent {
             shared: Arc::new(CcShared::new(None)),
             control_counter: AtomicU64::new(0),
         }
+    }
+
+    /// Arm the CLI-enforced dollar backstop (`--max-budget-usd`). Kept out
+    /// of `new()` so the many existing constructor sites stay unchanged.
+    pub fn with_max_budget_usd(mut self, budget: Option<f64>) -> Self {
+        self.max_budget_usd = budget.filter(|b| b.is_finite() && *b > 0.0);
+        self
     }
 
     /// The scoped loopback MCP URL injected into `--mcp-config` and the ctl
@@ -2101,7 +2122,7 @@ impl ClaudeCodeAgent {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 CallerError::ExternalAgent(
-                    "permission-mode requires a mode (default, acceptEdits, plan, bypassPermissions)"
+                    "permission-mode requires a mode (default, acceptEdits, plan, auto, dontAsk, bypassPermissions)"
                         .into(),
                 )
             })?;
@@ -2201,6 +2222,11 @@ impl ExternalAgent for ClaudeCodeAgent {
         if let Some(ref effort) = self.effort {
             args.push("--effort".into());
             args.push(effort.clone());
+        }
+
+        if let Some(budget) = self.max_budget_usd {
+            args.push("--max-budget-usd".into());
+            args.push(budget.to_string());
         }
 
         if !self.allowed_tools.is_empty() {
@@ -2556,6 +2582,36 @@ mod tests {
     }
 
     #[test]
+    fn with_max_budget_usd_rejects_nonpositive() {
+        let base = || ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
+        assert_eq!(base().with_max_budget_usd(Some(2.5)).max_budget_usd, Some(2.5));
+        assert_eq!(base().with_max_budget_usd(Some(0.0)).max_budget_usd, None);
+        assert_eq!(base().with_max_budget_usd(Some(-1.0)).max_budget_usd, None);
+        assert_eq!(
+            base().with_max_budget_usd(Some(f64::NAN)).max_budget_usd,
+            None
+        );
+        assert_eq!(base().with_max_budget_usd(None).max_budget_usd, None);
+    }
+
+    #[test]
+    fn max_budget_error_result_carries_recovery_hint() {
+        // Probed on 2.1.206: exceeding --max-budget-usd fails the turn with
+        // subtype error_max_budget_usd and result null; the process
+        // survives (and keeps failing) — the hint tells the user which
+        // knob to turn.
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"error_max_budget_usd","is_error":true,"result":null,"num_turns":1,"total_cost_usd":0.0119,"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::BackendError { code: Some(code), recovery_hint: Some(hint), .. }
+                if code == "error_max_budget_usd" && hint.contains("max_budget_usd")
+        )));
+    }
+
+    #[test]
     fn claude_code_agent_with_options() {
         let agent = ClaudeCodeAgent::new(
             "/usr/local/bin/claude".into(),
@@ -2784,9 +2840,19 @@ mod tests {
 
     #[test]
     fn permission_mode_normalization() {
-        // The legacy Intendant default "auto" is not a Claude Code mode;
-        // the CLI coerces it to default, so we don't pass the flag at all.
-        assert_eq!(normalize_permission_mode("auto"), None);
+        // "auto" is a documented CLI mode since 2.1.x (classifier-based
+        // approvals; accepted on 2.1.206) — it passes through. "manual" is
+        // the CLI's alias for default, so like default the flag is omitted.
+        assert_eq!(normalize_permission_mode("auto").as_deref(), Some("auto"));
+        assert_eq!(
+            normalize_permission_mode("dontAsk").as_deref(),
+            Some("dontAsk")
+        );
+        assert_eq!(
+            normalize_permission_mode("dont-ask").as_deref(),
+            Some("dontAsk")
+        );
+        assert_eq!(normalize_permission_mode("manual"), None);
         assert_eq!(normalize_permission_mode("default"), None);
         assert_eq!(normalize_permission_mode(""), None);
         assert_eq!(
