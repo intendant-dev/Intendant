@@ -1995,7 +1995,9 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/session/current/prune` | SessionManage | own origin | bounded | Prune rollback state for the current session |
 | POST | `/api/session/current/agent-output` | SessionManage | own origin | bounded | Fetch the current session's persisted agent output by id (POST-shaped read) |
 | POST | `/api/session/current/uploads` | SessionManage | own origin | streaming | Upload a file attachment (raw streamed body; name/destination in query) |
-| GET | `/api/session/current/uploads[/…]` | SessionManage | own origin | none | List uploads, or fetch one (subpath {id}/raw) |
+| GET | `/api/session/current/uploads` | SessionManage | own origin | none | List uploads for the current session |
+| GET | `/api/session/current/uploads/{id}/raw` | SessionManage | own origin | none | Fetch one upload's raw bytes (inline Content-Disposition) |
+| GET | `/api/session/current/uploads[/…]` | SessionManage | own origin | none | Unknown upload subpaths (handler-owned JSON 404) |
 | DELETE | `/api/session/current/uploads/{upload_id}` | SessionManage | own origin | none | Delete one upload (file + sidecar) |
 | DELETE | `/api/session/{id}` | SessionManage | own origin | none | Delete a session's data |
 | DELETE | `/api/session/{id}/{target}` | SessionManage | own origin | none | Delete one data kind for a session (recordings, frames, …) |
