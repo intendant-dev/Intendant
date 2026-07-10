@@ -59,6 +59,34 @@ Deferred: the Windows runner host needs the equivalent (scheduled task,
 `LOCALAPPDATA\intendant-ci\target` cache root, 60G budget) once the box
 is reachable for verification — tracked in the CI hardening program.
 
+## Cargo parallelism cap (runner accounts)
+
+A box that hosts two listeners plus interactive agents cannot run
+uncapped rustc: concurrent test-binary links exceed physical RAM, the
+box swaps, macOS's `kernel_task` thermal/IO throttling then slows the
+CPU, the links crawl instead of finishing, more jobs stack behind
+them, and the kernel finally OOM-kills a compile (`sccache: Compile
+terminated by signal 9`) — failing whole speculative merge-queue
+entries (2026-07-10: three hours of queue stall on the 24GB Mac).
+
+Cap cargo at the account level in the runner account's
+`~/.cargo/config.toml`:
+
+```toml
+[build]
+jobs = 6   # 2 listeners x 6 jobs fits a 24GB box; scale with RAM
+```
+
+This binds every cargo invocation in that account — CI legs and local
+agents alike — without touching workflow files or restarting
+listeners. Pair it with the merge queue's build concurrency (ruleset;
+2 as of 2026-07-10): the queue bounds how many entries validate at
+once, the jobs cap bounds what each validation can demand.
+
+Future watchdog enhancement (not yet implemented): gate listener
+resume on `memory_pressure` in addition to disk, so a swap storm
+pauses assignment the way a full disk does.
+
 ## Interlocks
 
 - The workflow cache steps and this watchdog share the cache layout

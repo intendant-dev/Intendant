@@ -112,6 +112,10 @@ jobs:
           awk -v l="$load" -v c="$cores" 'BEGIN { if (l > 3*c) print "::warning::fleet preflight: load " l " is over 3x the " c " cores — timing-sensitive tests may flake; consider draining the box" }'
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        # The default persisted token grants every later step push access;
+        # nothing in these jobs pushes.
+        with:
+          persist-credentials: false
 
       # Fleet build state lives outside the workspace (checkout's
       # `git clean -ffdx` wipes an in-tree target/ every job) — same
@@ -265,6 +269,10 @@ jobs:
           awk -v l="$load" -v c="$cores" 'BEGIN { if (l > 3*c) print "::warning::fleet preflight: load " l " is over 3x the " c " cores — timing-sensitive tests may flake; consider draining the box" }'
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        # The default persisted token grants every later step push access;
+        # nothing in these jobs pushes.
+        with:
+          persist-credentials: false
 
       # Same external per-listener build cache as the smokes job above.
       - name: External cargo target dir

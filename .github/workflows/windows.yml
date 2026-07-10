@@ -151,6 +151,10 @@ jobs:
           }
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        # The default persisted token grants every later step push access;
+        # nothing in these jobs pushes.
+        with:
+          persist-credentials: false
 
       # Fleet build state lives OUTSIDE the workspace: checkout
       # (clean: true) runs `git clean -ffdx` at the start of every job, so
