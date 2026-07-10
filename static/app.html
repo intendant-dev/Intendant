@@ -26732,7 +26732,11 @@ window.qa = Object.assign(window.qa || {}, {
    blob authentication" below), so the store cannot tamper, splice, or
    relabel. What remains to the store: withholding, or serving a stale
    revision — detectable via the local high-water mark. Unsealing happens
-   only here, in memory, behind a passkey gesture or the phrase. */
+   only client-side, in memory, behind a passkey gesture or the phrase —
+   and the key-touching crypto itself runs inside the pinned crypto
+   kernel (static/vault-kernel.js, a hash-verified dedicated Worker; see
+   "Vault crypto: the pinned kernel" below), so the master key never
+   exists in this page's memory. */
 
 const VAULT_LOCAL_KEY = 'intendant_vault_local_v1';
 const VAULT_HKDF_SALT = 'intendant-vault-v1';
@@ -26760,7 +26764,8 @@ const vaultState = {
   blob: null,          // the full encrypted vault blob
   entries: [],         // decrypted entries while unlocked
   settings: {},        // decrypted vault-wide settings while unlocked
-  kBytes: null,        // raw master key while unlocked (zeroed on lock)
+  // The master key itself lives in the crypto kernel worker while
+  // unlocked; the page holds only vaultKernelToken (below).
   matchedEnvelopeId: null, // which prf envelope this session's passkey opened
   macSeen: false,      // downgrade ratchet: an authenticated blob has been seen
   rollbackWarning: '',
@@ -26806,78 +26811,159 @@ function vaultAvailable() {
   return Boolean(crypto?.subtle) && vaultBackendKind() !== null;
 }
 
-/* ── Vault crypto ── */
+/* ── Vault crypto: the pinned kernel ──
+   All key-touching crypto lives in static/vault-kernel.js — a small,
+   separately served, dedicated Worker that holds the master key, every
+   KEK, and the MAC key for its lifetime (the kernel's header carries the
+   full design and its honest limits). The page refuses to run vault
+   crypto through unverified code: it fetches /vault-kernel.js, hashes
+   the bytes, and compares against VAULT_KERNEL_SHA256 — the sha256 the
+   app.html assembler computed from the kernel file at build time. On a
+   mismatch the vault fails closed with a loud error; there is
+   deliberately no inline-crypto fallback. What remains in this fragment
+   is policy and state: which envelope to try, when to trust a MAC, what
+   to render, storage and sync. */
 
-async function vaultHkdfAesKey(secretBytes, info) {
-  const hkdf = await crypto.subtle.importKey('raw', secretBytes, 'HKDF', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    {
-      name: 'HKDF',
-      hash: 'SHA-256',
-      salt: new TextEncoder().encode(VAULT_HKDF_SALT),
-      info: new TextEncoder().encode(info),
-    },
-    hkdf,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
+/* Substituted by crates/app-html-assembler at assembly time (the
+   fragment source carries the placeholder; the assembled app.html
+   carries the real lowercase-hex sha256 of static/vault-kernel.js). */
+const VAULT_KERNEL_SHA256 = 'e140c644b7c583f7ba1b66270ff11820d5ed2955b75c4f00e2f1090831219879';
+
+let vaultKernel = null;        // { worker, pending, seq } once verified + running
+let vaultKernelPromise = null; // in-flight spawn: concurrent callers share one fetch
+let vaultKernelToken = '';     // the kernel's unlock token (page-held session nonce)
+
+async function vaultKernelSpawn() {
+  const resp = await fetch('/vault-kernel.js', { cache: 'no-cache' });
+  if (!resp.ok) throw new Error(`vault kernel fetch failed: HTTP ${resp.status}`);
+  const bytes = await resp.arrayBuffer();
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  const hex = Array.from(digest, b => b.toString(16).padStart(2, '0')).join('');
+  if (hex !== VAULT_KERNEL_SHA256) {
+    // Fail closed and loudly: a mismatch means the served kernel is not
+    // the one this bundle was built against — tampering, or a skewed
+    // deploy (e.g. an edited kernel without `cargo run -p
+    // app-html-assembler`).
+    const err = new Error(
+      `VAULT KERNEL INTEGRITY FAILURE: /vault-kernel.js hashes to ${hex} but this dashboard pins ${VAULT_KERNEL_SHA256}. Refusing to unseal the vault through unverified code.`
+    );
+    err.vaultKernelIntegrity = true;
+    throw err;
+  }
+  // Instantiate from the VERIFIED bytes (a blob: URL), never from the
+  // network path — re-fetching could race a swap after verification.
+  const url = URL.createObjectURL(new Blob([bytes], { type: 'text/javascript' }));
+  let worker;
+  try {
+    worker = new Worker(url);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  const kernel = { worker, pending: new Map(), seq: 0 };
+  const fail = message => {
+    for (const request of kernel.pending.values()) request.reject(new Error(message));
+    kernel.pending.clear();
+    if (vaultKernel === kernel) {
+      vaultKernel = null;
+      vaultKernelPromise = null;
+    }
+    try { worker.terminate(); } catch (_) {}
+  };
+  worker.onmessage = event => {
+    const msg = event.data || {};
+    const request = kernel.pending.get(msg.id);
+    if (!request) return;
+    kernel.pending.delete(msg.id);
+    if (msg.ok) request.resolve(msg.result || {});
+    else request.reject(new Error(msg.error || 'vault kernel error'));
+  };
+  worker.onerror = event => fail(`vault kernel crashed: ${event?.message || 'worker error'}`);
+  worker.onmessageerror = () => fail('vault kernel message deserialization failed');
+  return kernel;
 }
 
-/* KEK from the dedicated vault PRF domain — what new envelopes use. */
-async function vaultPrfKekDedicated() {
+function vaultKernelEnsure() {
+  if (vaultKernel) return Promise.resolve(vaultKernel);
+  if (!vaultKernelPromise) {
+    vaultKernelPromise = vaultKernelSpawn().then(
+      kernel => {
+        vaultKernel = kernel;
+        return kernel;
+      },
+      err => {
+        vaultKernelPromise = null;
+        if (err?.vaultKernelIntegrity) {
+          // Tamper evidence must surface even on silent auto-unlock paths.
+          console.error('[vault]', err.message);
+          vaultState.lastError = err.message;
+          renderAccessVaultSection();
+        }
+        throw err;
+      }
+    );
+  }
+  return vaultKernelPromise;
+}
+
+/* One kernel RPC. `transfer` optionally moves ArrayBuffers into the
+   worker, detaching the page-side copy. */
+async function vaultKernelCall(op, params = {}, transfer = []) {
+  const kernel = await vaultKernelEnsure();
+  return new Promise((resolve, reject) => {
+    const id = ++kernel.seq;
+    kernel.pending.set(id, { resolve, reject });
+    try {
+      kernel.worker.postMessage({ id, op, params }, transfer);
+    } catch (err) {
+      kernel.pending.delete(id);
+      reject(err);
+    }
+  });
+}
+
+/* Drop the kernel's master key; best-effort and non-blocking so lock
+   paths stay synchronous. Clears the page-held token either way, and
+   never spawns a kernel just to lock it. */
+function vaultKernelLock() {
+  if (vaultKernel) vaultKernelCall('lock').catch(() => {});
+  vaultKernelToken = '';
+}
+
+/* The dedicated vault PRF secret for this session, as bytes (null when
+   the login gesture did not evaluate the second salt). sessionStorage
+   keeps the base64url copy so a reload can re-unlock without a fresh
+   gesture — a pre-kernel design the kernel does not change; what the
+   kernel removes from the page is every key DERIVED from it. */
+function vaultPrfSecretDedicated() {
   const prfB64u = sessionStorage.getItem(VAULT_PRF_SESSION_KEY) || '';
   if (!prfB64u) return null;
   try {
-    return await vaultHkdfAesKey(dashboardBase64UrlToBytes(prfB64u), 'vault-kek');
-  } catch (err) {
-    console.warn('[vault] vault-PRF key derivation failed:', err?.message || err);
+    return dashboardBase64UrlToBytes(prfB64u);
+  } catch {
     return null;
   }
 }
 
-/* KEK from the fleet PRF secret — legacy: pre-two-salt envelopes were
-   wrapped under this. Kept for unlocking them (and as the wrap fallback
-   for authenticators that only evaluate one PRF salt). */
-async function vaultPrfKekLegacy() {
+/* The fleet PRF secret — legacy: pre-two-salt envelopes were wrapped
+   under a KEK derived from it. Kept for unlocking them (and as the wrap
+   fallback for authenticators that only evaluate one PRF salt). */
+function vaultPrfSecretLegacy() {
   const prfB64u = sessionStorage.getItem(FLEET_PRF_SESSION_KEY) || '';
   if (!prfB64u) return null;
   try {
-    return await vaultHkdfAesKey(dashboardBase64UrlToBytes(prfB64u), 'vault-kek');
-  } catch (err) {
-    console.warn('[vault] PRF key derivation failed:', err?.message || err);
+    return dashboardBase64UrlToBytes(prfB64u);
+  } catch {
     return null;
   }
 }
 
-/* KEK for wrapping a NEW envelope: [kek, marker]. Dedicated domain when
-   the authenticator evaluated both salts, legacy (markerless) otherwise. */
-async function vaultPrfKekForWrap() {
-  const dedicated = await vaultPrfKekDedicated();
+/* The PRF secret + envelope marker for wrapping a NEW envelope:
+   dedicated domain when the authenticator evaluated both salts, legacy
+   (markerless) otherwise. */
+function vaultPrfWrapSource() {
+  const dedicated = vaultPrfSecretDedicated();
   if (dedicated) return [dedicated, VAULT_PRF_ENVELOPE_MARK];
-  return [await vaultPrfKekLegacy(), null];
-}
-
-/* KEK for OPENING an existing envelope, chosen by its marker. */
-async function vaultPrfKekForEnvelope(envelope) {
-  return envelope?.prf === VAULT_PRF_ENVELOPE_MARK
-    ? vaultPrfKekDedicated()
-    : vaultPrfKekLegacy();
-}
-
-/* Standard BIP39 seed stretch (PBKDF2-HMAC-SHA512, salt 'mnemonic',
-   2048 iterations — the 128-bit entropy does the security work), then
-   our own HKDF domain down to an AES-GCM key. */
-async function vaultPhraseKek(phrase) {
-  const password = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(phrase.normalize('NFKD')), 'PBKDF2', false, ['deriveBits']
-  );
-  const seed = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', hash: 'SHA-512', salt: new TextEncoder().encode('mnemonic'), iterations: 2048 },
-    password,
-    512
-  );
-  return vaultHkdfAesKey(new Uint8Array(seed), 'vault-kek-phrase');
+  return [vaultPrfSecretLegacy(), null];
 }
 
 async function vaultGeneratePhrase() {
@@ -26911,79 +26997,6 @@ async function vaultNormalizePhrase(input) {
   return words.join(' ');
 }
 
-function vaultEnvelopeAad() {
-  return new TextEncoder().encode(`${VAULT_HKDF_SALT}|kek`);
-}
-
-/* The body AAD binds the revision into the ciphertext, so the store
-   cannot re-label an old body with a new revision number; replaying a
-   complete old blob (rollback) remains and is what highWater detects. */
-function vaultBodyAad(revision) {
-  return new TextEncoder().encode(`${VAULT_HKDF_SALT}|body|rev:${revision}`);
-}
-
-async function vaultWrapMasterKey(kek, kBytes) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const wrapped = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: vaultEnvelopeAad() },
-    kek,
-    kBytes
-  );
-  return {
-    iv: dashboardBytesToBase64Url(iv),
-    wrapped: dashboardBytesToBase64Url(new Uint8Array(wrapped)),
-  };
-}
-
-async function vaultUnwrapMasterKey(kek, envelope) {
-  try {
-    const kBytes = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: dashboardBase64UrlToBytes(String(envelope.iv || '')), additionalData: vaultEnvelopeAad() },
-      kek,
-      dashboardBase64UrlToBytes(String(envelope.wrapped || ''))
-    );
-    return new Uint8Array(kBytes);
-  } catch {
-    return null;
-  }
-}
-
-async function vaultMasterAesKey(kBytes) {
-  return crypto.subtle.importKey('raw', kBytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-}
-
-async function vaultEncryptBody(kBytes, bodyObj, revision) {
-  const key = await vaultMasterAesKey(kBytes);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: vaultBodyAad(revision) },
-    key,
-    new TextEncoder().encode(JSON.stringify(bodyObj))
-  );
-  return {
-    iv: dashboardBytesToBase64Url(iv),
-    ct: dashboardBytesToBase64Url(new Uint8Array(ct)),
-  };
-}
-
-async function vaultDecryptBody(kBytes, blob) {
-  try {
-    const key = await vaultMasterAesKey(kBytes);
-    const plaintext = await crypto.subtle.decrypt(
-      {
-        name: 'AES-GCM',
-        iv: dashboardBase64UrlToBytes(String(blob?.body?.iv || '')),
-        additionalData: vaultBodyAad(Number(blob?.revision) || 0),
-      },
-      key,
-      dashboardBase64UrlToBytes(String(blob?.body?.ct || ''))
-    );
-    return JSON.parse(new TextDecoder().decode(plaintext));
-  } catch {
-    return null;
-  }
-}
-
 function vaultRandomId(prefix) {
   return `${prefix}_${dashboardBytesToBase64Url(crypto.getRandomValues(new Uint8Array(9)))}`;
 }
@@ -26995,60 +27008,9 @@ function vaultRandomId(prefix) {
    closes that: HMAC-SHA-256 under a key derived from the vault master
    key over the whole blob. The store never holds the master key, so it
    can neither mint nor relabel a MAC'd blob; every unlocker can verify.
-   Canonical JSON (sorted keys) because the store's serializer is free to
-   reorder object keys in transit. */
-
-function vaultCanonicalJson(value) {
-  if (Array.isArray(value)) return `[${value.map(vaultCanonicalJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const keys = Object.keys(value).sort();
-    return `{${keys.map(k => `${JSON.stringify(k)}:${vaultCanonicalJson(value[k])}`).join(',')}}`;
-  }
-  return JSON.stringify(value);
-}
-
-async function vaultMacKey(kBytes) {
-  const hkdf = await crypto.subtle.importKey('raw', kBytes, 'HKDF', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    {
-      name: 'HKDF',
-      hash: 'SHA-256',
-      salt: new TextEncoder().encode(VAULT_HKDF_SALT),
-      info: new TextEncoder().encode('vault-mac-v1'),
-    },
-    hkdf,
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign', 'verify']
-  );
-}
-
-function vaultMacPayload(blob) {
-  return new TextEncoder().encode(
-    `intendant-vault-mac-v1\n${Number(blob.v) || 0}\n${String(blob.kind || '')}\n` +
-    `${Number(blob.revision) || 0}\n${vaultCanonicalJson(blob.envelopes || [])}\n` +
-    `${vaultCanonicalJson(blob.body || {})}`
-  );
-}
-
-async function vaultComputeMac(kBytes, blob) {
-  const key = await vaultMacKey(kBytes);
-  const mac = await crypto.subtle.sign('HMAC', key, vaultMacPayload(blob));
-  return dashboardBytesToBase64Url(new Uint8Array(mac));
-}
-
-async function vaultVerifyMac(kBytes, blob) {
-  const mac = String(blob?.mac || '');
-  if (!mac) return false;
-  try {
-    const key = await vaultMacKey(kBytes);
-    return await crypto.subtle.verify(
-      'HMAC', key, dashboardBase64UrlToBytes(mac), vaultMacPayload(blob)
-    );
-  } catch {
-    return false;
-  }
-}
+   The kernel computes and verifies MACs (compute-mac / verify-mac); this
+   page decides the POLICY — when a missing MAC is legacy-acceptable and
+   when it is a downgrade attack (the macSeen ratchet below). */
 
 /* Once this device has seen an authenticated blob, an unauthenticated one
    is a downgrade attack, not a legacy vault. Ratchet state rides in
@@ -27149,8 +27111,9 @@ async function vaultAdoptBlob(blob, { fromServer = false } = {}) {
   // Locked with a MAC: adopt provisionally — unlock verifies before any
   // use. Either way the downgrade ratchet refuses an unauthenticated
   // blob once this device has seen an authenticated one.
-  if (blob.mac && vaultState.kBytes) {
-    if (!(await vaultVerifyMac(vaultState.kBytes, blob))) {
+  if (blob.mac && vaultKernelToken) {
+    const { valid } = await vaultKernelCall('verify-mac', { token: vaultKernelToken, blob });
+    if (!valid) {
       vaultState.lastError = 'The store returned a vault blob that failed its integrity check — ignoring it.';
       renderAccessVaultSection();
       return;
@@ -27164,8 +27127,8 @@ async function vaultAdoptBlob(blob, { fromServer = false } = {}) {
   vaultState.blob = blob;
   vaultState.revision = revision;
   vaultState.highWater = Math.max(vaultState.highWater, revision);
-  if (vaultState.kBytes) {
-    const body = await vaultDecryptBody(vaultState.kBytes, blob);
+  if (vaultKernelToken) {
+    const { body } = await vaultKernelCall('decrypt-body', { token: vaultKernelToken, blob });
     if (body) {
       vaultState.entries = Array.isArray(body.entries) ? body.entries : [];
       vaultState.settings = body.settings && typeof body.settings === 'object' ? body.settings : {};
@@ -27221,8 +27184,7 @@ async function vaultInitInner() {
 /* ── Lock / unlock / create / enroll ── */
 
 function vaultLock(notice) {
-  if (vaultState.kBytes) vaultState.kBytes.fill(0);
-  vaultState.kBytes = null;
+  vaultKernelLock();
   vaultState.entries = [];
   vaultState.settings = {};
   vaultState.matchedEnvelopeId = null;
@@ -27239,29 +27201,44 @@ function vaultLock(notice) {
   renderAccessVaultSection();
 }
 
-async function vaultFinishUnlock(kBytes, envelopeId) {
-  // Every unlock funnels through here: authenticate the whole blob before
-  // trusting any of it. A blob without a MAC is legacy — allowed only
-  // until this device has seen an authenticated one, and upgraded in
-  // place right after unlock.
-  if (vaultState.blob?.mac) {
-    if (!(await vaultVerifyMac(kBytes, vaultState.blob))) {
-      vaultState.lastError = 'Vault integrity check failed — the stored blob was tampered with or spliced. Refusing to unlock it.';
+async function vaultFinishUnlock(token, envelopeId) {
+  // Every unlock funnels through here: the kernel already holds the
+  // master key behind `token`; authenticate the whole blob before
+  // trusting any of it (and re-lock the kernel on every refusal so the
+  // worker never outlives the page's decision). A blob without a MAC is
+  // legacy — allowed only until this device has seen an authenticated
+  // one, and upgraded in place right after unlock.
+  vaultKernelToken = token;
+  let body;
+  try {
+    if (vaultState.blob?.mac) {
+      const { valid } = await vaultKernelCall('verify-mac', { token, blob: vaultState.blob });
+      if (!valid) {
+        vaultKernelLock();
+        vaultState.lastError = 'Vault integrity check failed — the stored blob was tampered with or spliced. Refusing to unlock it.';
+        renderAccessVaultSection();
+        return false;
+      }
+      vaultMarkMacSeen();
+    } else if (vaultState.macSeen) {
+      vaultKernelLock();
+      vaultState.lastError = 'The store served an unauthenticated vault although this device has seen an authenticated one — refusing the downgrade.';
       renderAccessVaultSection();
       return false;
     }
-    vaultMarkMacSeen();
-  } else if (vaultState.macSeen) {
-    vaultState.lastError = 'The store served an unauthenticated vault although this device has seen an authenticated one — refusing the downgrade.';
+    body = (await vaultKernelCall('decrypt-body', { token, blob: vaultState.blob })).body;
+  } catch (err) {
+    // Kernel died mid-unlock: keep the historical never-throws contract.
+    vaultKernelLock();
+    vaultState.lastError = `Vault unlock failed: ${err?.message || err}`;
     renderAccessVaultSection();
     return false;
   }
-  const body = await vaultDecryptBody(kBytes, vaultState.blob);
   if (!body) {
+    vaultKernelLock();
     vaultState.lastError = 'The key envelope opened but the vault body did not decrypt — the blob may be corrupted.';
     return false;
   }
-  vaultState.kBytes = kBytes;
   vaultState.entries = Array.isArray(body.entries) ? body.entries : [];
   vaultState.settings = body.settings && typeof body.settings === 'object' ? body.settings : {};
   vaultState.matchedEnvelopeId = envelopeId || null;
@@ -27291,25 +27268,44 @@ async function vaultFinishUnlock(kBytes, envelopeId) {
 
 async function vaultTryPrfUnlock({ silent = false } = {}) {
   if (!vaultState.blob) return false;
-  let sawKek = false;
-  for (const envelope of vaultState.blob.envelopes || []) {
-    if (envelope.kind !== 'prf') continue;
-    // Each envelope names its PRF domain: marked = dedicated vault salt,
-    // markerless = legacy fleet-secret derivation.
-    const kek = await vaultPrfKekForEnvelope(envelope);
-    if (!kek) continue;
-    sawKek = true;
-    const kBytes = await vaultUnwrapMasterKey(kek, envelope);
-    if (kBytes) {
-      const unlocked = await vaultFinishUnlock(kBytes, envelope.id);
-      if (unlocked && envelope.prf !== VAULT_PRF_ENVELOPE_MARK) {
-        vaultMigratePrfEnvelope(envelope.id);
-      }
-      return unlocked;
+  // Each envelope names its PRF domain: marked = dedicated vault salt,
+  // markerless = legacy fleet-secret derivation. The kernel picks the
+  // matching secret per envelope; this page only decides which secrets
+  // exist this session. No secret at all skips the kernel entirely.
+  const secretDedicated = vaultPrfSecretDedicated();
+  const secretLegacy = vaultPrfSecretLegacy();
+  if (!secretDedicated && !secretLegacy) {
+    if (!silent) {
+      vaultState.lastError = 'No passkey secret in this session — sign in with the account passkey, or use the recovery phrase.';
     }
+    return false;
+  }
+  let result;
+  try {
+    // Transfer the secret buffers into the worker (detaches the page-side
+    // copies; the sessionStorage strings remain for reload-unlock).
+    const transfer = [secretDedicated?.buffer, secretLegacy?.buffer].filter(Boolean);
+    result = await vaultKernelCall('unlock-prf', {
+      envelopes: vaultState.blob.envelopes || [],
+      secret_dedicated: secretDedicated,
+      secret_legacy: secretLegacy,
+    }, transfer);
+  } catch (err) {
+    console.warn('[vault] kernel unlock-prf failed:', err?.message || err);
+    if (!silent && !err?.vaultKernelIntegrity) {
+      vaultState.lastError = `Passkey unlock failed: ${err?.message || err}`;
+    }
+    return false;
+  }
+  if (result.unlocked) {
+    const unlocked = await vaultFinishUnlock(result.token, result.envelope_id);
+    if (unlocked && result.envelope_prf !== VAULT_PRF_ENVELOPE_MARK) {
+      vaultMigratePrfEnvelope(result.envelope_id);
+    }
+    return unlocked;
   }
   if (!silent) {
-    vaultState.lastError = sawKek
+    vaultState.lastError = result.saw_kek
       ? 'This passkey is not enrolled in the vault yet — unlock with the recovery phrase, then enroll it.'
       : 'No passkey secret in this session — sign in with the account passkey, or use the recovery phrase.';
   }
@@ -27323,9 +27319,9 @@ async function vaultTryPrfUnlock({ silent = false } = {}) {
 function vaultMigratePrfEnvelope(envelopeId) {
   vaultPublishChain = vaultPublishChain
     .then(async () => {
-      if (!vaultState.kBytes || !vaultState.blob) return false;
-      const [kek, mark] = await vaultPrfKekForWrap();
-      if (!kek || mark !== VAULT_PRF_ENVELOPE_MARK) return false;
+      if (!vaultKernelToken || !vaultState.blob) return false;
+      const [secret, mark] = vaultPrfWrapSource();
+      if (!secret || mark !== VAULT_PRF_ENVELOPE_MARK) return false;
       const envelopes = [];
       let migrated = false;
       for (const envelope of vaultState.blob.envelopes || []) {
@@ -27333,7 +27329,10 @@ function vaultMigratePrfEnvelope(envelopeId) {
           envelopes.push({
             ...envelope,
             prf: VAULT_PRF_ENVELOPE_MARK,
-            ...(await vaultWrapMasterKey(kek, vaultState.kBytes)),
+            ...(await vaultKernelCall('wrap-new-envelope', {
+              token: vaultKernelToken,
+              prf_secret: secret,
+            })),
           });
           migrated = true;
         } else {
@@ -27410,15 +27409,23 @@ async function vaultUnlockWithPhrase(input) {
     renderAccessVaultSection();
     return false;
   }
-  const kek = await vaultPhraseKek(phrase);
-  for (const envelope of vaultState.blob?.envelopes || []) {
-    if (envelope.kind !== 'phrase') continue;
-    const kBytes = await vaultUnwrapMasterKey(kek, envelope);
-    // matchedEnvelopeId means "the prf envelope this session's passkey
-    // opened" — a phrase unlock matches none, which is exactly what
-    // makes the enroll-this-passkey offer appear.
-    if (kBytes) return vaultFinishUnlock(kBytes, null);
+  let result;
+  try {
+    result = await vaultKernelCall('unlock-phrase', {
+      phrase,
+      envelopes: vaultState.blob?.envelopes || [],
+    });
+  } catch (err) {
+    if (!err?.vaultKernelIntegrity) {
+      vaultState.lastError = `Phrase unlock failed: ${err?.message || err}`;
+    }
+    renderAccessVaultSection();
+    return false;
   }
+  // matchedEnvelopeId means "the prf envelope this session's passkey
+  // opened" — a phrase unlock matches none, which is exactly what
+  // makes the enroll-this-passkey offer appear.
+  if (result.unlocked) return vaultFinishUnlock(result.token, null);
   vaultState.lastError = 'The phrase is well-formed but does not open this vault.';
   renderAccessVaultSection();
   return false;
@@ -27426,48 +27433,45 @@ async function vaultUnlockWithPhrase(input) {
 
 async function vaultCreate(phrase) {
   if (!vaultAvailable()) throw new Error('the vault needs a hosted session');
-  const kBytes = crypto.getRandomValues(new Uint8Array(32));
   const now = Date.now();
-  const envelopes = [];
-  envelopes.push({
-    kind: 'phrase',
-    id: vaultRandomId('env'),
-    label: 'Recovery phrase',
-    created_unix_ms: now,
-    ...(await vaultWrapMasterKey(await vaultPhraseKek(phrase), kBytes)),
-  });
-  let matched = null;
-  const [prfKek, prfMark] = await vaultPrfKekForWrap();
-  if (prfKek) {
-    const envelope = {
-      kind: 'prf',
+  // The page owns the metadata (ids, labels, timestamps); the kernel
+  // generates the master key, wraps the envelopes, encrypts the empty
+  // body, and MACs the assembled blob — the key never exists here.
+  const [prfSecret, prfMark] = vaultPrfWrapSource();
+  const { token, blob, matched_envelope_id: matched } = await vaultKernelCall('create', {
+    phrase,
+    phrase_envelope: {
+      kind: 'phrase',
       id: vaultRandomId('env'),
-      label: `Passkey enrolled ${new Date(now).toISOString().slice(0, 10)}`,
+      label: 'Recovery phrase',
       created_unix_ms: now,
-      ...(prfMark ? { prf: prfMark } : {}),
-      ...(await vaultWrapMasterKey(prfKek, kBytes)),
-    };
-    envelopes.push(envelope);
-    matched = envelope.id;
+    },
+    prf_secret: prfSecret,
+    prf_mark: prfMark,
+    prf_envelope: prfSecret
+      ? {
+          kind: 'prf',
+          id: vaultRandomId('env'),
+          label: `Passkey enrolled ${new Date(now).toISOString().slice(0, 10)}`,
+          created_unix_ms: now,
+        }
+      : null,
+    revision: Math.max(1, vaultState.highWater + 1),
+    now,
+  });
+  try {
+    await vaultServerPublish(blob);
+  } catch (err) {
+    // Nothing was committed: drop the kernel's key with the ceremony.
+    vaultKernelLock();
+    throw err;
   }
-  const revision = Math.max(1, vaultState.highWater + 1);
-  const blob = {
-    v: 1,
-    kind: 'intendant-vault',
-    revision,
-    created_unix_ms: now,
-    updated_unix_ms: now,
-    envelopes,
-    body: await vaultEncryptBody(kBytes, { entries: [], settings: {} }, revision),
-  };
-  blob.mac = await vaultComputeMac(kBytes, blob);
-  await vaultServerPublish(blob);
   vaultState.blob = blob;
-  vaultState.revision = revision;
-  vaultState.highWater = Math.max(vaultState.highWater, revision);
+  vaultState.revision = blob.revision;
+  vaultState.highWater = Math.max(vaultState.highWater, blob.revision);
   vaultState.macSeen = true;
   vaultWriteLocal();
-  await vaultFinishUnlock(kBytes, matched);
+  await vaultFinishUnlock(token, matched);
 }
 
 /* Re-encrypt and publish the unlocked state as the next revision. On a
@@ -27475,21 +27479,21 @@ async function vaultCreate(phrase) {
    a concurrent update wins over a concurrent delete, never silently
    dropping a credential — and retry once. */
 async function vaultPersist() {
-  if (!vaultState.kBytes || !vaultState.blob) throw new Error('vault is locked');
+  if (!vaultKernelToken || !vaultState.blob) throw new Error('vault is locked');
   const attempt = async () => {
     const revision = Math.max(vaultState.revision, vaultState.highWater) + 1;
     const blob = {
       ...vaultState.blob,
       revision,
       updated_unix_ms: Date.now(),
-      body: await vaultEncryptBody(
-        vaultState.kBytes,
-        { entries: vaultState.entries, settings: vaultState.settings },
-        revision
-      ),
+      body: await vaultKernelCall('encrypt-body', {
+        token: vaultKernelToken,
+        body: { entries: vaultState.entries, settings: vaultState.settings },
+        revision,
+      }),
     };
     // Recompute — the spread carries the previous revision's MAC.
-    blob.mac = await vaultComputeMac(vaultState.kBytes, blob);
+    blob.mac = (await vaultKernelCall('compute-mac', { token: vaultKernelToken, blob })).mac;
     await vaultServerPublish(blob);
     vaultState.blob = blob;
     vaultState.revision = revision;
@@ -27507,7 +27511,7 @@ async function vaultPersist() {
       // envelope set here and re-signing it in the retry would launder the
       // splice into a valid MAC.
       const remoteAuthentic = server.vault.mac
-        ? await vaultVerifyMac(vaultState.kBytes, server.vault)
+        ? (await vaultKernelCall('verify-mac', { token: vaultKernelToken, blob: server.vault })).valid
         : !vaultState.macSeen;
       if (!remoteAuthentic) {
         vaultState.lastError = 'The conflict refetch returned a vault blob that failed its integrity check — keeping local state.';
@@ -27515,7 +27519,10 @@ async function vaultPersist() {
         throw err;
       }
       if (server.vault.mac) vaultMarkMacSeen();
-      const remoteBody = await vaultDecryptBody(vaultState.kBytes, server.vault);
+      const { body: remoteBody } = await vaultKernelCall('decrypt-body', {
+        token: vaultKernelToken,
+        blob: server.vault,
+      });
       if (!remoteBody) {
         vaultLock('The vault was re-keyed on another device — unlock it again.');
         throw err;
@@ -27611,42 +27618,26 @@ function vaultRemoveEntry(id) {
    every unlock we (1) ensure the deposit keypair exists inside the sealed
    body's settings and publish its public half to this daemon, then
    (2) fold queued deposits into the vault as ordinary entries, consuming
-   them only AFTER the re-wrapped blob has published. The crypto mirrors
-   vault_deposits.rs (v1) exactly: P-256 ECDH → HKDF-SHA256 (empty salt,
-   info = "intendant-vault-deposit-v1" || eph_pub || recipient_pub ||
-   label) → AES-256-GCM with AAD "intendant-vault-deposit-v1:" + label.
-   ring concatenates its HKDF info parts, so `info` here is the same
-   byte string. Cross-implementation parity harness:
+   them only AFTER the re-wrapped blob has published. The crypto (P-256
+   ECDH → HKDF-SHA256 → AES-256-GCM, label-bound) lives in the kernel
+   (open-deposit / generate-deposit-keypair) and mirrors vault_deposits.rs
+   (v1) exactly. Cross-implementation parity harness:
    scripts/vault-deposit-parity.cjs. */
-const VAULT_DEPOSIT_INFO = 'intendant-vault-deposit-v1';
-
-function vaultDepositConcatBytes(...parts) {
-  const total = parts.reduce((n, p) => n + p.length, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const part of parts) {
-    out.set(part, offset);
-    offset += part.length;
-  }
-  return out;
-}
 
 async function vaultDepositLaneSync() {
-  if (vaultState.status !== 'unlocked' || !vaultState.kBytes) return;
+  if (vaultState.status !== 'unlocked' || !vaultKernelToken) return;
   try {
     // 1. Keypair lives inside the sealed body (extractable so it rides
     //    the blob to every unlocking device; it exists only as ciphertext
-    //    at rest).
+    //    at rest). The kernel generates it; the private JWK is body
+    //    material by design — it must reach every unlocking device.
     let lane = vaultState.settings.deposit_lane;
     if (!lane || !lane.priv_jwk || !lane.pub_raw_b64u) {
-      const pair = await crypto.subtle.generateKey(
-        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
-      const privJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-      const pubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey));
+      const pair = await vaultKernelCall('generate-deposit-keypair', { token: vaultKernelToken });
       lane = {
         alg: 'ECDH-P256',
-        priv_jwk: privJwk,
-        pub_raw_b64u: dashboardBytesToBase64Url(pubRaw),
+        priv_jwk: pair.priv_jwk,
+        pub_raw_b64u: pair.pub_raw_b64u,
         created_unix_ms: Date.now(),
       };
       vaultState.settings.deposit_lane = lane;
@@ -27669,12 +27660,15 @@ async function vaultDepositLaneSync() {
     const fetched = await vaultLeaseRpc('api_daemon_vault_deposits_fetch').catch(() => null);
     const deposits = Array.isArray(fetched?.deposits) ? fetched.deposits : [];
     if (!deposits.length) return;
-    const privKey = await crypto.subtle.importKey(
-      'jwk', lane.priv_jwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
     const consumed = [];
     for (const dep of deposits) {
       try {
-        const secret = await vaultOpenDeposit(privKey, lane.pub_raw_b64u, dep);
+        const { secret } = await vaultKernelCall('open-deposit', {
+          token: vaultKernelToken,
+          deposit: dep,
+          lane_priv_jwk: lane.priv_jwk,
+          lane_pub_raw_b64u: lane.pub_raw_b64u,
+        });
         vaultState.entries.push({
           id: vaultRandomId('cred'),
           kind: 'api_key',
@@ -27704,58 +27698,27 @@ async function vaultDepositLaneSync() {
   }
 }
 
-async function vaultOpenDeposit(privKey, recipientPubB64u, dep) {
-  if (dep?.alg !== 'ECIES-P256-HKDF-SHA256-A256GCM') {
-    throw new Error(`unknown deposit alg ${dep?.alg}`);
-  }
-  const encoder = new TextEncoder();
-  const ephRaw = dashboardBase64UrlToBytes(String(dep.eph_pub_raw_b64u || ''));
-  const ephKey = await crypto.subtle.importKey(
-    'raw', ephRaw, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
-  const shared = new Uint8Array(
-    await crypto.subtle.deriveBits({ name: 'ECDH', public: ephKey }, privKey, 256));
-  const label = String(dep.label || '');
-  const info = vaultDepositConcatBytes(
-    encoder.encode(VAULT_DEPOSIT_INFO),
-    ephRaw,
-    dashboardBase64UrlToBytes(recipientPubB64u),
-    encoder.encode(label));
-  const hkdfKey = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
-  const aesKey = await crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info },
-    hkdfKey,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['decrypt']);
-  const plain = await crypto.subtle.decrypt(
-    {
-      name: 'AES-GCM',
-      iv: dashboardBase64UrlToBytes(String(dep.nonce_b64u || '')),
-      additionalData: encoder.encode(VAULT_DEPOSIT_INFO + ':' + label),
-    },
-    aesKey,
-    dashboardBase64UrlToBytes(String(dep.ct_b64u || '')));
-  return new TextDecoder().decode(plain);
-}
-
 async function vaultEnrollThisPasskey() {
-  if (!vaultState.kBytes) return;
+  if (!vaultKernelToken) return;
   vaultState.lastError = '';
   try {
-    let [kek, mark] = await vaultPrfKekForWrap();
-    if (!kek) {
+    let [secret, mark] = vaultPrfWrapSource();
+    if (!secret) {
       if (!(await vaultRequestPrfSecret())) throw new Error('this authenticator did not return a PRF secret');
-      [kek, mark] = await vaultPrfKekForWrap();
+      [secret, mark] = vaultPrfWrapSource();
     }
-    if (!kek) throw new Error('no PRF secret available');
-    for (const envelope of vaultState.blob.envelopes || []) {
-      if (envelope.kind !== 'prf') continue;
-      const envelopeKek = await vaultPrfKekForEnvelope(envelope);
-      if (envelopeKek && (await vaultUnwrapMasterKey(envelopeKek, envelope))) {
-        vaultState.matchedEnvelopeId = envelope.id;
-        renderAccessVaultSection();
-        return;
-      }
+    if (!secret) throw new Error('no PRF secret available');
+    // Already enrolled? The kernel probes which envelope (if any) this
+    // session's secrets open, without touching the held key.
+    const { envelope_id: matched } = await vaultKernelCall('match-prf-envelope', {
+      envelopes: vaultState.blob.envelopes || [],
+      secret_dedicated: vaultPrfSecretDedicated(),
+      secret_legacy: vaultPrfSecretLegacy(),
+    });
+    if (matched) {
+      vaultState.matchedEnvelopeId = matched;
+      renderAccessVaultSection();
+      return;
     }
     const now = Date.now();
     const envelope = {
@@ -27764,7 +27727,10 @@ async function vaultEnrollThisPasskey() {
       label: `Passkey enrolled ${new Date(now).toISOString().slice(0, 10)}`,
       created_unix_ms: now,
       ...(mark ? { prf: mark } : {}),
-      ...(await vaultWrapMasterKey(kek, vaultState.kBytes)),
+      ...(await vaultKernelCall('wrap-new-envelope', {
+        token: vaultKernelToken,
+        prf_secret: secret,
+      })),
     };
     vaultState.blob = { ...vaultState.blob, envelopes: [...(vaultState.blob.envelopes || []), envelope] };
     vaultState.matchedEnvelopeId = envelope.id;
@@ -27784,7 +27750,7 @@ let vaultVoiceMirror = {};
    synchronous voice paths keep working without an unlock await. */
 function vaultSyncVoiceMirror() {
   const mirror = {};
-  if (vaultState.status === 'unlocked' || vaultState.kBytes) {
+  if (vaultState.status === 'unlocked' || vaultKernelToken) {
     const usable = vaultState.entries.filter(vaultEntryUsableHere);
     for (const [storageKey, provider] of Object.entries(VAULT_VOICE_STORAGE_PROVIDERS)) {
       const entry =

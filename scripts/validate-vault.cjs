@@ -249,7 +249,14 @@ async function main() {
     console.log('PASS vault-lock-unlock passkey round-trip');
 
     // ── 8. Fresh session: recovery-phrase unlock ──
-    await page.evaluate(() => sessionStorage.removeItem('intendant_fleet_prf_v1'));
+    // Drop BOTH PRF session secrets (the fleet salt and the vault's own
+    // dedicated salt — the two-salt split): leaving either one behind
+    // lets the silent boot unlock succeed and the vault never reads
+    // "locked".
+    await page.evaluate(() => {
+      sessionStorage.removeItem('intendant_fleet_prf_v1');
+      sessionStorage.removeItem('intendant_vault_prf_v1');
+    });
     await page.reload({ timeout: START_TIMEOUT_MS });
     await page.waitForFunction(() => Boolean(window.intendantVault), { timeout: START_TIMEOUT_MS });
     const lockedFresh = await waitVault(page, s => s.status === 'locked', 'locked without a session PRF secret');
