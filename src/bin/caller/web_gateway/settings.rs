@@ -329,10 +329,10 @@ pub(crate) fn settings_post_result(
     body_text: &str,
     project_root: Option<&Path>,
     bus: &EventBus,
-) -> (&'static str, String) {
+) -> (u16, String) {
     let Some(root) = project_root else {
         return (
-            "400 Bad Request",
+            400,
             serde_json::json!({"error": "No project root"}).to_string(),
         );
     };
@@ -340,7 +340,7 @@ pub(crate) fn settings_post_result(
         Ok(payload) => payload,
         Err(e) => {
             return (
-                "400 Bad Request",
+                400,
                 serde_json::json!({"error": format!("Invalid settings: {}", e)}).to_string(),
             );
         }
@@ -348,22 +348,16 @@ pub(crate) fn settings_post_result(
     let mut proj = match crate::project::Project::from_root(root.to_path_buf()) {
         Ok(proj) => proj,
         Err(e) => {
-            return (
-                "500 Internal Server Error",
-                serde_json::json!({"error": e.to_string()}).to_string(),
-            );
+            return (500, serde_json::json!({"error": e.to_string()}).to_string());
         }
     };
     apply_settings_payload(&mut proj.config, &payload);
     match proj.save_config() {
         Ok(()) => {
             dispatch_codex_settings_control_msgs(bus, &payload);
-            ("200 OK", serde_json::json!({"ok": true}).to_string())
+            (200, serde_json::json!({"ok": true}).to_string())
         }
-        Err(e) => (
-            "500 Internal Server Error",
-            serde_json::json!({"error": e.to_string()}).to_string(),
-        ),
+        Err(e) => (500, serde_json::json!({"error": e.to_string()}).to_string()),
     }
 }
 
@@ -485,9 +479,22 @@ pub(crate) struct SetApiKeysPayload {
     keys: std::collections::HashMap<String, String>,
 }
 
-/// Handle POST /api/api-keys: persist keys to ~/.config/intendant/.env and
-/// set them in the current process.
-pub(crate) fn handle_set_api_keys(body: &str) -> String {
+/// The `.env` file POST /api/api-keys persists provider keys to
+/// (`<config_dir>/intendant/.env`). Resolved here — at the transport
+/// edges — so the persist core takes the path as a parameter and stays
+/// hermetically testable (tests inject a tempdir path; the CLAUDE.md
+/// tests-are-hermetic convention). `None` when the platform reports no
+/// config directory.
+pub(crate) fn api_keys_env_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("intendant").join(".env"))
+}
+
+/// POST /api/api-keys persist core: validate the payload against the
+/// authoritative provider key list, persist to `env_path`, and set the
+/// keys in the current process so future provider instantiations pick
+/// them up without a restart. Failures report in the body — the
+/// endpoint's historical contract answers 200 either way.
+pub(crate) fn set_api_keys_result(env_path: Option<&Path>, body: &str) -> String {
     let payload: SetApiKeysPayload = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(e) => {
@@ -502,21 +509,17 @@ pub(crate) fn handle_set_api_keys(body: &str) -> String {
         }
     }
 
-    // Resolve config dir.
-    let config_dir = match dirs::config_dir() {
-        Some(d) => d.join("intendant"),
-        None => {
-            return serde_json::json!({"error": "Cannot determine config directory"}).to_string();
-        }
+    let Some(env_path) = env_path else {
+        return serde_json::json!({"error": "Cannot determine config directory"}).to_string();
     };
 
     // Ensure the directory exists.
-    if let Err(e) = std::fs::create_dir_all(&config_dir) {
-        return serde_json::json!({"error": format!("Cannot create config dir: {}", e)})
-            .to_string();
+    if let Some(config_dir) = env_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(config_dir) {
+            return serde_json::json!({"error": format!("Cannot create config dir: {}", e)})
+                .to_string();
+        }
     }
-
-    let env_path = config_dir.join(".env");
 
     // Read existing content (may not exist yet).
     let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
@@ -561,6 +564,81 @@ pub(crate) fn handle_set_api_keys(body: &str) -> String {
     serde_json::json!({"ok": true}).to_string()
 }
 
+/// Ambient-path twin of [`set_api_keys_result`] for the unconverted
+/// tunnel caller; the S5 tunnel commit retires it.
+pub(crate) fn handle_set_api_keys(body: &str) -> String {
+    set_api_keys_result(api_keys_env_path().as_deref(), body)
+}
+
+// ── Transport-neutral cores (transport-unification design §2.1, S5):
+//    the settings/keys family. Each fn is the single response builder
+//    both lanes render — the HTTP shims below hand them to
+//    `write_api_response`; the tunnel twins frame them through the
+//    dispatch adapters.
+
+/// JSON under the bare wildcard-CORS tail (`Access-Control-Allow-Origin:
+/// *` + `Connection: close`, NO `Cache-Control`) — the historical
+/// framing of the api-keys POST and the diagnostics sink.
+pub(crate) fn bare_wildcard_json_response(status: u16, body: String) -> ApiResponse {
+    ApiResponse::Json {
+        status,
+        body: JsonBody::PreSerialized(body),
+        headers: vec![
+            ("Access-Control-Allow-Origin", "*".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+    }
+}
+
+/// GET /api/settings + the tunnel's `api_settings`: the flattened
+/// settings payload — or the historical error body, still under 200.
+pub(crate) async fn settings_get_api_response(
+    project_root: Option<&Path>,
+    runtime_settings: &RuntimeSettingsState,
+) -> ApiResponse {
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(settings_get_response_body(project_root, runtime_settings).await),
+    )
+}
+
+/// POST /api/settings + the tunnel's `api_settings_save`.
+pub(crate) fn settings_post_api_response(
+    body_text: &str,
+    project_root: Option<&Path>,
+    bus: &EventBus,
+) -> ApiResponse {
+    let (status, body) = settings_post_result(body_text, project_root, bus);
+    ApiResponse::json(status, JsonBody::PreSerialized(body))
+}
+
+/// POST /api/api-keys + the tunnel's `api_api_keys_save`: always 200 —
+/// the historical lane reports failures in the body — under the bare
+/// wildcard tail. `env_path` arrives from the transport edge
+/// ([`api_keys_env_path`]).
+pub(crate) fn api_keys_save_api_response(
+    env_path: Option<&Path>,
+    body_text: &str,
+) -> ApiResponse {
+    bare_wildcard_json_response(200, set_api_keys_result(env_path, body_text))
+}
+
+/// GET /api/api-key-status + the tunnel's `api_key_status`.
+pub(crate) fn api_key_status_api_response() -> ApiResponse {
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(api_key_status_response_body()),
+    )
+}
+
+/// GET /api/project-root + the tunnel's `api_project_root`.
+pub(crate) fn project_root_api_response(project_root: Option<&Path>) -> ApiResponse {
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(project_root_response_body(project_root)),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // MCP-over-HTTP (Streamable HTTP) types
 // ---------------------------------------------------------------------------
@@ -573,68 +651,57 @@ pub(crate) fn handle_set_api_keys(body: &str) -> String {
 // body as ServerJsonRpcMessage, which fails because there's no valid `id`.
 
 
-pub(crate) async fn handle_project_root(mut stream: DemuxStream, project_root: Option<PathBuf>) {
-    use tokio::io::AsyncWriteExt;
-    let body = project_root_response_body(project_root.as_deref());
-    let response = HttpResponse::with_content("200 OK", "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+pub(crate) async fn handle_project_root(
+    stream: DemuxStream,
+    project_root: Option<PathBuf>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = project_root_api_response(project_root.as_deref());
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_settings_post(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     bus: EventBus,
     project_root: Option<PathBuf>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    let (status, result) =
-        settings_post_result(&body_text, project_root.as_deref(), &bus);
-    let response = json_response(status, result);
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = settings_post_api_response(&body_text, project_root.as_deref(), &bus);
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_settings_get(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     project_root: Option<PathBuf>,
     runtime_settings: RuntimeSettingsState,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    let body =
-        settings_get_response_body(project_root.as_deref(), &runtime_settings)
-            .await;
-    let response = HttpResponse::with_content("200 OK", "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = settings_get_api_response(project_root.as_deref(), &runtime_settings).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
-pub(crate) async fn handle_api_keys_post(mut stream: DemuxStream, body_text: String) {
-    use tokio::io::AsyncWriteExt;
-    let result = handle_set_api_keys(&body_text);
-    let response = HttpResponse::with_content("200 OK", "application/json", result)
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+pub(crate) async fn handle_api_keys_post(
+    stream: DemuxStream,
+    body_text: String,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    // The transport edge resolves the ambient env path; the neutral core
+    // below it is path-parameterized (hermeticity convention).
+    let response = api_keys_save_api_response(api_keys_env_path().as_deref(), &body_text);
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
-pub(crate) async fn handle_api_key_status(mut stream: DemuxStream) {
-    use tokio::io::AsyncWriteExt;
-    let body = api_key_status_response_body();
-    let response = HttpResponse::with_content("200 OK", "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+pub(crate) async fn handle_api_key_status(
+    stream: DemuxStream,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    write_api_response(stream, api_key_status_api_response(), cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_external_agents(mut stream: DemuxStream, project_root: Option<PathBuf>) {
@@ -769,7 +836,7 @@ mod tests {
             &EventBus::new(),
         );
 
-        assert_eq!(status, "400 Bad Request");
+        assert_eq!(status, 400);
         assert!(body.contains("Invalid settings"));
     }
 
@@ -777,7 +844,7 @@ mod tests {
     fn settings_post_result_rejects_missing_project_root_with_bad_request() {
         let (status, body) = settings_post_result("{}", None, &EventBus::new());
 
-        assert_eq!(status, "400 Bad Request");
+        assert_eq!(status, 400);
         assert!(body.contains("No project root"));
     }
 
@@ -820,7 +887,7 @@ mod tests {
         .to_string();
 
         let (status, _) = settings_post_result(&body, Some(dir.path()), &bus);
-        assert_eq!(status, "200 OK");
+        assert_eq!(status, 200);
 
         let mut saw_command = false;
         let mut saw_sandbox = false;
@@ -931,13 +998,24 @@ mod tests {
         String::from_utf8_lossy(bytes).into_owned()
     }
 
+    /// The CORS posture dispatch hands the shim — read from the route
+    /// table so a row-posture change fails these byte pins instead of
+    /// silently changing the wire.
+    fn settings_route_cors(method: &str, path: &str) -> crate::gateway_routes::CorsPosture {
+        crate::gateway_routes::match_route(method, path)
+            .expect("settings route declared")
+            .0
+            .cors
+    }
+
     #[tokio::test]
     async fn golden_project_root_transcripts() {
+        let cors = settings_route_cors("GET", "/api/project-root");
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let root_json = serde_json::json!(root.to_string_lossy()).to_string();
         let response = collect_settings_handler_response(|stream| {
-            handle_project_root(stream, Some(root.clone()))
+            handle_project_root(stream, Some(root.clone()), cors, None)
         })
         .await;
         assert_eq!(
@@ -948,8 +1026,10 @@ mod tests {
             )
         );
 
-        let response =
-            collect_settings_handler_response(|stream| handle_project_root(stream, None)).await;
+        let response = collect_settings_handler_response(|stream| {
+            handle_project_root(stream, None, cors, None)
+        })
+        .await;
         assert_eq!(
             golden_settings_transcript(&response),
             golden_settings_json_transcript("200 OK", r#"{"project_root":null}"#)
@@ -961,7 +1041,13 @@ mod tests {
         // Historical shape: the missing-project-root ERROR body still
         // answers 200 OK on the GET lane.
         let response = collect_settings_handler_response(|stream| {
-            handle_settings_get(stream, None, RuntimeSettingsState::default())
+            handle_settings_get(
+                stream,
+                None,
+                RuntimeSettingsState::default(),
+                settings_route_cors("GET", "/api/settings"),
+                None,
+            )
         })
         .await;
         assert_eq!(
@@ -985,7 +1071,13 @@ mod tests {
             "default-config payload expected: {body}"
         );
         let response = collect_settings_handler_response(|stream| {
-            handle_settings_get(stream, Some(root.clone()), runtime_settings.clone())
+            handle_settings_get(
+                stream,
+                Some(root.clone()),
+                runtime_settings.clone(),
+                settings_route_cors("GET", "/api/settings"),
+                None,
+            )
         })
         .await;
         assert_eq!(
@@ -996,9 +1088,10 @@ mod tests {
 
     #[tokio::test]
     async fn golden_settings_post_transcripts() {
+        let cors = settings_route_cors("POST", "/api/settings");
         // Missing project root: 400 under the canonical tail.
         let response = collect_settings_handler_response(|stream| {
-            handle_settings_post(stream, "{}".to_string(), EventBus::new(), None)
+            handle_settings_post(stream, "{}".to_string(), EventBus::new(), None, cors, None)
         })
         .await;
         assert_eq!(
@@ -1021,6 +1114,8 @@ mod tests {
                 invalid.to_string(),
                 EventBus::new(),
                 Some(parse_dir.path().to_path_buf()),
+                cors,
+                None,
             )
         })
         .await;
@@ -1055,7 +1150,14 @@ mod tests {
         })
         .to_string();
         let response = collect_settings_handler_response(|stream| {
-            handle_settings_post(stream, body, EventBus::new(), Some(root.clone()))
+            handle_settings_post(
+                stream,
+                body,
+                EventBus::new(),
+                Some(root.clone()),
+                cors,
+                None,
+            )
         })
         .await;
         assert_eq!(
@@ -1067,11 +1169,17 @@ mod tests {
 
     #[tokio::test]
     async fn golden_api_keys_post_transcripts() {
+        let cors = settings_route_cors("POST", "/api/api-keys");
         // Unknown key: rejected before any config-dir resolution — and
         // still 200 OK (the historical always-200 POST lane) under the
         // bare wildcard tail.
         let response = collect_settings_handler_response(|stream| {
-            handle_api_keys_post(stream, r#"{"keys":{"NOT_A_KNOWN_KEY":"x"}}"#.to_string())
+            handle_api_keys_post(
+                stream,
+                r#"{"keys":{"NOT_A_KNOWN_KEY":"x"}}"#.to_string(),
+                cors,
+                None,
+            )
         })
         .await;
         assert_eq!(
@@ -1092,7 +1200,7 @@ mod tests {
         let expected_body =
             serde_json::json!({"error": format!("Invalid payload: {}", serde_error)}).to_string();
         let response = collect_settings_handler_response(|stream| {
-            handle_api_keys_post(stream, invalid.to_string())
+            handle_api_keys_post(stream, invalid.to_string(), cors, None)
         })
         .await;
         assert_eq!(
@@ -1109,8 +1217,14 @@ mod tests {
         let body = api_key_status_response_body();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(parsed.is_object(), "status body is an object: {body}");
-        let response =
-            collect_settings_handler_response(|stream| handle_api_key_status(stream)).await;
+        let response = collect_settings_handler_response(|stream| {
+            handle_api_key_status(
+                stream,
+                settings_route_cors("GET", "/api/api-key-status"),
+                None,
+            )
+        })
+        .await;
         assert_eq!(
             golden_settings_transcript(&response),
             golden_settings_json_transcript("200 OK", &body)
@@ -1148,7 +1262,7 @@ mod tests {
         .to_string();
 
         let (status, _) = settings_post_result(&body, Some(dir.path()), &bus);
-        assert_eq!(status, "200 OK");
+        assert_eq!(status, 200);
 
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(msg) = event {

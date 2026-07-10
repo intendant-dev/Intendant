@@ -960,12 +960,12 @@ pub(crate) async fn api_settings_save_response(
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
-    let (status_line, body) = crate::web_gateway::settings_post_result(
+    let (status, body) = crate::web_gateway::settings_post_result(
         &body_text,
         runtime.project_root.as_deref(),
         &runtime.bus,
     );
-    http_body_response(id, status_line_code(status_line), body, "settings save")
+    http_body_response(id, status, body, "settings save")
 }
 
 pub(crate) async fn api_control_msg_response(
