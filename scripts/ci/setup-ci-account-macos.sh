@@ -54,32 +54,34 @@ echo "== account"
 if dscl . -read "/Users/$CI_ACCOUNT" UniqueID >/dev/null 2>&1; then
     echo "account $CI_ACCOUNT already exists — leaving it as is"
 else
-    # Free UID in Apple's role-account range (sysadminctl -roleAccount
-    # requires the underscore prefix and a 200-400 UID). One dscl snapshot,
-    # then a pure-shell scan.
+    # Free UID in Apple's role-account range: sysadminctl -roleAccount
+    # requires the underscore prefix and a UID in 450-499 (enforced by
+    # sysadminctl itself — "Role account requires specified UID in 450-499
+    # range", verified live on Darwin 25.4; older docs said 200-400). One
+    # dscl snapshot, then a pure-shell scan.
     used_uids="$(dscl . -list /Users UniqueID | awk '{print $2}')"
     uid=""
-    for candidate in $(seq 200 400); do
+    for candidate in $(seq 450 499); do
         if ! printf '%s\n' "$used_uids" | grep -qx "$candidate"; then
             uid="$candidate"
             break
         fi
     done
     if [ -z "$uid" ]; then
-        echo "no free role-account UID in 200-400" >&2
+        echo "no free role-account UID in 450-499" >&2
         exit 1
     fi
     # Dedicated primary group (NOT staff, NOT admin); prefer gid == uid.
     used_gids="$(dscl . -list /Groups PrimaryGroupID | awk '{print $2}')"
     gid=""
-    for candidate in "$uid" $(seq 200 400); do
+    for candidate in "$uid" $(seq 450 499); do
         if ! printf '%s\n' "$used_gids" | grep -qx "$candidate"; then
             gid="$candidate"
             break
         fi
     done
     if [ -z "$gid" ]; then
-        echo "no free role-account GID in 200-400" >&2
+        echo "no free role-account GID in 450-499" >&2
         exit 1
     fi
     if ! dseditgroup -o read "$CI_ACCOUNT" >/dev/null 2>&1; then
