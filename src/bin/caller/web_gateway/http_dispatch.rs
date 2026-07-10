@@ -843,7 +843,6 @@ pub(crate) async fn serve_http_request(
                     req_path,
                     cert_dir,
                     http_access_context,
-                    route.cors,
                     fleet_cors_origin.as_deref(),
                 )
                 .await;

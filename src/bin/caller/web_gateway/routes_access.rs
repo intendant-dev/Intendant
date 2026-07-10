@@ -300,7 +300,6 @@ pub(crate) async fn handle_access_org_manage(
     req_path: &str,
     cert_dir: std::path::PathBuf,
     http_access_context: HttpAccessContext,
-    cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
     // Belt-and-suspenders manage re-check (see the claim-code shim).
@@ -325,7 +324,22 @@ pub(crate) async fn handle_access_org_manage(
         ),
         Err(error) => *error,
     };
-    write_api_response(stream, response, cors, fleet_origin).await;
+    // Historical framing quirk, byte-pinned by the golden transcripts:
+    // this handler has always rendered through the fleet decorator
+    // regardless of leaf, so the five own-origin leaves (issue,
+    // revoke-member, issuers/*) carry an inert `Vary: Origin` tail and
+    // can never see an echo — dispatch's origin gate refuses foreign
+    // origins on non-fleet paths before dispatch, so `fleet_origin` is
+    // always None for them. Purifying them onto the row posture would
+    // be a (harmless-looking but real) wire change — not part of the S6
+    // conversion.
+    write_api_response(
+        stream,
+        response,
+        crate::gateway_routes::CorsPosture::FleetAllowlist,
+        fleet_origin,
+    )
+    .await;
 }
 
 pub(crate) async fn handle_access_enrollment_decide(
@@ -4098,7 +4112,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
 
         // Issue without a root key or issuer cert in the injected store:
-        // the deterministic 400 under the fleet tail (echo case).
+        // the deterministic 400. The issue row is own-origin, so no
+        // foreign origin can ever reach this handler for it (the
+        // pre-dispatch origin gate refuses them) — the reachable shape
+        // is the fleet decorator's inert bare `Vary: Origin` tail, the
+        // handler's historical framing on every leaf.
         let response = collect_access_handler_response(|stream| {
             handle_access_org_manage(
                 stream,
@@ -4106,8 +4124,7 @@ mod tests {
                 "/api/access/org-grants/issue",
                 tmp.path().to_path_buf(),
                 golden_root_context(),
-                org_cors("/api/access/org-grants/issue"),
-                Some(GOLDEN_FLEET_ORIGIN),
+                None,
             )
         })
         .await;
@@ -4117,11 +4134,7 @@ mod tests {
         .to_string();
         assert_eq!(
             golden_access_transcript(&response),
-            golden_access_fleet_json_transcript(
-                "400 Bad Request",
-                &expected_body,
-                Some(GOLDEN_FLEET_ORIGIN)
-            )
+            golden_access_fleet_json_transcript("400 Bad Request", &expected_body, None)
         );
 
         // Delegate without a root key: the deterministic 400. (The
@@ -4134,7 +4147,6 @@ mod tests {
                 "/api/access/org-grants/issuers/delegate",
                 tmp.path().to_path_buf(),
                 golden_root_context(),
-                org_cors("/api/access/org-grants/issuers/delegate"),
                 None,
             )
         })
@@ -4158,7 +4170,6 @@ mod tests {
                 "/api/access/org-grants/issuers/init",
                 tmp.path().to_path_buf(),
                 golden_root_context(),
-                org_cors("/api/access/org-grants/issuers/init"),
                 None,
             )
         })
@@ -4191,7 +4202,6 @@ mod tests {
                 "/api/access/orgs/trust",
                 tmp.path().to_path_buf(),
                 golden_root_context(),
-                org_cors("/api/access/orgs/trust"),
                 Some(GOLDEN_FLEET_ORIGIN),
             )
         })
@@ -4216,7 +4226,6 @@ mod tests {
                 "/api/access/orgs/trust",
                 denied_dir.path().to_path_buf(),
                 context,
-                org_cors("/api/access/orgs/trust"),
                 Some(GOLDEN_FLEET_ORIGIN),
             )
         })
