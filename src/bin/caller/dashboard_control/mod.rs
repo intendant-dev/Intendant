@@ -122,16 +122,6 @@ const fn uploadable(name: &'static str, op: PeerOperation) -> ControlMethodSpec 
     }
 }
 
-/// Upload-frame-only method (no request-lane dispatch, no feature entry).
-const fn upload_only(name: &'static str, op: PeerOperation) -> ControlMethodSpec {
-    ControlMethodSpec {
-        name,
-        op: Some(op),
-        advertised: false,
-        upload: true,
-    }
-}
-
 /// The residue half of the tunnel method table: methods not (yet) declared
 /// as a `tunnel:` column on a `gateway_routes::ROUTES` row. Do NOT add a
 /// method here if its HTTP twin has a route row — declare it on the row
