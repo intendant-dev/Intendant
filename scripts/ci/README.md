@@ -87,6 +87,158 @@ Future watchdog enhancement (not yet implemented): gate listener
 resume on `memory_pressure` in addition to disk, so a swap storm
 pauses assignment the way a full disk does.
 
+## macOS CI service account (`_intendant-ci`)
+
+**Why:** CI jobs on the Mac listeners historically executed as the
+operator's own account — so any code that lands in a PR (and every
+action it pulls in) could read everything the operator can read
+(`~/.ssh`, `.env` API keys, gh tokens, browser profiles, session
+stores) and inherited the operator's TCC grants (Screen Recording,
+Microphone, Accessibility). The Dell and Windows runners already run
+as dedicated non-admin `ci` users; this kit brings the Mac to parity.
+
+The kit (all root, all idempotent, everything host-specific detected
+at run time — nothing beyond the generic `_intendant-ci` name is
+committed):
+
+- **`setup-ci-account-macos.sh`** — creates the hidden role account
+  (`sysadminctl -roleAccount`: UID auto-picked in 200–400, own primary
+  group — not `staff`, not `admin` — no password login, home `/var/ci`;
+  role accounts conventionally live outside `/Users`, and an empty
+  non-template home keeps the hermeticity signal clean). Provisions the
+  per-user toolchain **as that account**: rustup pinned to the invoking
+  host's current `rustc -V` (printed; the workflows key their cargo
+  target caches by it), `~/.cargo/config.toml` with the jobs cap above
+  (mirrors the operator's value; adds `rustc-wrapper = <sccache>` iff
+  sccache exists at install time), wasm-pack at the repo's
+  `.wasm-pack-version` pin (failure is a loud, canary-visible gap, not
+  a blocker). Installs the job hooks. Verifies and prints: not in
+  admin/staff, no password material, HOME resolves, and that the
+  account **cannot traverse any human `/Users/<home>`** (expects 700;
+  reports, never chmods — that fix is the operator's call).
+- **`migrate-runner-macos.sh <listener-name>`** — one listener per
+  invocation. Stops the operator-account LaunchAgent, waits for the
+  service tree to exit, moves the runner dir into `/var/ci` (the
+  `.runner`/`.credentials` registration travels with it — identity and
+  name preserved, **no re-registration**), remaps `.path` onto the CI
+  home, wires the hooks into `.env`, renders a LaunchDaemon from the
+  runner's own `bin/actions.runner.plist.template` (the exact template
+  `svc.sh` renders LaunchAgents from — same load-bearing keys:
+  `runsvc.sh` ProgramArguments, WorkingDirectory, RunAtLoad, log paths,
+  `ACTIONS_RUNNER_SVC=1`, ProcessType Interactive, SessionCreate) with
+  `UserName` swapped to `_intendant-ci` and `HOME`/`USER` injected into
+  `EnvironmentVariables` (the one deliberate divergence: gui
+  LaunchAgents inherit them from the login session, system
+  LaunchDaemons get neither, and rustup/cargo need `HOME`), bootstraps
+  it in the system domain, waits for the runner to report online
+  (`gh api`, when
+  available), and rewires `watchdog.conf` (label moves to
+  `RUNNER_DAEMON_LABELS`, CI cache root and account are added; the old
+  cache root stays listed so the watchdog prunes its stale keys away).
+  Prints the rollback invocation on completion. Post-migration the
+  runner's `svc.sh` no longer applies (gui-domain only) — control the
+  listener via `launchctl … system …` or the watchdog.
+- **`rollback-runner-macos.sh <listener-name>`** — exact inverse, from
+  the metadata migrate parked under `/etc/intendant-ci/migration/`:
+  bootout the daemon, move the dir back, chown, restore
+  `.path`/`.env`/`.service`, restore + bootstrap the original
+  LaunchAgent, restore the watchdog entries (the CI account and cache
+  root drop out once no daemon listener remains).
+
+### Migration runbook
+
+```bash
+sudo scripts/ci/setup-ci-account-macos.sh        # account + toolchain + hooks
+sudo scripts/ci/migrate-runner-macos.sh <listener-b>   # secondary listener first
+# canary (below), soak ≥ a day
+sudo scripts/ci/migrate-runner-macos.sh <listener-a>   # primary listener
+# final soak; rollback at any point:
+sudo scripts/ci/rollback-runner-macos.sh <name>
+```
+
+Canary: after migrating the first listener, force a full required-check
+run onto it — pause the un-migrated listener for one run
+(`launchctl bootout gui/<uid>/<label>`, resume with the matching
+`bootstrap`) or simply watch until the migrated listener has executed
+each required workflow at least once (`gh run list`, per-job runner
+name in the job log).
+
+### Canary expectations (fresh account: zero TCC grants, no Aqua/WindowServer session)
+
+The LaunchDaemon carries `SessionCreate=true`, so jobs get a security
+session (securityd works) but no window server and no TCC grants.
+Suite grep, 2026-07-10 — the classes that touch macOS machinery, and
+what to expect:
+
+| Test class | Expectation as `_intendant-ci` |
+|---|---|
+| `access/certs.rs::p12_imports_via_real_macos_keychain`, `::p12_imports_via_security_cli_auto_detection` | **PASS — watch these closest.** Real Keychain machinery, but against throwaway *file-backed* keychains in tempdirs (never the login keychain). Needs securityd + a security session, not WindowServer/TCC. A regression here looks like `errSecInteractionNotAllowed` / `security create-keychain` failing. |
+| `sandbox.rs` seatbelt tests (3 spawn real `/usr/bin/sandbox-exec`) | PASS — Seatbelt needs no GUI or TCC. |
+| `access/cert_server.rs::mobileconfig_profile_is_valid_plist_on_macos` | PASS — spawns `plutil`, headless-safe. |
+| `terminal.rs` PTY suite | PASS — `openpty` needs no controlling terminal or GUI. |
+| `platform.rs` (process tree/spawn), `vision.rs` (Linux-display logic), `computer_use.rs` (pure key parsing), `audio_routing.rs` / `transcription.rs` / `recording.rs` (pure command construction), `encode/*` (software VP8 + AVCC byte-munging), `clipboard.rs` (struct-only — tests never start the NSPasteboard poller) | PASS — pure logic; no live OS surface. |
+| `ax.rs::live_read_frontmost` (AX TCC), `intendant-display::macos_real_capture_stress_cycles` (Screen Recording TCC + display), `live_audio.rs` live-API tests | Already `#[ignore]`d — not in CI on any account; they stay operator-hardware smokes. |
+| `tests/e2e` (mock provider, headless) | PASS — hermetic by design; fixtures inject their roots. A test that fails **only** on the CI account because it resolved the real `$HOME` (now an empty `/var/ci`) is an unhermetic-fixture bug to fix (CLAUDE.md, "Tests are hermetic"), not a migration blocker. |
+
+What *would* regress, and deliberately doesn't exist: any non-ignored
+test calling WindowServer (CGDisplay/ScreenCaptureKit/NSPasteboard/
+CGEvent-post) — the grep found none; new tests must keep it that way.
+Runtime capabilities of the box under the CI account are reduced **by
+design**: `screencapture`, ScreenCaptureKit, AX, and live audio would
+each need TCC grants the fresh account doesn't have — CI never uses
+them.
+
+### Job hooks
+
+`hooks/job-started.sh` / `hooks/job-completed.sh` (shared engine
+`hooks/hook-lib.sh`) are wired through each runner root's `.env` —
+`ACTIONS_RUNNER_HOOK_JOB_STARTED=…` / `…_JOB_COMPLETED=…`, the
+documented runner mechanism; the runner reads `.env` at listener
+startup, so re-wiring needs a listener restart. Per invocation,
+bounded by a 60s self-timeout (a watchdog subshell reaps hung work —
+GitHub applies no timeout of its own, and a wedged started-hook would
+wedge the job):
+
+- wipe `$RUNNER_TEMP` contents (per-runner, recreated every job);
+- reap stale (>24h) temp/test-home residue — `$TMPDIR` and
+  `~/.intendant` are per-*account*, shared with the other listener's
+  live jobs, hence the age gate;
+- kill leftover CI-account processes that no live runner tree owns —
+  decided by **ancestry**, not age (both listeners share the account);
+  the runner service stacks and the shared sccache server are
+  protected (killing sccache mid-compile fails the other listener's
+  rustc invocations);
+- log exactly one summary line to `/var/log/intendant-ci-hooks.log`
+  (rotated at 1MB like the watchdog log, truncate-in-place because the
+  account can't create files in `/var/log`);
+- **always exit 0** — a non-zero started-hook fails the job (GitHub
+  semantics), and janitorial trouble must never take down CI.
+
+Never touched: `~/.cache/intendant-ci` (the watchdog owns the warm
+target caches), `~/.cargo`, `~/.rustup`.
+
+### Watchdog interplay
+
+`fleet-watchdog.sh` understands both listener shapes at once —
+`RUNNER_LABELS` (gui-domain LaunchAgents, `RUNNER_UID` +
+`RUNNER_PLIST_DIR`) and `RUNNER_DAEMON_LABELS` (system-domain
+LaunchDaemons, `RUNNER_DAEMON_PLIST_DIR`) — and `RUNNER_USER` may list
+several accounts, so a half-migrated host stays fully supervised. The
+migrate/rollback scripts edit `watchdog.conf` themselves; the
+before-images land in `/etc/intendant-ci/migration/` for audit.
+
+### Deliberately deferred
+
+- **PF / private-LAN egress deny for the CI account** (packet-filter
+  rules keyed to `_intendant-ci`'s uid, so PR code can't probe the
+  LAN): needs operator sign-off at apply time — not part of this kit.
+- **Windows host equivalent** of the hooks + migration ergonomics (the
+  Windows runner already runs as a dedicated non-admin user; see the
+  watchdog "Windows" note above).
+- **sccache cache custody**: the CI account's sccache cache lives in
+  its own `~/Library/Caches` under sccache's default 10G self-cap; the
+  watchdog does not manage it yet.
+
 ## Interlocks
 
 - The workflow cache steps and this watchdog share the cache layout
@@ -97,3 +249,8 @@ pauses assignment the way a full disk does.
   the watchdog should pause listeners long before any job can see a
   sub-floor disk, leaving the preflight as the backstop for the
   watchdog being dead or misconfigured.
+- The migrate/rollback scripts and the watchdog share the
+  `watchdog.conf` vocabulary (`RUNNER_LABELS` ↔
+  `RUNNER_DAEMON_LABELS`, multi-account `RUNNER_USER`). Change the
+  conf schema, change `migrate-runner-macos.sh` /
+  `rollback-runner-macos.sh` in the same commit.
