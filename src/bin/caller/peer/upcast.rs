@@ -80,6 +80,17 @@ pub(crate) fn log_event(level: LogLevel, source: &str, message: String) -> PeerE
     }
 }
 
+/// Peer-facing text for a display-only session note: the note body plus a
+/// count marker for attachments, whose `/api/session/current/uploads/*`
+/// URLs only resolve against the origin daemon.
+pub(crate) fn session_note_peer_log_text(text: &str, attachment_count: usize) -> String {
+    match attachment_count {
+        0 => text.to_string(),
+        1 => format!("{text} [1 image attachment]"),
+        n => format!("{text} [{n} image attachments]"),
+    }
+}
+
 /// Map Intendant's internal multi-source `LogLevel` to the peer
 /// module's 5-level vocabulary. Source-specific variants
 /// (Model/Agent/SubAgent) collapse to `Info` because the peer Log
@@ -1508,6 +1519,20 @@ impl AppEventUpcaster {
                 };
                 vec![log_event(log_level, source, content.clone())]
             }
+            // Display-only session note: forward the text as peer log
+            // activity. Attachment URLs are daemon-local (`/api/session/
+            // current/uploads/.../raw` on the origin daemon), so peers get
+            // a count marker instead of unreachable references.
+            AppEvent::SessionNote {
+                text,
+                attachments,
+                source,
+                ..
+            } => vec![log_event(
+                LogLevel::Info,
+                source.as_deref().unwrap_or("note"),
+                session_note_peer_log_text(text, attachments.len()),
+            )],
             AppEvent::UserMessageRewind {
                 user_turn_index,
                 turns_removed,
@@ -2791,6 +2816,19 @@ impl WireEventUpcaster {
             } => {
                 vec![log_event(wire_log_level(level), source, content.clone())]
             }
+            // Same treatment as the AppEvent-side arm: note text as peer
+            // log activity, attachments as a count (their URLs only
+            // resolve on the origin daemon).
+            OutboundEvent::SessionNote {
+                text,
+                attachments,
+                source,
+                ..
+            } => vec![log_event(
+                LogLevel::Info,
+                source.as_deref().unwrap_or("note"),
+                session_note_peer_log_text(text, attachments.len()),
+            )],
             OutboundEvent::UserMessageRewind {
                 user_turn_index,
                 turns_removed,
