@@ -740,7 +740,7 @@ context_archive = "summary"          # summary | exact | off — context snapsho
 [agent.claude_code]
 command         = "claude"
 model           = "claude-sonnet-4-6"  # optional; any claude CLI --model value (e.g. "haiku")
-permission_mode = "default"           # default | acceptEdits | plan | bypassPermissions (legacy "auto" = default)
+permission_mode = "default"           # default (alias manual) | acceptEdits | plan | auto | dontAsk | bypassPermissions
 allowed_tools   = []                  # e.g. ["Read", "Edit", "Bash"]; empty = all
 ```
 
