@@ -102,20 +102,28 @@ at run time — nothing beyond the generic `_intendant-ci` name is
 committed):
 
 - **`setup-ci-account-macos.sh`** — creates the hidden role account
-  (`sysadminctl -roleAccount`: UID auto-picked in 200–400, own primary
-  group — not `staff`, not `admin` — no password login, home `/var/ci`;
-  role accounts conventionally live outside `/Users`, and an empty
-  non-template home keeps the hermeticity signal clean). Provisions the
+  (`sysadminctl -roleAccount`: UID auto-picked in 450–499 — the range
+  sysadminctl itself enforces — own primary group, not `admin`, no
+  password material, home `/var/ci`; role accounts conventionally live
+  outside `/Users`, and an empty non-template home keeps the
+  hermeticity signal clean). Two macOS realities, verified live: staff
+  membership is *computed* for every local account (not removable —
+  the boundary is 700 operator homes + no admin), and sysadminctl
+  mints ShadowHashData even with no password argument (the script
+  deletes it; verification fails if it ever reappears). Provisions the
   per-user toolchain **as that account**: rustup pinned to the invoking
   host's current `rustc -V` (printed; the workflows key their cargo
   target caches by it), `~/.cargo/config.toml` with the jobs cap above
-  (mirrors the operator's value; adds `rustc-wrapper = <sccache>` iff
-  sccache exists at install time), wasm-pack at the repo's
-  `.wasm-pack-version` pin (failure is a loud, canary-visible gap, not
-  a blocker). Installs the job hooks. Verifies and prints: not in
-  admin/staff, no password material, HOME resolves, and that the
-  account **cannot traverse any human `/Users/<home>`** (expects 700;
-  reports, never chmods — that fix is the operator's call).
+  (mirrors the operator's value; adds `rustc-wrapper = <sccache>` plus
+  a per-account `SCCACHE_SERVER_PORT`/`SCCACHE_DIR` iff sccache exists
+  — the client/server rendezvous is one machine-wide TCP port, and the
+  operator's server cannot read the CI account's 0750 toolchain).
+  wasm-pack at the repo's `.wasm-pack-version` pin (failure is a loud,
+  canary-visible gap, not a blocker). Installs the job hooks. Verifies
+  and prints: not in admin, no password material, HOME resolves, and
+  that the account **cannot traverse any human `/Users/<home>`**
+  (expects 700; reports, never chmods — that fix is the operator's
+  call).
 - **`migrate-runner-macos.sh <listener-name>`** — one listener per
   invocation. Stops the operator-account LaunchAgent, waits for the
   service tree to exit, moves the runner dir into `/var/ci` (the

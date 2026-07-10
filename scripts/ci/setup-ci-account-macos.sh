@@ -105,6 +105,12 @@ else
     dscl . -create "/Users/$CI_ACCOUNT" UserShell /bin/bash
     # Belt and braces (role accounts are already hidden by UID range):
     dscl . -create "/Users/$CI_ACCOUNT" IsHidden 1
+    # sysadminctl mints real PBKDF2 password material (ShadowHashData) even
+    # with no -password argument (verified live on Darwin 25.4). It is
+    # inert while the record has no AuthenticationAuthority, but a later
+    # tool could add one — delete the hash so password auth has nothing to
+    # verify against, ever.
+    dscl . -delete "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData 2>/dev/null || true
 fi
 
 CI_GROUP="$(id -gn "$CI_ACCOUNT")"
@@ -205,6 +211,15 @@ else
         echo "jobs = $jobs"
         if [ -n "$sccache_bin" ]; then
             echo "rustc-wrapper = \"$sccache_bin\""
+            # sccache's client/server rendezvous is one TCP port (default
+            # 4226) for the whole machine: the CI client would attach to
+            # the OPERATOR's server, which then can't read a 0750 /var/ci
+            # toolchain — "failed to execute compile" (live 2026-07-10).
+            # Give the CI account its own port and cache dir.
+            echo ""
+            echo "[env]"
+            echo "SCCACHE_SERVER_PORT = \"4227\""
+            echo "SCCACHE_DIR = \"$CI_HOME/.cache/sccache\""
         fi
     } > "$CARGO_CONFIG"
     chown "$CI_ACCOUNT:$CI_GROUP" "$CARGO_CONFIG"
@@ -282,18 +297,31 @@ if dseditgroup -o checkmember -m "$CI_ACCOUNT" admin 2>/dev/null | grep -q "^yes
 else
     echo "ok: not in admin"
 fi
+# staff(20) membership is COMPUTED for every local account on macOS
+# (opendirectoryd implicit membership — /Groups/staff lists only root;
+# there is no per-user record to delete, verified live on Darwin 25.4).
+# The effective boundary is 700 operator homes + no admin, checked below.
 if dseditgroup -o checkmember -m "$CI_ACCOUNT" staff 2>/dev/null | grep -q "^yes"; then
-    echo "FAIL: $CI_ACCOUNT is in staff" >&2
-    fail=1
+    echo "note: staff membership is macOS-computed for all local accounts (not removable; boundary = home modes + no admin)"
 else
     echo "ok: not in staff (primary group: $CI_GROUP)"
 fi
 
+# Password material: check the hash data itself, not just the authority
+# list — sysadminctl mints ShadowHashData unasked. Idempotent runs
+# converge (delete) rather than warn.
+if dscl . -read "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData >/dev/null 2>&1; then
+    dscl . -delete "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData 2>/dev/null || true
+fi
 auth_auth="$(dscl . -read "/Users/$CI_ACCOUNT" AuthenticationAuthority 2>/dev/null || true)"
-if echo "$auth_auth" | grep -q "ShadowHash"; then
-    echo "WARN: $CI_ACCOUNT has password material (AuthenticationAuthority: ShadowHash) — expected none" >&2
+if dscl . -read "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData >/dev/null 2>&1; then
+    echo "FAIL: $CI_ACCOUNT still has ShadowHashData after delete" >&2
+    fail=1
+elif echo "$auth_auth" | grep -q "ShadowHash"; then
+    echo "FAIL: $CI_ACCOUNT has a ShadowHash AuthenticationAuthority" >&2
+    fail=1
 else
-    echo "ok: no password login (no ShadowHash authority)"
+    echo "ok: no password material (no ShadowHashData, no ShadowHash authority)"
 fi
 
 # (logical pwd: /var is a symlink to /private/var on macOS, so a physical
