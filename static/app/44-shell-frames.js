@@ -621,6 +621,25 @@ function initShell() {
     shellTerm.open(document.getElementById('shell-container'));
     syncTerminalPaneAccessibility();
     shellFitAddon.fit();
+
+    // Keyboard escape hatch (a11y): plain Tab must stay a terminal byte
+    // (shell completion), so xterm swallows it and a keyboard user could
+    // never move focus forward out of the terminal. Ctrl+Shift+Tab is the
+    // documented escape — it never reaches the PTY and lands focus on the
+    // key bar. The visually-hidden #shell-escape-hint carries the same
+    // instruction to assistive tech via aria-describedby on xterm's input
+    // textarea.
+    shellTerm.attachCustomKeyEventHandler((ev) => {
+      if (ev.key === 'Tab' && ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey) {
+        if (ev.type === 'keydown') {
+          ev.preventDefault();
+          focusShellKeybar();
+        }
+        return false; // xterm must not handle (or forward) any phase of it
+      }
+      return true;
+    });
+    shellTerm.textarea?.setAttribute('aria-describedby', 'shell-escape-hint');
     // Live theme flips: xterm latched the palette resolved above; re-apply
     // from the current tokens whenever data-theme changes (a light terminal
     // otherwise sits inside a dark app, and vice versa).
@@ -774,6 +793,20 @@ function updateShellModifierUi() {
     const name = btn.dataset.sticky;
     btn.classList.toggle('armed', !!shellModifiers[name]);
   });
+}
+
+// Land keyboard focus on the key bar — the Ctrl+Shift+Tab escape hatch out
+// of xterm (see initShell). On desktop pointers the bar is display:none
+// until toggled, so reveal it through the existing toggle first (which
+// also refits the terminal); if no key is visible, fall back to the
+// toggle button itself so focus always escapes the terminal.
+function focusShellKeybar() {
+  const bar = document.getElementById('shell-keybar');
+  const toggle = document.getElementById('keybar-toggle');
+  if (bar && getComputedStyle(bar).display === 'none') toggle?.click();
+  const key = bar && Array.from(bar.querySelectorAll('.shell-key'))
+    .find(el => el.offsetParent !== null); // skips keys the active UI generation hides
+  (key || toggle)?.focus();
 }
 
 function wireShellKeybar() {
