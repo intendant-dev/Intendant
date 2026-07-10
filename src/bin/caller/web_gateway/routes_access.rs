@@ -520,14 +520,26 @@ pub(crate) async fn handle_access_connect_claim_code(
     finalize_http_stream(&mut stream).await;
 }
 
-/// Enable/disable the Connect client: persist `[connect]` to
-/// intendant.toml, then apply the effective config to the running client
+/// Enable/disable the Connect client: persist `[connect]` to the
+/// daemon's Connect store — the project's intendant.toml when rooted,
+/// the daemon-scoped connect.toml when projectless (the bundled app's
+/// normal shape) — then apply the effective config to the running client
 /// (start/stop live). The environment override always wins over the
 /// file, so the response reports both what was written and what is
 /// actually in effect.
 pub(crate) fn access_connect_config_response_value(
     params: serde_json::Value,
     project_root: Option<&std::path::Path>,
+) -> Result<serde_json::Value, String> {
+    access_connect_config_response_value_in(
+        params,
+        &crate::project::ConnectConfigStore::for_project_root(project_root),
+    )
+}
+
+fn access_connect_config_response_value_in(
+    params: serde_json::Value,
+    store: &crate::project::ConnectConfigStore,
 ) -> Result<serde_json::Value, String> {
     let enabled = params
         .get("enabled")
@@ -539,17 +551,13 @@ pub(crate) fn access_connect_config_response_value(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let root = project_root.ok_or_else(|| "no project root for this daemon".to_string())?;
-    let mut project = crate::project::Project::from_root(root.to_path_buf())
-        .map_err(|e| format!("load project config: {e}"))?;
-    project.config.connect.enabled = enabled;
+    let mut config = store.load()?;
+    config.enabled = enabled;
     if let Some(url) = rendezvous_url {
-        project.config.connect.rendezvous_url = Some(url);
+        config.rendezvous_url = Some(url);
     }
-    project
-        .save_config()
-        .map_err(|e| format!("write intendant.toml: {e}"))?;
-    let effective = project.config.connect.clone().effective_with_env();
+    store.save(&config)?;
+    let effective = config.effective_with_env();
     let running = crate::connect_rendezvous::apply_config(effective.clone())?;
     Ok(serde_json::json!({
         "schema_version": 1,
@@ -660,10 +668,8 @@ pub(crate) async fn handle_access_connect_unclaim(
 pub(crate) async fn access_connect_unclaim_response_value(
     project_root: Option<std::path::PathBuf>,
 ) -> Result<serde_json::Value, String> {
-    let root = project_root.ok_or_else(|| "no project root for this daemon".to_string())?;
-    let project = crate::project::Project::from_root(root)
-        .map_err(|e| format!("load project config: {e}"))?;
-    let mut config = project.config.connect.clone().effective_with_env();
+    let store = crate::project::ConnectConfigStore::for_project_root(project_root.as_deref());
+    let mut config = store.load()?.effective_with_env();
     if config.rendezvous_url.is_none() {
         // Enabled-by-dashboard-then-restarted edge: fall back to whatever
         // rendezvous the running client used.
@@ -2411,6 +2417,29 @@ pub(crate) fn resolve_peer_connection_identity_from_cert_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_toggle_works_on_a_projectless_daemon_via_the_daemon_store() {
+        // The bundled app's daemon has no project root; the toggle must
+        // round-trip through the daemon-scoped connect.toml instead of
+        // failing with "no project root for this daemon". enabled=false
+        // keeps apply_config on its stop path (no client spawned).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("connect.toml");
+        let store = crate::project::ConnectConfigStore::DaemonFile(path.clone());
+
+        let value = access_connect_config_response_value_in(
+            serde_json::json!({ "enabled": false }),
+            &store,
+        )
+        .expect("projectless toggle must not require a project root");
+        assert_eq!(value["written_enabled"], serde_json::json!(false));
+        assert_eq!(value["running"], serde_json::json!(false));
+        assert!(path.exists(), "daemon-scoped connect.toml must be written");
+        assert!(!crate::project::load_daemon_connect_config_in(&path)
+            .unwrap()
+            .enabled);
+    }
 
     #[test]
     fn fleet_origin_gate_normalizes_and_allowlists() {
