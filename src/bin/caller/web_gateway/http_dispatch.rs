@@ -454,6 +454,9 @@ pub(crate) async fn serve_http_request(
             RouteHandlerId::WorktreesRemove => {
                 return handle_worktrees_remove(stream, route_body, worktree_inventory_cache).await;
             }
+            RouteHandlerId::WorktreesMerge => {
+                return handle_worktrees_merge(stream, route_body, worktree_inventory_cache).await;
+            }
             RouteHandlerId::WorktreesScan => {
                 return handle_worktrees_scan(stream, project_root, worktree_inventory_cache).await;
             }

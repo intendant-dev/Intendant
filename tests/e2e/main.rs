@@ -816,6 +816,201 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
     child.kill().await.expect("stop the daemon");
 }
 
+/// Worktree sessions, the daemon lane: `CreateSession { worktree: true }`
+/// must branch a fresh worktree off the project's HEAD and run the session
+/// INSIDE it. The scripted loop proves the cwd through the real runtime by
+/// writing a relative-path probe file — it must land in the worktree
+/// checkout, not the base project — and the session's recorded meta pins
+/// the linkage (branch, checkout path, base branch/sha) plus the effective
+/// project root.
+#[tokio::test]
+async fn create_session_with_worktree_runs_inside_the_worktree() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    // The daemon's default project is a real git repo with one commit
+    // (worktree launches branch from HEAD, so an empty repo is an error by
+    // design). intendant.toml doubles as the rooted-daemon marker
+    // spawn_daemon_on_rig would write; committing it keeps the base clean.
+    let project = rig.project.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "e2e@test.com"]);
+    git(&["config", "user.name", "E2E"]);
+    std::fs::write(project.join("intendant.toml"), "").expect("project marker");
+    std::fs::write(project.join("README.md"), "# worktree e2e\n").expect("seed file");
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial"]);
+    let base_head = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&project)
+            .output()
+            .expect("read base HEAD");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // `echo MARKER && echo done > wt_probe.txt` works under both sh and
+    // cmd; the relative redirect target is the cwd proof.
+    let script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Writing the cwd probe.",
+                  "tool_calls": [{ "name": "exec_command",
+                                   "arguments": { "nonce": 1,
+                                                  "command": "echo WORKTREE_E2E_ROUNDTRIP && echo done > wt_probe.txt" } }] },
+                { "expect_transcript_contains": "WORKTREE_E2E_ROUNDTRIP",
+                  "content": "Probe written.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "worktree session complete" } }] }
+            ]
+        }]
+    });
+
+    let client = reqwest::Client::new();
+    let mut daemon = spawn_daemon_on_rig(&client, rig, &script, free_loopback_port(), false).await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", daemon.port))
+            .await
+            .expect("connect /ws");
+
+    // The very first control message can race daemon startup on a
+    // saturated box (the gateway accepts /ws a beat before the
+    // supervisor's bus subscription), so retry until session_started.
+    let mut started = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "write the probe file in the isolated checkout",
+                "direct": true,
+                "worktree": true,
+                "worktree_branch": "wt-e2e",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send worktree create_session");
+        started = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("session_started")
+                && json
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|task| task.contains("isolated checkout"))
+        })
+        .await;
+        if started.is_some() {
+            break;
+        }
+    }
+    let started = started.unwrap_or_else(|| {
+        panic!(
+            "worktree create_session never started; daemon log:\n{}",
+            daemon.log_tail()
+        )
+    });
+    let session_id = started
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("session_started carries a session id")
+        .to_string();
+
+    complete_and_stop_session(&mut ws, &session_id, || daemon.log_tail()).await;
+
+    // The worktree exists where the launch contract says (a `.git` file,
+    // not a directory, marks a linked worktree checkout).
+    let worktree_path = project.join(".intendant").join("worktrees").join("wt-e2e");
+    assert!(
+        worktree_path.join(".git").is_file(),
+        "expected a linked worktree checkout at {}",
+        worktree_path.display()
+    );
+
+    // cwd proof: the relative-path probe landed inside the worktree, and
+    // did NOT land in the base project.
+    assert!(
+        worktree_path.join("wt_probe.txt").is_file(),
+        "probe file missing from the worktree — the session did not run inside it; daemon log:\n{}",
+        daemon.log_tail()
+    );
+    assert!(
+        !project.join("wt_probe.txt").exists(),
+        "probe file leaked into the base project — the session ran in the wrong cwd"
+    );
+
+    // Recorded linkage: effective project root is the worktree, and the
+    // worktree meta names the branch and where it branched from.
+    let meta_raw = std::fs::read_to_string(
+        daemon
+            .rig
+            .home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join(&session_id)
+            .join("session_meta.json"),
+    )
+    .expect("session_meta.json for the worktree session");
+    let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("meta parses");
+    let recorded_root = meta
+        .get("project_root")
+        .and_then(|v| v.as_str())
+        .expect("meta records a project root");
+    assert!(
+        std::fs::canonicalize(recorded_root).expect("recorded root exists")
+            == std::fs::canonicalize(&worktree_path).expect("worktree exists"),
+        "meta project_root {recorded_root} is not the worktree {}",
+        worktree_path.display()
+    );
+    let linkage = meta.get("worktree").expect("meta records worktree linkage");
+    assert_eq!(linkage["branch"], "wt-e2e", "{linkage}");
+    assert_eq!(linkage["base_branch"], "main", "{linkage}");
+    assert_eq!(linkage["base_sha"], serde_json::json!(base_head), "{linkage}");
+    assert!(
+        linkage
+            .get("base_root")
+            .and_then(|v| v.as_str())
+            .is_some_and(
+                |root| std::fs::canonicalize(root).ok() == std::fs::canonicalize(&project).ok()
+            ),
+        "{linkage}"
+    );
+
+    // The done signal only fired after the runtime round-trip, and the
+    // base checkout never left its branch.
+    assert!(
+        daemon
+            .rig
+            .session_logs()
+            .contains("worktree session complete"),
+        "session log missing the done signal"
+    );
+    let base_branch_now = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .current_dir(&project)
+        .output()
+        .expect("read base branch");
+    assert_eq!(
+        String::from_utf8_lossy(&base_branch_now.stdout).trim(),
+        "main",
+        "worktree launch must not move the base checkout"
+    );
+
+    daemon.child.kill().await.expect("stop the daemon");
+}
+
 #[tokio::test]
 async fn mock_provider_without_a_script_fails_closed() {
     let rig = TestRig::new();

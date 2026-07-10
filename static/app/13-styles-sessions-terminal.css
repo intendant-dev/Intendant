@@ -585,6 +585,22 @@
 .sessions-project-status.ok { color: var(--green); }
 .sessions-project-status.warn { color: var(--yellow); }
 .sessions-project-status.error { color: var(--red); }
+.sessions-worktree-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+.sessions-worktree-toggle {
+  flex-shrink: 0;
+  text-transform: none;
+}
+.sessions-worktree-branch {
+  flex: 1 1 200px;
+  min-width: 160px;
+}
+.sessions-worktree-branch.hidden { display: none; }
 .sessions-start-btn {
   align-self: flex-start;
   padding: 4px 12px;

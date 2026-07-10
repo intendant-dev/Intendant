@@ -27,6 +27,7 @@ impl SessionSupervisor {
         display_target: Option<String>,
         attachments: Vec<String>,
         codex_service_tier: Option<String>,
+        worktree: Option<SessionWorktreeRequest>,
     ) {
         let session_name = match normalize_session_name_option(name.as_deref()) {
             Ok(name) => name,
@@ -76,6 +77,40 @@ impl SessionSupervisor {
                 return;
             }
         };
+        // Worktree launch: branch off the resolved project root's HEAD and
+        // make the fresh checkout the session's effective project root. A
+        // failure (not a git repo, no commits, bad branch name) closes the
+        // just-opened session honestly, exactly like the no-project arm.
+        let worktree_meta = match worktree.as_ref() {
+            Some(request) => {
+                match prepare_session_worktree(
+                    &project_root,
+                    request,
+                    session_name.as_deref(),
+                    &session_id,
+                ) {
+                    Ok(meta) => Some(meta),
+                    Err(e) => {
+                        let reason = format!("worktree launch failed: {e}");
+                        slog(&session_log, |l| {
+                            l.write_summary(&task, &format!("error: {reason}"), 0)
+                        });
+                        self.loop_error(format!("Session create failed: {reason}"));
+                        self.config.bus.send(AppEvent::SessionEnded {
+                            session_id,
+                            reason: format!("error: {reason}"),
+                            error_kind: None,
+                        });
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
+        let project_root = worktree_meta
+            .as_ref()
+            .map(|meta| PathBuf::from(&meta.path))
+            .unwrap_or(project_root);
         let project = match Project::from_root(project_root) {
             Ok(project) => project,
             Err(e) => {
@@ -95,6 +130,17 @@ impl SessionSupervisor {
             task_meta,
             session_name.as_deref(),
         );
+        if let Some(ref meta) = worktree_meta {
+            // Persist the linkage after the meta file exists; it survives
+            // later meta rewrites (see SessionLog::write_meta_worktree).
+            slog(&session_log, |l| l.write_meta_worktree(meta));
+            self.info(&format!(
+                "Session {} runs in git worktree {} (branch {})",
+                short_session(&session_id),
+                meta.path,
+                meta.branch
+            ));
+        }
         self.activate_shared_session(session_log.clone()).await;
 
         if !reference_frame_ids.is_empty()
@@ -1183,6 +1229,52 @@ impl std::fmt::Display for ProjectRootResolveError {
     }
 }
 
+/// Worktree launch request carried by `CreateSession { worktree: true }`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionWorktreeRequest {
+    /// User-supplied branch name; derived from the session name / id when
+    /// absent.
+    pub(crate) branch: Option<String>,
+}
+
+/// Create the git worktree for a new session: validate the requested
+/// branch (or derive one from the session name / id, suffixing on
+/// collision), branch off the resolved project root's HEAD, and return
+/// the linkage recorded in `session_meta.json`. The returned meta's
+/// `path` becomes the session's effective project root.
+pub(crate) fn prepare_session_worktree(
+    project_root: &Path,
+    request: &SessionWorktreeRequest,
+    session_name: Option<&str>,
+    session_id: &str,
+) -> Result<session_log::SessionWorktreeMeta, String> {
+    // Doubles as the git preflight: a non-repo project root and a repo
+    // with no commits both fail here with an actionable message.
+    let base_sha = worktree::head_commit(project_root)?;
+    let branch = match request
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+    {
+        Some(requested) => worktree::validate_branch_name(requested)
+            .map_err(|e| format!("invalid worktree branch name {requested:?}: {e}"))?,
+        None => {
+            let derived = worktree::derive_branch_name(session_name, session_id);
+            worktree::unique_branch_name(project_root, &derived)
+        }
+    };
+    let base_branch = worktree::current_branch(project_root);
+    let wt = worktree::create(project_root, &branch, "HEAD").map_err(|e| e.to_string())?;
+    Ok(session_log::SessionWorktreeMeta {
+        branch: wt.branch_name,
+        path: wt.path.to_string_lossy().to_string(),
+        base_root: project_root.to_string_lossy().to_string(),
+        base_branch,
+        base_sha: Some(base_sha),
+    })
+}
+
 pub(crate) fn resolve_project_root_override(
     project_root: Option<String>,
     default_root: Option<&Path>,
@@ -1617,6 +1709,113 @@ mod tests {
             resolve_external_resume_project_root(None, None, None).unwrap_err(),
             ProjectRootResolveError::NoProject
         );
+    }
+
+    fn init_worktree_test_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.path().join("README.md"), "# test\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-m", "initial"]);
+        dir
+    }
+
+    #[test]
+    fn prepare_session_worktree_requires_a_git_repository() {
+        let plain = tempfile::tempdir().unwrap();
+        let err = prepare_session_worktree(
+            plain.path(),
+            &SessionWorktreeRequest::default(),
+            None,
+            "abcd1234",
+        )
+        .unwrap_err();
+        assert!(err.contains("not a git repository"), "{err}");
+        // The failure is clean: nothing was created under the project.
+        assert!(!plain.path().join(".intendant").exists());
+    }
+
+    #[test]
+    fn prepare_session_worktree_records_full_linkage() {
+        let repo = init_worktree_test_repo();
+        let meta = prepare_session_worktree(
+            repo.path(),
+            &SessionWorktreeRequest::default(),
+            Some("Fix the Login Bug"),
+            "abcd1234-uuid",
+        )
+        .unwrap();
+        assert_eq!(meta.branch, "fix-the-login-bug");
+        let path = PathBuf::from(&meta.path);
+        assert!(path.is_dir(), "worktree checkout exists");
+        assert_eq!(
+            path,
+            repo.path()
+                .join(".intendant")
+                .join("worktrees")
+                .join("fix-the-login-bug")
+        );
+        assert_eq!(meta.base_root, repo.path().to_string_lossy());
+        assert_eq!(meta.base_branch.as_deref(), Some("main"));
+        let sha = meta.base_sha.expect("base sha recorded");
+        assert_eq!(sha.len(), 40, "{sha}");
+        // Derived names dodge collisions with a numeric suffix.
+        let second = prepare_session_worktree(
+            repo.path(),
+            &SessionWorktreeRequest::default(),
+            Some("Fix the Login Bug"),
+            "efgh5678-uuid",
+        )
+        .unwrap();
+        assert_eq!(second.branch, "fix-the-login-bug-2");
+    }
+
+    #[test]
+    fn prepare_session_worktree_validates_requested_branch() {
+        let repo = init_worktree_test_repo();
+        let err = prepare_session_worktree(
+            repo.path(),
+            &SessionWorktreeRequest {
+                branch: Some("../escape".to_string()),
+            },
+            None,
+            "abcd1234",
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid worktree branch name"), "{err}");
+
+        let meta = prepare_session_worktree(
+            repo.path(),
+            &SessionWorktreeRequest {
+                branch: Some("feat/requested".to_string()),
+            },
+            None,
+            "abcd1234",
+        )
+        .unwrap();
+        assert_eq!(meta.branch, "feat/requested");
+        // A user-supplied duplicate is an error (git refuses), not a
+        // silent suffix.
+        let err = prepare_session_worktree(
+            repo.path(),
+            &SessionWorktreeRequest {
+                branch: Some("feat/requested".to_string()),
+            },
+            None,
+            "efgh5678",
+        )
+        .unwrap_err();
+        assert!(err.contains("feat/requested"), "{err}");
     }
 
     /// End-to-end substrate test, keyless: a mock provider drives an

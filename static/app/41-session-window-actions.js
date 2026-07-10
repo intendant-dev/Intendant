@@ -150,11 +150,14 @@ function ensureSessionWindow(sessionId, meta = {}) {
     'unknown',
     'Working directory not known yet'
   );
+  const worktreeBadge = document.createElement('span');
+  worktreeBadge.className = 'session-window-worktree hidden';
   const metaRow = document.createElement('div');
   metaRow.className = 'session-window-meta';
   metaRow.appendChild(id);
   metaRow.appendChild(relationStrip);
   metaRow.appendChild(project);
+  metaRow.appendChild(worktreeBadge);
   const task = document.createElement('div');
   task.className = 'session-window-task';
   task.textContent = meta.task || 'initial message pending';
@@ -323,6 +326,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     relationStrip,
     project,
     cwd,
+    worktreeBadge,
     task,
     status,
     goal,
@@ -407,6 +411,7 @@ function updateSessionWindow(sessionId, meta = {}) {
     );
   }
   refreshSessionWindowPathLabels(win);
+  renderSessionWindowWorktreeBadge(win, meta.worktree || null);
   if (meta.task) {
     win.task.textContent = meta.task;
     win.task.title = meta.task;
@@ -442,6 +447,27 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (meta.parentId) updateSessionRelationshipBadges(meta.parentId);
   scheduleSessionRelationshipRender();
   persistSessionWindowState();
+}
+
+// Worktree badge next to the project path: branch name up front, the full
+// linkage (checkout path, base branch/commit) in the tooltip.
+function renderSessionWindowWorktreeBadge(win, worktree) {
+  if (!win?.worktreeBadge) return;
+  if (!worktree?.branch) {
+    win.worktreeBadge.className = 'session-window-worktree hidden';
+    win.worktreeBadge.textContent = '';
+    win.worktreeBadge.title = '';
+    return;
+  }
+  win.worktreeBadge.className = 'session-window-worktree';
+  win.worktreeBadge.textContent = `⎇ ${worktree.branch}`;
+  const lines = [`Session runs in a git worktree on branch ${worktree.branch}`];
+  if (worktree.path) lines.push(`Checkout: ${worktree.path}`);
+  if (worktree.baseRoot) lines.push(`Base project: ${worktree.baseRoot}`);
+  if (worktree.baseBranch) {
+    lines.push(`Branched from ${worktree.baseBranch}${worktree.baseSha ? ` @ ${worktree.baseSha.slice(0, 12)}` : ''}`);
+  }
+  win.worktreeBadge.title = lines.join('\n');
 }
 
 function updateSessionWindowMinimizeState(sessionId) {

@@ -3274,6 +3274,7 @@ mod tests {
             ("api_session_control_msg", Residue, Some(Op::SessionManage)),
             ("api_worktrees_scan", Residue, Some(Op::SessionManage)),
             ("api_worktrees_remove", Residue, Some(Op::SessionManage)),
+            ("api_worktrees_merge", Row, Some(Op::SessionManage)),
             (
                 "api_session_current_upload",
                 Residue,
