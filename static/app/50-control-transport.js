@@ -1750,36 +1750,35 @@ async function fetchSessionsSearchPayload(options = {}) {
   return resp.body;
 }
 
+// The F3 settings/keys-family reads (below): daemonApi — tunnel first,
+// direct HTTP per the GET-twin fallback policy. These tunnel results ride
+// the body-only envelope (no injected status), so `resp.ok` reflects the
+// HTTP lane exactly where the legacy fallbacks threw on !resp.ok, and the
+// historical always-200 error bodies (settings GET's
+// {"error":"No project root"}) still arrive as ok bodies for callers to
+// inspect.
 async function fetchDashboardSettings() {
-  return dashboardTransport.rpcOrHttp('api_settings', {}, async () => {
-    const resp = await fetch('/api/settings');
-    if (!resp.ok) throw new Error(`/api/settings returned ${resp.status}`);
-    return resp.json();
-  }, 'api_settings');
+  const resp = await daemonApi.request('api_settings');
+  if (!resp.ok) throw new Error(`/api/settings returned ${resp.status}`);
+  return resp.body;
 }
 
 async function fetchApiKeyStatus() {
-  return dashboardTransport.rpcOrHttp('api_key_status', {}, async () => {
-    const resp = await fetch('/api/api-key-status');
-    if (!resp.ok) throw new Error(`/api/api-key-status returned ${resp.status}`);
-    return resp.json();
-  }, 'api_key_status');
+  const resp = await daemonApi.request('api_key_status');
+  if (!resp.ok) throw new Error(`/api/api-key-status returned ${resp.status}`);
+  return resp.body;
 }
 
 async function fetchExternalAgentAvailability() {
-  return dashboardTransport.rpcOrHttp('api_external_agents', {}, async () => {
-    const resp = await fetch('/api/external-agents');
-    if (!resp.ok) throw new Error(`/api/external-agents returned ${resp.status}`);
-    return resp.json();
-  }, 'api_external_agents');
+  const resp = await daemonApi.request('api_external_agents');
+  if (!resp.ok) throw new Error(`/api/external-agents returned ${resp.status}`);
+  return resp.body;
 }
 
 async function fetchProjectRoot() {
-  return dashboardTransport.rpcOrHttp('api_project_root', {}, async () => {
-    const resp = await fetch('/api/project-root');
-    if (!resp.ok) throw new Error(`/api/project-root returned ${resp.status}`);
-    return resp.json();
-  }, 'api_project_root');
+  const resp = await daemonApi.request('api_project_root');
+  if (!resp.ok) throw new Error(`/api/project-root returned ${resp.status}`);
+  return resp.body;
 }
 
 function dashboardReportRpcAvailable() {
@@ -2100,12 +2099,13 @@ function normalizeDisplaysPayload(payload) {
 }
 
 async function fetchLocalDisplaysPayload() {
-  return dashboardTransport.rpcOrHttp('api_displays', {}, async () => {
-    const resp = await authedFetch('/api/displays');
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-    return data;
-  }, 'api_displays');
+  // daemonApi (transport F3): tunnel first, direct HTTP per the GET-twin
+  // fallback policy (the HTTP error body's message survives as before).
+  const resp = await daemonApi.request('api_displays');
+  if (!resp.ok) {
+    throw new Error((resp.body && resp.body.error) || `HTTP ${resp.status}`);
+  }
+  return resp.body;
 }
 
 function dashboardControlBindingPayload(binding) {
