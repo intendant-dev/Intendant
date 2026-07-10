@@ -246,8 +246,8 @@ impl Default for WebGatewayConfig {
 
 // Deliberately no Access-Control-Allow-Origin here: API responses are
 // same-origin by default. Cross-origin readability is opt-in — the fleet
-// Access APIs echo allowlisted origins (`with_fleet_cors`) and the public
-// bootstrap surfaces use `with_public_cors`. A blanket wildcard would let
+// Access APIs echo allowlisted origins (`HttpResponse::fleet_cors`) and the
+// public bootstrap surfaces use `with_public_cors`. A blanket wildcard would let
 // any website read cert-authenticated responses through a visitor's
 // browser (see docs/src/trust-architecture.md).
 

@@ -449,8 +449,9 @@ impl HttpResponse {
     }
 
     /// Fleet-allowlist CORS posture: strip any wildcard, echo the origin
-    /// only when it passed the allowlist, and mark `Vary: Origin` — the
-    /// builder form of `with_fleet_cors`.
+    /// only when it passed the allowlist, and mark `Vary: Origin`. The
+    /// one fleet renderer (its string-form ancestor retired with the S6
+    /// access-family conversion).
     pub(crate) fn fleet_cors(mut self, allowed_origin: Option<&str>) -> Self {
         self.headers
             .retain(|(name, _)| !name.eq_ignore_ascii_case("access-control-allow-origin"));
@@ -666,33 +667,6 @@ pub(crate) fn with_public_cors(response: String) -> String {
     format!("{head}\r\nAccess-Control-Allow-Origin: *{rest}")
 }
 
-/// Rewrite a JSON response's CORS posture for the fleet Access APIs: echo
-/// the specific origin only when it passed the fleet allowlist (stripping
-/// any pre-existing ACAO — duplicates are invalid to browsers). These six
-/// routes must never be wildcard-readable — a cert-installed browser would
-/// happily authenticate reads for any website.
-pub(crate) fn with_fleet_cors(response: String, allowed_origin: Option<&str>) -> String {
-    let Some(split) = response.find("\r\n\r\n") else {
-        return response;
-    };
-    let (head, rest) = response.split_at(split);
-    let mut lines: Vec<&str> = head
-        .split("\r\n")
-        .filter(|line| {
-            !line
-                .to_ascii_lowercase()
-                .starts_with("access-control-allow-origin:")
-        })
-        .collect();
-    let echo;
-    if let Some(origin) = allowed_origin {
-        echo = format!("Access-Control-Allow-Origin: {origin}");
-        lines.push(&echo);
-    }
-    lines.push("Vary: Origin");
-    format!("{}{rest}", lines.join("\r\n"))
-}
-
 /// Body cap for the public /connect/dashboard signaling arms (SDP offers
 /// and ICE batches stay far below this; the lane is reachable before any
 /// authentication, so it must never buffer unbounded input).
@@ -816,7 +790,10 @@ mod tests {
              \r\n\
              <h1>gone</h1>"
         );
-        // The builder's CORS postures match the string post-processors.
+        // The builder's CORS postures match the historical
+        // post-processor bytes (the string-form fleet helper is gone —
+        // the builder is the one fleet renderer, so its shapes are
+        // pinned literally).
         assert_eq!(
             HttpResponse::json("200 OK", "{}")
                 .public_cors()
@@ -827,16 +804,28 @@ mod tests {
             HttpResponse::json("200 OK", "{}")
                 .fleet_cors(Some("https://fleet.example"))
                 .into_string(),
-            with_fleet_cors(
-                json_response("200 OK", "{}".to_string()),
-                Some("https://fleet.example")
-            )
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 2\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n\
+             Access-Control-Allow-Origin: https://fleet.example\r\n\
+             Vary: Origin\r\n\
+             \r\n\
+             {}"
         );
         assert_eq!(
             HttpResponse::json("200 OK", "{}")
                 .fleet_cors(None)
                 .into_string(),
-            with_fleet_cors(json_response("200 OK", "{}".to_string()), None)
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 2\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n\
+             Vary: Origin\r\n\
+             \r\n\
+             {}"
         );
     }
 
@@ -964,19 +953,19 @@ mod tests {
         assert!(!is_fleet_cors_access_path("/api/access/org-grants"));
         assert!(!is_fleet_cors_access_path("/api/access/org-grants/issue"));
 
-        // The generic helper's wildcard must be REPLACED, never duplicated.
-        let with = with_fleet_cors(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}".to_string(),
-            Some("https://daemon.local:8765"),
-        );
+        // A pre-existing wildcard must be REPLACED, never duplicated.
+        let with = HttpResponse::with_content("200 OK", "application/json", "{}")
+            .header("Access-Control-Allow-Origin", "*")
+            .fleet_cors(Some("https://daemon.local:8765"))
+            .into_string();
         assert_eq!(with.matches("Access-Control-Allow-Origin").count(), 1);
         assert!(with.contains("Access-Control-Allow-Origin: https://daemon.local:8765"));
         assert!(with.contains("Vary: Origin"));
         assert!(with.ends_with("\r\n\r\n{}"));
-        let without = with_fleet_cors(
-            "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}".to_string(),
-            None,
-        );
+        let without = HttpResponse::with_content("200 OK", "application/json", "{}")
+            .header("Access-Control-Allow-Origin", "*")
+            .fleet_cors(None)
+            .into_string();
         assert!(!without.contains("Access-Control-Allow-Origin"));
         assert!(without.contains("Vary: Origin"));
     }
