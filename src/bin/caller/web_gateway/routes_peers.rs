@@ -53,8 +53,32 @@ pub(crate) async fn handle_doorbell(
     finalize_http_stream(&mut stream).await;
 }
 
+/// The peers family's historical JSON framing: the family predates the
+/// posture-derived CORS renderers, so its wildcard tail (`Cache-Control`,
+/// `Access-Control-Allow-Origin: *`, the per-handler `Allow-Methods`
+/// list, `Allow-Headers`, `Connection: close`) rides the response
+/// headers verbatim — the row posture (`OwnOrigin`) appends nothing on
+/// top. The golden transcripts pin these bytes.
+fn peers_family_api_response(
+    status: u16,
+    body: String,
+    allow_methods: &'static str,
+) -> ApiResponse {
+    ApiResponse::Json {
+        status,
+        body: JsonBody::PreSerialized(body),
+        headers: vec![
+            ("Cache-Control", "no-cache".to_string()),
+            ("Access-Control-Allow-Origin", "*".to_string()),
+            ("Access-Control-Allow-Methods", allow_methods.to_string()),
+            ("Access-Control-Allow-Headers", "Content-Type".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+    }
+}
+
 pub(crate) async fn handle_peers_sub_router(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     request_line: &str,
     req_method: &str,
@@ -63,32 +87,67 @@ pub(crate) async fn handle_peers_sub_router(
     project_root: Option<PathBuf>,
     peer_registry: Option<crate::peer::PeerRegistry>,
 ) {
-    // Peer registry endpoints. Dispatch:
-    //   GET    /api/peers                  → list
-    //   POST   /api/peers                  → add
-    //   DELETE /api/peers                  → remove
-    //   POST   /api/peers/pairing/invite   → issue pairing invite
-    //   POST   /api/peers/pairing/join     → import pairing invite
-    //   POST   /api/peers/{id}/message     → send message
-    //   POST   /api/peers/{id}/task        → delegate task
-    //   POST   /api/peers/{id}/approval    → resolve approval
-    //
-    // When no registry is wired in (test call sites
-    // that pass None), every request returns 503 so
-    // the dashboard can render "peers unavailable"
-    // instead of the empty list that a working-but-
-    // empty registry would produce.
-    use tokio::io::AsyncWriteExt;
-
-    // Extract subpath after `/api/peers`. The list/
-    // add/remove ops have an empty subpath; per-peer
-    // ops have `/{id}/{op}`. Extract the *path*
-    // token from the request line first (the second
-    // whitespace-separated word) — splitting on
-    // `/api/peers` directly would walk into the
-    // ` HTTP/1.1` suffix and mistake `HTTP` and `1.1`
-    // for path segments.
+    // Extract the *path* token from the request line (the second
+    // whitespace-separated word) — splitting on `/api/peers` directly
+    // would walk into the ` HTTP/1.1` suffix and mistake `HTTP` and
+    // `1.1` for path segments.
     let path_token = request_line.split_whitespace().nth(1).unwrap_or("");
+    let response = peers_sub_router_api_response(
+        req_method,
+        path_token,
+        &body_text,
+        &cert_dir,
+        &bus,
+        project_root.as_deref(),
+        peer_registry.as_ref(),
+    )
+    .await;
+    write_api_response(
+        stream,
+        response,
+        crate::gateway_routes::CorsPosture::OwnOrigin,
+        None,
+    )
+    .await;
+}
+
+/// The peers sub-router, transport-neutral (transport-unification S7):
+/// one handler unit — per-leaf resolution (path-addressed here; the
+/// datachannel twins address the same leaves by method name and
+/// params) plus the family's historical envelope. Deliberately still
+/// one function: the leaves stay intact and the handler keeps owning
+/// the JSON 404/405 shapes for garbage subpaths (design §2.7; per-leaf
+/// route rows exist for declaration, the `Any` catch-all row keeps
+/// dispatch behavior).
+///
+/// Dispatch:
+///   GET    /api/peers                  → list
+///   POST   /api/peers                  → add
+///   DELETE /api/peers                  → remove
+///   GET    /api/peers/eligible         → capability-filtered list
+///   POST   /api/peers/pairing/invite   → issue pairing invite
+///   POST   /api/peers/pairing/join     → import pairing invite
+///   POST   /api/peers/pairing/request-access[/poll] → doorbell client
+///   GET    /api/peers/pairing/requests|identities   → pairing reads
+///   POST   /api/peers/pairing/requests/{code}/{op}  → decision
+///   POST   /api/peers/pairing/identities/revoke     → revoke identity
+///   POST   /api/peers/{id}/message|task|approval    → quick controls
+///   POST   /api/peers/{id}/webrtc|file-transfer-webrtc|
+///          dashboard-control-webrtc                 → signaling relays
+///
+/// When no registry is wired in (test call sites that pass None),
+/// every registry-backed leaf returns 503 so the dashboard can render
+/// "peers unavailable" instead of the empty list that a working-but-
+/// empty registry would produce.
+pub(crate) async fn peers_sub_router_api_response(
+    req_method: &str,
+    path_token: &str,
+    body_text: &str,
+    cert_dir: &Path,
+    bus: &EventBus,
+    project_root: Option<&Path>,
+    peer_registry: Option<&crate::peer::PeerRegistry>,
+) -> ApiResponse {
     // Split path from query string. `/api/peers/eligible
     // ?capability=display` needs the query stripped before
     // we extract subpath segments.
@@ -103,31 +162,25 @@ pub(crate) async fn handle_peers_sub_router(
     let segments: Vec<&str> = subpath.split('/').filter(|s| !s.is_empty()).collect();
 
     let (status, body) = if segments == ["pairing", "invite"] && req_method == "POST" {
-        peers_pairing_invite(&body_text)
+        peers_pairing_invite(body_text)
     } else if segments == ["pairing", "request-access"] && req_method == "POST" {
-        peers_pairing_request_access(&cert_dir, &body_text).await
+        peers_pairing_request_access(cert_dir, body_text).await
     } else if segments == ["pairing", "request-access", "poll"] && req_method == "POST" {
-        peers_pairing_request_access_poll(
-            peer_registry.as_ref(),
-            project_root.as_deref(),
-            &cert_dir,
-            &body_text,
-        )
-        .await
+        peers_pairing_request_access_poll(peer_registry, project_root, cert_dir, body_text).await
     } else if segments == ["pairing", "requests"] && req_method == "GET" {
-        peers_pairing_requests_list(&cert_dir)
+        peers_pairing_requests_list(cert_dir)
     } else if segments == ["pairing", "identities"] && req_method == "GET" {
-        peers_pairing_identities_list_from_cert_dir(&cert_dir)
+        peers_pairing_identities_list_from_cert_dir(cert_dir)
     } else if segments == ["pairing", "identities", "revoke"] && req_method == "POST" {
-        peers_pairing_identity_revoke_from_cert_dir(&cert_dir, &body_text)
+        peers_pairing_identity_revoke_from_cert_dir(cert_dir, body_text)
     } else if segments.len() == 4
         && segments[0] == "pairing"
         && segments[1] == "requests"
         && req_method == "POST"
     {
-        peers_pairing_request_decision(&cert_dir, segments[2], segments[3], &body_text)
+        peers_pairing_request_decision(cert_dir, segments[2], segments[3], body_text)
     } else {
-        match peer_registry.as_ref() {
+        match peer_registry {
             None => (
                 503,
                 serde_json::json!({
@@ -142,9 +195,9 @@ pub(crate) async fn handle_peers_sub_router(
                 if segments.is_empty() && (req_method == "POST" || req_method == "DELETE") =>
             {
                 if req_method == "POST" {
-                    peers_add(registry, project_root.as_deref(), &body_text).await
+                    peers_add(registry, project_root, body_text).await
                 } else {
-                    peers_remove(registry, &body_text).await
+                    peers_remove(registry, body_text).await
                 }
             }
             Some(registry) if segments == ["eligible"] && req_method == "GET" => {
@@ -159,21 +212,21 @@ pub(crate) async fn handle_peers_sub_router(
                 peers_eligible(registry, query_str)
             }
             Some(registry) if segments == ["pairing", "join"] && req_method == "POST" => {
-                peers_pairing_join(registry, project_root.as_deref(), &body_text).await
+                peers_pairing_join(registry, project_root, body_text).await
             }
             Some(registry) if segments.len() == 2 && req_method == "POST" => {
                 let id = url_path_decode(segments[0]);
                 let op = segments[1];
                 match op {
-                    "message" => peers_send_message(registry, &id, &body_text).await,
-                    "task" => peers_delegate_task(registry, &id, &body_text).await,
-                    "approval" => peers_resolve_approval(registry, &id, &body_text).await,
-                    "webrtc" => peers_webrtc_signal(registry, &id, &body_text, &bus).await,
+                    "message" => peers_send_message(registry, &id, body_text).await,
+                    "task" => peers_delegate_task(registry, &id, body_text).await,
+                    "approval" => peers_resolve_approval(registry, &id, body_text).await,
+                    "webrtc" => peers_webrtc_signal(registry, &id, body_text, bus).await,
                     "file-transfer-webrtc" => {
-                        peers_file_transfer_signal(registry, &id, &body_text, &bus).await
+                        peers_file_transfer_signal(registry, &id, body_text, bus).await
                     }
                     "dashboard-control-webrtc" => {
-                        peers_dashboard_control_signal(registry, &id, &body_text, &bus).await
+                        peers_dashboard_control_signal(registry, &id, body_text, bus).await
                     }
                     other => (
                         404,
@@ -195,30 +248,14 @@ pub(crate) async fn handle_peers_sub_router(
             ),
         }
     };
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "Error",
-    };
-    let response =
-        HttpResponse::with_content(format!("{} {}", status, reason), "application/json", body)
-            .header("Cache-Control", "no-cache")
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-            .header("Access-Control-Allow-Headers", "Content-Type")
-            .header("Connection", "close")
-            .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    // The family reason ladder is status_reason's: every status the
+    // leaves produce (200/400/404/405/500/502/503) maps identically,
+    // pinned by peers_family_reason_ladder_is_preserved below.
+    peers_family_api_response(status, body, "GET, POST, DELETE, OPTIONS")
 }
 
 pub(crate) async fn handle_coordinator_route(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     req_method: &str,
     peer_registry: Option<crate::peer::PeerRegistry>,
@@ -230,8 +267,26 @@ pub(crate) async fn handle_coordinator_route(
     // ..., "client_correlation_id": "..."}}.
     // Response: {"peer_id": "...", "task_id": "..."}
     // on success, structured error otherwise.
-    use tokio::io::AsyncWriteExt;
-    let (status, body) = match peer_registry.as_ref() {
+    let response =
+        coordinator_route_api_response(req_method, &body_text, peer_registry.as_ref()).await;
+    write_api_response(
+        stream,
+        response,
+        crate::gateway_routes::CorsPosture::OwnOrigin,
+        None,
+    )
+    .await;
+}
+
+/// The coordinator route, transport-neutral (transport-unification
+/// S7): the same core the `api_coordinator_route` datachannel twin
+/// runs, under the family's historical envelope.
+pub(crate) async fn coordinator_route_api_response(
+    req_method: &str,
+    body_text: &str,
+    peer_registry: Option<&crate::peer::PeerRegistry>,
+) -> ApiResponse {
+    let (status, body) = match peer_registry {
         None => (
             503,
             serde_json::json!({
@@ -246,28 +301,9 @@ pub(crate) async fn handle_coordinator_route(
             })
             .to_string(),
         ),
-        Some(registry) => coordinator_route(registry, &body_text).await,
+        Some(registry) => coordinator_route(registry, body_text).await,
     };
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "Error",
-    };
-    let response =
-        HttpResponse::with_content(format!("{} {}", status, reason), "application/json", body)
-            .header("Cache-Control", "no-cache")
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Access-Control-Allow-Methods", "POST, OPTIONS")
-            .header("Access-Control-Allow-Headers", "Content-Type")
-            .header("Connection", "close")
-            .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    peers_family_api_response(status, body, "POST, OPTIONS")
 }
 
 /// Wrapper for the `GET /api/peers` JSON body.
@@ -2710,6 +2746,28 @@ mod tests {
                 &serde_json::json!({"error": "unknown pairing request decision"}).to_string(),
             )
         );
+    }
+
+    /// The family's pre-conversion handlers carried their own reason
+    /// ladder; the neutral core renders through the shared
+    /// `status_reason`. For every status the leaves can produce
+    /// (peer_error_response's 404/405/502/500, the decode 400s, the
+    /// registry 503s, and 200) the two ladders agree — pinned here so
+    /// the 502 relay class (unreachable in a hermetic fixture) keeps
+    /// its historical `Bad Gateway` status line.
+    #[test]
+    fn peers_family_reason_ladder_is_preserved() {
+        for (status, legacy_reason) in [
+            (200, "OK"),
+            (400, "Bad Request"),
+            (404, "Not Found"),
+            (405, "Method Not Allowed"),
+            (500, "Internal Server Error"),
+            (502, "Bad Gateway"),
+            (503, "Service Unavailable"),
+        ] {
+            assert_eq!(status_reason(status), format!("{status} {legacy_reason}"));
+        }
     }
 
     #[tokio::test]

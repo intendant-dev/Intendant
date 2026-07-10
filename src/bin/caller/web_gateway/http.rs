@@ -732,6 +732,11 @@ pub(crate) fn status_reason(status: u16) -> &'static str {
         416 => "416 Range Not Satisfiable",
         429 => "429 Too Many Requests",
         500 => "500 Internal Server Error",
+        // The peers family's relay-failure class (peer_error_response,
+        // coordinator delegation): NotConnected/Transport/Auth/Rejected
+        // answer 502 through the shared renderer since the S7
+        // conversion.
+        502 => "502 Bad Gateway",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     }
