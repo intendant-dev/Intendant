@@ -124,7 +124,5 @@ function ui2VoiceBuildPanel() {
   applyState();
 }
 
-if (ui2Enabled()) {
-  if (document.readyState === 'complete') ui2VoiceBuildPanel();
-  else document.addEventListener('DOMContentLoaded', ui2VoiceBuildPanel, { once: true });
-}
+if (document.readyState === 'complete') ui2VoiceBuildPanel();
+else document.addEventListener('DOMContentLoaded', ui2VoiceBuildPanel, { once: true });

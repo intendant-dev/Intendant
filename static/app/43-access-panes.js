@@ -661,9 +661,8 @@ function renderAccessExplainer() {
   const mount = document.getElementById('access-model-explainer');
   if (!mount || mount.dataset.built === 'true') return;
   mount.dataset.built = 'true';
-  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
-    // ui-v2 only: the design's "How access works" section eyebrow. The v1
-    // explainer renders headless, so this is additive and flag-gated.
+  {
+    // The design's "How access works" section eyebrow.
     const head = document.createElement('div');
     head.className = 'ui2-acc-explainer-head';
     head.textContent = 'How access works';
@@ -2278,7 +2277,6 @@ function renderAccessIamStateCard() {
    Access subtabs. Injected at render time under the flag so the v1 DOM
    stays byte-identical; idempotent, so ticks cost one getElementById. */
 function ui2AccessEnsurePageChrome() {
-  if (typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
   if (document.getElementById('ui2-access-pagehead')) return;
   const subtabs = document.getElementById('access-subtabs');
   if (!subtabs || !subtabs.parentElement) return;
@@ -2298,14 +2296,11 @@ function ui2AccessEnsurePageChrome() {
 function renderAccessAdminSummaries() {
   if (!document.getElementById('tab-access')) return;
   ui2AccessEnsurePageChrome();
-  // Under ui-v2 the vault + custody sections live on their own #vault pane
+  // The vault + custody sections live on their own #vault pane
   // (re-parented at boot): give them the same tick-driven cadence there
-  // that this fanout provides while the Access pane is visible under v1
-  // (lease countdowns, custody freshness). The v1 path is untouched —
-  // renderAccessVaultSection() still runs from the fanout below.
-  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
-    renderOrDefer('vault', 'vault-section', renderAccessVaultSection);
-  }
+  // that this fanout provides for the Access pane (lease countdowns,
+  // custody freshness).
+  renderOrDefer('vault', 'vault-section', renderAccessVaultSection);
   // Transport ticks call this 17-renderer fanout constantly; skip the DOM
   // work while the Access pane is hidden and run once on the next entry.
   if (!paneIsVisible('access')) {

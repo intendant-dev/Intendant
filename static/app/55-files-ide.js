@@ -27,10 +27,7 @@ function switchFilesSubtab(name) {
 // palette: sky = this daemon, violet = peer). Applied to the active editor
 // tab, tree selection, and the statusbar host chip via --files-accent.
 function filesIdeApplyAccent(hostId) {
-  const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
-  const accent = hostId
-    ? (ui2 ? 'var(--violet)' : 'var(--mauve)')
-    : (ui2 ? 'var(--sky)' : 'var(--blue)');
+  const accent = hostId ? 'var(--violet)' : 'var(--sky)';
   document.getElementById('tab-files')?.style.setProperty('--files-accent', accent);
 }
 
@@ -910,9 +907,8 @@ function filesIdeSetSaveStatus(kind, text) {
 function filesIdeUpdateLnCol() {
   const el = document.getElementById('files-ide-status-lncol');
   if (!el) return;
-  const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
   const buffer = filesIdeActiveBuffer();
-  if (!ui2 || !buffer || !filesIdeCm) {
+  if (!buffer || !filesIdeCm) {
     if (el.textContent) el.textContent = '';
     return;
   }
@@ -2492,10 +2488,9 @@ function daemonInternalUnfueled() {
 
 function refreshFuelStateForBanner() {
   const status = dashboardControlTransport?.lastStatus;
-  // ui-v2's green Fueled banner names the fueled providers, so under the
-  // flag the one-shot probe also runs when the status frame already
-  // answered the boolean; v1 keeps the original short-circuits.
-  const wantProviders = typeof ui2Enabled === 'function' && ui2Enabled() && daemonFuelProviders === null;
+  // The green Fueled banner names the fueled providers, so the one-shot
+  // probe also runs when the status frame already answered the boolean.
+  const wantProviders = daemonFuelProviders === null;
   if (status && typeof status.fueled === 'boolean' && !wantProviders) return;
   if ((daemonUnfueledCached !== null && !wantProviders) || daemonFuelProbeInFlight) return;
   if (typeof fetchApiKeyStatus !== 'function') return;
@@ -2627,7 +2622,7 @@ function ui2SyncExecSeg() {
   }
 }
 
-if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+{
   const wrap = document.getElementById('new-session-execution-wrap');
   if (wrap && wrap.parentElement) {
     const field = document.createElement('div');
@@ -2679,16 +2674,15 @@ function updateNewSessionFuelBanner() {
     btn.title = show ? 'Internal sessions need an API key or a vault credential lease' : '';
   }
 
-  // ui-v2 only: the design's green happy-path banner. Shown exclusively
-  // when fuel is positively known (status frame `fueled === true` or the
-  // key probe found a provider) — an unknown state shows neither banner,
-  // never a claimed one. v1 never unhides this element.
+  // The design's green happy-path banner. Shown exclusively when fuel is
+  // positively known (status frame `fueled === true` or the key probe
+  // found a provider) — an unknown state shows neither banner, never a
+  // claimed one.
   const fueledBanner = document.getElementById('new-session-fueled-banner');
   if (fueledBanner) {
-    const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
     const status = dashboardControlTransport?.lastStatus;
     const knownFueled = (status && status.fueled === true) || daemonUnfueledCached === false;
-    const showFueled = ui2 && internalSelected && !show && knownFueled;
+    const showFueled = internalSelected && !show && knownFueled;
     fueledBanner.classList.toggle('hidden', !showFueled);
     if (showFueled) {
       const textEl = document.getElementById('new-session-fueled-text');

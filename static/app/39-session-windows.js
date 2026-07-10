@@ -2107,7 +2107,7 @@ function shouldDetachConcurrentLogStream() {
   // grid is CSS-hidden without touching its .hidden class) — never park
   // the stream in the detached fragment there, or Focus shows nothing.
   const root = document.documentElement;
-  if (root.classList.contains('ui-v2') && root.dataset.ui2Layout !== 'grid') return false;
+  if (root.dataset.ui2Layout !== 'grid') return false;
   const grid = document.getElementById('session-window-grid');
   return !!grid
     && !grid.classList.contains('hidden')

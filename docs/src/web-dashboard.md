@@ -7,9 +7,8 @@ mobile-responsive). Since the design-overhaul flip the default look is the
 **v2 chrome** (Iris accent: left navigation rail, oversight bar, ⌘K command
 palette, bottom composer). Dark is the default theme; a **light theme** ships
 alongside it (Settings → Appearance, or the ⌘K theme toggle — browser-scoped,
-persisted per browser). The previous Catppuccin Mocha generation remains
-reachable at `?ui=v1` as an escape hatch during the soak period, after which
-it will be deleted. The SPA is served as one
+persisted per browser). The previous Catppuccin Mocha generation and its
+`?ui=v1` escape hatch were deleted after the soak period. The SPA is served as one
 self-contained file, `static/app.html` — a **generated artifact**: `build.rs`
 assembles it from the ordered fragments in `static/app/` (`manifest.txt` fixes
 the order) via `crates/app-html-assembler`, and CI rejects any drift between
@@ -95,8 +94,7 @@ top carries the phase pill, stop control, context meter, transport state, the
 Activity Focus/Grid layout toggle, and the ⌘K command palette; the composer —
 the global task input — docks at the bottom and reaches the daemon from any
 destination. New events arriving while you are elsewhere raise a badge on the
-rail item. (Under `?ui=v1` the same panes hang off the classic top tab bar;
-Vault lives inside Access there.)
+rail item.
 
 The section headings below keep the internal pane names (`Video` is the Live
 display destination, `Stats` is Usage) — ids, routes, and deep links are
@@ -366,8 +364,7 @@ concepts separate (see
   to the live presence (voice) model only.
 
 Both modes revoke from the same card (**Stop viewing** / **Revoke
-access**), the v1 status-bar chip (`off`/`view`/`on`) stays a pure
-toggle with its historical agent-share semantics, and
+access**), and
 `GET /api/displays` annotates entries with `capture_active` +
 `agent_visible` so pickers and chips can render live state.
 
@@ -613,9 +610,9 @@ Unified administration for how dashboards and daemons reach each other:
   identities, and every peer-profile grant in both directions.
 - **Diagnostics** owns dashboard route health, including hosted Connect,
   local/mTLS, local WebRTC control, event delivery, byte streams, uploads, and
-  self-tests. The status-bar access dot links here, and its prefix names the
-  actual route (`mTLS`, `Connect`, `WebRTC`, or `local`) so "Ready" is never
-  ambiguous.
+  self-tests. The oversight bar's access dot links here, and its prefix names
+  the actual route (`mTLS`, `Connect`, `WebRTC`, or `local`) so "Ready" is
+  never ambiguous.
 - **Advanced** is the poweruser den: the role catalog and the exact
   policy×permission matrix, every grant with policy/transport/reason detail,
   the raw model inspector (principals, grants, policies, permissions, IAM
@@ -1800,7 +1797,7 @@ cross-refresh resume tokens, and any remaining non-allowlisted control
 mutations should move only after resumable stream/file-transfer semantics and
 per-action no-replay rules are settled.
 
-The dashboard status bar now exposes the selected control transport. Direct
+The oversight bar exposes the selected control transport. Direct
 dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
 shows `checking`, verified `WebRTC`, `relay` when browser ICE stats report a
 TURN-relayed candidate pair, or `failed` when signaling or daemon-binding

@@ -253,10 +253,10 @@ function showDisplayPicker(displays, mode) {
   // to the live rail's "Your screen" card (the control that proxies the
   // grant under v2). Single-display hosts grant instantly and never open
   // the picker, which is why this only bit multi-display setups.
-  if (typeof ui2Enabled === 'function' && ui2Enabled() && picker.closest('#status-bar')) {
+  if (picker.closest('#status-bar')) {
     document.body.appendChild(picker);
   }
-  if (typeof ui2Enabled === 'function' && ui2Enabled() && picker.parentElement === document.body) {
+  if (picker.parentElement === document.body) {
     const anchor = document.getElementById('ui2-live-yourscreen');
     const rect = anchor ? anchor.getBoundingClientRect() : null;
     picker.style.position = 'fixed';

@@ -508,9 +508,9 @@ function buildSessionCard(m, derived, ctx) {
   if (!isExternal && hasExternalBackend && backendSource && backendSource !== 'intendant') {
     sourceEl.title = `${prettyAgentName(backendSource) || backendSource} backend`;
   }
-  // ui-v2 badge tint is CSS-keyed off the normalized source id (native=iris,
-  // codex=neutral, claude-code=amber); v1 renders no attribute.
-  if (typeof ui2Enabled === 'function' && ui2Enabled()) sourceEl.dataset.src = source;
+  // Badge tint is CSS-keyed off the normalized source id (native=iris,
+  // codex=neutral, claude-code=amber).
+  sourceEl.dataset.src = source;
   top.appendChild(sourceEl);
 
   if (rowIsPartial) {

@@ -10,38 +10,22 @@
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#0B0C10">
 <script>
-  // ui-v2 flag (design-overhaul program): decide before first paint so
-  // neither UI generation flashes. `?ui=v2` / `?ui=v1` overrides and
-  // persists; otherwise localStorage wins. v2 is the DEFAULT since the
-  // P3 flip — `?ui=v1` (or a stored '0') is the soak-period escape
-  // hatch until the v1 chrome is deleted. The class lives on <html> —
-  // all v2 styles are scoped under `html.ui-v2` and inert without it.
+  // The ui-v2 chrome is the only generation (the v1 chrome + its
+  // `?ui=v1` soak-period escape hatch were deleted post-soak). The
+  // `.ui-v2` class stays on <html> as the permanent scoping namespace —
+  // every chrome style is written under `html.ui-v2`, and stripping the
+  // prefix from ~2k selectors would only lower their specificity.
   (function () {
-    var on = true;
+    document.documentElement.classList.add('ui-v2');
+    // Light theme (design-system import): browser-scoped preference,
+    // stamped pre-paint so neither theme flashes.
     try {
-      var q = new URLSearchParams(location.search).get('ui');
-      if (q === 'v2' || q === 'v1') {
-        on = q === 'v2';
-        localStorage.setItem('intendant.ui2', on ? '1' : '0');
-      } else {
-        on = localStorage.getItem('intendant.ui2') !== '0';
+      if (localStorage.getItem('intendant.ui2.theme') === 'light') {
+        document.documentElement.setAttribute('data-theme', 'light');
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute('content', '#F5F6FB');
       }
-    } catch (e) { /* storage unavailable: v2 default */ }
-    var meta = document.querySelector('meta[name="theme-color"]');
-    if (on) {
-      document.documentElement.classList.add('ui-v2');
-      // Light theme (design-system import): browser-scoped preference,
-      // stamped pre-paint so neither theme flashes.
-      try {
-        if (localStorage.getItem('intendant.ui2.theme') === 'light') {
-          document.documentElement.setAttribute('data-theme', 'light');
-          if (meta) meta.setAttribute('content', '#F5F6FB');
-        }
-      } catch (e) { /* private mode: dark */ }
-    } else if (meta) {
-      // v1 keeps its Catppuccin crust tab tint during the soak.
-      meta.setAttribute('content', '#11111b');
-    }
+    } catch (e) { /* private mode: dark */ }
   })();
 </script>
 <style>
@@ -85,27 +69,9 @@
 }
 /* ── static/app/10-styles-shell.css ── */
 :root {
-  --base: #1e1e2e;
-  --mantle: #181825;
-  --crust: #11111b;
-  --surface0: #313244;
-  --surface1: #45475a;
-  --surface2: #585b70;
-  --overlay0: #6c7086;
-  --overlay1: #7f849c;
-  --text: #cdd6f4;
-  --subtext0: #a6adc8;
-  --subtext1: #bac2de;
-  --blue: #89b4fa;
-  --green: #a6e3a1;
-  --teal: #94e2d5;
-  --yellow: #f9e2af;
-  --peach: #fab387;
-  --red: #f38ba8;
-  --mauve: #cba6f7;
-  --lavender: #b4befe;
-  --sapphire: #74c7ec;
-
+  /* Base palette names (--base, --surface0, --text, --blue, ...) are
+     supplied by the alias layer in 16-styles-v2-tokens.css (html.ui-v2
+     is always stamped). The derived vars below resolve through it. */
   --log-info: var(--text);
   --log-model: var(--blue);
   --log-agent: var(--teal);
@@ -192,268 +158,8 @@ html {
   height: 100%;
 }
 
-/* ── Status Bar ── */
-.status-bar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 6px 12px;
-  background: var(--glass-bg-deep);
-  border-bottom: 1px solid var(--glass-hairline-bright);
-  -webkit-backdrop-filter: var(--glass-blur);
-  backdrop-filter: var(--glass-blur);
-  box-shadow: var(--glass-highlight), 0 1px 10px rgba(0, 0, 0, 0.2);
-  flex-shrink: 0;
-  flex-wrap: wrap;
-  overflow-x: hidden;
-  white-space: normal;
-  row-gap: 4px;
-  font-size: 12px;
-}
-.status-bar > span,
-.status-bar > div {
-  min-width: 0;
-  white-space: nowrap;
-}
-.status-bar .host-label {
-  color: var(--peach);
-  font-weight: 600;
-  padding: 1px 6px;
-  background: var(--surface0);
-  border-radius: 3px;
-  font-size: 10px;
-  letter-spacing: 0.3px;
-}
-/* Aggregate multi-host connection state: one dot summarizing all
-   configured secondaries. Hidden on single-host setups. Click jumps
-   to Access targets. */
-.hosts-aggregate-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--overlay0);
-  flex-shrink: 0;
-  cursor: pointer;
-  margin-right: 4px;
-}
-.hosts-aggregate-dot.ok { background: var(--green); }
-.hosts-aggregate-dot.warn { background: var(--yellow); }
-.hosts-aggregate-dot.err { background: var(--red); }
-.status-bar .provider,
-.status-bar .model,
-.status-bar .session,
-.status-bar #sb-dashboard-transport-label,
-.status-bar #sb-voice-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.status-bar .provider {
-  color: var(--blue);
-  max-width: min(140px, 18vw);
-}
-.status-bar .model {
-  color: var(--green);
-  max-width: min(260px, 26vw);
-}
-.status-bar .turn { color: var(--yellow); }
-.status-bar .session {
-  color: var(--overlay1);
-  font-size: 11px;
-  max-width: min(220px, 22vw);
-}
-.status-bar #sb-voice-label {
-  display: inline-block;
-  max-width: 96px;
-  vertical-align: bottom;
-  font-size: 11px;
-  color: var(--overlay0);
-}
-.status-bar #sb-dashboard-transport-label {
-  display: inline-block;
-  color: var(--overlay0);
-  font-size: 11px;
-  max-width: 112px;
-  vertical-align: bottom;
-}
-.status-bar .autonomy {
-  font-weight: 600;
-  cursor: pointer;
-  text-decoration: underline dotted;
-}
-.status-bar .sep { color: var(--surface2); }
-.status-bar .field-label { color: var(--overlay0); font-size: 10px; margin-right: -6px; }
-/* The negative margin above is sized for direct status-bar children
-   (which have an 8px flex gap, so -6 leaves a 2px effective gap).
-   Inside our nested wrappers (`inline-flex` with their own small gap)
-   it overshoots into a visible overlap. Reset the margin in those
-   contexts so the wrapper's own gap rule controls the spacing. */
-.status-bar .display-toggle-wrap .field-label,
-.status-bar .sb-dot-group .field-label { margin-right: 0; }
-.status-bar .display-toggle-wrap .field-label { cursor: pointer; }
-/* Grant state colors itself: red until the user grants their display. */
-.status-bar #sb-display-access {
-  cursor: pointer;
-  font-weight: 600;
-  color: var(--red);
-}
-.status-bar #sb-display-access.granted { color: var(--green); }
-/* Private view active: the chip reads 'view' in a neutral accent — the
-   agent does NOT have the display, so the granted green stays off. */
-.status-bar #sb-display-access.view-only { color: var(--blue); }
-.display-toggle-wrap { position: relative; display: inline-flex; align-items: center; gap: 4px; }
-.display-picker {
-  display: none;
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 50%;
-  transform: translateX(-50%);
-  /* Translucent layered glass, deliberately blur-free: the open picker can
-     extend over tab content (including the Station canvases). */
-  background: linear-gradient(180deg, color-mix(in srgb, var(--surface0) 94%, transparent), color-mix(in srgb, var(--base) 96%, transparent));
-  border: 1px solid var(--glass-hairline-bright);
-  border-radius: 10px;
-  padding: 4px 0;
-  z-index: 200;
-  min-width: 200px;
-  box-shadow: var(--glass-highlight), 0 10px 28px rgba(0, 0, 0, 0.45);
-}
-.display-picker.visible { display: block; }
-.display-picker-item {
-  padding: 6px 12px;
-  cursor: pointer;
-  white-space: nowrap;
-  font-size: 12px;
-  color: var(--text);
-}
-.display-picker-item:hover { background: var(--surface1); }
-.display-picker-item .dp-primary { color: var(--green); font-size: 10px; margin-left: 4px; }
-/* Action rows (e.g. "New virtual display") sit under the capture targets. */
-.display-picker-item.dp-action { border-top: 1px solid var(--surface1); margin-top: 4px; padding-top: 8px; color: var(--blue); }
-.budget-bar {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-.budget-bar .bar-track {
-  display: inline-block;
-  width: 60px;
-  height: 6px;
-  background: var(--surface0);
-  border-radius: 3px;
-  overflow: hidden;
-}
-.budget-bar .bar-fill {
-  height: 100%;
-  border-radius: 3px;
-  transition: width 0.3s, background 0.3s;
-}
-.budget-pct { font-size: 11px; }
-
-/* ── Connection Dot ── */
-.conn-dot {
-  width: 8px; height: 8px;
-  border-radius: 50%;
-  display: inline-block;
-  flex-shrink: 0;
-}
-.conn-dot.ok { background: var(--green); }
-.conn-dot.warn { background: var(--yellow); }
-.conn-dot.err { background: var(--red); }
-
-/* Group wrapper for status-bar dot + label pairs. Each group is an
-   `inline-flex` with a tight gap so the label sticks to its dot, and
-   the wrapper's `title` attribute provides a generous hover target
-   for the tooltip instead of relying on the bare 8x8 dot. The right-
-   anchor (`margin-left: auto` for "everything floats right") lives on
-   `.active-badge` instead of any of these groups so separators flow
-   naturally between them. */
-.status-bar .sb-dot-group {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  cursor: default;
-}
-.status-bar .sb-dot-group.clickable { cursor: pointer; }
-.status-bar .sb-dot-group .sep { margin: 0 2px; }
-.status-bar .active-badge {
-  margin-left: 0;
-  flex-shrink: 0;
-}
-.status-bar .access-nav-link {
-  color: var(--blue);
-  font-size: 11px;
-  font-weight: 700;
-}
-
-body.access-page .ticker-bar,
-body.access-page .global-task-bar,
-body.access-page .tab-bar {
-  display: none;
-}
-
-body.access-page #tab-access {
-  padding-top: 0;
-}
-
-/* ── Active/Passive Badge ── */
-.active-badge {
-  font-size: 10px;
-  padding: 1px 6px;
-  border-radius: 3px;
-  cursor: pointer;
-  user-select: none;
-  font-weight: 600;
-  transition: all 0.15s;
-  border: 1px solid transparent;
-}
-.active-badge.is-active {
-  color: var(--green);
-  border-color: var(--green);
-}
-.active-badge.is-passive {
-  color: var(--peach);
-  border-color: var(--peach);
-}
-.active-badge:hover {
-  background: var(--surface1);
-}
-
-/* ── Token Ticker ── */
-.ticker-bar {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 3px 12px;
-  background: var(--glass-bg);
-  border-bottom: 1px solid var(--glass-hairline);
-  -webkit-backdrop-filter: var(--glass-blur);
-  backdrop-filter: var(--glass-blur);
-  font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
-  font-size: 11px;
-  color: var(--subtext0);
-  cursor: pointer;
-  flex-shrink: 0;
-}
-.ticker-collapsed { display: flex; gap: 8px; align-items: center; white-space: nowrap; }
-.ticker-expanded { display: flex; flex-direction: column; gap: 2px; font-size: 11px; }
-.ticker-expanded > div { white-space: nowrap; }
-.tk-sep { color: var(--surface2); }
-.ticker-chevron { color: var(--overlay0); font-size: 10px; line-height: 1; margin-top: 2px; flex-shrink: 0; }
-@keyframes tk-flash { 0% { color: var(--green); } 100% { color: inherit; } }
-.tk-flash { animation: tk-flash 0.8s ease-out; }
-
-/* ── Tab Bar ── */
-.tab-bar {
-  display: flex;
-  background: var(--glass-bg);
-  border-bottom: 1px solid var(--glass-hairline-bright);
-  -webkit-backdrop-filter: var(--glass-blur);
-  backdrop-filter: var(--glass-blur);
-  box-shadow: var(--glass-highlight);
-  flex-shrink: 0;
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
-}
+/* ── Tab buttons (shared contract: the ui-v2 rail stamps .tab-btn on its
+   nav items so the router binds them) ── */
 .tab-btn {
   padding: 8px 16px;
   min-height: 36px;
@@ -2471,9 +2177,6 @@ body.access-page #tab-access {
 .files-ide-tab .files-ide-tab-close:focus-visible {
   opacity: 1;
 }
-.files-ide-tab.dirty:hover .files-ide-tab-dirty {
-  display: none;
-}
 .files-ide-tab .files-ide-tab-close:hover {
   background: var(--surface1);
   color: var(--text);
@@ -2668,11 +2371,6 @@ body.access-page #tab-access {
   .files-ide-toolbar {
     flex-wrap: wrap;
     min-height: 0;
-  }
-  .files-ide-target-summary {
-    order: 5;
-    flex-basis: 100%;
-    max-width: 100%;
   }
   .files-ide-body {
     grid-template-columns: 1fr;
@@ -12099,24 +11797,18 @@ body.display-fullscreen-open {
   }
 }
 /* ── static/app/16-styles-v2-tokens.css ── */
-/* ── ui-v2 design tokens (design-overhaul program) ─────────────────────
-   Everything here is scoped under `html.ui-v2` and is completely inert
-   for the v1 UI: the flag is set pre-paint in 00-head.html (?ui=v2 or
-   localStorage intendant.ui2). Two layers live in this file:
+/* ── Design tokens (design-overhaul program) ───────────────────────────
+   Scoped under `html.ui-v2` — the permanent namespace class 00-head.html
+   stamps pre-paint (the v1 chrome and its runtime flag are gone). Two
+   layers live in this file:
 
-   1. The v2 token vocabulary (dark theme, Iris accent — light theme and
-      alternate accents are a later program phase). Values are the design
-      handoff's, verbatim; tokens the prototype used but never declared
-      (--iris-deep, --on-accent, --hover-wash, the -rgb triplets) are
-      declared here so no component ever hardcodes them.
-   2. The v1-bridge remaps: the Catppuccin names the existing fragments
-      consume, re-pointed at v2 tokens so not-yet-migrated panes render
-      acceptably under the v2 chrome during the migration. Deleted at
-      program end together with the v1 chrome.
-
-   Naming note: --text and --green exist in BOTH vocabularies by design —
-   under the flag the v2 definition wins everywhere, which IS the bridge
-   for those two names. */
+   1. The token vocabulary (dark + light themes, Iris accent). Values are
+      the design handoff's, verbatim; tokens the prototype used but never
+      declared (--iris-deep, --on-accent, --hover-wash, the -rgb
+      triplets) are declared here so no component ever hardcodes them.
+   2. The alias layer: the Catppuccin names the base stylesheets (10-14)
+      still consume, pointed at the tokens above. Since the v1 palette's
+      deletion this block IS those names' definition. */
 
 html.ui-v2 {
   /* — surfaces — */
@@ -12187,7 +11879,11 @@ html.ui-v2 {
   --t-med: .15s;
   --t-slow: .2s;
 
-  /* ── v1 bridge: Catppuccin vocabulary → v2 values ─────────────────── */
+  /* ── Alias layer: Catppuccin vocabulary → v2 values. Permanent —
+     the base stylesheets (10-14) consume these names ~1,900×; the
+     v1 palette that once defined them is gone, so this block IS
+     their definition now. Migrating consumers to v2 names is an
+     opportunistic mechanical refactor, per-file, no deadline. ── */
   --base: var(--bg);
   --mantle: var(--bg-1);
   --crust: var(--code-bg);
@@ -12234,9 +11930,9 @@ html.ui-v2 {
    Settings → Appearance segmented flips it). Values verbatim from the
    design system's tokens/colors-light.css: iris DEEPENS for contrast
    (--iris-2 becomes deeper ink, not brighter), semantics darken,
-   on-accent flips to white, shadows soften. The v1-bridge names follow
-   automatically; the handful of legacy rgba surfaces the v2 panes still
-   consume are remapped to the light surface vocabulary below. */
+   on-accent flips to white, shadows soften. The alias-layer names follow
+   automatically; the handful of legacy rgba surfaces still consumed via
+   the aliases are remapped to the light surface vocabulary below. */
 html.ui-v2[data-theme="light"] {
   /* — surfaces — */
   --bg: #F5F6FB;
@@ -24207,18 +23903,11 @@ const UI2_AUTONOMY_TAGS = {
   Full: 'ungated',
 };
 
+// The v1 chrome and its runtime flag are gone; the ui-v2 chrome is the
+// only generation. Kept as a constant on the QA facade so harness probes
+// written against the flag era keep working.
 function ui2Enabled() {
-  return document.documentElement.classList.contains('ui-v2');
-}
-
-// Persist + reload: the two chromes are alternate DOM, not alternate CSS
-// only, so a live toggle re-boots the app. Callers: the palette/settings
-// escape hatches and the QA harness.
-function ui2SetEnabled(on) {
-  try { localStorage.setItem('intendant.ui2', on ? '1' : '0'); } catch (e) { /* private mode */ }
-  const url = new URL(location.href);
-  url.searchParams.delete('ui');
-  location.replace(url.toString());
+  return true;
 }
 
 // Theme (design-system import): dark is the default; light remaps the
@@ -24247,7 +23936,7 @@ function ui2Icon(name, size = 18) {
 
 // QA/debug facade (mirrors the window.qa / stationProbe convention).
 window.__ui2 = {
-  enabled: ui2Enabled, setEnabled: ui2SetEnabled, icon: ui2Icon,
+  enabled: ui2Enabled, icon: ui2Icon,
   theme: ui2Theme, setTheme: ui2SetTheme,
 };
 /* ── static/app/ui2-chrome.js ── */
@@ -24730,7 +24419,7 @@ function ui2WirePalette() {
 }
 
 ui2BuildNav();
-if (ui2Enabled()) {
+{
   // Single-boot: a module script executes at readyState 'interactive', so
   // the old immediate call + DOMContentLoaded listener both fired and wired
   // everything twice — the doubled capture-phase keydown made one ⌘K
@@ -24867,10 +24556,8 @@ function ui2VoiceBuildPanel() {
   applyState();
 }
 
-if (ui2Enabled()) {
-  if (document.readyState === 'complete') ui2VoiceBuildPanel();
-  else document.addEventListener('DOMContentLoaded', ui2VoiceBuildPanel, { once: true });
-}
+if (document.readyState === 'complete') ui2VoiceBuildPanel();
+else document.addEventListener('DOMContentLoaded', ui2VoiceBuildPanel, { once: true });
 /* ── static/app/ui2-activity.js ── */
 // ── ui-v2 Activity slice 1: approval-card semantics (user-approved) ────
 // Under the flag, the approval card's bulk action becomes CATEGORY-
@@ -25161,7 +24848,7 @@ function ui2RailTick(force) {
   ui2RailSetRow('ui2-rail-changes', badgeShown ? `${badgeShown.trim()} — view diff` : 'none yet', null, null);
 }
 
-if (ui2Enabled()) {
+{
   const wire = () => {
     ui2AugmentApprovalPanel();
     ui2WireLayoutToggle();
@@ -29441,7 +29128,6 @@ function renderAccessVaultSection() {
    link card is left behind so #access/advanced deep links (unfueled
    empty-state, older bookmarks) still lead somewhere honest. */
 function ui2VaultAdoptSections() {
-  if (typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
   if (DASHBOARD_ACCESS_PAGE_MODE) return;
   const host = document.getElementById('vault-tab-sections');
   const vaultMount = document.getElementById('access-vault-section');
@@ -44971,7 +44657,7 @@ function shouldDetachConcurrentLogStream() {
   // grid is CSS-hidden without touching its .hidden class) — never park
   // the stream in the detached fragment there, or Focus shows nothing.
   const root = document.documentElement;
-  if (root.classList.contains('ui-v2') && root.dataset.ui2Layout !== 'grid') return false;
+  if (root.dataset.ui2Layout !== 'grid') return false;
   const grid = document.getElementById('session-window-grid');
   return !!grid
     && !grid.classList.contains('hidden')
@@ -54734,9 +54420,8 @@ function renderAccessExplainer() {
   const mount = document.getElementById('access-model-explainer');
   if (!mount || mount.dataset.built === 'true') return;
   mount.dataset.built = 'true';
-  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
-    // ui-v2 only: the design's "How access works" section eyebrow. The v1
-    // explainer renders headless, so this is additive and flag-gated.
+  {
+    // The design's "How access works" section eyebrow.
     const head = document.createElement('div');
     head.className = 'ui2-acc-explainer-head';
     head.textContent = 'How access works';
@@ -56351,7 +56036,6 @@ function renderAccessIamStateCard() {
    Access subtabs. Injected at render time under the flag so the v1 DOM
    stays byte-identical; idempotent, so ticks cost one getElementById. */
 function ui2AccessEnsurePageChrome() {
-  if (typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
   if (document.getElementById('ui2-access-pagehead')) return;
   const subtabs = document.getElementById('access-subtabs');
   if (!subtabs || !subtabs.parentElement) return;
@@ -56371,14 +56055,11 @@ function ui2AccessEnsurePageChrome() {
 function renderAccessAdminSummaries() {
   if (!document.getElementById('tab-access')) return;
   ui2AccessEnsurePageChrome();
-  // Under ui-v2 the vault + custody sections live on their own #vault pane
+  // The vault + custody sections live on their own #vault pane
   // (re-parented at boot): give them the same tick-driven cadence there
-  // that this fanout provides while the Access pane is visible under v1
-  // (lease countdowns, custody freshness). The v1 path is untouched —
-  // renderAccessVaultSection() still runs from the fanout below.
-  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
-    renderOrDefer('vault', 'vault-section', renderAccessVaultSection);
-  }
+  // that this fanout provides for the Access pane (lease countdowns,
+  // custody freshness).
+  renderOrDefer('vault', 'vault-section', renderAccessVaultSection);
   // Transport ticks call this 17-renderer fanout constantly; skip the DOM
   // work while the Access pane is hidden and run once on the next entry.
   if (!paneIsVisible('access')) {
@@ -57085,28 +56766,17 @@ function initShell() {
   document.getElementById('xterm-css').removeAttribute('disabled');
 
   const start = () => {
-    // ui-v2 re-themes the same instance from design tokens (and turns on
-    // the design's blinking block cursor); v1 keeps Catppuccin Mocha
-    // verbatim. Sizing/fit logic is identical in both generations.
-    const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
-    const theme = (ui2 && ui2ShellTheme()) || {
-      background: '#1e1e2e', foreground: '#cdd6f4', cursor: '#f5e0dc', cursorAccent: '#1e1e2e',
-      selectionBackground: '#45475a',
-      black: '#45475a', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
-      blue: '#89b4fa', magenta: '#cba6f7', cyan: '#94e2d5', white: '#bac2de',
-      brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
-      brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#cba6f7',
-      brightCyan: '#94e2d5', brightWhite: '#a6adc8',
-    };
-    const ui2Mono = ui2
-      ? getComputedStyle(document.documentElement).getPropertyValue('--mono').trim()
-      : '';
+    // Theme from the design tokens (blinking block cursor per the
+    // design); `|| undefined` keeps xterm's built-in default as the net
+    // if the tokens ever fail to resolve.
+    const theme = ui2ShellTheme() || undefined;
+    const mono = getComputedStyle(document.documentElement).getPropertyValue('--mono').trim();
     shellTerm = new Terminal({
       theme,
-      fontFamily: ui2Mono || "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
+      fontFamily: mono || "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
       fontSize: 13, allowProposedApi: true,
       scrollback: 5000,
-      cursorBlink: ui2,
+      cursorBlink: true,
     });
     shellFitAddon = new FitAddon.FitAddon();
     shellTerm.loadAddon(shellFitAddon);
@@ -57116,13 +56786,11 @@ function initShell() {
     // Live theme flips: xterm latched the palette resolved above; re-apply
     // from the current tokens whenever data-theme changes (a light terminal
     // otherwise sits inside a dark app, and vice versa).
-    if (ui2) {
-      new MutationObserver(() => {
-        if (!shellTerm || typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
-        const t = ui2ShellTheme();
-        if (t) shellTerm.options.theme = t;
-      }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
-    }
+    new MutationObserver(() => {
+      if (!shellTerm) return;
+      const t = ui2ShellTheme();
+      if (t) shellTerm.options.theme = t;
+    }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
     // Forward every byte the user types straight to the PTY. We use
     // `onData` (not `onKey`) so sequences like arrow keys, Ctrl+C, and
@@ -57308,13 +56976,10 @@ function wireShellKeybar() {
   // rule forces the bar visible on touch devices regardless of this class.
   const toggle = document.getElementById('keybar-toggle');
   if (toggle) {
-    // ui-v2: the Terminal sub-tab strip is hidden (Shell is its only
-    // sub-tab) and the Keys toggle joins the shell toolbar, matching the
-    // design's toolbar placement. The element keeps its id and listeners;
-    // v1 keeps the strip untouched.
-    if (typeof ui2Enabled === 'function' && ui2Enabled()) {
-      document.querySelector('#tab-terminal .shell-toolbar')?.appendChild(toggle);
-    }
+    // The Terminal sub-tab strip is hidden (Shell is its only sub-tab);
+    // the Keys toggle joins the shell toolbar, matching the design's
+    // toolbar placement. The element keeps its id and listeners.
+    document.querySelector('#tab-terminal .shell-toolbar')?.appendChild(toggle);
     const isCoarse = window.matchMedia('(pointer: coarse)').matches;
     if (isCoarse) {
       toggle.classList.add('active');
@@ -58988,7 +58653,7 @@ function applyDisplayStripState() {
 // authority copy: taking control is last-take-wins displacement between
 // viewers (no request/approve ceremony), and "another viewer has input"
 // is a first-class rendered state.
-if (typeof ui2Enabled === 'function' && ui2Enabled()) (() => {
+(() => {
   const tab = document.getElementById('tab-displays');
   if (!tab) return;
   const rail = document.createElement('aside');
@@ -62566,14 +62231,12 @@ const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug', 'autonom
 // the four design sections — and back when the flag is off — so both
 // generations of deep link keep landing somewhere sensible. 'network'
 // stays out of both maps: its Access redirect below handles it.
-const SETTINGS_SUBTAB_TO_V2 = { account: 'providers', agent: 'providers', debug: 'advanced' };
-const SETTINGS_SUBTAB_TO_V1 = { autonomy: 'agent', providers: 'account', presence: 'agent', advanced: 'debug' };
+// Legacy v1-era subtab names in old bookmarks/deep links map onto the
+// sections that absorbed them.
+const SETTINGS_SUBTAB_ALIASES = { account: 'providers', agent: 'providers', debug: 'advanced' };
 function normalizeSettingsSubtab(name) {
   const raw = String(name || '').trim();
-  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
-    return SETTINGS_SUBTAB_TO_V2[raw] || raw;
-  }
-  return SETTINGS_SUBTAB_TO_V1[raw] || raw;
+  return SETTINGS_SUBTAB_ALIASES[raw] || raw;
 }
 const ACCESS_SUBTAB_ALIASES = {
   targets: 'daemons',
@@ -64508,11 +64171,8 @@ function switchSettingsSubtab(name) {
 // inline onclick handlers (the unfueled banner's Add-keys button) and the
 // validate-dashboard harness need an explicit global.
 function focusSettingsApiKeys() {
-  // Under ui-v2 the API-keys card lives in the Providers & models
-  // section (same DOM node, re-parented) — route to the canonical
-  // per-generation section so the hash stays truthful.
-  const keysSubtab = (typeof ui2Enabled === 'function' && ui2Enabled()) ? 'providers' : 'account';
-  routeTo('settings', keysSubtab);
+  // The API-keys card lives in the Providers & models section.
+  routeTo('settings', 'providers');
   requestAnimationFrame(() => {
     const heading = document.getElementById('settings-keys-heading');
     const card = heading?.closest('.ui-card') || heading;
@@ -64551,12 +64211,10 @@ function applyInitialSettingsSubtab() {
 function updateSettingsSaveRow() {
   const row = document.querySelector('#tab-settings .settings-save-row');
   if (!row) return;
-  // ui-v2: the batch-saved /api/settings fields live in the Providers &
-  // models and Presence & voice sections; Autonomy is live-apply and
-  // Account & advanced is read-only.
-  const visible = (typeof ui2Enabled === 'function' && ui2Enabled())
-    ? (activeSettingsSubtab === 'providers' || activeSettingsSubtab === 'presence')
-    : (activeSettingsSubtab === 'agent');
+  // The batch-saved /api/settings fields live in the Providers & models
+  // and Presence & voice sections; Autonomy is live-apply and Account &
+  // advanced is read-only.
+  const visible = activeSettingsSubtab === 'providers' || activeSettingsSubtab === 'presence';
   row.style.display = visible ? '' : 'none';
 }
 
@@ -74826,8 +74484,7 @@ function renderStatsSessionSections(sessions) {
   }
   setStatsSessionLoading(currentStatsHostKey(), false);
   renderStatsKpiRow(sessions);
-  // ui-v2 only: per-model cost cards (the section exists only under the flag).
-  if (typeof ui2Enabled === 'function' && ui2Enabled()) renderUi2UsageByModel(sessions);
+  renderUi2UsageByModel(sessions);
   renderTokenActivity(sessions);
   renderAllSessionsUsage(sessions);
   renderDailyUsage(sessions);
@@ -76144,7 +75801,7 @@ function renderUi2UsageByModel(sessions) {
 // tables, disk usage, and display transport). Nodes are MOVED with
 // appendChild — ids, renderer contracts, and delegated listeners are
 // untouched — and none of this runs under v1.
-if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+{
   const usageContainer = document.getElementById('usage-container');
   if (usageContainer) {
     const head = document.createElement('div');
@@ -76499,7 +76156,6 @@ function ui2SettingsRenderRules() {
 // Hook target: called at the end of renderControlPane() (fragment 37) so
 // a rules refresh from ANY surface re-paints this card too.
 function ui2SettingsSyncFromControl() {
-  if (typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
   ui2SettingsRenderRules();
 }
 
@@ -76522,7 +76178,7 @@ function ui2SettingsSyncMirrors() {
 // Hook target: called from switchSettingsSubtab (fragment 48) after the
 // pane toggle so section-shown work runs on real switches.
 function ui2SettingsOnSubtabShown(name) {
-  if (typeof ui2Enabled !== 'function' || !ui2Enabled() || !ui2SettingsBuilt) return;
+  if (!ui2SettingsBuilt) return;
   // Sections share one scroll container — land each switch at its top,
   // not wherever the previous section was scrolled to. (Deep-link scrolls
   // like focusSettingsApiKeys run after this, in their own rAF.)
@@ -76547,7 +76203,6 @@ function ui2SettingsApplyActive() {
 
 function ui2SettingsBuild() {
   if (ui2SettingsBuilt) return;
-  if (typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
   const tab = document.getElementById('tab-settings');
   if (!tab) return;
 
@@ -76839,9 +76494,7 @@ function ui2SettingsBuild() {
   refreshControlPane();
 }
 
-if (typeof ui2Enabled === 'function' && ui2Enabled()) {
-  ui2SettingsBuild();
-}
+ui2SettingsBuild();
 /* ── static/app/53-transfer-fsm.js ── */
 // ── Files-transfer state machine ─────────────────────────────────────────
 // Every `status` write on a filesTransfers entry flows through this module:
@@ -80249,10 +79902,7 @@ function switchFilesSubtab(name) {
 // palette: sky = this daemon, violet = peer). Applied to the active editor
 // tab, tree selection, and the statusbar host chip via --files-accent.
 function filesIdeApplyAccent(hostId) {
-  const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
-  const accent = hostId
-    ? (ui2 ? 'var(--violet)' : 'var(--mauve)')
-    : (ui2 ? 'var(--sky)' : 'var(--blue)');
+  const accent = hostId ? 'var(--violet)' : 'var(--sky)';
   document.getElementById('tab-files')?.style.setProperty('--files-accent', accent);
 }
 
@@ -81132,9 +80782,8 @@ function filesIdeSetSaveStatus(kind, text) {
 function filesIdeUpdateLnCol() {
   const el = document.getElementById('files-ide-status-lncol');
   if (!el) return;
-  const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
   const buffer = filesIdeActiveBuffer();
-  if (!ui2 || !buffer || !filesIdeCm) {
+  if (!buffer || !filesIdeCm) {
     if (el.textContent) el.textContent = '';
     return;
   }
@@ -82714,10 +82363,9 @@ function daemonInternalUnfueled() {
 
 function refreshFuelStateForBanner() {
   const status = dashboardControlTransport?.lastStatus;
-  // ui-v2's green Fueled banner names the fueled providers, so under the
-  // flag the one-shot probe also runs when the status frame already
-  // answered the boolean; v1 keeps the original short-circuits.
-  const wantProviders = typeof ui2Enabled === 'function' && ui2Enabled() && daemonFuelProviders === null;
+  // The green Fueled banner names the fueled providers, so the one-shot
+  // probe also runs when the status frame already answered the boolean.
+  const wantProviders = daemonFuelProviders === null;
   if (status && typeof status.fueled === 'boolean' && !wantProviders) return;
   if ((daemonUnfueledCached !== null && !wantProviders) || daemonFuelProbeInFlight) return;
   if (typeof fetchApiKeyStatus !== 'function') return;
@@ -82849,7 +82497,7 @@ function ui2SyncExecSeg() {
   }
 }
 
-if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+{
   const wrap = document.getElementById('new-session-execution-wrap');
   if (wrap && wrap.parentElement) {
     const field = document.createElement('div');
@@ -82901,16 +82549,15 @@ function updateNewSessionFuelBanner() {
     btn.title = show ? 'Internal sessions need an API key or a vault credential lease' : '';
   }
 
-  // ui-v2 only: the design's green happy-path banner. Shown exclusively
-  // when fuel is positively known (status frame `fueled === true` or the
-  // key probe found a provider) — an unknown state shows neither banner,
-  // never a claimed one. v1 never unhides this element.
+  // The design's green happy-path banner. Shown exclusively when fuel is
+  // positively known (status frame `fueled === true` or the key probe
+  // found a provider) — an unknown state shows neither banner, never a
+  // claimed one.
   const fueledBanner = document.getElementById('new-session-fueled-banner');
   if (fueledBanner) {
-    const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
     const status = dashboardControlTransport?.lastStatus;
     const knownFueled = (status && status.fueled === true) || daemonUnfueledCached === false;
-    const showFueled = ui2 && internalSelected && !show && knownFueled;
+    const showFueled = internalSelected && !show && knownFueled;
     fueledBanner.classList.toggle('hidden', !showFueled);
     if (showFueled) {
       const textEl = document.getElementById('new-session-fueled-text');
@@ -83260,10 +82907,10 @@ let debugScreenActive = false;
 let debugRecording = false;
 const browserWorkspaces = new Map();
 
-// ui-v2 re-skin (design overhaul): the reference Debug page carries a page
-// header the v1 DOM never had. Inject it under the flag only — v1 markup
-// stays untouched; the cards, ids, and handlers below are shared by both.
-if (ui2Enabled()) {
+// Design-overhaul re-skin: the reference Debug page carries a page header
+// the original DOM never had — injected here; the cards, ids, and handlers
+// below predate it.
+{
   const debugPane = document.querySelector('#tab-debug .debug-pane');
   if (debugPane) {
     const head = document.createElement('header');
@@ -83400,8 +83047,8 @@ function renderBrowserWorkspaces() {
   for (const w of rows) {
     const card = document.createElement('div');
     card.className = 'debug-workspace-row';
-    // ui-v2 status dot is CSS-keyed off this attribute; v1 renders none.
-    if (ui2Enabled()) card.dataset.status = String(w.status || '');
+    // The status dot is CSS-keyed off this attribute.
+    card.dataset.status = String(w.status || '');
     const meta = document.createElement('div');
     meta.className = 'debug-workspace-row-main';
     const lease = w.lease ? `leased by ${w.lease.holder_id || 'unknown'}` : 'unleased';
@@ -85274,45 +84921,35 @@ function renderSessionsAggregate(sessions, el) {
   const outputTile = { label: 'Output', value: detailsLoading ? loadingValue : totalOutput.toLocaleString(), loading: detailsLoading };
   const diskTile = { label: 'Disk', value: detailsLoading ? loadingValue : _fmtBytes(totalDiskBytes), loading: detailsLoading };
 
-  let cards;
-  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
-    // ui-v2 (design overhaul): the reference KPI set — Sessions · Tokens ·
-    // Cost · Active days — leads, with the v1 breakdown tiles kept as a
-    // second row (re-homed, not deleted). All values are real: cost sums
-    // per-row estimates; active days counts distinct calendar days that
-    // saw session activity (created or last changed — the honest
-    // client-side read; no per-day server metric exists).
-    const totalCost = sessions.reduce((sum, s) => sum + (s.estimated_cost || 0), 0);
-    const activeDayKeys = new Set();
-    for (const s of sessions) {
-      for (const value of [s.created_at, s.updated_at || s.changed_at]) {
-        if (!value) continue;
-        const t = Date.parse(value);
-        if (Number.isNaN(t)) continue;
-        const d = new Date(t);
-        activeDayKeys.add(`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`);
-      }
+  // The reference KPI set — Sessions · Tokens · Cost · Active days —
+  // leads, with the breakdown tiles as a second row. All values are
+  // real: cost sums per-row estimates; active days counts distinct
+  // calendar days that saw session activity (created or last changed —
+  // the honest client-side read; no per-day server metric exists).
+  const totalCost = sessions.reduce((sum, s) => sum + (s.estimated_cost || 0), 0);
+  const activeDayKeys = new Set();
+  for (const s of sessions) {
+    for (const value of [s.created_at, s.updated_at || s.changed_at]) {
+      if (!value) continue;
+      const t = Date.parse(value);
+      if (Number.isNaN(t)) continue;
+      const d = new Date(t);
+      activeDayKeys.add(`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`);
     }
-    cards = [
-      sessionsTile,
-      { label: 'Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
-      {
-        label: 'Cost',
-        value: detailsLoading
-          ? loadingValue
-          : '$' + totalCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-        loading: detailsLoading,
-      },
-      { label: 'Active days', value: activeDayKeys.size.toLocaleString(), sub: detailsLoading ? 'visible so far' : '' },
-      inputTile, cachedTile, outputTile, diskTile,
-    ];
-  } else {
-    cards = [
-      sessionsTile,
-      { label: 'Total Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
-      inputTile, cachedTile, outputTile, diskTile,
-    ];
   }
+  const cards = [
+    sessionsTile,
+    { label: 'Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
+    {
+      label: 'Cost',
+      value: detailsLoading
+        ? loadingValue
+        : '$' + totalCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+      loading: detailsLoading,
+    },
+    { label: 'Active days', value: activeDayKeys.size.toLocaleString(), sub: detailsLoading ? 'visible so far' : '' },
+    inputTile, cachedTile, outputTile, diskTile,
+  ];
 
   renderAggregateStatTiles(el, cards);
 }
@@ -85852,9 +85489,9 @@ function buildSessionCard(m, derived, ctx) {
   if (!isExternal && hasExternalBackend && backendSource && backendSource !== 'intendant') {
     sourceEl.title = `${prettyAgentName(backendSource) || backendSource} backend`;
   }
-  // ui-v2 badge tint is CSS-keyed off the normalized source id (native=iris,
-  // codex=neutral, claude-code=amber); v1 renders no attribute.
-  if (typeof ui2Enabled === 'function' && ui2Enabled()) sourceEl.dataset.src = source;
+  // Badge tint is CSS-keyed off the normalized source id (native=iris,
+  // codex=neutral, claude-code=amber).
+  sourceEl.dataset.src = source;
   top.appendChild(sourceEl);
 
   if (rowIsPartial) {
@@ -89042,10 +88679,10 @@ function showDisplayPicker(displays, mode) {
   // to the live rail's "Your screen" card (the control that proxies the
   // grant under v2). Single-display hosts grant instantly and never open
   // the picker, which is why this only bit multi-display setups.
-  if (typeof ui2Enabled === 'function' && ui2Enabled() && picker.closest('#status-bar')) {
+  if (picker.closest('#status-bar')) {
     document.body.appendChild(picker);
   }
-  if (typeof ui2Enabled === 'function' && ui2Enabled() && picker.parentElement === document.body) {
+  if (picker.parentElement === document.body) {
     const anchor = document.getElementById('ui2-live-yourscreen');
     const rect = anchor ? anchor.getBoundingClientRect() : null;
     picker.style.position = 'fixed';
