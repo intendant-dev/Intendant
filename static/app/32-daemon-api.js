@@ -49,13 +49,16 @@
 // mirror"). KEEP ONE ENTRY PER LINE: the test parses this literal.
 //
 // Coverage: the F1 family (filesystem + staged uploads) and the F2
-// sessions-family reads (managed-context + worktrees so far). The
-// `api_transfer_*` methods are deliberately absent: they have no HTTP rows
+// sessions-family reads (managed-context + worktrees + the session list
+// and its NDJSON stream so far). The `api_transfer_*` methods are
+// deliberately absent: they have no HTTP rows
 // until the server-track stage that adds /api/transfers (task #6); F1 adds
 // their entries when those rows land.
 // Entry shape: verb + path template (`{name}` segments are lifted from
-// params), `query` = param keys lifted into the query string, `lane` =
-// non-JSON response/request lane ('bytes' | 'upload'), `encode` = upload
+// params), `query` = param keys lifted into the query string (arrays
+// comma-join; empty arrays stay absent), `lane` =
+// non-JSON response/request lane ('bytes' | 'upload' | 'stream'),
+// `encode` = upload
 // body encoding ('raw' streamed body | 'json-b64' JSON envelope with
 // content_b64), `rawQuery` = the named param is a pre-encoded query STRING
 // the HTTP twin takes verbatim (the managed-context tunnel contract).
@@ -73,6 +76,8 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_session_current_upload: { verb: 'POST', path: '/api/session/current/uploads', query: ['name', 'destination'], lane: 'upload', encode: 'raw' },
   api_session_current_upload_raw: { verb: 'GET', path: '/api/session/current/uploads/{id}/raw', lane: 'bytes' },
   api_session_current_upload_delete: { verb: 'DELETE', path: '/api/session/current/uploads/{upload_id}' },
+  api_sessions: { verb: 'GET', path: '/api/sessions', query: ['ids', 'limit', 'view'] },
+  api_sessions_stream: { verb: 'GET', path: '/api/sessions/stream', query: ['limit'], lane: 'stream' },
   api_managed_context_records: { verb: 'GET', path: '/api/managed-context/records', rawQuery: 'query' },
   api_managed_context_anchors: { verb: 'GET', path: '/api/managed-context/anchors', rawQuery: 'query' },
   api_managed_context_fission: { verb: 'GET', path: '/api/managed-context/fission', rawQuery: 'query' },
@@ -278,6 +283,15 @@ function daemonApiHttpTarget(spec, method, params) {
     const value = source[key];
     if (value === undefined || value === null) continue;
     used.add(key);
+    // Array params comma-join (api_sessions ids); an empty list stays
+    // absent — the tunnel vocabulary cannot express HTTP's
+    // present-but-empty filter, and no legacy call site sent one.
+    if (Array.isArray(value)) {
+      if (value.length) {
+        query.push(`${encodeURIComponent(key)}=${encodeURIComponent(value.join(','))}`);
+      }
+      continue;
+    }
     query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
   }
   // rawQuery twins: the tunnel method takes one pre-encoded query-string
@@ -396,6 +410,68 @@ async function daemonApiHttpUpload(method, params, source, opts) {
   }
   const body = await resp.json().catch(() => ({}));
   return { ok: resp.ok, status: resp.status, body: body ?? {} };
+}
+
+// Read a newline-delimited JSON body, invoking onLine per non-empty line.
+// Shared with call sites that keep an explicit remote NDJSON lane (the
+// cross-origin peer session stream) so the reader exists exactly once.
+async function daemonApiReadNdjsonBody(response, onLine) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const handleLine = line => {
+    const trimmed = line.trim();
+    if (trimmed) onLine(trimmed);
+  };
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) handleLine(line);
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) handleLine(buffer);
+}
+
+// Stream-lane twins over direct HTTP: the daemon's NDJSON endpoints emit
+// the same event objects the tunnel's stream_event frames carry (the
+// sessions stream predates the tunnel lane), so the adapter reads lines
+// and feeds the same callbacks. There is no stream_end result on HTTP —
+// resolve with null, exactly what consumers that track state from events
+// expect. `end` fires like the tunnel's; `start` has no HTTP equivalent
+// frame and is never synthesized.
+async function daemonApiHttpStream(method, params, opts, onEvent) {
+  const spec = DAEMON_API_HTTP_MAP[method];
+  const { url } = daemonApiHttpTarget(spec, method, params);
+  let resp;
+  try {
+    resp = await authedFetch(url, { method: spec.verb, signal: daemonApiHttpSignal(method, opts) });
+  } catch (err) {
+    throw daemonApiHttpError(err, method);
+  }
+  if (!resp.ok || !resp.body) {
+    throw new DaemonApiError('http', method, null, `${method} returned HTTP ${resp.status}`, resp.status);
+  }
+  const emit = event => {
+    // Same callback-shape tolerance as the tunnel's callStreamCallback.
+    try {
+      if (typeof onEvent === 'function') onEvent(event);
+      else if (onEvent && typeof onEvent.event === 'function') onEvent.event(event);
+    } catch (err) {
+      console.warn('[daemon-api] stream callback failed', err);
+    }
+  };
+  try {
+    await daemonApiReadNdjsonBody(resp, line => emit(JSON.parse(line)));
+  } catch (err) {
+    throw daemonApiHttpError(err, method);
+  }
+  if (onEvent && typeof onEvent.end === 'function') {
+    try { onEvent.end(null); } catch (err) { console.warn('[daemon-api] stream end callback failed', err); }
+  }
+  return null;
 }
 
 // ── Tunnel adapters ───────────────────────────────────────────────────────
@@ -530,20 +606,21 @@ async function daemonApiStream(method, params = {}, opts = {}, onEvent = {}) {
     }
   }
   const transport = dashboardControlTransport;
-  if (!transport || !transport.canUseRpc()) {
-    // No stream twin exists in the F0 descriptor family; the NDJSON HTTP
-    // lane arrives with the sessions family (F2) once the server stream
-    // stage lands. Until then streams are tunnel-only.
-    throw new DaemonApiError(
-      'unavailable', method, null,
-      `dashboard tunnel is not connected for ${method} (streams have no HTTP lane yet)`
-    );
+  let tunnelError = null;
+  if (transport && transport.canUseRpc()) {
+    try {
+      return await transport.stream(method, params, daemonApiTunnelOptions(method, opts), onEvent);
+    } catch (err) {
+      tunnelError = daemonApiTunnelError(err, method, null);
+      if (tunnelError.kind === 'abort') throw tunnelError;
+    }
   }
-  try {
-    return await transport.stream(method, params, daemonApiTunnelOptions(method, opts), onEvent);
-  } catch (err) {
-    throw daemonApiTunnelError(err, method, null);
-  }
+  // Streams are GET twins: a failed tunnel stream may replay over the
+  // NDJSON HTTP lane (consumers merge idempotent event objects; a
+  // mid-stream restart re-delivers rows, exactly like the legacy
+  // per-call-site fallbacks did). Connect mode never uses HTTP.
+  daemonApiEnsureHttpFallback(method, opts, tunnelError);
+  return daemonApiHttpStream(method, params, opts, onEvent);
 }
 
 // ── Availability (§3.4): one function, derived ────────────────────────────
@@ -560,9 +637,15 @@ function daemonApiTunnelMethodAvailability(transport, method) {
   const status = transport.lastStatus || null;
   const features = Array.isArray(transport.controlFeatures) ? transport.controlFeatures : [];
   const lane = (spec && spec.lane) || 'json';
-  const laneFeature = lane === 'bytes' ? 'byte_streams' : (lane === 'upload' ? 'upload_frames' : '');
+  const laneFeature = lane === 'bytes' ? 'byte_streams'
+    : (lane === 'upload' ? 'upload_frames'
+      : (lane === 'stream' ? 'stream_frames' : ''));
   if (laneFeature) {
-    const laneOk = status ? status[`${laneFeature}_available`] === true : features.includes(laneFeature);
+    // Not every lane feature has a status boolean (stream_frames is
+    // wire-level only), and pre-status daemons carry none — fall back to
+    // the hello features list rather than reading absence as denial.
+    const laneFlag = status ? status[`${laneFeature}_available`] : undefined;
+    const laneOk = typeof laneFlag === 'boolean' ? laneFlag : features.includes(laneFeature);
     if (!laneOk) return { ok: false, reason: 'unsupported' };
   }
   const flag = status ? status[`${method}_available`] : undefined;
@@ -663,6 +746,8 @@ window.qa = Object.assign(window.qa || {}, {
         api_fs_stat: daemonApiAvailability('api_fs_stat'),
         api_fs_write: daemonApiAvailability('api_fs_write'),
         api_session_current_upload: daemonApiAvailability('api_session_current_upload'),
+        api_sessions: daemonApiAvailability('api_sessions'),
+        api_sessions_stream: daemonApiAvailability('api_sessions_stream'),
       },
       descriptor: {
         methods: Object.keys(DAEMON_API_HTTP_MAP).length,
